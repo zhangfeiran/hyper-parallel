@@ -23,8 +23,11 @@ constexpr uint32_t QUEUE_CAPACITY = 100;
 constexpr uint32_t TASK_TYPE_INDEX_NUM = 256 * 100;
 constexpr uint32_t MAX_GROUP_LIST = 512;
 constexpr uint32_t ATOMIC_ADD_VALUE_LEN = 8;
+constexpr uint32_t READY_HANDSHAKE_MAGIC = 0x4D4D5231;
+constexpr uint32_t READY_HANDSHAKE_VERSION = 1;
 
 constexpr uint32_t UB_32B_ALIGN = 32;
+constexpr uint32_t DATA_CACHE_LINE_SIZE = 64;
 constexpr uint32_t EXP_TOKEN_COUNT_FLAG_CNT = UB_32B_ALIGN / sizeof(int32_t);  // 8
 constexpr uint32_t DISPATCH_TOKEN_UB_SIZE = 3 * 32;
 
@@ -137,7 +140,17 @@ struct RuntimeConfig {
   int32_t *atomic_add_values;
 };
 
+struct ReadyHandshakeMeta {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t ready_event;
+};
+
 __aicore__ inline uint32_t getTaskNum(__gm__ uint8_t *tiling) { return (*(__gm__ uint32_t *)(tiling)); }
+
+__aicore__ inline uint32_t getConfigExtraValue(__gm__ uint8_t *tiling) {
+  return (*(__gm__ uint32_t *)(tiling + UINT32_T_SIZE * 3));
+}
 
 __aicore__ inline uint32_t getAllEventNumTriggersOffset() { return UINT32_T_SIZE * 4; }
 
@@ -281,6 +294,17 @@ __aicore__ inline uint32_t getGroupedMatmulGroupListOffsetById(__gm__ uint8_t *t
 
 __aicore__ inline uint32_t getAtomicAddValuesOffset() {
   return getGroupedMatmulGroupListOffset() + MAX_GROUP_LIST * INT64_T_SIZE;
+}
+
+__aicore__ inline uint32_t getReadyHandshakeMetaOffset() {
+  return getAtomicAddValuesOffset() + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
+}
+
+__aicore__ inline void getReadyHandshakeMeta(__gm__ uint8_t *tiling, ReadyHandshakeMeta *meta) {
+  __gm__ uint8_t *base = tiling + getReadyHandshakeMetaOffset();
+  meta->magic = (*(__gm__ uint32_t *)(base));
+  meta->version = (*(__gm__ uint32_t *)(base + UINT32_T_SIZE));
+  meta->ready_event = (*(__gm__ uint32_t *)(base + UINT32_T_SIZE * 2));
 }
 
 __aicore__ inline int64_t getExtraValueFromTiling(__gm__ uint8_t *tiling, uint32_t index) {

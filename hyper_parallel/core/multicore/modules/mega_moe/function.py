@@ -160,16 +160,11 @@ def _get_mega_moe_function() -> Any:
             try:
                 dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
                 combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-                events = _workspace_tensor(
-                    workspace.forward_event_counters,
-                    "forward_event_counters",
-                )
                 gmm_workspace = _workspace_tensor(
                     workspace.gmm_workspace, "gmm_workspace"
                 )
                 dispatch.zero_()
                 combine.zero_()
-                events.zero_()
                 capacity = workspace.expert_capacity
                 up_proj, activation, down_proj = _allocate_forward_intermediates(
                     spec,
@@ -177,7 +172,7 @@ def _get_mega_moe_function() -> Any:
                     routed_tokens,
                     dispatch,
                 )
-                workspace.symmetric_memory.barrier()
+                events = workspace.prepare_event_counters(forward=True)
                 multicore_adapter.mega_moe(
                     dispatch,
                     metadata.dispatch_target_off * spec.hidden_size,
@@ -255,10 +250,6 @@ def _get_mega_moe_function() -> Any:
             try:
                 dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
                 grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-                events = _workspace_tensor(
-                    workspace.backward_event_counters,
-                    "backward_event_counters",
-                )
                 gmm_workspace = _workspace_tensor(
                     workspace.gmm_workspace, "gmm_workspace"
                 )
@@ -268,7 +259,6 @@ def _get_mega_moe_function() -> Any:
                 )
                 dispatch.zero_()
                 grad_x.zero_()
-                events.zero_()
                 capacity = workspace.expert_capacity
                 (
                     grad_weight1,
@@ -283,7 +273,7 @@ def _get_mega_moe_function() -> Any:
                     weight1,
                     weight2,
                 )
-                workspace.symmetric_memory.barrier()
+                events = workspace.prepare_event_counters(forward=False)
                 multicore_adapter.mega_moe_grad(
                     dispatch,
                     dispatch_target_off * spec.hidden_size,

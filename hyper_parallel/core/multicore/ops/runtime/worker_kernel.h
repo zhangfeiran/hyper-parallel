@@ -63,6 +63,15 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void Process() {
+    ReadyHandshakeMeta meta;
+    if (LoadReadyHandshakeMeta(&meta)) {
+      WaitForDeviceReady(meta);
+    }
+    ProcessStatic();
+  }
+
+ protected:
+  __aicore__ inline void ProcessStatic() {
 #ifdef __DAV_C220_CUBE__
     uint32_t block_idx = this->worker_id_;
     do {
@@ -90,7 +99,58 @@ class KernelWorkerBase {
 #endif
   }
 
- protected:
+  __aicore__ inline bool LoadReadyHandshakeMeta(ReadyHandshakeMeta *meta) {
+    if (getConfigExtraValue(this->runtimeConfigPtr) != READY_HANDSHAKE_MAGIC) {
+      return false;
+    }
+    getReadyHandshakeMeta(this->runtimeConfigPtr, meta);
+    return meta->magic == READY_HANDSHAKE_MAGIC && meta->version == READY_HANDSHAKE_VERSION;
+  }
+
+  __aicore__ inline void PublishDeviceReady(const ReadyHandshakeMeta &meta) {
+#ifndef __DAV_C220_CUBE__
+    int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    int64_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
+    constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
+    __gm__ int32_t *ready =
+      (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + MAX_EVENT_NUM;
+
+    GlobalTensor<int32_t> ready_state;
+    ready_state.SetGlobalBuffer(ready, static_cast<uint32_t>((ep + 1) * ready_stride));
+    uint32_t generation_index = static_cast<uint32_t>(ep) * ready_stride;
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+      ready_state[generation_index]);
+    int32_t generation = ready_state.GetValue(generation_index) + 1;
+    ready_state.SetValue(generation_index, generation);
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+      ready_state[generation_index]);
+    PipeBarrier<PIPE_ALL>();
+
+    uint32_t round = 0;
+    for (int64_t distance = 1; distance < ep; distance *= 2, ++round) {
+      int64_t target = (rank + distance) % ep;
+      __gm__ int32_t *round_ready = ready + round * ready_stride;
+      aclshmemx_signal_op(round_ready, generation, ACLSHMEM_SIGNAL_SET, static_cast<int>(target));
+      aclshmem_signal_wait_until(round_ready, ACLSHMEM_CMP_GE, generation);
+    }
+    TriggerEvent(meta.ready_event);
+#endif
+  }
+
+  __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
+#ifdef __DAV_C220_CUBE__
+    WaitForDependency(meta.ready_event);
+#else
+    if (this->worker_id_ % 2 == 0) {
+      return;
+    }
+    if (this->worker_id_ == 1) {
+      PublishDeviceReady(meta);
+    }
+    WaitForDependency(meta.ready_event);
+#endif
+  }
+
   __aicore__ inline TaskId GetTaskIndex(uint32_t task_id) {
 #ifdef __DAV_C220_CUBE__
     return cube_task_indexs.GetValue(task_id);

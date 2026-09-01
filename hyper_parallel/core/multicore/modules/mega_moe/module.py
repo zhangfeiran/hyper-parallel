@@ -342,6 +342,7 @@ class MegaMoeExperts(MulticoreModule):
             topk_weights,
             resources.spec,
             tokens_per_expert,
+            workspace=resources.workspace,
         )
         expert_output = execute_mega_moe(
             route.routed_tokens,

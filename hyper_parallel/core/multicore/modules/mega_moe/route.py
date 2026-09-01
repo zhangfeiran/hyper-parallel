@@ -18,11 +18,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch_npu
 
 from .spec import MegaMoeSpec
+
+if TYPE_CHECKING:
+    from .workspace import MegaMoeWorkspace
 
 torch = import_module("torch")
 dist = import_module("torch.distributed")
@@ -237,6 +240,7 @@ def prepare_topk_route(
     topk_weights: torch.Tensor,
     spec: MegaMoeSpec,
     tokens_per_expert: torch.Tensor | None,
+    workspace: MegaMoeWorkspace | None = None,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -246,12 +250,15 @@ def prepare_topk_route(
         topk_weights: Router weights paired with ``topk_ids``.
         spec: Bound shape and expert-parallel specification.
         tokens_per_expert: Optional trusted Router histogram.
+        workspace: Optional lease owner ordered before the count exchange.
 
     Returns:
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
+    if workspace is not None:
+        workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
     routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     received_counts = _finish_count_gather(counts_by_source, count_work, spec)

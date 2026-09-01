@@ -451,7 +451,7 @@ python -m hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_dat
 ├── up_proj_tiling.bin              # GMM1 tiling（各 rank 共用）
 ├── swiglu_tiling.bin               # SwiGLU tiling（各 rank 共用）
 ├── down_proj_tiling.bin            # GMM2 tiling（各 rank 共用）
-├── all_event_counters.bin          # 4096 uint8 zeros，4 KB（各 rank 共用，需 symmetric memory）
+├── all_event_counters.bin          # 4 KB counters + EP ready state（各 rank 共用，需 symmetric memory）
 ├── gmm_workspace.bin               # 256 MiB zeros（各 rank 共用）
 ├── runtime_config_input_rank_0.bin # Rank 0 调度配置
 ├── runtime_config_input_rank_1.bin
@@ -496,7 +496,7 @@ python -m hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_da
 ├── w1_grad_tiling.bin              # GMM3（W1 梯度）tiling
 ├── w2_grad_tiling.bin              # GMM4（W2 梯度）tiling
 ├── swiglu_grad_tiling.bin          # SwiGLU 反向 tiling
-├── all_event_counters.bin          # 4096 uint8 zeros，4 KB（各 rank 共用）
+├── all_event_counters.bin          # 4 KB counters + EP ready state（各 rank 共用）
 ├── gmm_workspace.bin
 └── runtime_config_input_rank_<i>.bin
 ```

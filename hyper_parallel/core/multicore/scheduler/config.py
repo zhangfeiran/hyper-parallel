@@ -37,6 +37,10 @@ QUEUE_CAPACITY       = 100
 TASK_TYPE_INDEX_NUM  = 256 * 100
 MAX_GROUP_LIST       = 512
 ATOMIC_ADD_VALUE_LEN = 8
+READY_HANDSHAKE_MAGIC   = 0x4D4D5231
+READY_HANDSHAKE_VERSION = 1
+EVENT_COUNTER_BYTES     = MAX_EVENT_NUM * ctypes.sizeof(ctypes.c_int32)
+READY_CACHE_LINE_BYTES  = 64
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
@@ -131,6 +135,16 @@ class DynamicDataC(ctypes.Structure):
     ]
 
 
+class ReadyHandshakeMetaC(ctypes.Structure):
+    """Device metadata for the cross-rank workspace-ready handshake."""
+
+    _fields_ = [
+        ("magic",       ctypes.c_uint32),
+        ("version",     ctypes.c_uint32),
+        ("ready_event", ctypes.c_uint32),
+    ]
+
+
 class RuntimeConfigC(ctypes.Structure):
     _fields_ = [
         ("task_num",                  ctypes.c_uint32),
@@ -147,6 +161,7 @@ class RuntimeConfigC(ctypes.Structure):
         ("dynamic_data",              DynamicDataC),
         ("grouped_matmul_group_list", ctypes.c_int64   * MAX_GROUP_LIST),
         ("atomic_add_values",         ctypes.c_int32   * ATOMIC_ADD_VALUE_LEN),
+        ("ready_handshake_meta",      ReadyHandshakeMetaC),
     ]
 
 
@@ -251,3 +266,24 @@ def init_task_split_value(tsv: TaskSplitValue) -> None:
     tsv.pre_cube_task_num   = 0
     tsv.pre_vector_task_num = 0
     tsv.pre_mix_task_num    = 0
+
+
+def configure_ready_handshake(cfg: RuntimeConfigC, tsv: TaskSplitValue) -> None:
+    """Enable the device-side workspace-ready fence for multi-rank EP."""
+    if tsv.ep == 1:
+        return
+    ready_event = tsv.all_event_num + 3
+    if ready_event >= MAX_EVENT_NUM:
+        raise ValueError("ready handshake event exceeds MAX_EVENT_NUM.")
+    cfg.ready_handshake_meta.magic = READY_HANDSHAKE_MAGIC
+    cfg.ready_handshake_meta.version = READY_HANDSHAKE_VERSION
+    cfg.ready_handshake_meta.ready_event = ready_event
+    cfg.all_event_num_triggers[ready_event] = 1
+    cfg.config_extra_value = READY_HANDSHAKE_MAGIC
+
+
+def event_workspace_bytes(ep_size: int) -> int:
+    """Return event-counter plus persistent ready-state storage."""
+    if ep_size <= 1:
+        return EVENT_COUNTER_BYTES
+    return EVENT_COUNTER_BYTES + (ep_size + 1) * READY_CACHE_LINE_BYTES
