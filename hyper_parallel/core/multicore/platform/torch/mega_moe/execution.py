@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import importlib
 from typing import Any
 
 from hyper_parallel.core.multicore.platform import torch as multicore_adapter
@@ -34,13 +33,6 @@ def _workspace_tensor(tensor: Any | None, name: str) -> Any:
     if tensor is None:
         raise RuntimeError(f"MegaMoe workspace {name} is not initialized.")
     return tensor
-
-
-def _barrier() -> None:
-    """Synchronize the process group bound to the SHMEM handler."""
-    symm = importlib.import_module("hyper_parallel.core.symmetric_memory")
-
-    symm.barrier()
 
 
 def _allocate_forward_intermediates(
@@ -175,16 +167,11 @@ def _get_mega_moe_function() -> Any:
             try:
                 dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
                 combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-                events = _workspace_tensor(
-                    workspace.forward_event_counters,
-                    "forward_event_counters",
-                )
                 gmm_workspace = _workspace_tensor(
                     workspace.gmm_workspace, "gmm_workspace"
                 )
                 dispatch.zero_()
                 combine.zero_()
-                events.zero_()
                 capacity = workspace.expert_capacity
                 up_proj, activation, down_proj = _allocate_forward_intermediates(
                     torch,
@@ -193,7 +180,7 @@ def _get_mega_moe_function() -> Any:
                     routed_tokens,
                     dispatch,
                 )
-                _barrier()
+                events = workspace.prepare_event_counters(forward=True)
                 multicore_adapter.run_mega_moe(
                     dispatch,
                     metadata.dispatch_target_off * config.hidden_size,
@@ -271,10 +258,6 @@ def _get_mega_moe_function() -> Any:
             try:
                 dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
                 grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-                events = _workspace_tensor(
-                    workspace.backward_event_counters,
-                    "backward_event_counters",
-                )
                 gmm_workspace = _workspace_tensor(
                     workspace.gmm_workspace, "gmm_workspace"
                 )
@@ -284,7 +267,6 @@ def _get_mega_moe_function() -> Any:
                 )
                 dispatch.zero_()
                 grad_x.zero_()
-                events.zero_()
                 capacity = workspace.expert_capacity
                 (
                     grad_weight1,
@@ -300,7 +282,7 @@ def _get_mega_moe_function() -> Any:
                     weight1,
                     weight2,
                 )
-                _barrier()
+                events = workspace.prepare_event_counters(forward=False)
                 multicore_adapter.run_mega_moe_grad(
                     dispatch,
                     dispatch_target_off * config.hidden_size,

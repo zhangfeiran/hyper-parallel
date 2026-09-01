@@ -21,6 +21,7 @@ from hyper_parallel.core.multicore.platform.torch.mega_moe.config import (
 )
 from hyper_parallel.core.multicore.platform.torch.mega_moe.workspace import (
     _EVENT_COUNTER_BYTES,
+    _READY_CACHE_LINE_BYTES,
     _WORKSPACE_ALIGNMENT,
     _spec_workspace_bytes,
 )
@@ -47,6 +48,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             * specification["hidden_size"]
             * element_size
             + 2 * _EVENT_COUNTER_BYTES
+            + 2 * (specification["ep_size"] + 1) * _READY_CACHE_LINE_BYTES
             + 4 * (_WORKSPACE_ALIGNMENT - 1)
         )
 

@@ -26,7 +26,7 @@ Outputs (rank-independent):
     <output_dir>/w1_grad_tiling.bin          (w1_grad, pos 22)
     <output_dir>/w2_grad_tiling.bin          (w2_grad, pos 23)
     <output_dir>/swiglu_grad_tiling.bin      (SwiGLU-grad, pos 24)
-    <output_dir>/all_event_counters.bin      1024×int32 zeros (4 KB)
+    <output_dir>/all_event_counters.bin      event counters and ready state
     <output_dir>/gmm_workspace.bin           256 MiB zeros
 
 Outputs (per rank):
@@ -34,12 +34,13 @@ Outputs (per rank):
 """
 import argparse
 import os
-import numpy as np
 
 from hyper_parallel.core.multicore.scheduler.config import (
     RuntimeConfigC, QUEUE_CAPACITY,
-    TaskSplitValue, init_task_split_value,
+    TaskSplitValue, configure_ready_handshake, event_workspace_bytes,
+    init_task_split_value,
 )
+from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 from hyper_parallel.core.multicore.scheduler.scheduler import (
     revise_task_queue, revise_gmm_task_queue_bwd,
 )
@@ -54,7 +55,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables impor
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for backward data generation."""
     p = argparse.ArgumentParser()
     p.add_argument('--tp',                type=int, default=4)
@@ -75,7 +76,7 @@ def parse_args():
     return p.parse_args()
 
 
-def build_config_for_rank(graph, tsv: TaskSplitValue, rank_id: int,
+def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
                           num_cube_cores: int = 24) -> RuntimeConfigC:
     """Build backward RuntimeConfig for a single rank."""
     cfg = RuntimeConfigC()
@@ -106,6 +107,7 @@ def build_config_for_rank(graph, tsv: TaskSplitValue, rank_id: int,
     revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num)
     revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
     add_dynamic_data(cfg, tsv, dynamic_input_position=19)
+    configure_ready_handshake(cfg, tsv)
 
     cfg.task_num = task_num_all
     cfg.atomic_add_values[0] = 1
@@ -120,7 +122,7 @@ def write_bin(path: str, data: bytes) -> None:
     print(f"  wrote {len(data):>10,} bytes → {path}")
 
 
-def main():
+def main() -> None:
     """Entry point for backward pass runtime data generation."""
     args = parse_args()
     out  = args.output_dir
@@ -189,9 +191,9 @@ def main():
     write_bin(os.path.join(out, 'swiglu_grad_tiling.bin'), swiglu_grad_bytes)
 
     # ── Event counters + workspace (rank-independent) ─────────────────────────
-    # all_event_counters: 1024×int32_t zeros — matches C++ reference gen_data
+    # The persistent tail stores the per-rank ready generation.
     write_bin(os.path.join(out, 'all_event_counters.bin'),
-              np.zeros(1024, dtype=np.int32).tobytes())
+              bytes(event_workspace_bytes(args.ep)))
     # gmm_workspace: 256 MiB zeros — kernel-internal scratch buffer
     write_bin(os.path.join(out, 'gmm_workspace.bin'),
               bytes(256 * 1024 * 1024))

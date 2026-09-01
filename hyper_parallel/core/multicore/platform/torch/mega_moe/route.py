@@ -17,11 +17,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ._framework import get_torch, get_torch_distributed
 from .config import MegaMoeConfig
 from .runtime import MegaMoeRuntime
+
+if TYPE_CHECKING:
+    from .workspace import MegaMoeWorkspace
 
 
 @dataclass(frozen=True)
@@ -214,11 +217,16 @@ def prepare_topk_route(
     topk_weights: Any,
     runtime: MegaMoeRuntime,
     tokens_per_expert: Any | None,
+    workspace: MegaMoeWorkspace | None = None,
 ) -> PreparedTopKRoute:
     """Overlap native TopK permutation with count gathering and build route metadata."""
     config = runtime.config
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     counts = _resolve_counts(flat_ids, tokens_per_expert, config)
+    if workspace is not None:
+        # Waiting before the mandatory count exchange turns its completion into
+        # the cross-rank rendezvous for the next symmetric-buffer generation.
+        workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, config)
     routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     received_counts, maximum_received_slots = _finish_count_gather(

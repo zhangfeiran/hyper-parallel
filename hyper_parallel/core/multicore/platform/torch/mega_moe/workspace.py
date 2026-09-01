@@ -23,12 +23,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from hyper_parallel.core.multicore.scheduler.config import (
+    EVENT_COUNTER_BYTES as _EVENT_COUNTER_BYTES,
+    READY_CACHE_LINE_BYTES as _READY_CACHE_LINE_BYTES,
+    event_workspace_bytes,
+)
+
 from ._framework import get_torch
 from .config import MegaMoeConfig, _resolve_receive_capacity
 
 _GMM_WORKSPACE_BYTES = 32 * 1024 * 1024
 _SWIGLU_GRAD_WORKSPACE_BYTES = 16 * 1024 * 1024
-_EVENT_COUNTER_BYTES = 4096
 _WORKSPACE_ALIGNMENT = 512
 _HEAP_GRANULARITY_BYTES = 64 * 1024 * 1024
 
@@ -48,7 +53,8 @@ def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -
     tensor_bytes = (
         (capacity + routed_slots) * specification["hidden_size"] * element_size
     )
-    return tensor_bytes + 2 * _EVENT_COUNTER_BYTES + 4 * (_WORKSPACE_ALIGNMENT - 1)
+    event_bytes = event_workspace_bytes(specification["ep_size"])
+    return tensor_bytes + 2 * event_bytes + 4 * (_WORKSPACE_ALIGNMENT - 1)
 
 
 def configure_symmetric_heap(
@@ -106,7 +112,10 @@ class MegaMoeWorkspace:
     gmm_workspace: Any | None = None
     swiglu_grad_workspace: Any | None = None
     in_use: bool = False
-    used: bool = False
+    reuse_event: Any | None = None
+    reuse_event_pending: bool = False
+    forward_ready_initialized: bool = False
+    backward_ready_initialized: bool = False
     lock: Any = field(default_factory=threading.Lock, repr=False)
 
     def ensure(
@@ -151,11 +160,12 @@ class MegaMoeWorkspace:
         self.routed_buffer = symm.aligned_empty(
             (config.routed_slots, config.hidden_size), dtype, _WORKSPACE_ALIGNMENT
         )
+        event_bytes = event_workspace_bytes(config.ep_size)
         self.forward_event_counters = symm.aligned_empty(
-            (_EVENT_COUNTER_BYTES,), torch.uint8, _WORKSPACE_ALIGNMENT
+            (event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT
         )
         self.backward_event_counters = symm.aligned_empty(
-            (_EVENT_COUNTER_BYTES,), torch.uint8, _WORKSPACE_ALIGNMENT
+            (event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT
         )
         self.gmm_workspace = torch.empty(
             (_GMM_WORKSPACE_BYTES,), dtype=torch.uint8, device=device
@@ -164,28 +174,73 @@ class MegaMoeWorkspace:
             (_SWIGLU_GRAD_WORKSPACE_BYTES,), dtype=torch.uint8, device=device
         )
 
+    def prepare_event_counters(self, *, forward: bool) -> Any:
+        """Reset per-call counters while preserving the ready generation."""
+        if forward:
+            field_name = "forward_event_counters"
+            events = self.forward_event_counters
+            ready_initialized = self.forward_ready_initialized
+        else:
+            field_name = "backward_event_counters"
+            events = self.backward_event_counters
+            ready_initialized = self.backward_ready_initialized
+        if events is None:
+            raise RuntimeError(f"MegaMoe workspace {field_name} is not initialized.")
+        events[:_EVENT_COUNTER_BYTES].zero_()
+        if events.numel() == _EVENT_COUNTER_BYTES or ready_initialized:
+            return events
+
+        # Initialize the persistent generation before any peer can signal it.
+        symm = importlib.import_module("hyper_parallel.core.symmetric_memory")
+
+        events[_EVENT_COUNTER_BYTES:].zero_()
+        symm.barrier()
+        if forward:
+            self.forward_ready_initialized = True
+        else:
+            self.backward_ready_initialized = True
+        return events
+
     def claim(self) -> None:
         """Claim the fixed serial workspace lease."""
-        torch = get_torch()
-
         with self.lock:
             if self.in_use:
                 raise RuntimeError(
                     "MegaMoe execution resources do not support concurrent calls."
                 )
-            if self.used and not self.shared:
-                torch.npu.synchronize()
+            self._wait_for_reuse()
+            self.reuse_event_pending = False
             self.in_use = True
+
+    def wait_for_reuse(self) -> None:
+        """Order route exchange after the previous lease without a host wait."""
+        with self.lock:
+            self._wait_for_reuse()
+
+    def _wait_for_reuse(self) -> None:
+        """Enqueue the pending event wait while the lease lock is held."""
+        torch = get_torch()
+
+        if not self.reuse_event_pending:
+            return
+        if self.reuse_event is None or self.device is None:
+            raise RuntimeError("MegaMoe workspace has an incomplete reuse event.")
+        torch.npu.current_stream(self.device).wait_event(self.reuse_event)
 
     def release(self) -> None:
         """Release the workspace lease after an enqueued kernel call."""
         torch = get_torch()
 
-        if self.shared:
-            torch.npu.synchronize()
         with self.lock:
+            if not self.in_use:
+                raise RuntimeError("MegaMoe execution resources are not currently claimed.")
+            if self.reuse_event is None:
+                self.reuse_event = torch.npu.Event()
+            if self.device is None:
+                raise RuntimeError("MegaMoe workspace device is not initialized.")
+            self.reuse_event.record(torch.npu.current_stream(self.device))
+            self.reuse_event_pending = True
             self.in_use = False
-            self.used = True
 
     def _free_symmetric_tensors(self) -> None:
         """Free each unique SHMEM allocation and invalidate its tensor view."""
@@ -205,3 +260,5 @@ class MegaMoeWorkspace:
             setattr(self, field_name, None)
         self.expert_capacity = 0
         self.routed_slots = 0
+        self.forward_ready_initialized = False
+        self.backward_ready_initialized = False

@@ -87,6 +87,7 @@ class TorchMegaMoeBackend:
             topk_weights,
             self.runtime,
             tokens_per_expert,
+            workspace=self.workspace,
         )
         if route.receive_overflow:
             return execute_native_from_permuted_route(
