@@ -51,7 +51,7 @@ from hyper_parallel.platform.torch.common import GroupedExperts
 
 _WORLD_SIZE = 8
 _BATCH_SIZE = 1
-_SEQUENCE_LENGTH = 1024
+_SEQUENCE_LENGTH = 4096
 _DTYPE = torch.bfloat16
 _RTOL = 2e-2
 _ATOL = 2e-3
@@ -153,7 +153,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--expert-capacity-factor", type=_capacity_factor, default=None)
-    parser.add_argument("--routing", choices=("topk", "dirichlet"), default="topk")
+    parser.add_argument("--routing", choices=("balanced", "topk", "dirichlet"), default="balanced")
     parser.add_argument("--router-load-alpha", type=float, default=1.0)
     parser.add_argument("--router-load-seed", type=int, default=42)
     parser.add_argument("--seed", type=int, default=42)

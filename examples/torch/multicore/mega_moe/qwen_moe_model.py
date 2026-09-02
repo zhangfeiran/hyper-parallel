@@ -30,6 +30,7 @@ from typing import Any, Literal
 
 # This is a Torch-only executable example, not a platform-agnostic library module.
 import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
@@ -44,7 +45,7 @@ from hyper_parallel.models.modules import (
     apply_rotary_pos_emb,
 )
 
-RoutingMode = Literal["topk", "dirichlet"]
+RoutingMode = Literal["balanced", "topk", "dirichlet"]
 
 
 @dataclass(frozen=True)
@@ -52,27 +53,27 @@ class QwenMoeConfig:
     """Fixed-shape synthetic Qwen model configuration.
 
     The example intentionally models one TP1/EP8 optimizer-step workload. Its
-    optional deterministic Dirichlet route makes load-skew correctness and
-    native-fallback behavior reproducible without changing the model shape.
+    deterministic balanced default gives every destination the same load;
+    optional Dirichlet routing reproduces load-skew and fallback behavior.
     """
 
     vocab_size: int = 32000
-    hidden_size: int = 2048
+    hidden_size: int = 5120
     num_layers: int = 8
     num_attention_heads: int = 16
     num_key_value_heads: int = 2
-    max_seq_len: int = 1024
+    max_seq_len: int = 4096
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10_000_000.0
-    num_experts: int = 16
+    num_experts: int = 48
     top_k: int = 8
-    intermediate_size: int = 512
+    intermediate_size: int = 1792
     shared_expert_intermediate_size: int = 512
     routed_scaling_factor: float = 1.0
-    routing: RoutingMode = "topk"
+    routing: RoutingMode = "balanced"
     router_load_alpha: float = 1.0
     router_load_seed: int = 42
-    local_num_tokens: int = 1024
+    local_num_tokens: int = 4096
     expert_capacity_factor: float | None = None
     ep_size: int = 8
 
@@ -122,8 +123,18 @@ class QwenMoeConfig:
                 f"max_seq_len ({self.max_seq_len}) cannot exceed local_num_tokens "
                 f"({self.local_num_tokens}) in the fixed batch-one workload."
             )
-        if self.routing not in ("topk", "dirichlet"):
+        self._validate_routing()
+
+    def _validate_routing(self) -> None:
+        """Validate learned and synthetic router parameters."""
+        if self.routing not in ("balanced", "topk", "dirichlet"):
             raise ValueError(f"unsupported routing mode: {self.routing!r}.")
+        if self.routing == "balanced" and self.top_k != self.ep_size:
+            raise ValueError(
+                "balanced routing requires top_k to equal ep_size so every token "
+                f"selects one expert per destination, got top_k={self.top_k} and "
+                f"ep_size={self.ep_size}."
+            )
         if not math.isfinite(self.router_load_alpha) or self.router_load_alpha < 0.01:
             raise ValueError(
                 "router_load_alpha must be finite and at least 0.01, got "
@@ -310,6 +321,32 @@ def _fixed_token_major_route(
     return topk_weights, topk_ids
 
 
+def _balanced_token_major_route(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    ep_size: int,
+    source_rank: int,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build an exact destination-balanced route with near-even experts."""
+    if top_k != ep_size:
+        raise ValueError("balanced routing requires top_k to equal ep_size.")
+    local_experts = num_experts // ep_size
+    token_index = torch.arange(num_tokens, dtype=torch.long).unsqueeze(1)
+    destination = torch.arange(ep_size, dtype=torch.long).unsqueeze(0)
+    global_token_index = token_index * ep_size + source_rank
+    local_expert = (global_token_index + destination) % local_experts
+    topk_ids = destination * local_experts + local_expert
+    topk_weights = torch.full(
+        (num_tokens, top_k),
+        routed_scaling_factor / top_k,
+        dtype=torch.float32,
+    )
+    counts = torch.bincount(topk_ids.reshape(-1), minlength=num_experts).to(torch.int32)
+    return topk_weights, topk_ids, counts
+
+
 class QwenMoeBlock(nn.Module):
     """One Qwen router, managed routed-expert, and shared-expert block."""
 
@@ -331,7 +368,17 @@ class QwenMoeBlock(nn.Module):
         fixed_counts = None
         fixed_weights = None
         fixed_ids = None
-        if config.routing == "dirichlet":
+        if config.routing == "balanced":
+            source_rank = dist.get_rank(ep_group) if dist.is_initialized() else 0
+            fixed_weights, fixed_ids, fixed_counts = _balanced_token_major_route(
+                config.local_num_tokens,
+                config.top_k,
+                config.num_experts,
+                config.ep_size,
+                source_rank,
+                config.routed_scaling_factor,
+            )
+        elif config.routing == "dirichlet":
             fixed_counts = _dirichlet_expert_counts(
                 config.local_num_tokens,
                 config.top_k,
@@ -369,7 +416,7 @@ class QwenMoeBlock(nn.Module):
         """Run routed experts and the always-active shared expert."""
         hidden_shape = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, hidden_shape[-1])
-        if self.config.routing == "dirichlet":
+        if self.config.routing in ("balanced", "dirichlet"):
             if (
                 self._fixed_topk_weights is None
                 or self._fixed_topk_ids is None
@@ -462,7 +509,7 @@ class QwenMoeModel(nn.Module):
         self.layers = nn.ModuleList(
             QwenDecoderLayer(
                 config,
-                    ep_group,
+                ep_group,
                 layer_index=layer_index,
             )
             for layer_index in range(config.num_layers)
