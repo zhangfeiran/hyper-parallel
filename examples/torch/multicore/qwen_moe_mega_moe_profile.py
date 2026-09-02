@@ -45,7 +45,7 @@ from qwen_moe_mega_moe_model import MoeBackend, QwenMoeConfig, QwenMoeModel
 
 _WORLD_SIZE = 8
 _BATCH_SIZE = 1
-_SEQUENCE_LENGTH = 1024
+_SEQUENCE_LENGTH = 4096
 _DTYPE = torch.bfloat16
 _MEMORY_SAMPLE_INTERVAL_SECONDS = 0.01
 
@@ -89,7 +89,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("mega_moe", "native"),
         required=True,
     )
-    parser.add_argument("--routing", choices=("topk", "dirichlet"), default="topk")
+    parser.add_argument(
+        "--routing",
+        choices=("balanced", "topk", "dirichlet"),
+        default="balanced",
+    )
     parser.add_argument("--router-load-alpha", type=float, default=1.0)
     parser.add_argument("--router-load-seed", type=int, default=42)
     parser.add_argument("--expert-capacity-factor", type=float, default=1.5)
