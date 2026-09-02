@@ -89,6 +89,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("mega_moe", "native"),
         required=True,
     )
+    parser.add_argument("--routing", choices=("topk", "dirichlet"), default="topk")
+    parser.add_argument("--router-load-alpha", type=float, default=1.0)
+    parser.add_argument("--router-load-seed", type=int, default=42)
+    parser.add_argument("--expert-capacity-factor", type=float, default=1.5)
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measured-steps", type=int, default=10)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -111,6 +115,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         raise ValueError(
             f"weight_decay must be finite and nonnegative, got {args.weight_decay}."
+        )
+    if not math.isfinite(args.router_load_alpha) or args.router_load_alpha < 0.01:
+        raise ValueError(
+            "router_load_alpha must be finite and at least 0.01, got "
+            f"{args.router_load_alpha}."
+        )
+    if (
+        not math.isfinite(args.expert_capacity_factor)
+        or args.expert_capacity_factor < 1.0
+    ):
+        raise ValueError(
+            "expert_capacity_factor must be finite and at least 1.0, got "
+            f"{args.expert_capacity_factor}."
         )
     return args
 
@@ -237,18 +254,87 @@ def _all_ranks_true(value: bool, device: torch.device) -> bool:
 
 def _validation_parameters(
     model: QwenMoeModel,
-) -> tuple[torch.nn.Parameter, torch.nn.Parameter]:
-    """Return dense and expert parameters with BF16-observable updates."""
-    return model.lm_head.weight, model.expert_parameters()[0]
+) -> tuple[torch.nn.Parameter, tuple[torch.nn.Parameter, ...]]:
+    """Return dense and all local expert parameters used for update checks."""
+    return model.lm_head.weight, model.expert_parameters()
+
+
+def _expert_update_samples(
+    parameters: tuple[torch.nn.Parameter, ...],
+) -> tuple[torch.Tensor, ...]:
+    """Sample every local expert so an intentionally empty expert is harmless."""
+    samples = []
+    for parameter in parameters:
+        local_experts = parameter.shape[0]
+        samples.append(
+            parameter.detach().reshape(local_experts, -1)[:, :256].clone()
+        )
+    return tuple(samples)
+
+
+def _route_validation(
+    model: QwenMoeModel,
+    backend: MoeBackend,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Summarize global per-layer route skew and MegaMoe fallback decisions."""
+    config = model.config
+    local_experts = config.num_experts // config.ep_size
+    requested_capacity = math.ceil(
+        config.local_num_tokens * config.top_k * config.expert_capacity_factor
+    )
+    receive_capacity = (requested_capacity + 127) // 128 * 128
+    layers = []
+    any_overflow = False
+    for layer_index, layer in enumerate(model.layers):
+        global_counts = layer.mlp.route_counts().to(torch.int64).clone()
+        dist.all_reduce(global_counts, op=dist.ReduceOp.SUM)
+        count_values = global_counts.cpu().tolist()
+        destination_loads = [
+            sum(count_values[start:start + local_experts])
+            for start in range(0, config.num_experts, local_experts)
+        ]
+        maximum_load = max(destination_loads)
+        overflow = maximum_load > receive_capacity
+        any_overflow = any_overflow or overflow
+        layers.append(
+            {
+                "layer": layer_index,
+                "expert_counts": count_values,
+                "empty_experts": sum(count == 0 for count in count_values),
+                "destination_loads": destination_loads,
+                "destination_max_to_mean": maximum_load
+                / (sum(destination_loads) / len(destination_loads)),
+                "receive_capacity": receive_capacity,
+                "receive_overflow": overflow,
+                "execution": (
+                    "native_fallback"
+                    if backend == "mega_moe" and overflow
+                    else backend
+                ),
+            }
+        )
+    return {
+        "mode": config.routing,
+        "dirichlet_alpha": (
+            config.router_load_alpha if config.routing == "dirichlet" else None
+        ),
+        "dirichlet_seed": (
+            config.router_load_seed if config.routing == "dirichlet" else None
+        ),
+        "any_receive_overflow": any_overflow,
+        "layers": layers,
+        "device": str(device),
+    }
 
 
 def _validate_first_step(
     workload: _OptimizerWorkload,
 ) -> dict[str, Any]:
     """Run the first warmup and validate loss, gradients, and updates."""
-    dense_parameter, expert_parameter = _validation_parameters(workload.model)
+    dense_parameter, expert_parameters = _validation_parameters(workload.model)
     dense_before = dense_parameter.detach().reshape(-1)[:256].clone()
-    expert_before = expert_parameter.detach().reshape(-1)[:256].clone()
+    expert_before = _expert_update_samples(expert_parameters)
     loss = _optimizer_step(workload)
     torch.npu.synchronize(workload.device)
     loss_finite = _all_ranks_true(
@@ -264,9 +350,12 @@ def _validate_first_step(
         workload.device,
     )
     expert_updated = _all_ranks_true(
-        not torch.equal(
-            expert_before,
-            expert_parameter.detach().reshape(-1)[:256],
+        any(
+            not torch.equal(before, after)
+            for before, after in zip(
+                expert_before,
+                _expert_update_samples(expert_parameters),
+            )
         ),
         workload.device,
     )
@@ -514,6 +603,15 @@ def _result_metadata(
             "expert_capacity_factor": config.expert_capacity_factor,
             "dtype": "bfloat16",
         },
+        "routing": {
+            "mode": config.routing,
+            "dirichlet_alpha": (
+                config.router_load_alpha if config.routing == "dirichlet" else None
+            ),
+            "dirichlet_seed": (
+                config.router_load_seed if config.routing == "dirichlet" else None
+            ),
+        },
         "optimizer": {
             "name": "AdamW",
             "learning_rate": args.learning_rate,
@@ -584,7 +682,12 @@ def main(argv: list[str] | None = None) -> int:
     """Run the fixed optimizer-step validation and benchmark."""
     args = parse_args(argv)
     rank, world_size, device = _init_runtime()
-    config = QwenMoeConfig()
+    config = QwenMoeConfig(
+        routing=args.routing,
+        router_load_alpha=args.router_load_alpha,
+        router_load_seed=args.router_load_seed,
+        expert_capacity_factor=args.expert_capacity_factor,
+    )
     succeeded = False
     try:
         _set_model_seed(args.seed)
@@ -611,6 +714,11 @@ def main(argv: list[str] | None = None) -> int:
 
         first_step_sampler = _start_memory_measurement(device)
         validation = _validate_first_step(workload)
+        validation["routing"] = _route_validation(
+            model,
+            args.backend,
+            device,
+        )
         first_step_memory = _finish_memory_measurement(first_step_sampler, device)
 
         for _ in range(args.warmup_steps - 2):

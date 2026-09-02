@@ -22,9 +22,11 @@ __all__ = [
     "QwenMoeBlock",
     "QwenMoeConfig",
     "QwenMoeModel",
+    "RoutingMode",
 ]
 
 from dataclasses import dataclass
+import math
 from typing import Any, Literal
 
 # This is a Torch-only executable example, not a platform-agnostic library module.
@@ -47,15 +49,16 @@ from hyper_parallel.models.modules import (
 )
 
 MoeBackend = Literal["mega_moe", "native"]
+RoutingMode = Literal["topk", "dirichlet"]
 
 
 @dataclass(frozen=True)
 class QwenMoeConfig:
     """Fixed-shape synthetic Qwen model configuration.
 
-    The example intentionally models one TP1/EP8 optimizer-step workload.
-    Route stress, fusion matrices, and isolated expert performance belong to
-    the corresponding distributed system tests.
+    The example intentionally models one TP1/EP8 optimizer-step workload. Its
+    optional deterministic Dirichlet route makes load-skew correctness and
+    native-fallback behavior reproducible without changing the model shape.
     """
 
     vocab_size: int = 32000
@@ -71,6 +74,9 @@ class QwenMoeConfig:
     intermediate_size: int = 512
     shared_expert_intermediate_size: int = 512
     routed_scaling_factor: float = 1.0
+    routing: RoutingMode = "topk"
+    router_load_alpha: float = 1.0
+    router_load_seed: int = 42
     local_num_tokens: int = 1024
     expert_capacity_factor: float = 1.5
     ep_size: int = 8
@@ -120,6 +126,18 @@ class QwenMoeConfig:
             raise ValueError(
                 f"max_seq_len ({self.max_seq_len}) cannot exceed local_num_tokens "
                 f"({self.local_num_tokens}) in the fixed batch-one workload."
+            )
+        if self.routing not in ("topk", "dirichlet"):
+            raise ValueError(f"unsupported routing mode: {self.routing!r}.")
+        if not math.isfinite(self.router_load_alpha) or self.router_load_alpha < 0.01:
+            raise ValueError(
+                "router_load_alpha must be finite and at least 0.01, got "
+                f"{self.router_load_alpha}."
+            )
+        if not math.isfinite(self.routed_scaling_factor) or self.routed_scaling_factor <= 0:
+            raise ValueError(
+                "routed_scaling_factor must be finite and positive, got "
+                f"{self.routed_scaling_factor}."
             )
 
 
@@ -220,6 +238,83 @@ def _topk_route(
     return topk_weights * routed_scaling_factor, topk_ids
 
 
+def _dirichlet_expert_counts(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    alpha: float,
+    seed: int,
+) -> torch.Tensor:
+    """Draw reproducible expert counts with exact, distinct Top-K slots."""
+    total_slots = num_tokens * top_k
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        concentration = torch.full((num_experts,), alpha, dtype=torch.float64)
+        shares = torch.distributions.Dirichlet(concentration).sample()
+
+    # Cap every expert at one slot per token. This makes it possible to turn
+    # the expert-major histogram into token-major Top-K selections without a
+    # repeated expert for any token.
+    target = torch.zeros(num_experts, dtype=torch.float64)
+    remaining = torch.ones(num_experts, dtype=torch.bool)
+    remaining_slots = total_slots
+    while remaining_slots:
+        active = remaining.nonzero(as_tuple=False).flatten()
+        if active.numel() == 0:
+            raise RuntimeError("Dirichlet route apportionment exhausted all experts.")
+        active_shares = shares[active]
+        share_sum = active_shares.sum()
+        if not bool(share_sum > 0):
+            active_shares = torch.ones_like(active_shares)
+            share_sum = active_shares.sum()
+        proposed = active_shares / share_sum * remaining_slots
+        saturated = proposed > num_tokens
+        if not bool(saturated.any()):
+            target[active] = proposed
+            break
+        saturated_experts = active[saturated]
+        target[saturated_experts] = num_tokens
+        remaining[saturated_experts] = False
+        remaining_slots -= num_tokens * saturated_experts.numel()
+
+    counts = target.floor().to(torch.int64)
+    residual = total_slots - int(counts.sum())
+    if residual:
+        fractions = target - counts
+        fractions[counts >= num_tokens] = -1.0
+        order = torch.argsort(fractions, descending=True, stable=True)
+        counts[order[:residual]] += 1
+    if int(counts.sum()) != total_slots or bool((counts > num_tokens).any()):
+        raise RuntimeError("Dirichlet route apportionment violated its slot constraints.")
+    return counts
+
+
+def _fixed_token_major_route(
+    num_tokens: int,
+    top_k: int,
+    counts: torch.Tensor,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert exact expert counts into deterministic token-major selections."""
+    expert_ids = torch.repeat_interleave(
+        torch.arange(counts.numel(), dtype=torch.long, device=counts.device),
+        counts,
+    )
+    if expert_ids.numel() != num_tokens * top_k:
+        raise ValueError(
+            f"route counts contain {expert_ids.numel()} slots, expected "
+            f"{num_tokens * top_k}."
+        )
+    topk_ids = expert_ids.view(top_k, num_tokens).transpose(0, 1).contiguous()
+    topk_weights = torch.full(
+        (num_tokens, top_k),
+        routed_scaling_factor / top_k,
+        dtype=torch.float32,
+        device=counts.device,
+    )
+    return topk_weights, topk_ids
+
+
 class QwenMoeBlock(nn.Module):
     """One Qwen router/shared-expert block with a selectable expert backend."""
 
@@ -228,11 +323,38 @@ class QwenMoeBlock(nn.Module):
         config: QwenMoeConfig,
         backend: MoeBackend,
         ep_group: Any | None,
+        *,
+        layer_index: int = 0,
     ) -> None:
         """Initialize the router, routed experts, and shared expert."""
         super().__init__()
         self.config = config
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.gate = (
+            nn.Linear(config.hidden_size, config.num_experts, bias=False)
+            if config.routing == "topk"
+            else None
+        )
+        fixed_counts = None
+        fixed_weights = None
+        fixed_ids = None
+        if config.routing == "dirichlet":
+            fixed_counts = _dirichlet_expert_counts(
+                config.local_num_tokens,
+                config.top_k,
+                config.num_experts,
+                config.router_load_alpha,
+                config.router_load_seed + layer_index,
+            ).to(torch.int32)
+            fixed_weights, fixed_ids = _fixed_token_major_route(
+                config.local_num_tokens,
+                config.top_k,
+                fixed_counts,
+                config.routed_scaling_factor,
+            )
+        self.register_buffer("_fixed_route_counts", fixed_counts, persistent=False)
+        self.register_buffer("_fixed_topk_weights", fixed_weights, persistent=False)
+        self.register_buffer("_fixed_topk_ids", fixed_ids, persistent=False)
+        self._last_route_counts: torch.Tensor | None = None
         if backend == "mega_moe":
             self.experts: nn.Module = MegaMoeExperts(
                 local_num_tokens=config.local_num_tokens,
@@ -264,19 +386,33 @@ class QwenMoeBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run learned routed experts and the always-active shared expert."""
+        """Run routed experts and the always-active shared expert."""
         hidden_shape = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, hidden_shape[-1])
-        topk_weights, topk_ids = _topk_route(
-            hidden_flat,
-            self.gate,
-            self.config.top_k,
-            self.config.routed_scaling_factor,
-        )
-        tokens_per_expert = torch.bincount(
-            topk_ids.reshape(-1).to(torch.int64),
-            minlength=self.config.num_experts,
-        ).to(torch.int32)
+        if self.config.routing == "dirichlet":
+            if (
+                self._fixed_topk_weights is None
+                or self._fixed_topk_ids is None
+                or self._fixed_route_counts is None
+            ):
+                raise RuntimeError("Dirichlet route buffers were not initialized.")
+            topk_weights = self._fixed_topk_weights
+            topk_ids = self._fixed_topk_ids
+            tokens_per_expert = self._fixed_route_counts
+        else:
+            if self.gate is None:
+                raise RuntimeError("learned Top-K routing requires a gate projection.")
+            topk_weights, topk_ids = _topk_route(
+                hidden_flat,
+                self.gate,
+                self.config.top_k,
+                self.config.routed_scaling_factor,
+            )
+            tokens_per_expert = torch.bincount(
+                topk_ids.reshape(-1).to(torch.int64),
+                minlength=self.config.num_experts,
+            ).to(torch.int32)
+        self._last_route_counts = tokens_per_expert.detach()
         routed_output = self.experts(
             hidden_flat,
             topk_ids,
@@ -285,6 +421,12 @@ class QwenMoeBlock(nn.Module):
         )
         shared_output = self.shared_expert(hidden_flat)
         return (routed_output + shared_output).view(hidden_shape)
+
+    def route_counts(self) -> torch.Tensor:
+        """Return the most recently executed local expert histogram."""
+        if self._last_route_counts is None:
+            raise RuntimeError("route counts are unavailable before the first forward pass.")
+        return self._last_route_counts
 
 
 class QwenDecoderLayer(nn.Module):
@@ -295,6 +437,8 @@ class QwenDecoderLayer(nn.Module):
         config: QwenMoeConfig,
         backend: MoeBackend,
         ep_group: Any | None,
+        *,
+        layer_index: int = 0,
     ) -> None:
         """Initialize one attention and MoE decoder layer."""
         super().__init__()
@@ -304,7 +448,12 @@ class QwenDecoderLayer(nn.Module):
             config.rms_norm_eps,
         )
         self.self_attn = QwenAttention(config)
-        self.mlp = QwenMoeBlock(config, backend, ep_group)
+        self.mlp = QwenMoeBlock(
+            config,
+            backend,
+            ep_group,
+            layer_index=layer_index,
+        )
 
     def forward(
         self,
@@ -334,8 +483,13 @@ class QwenMoeModel(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            QwenDecoderLayer(config, backend, ep_group)
-            for _ in range(config.num_layers)
+            QwenDecoderLayer(
+                config,
+                backend,
+                ep_group,
+                layer_index=layer_index,
+            )
+            for layer_index in range(config.num_layers)
         )
         if backend == "mega_moe":
             MegaMoeExperts.share_execution_resources(

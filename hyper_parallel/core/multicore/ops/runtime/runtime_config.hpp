@@ -25,6 +25,8 @@ constexpr uint32_t MAX_GROUP_LIST = 512;
 constexpr uint32_t ATOMIC_ADD_VALUE_LEN = 8;
 constexpr uint32_t READY_HANDSHAKE_MAGIC = 0x4D4D5231;
 constexpr uint32_t READY_HANDSHAKE_VERSION = 1;
+constexpr uint32_t RUNTIME_TASK_CAPACITY_MAGIC = 0x80000000;
+constexpr uint32_t RUNTIME_TASK_CAPACITY_MASK = RUNTIME_TASK_CAPACITY_MAGIC - 1;
 
 constexpr uint32_t UB_32B_ALIGN = 32;
 constexpr uint32_t DATA_CACHE_LINE_SIZE = 64;
@@ -152,18 +154,25 @@ __aicore__ inline uint32_t getConfigExtraValue(__gm__ uint8_t *tiling) {
   return (*(__gm__ uint32_t *)(tiling + UINT32_T_SIZE * 3));
 }
 
+__aicore__ inline uint32_t getRuntimeTaskCapacity(__gm__ uint8_t *tiling) {
+  uint32_t encoded = (*(__gm__ uint32_t *)(tiling + UINT32_T_SIZE * 2));
+  return (encoded & RUNTIME_TASK_CAPACITY_MAGIC) != 0
+    ? encoded & RUNTIME_TASK_CAPACITY_MASK
+    : MAX_TASK_NUM;
+}
+
 __aicore__ inline uint32_t getAllEventNumTriggersOffset() { return UINT32_T_SIZE * 4; }
 
 __aicore__ inline uint32_t getAllTasksOffset() { return UINT32_T_SIZE * 4 + INT32_T_SIZE * MAX_EVENT_NUM; }
 
-__aicore__ inline uint32_t getAllEventsOffset() {
+__aicore__ inline uint32_t getAllEventsOffset(__gm__ uint8_t *tiling) {
   uint32_t start_size = getAllTasksOffset();
 
   uint32_t tensor_desc_size = UINT32_T_SIZE * 8 + UINT32_T_SIZE * MAX_TENSOR_DIMS * 2;
   uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size +
                             MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
 
-  return start_size + task_desc_size * MAX_TASK_NUM;
+  return start_size + task_desc_size * getRuntimeTaskCapacity(tiling);
 }
 
 __aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData, uint32_t index_size) {
@@ -243,7 +252,7 @@ __aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData,
 }
 
 __aicore__ inline void getEventDesc(__gm__ uint8_t *tiling, EventDesc *tilingData, uint32_t index_size) {
-  uint32_t size = getAllEventsOffset() + index_size * 4 * UINT32_T_SIZE;
+  uint32_t size = getAllEventsOffset(tiling) + index_size * 4 * UINT32_T_SIZE;
 
   tilingData->event_type = (*(__gm__ EventType *)(tiling + size));
   tilingData->num_triggers = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE));
@@ -251,10 +260,12 @@ __aicore__ inline void getEventDesc(__gm__ uint8_t *tiling, EventDesc *tilingDat
   tilingData->last_task_id = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE * 3));
 }
 
-__aicore__ inline uint32_t getTaskIndexNumOffset() { return getAllEventsOffset() + MAX_EVENT_NUM * 4 * UINT32_T_SIZE; }
+__aicore__ inline uint32_t getTaskIndexNumOffset(__gm__ uint8_t *tiling) {
+  return getAllEventsOffset(tiling) + MAX_EVENT_NUM * 4 * UINT32_T_SIZE;
+}
 
 __aicore__ inline int32_t getTaskIndexNumByTaskType(__gm__ uint8_t *tiling, TaskAiCoreType task_aicore_type) {
-  uint32_t size = getAllEventsOffset() + MAX_EVENT_NUM * 4 * UINT32_T_SIZE;
+  uint32_t size = getTaskIndexNumOffset(tiling);
   if (task_aicore_type == TaskAiCoreType::TASK_AICORE_VECTOR) {
     return (*(__gm__ int32_t *)(tiling + size + INT32_T_SIZE));
   } else if (task_aicore_type == TaskAiCoreType::TASK_AICORE_CUBE) {
@@ -264,44 +275,48 @@ __aicore__ inline int32_t getTaskIndexNumByTaskType(__gm__ uint8_t *tiling, Task
   }
 }
 
-__aicore__ inline uint32_t getCubeTaskIndexsOffset() { return getTaskIndexNumOffset() + 4 * INT32_T_SIZE; }
-
-__aicore__ inline uint32_t getVectorTaskIndexsOffset() {
-  return getCubeTaskIndexsOffset() + TASK_TYPE_INDEX_NUM * INT32_T_SIZE;
+__aicore__ inline uint32_t getCubeTaskIndexsOffset(__gm__ uint8_t *tiling) {
+  return getTaskIndexNumOffset(tiling) + 4 * INT32_T_SIZE;
 }
 
-__aicore__ inline uint32_t getMixTaskIndexsOffset() {
-  return getVectorTaskIndexsOffset() + TASK_TYPE_INDEX_NUM * INT32_T_SIZE;
+__aicore__ inline uint32_t getVectorTaskIndexsOffset(__gm__ uint8_t *tiling) {
+  return getCubeTaskIndexsOffset(tiling) + getRuntimeTaskCapacity(tiling) * INT32_T_SIZE;
 }
 
-__aicore__ inline uint32_t getDynamicDataOffset() {
-  return getMixTaskIndexsOffset() + TASK_TYPE_INDEX_NUM * INT32_T_SIZE;
+__aicore__ inline uint32_t getMixTaskIndexsOffset(__gm__ uint8_t *tiling) {
+  return getVectorTaskIndexsOffset(tiling) + getRuntimeTaskCapacity(tiling) * INT32_T_SIZE;
+}
+
+__aicore__ inline uint32_t getDynamicDataOffset(__gm__ uint8_t *tiling) {
+  return getMixTaskIndexsOffset(tiling) + getRuntimeTaskCapacity(tiling) * INT32_T_SIZE;
 }
 
 __aicore__ inline void getDynamicData(__gm__ uint8_t *tiling, DynamicData *tilingData) {
-  uint32_t size = getDynamicDataOffset();
+  uint32_t size = getDynamicDataOffset(tiling);
   tilingData->dynamic_type = (*(__gm__ DynamicType *)(tiling + size));
   tilingData->dynamic_input_position = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE));
   tilingData->dynamic_group_size = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE * 2));
   tilingData->dynamic_max_seq_len = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE * 3));
 }
 
-__aicore__ inline uint32_t getGroupedMatmulGroupListOffset() { return getDynamicDataOffset() + 4 * UINT32_T_SIZE; }
+__aicore__ inline uint32_t getGroupedMatmulGroupListOffset(__gm__ uint8_t *tiling) {
+  return getDynamicDataOffset(tiling) + 4 * UINT32_T_SIZE;
+}
 
 __aicore__ inline uint32_t getGroupedMatmulGroupListOffsetById(__gm__ uint8_t *tiling, uint32_t block_idx) {
-  return getGroupedMatmulGroupListOffset() + 8 * INT64_T_SIZE * block_idx;
+  return getGroupedMatmulGroupListOffset(tiling) + 8 * INT64_T_SIZE * block_idx;
 }
 
-__aicore__ inline uint32_t getAtomicAddValuesOffset() {
-  return getGroupedMatmulGroupListOffset() + MAX_GROUP_LIST * INT64_T_SIZE;
+__aicore__ inline uint32_t getAtomicAddValuesOffset(__gm__ uint8_t *tiling) {
+  return getGroupedMatmulGroupListOffset(tiling) + MAX_GROUP_LIST * INT64_T_SIZE;
 }
 
-__aicore__ inline uint32_t getReadyHandshakeMetaOffset() {
-  return getAtomicAddValuesOffset() + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
+__aicore__ inline uint32_t getReadyHandshakeMetaOffset(__gm__ uint8_t *tiling) {
+  return getAtomicAddValuesOffset(tiling) + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
 }
 
 __aicore__ inline void getReadyHandshakeMeta(__gm__ uint8_t *tiling, ReadyHandshakeMeta *meta) {
-  __gm__ uint8_t *base = tiling + getReadyHandshakeMetaOffset();
+  __gm__ uint8_t *base = tiling + getReadyHandshakeMetaOffset(tiling);
   meta->magic = (*(__gm__ uint32_t *)(base));
   meta->version = (*(__gm__ uint32_t *)(base + UINT32_T_SIZE));
   meta->ready_event = (*(__gm__ uint32_t *)(base + UINT32_T_SIZE * 2));

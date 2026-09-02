@@ -41,6 +41,9 @@ READY_HANDSHAKE_MAGIC   = 0x4D4D5231
 READY_HANDSHAKE_VERSION = 1
 EVENT_COUNTER_BYTES     = MAX_EVENT_NUM * ctypes.sizeof(ctypes.c_int32)
 READY_CACHE_LINE_BYTES  = 64
+RUNTIME_TASK_CAPACITY_MAGIC = 0x80000000
+RUNTIME_TASK_CAPACITY_MASK = RUNTIME_TASK_CAPACITY_MAGIC - 1
+RUNTIME_TASK_CAPACITY_ALIGNMENT = 16
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
@@ -146,6 +149,9 @@ class ReadyHandshakeMetaC(ctypes.Structure):
 
 
 class RuntimeConfigC(ctypes.Structure):
+    # Keep the full logical-capacity mirror while graph builders populate it.
+    # serialize_runtime_config() removes unused task and task-index tails before
+    # the online runtime copies the descriptor to device HBM.
     _fields_ = [
         ("task_num",                  ctypes.c_uint32),
         ("num_workers",               ctypes.c_uint32),
@@ -163,6 +169,107 @@ class RuntimeConfigC(ctypes.Structure):
         ("atomic_add_values",         ctypes.c_int32   * ATOMIC_ADD_VALUE_LEN),
         ("ready_handshake_meta",      ReadyHandshakeMetaC),
     ]
+
+
+TENSOR_DESC_SIZE = ctypes.sizeof(TensorDescC)
+TASK_DESC_SIZE = ctypes.sizeof(TaskDescC)
+assert TENSOR_DESC_SIZE == 64
+assert TASK_DESC_SIZE == 576
+
+RUNTIME_CONFIG_FIXED_BYTES = (
+    ctypes.sizeof(RuntimeConfigC)
+    - MAX_TASK_NUM * (TASK_DESC_SIZE + 3 * ctypes.sizeof(ctypes.c_int32))
+)
+RUNTIME_CONFIG_BYTES_PER_TASK_CAPACITY = (
+    TASK_DESC_SIZE + 3 * ctypes.sizeof(ctypes.c_int32)
+)
+
+
+def runtime_config_task_capacity(cfg: RuntimeConfigC) -> int:
+    """Return the aligned wire capacity required by populated task queues."""
+    counts = [int(cfg.task_index_num[index]) for index in range(3)]
+    for count in counts:
+        if count < 0 or count > TASK_TYPE_INDEX_NUM:
+            raise ValueError(f"invalid runtime task-index count {count}")
+
+    maximum_task_id = -1
+    for indices, count in zip(
+        (cfg.cube_task_indices, cfg.vector_task_indices, cfg.mix_task_indices),
+        counts,
+    ):
+        for index in range(count):
+            task_id = int(indices[index])
+            if task_id < 0 or task_id >= MAX_TASK_NUM:
+                raise ValueError(f"invalid runtime task id {task_id}")
+            maximum_task_id = max(maximum_task_id, task_id)
+
+    required = max(int(cfg.task_num), *counts, maximum_task_id + 1)
+    if required > MAX_TASK_NUM:
+        raise ValueError(
+            f"runtime requires {required} task slots, maximum is {MAX_TASK_NUM}"
+        )
+    alignment = RUNTIME_TASK_CAPACITY_ALIGNMENT
+    return (required + alignment - 1) // alignment * alignment
+
+
+def runtime_config_serialized_size(task_capacity: int) -> int:
+    """Return the dynamic wire size for an aligned full task capacity."""
+    if (
+        task_capacity < 0
+        or task_capacity > MAX_TASK_NUM
+        or task_capacity % RUNTIME_TASK_CAPACITY_ALIGNMENT
+    ):
+        raise ValueError(f"invalid runtime task capacity {task_capacity}")
+    return (
+        RUNTIME_CONFIG_FIXED_BYTES
+        + task_capacity * RUNTIME_CONFIG_BYTES_PER_TASK_CAPACITY
+    )
+
+
+def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
+    """Serialize only populated task and task-index prefixes.
+
+    The high bit in the legacy ``queue_capacity`` header word marks a dynamic
+    image. Unmarked offline descriptors retain the fixed-capacity ABI.
+    """
+    capacity = runtime_config_task_capacity(cfg)
+    raw = bytes(cfg)
+    prefix = bytearray(raw[:RuntimeConfigC.all_tasks.offset])
+    encoded_capacity = RUNTIME_TASK_CAPACITY_MAGIC | capacity
+    queue_offset = RuntimeConfigC.queue_capacity.offset
+    prefix[queue_offset:queue_offset + 4] = encoded_capacity.to_bytes(4, "little")
+
+    int32_size = ctypes.sizeof(ctypes.c_int32)
+    data = b"".join(
+        (
+            bytes(prefix),
+            raw[
+                RuntimeConfigC.all_tasks.offset:
+                RuntimeConfigC.all_tasks.offset + capacity * TASK_DESC_SIZE
+            ],
+            raw[RuntimeConfigC.all_events.offset:RuntimeConfigC.task_index_num.offset],
+            raw[RuntimeConfigC.task_index_num.offset:RuntimeConfigC.cube_task_indices.offset],
+            raw[
+                RuntimeConfigC.cube_task_indices.offset:
+                RuntimeConfigC.cube_task_indices.offset + capacity * int32_size
+            ],
+            raw[
+                RuntimeConfigC.vector_task_indices.offset:
+                RuntimeConfigC.vector_task_indices.offset + capacity * int32_size
+            ],
+            raw[
+                RuntimeConfigC.mix_task_indices.offset:
+                RuntimeConfigC.mix_task_indices.offset + capacity * int32_size
+            ],
+            raw[RuntimeConfigC.dynamic_data.offset:],
+        )
+    )
+    expected = runtime_config_serialized_size(capacity)
+    if len(data) != expected:
+        raise RuntimeError(
+            f"runtime config serialization produced {len(data)} bytes, expected {expected}"
+        )
+    return data
 
 
 class TilingDataC(ctypes.Structure):

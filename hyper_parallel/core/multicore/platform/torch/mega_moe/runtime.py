@@ -43,7 +43,10 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
-from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
+from hyper_parallel.core.multicore.scheduler.config import (
+    TaskSplitValue,
+    serialize_runtime_config,
+)
 
 from ._framework import get_torch
 from .config import MegaMoeConfig
@@ -165,7 +168,10 @@ def build_mega_moe_runtime(config: MegaMoeConfig, device: Any) -> MegaMoeRuntime
     swiglu_grad = backward_graph.get_op("swiglu_grad")
     return MegaMoeRuntime(
         config=config,
-        fwd_runtime_config=_tensor_from_bytes(bytes(forward_data), device),
+        fwd_runtime_config=_tensor_from_bytes(
+            serialize_runtime_config(forward_data),
+            device,
+        ),
         up_proj_tiling=_tensor_from_bytes(
             get_up_proj_tiling_bytes(up_proj.split_value, **gmm_options), device
         ),
@@ -182,7 +188,10 @@ def build_mega_moe_runtime(config: MegaMoeConfig, device: Any) -> MegaMoeRuntime
         down_proj_tiling=_tensor_from_bytes(
             get_down_proj_tiling_bytes(down_proj.split_value, **gmm_options), device
         ),
-        bwd_runtime_config=_tensor_from_bytes(bytes(backward_data), device),
+        bwd_runtime_config=_tensor_from_bytes(
+            serialize_runtime_config(backward_data),
+            device,
+        ),
         act_grad_tiling=_tensor_from_bytes(
             get_act_grad_tiling_bytes(act_grad.split_value, **gmm_options), device
         ),
