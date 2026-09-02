@@ -22,6 +22,27 @@
 namespace optiling {
 const uint64_t BLOCK_SIZE = 32;
 const uint64_t BUFFER_NUM = 2;
+
+static ge::graphStatus GetIntermediateSize(gert::TilingContext *context, int64_t hiddenSize, int64_t expertNum,
+                                           int64_t ep, int64_t *intermediateSize) {
+  constexpr size_t kWeight2Index = 7;
+  constexpr size_t kWeight1Index = 11;
+  auto weight2Shape = context->GetInputShape(kWeight2Index);
+  auto weight1Shape = context->GetInputShape(kWeight1Index);
+  OP_CHECK_NULL_WITH_CONTEXT(context, weight2Shape);
+  OP_CHECK_NULL_WITH_CONTEXT(context, weight1Shape);
+  const auto &weight2 = weight2Shape->GetOriginShape();
+  const auto &weight1 = weight1Shape->GetOriginShape();
+  if (weight2.GetDimNum() != 3 || weight1.GetDimNum() != 3 || ep <= 0 || expertNum <= 0 || expertNum % ep != 0 ||
+      weight2.GetDim(0) != expertNum / ep || weight1.GetDim(0) != expertNum / ep || weight2.GetDim(1) != hiddenSize ||
+      weight1.GetDim(2) != hiddenSize || weight1.GetDim(1) != 2 * weight2.GetDim(2) || weight2.GetDim(2) <= 0) {
+    OP_LOGE(context->GetNodeName(), "HyperMegaMoeGrad weights must have shapes [E,H,I] and [E,2I,H]");
+    return ge::GRAPH_FAILED;
+  }
+  *intermediateSize = weight2.GetDim(2);
+  return ge::GRAPH_SUCCESS;
+}
+
 static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
   auto coreNum = ascendcPlatform.GetCoreNumAic();
@@ -57,6 +78,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     tiling.set_hiddenSize((*(attr->GetAttrPointer<int64_t>(3))));
     tiling.set_seqSize((*(attr->GetAttrPointer<int64_t>(4))));
     tiling.set_coreNum(static_cast<int64_t>(coreNum));
+    int64_t intermediateSize = 0;
+    if (GetIntermediateSize(context, tiling.get_hiddenSize(), tiling.get_expertNum(), tiling.get_ep(),
+                            &intermediateSize) != ge::GRAPH_SUCCESS) {
+      return ge::GRAPH_FAILED;
+    }
+    tiling.set_intermediateSize(intermediateSize);
   }
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
   context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());

@@ -68,8 +68,12 @@ def _allocate_backward_intermediates(
     weight1: Any,
     weight2: Any,
 ) -> tuple[Any, Any, Any, Any, Any]:
-    """Allocate zero-safe backward tensors outside the autograd bridge."""
-    grad_weight2 = torch_module.zeros_like(weight2)
+    """Allocate backward tensors that the device kernel fully initializes."""
+    grad_weight2 = torch_module.empty(
+        tuple(weight2.shape),
+        dtype=weight2.dtype,
+        device=weight2.device,
+    )
     act_grad = torch_module.empty(
         (capacity, config.intermediate_size),
         dtype=grad_output.dtype,
@@ -85,8 +89,11 @@ def _allocate_backward_intermediates(
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
-    # Empty experts must retain exact zero gradients on the baseline kernel.
-    grad_weight1 = torch_module.zeros_like(weight1)
+    grad_weight1 = torch_module.empty(
+        tuple(weight1.shape),
+        dtype=weight1.dtype,
+        device=weight1.device,
+    )
     return grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx
 
 

@@ -32,6 +32,64 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   static constexpr uint32_t WORKSPACE_IDX           = 25;
   static constexpr uint32_t SWIGLU_GRAD_WORKSPACE_IDX = 26;
 
+#ifndef __DAV_C220_CUBE__
+  // Weight-gradient GMMs fully overwrite nonempty experts but skip zero-row
+  // experts. Clear only those skipped blocks before the scheduler starts.
+  // worker_id_ spans both AIV subblocks, so each lane owns disjoint rows.
+  template <typename T>
+  __aicore__ inline void ZeroEmptyExpertMatrix(GM_ADDR output_addr, GM_ADDR group_list_addr, int64_t expert,
+                                               int64_t rows, int64_t cols, int64_t local_experts) {
+    if (output_addr == nullptr || group_list_addr == nullptr || rows <= 0 || cols <= 0 || local_experts <= 0 ||
+        expert < 0 || expert >= local_experts) {
+      return;
+    }
+    GlobalTensor<int64_t> group_list;
+    group_list.SetGlobalBuffer((__gm__ int64_t *)group_list_addr);
+    const int64_t end = group_list.GetValue(static_cast<uint32_t>(expert));
+    const int64_t begin = expert == 0 ? 0 : group_list.GetValue(static_cast<uint32_t>(expert - 1));
+    if (end != begin) {
+      return;
+    }
+
+    const int64_t lane = static_cast<int64_t>(this->worker_id_);
+    const int64_t lanes = this->vector_num;
+    if (lanes <= 0) {
+      return;
+    }
+    // Keep row partitions aligned to one 32-byte bf16/fp16 block.
+    const int64_t rows_per_lane = ((rows + lanes - 1) / lanes + 15) / 16 * 16;
+    const int64_t row_begin = lane * rows_per_lane;
+    if (row_begin >= rows) {
+      return;
+    }
+    const int64_t row_count = (rows - row_begin < rows_per_lane) ? rows - row_begin : rows_per_lane;
+    const uint64_t expert_offset =
+      static_cast<uint64_t>(expert) * static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
+    const uint64_t row_offset = static_cast<uint64_t>(row_begin) * static_cast<uint64_t>(cols);
+    GlobalTensor<T> output;
+    output.SetGlobalBuffer((__gm__ T *)output_addr);
+    InitOutput<T>(output[expert_offset + row_offset], static_cast<uint32_t>(row_count * cols), 0);
+  }
+
+  __aicore__ inline void ZeroEmptyWeightGradBlocks() {
+    const int64_t expert_num = getExtraValueFromTiling(input_list[TILING_IDX], 2);
+    const int64_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+    const int64_t hidden_size = getExtraValueFromTiling(input_list[TILING_IDX], 3);
+    const int64_t intermediate_size = getExtraValueFromTiling(input_list[TILING_IDX], 6);
+    if (ep <= 0 || expert_num <= 0 || hidden_size <= 0 || intermediate_size <= 0 || expert_num % ep != 0) {
+      return;
+    }
+    const int64_t local_experts = expert_num / ep;
+    GM_ADDR group_list = input_list[19];
+    for (int64_t expert = 0; expert < local_experts; ++expert) {
+      ZeroEmptyExpertMatrix<DTYPE_DISPATCH_TARGET>(input_list[6], group_list, expert, intermediate_size, hidden_size,
+                                                   local_experts);
+      ZeroEmptyExpertMatrix<DTYPE_DISPATCH_TARGET>(input_list[18], group_list, expert, hidden_size,
+                                                   intermediate_size * 2, local_experts);
+    }
+  }
+#endif
+
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     switch (task_desc.task_type) {
       case TASK_BEGIN_TASK_GRAPH:
@@ -271,5 +329,8 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
                                                 GM_ADDR *input_list) {
   KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
+#ifndef __DAV_C220_CUBE__
+  worker.ZeroEmptyWeightGradBlocks();
+#endif
   worker.Process();
 }
