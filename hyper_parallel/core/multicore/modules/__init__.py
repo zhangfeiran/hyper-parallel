@@ -12,3 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+"""Managed multicore module APIs."""
+
+__all__ = ["MulticoreModule"]
+
+from .module import MulticoreModule

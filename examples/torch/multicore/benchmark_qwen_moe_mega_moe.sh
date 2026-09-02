@@ -1,0 +1,75 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+ROOT="${HP_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [[ "$PYTHON_BIN" != */* ]]; then
+    PYTHON_BIN=$(command -v "$PYTHON_BIN") || die "Python is not executable: $PYTHON_BIN"
+fi
+TORCHRUN_BIN="${TORCHRUN_BIN:-$(dirname "$PYTHON_BIN")/torchrun}"
+CANN_ENV_FILE="${CANN_ENV_FILE:-/usr/local/Ascend/cann/set_env.sh}"  # codespell:ignore cann
+NATIVE_ENV_FILE="${NATIVE_ENV_FILE:-$ROOT/build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash}"
+SHMEM_LIB_DIR="${SHMEM_LIB_DIR:-$ROOT/build/native/payload/hyper_parallel/core/symmetric_memory/lib/shmem}"
+VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+MASTER_PORT_VALUE="${MASTER_PORT:-29500}"
+SHMEM_PORT_VALUE="${SHMEM_PORT:-$((MASTER_PORT_VALUE + 1000))}"
+TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-3600}"
+
+source_env() {
+    local env_file=$1
+    [[ -f "$env_file" ]] || die "environment file not found: $env_file"
+    set +u
+    # shellcheck disable=SC1090
+    source "$env_file"
+    set -u
+}
+
+[[ -x "$PYTHON_BIN" ]] || die "Python is not executable: $PYTHON_BIN"
+[[ -x "$TORCHRUN_BIN" ]] || die "torchrun is not executable: $TORCHRUN_BIN"
+[[ -f "$ROOT/examples/torch/multicore/qwen_moe_mega_moe_profile.py" ]] || \
+    die "benchmark runner is missing under $ROOT"
+[[ -d "$SHMEM_LIB_DIR" ]] || die "SHMEM library directory is missing: $SHMEM_LIB_DIR"
+[[ "$MASTER_PORT_VALUE" =~ ^[0-9]+$ ]] || die "MASTER_PORT must be an integer"
+[[ "$SHMEM_PORT_VALUE" =~ ^[0-9]+$ ]] || die "SHMEM_PORT must be an integer"
+
+cd "$ROOT"
+source_env "$CANN_ENV_FILE"
+source_env "$NATIVE_ENV_FILE"
+
+export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"
+export HYPER_PARALLEL_PLATFORM=torch
+export SHMEM_IP_PORT="tcp://127.0.0.1:$SHMEM_PORT_VALUE"
+export LD_LIBRARY_PATH="$SHMEM_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+
+IMPORTED_PACKAGE=$(
+    "$PYTHON_BIN" -c 'import pathlib, hyper_parallel; print(pathlib.Path(hyper_parallel.__file__).resolve())'
+)
+case "$IMPORTED_PACKAGE" in
+    "$ROOT"/*) ;;
+    *) die "hyper_parallel imports from $IMPORTED_PACKAGE instead of $ROOT; run $PYTHON_BIN -m pip install -e $ROOT" ;;
+esac
+
+exec timeout --kill-after=60s "$TIMEOUT_SECONDS" \
+    "$TORCHRUN_BIN" \
+    --nproc_per_node=8 \
+    --master_port="$MASTER_PORT_VALUE" \
+    examples/torch/multicore/qwen_moe_mega_moe_profile.py \
+    "$@"

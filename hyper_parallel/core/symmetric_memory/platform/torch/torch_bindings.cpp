@@ -60,9 +60,26 @@ class Manager : public torch::jit::CustomClassHolder {
                                          [](int64_t acc, int64_t dim) { return acc * dim; });
     int64_t element_size = at::elementSize(dtype);
     void *symmPtr = aclshmem_malloc(total_size * element_size);
+    TORCH_CHECK(symmPtr != nullptr,
+                "aclshmem_malloc failed for ", total_size * element_size,
+                " bytes. Increase SYMMETRIC_MEMORY_HEAP_SIZE or release unused allocations.");
     at::Tensor aclshmem_tensor = at_npu::native::from_blob(symmPtr, shape, dtype);
 
     return aclshmem_tensor;
+  }
+
+  at::Tensor aligned_malloc_tensor(const std::vector<int64_t> &shape, torch::Dtype dtype,
+                                   int64_t alignment) {
+    TORCH_CHECK(alignment > 0 && (alignment & (alignment - 1)) == 0,
+                "alignment must be a positive power of two, got ", alignment, ".");
+    int64_t total_size = std::accumulate(shape.begin(), shape.end(), static_cast<int64_t>(1),
+                                         [](int64_t acc, int64_t dim) { return acc * dim; });
+    int64_t element_size = at::elementSize(dtype);
+    void *symmPtr = aclshmem_align(static_cast<size_t>(alignment), total_size * element_size);
+    TORCH_CHECK(symmPtr != nullptr,
+                "aclshmem_align failed for ", total_size * element_size,
+                " bytes with ", alignment, "-byte alignment. Increase SYMMETRIC_MEMORY_HEAP_SIZE.");
+    return at_npu::native::from_blob(symmPtr, shape, dtype);
   }
 
   void free_tensor(const at::Tensor &aclshmem_tensor) {
@@ -193,6 +210,7 @@ static auto registry_common = torch::jit::class_<ShmemOps::Manager>("SymmetricMe
                                 .def("attr_init", &ShmemOps::Manager::attr_init)
                                 .def("finalize", &ShmemOps::Manager::finalize)
                                 .def("malloc", &ShmemOps::Manager::malloc_tensor)
+                                .def("aligned_malloc", &ShmemOps::Manager::aligned_malloc_tensor)
                                 .def("free", &ShmemOps::Manager::free_tensor)
                                 .def("get_name", &ShmemOps::Manager::get_name);
 

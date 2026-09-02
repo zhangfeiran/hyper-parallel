@@ -13,4 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Torch Symmetric memory module for hyper-parallel."""
-from .symmetric_memory import TorchSymmetricMemoryHandler
+
+__all__ = ["TorchSymmetricMemoryHandler"]
+
+from hyper_parallel.core.symmetric_memory.platform.torch.managed import (
+    TorchSymmetricMemoryHandler,
+)

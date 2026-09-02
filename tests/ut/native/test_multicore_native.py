@@ -178,3 +178,29 @@ class TestMulticoreNative(unittest.TestCase):
                     cann_environment[variable],
                     f"The ST helper did not restore parent rank metadata: variable={variable}",
                 )
+
+    def test_st_framework_probe_only_skips_an_absent_adapter(self):
+        """The ST probe skips an unbuilt target but exposes a broken adapter to its worker."""
+        helper_path = Path(__file__).resolve().parents[2] / "common" / "multicore_test_env.py"
+        helper_spec = importlib.util.spec_from_file_location("hp_multicore_test_env", helper_path)
+        self.assertIsNotNone(helper_spec)
+        self.assertIsNotNone(helper_spec.loader)
+        test_env = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(test_env)
+        environment = {
+            "ASCEND_CUSTOM_OPP_PATH": str(self.vendor_root),
+            "LD_LIBRARY_PATH": str(self.vendor_root / "op_api" / "lib"),
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertTrue(test_env.multicore_framework_adapter_is_available("mindspore"))
+            self.assertFalse(test_env.multicore_framework_adapter_is_available("torch"))
+
+            broken_adapter = (
+                self.native_root / "framework" / "torch" / "hyper_parallel_mega_moe_pta.broken.so"
+            )
+            broken_adapter.parent.mkdir(parents=True)
+            broken_adapter.touch()
+            self.assertTrue(test_env.multicore_framework_adapter_is_available("torch"))
+
+            with self.assertRaisesRegex(ValueError, "Unsupported multicore framework"):
+                test_env.multicore_framework_adapter_is_available("jax")
