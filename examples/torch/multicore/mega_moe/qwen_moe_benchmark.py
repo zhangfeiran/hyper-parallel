@@ -153,6 +153,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--expert-capacity-factor", type=_capacity_factor, default=None)
+    parser.add_argument("--routing", choices=("topk", "dirichlet"), default="topk")
+    parser.add_argument("--router-load-alpha", type=float, default=1.0)
+    parser.add_argument("--router-load-seed", type=int, default=42)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--output",
@@ -727,6 +730,9 @@ def main(argv: list[str] | None = None) -> int:
     config = replace(
         QwenMoeConfig(),
         expert_capacity_factor=args.expert_capacity_factor,
+        routing=args.routing,
+        router_load_alpha=args.router_load_alpha,
+        router_load_seed=args.router_load_seed,
     )
     models: dict[str, QwenMoeModel] = {}
     try:

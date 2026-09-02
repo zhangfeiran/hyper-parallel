@@ -36,7 +36,7 @@ import os
 from hyper_parallel.core.multicore.scheduler.config import (
     RuntimeConfigC, QUEUE_CAPACITY,
     TaskSplitValue, configure_ready_handshake, event_workspace_bytes,
-    init_task_split_value,
+    init_task_split_value, serialize_runtime_config,
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 from hyper_parallel.core.multicore.scheduler.scheduler import revise_task_queue
@@ -172,7 +172,7 @@ def main() -> None:
     # ── RuntimeConfig files (one per rank) ───────────────────────────────────
     for rank_id in range(args.ep):
         cfg  = build_config_for_rank(graph, tsv, rank_id, num_cube_cores=args.num_cube_cores)
-        data = bytes(cfg)
+        data = serialize_runtime_config(cfg)
         path = os.path.join(out, f'runtime_config_input_rank_{rank_id}.bin')
         write_bin(path, data)
 

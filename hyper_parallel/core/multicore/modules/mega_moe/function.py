@@ -41,20 +41,24 @@ def _allocate_forward_intermediates(
     spec: Any,
     capacity: int,
     routed_tokens: Any,
-    dispatch: Any,
 ) -> tuple[Any, Any, Any]:
-    """Allocate forward tensors outside the autograd bridge."""
-    up_proj = torch.zeros(
+    """Allocate forward tensors at the route's actual bounded capacity."""
+    up_proj = torch.empty(
         (capacity, spec.intermediate_size * 2),
         dtype=routed_tokens.dtype,
         device=routed_tokens.device,
     )
-    activation = torch.zeros(
+    activation = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=routed_tokens.dtype,
         device=routed_tokens.device,
     )
-    return up_proj, activation, torch.zeros_like(dispatch)
+    down_proj = torch.empty(
+        (capacity, spec.hidden_size),
+        dtype=routed_tokens.dtype,
+        device=routed_tokens.device,
+    )
+    return up_proj, activation, down_proj
 
 
 def _allocate_backward_intermediates(
@@ -66,17 +70,17 @@ def _allocate_backward_intermediates(
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Allocate zero-safe backward tensors outside the autograd bridge."""
     grad_weight2 = torch.zeros_like(weight2)
-    act_grad = torch.zeros(
+    act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
-    swiglu_grad = torch.zeros(
+    swiglu_grad = torch.empty(
         (capacity, spec.intermediate_size * 2),
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
-    gate_dx = torch.zeros(
+    gate_dx = torch.empty(
         (capacity, spec.hidden_size),
         dtype=grad_output.dtype,
         device=grad_output.device,
@@ -158,19 +162,21 @@ def _get_mega_moe_function() -> Any:
             workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
             workspace.claim()
             try:
-                dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
+                capacity = metadata.expert_capacity
+                dispatch = _workspace_tensor(
+                    workspace.expert_buffer,
+                    "expert_buffer",
+                ).narrow(0, 0, capacity)
                 combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
                 gmm_workspace = _workspace_tensor(
                     workspace.gmm_workspace, "gmm_workspace"
                 )
                 dispatch.zero_()
                 combine.zero_()
-                capacity = workspace.expert_capacity
                 up_proj, activation, down_proj = _allocate_forward_intermediates(
                     spec,
                     capacity,
                     routed_tokens,
-                    dispatch,
                 )
                 events = workspace.prepare_event_counters(forward=True)
                 multicore_adapter.mega_moe(
@@ -248,7 +254,11 @@ def _get_mega_moe_function() -> Any:
             ) = ctx.saved_tensors
             workspace.claim()
             try:
-                dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
+                capacity = saved_dispatch.shape[0]
+                dispatch = _workspace_tensor(
+                    workspace.expert_buffer,
+                    "expert_buffer",
+                ).narrow(0, 0, capacity)
                 grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
                 gmm_workspace = _workspace_tensor(
                     workspace.gmm_workspace, "gmm_workspace"
@@ -259,7 +269,6 @@ def _get_mega_moe_function() -> Any:
                 )
                 dispatch.zero_()
                 grad_x.zero_()
-                capacity = workspace.expert_capacity
                 (
                     grad_weight1,
                     grad_weight2,

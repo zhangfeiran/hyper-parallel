@@ -46,13 +46,17 @@ class KernelWorkerBase {
     all_event_num_triggers.SetGlobalBuffer((__gm__ int32_t *)(this->runtimeConfigPtr + getAllEventNumTriggersOffset()),
                                            MAX_EVENT_NUM);
 
-    vector_task_indexs.SetGlobalBuffer((__gm__ int32_t *)(this->runtimeConfigPtr + getVectorTaskIndexsOffset()),
-                                       TASK_TYPE_INDEX_NUM);
+    uint32_t runtime_task_capacity = getRuntimeTaskCapacity(this->runtimeConfigPtr);
+    vector_task_indexs.SetGlobalBuffer(
+      (__gm__ int32_t *)(this->runtimeConfigPtr + getVectorTaskIndexsOffset(this->runtimeConfigPtr)),
+      runtime_task_capacity);
 
-    cube_task_indexs.SetGlobalBuffer((__gm__ int32_t *)(this->runtimeConfigPtr + getCubeTaskIndexsOffset()),
-                                     TASK_TYPE_INDEX_NUM);
+    cube_task_indexs.SetGlobalBuffer(
+      (__gm__ int32_t *)(this->runtimeConfigPtr + getCubeTaskIndexsOffset(this->runtimeConfigPtr)),
+      runtime_task_capacity);
 
-    atomic_add_values.SetGlobalBuffer((__gm__ int32_t *)(this->runtimeConfigPtr + getAtomicAddValuesOffset()), 8);
+    atomic_add_values.SetGlobalBuffer(
+      (__gm__ int32_t *)(this->runtimeConfigPtr + getAtomicAddValuesOffset(this->runtimeConfigPtr)), 8);
 
     this->input_list = input_list;
     this->task_num = getTaskNum(this->runtimeConfigPtr);
