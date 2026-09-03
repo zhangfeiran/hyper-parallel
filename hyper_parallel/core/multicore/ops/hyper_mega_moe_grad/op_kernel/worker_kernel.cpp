@@ -568,6 +568,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     int64_t expert_num = getExtraValueFromTiling(input_list[TILING_IDX], 2);
     int64_t local_experts = expert_num / ep;
     int64_t hidden_size = getExtraValueFromTiling(input_list[TILING_IDX], 3);
+    int64_t top_k = static_cast<int64_t>(task_desc.extra_value_3);
     int64_t tasks_per_expert = task_desc.task_split_num / expert_num;
     int64_t target_pe = task_desc.task_index / (local_experts * tasks_per_expert);
 
@@ -617,7 +618,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
     for (int64_t row = 0; row < rows; ++row) {
       int64_t route_row = logical_src_row + row;
-      int32_t token_row = route_index[route_row];
+      int32_t token_row = route_index[route_row] / top_k;
       float weight = route_weight[route_row];
       for (int64_t col = 0; col < hidden_size; col += chunk_elems) {
         int64_t elements = hidden_size - col;

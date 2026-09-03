@@ -25,6 +25,7 @@ from typing import Any, Literal, cast
 from ._framework import get_torch, get_torch_distributed
 
 _COMMUNICATION_SPLIT = 128
+_MAX_EXACT_FLOAT32_INTEGER = 1 << 24
 _FUSION_MODES = frozenset({"legacy", "permute", "unpermute", "both"})
 _FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_FUSION_MODE"
 _FORWARD_FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_FORWARD_FUSION_MODE"
@@ -216,5 +217,12 @@ def build_config(specification: Mapping[str, Any], tensor: Any) -> MegaMoeConfig
         raise ValueError(
             "receive_capacity cannot be smaller than the local routed row count "
             f"{config.routed_slots}, got {config.receive_capacity}."
+        )
+    if (
+        config.forward_permute_fused or config.backward_permute_fused
+    ) and config.routed_slots > _MAX_EXACT_FLOAT32_INTEGER:
+        raise ValueError(
+            "route-fused MegaMoe requires local_num_tokens * top_k to be at "
+            f"most {_MAX_EXACT_FLOAT32_INTEGER}."
         )
     return config

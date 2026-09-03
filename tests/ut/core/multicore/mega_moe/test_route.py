@@ -25,6 +25,7 @@ import torch
 from hyper_parallel.core.multicore.platform.torch.mega_moe import route as route_module
 from hyper_parallel.core.multicore.platform.torch.mega_moe.config import MegaMoeConfig
 from hyper_parallel.core.multicore.platform.torch.mega_moe.route import (
+    _build_route_indices,
     _permute_topk_input,
     _resolve_counts,
     _validate_topk_inputs,
@@ -115,6 +116,32 @@ class TestMegaMoeRoute(unittest.TestCase):
         self.assertIs(unpermute_call.args[1], unpermute_mapping)
         self.assertEqual(unpermute_call.kwargs["probs"].dtype, torch.float32)
         self.assertTrue(unpermute_call.kwargs["probs"].is_contiguous())
+
+    def test_fused_route_indices_preserve_expert_major_route_slots(self):
+        """Keep route-slot identity so kernels can recover tokens and weights."""
+        route_slots = torch.arange(6, dtype=torch.float32).reshape(-1, 1)
+        topk_ids = torch.tensor([[2, 0], [1, 2], [0, 1]], dtype=torch.int32)
+        expert_order = torch.tensor([1, 4, 2, 5, 0, 3], dtype=torch.float32)
+        inverse_order = torch.tensor([4, 0, 2, 5, 1, 3], dtype=torch.int32)
+        mock_permute = Mock(return_value=(expert_order.reshape(-1, 1), inverse_order))
+        fake_torch_npu = SimpleNamespace(npu_moe_token_permute=mock_permute)
+
+        with patch.dict(sys.modules, {"torch_npu": fake_torch_npu}):
+            route_index, unpermute_mapping = _build_route_indices(
+                route_slots,
+                topk_ids,
+            )
+
+        self.assertTrue(torch.equal(route_index, expert_order.to(torch.int32)))
+        self.assertTrue(
+            torch.equal(unpermute_mapping, inverse_order.reshape_as(topk_ids))
+        )
+        permute_call = mock_permute.call_args
+        self.assertIs(permute_call.args[0], route_slots)
+        self.assertEqual(tuple(permute_call.args[1].shape), (6, 1))
+        self.assertTrue(
+            torch.equal(permute_call.args[1].reshape_as(topk_ids), topk_ids)
+        )
 
     def test_async_count_gather_overlaps_permute_and_builds_metadata_locally(self):
         """Wait after permutation and derive every legacy offset from gathered counts."""

@@ -375,8 +375,8 @@ def build_route_forward_graph(tsv: TaskSplitValue, **kwargs: Any) -> ComputeGrap
         A route-aware forward graph ready for split propagation.
     """
     # 普通图的 dispatch 输入是已排好 expert-major 的 src；route 图把输入槽位改为
-    # 原始 token-order x，并给 AllToAll descriptor 增加 permute_src_index 位置，
-    # 由 worker 在发往远端时按索引取行，省掉独立的 routed_tokens materialization。
+    # 原始 token-order x，并给 AllToAll descriptor 增加 expert-major route-slot 索引，
+    # worker 用 slot // top_k 找到源 token，省掉独立的 routed_tokens materialization。
     integrated_unpermute = kwargs.get("integrated_unpermute", False)
     # Reserve a completion event after the per-expert Combine chain for either
     # the fused reduction or the external-consumer acquire epilogue.
@@ -408,6 +408,7 @@ def build_route_forward_graph(tsv: TaskSplitValue, **kwargs: Any) -> ComputeGrap
     dispatch.param_positions = [1, _POS_ORIGINAL_X, 3, 4, 0]
     dispatch.fill_config.dependent_event = 0
     dispatch.fill_config.route_index_position = _POS_PERMUTE_SRC_INDEX
+    dispatch.fill_config.route_top_k = tsv.top_k
     dispatch.fill_config.isolated_route_signals = True
 
     graph = ComputeGraph()

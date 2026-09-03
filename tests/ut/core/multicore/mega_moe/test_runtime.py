@@ -16,8 +16,11 @@
 
 import unittest
 
+import torch
+
 from hyper_parallel.core.multicore.platform.torch.mega_moe.config import MegaMoeConfig
 from hyper_parallel.core.multicore.platform.torch.mega_moe.runtime import (
+    _build_route_slots,
     _build_task_values,
 )
 
@@ -48,3 +51,30 @@ class TestMegaMoeRuntime(unittest.TestCase):
             task_values.per_rank_seq, config.local_num_tokens * config.top_k
         )
         self.assertEqual(task_values.per_expert_seq_to_other, config.local_num_tokens)
+
+    def test_permute_fusion_caches_each_route_slot(self):
+        """Represent every Top-K slot exactly once for expert-major routing."""
+        config = MegaMoeConfig(
+            local_num_tokens=4,
+            hidden_size=8,
+            intermediate_size=4,
+            num_experts=4,
+            top_k=2,
+            receive_capacity=128,
+            ep_size=1,
+            ep_group=None,
+            rank_id=0,
+            num_cube_cores=24,
+            forward_fusion_mode="permute",
+        )
+
+        route_slots = _build_route_slots(config, "cpu")
+
+        self.assertEqual(tuple(route_slots.shape), (config.routed_slots, 1))
+        self.assertEqual(route_slots.dtype, torch.float32)
+        self.assertTrue(
+            torch.equal(
+                route_slots.reshape(-1),
+                torch.arange(config.routed_slots, dtype=torch.float32),
+            )
+        )
