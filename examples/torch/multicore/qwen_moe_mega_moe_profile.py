@@ -618,6 +618,7 @@ def _result_metadata(
         },
         "optimizer": {
             "name": "AdamW",
+            "fused": True,
             "learning_rate": args.learning_rate,
             "weight_decay": args.weight_decay,
         },
@@ -701,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
             model.parameters(),
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
+            fused=True,
         )
         input_ids, labels = _build_batch(config, rank, args.seed, device)
         workload = _OptimizerWorkload(

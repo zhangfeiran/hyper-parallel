@@ -40,7 +40,7 @@ are not benchmark arguments.
 | Routed experts / TopK | 16 / 8 |
 | Expert intermediate | 512 |
 | Receive capacity factor | 1.5 |
-| Optimizer | AdamW |
+| Optimizer | fused AdamW |
 | Timed operation | zero-grad, forward, loss, backward, dense-grad sync, optimizer step |
 | Default measurement | 5 warmup + 10 measured steps |
 

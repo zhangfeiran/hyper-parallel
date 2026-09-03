@@ -82,10 +82,26 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     __asm__ __volatile__("");
   }
 
+  __aicore__ inline void LoadRouteChunk(__gm__ DTYPE_DISPATCH_TARGET *source, __ubuf__ DTYPE_DISPATCH_TARGET *buffer,
+                                        uint64_t bytes, AscendC::TEventID value_event, AscendC::TEventID save_event) {
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(value_event);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(save_event);
+    aclshmemi_copy_gm2ub(buffer, source, bytes);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(value_event);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(save_event);
+  }
+
+  __aicore__ inline void SaveRouteChunk(__gm__ DTYPE_DISPATCH_TARGET *target, __ubuf__ DTYPE_DISPATCH_TARGET *buffer,
+                                        uint64_t bytes, AscendC::TEventID save_event) {
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(save_event);
+    aclshmemi_copy_ub2gm(target, buffer, bytes);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(save_event);
+  }
+
   __aicore__ inline void RunWeightedUnpermute(__gm__ DTYPE_DISPATCH_TARGET *expert_output, __gm__ int32_t *route_index,
                                               __gm__ float *topk_weights, __gm__ DTYPE_DISPATCH_TARGET *final_out,
-                                              int64_t hidden_size, int64_t top_k, int64_t token_begin,
-                                              int64_t token_end) {
+                                              __gm__ DTYPE_DISPATCH_TARGET *saved_expert_output, int64_t hidden_size,
+                                              int64_t top_k, int64_t token_begin, int64_t token_end) {
     __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
     uint64_t reduce_ub = device_state->mte_config.aclshmem_ub + device_state->mte_config.ub_size;
     constexpr int64_t chunk_elems = 4096;
@@ -111,6 +127,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID3);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
     for (int64_t token = token_begin; token < token_end; ++token) {
       int64_t route_base = token * top_k;
       for (int64_t col = 0; col < hidden_size; col += chunk_elems) {
@@ -120,17 +138,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         }
         uint64_t bytes = elements * sizeof(DTYPE_DISPATCH_TARGET);
         int32_t first_row = route_index[route_base];
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
-        aclshmemi_copy_gm2ub(value_ping_ub, expert_output + static_cast<int64_t>(first_row) * hidden_size + col, bytes);
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        LoadRouteChunk(expert_output + static_cast<int64_t>(first_row) * hidden_size + col, value_ping_ub, bytes,
+                       EVENT_ID0, EVENT_ID3);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         if (top_k > 1) {
           int32_t second_row = route_index[route_base + 1];
-          AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
-          aclshmemi_copy_gm2ub(value_pong_ub, expert_output + static_cast<int64_t>(second_row) * hidden_size + col,
-                               bytes);
-          AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
+          LoadRouteChunk(expert_output + static_cast<int64_t>(second_row) * hidden_size + col, value_pong_ub, bytes,
+                         EVENT_ID1, EVENT_ID4);
         }
+        SaveRouteChunk(saved_expert_output + static_cast<int64_t>(first_row) * hidden_size + col, value_ping_ub, bytes,
+                       EVENT_ID3);
         Cast(temporary_ping, value_ping, RoundMode::CAST_NONE, elements);
         PipeBarrier<PIPE_V>();
         float first_weight = topk_weights[route_base];
@@ -142,24 +159,25 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           float weight = topk_weights[route_offset];
           bool pong = (k & 1) != 0;
           AscendC::TEventID event_id = pong ? EVENT_ID1 : EVENT_ID0;
+          AscendC::TEventID save_event_id = pong ? EVENT_ID4 : EVENT_ID3;
           LocalTensor<DTYPE_DISPATCH_TARGET> value = pong ? value_pong : value_ping;
+          __ubuf__ DTYPE_DISPATCH_TARGET *value_ub = pong ? value_pong_ub : value_ping_ub;
           LocalTensor<float> temporary = pong ? temporary_pong : temporary_ping;
           AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(event_id);
+          SaveRouteChunk(saved_expert_output + static_cast<int64_t>(route_index[route_offset]) * hidden_size + col,
+                         value_ub, bytes, save_event_id);
           if (k + 1 < top_k) {
             bool next_pong = ((k + 1) & 1) != 0;
             AscendC::TEventID next_event_id = next_pong ? EVENT_ID1 : EVENT_ID0;
+            AscendC::TEventID next_save_event_id = next_pong ? EVENT_ID4 : EVENT_ID3;
             __ubuf__ DTYPE_DISPATCH_TARGET *next_value_ub = next_pong ? value_pong_ub : value_ping_ub;
             int32_t next_row = route_index[route_offset + 1];
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(next_event_id);
-            aclshmemi_copy_gm2ub(next_value_ub, expert_output + static_cast<int64_t>(next_row) * hidden_size + col,
-                                 bytes);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(next_event_id);
+            LoadRouteChunk(expert_output + static_cast<int64_t>(next_row) * hidden_size + col, next_value_ub, bytes,
+                           next_event_id, next_save_event_id);
           }
           Cast(temporary, value, RoundMode::CAST_NONE, elements);
           PipeBarrier<PIPE_V>();
-          Muls(temporary, temporary, weight, elements);
-          PipeBarrier<PIPE_V>();
-          Add(accumulator, accumulator, temporary, elements);
+          Axpy(accumulator, temporary, weight, elements);
           PipeBarrier<PIPE_V>();
           AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(event_id);
         }
@@ -175,6 +193,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID3);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
   }
 
   __aicore__ inline void ExecuteWeightedUnpermute(const TaskDesc &task_desc) {
@@ -200,8 +220,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     __gm__ float *topk_weights = (__gm__ float *)(input_list[task_desc.inputs[2].input_position]);
     __gm__ DTYPE_DISPATCH_TARGET *final_out =
       (__gm__ DTYPE_DISPATCH_TARGET *)(input_list[task_desc.outputs[0].input_position]);
-    RunWeightedUnpermute(expert_output, route_index, topk_weights, final_out, hidden_size, top_k, token_begin,
-                         token_end);
+    __gm__ DTYPE_DISPATCH_TARGET *saved_expert_output =
+      (__gm__ DTYPE_DISPATCH_TARGET *)(input_list[task_desc.inputs[3].input_position]);
+    RunWeightedUnpermute(expert_output, route_index, topk_weights, final_out, saved_expert_output, hidden_size, top_k,
+                         token_begin, token_end);
   }
 #endif
 

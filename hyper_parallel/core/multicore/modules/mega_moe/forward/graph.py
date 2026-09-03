@@ -217,12 +217,16 @@ def _append_weighted_unpermute(
     weighted_unpermute = OperatorNode(
         name="weighted_unpermute",
         op_type=OpType.WEIGHTED_UNPERMUTE,
-        inputs=[specs[12], reduce_route_index, topk_weights],
+        # down_proj_y is dead after Combine. The worker reuses it as the
+        # backward-owned expert-output snapshot while each route row is
+        # already resident in UB for weighted reduction.
+        inputs=[specs[12], reduce_route_index, topk_weights, specs[11]],
         outputs=[final_out],
         param_positions=[
             12,
             _POS_REDUCE_ROUTE_INDEX,
             _POS_TOPK_WEIGHTS,
+            11,
             _POS_FINAL_OUT,
         ],
         split_value=unpermute_sv,
@@ -299,7 +303,7 @@ def build_forward_graph(tsv: TaskSplitValue, *,
                         dtype_size:        int = 2,
                         num_cube_cores:    int = 24,
                         integrated_unpermute: bool = False,
-                        unpermute_sv: int = 8) -> ComputeGraph:
+                        unpermute_sv: int = 16) -> ComputeGraph:
     """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.
 
     Operator execution order and param_positions (C++ memory slots):
@@ -423,7 +427,7 @@ def build_route_forward_graph(tsv: TaskSplitValue, **kwargs: Any) -> ComputeGrap
             combine,
             hidden_size=hidden_size,
             dtype_size=dtype_size,
-            unpermute_sv=kwargs.get("unpermute_sv", 8),
+            unpermute_sv=kwargs.get("unpermute_sv", 16),
         )
     else:
         _append_remote_write_acquire(
