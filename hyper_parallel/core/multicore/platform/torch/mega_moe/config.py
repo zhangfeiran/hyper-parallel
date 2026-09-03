@@ -27,6 +27,8 @@ from ._framework import get_torch, get_torch_distributed
 _COMMUNICATION_SPLIT = 128
 _FUSION_MODES = frozenset({"legacy", "permute", "unpermute", "both"})
 _FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_FUSION_MODE"
+_FORWARD_FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_FORWARD_FUSION_MODE"
+_BACKWARD_FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_BACKWARD_FUSION_MODE"
 FusionMode = Literal["legacy", "permute", "unpermute", "both"]
 
 
@@ -44,7 +46,8 @@ class MegaMoeConfig:
     ep_group: Any | None
     rank_id: int
     num_cube_cores: int
-    fusion_mode: FusionMode = "legacy"
+    forward_fusion_mode: FusionMode = "legacy"
+    backward_fusion_mode: FusionMode = "legacy"
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
@@ -59,6 +62,26 @@ class MegaMoeConfig:
         """Return routed rows produced by local Top-K expansion."""
         return self.local_num_tokens * self.top_k
 
+    @property
+    def forward_permute_fused(self) -> bool:
+        """Return whether forward dispatch gathers token-major rows."""
+        return self.forward_fusion_mode in {"permute", "both"}
+
+    @property
+    def forward_unpermute_fused(self) -> bool:
+        """Return whether forward combines and weights token outputs."""
+        return self.forward_fusion_mode in {"unpermute", "both"}
+
+    @property
+    def backward_permute_fused(self) -> bool:
+        """Return whether backward dispatch consumes token-major gradients."""
+        return self.backward_fusion_mode in {"permute", "both"}
+
+    @property
+    def backward_unpermute_fused(self) -> bool:
+        """Return whether backward reduces expert-major input gradients."""
+        return self.backward_fusion_mode in {"unpermute", "both"}
+
 
 def _resolve_receive_capacity(expert_capacity_factor: float, routed_slots: int) -> int:
     """Resolve an aligned receive limit from the public capacity multiplier."""
@@ -70,17 +93,48 @@ def _resolve_receive_capacity(expert_capacity_factor: float, routed_slots: int) 
     )
 
 
-def _resolve_fusion_mode(top_k: int | None = None) -> FusionMode:
-    """Resolve and validate the private route-fusion experiment selector."""
-    fusion_mode = os.getenv(_FUSION_MODE_ENV, "legacy")
+def _validate_fusion_mode(
+    fusion_mode: str,
+    environment_name: str,
+    top_k: int | None,
+) -> FusionMode:
+    """Validate one private route-fusion experiment selector."""
     if fusion_mode not in _FUSION_MODES:
         expected = ", ".join(sorted(_FUSION_MODES))
         raise ValueError(
-            f"{_FUSION_MODE_ENV} must be one of {expected}, got {fusion_mode!r}."
+            f"{environment_name} must be one of {expected}, got {fusion_mode!r}."
         )
     if top_k is not None and fusion_mode != "legacy" and top_k > 16:
         raise ValueError("route-fused MegaMoe currently supports top_k <= 16.")
     return cast(FusionMode, fusion_mode)
+
+
+def _resolve_fusion_modes(
+    top_k: int | None = None,
+) -> tuple[FusionMode, FusionMode]:
+    """Resolve independent forward/backward modes with a shared shorthand."""
+    shared_mode = os.getenv(_FUSION_MODE_ENV, "legacy")
+    forward_name = (
+        _FORWARD_FUSION_MODE_ENV
+        if _FORWARD_FUSION_MODE_ENV in os.environ
+        else _FUSION_MODE_ENV
+    )
+    backward_name = (
+        _BACKWARD_FUSION_MODE_ENV
+        if _BACKWARD_FUSION_MODE_ENV in os.environ
+        else _FUSION_MODE_ENV
+    )
+    forward_mode = _validate_fusion_mode(
+        os.getenv(_FORWARD_FUSION_MODE_ENV, shared_mode),
+        forward_name,
+        top_k,
+    )
+    backward_mode = _validate_fusion_mode(
+        os.getenv(_BACKWARD_FUSION_MODE_ENV, shared_mode),
+        backward_name,
+        top_k,
+    )
+    return forward_mode, backward_mode
 
 
 def build_config(specification: Mapping[str, Any], tensor: Any) -> MegaMoeConfig:
@@ -138,7 +192,7 @@ def build_config(specification: Mapping[str, Any], tensor: Any) -> MegaMoeConfig
         specification["expert_capacity_factor"],
         local_num_tokens * top_k,
     )
-    fusion_mode = _resolve_fusion_mode(top_k)
+    forward_fusion_mode, backward_fusion_mode = _resolve_fusion_modes(top_k)
     config = MegaMoeConfig(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],
@@ -150,7 +204,8 @@ def build_config(specification: Mapping[str, Any], tensor: Any) -> MegaMoeConfig
         ep_group=ep_group,
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
-        fusion_mode=fusion_mode,
+        forward_fusion_mode=forward_fusion_mode,
+        backward_fusion_mode=backward_fusion_mode,
     )
     if config.local_num_tokens % _COMMUNICATION_SPLIT:
         raise ValueError(

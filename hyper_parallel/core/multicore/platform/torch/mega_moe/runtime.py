@@ -130,8 +130,11 @@ def _build_forward_schedule(
     device: Any,
 ) -> tuple[Any, Any]:
     """Build the selected forward graph and its compact device descriptor."""
-    permute_fused = config.fusion_mode in {"permute", "both"}
-    builder = build_route_forward_graph if permute_fused else build_forward_graph
+    builder = (
+        build_route_forward_graph
+        if config.forward_permute_fused
+        else build_forward_graph
+    )
     graph = builder(
         task_values,
         dispatch_sv=config.dispatch_split,
@@ -140,7 +143,7 @@ def _build_forward_schedule(
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
         num_cube_cores=config.num_cube_cores,
-        integrated_unpermute=config.fusion_mode in {"unpermute", "both"},
+        integrated_unpermute=config.forward_unpermute_fused,
     )
     graph.propagate_splits(task_values)
     data = build_forward_config(
@@ -158,8 +161,8 @@ def _build_backward_schedule(
     device: Any,
 ) -> tuple[Any, Any]:
     """Build the selected backward graph and its compact device descriptor."""
-    permute_fused = config.fusion_mode in {"permute", "both"}
-    unpermute_fused = config.fusion_mode in {"unpermute", "both"}
+    permute_fused = config.backward_permute_fused
+    unpermute_fused = config.backward_unpermute_fused
     route_fused = permute_fused or unpermute_fused
     builder = build_route_backward_graph if route_fused else build_backward_graph
     options = (
@@ -255,7 +258,7 @@ def _build_tilings(
 
 def _build_route_token_rows(config: MegaMoeConfig, device: Any) -> Any | None:
     """Cache the token-row payload used only by permute-fused routing."""
-    if config.fusion_mode not in {"permute", "both"}:
+    if not (config.forward_permute_fused or config.backward_permute_fused):
         return None
     torch = get_torch()
     return torch.arange(

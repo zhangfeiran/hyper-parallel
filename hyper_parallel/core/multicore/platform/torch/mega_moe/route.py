@@ -164,9 +164,8 @@ def _permute_topk_input(hidden_states: Any, topk_ids: Any) -> tuple[Any, Any]:
 def _build_route_indices(
     token_rows: Any,
     topk_ids: Any,
-    topk_weights: Any,
-) -> tuple[Any, Any, Any]:
-    """Build both route maps and expert-major weights with one native permute."""
+) -> tuple[Any, Any]:
+    """Build expert-major source rows and the inverse token route map."""
     # pylint: disable=C0415
     import torch_npu
 
@@ -178,6 +177,16 @@ def _build_route_indices(
     )
     permute_src_index = permuted_rows.reshape(-1).to(torch.int32).contiguous()
     inverse_order = inverse_order.reshape(-1).to(torch.int32).contiguous()
+    return permute_src_index, inverse_order.reshape_as(topk_ids).contiguous()
+
+
+def _build_expert_route_weights(
+    inverse_order: Any,
+    topk_weights: Any,
+) -> Any:
+    """Scatter token-major weights into expert-major dispatch order."""
+    torch = get_torch()
+
     expert_route_weights = torch.empty(
         topk_weights.numel(),
         dtype=topk_weights.dtype,
@@ -185,14 +194,10 @@ def _build_route_indices(
     )
     expert_route_weights.scatter_(
         0,
-        inverse_order,
+        inverse_order.reshape(-1),
         topk_weights.detach().reshape(-1),
     )
-    return (
-        permute_src_index.contiguous(),
-        inverse_order.reshape_as(topk_ids).contiguous(),
-        expert_route_weights,
-    )
+    return expert_route_weights
 
 
 def _compute_route_metadata(
@@ -264,13 +269,18 @@ def prepare_topk_route(
         # the cross-rank rendezvous for the next symmetric-buffer generation.
         workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, config)
-    permute_fused = config.fusion_mode in {"permute", "both"}
-    if permute_fused:
+    if config.forward_permute_fused:
         token_rows = runtime.route_token_rows
         if token_rows is None:
             raise RuntimeError("route-fused MegaMoe is missing token-row metadata.")
-        permute_src_index, unpermute_mapping, expert_route_weights = (
-            _build_route_indices(token_rows, topk_ids, topk_weights)
+        permute_src_index, unpermute_mapping = _build_route_indices(
+            token_rows,
+            topk_ids,
+        )
+        expert_route_weights = (
+            _build_expert_route_weights(unpermute_mapping, topk_weights)
+            if config.backward_permute_fused
+            else None
         )
         routed_tokens = None
     else:
