@@ -25,7 +25,6 @@ from typing import Any
 
 from hyper_parallel.core.multicore.scheduler.config import (
     EVENT_COUNTER_BYTES as _EVENT_COUNTER_BYTES,
-    READY_CACHE_LINE_BYTES as _READY_CACHE_LINE_BYTES,
     ROUTE_ARRIVAL_STRIDE_BYTES as _ROUTE_ARRIVAL_STRIDE_BYTES,
     event_workspace_bytes,
 )
@@ -33,7 +32,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
 from .spec import (
     _COMMUNICATION_SPLIT,
     MegaMoeSpec,
-    _resolve_fusion_mode,
+    _resolve_fusion_modes,
     _resolve_receive_capacity,
 )
 
@@ -83,15 +82,27 @@ def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -
     tensor_bytes = (
         (capacity + routed_slots) * specification["hidden_size"] * element_size
     )
-    fusion_mode = _resolve_fusion_mode(specification["top_k"])
-    event_bytes = _event_workspace_bytes(
+    forward_mode, backward_mode = _resolve_fusion_modes(specification["top_k"])
+    forward_event_bytes = _event_workspace_bytes(
         ep_size=specification["ep_size"],
         local_num_tokens=local_tokens,
         num_experts=specification["num_experts"],
         dispatch_split=_COMMUNICATION_SPLIT,
-        fusion_mode=fusion_mode,
+        fusion_mode=forward_mode,
     )
-    return tensor_bytes + 2 * event_bytes + 4 * (_WORKSPACE_ALIGNMENT - 1)
+    backward_event_bytes = _event_workspace_bytes(
+        ep_size=specification["ep_size"],
+        local_num_tokens=local_tokens,
+        num_experts=specification["num_experts"],
+        dispatch_split=_COMMUNICATION_SPLIT,
+        fusion_mode=backward_mode,
+    )
+    return (
+        tensor_bytes
+        + forward_event_bytes
+        + backward_event_bytes
+        + 4 * (_WORKSPACE_ALIGNMENT - 1)
+    )
 
 
 def configure_symmetric_heap(
@@ -160,7 +171,8 @@ class MegaMoeWorkspace:
     used: bool = False
     forward_ready_initialized: bool = False
     backward_ready_initialized: bool = False
-    route_arrivals_enabled: bool = False
+    forward_route_arrivals_enabled: bool = False
+    backward_route_arrivals_enabled: bool = False
     route_arrival_offset_bytes: int = 0
     lock: Any = field(default_factory=threading.Lock, repr=False)
 
@@ -190,18 +202,29 @@ class MegaMoeWorkspace:
         self.device = device
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
-        self.route_arrivals_enabled = spec.fusion_mode in {"permute", "both"}
+        self.forward_route_arrivals_enabled = spec.forward_permute_fused
+        self.backward_route_arrivals_enabled = spec.backward_permute_fused
         self.route_arrival_offset_bytes = (
             event_workspace_bytes(spec.ep_size)
-            if self.route_arrivals_enabled
+            if (
+                self.forward_route_arrivals_enabled
+                or self.backward_route_arrivals_enabled
+            )
             else 0
         )
-        event_bytes = _event_workspace_bytes(
+        forward_event_bytes = _event_workspace_bytes(
             ep_size=spec.ep_size,
             local_num_tokens=spec.local_num_tokens,
             num_experts=spec.num_experts,
             dispatch_split=spec.dispatch_split,
-            fusion_mode=spec.fusion_mode,
+            fusion_mode=spec.forward_fusion_mode,
+        )
+        backward_event_bytes = _event_workspace_bytes(
+            ep_size=spec.ep_size,
+            local_num_tokens=spec.local_num_tokens,
+            num_experts=spec.num_experts,
+            dispatch_split=spec.dispatch_split,
+            fusion_mode=spec.backward_fusion_mode,
         )
         try:
             self.expert_buffer = self.symmetric_memory.aligned_empty(
@@ -215,12 +238,12 @@ class MegaMoeWorkspace:
                 _WORKSPACE_ALIGNMENT,
             )
             self.forward_event_counters = self.symmetric_memory.aligned_empty(
-                (event_bytes,),
+                (forward_event_bytes,),
                 torch.uint8,
                 _WORKSPACE_ALIGNMENT,
             )
             self.backward_event_counters = self.symmetric_memory.aligned_empty(
-                (event_bytes,),
+                (backward_event_bytes,),
                 torch.uint8,
                 _WORKSPACE_ALIGNMENT,
             )
@@ -246,14 +269,16 @@ class MegaMoeWorkspace:
             field_name = "forward_event_counters"
             events = self.forward_event_counters
             ready_initialized = self.forward_ready_initialized
+            route_arrivals_enabled = self.forward_route_arrivals_enabled
         else:
             field_name = "backward_event_counters"
             events = self.backward_event_counters
             ready_initialized = self.backward_ready_initialized
+            route_arrivals_enabled = self.backward_route_arrivals_enabled
         if events is None:
             raise RuntimeError(f"MegaMoe workspace {field_name} is not initialized.")
         events[:_EVENT_COUNTER_BYTES].zero_()
-        if self.route_arrivals_enabled:
+        if route_arrivals_enabled:
             events[self.route_arrival_offset_bytes:].zero_()
         if events.numel() == _EVENT_COUNTER_BYTES or ready_initialized:
             return events
@@ -312,7 +337,8 @@ class MegaMoeWorkspace:
         self.routed_slots = 0
         self.forward_ready_initialized = False
         self.backward_ready_initialized = False
-        self.route_arrivals_enabled = False
+        self.forward_route_arrivals_enabled = False
+        self.backward_route_arrivals_enabled = False
         self.route_arrival_offset_bytes = 0
 
     def _free_local_tensors(self) -> None:

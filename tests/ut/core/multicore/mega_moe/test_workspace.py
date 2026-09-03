@@ -23,11 +23,11 @@ from hyper_parallel.core.multicore.modules.mega_moe.spec import (
 )
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
     _EVENT_COUNTER_BYTES,
-    _READY_CACHE_LINE_BYTES,
     _WORKSPACE_ALIGNMENT,
     MegaMoeWorkspace,
     _spec_workspace_bytes,
 )
+from hyper_parallel.core.multicore.scheduler.config import READY_CACHE_LINE_BYTES as _READY_CACHE_LINE_BYTES
 
 
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):

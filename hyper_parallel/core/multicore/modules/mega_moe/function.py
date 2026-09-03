@@ -21,11 +21,16 @@ from importlib import import_module
 from dataclasses import dataclass
 from typing import Any
 
-import torch_npu
 
 from hyper_parallel.core.multicore.platform import torch as multicore_adapter
 
-from .route import PreparedTopKRoute, RouteMetadata, restore_topk_output
+from .route import (
+    PreparedTopKRoute,
+    RouteMetadata,
+    _build_expert_route_weights,
+    _build_route_indices,
+    restore_topk_output,
+)
 from .plan import MegaMoePlan
 from .workspace import MegaMoeWorkspace
 
@@ -78,6 +83,7 @@ class _BackwardRouteState:
     """Route-dependent tensors selected before the backward kernel launch."""
 
     kernel_grad_output: Any
+    permute_src_index: Any
     route_weight: Any
     grad_topk_weights: Any | None
     dispatch: Any
@@ -220,8 +226,6 @@ def _save_forward_state(
     """Save owned forward tensors, route indices and static execution state."""
     ctx.plan = plan
     ctx.workspace = workspace
-    ctx.permute_fused = plan.spec.fusion_mode in {"permute", "both"}
-    ctx.unpermute_fused = plan.spec.fusion_mode in {"unpermute", "both"}
     ctx.save_for_backward(
         dispatch.clone(),
         up_proj,
@@ -274,19 +278,18 @@ def _prepare_forward_buffers(
         hidden_states,
     )
     combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-    unpermute_fused = spec.fusion_mode in {"unpermute", "both"}
     final_out = (
         torch_module.empty(
             (spec.local_num_tokens, spec.hidden_size),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        if unpermute_fused
+        if spec.forward_unpermute_fused
         else combine.reshape(-1).narrow(0, 0, 1)
     )
     permute_src_index = (
         _route_tensor(route.permute_src_index, "permute_src_index")
-        if spec.fusion_mode in {"permute", "both"}
+        if spec.forward_permute_fused
         else route.tokens_per_expert
     )
     return _ForwardBuffers(
@@ -359,6 +362,26 @@ def _load_forward_state(ctx: Any) -> _SavedForwardState:
     return _SavedForwardState(*ctx.saved_tensors)
 
 
+def _prepare_fused_backward_route(
+    plan: MegaMoePlan,
+    saved: _SavedForwardState,
+) -> tuple[Any, Any]:
+    """Return expert-major route indices and weights for fused dispatch."""
+    if plan.spec.forward_permute_fused:
+        return saved.permute_src_index, saved.expert_route_weights
+
+    token_rows = _route_tensor(plan.route_token_rows, "token-row metadata")
+    permute_src_index, inverse_order = _build_route_indices(
+        token_rows,
+        saved.topk_ids,
+    )
+    route_weight = _build_expert_route_weights(
+        inverse_order,
+        saved.topk_weights,
+    )
+    return permute_src_index, route_weight
+
+
 def _prepare_backward_route(
     ctx: Any,
     grad_output: Any,
@@ -367,9 +390,12 @@ def _prepare_backward_route(
     """Select external or fused route gradients and their destination buffers."""
     spec = ctx.plan.spec
     workspace = ctx.workspace
-    if ctx.permute_fused:
+    if spec.backward_permute_fused:
         kernel_grad_output = grad_output.contiguous()
-        route_weight = saved.expert_route_weights
+        permute_src_index, route_weight = _prepare_fused_backward_route(
+            ctx.plan,
+            saved,
+        )
         grad_topk_weights = None
     else:
         kernel_grad_output, grad_topk_weights = _unpermute_grad(
@@ -381,14 +407,15 @@ def _prepare_backward_route(
         kernel_grad_output = kernel_grad_output.contiguous()
         # This stable ABI slot has no consumer in the non-permute graph.
         route_weight = saved.topk_weights.reshape(-1).narrow(0, 0, 1)
+        permute_src_index = saved.dispatch_size
 
     capacity = saved.dispatch.shape[0]
     dispatch = _workspace_tensor(
         workspace.expert_buffer,
         "expert_buffer",
     ).narrow(0, 0, capacity)
-    route_graph = ctx.permute_fused or ctx.unpermute_fused
-    if route_graph and ctx.permute_fused:
+    route_graph = spec.backward_permute_fused or spec.backward_unpermute_fused
+    if route_graph and spec.backward_permute_fused:
         # dTopK reads the saved expert output while Combine writes dispatch.
         grad_x = saved.expert_output
     elif route_graph:
@@ -401,6 +428,7 @@ def _prepare_backward_route(
         grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
     return _BackwardRouteState(
         kernel_grad_output=kernel_grad_output,
+        permute_src_index=permute_src_index,
         route_weight=route_weight,
         grad_topk_weights=grad_topk_weights,
         dispatch=dispatch,
@@ -482,7 +510,7 @@ def _launch_backward(
         buffers.swiglu_workspace,
         plan.bwd_runtime_config,
         buffers.events,
-        saved.permute_src_index if ctx.permute_fused else saved.dispatch_size,
+        route_state.permute_src_index,
         route_state.route_weight,
         saved.reduce_route_index,
         spec.rank_id,
@@ -503,11 +531,11 @@ def _finish_backward(
     """Restore public gradient layouts after the backward custom operator."""
     spec = ctx.plan.spec
     grad_topk_weights = route_state.grad_topk_weights
-    if ctx.permute_fused:
+    if spec.backward_permute_fused:
         grad_topk_weights = route_state.route_weight.reshape_as(
             saved.topk_weights
         ).to(saved.topk_weights.dtype)
-    if ctx.unpermute_fused:
+    if spec.backward_unpermute_fused:
         grad_hidden = route_state.grad_x.narrow(0, 0, spec.local_num_tokens)
     else:
         expert_grad = (
@@ -537,15 +565,12 @@ def _finish_backward(
 def _get_mega_moe_function() -> Any:
     """Create the Torch autograd.Function lazily inside the Torch backend."""
     # pylint: disable=global-statement
-
     global _MEGA_MOE_FUNCTION
     if _MEGA_MOE_FUNCTION is not None:
         return _MEGA_MOE_FUNCTION
 
     # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
-    class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
-        torch.autograd.Function
-    ):
+    class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
         """Autograd bridge for legacy and independently fused route endpoints."""
 
         @staticmethod
@@ -566,10 +591,9 @@ def _get_mega_moe_function() -> Any:
             metadata = route.metadata
             if metadata is None:
                 raise RuntimeError("MegaMoe route metadata is unavailable.")
-            permute_fused = spec.fusion_mode in {"permute", "both"}
             kernel_input = (
                 hidden_states
-                if permute_fused
+                if spec.forward_permute_fused
                 else _route_tensor(routed_tokens, "routed_tokens")
             )
             workspace.ensure(
@@ -603,7 +627,7 @@ def _get_mega_moe_function() -> Any:
                 expert_output = buffers.combine.clone()
                 output = (
                     buffers.final_out
-                    if spec.fusion_mode in {"unpermute", "both"}
+                    if spec.forward_unpermute_fused
                     else restore_topk_output(
                         expert_output,
                         route.unpermute_mapping,
