@@ -614,7 +614,11 @@ def _get_mega_moe_function() -> Any:
                     topk_weights,
                     buffers,
                 )
-                expert_output = buffers.combine.clone()
+                expert_output = (
+                    buffers.down_proj
+                    if spec.forward_unpermute_fused
+                    else buffers.combine.clone()
+                )
                 output = (
                     buffers.final_out
                     if spec.forward_unpermute_fused
