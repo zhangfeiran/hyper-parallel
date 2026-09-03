@@ -41,6 +41,7 @@ READY_HANDSHAKE_MAGIC   = 0x4D4D5231
 READY_HANDSHAKE_VERSION = 1
 EVENT_COUNTER_BYTES     = MAX_EVENT_NUM * ctypes.sizeof(ctypes.c_int32)
 READY_CACHE_LINE_BYTES  = 64
+ROUTE_ARRIVAL_STRIDE_BYTES = READY_CACHE_LINE_BYTES
 RUNTIME_TASK_CAPACITY_MAGIC = 0x80000000
 RUNTIME_TASK_CAPACITY_MASK = RUNTIME_TASK_CAPACITY_MAGIC - 1
 RUNTIME_TASK_CAPACITY_ALIGNMENT = 16
@@ -63,6 +64,9 @@ class TaskType(IntEnum):
     TASK_GROUPED_MATMUL       = 104
     TASK_SHMEM_PUT_MEM_SIGNAL = 105
     TASK_SWI_GLU_GRAD         = 106
+    TASK_UNPERMUTE_REDUCE_GRAD = 110
+    TASK_TOPK_WEIGHT_GRAD     = 111
+    TASK_WEIGHTED_UNPERMUTE   = 112
 
 
 class EventType(IntEnum):
@@ -322,6 +326,7 @@ class TaskSplitValue:
     seq_size:       int = 8192
     all_expert_num: int = 32
     top_k:          int = 8
+    extra_event_num: int = 0
 
     # ── Derived properties ────────────────────────────────────────────────────
     @property
@@ -353,7 +358,7 @@ class TaskSplitValue:
     def all_event_num(self) -> int:
         """Total number of events needed for the schedule."""
         e = self.single_rank_expert_num
-        return 1 + self.all_expert_num + e + e + e
+        return 1 + self.all_expert_num + e + e + e + self.extra_event_num
 
     # ── Runtime counters (reset by init_task_split_value per rank) ────────────
     rank_id:              int = 0

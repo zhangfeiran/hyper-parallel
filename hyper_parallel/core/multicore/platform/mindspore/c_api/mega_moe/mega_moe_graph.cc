@@ -21,16 +21,14 @@
 #include <vector>
 #include "framework/module.h"
 
-// mega_moe has 5 in-place outputs:
-//   dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target
-static const mindspore::ShapeArray kFwdFakeOutShapes{
-    mindspore::ShapeVector{1}, mindspore::ShapeVector{1},
-    mindspore::ShapeVector{1}, mindspore::ShapeVector{1},
-    mindspore::ShapeVector{1}};
+// mega_moe has 6 in-place outputs:
+//   dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target, final_out
+static const mindspore::ShapeArray kFwdFakeOutShapes{mindspore::ShapeVector{1}, mindspore::ShapeVector{1},
+                                                     mindspore::ShapeVector{1}, mindspore::ShapeVector{1},
+                                                     mindspore::ShapeVector{1}, mindspore::ShapeVector{1}};
 static const std::vector<mindspore::TypeId> kFwdFakeOutTypes{
-    mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8,
-    mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8,
-    mindspore::TypeId::kNumberTypeInt8};
+  mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8,
+  mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8};
 
 namespace ms_multicore {
 using mindspore::PrimitivePtr;
@@ -62,15 +60,13 @@ class CustomMoeFwd : public KernelMod {
   using KernelMod::Init;
 
   bool Init(const std::vector<KernelTensor *> &inputs, const std::vector<KernelTensor *> &outputs) override {
-    MS_LOG(WARNING) << "CustomMoeFwd graph-mode stub: input=" << inputs.size()
-                    << " output=" << outputs.size();
+    MS_LOG(WARNING) << "CustomMoeFwd graph-mode stub: input=" << inputs.size() << " output=" << outputs.size();
     return true;
   }
 
   bool Launch(const std::vector<KernelTensor *> &inputs, const std::vector<KernelTensor *> &,
               const std::vector<KernelTensor *> &outputs, void *) override {
-    MS_LOG(WARNING) << "CustomMoeFwd graph-mode stub launch: input=" << inputs.size()
-                    << " output=" << outputs.size();
+    MS_LOG(WARNING) << "CustomMoeFwd graph-mode stub launch: input=" << inputs.size() << " output=" << outputs.size();
     return true;
   }
 

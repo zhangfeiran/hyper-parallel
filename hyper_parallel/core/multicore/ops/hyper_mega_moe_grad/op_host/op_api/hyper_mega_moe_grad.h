@@ -19,7 +19,7 @@
 
 namespace l0op {
 
-const std::array<const aclTensor *, 7> HyperMegaMoeGrad(
+const std::array<const aclTensor *, 8> HyperMegaMoeGrad(
   const aclTensor *dispatch_target, const aclTensor *dispatch_target_off, const aclTensor *dy,
   const aclTensor *dispatch_src_off, const aclTensor *dispatch_size, const aclTensor *hidden,
   const aclTensor *hidden_dw,
@@ -31,6 +31,7 @@ const std::array<const aclTensor *, 7> HyperMegaMoeGrad(
   const aclTensor *act_grad_tiling, const aclTensor *gate_grad_tiling, const aclTensor *w1_grad_tiling,
   const aclTensor *w2_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
   const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
+  const aclTensor *permute_src_index, const aclTensor *route_weight, const aclTensor *reduce_route_index,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, aclOpExecutor *executor);
 }  // namespace l0op
 

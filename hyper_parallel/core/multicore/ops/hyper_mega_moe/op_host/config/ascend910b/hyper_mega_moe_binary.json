@@ -249,6 +249,26 @@
             -2
           ],
           "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "original_x", "index": 22, "dtype": "bfloat16", "format": "ND",
+          "paramType": "required", "shape": [-2], "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "permute_src_index", "index": 23, "dtype": "int32", "format": "ND",
+          "paramType": "required", "shape": [-2], "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "reduce_route_index", "index": 24, "dtype": "int32", "format": "ND",
+          "paramType": "required", "shape": [-2], "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "topk_weights", "index": 25, "dtype": "float32", "format": "ND",
+          "paramType": "required", "shape": [-2], "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "final_out", "index": 26, "dtype": "bfloat16", "format": "ND",
+          "paramType": "required", "shape": [-2], "format_match_mode": "FormatDefault"
         }
       ],
       "outputs": [
@@ -306,6 +326,10 @@
             -2
           ],
           "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "final_out", "index": 5, "dtype": "bfloat16", "format": "ND",
+          "paramType": "required", "shape": [-2], "format_match_mode": "FormatDefault"
         }
       ],
       "attrs": [

@@ -26,9 +26,10 @@ __global__ __aicore__ void hyper_mega_moe_grad(
   GM_ADDR gate_dx, GM_ADDR grad_x, GM_ADDR combine_target_off, GM_ADDR combine_src_off, GM_ADDR combine_size,
   GM_ADDR permute_out, GM_ADDR gate_dw, GM_ADDR group_list, GM_ADDR act_grad_tiling, GM_ADDR gate_grad_tiling,
   GM_ADDR w1_grad_tiling, GM_ADDR w2_grad_tiling, GM_ADDR swiglu_grad_tiling, GM_ADDR gmm_workspace,
-  GM_ADDR swiglu_grad_workspace, GM_ADDR runtime_config, GM_ADDR all_event_counters, GM_ADDR dispatch_target_ref,
-  GM_ADDR hidden_dw_ref, GM_ADDR y_ref, GM_ADDR grad_gate_ref, GM_ADDR gate_dx_ref, GM_ADDR grad_x_ref,
-  GM_ADDR gate_dw_ref, GM_ADDR workspace, GM_ADDR tiling) {
+  GM_ADDR swiglu_grad_workspace, GM_ADDR runtime_config, GM_ADDR all_event_counters, GM_ADDR permute_src_index,
+  GM_ADDR route_weight, GM_ADDR reduce_route_index, GM_ADDR dispatch_target_ref, GM_ADDR hidden_dw_ref, GM_ADDR y_ref,
+  GM_ADDR grad_gate_ref, GM_ADDR gate_dx_ref, GM_ADDR grad_x_ref, GM_ADDR permute_out_ref, GM_ADDR gate_dw_ref,
+  GM_ADDR workspace, GM_ADDR tiling) {
   if (GROUP_LIST_TYPE != GROUPED_MATMUL_GROUP_LIST_TYPE_SPARSEM && IS_STATIC_TILING_API == 0 &&
       A8W4_KERNEL_TEMPLATE == GROUPED_MATMUL_A8W4_KERNEL_TEMPLATE_NONE) {
     if constexpr (TRANS_A == 0 && TRANS_B == 0 && AIV_AIC_RATIO == GROUPED_MATMUL_CUBE_ONLY) {
@@ -61,6 +62,9 @@ __global__ __aicore__ void hyper_mega_moe_grad(
                               swiglu_grad_workspace,
                               runtime_config,
                               nullptr,
+                              permute_src_index,
+                              route_weight,
+                              reduce_route_index,
                               workspace,
                               tiling,  // 30
                               all_event_counters};

@@ -537,7 +537,13 @@ class QwenMoeModel(nn.Module):
         logits = self.lm_head(self.norm(hidden_states))
         loss = None
         if labels is not None:
-            shift_labels = F.pad(labels, (0, 1), value=-100)[..., 1:]
+            ignored_label = torch.full(
+                (*labels.shape[:-1], 1),
+                -100,
+                dtype=labels.dtype,
+                device=labels.device,
+            )
+            shift_labels = torch.cat((labels, ignored_label), dim=-1)[..., 1:]
             loss = F.cross_entropy(
                 logits.float().view(-1, logits.shape[-1]),
                 shift_labels.reshape(-1),

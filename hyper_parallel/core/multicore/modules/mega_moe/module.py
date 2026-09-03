@@ -25,7 +25,7 @@ from hyper_parallel.platform.torch.symmetric_memory import acquire_symmetric_mem
 from ..module import MulticoreModule
 from .function import execute_mega_moe
 from .plan import build_mega_moe_plan
-from .route import prepare_topk_route, restore_topk_output
+from .route import prepare_topk_route
 from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
 
@@ -336,26 +336,27 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
         )
         resources = self._get_execution_resources(hidden_flat)
+        route_ids = topk_ids.to(torch.int32).contiguous()
+        route_weights = topk_weights.float().contiguous()
         route = prepare_topk_route(
             hidden_flat,
-            topk_ids,
-            topk_weights,
-            resources.spec,
+            route_ids,
+            route_weights,
+            resources.plan,
             tokens_per_expert,
             workspace=resources.workspace,
         )
-        expert_output = execute_mega_moe(
-            route.routed_tokens,
+        if route.receive_overflow:
+            raise RuntimeError("MegaMoe route exceeds the explicitly bounded receive capacity.")
+        output = execute_mega_moe(
+            hidden_flat,
+            route_ids,
+            route_weights,
             self.gate_up_weight,
             self.down_weight,
-            route.metadata,
+            route,
             resources.plan,
             resources.workspace,
-        )
-        output = restore_topk_output(
-            expert_output,
-            route.unpermute_mapping,
-            topk_weights,
         )
         return output.reshape(hidden_states.shape)
 

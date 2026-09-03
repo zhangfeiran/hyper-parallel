@@ -18,6 +18,8 @@ Compute graph abstractions: OpType, TensorSpec, SplitSpec, OperatorNode, Compute
 ComputeGraph.propagate_splits() traverses the DAG in topological order and
 automatically computes task_num / split_dim for every node from their SplitSpec.
 """
+from __future__ import annotations
+
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -31,6 +33,10 @@ class OpType(Enum):
     GMM         = "gmm"
     SWIGLU      = "swiglu"
     SWIGLU_GRAD = "swiglu_grad"
+    UNPERMUTE_REDUCE_GRAD = "unpermute_reduce_grad"
+    TOPK_WEIGHT_GRAD = "topk_weight_grad"
+    WEIGHTED_UNPERMUTE = "weighted_unpermute"
+    REMOTE_WRITE_ACQUIRE = "remote_write_acquire"
 
 
 @dataclass
@@ -92,9 +98,10 @@ class OperatorNode:
 class ComputeGraph:
     """Directed acyclic graph describing operator execution order."""
 
-    def __init__(self):
-        self._nodes: dict = {}
-        self._insertion_order: list = []
+    def __init__(self) -> None:
+        """Create an empty compute graph."""
+        self._nodes: dict[str, OperatorNode] = {}
+        self._insertion_order: list[str] = []
 
     def add_op(self, op: OperatorNode) -> 'ComputeGraph':
         """Add an operator node to the graph."""
@@ -102,7 +109,11 @@ class ComputeGraph:
         self._insertion_order.append(op.name)
         return self
 
-    def add_edge(self, src, dst) -> 'ComputeGraph':
+    def add_edge(
+        self,
+        src: OperatorNode | str,
+        dst: OperatorNode | str,
+    ) -> 'ComputeGraph':
         """src / dst can be an OperatorNode or a name string."""
         s = src if isinstance(src, OperatorNode) else self._nodes[src]
         d = dst if isinstance(dst, OperatorNode) else self._nodes[dst]
@@ -113,6 +124,10 @@ class ComputeGraph:
     def get_op(self, name: str) -> OperatorNode:
         """Retrieve an operator node by name."""
         return self._nodes[name]
+
+    def has_op(self, name: str) -> bool:
+        """Return whether an operator node exists."""
+        return name in self._nodes
 
     def topological_sort(self) -> List[OperatorNode]:
         """Kahn's algorithm; insertion order used for tie-breaking."""

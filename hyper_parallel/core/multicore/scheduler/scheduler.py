@@ -18,11 +18,14 @@ Task-queue reordering passes applied after the main fill loop.
 revise_task_queue          — RATR: rank-aware tile reorder for dispatch/combine.
 revise_gmm_task_queue_bwd  — Backward GMM1/GMM4 expert interleave in cube_task_indices.
 """
-from hyper_parallel.core.multicore.scheduler.config import RuntimeConfigC
+from __future__ import annotations
+
+from hyper_parallel.core.multicore.scheduler.config import RuntimeConfigC, TaskSplitValue
 
 
-def revise_task_queue(cfg: RuntimeConfigC, tsv,
-                      dispatch_task_num: int, swiglu_task_num: int) -> None:
+def revise_task_queue(cfg: RuntimeConfigC, tsv: TaskSplitValue,
+                      dispatch_task_num: int, swiglu_task_num: int,
+                      combine_task_num: int | None = None) -> None:
     """
     Reorder vector_task_indices for dispatch and combine based on rank_id (RATR).
 
@@ -52,6 +55,10 @@ def revise_task_queue(cfg: RuntimeConfigC, tsv,
                 index += 1
 
     # ── combine segment ──────────────────────────────────────────────────────
+    if combine_task_num is None:
+        combine_task_num = dispatch_task_num
+    single_expert_task_num = combine_task_num // tsv.all_expert_num
+    single_rank_task_num = combine_task_num // tsv.ep
     start = dispatch_task_num + swiglu_task_num
     index = 0
     for j in range(single_rank_expert_num):
@@ -64,7 +71,7 @@ def revise_task_queue(cfg: RuntimeConfigC, tsv,
                 index += 1
 
 
-def revise_gmm_task_queue_bwd(cfg: RuntimeConfigC, tsv,
+def revise_gmm_task_queue_bwd(cfg: RuntimeConfigC, tsv: TaskSplitValue,
                                act_grad_task_num: int,
                                num_cube_cores: int = 24) -> None:
     """
