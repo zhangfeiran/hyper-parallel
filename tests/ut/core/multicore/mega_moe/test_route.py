@@ -57,6 +57,8 @@ class TestMegaMoeRoute(unittest.TestCase):
             ep_group=None,
             rank_id=rank_id,
             num_cube_cores=24,
+            forward_fusion_mode="legacy",
+            backward_fusion_mode="legacy",
         )
 
     def test_router_counts_are_reused_or_computed_only_when_omitted(self) -> None:

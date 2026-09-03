@@ -14,11 +14,17 @@
 # ============================================================================
 """Unit tests for MegaMoe plan construction."""
 
+import os
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_parallel.core.multicore.modules.mega_moe.spec import (
+    _MAX_EXACT_FLOAT32_INTEGER,
+    MegaMoeSpec,
+    _resolve_fusion_modes,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.plan import (
     _build_route_slots,
     _build_task_values,
@@ -27,6 +33,25 @@ from hyper_parallel.core.multicore.modules.mega_moe.plan import (
 
 class TestMegaMoePlan(unittest.TestCase):
     """Validate translation from the public local-token contract."""
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_route_permute_is_the_supported_shape_default(self):
+        """Use the fastest measured forward/backward endpoints by default."""
+        self.assertEqual(_resolve_fusion_modes(8, 32_768), ("permute", "both"))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_unsupported_default_route_fusion_uses_legacy(self):
+        """Preserve the existing API envelope outside fused kernel limits."""
+        unsupported_shapes = (
+            (17, 32_768),
+            (8, _MAX_EXACT_FLOAT32_INTEGER + 1),
+        )
+        for top_k, routed_slots in unsupported_shapes:
+            with self.subTest(top_k=top_k, routed_slots=routed_slots):
+                self.assertEqual(
+                    _resolve_fusion_modes(top_k, routed_slots),
+                    ("legacy", "legacy"),
+                )
 
     def test_local_tokens_use_one_legacy_scheduler_partition(self):
         """Preserve routed dimensions without exposing TP in MegaMoe spec."""

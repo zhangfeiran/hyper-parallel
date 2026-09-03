@@ -82,7 +82,10 @@ def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -
     tensor_bytes = (
         (capacity + routed_slots) * specification["hidden_size"] * element_size
     )
-    forward_mode, backward_mode = _resolve_fusion_modes(specification["top_k"])
+    forward_mode, backward_mode = _resolve_fusion_modes(
+        specification["top_k"],
+        routed_slots,
+    )
     forward_event_bytes = _event_workspace_bytes(
         ep_size=specification["ep_size"],
         local_num_tokens=local_tokens,

@@ -359,7 +359,7 @@ def _prepare_fused_backward_route(
     plan: MegaMoePlan,
     saved: _SavedForwardState,
 ) -> tuple[Any, Any]:
-    """Return expert-major route slots and weights for fused dispatch."""
+    """Return expert-major route slots and token-major weights for dispatch."""
     if plan.spec.forward_permute_fused:
         permute_src_index = saved.permute_src_index
     else:
@@ -368,10 +368,7 @@ def _prepare_fused_backward_route(
             route_slots,
             saved.topk_ids,
         )
-    route_weight = saved.topk_weights.detach().reshape(-1).index_select(
-        0,
-        permute_src_index,
-    )
+    route_weight = saved.topk_weights.detach().reshape(-1)
     return permute_src_index, route_weight
 
 

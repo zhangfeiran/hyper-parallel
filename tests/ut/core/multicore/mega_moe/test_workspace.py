@@ -23,6 +23,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.spec import (
 )
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
     _EVENT_COUNTER_BYTES,
+    _ROUTE_ARRIVAL_STRIDE_BYTES,
     _WORKSPACE_ALIGNMENT,
     MegaMoeWorkspace,
     _spec_workspace_bytes,
@@ -57,6 +58,9 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             * element_size
             + 2 * _EVENT_COUNTER_BYTES
             + 2 * (specification["ep_size"] + 1) * _READY_CACHE_LINE_BYTES
+            + 2
+            * specification["num_experts"]
+            * _ROUTE_ARRIVAL_STRIDE_BYTES
             + 4 * (_WORKSPACE_ALIGNMENT - 1)
         )
 
