@@ -326,6 +326,18 @@
             -2
           ],
           "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "permute_src_index", "index": 29, "dtype": "int32", "format": "ND",
+          "paramType": "required", "shape": [-2], "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "route_weight", "index": 30, "dtype": "float32", "format": "ND",
+          "paramType": "required", "shape": [-2], "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "reduce_route_index", "index": 31, "dtype": "int32", "format": "ND",
+          "paramType": "required", "shape": [-2], "format_match_mode": "FormatDefault"
         }
       ],
       "outputs": [
@@ -396,7 +408,7 @@
           "format_match_mode": "FormatDefault"
         },
         {
-          "name": "gate_dw",
+          "name": "permute_out",
           "index": 6,
           "dtype": "bfloat16",
           "format": "ND",
@@ -405,6 +417,10 @@
             -2
           ],
           "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "gate_dw", "index": 7, "dtype": "bfloat16", "format": "ND",
+          "paramType": "required", "shape": [-2], "format_match_mode": "FormatDefault"
         }
       ],
       "attrs": [

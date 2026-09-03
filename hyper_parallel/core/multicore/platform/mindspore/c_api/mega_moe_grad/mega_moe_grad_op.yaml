@@ -59,6 +59,12 @@ mega_moe_grad:
       dtype: tensor
     all_event_counters:
       dtype: tensor
+    permute_src_index:
+      dtype: tensor
+    route_weight:
+      dtype: tensor
+    reduce_route_index:
+      dtype: tensor
     rank_id:
       dtype: int
       default: 0
@@ -93,11 +99,14 @@ mega_moe_grad:
     grad_x_output:
       dtype: tensor
       inplace: grad_x
+    permute_out_output:
+      dtype: tensor
+      inplace: permute_out
     gate_dw_output:
       dtype: tensor
       inplace: gate_dw
   args_signature:
-    rw_write: dispatch_target,hidden_dw,act_grad_y,grad_gate,gate_dx,grad_x,gate_dw
+    rw_write: dispatch_target,hidden_dw,act_grad_y,grad_gate,gate_dx,grad_x,permute_out,gate_dw
   labels:
     side_effect_mem: True
   function:

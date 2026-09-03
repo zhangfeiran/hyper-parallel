@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Legacy route preparation outside the persistent MegaMoe kernel."""
+"""Top-K route preparation for external and fused MegaMoe endpoints."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class RouteMetadata:
-    """Exact offsets and counts consumed by the legacy low-level ABI."""
+    """Exact row offsets and counts consumed by the low-level ABI."""
 
     dispatch_src_off: Any
     dispatch_target_off: Any
@@ -45,8 +45,10 @@ class RouteMetadata:
 class PreparedTopKRoute:
     """Permuted payload, count metadata and the capacity decision for one route."""
 
-    routed_tokens: Any
+    routed_tokens: Any | None
     unpermute_mapping: Any
+    permute_src_index: Any | None
+    expert_route_weights: Any | None
     tokens_per_expert: Any
     received_counts: Any
     receive_overflow: bool
@@ -58,7 +60,7 @@ def _validate_topk_inputs(
     topk_ids: Any,
     topk_weights: Any,
 ) -> Any:
-    """Validate route tensors and return flattened int64 expert IDs."""
+    """Validate route tensors and return flattened expert IDs."""
     torch = get_torch()
 
     if topk_ids.dtype not in (torch.int32, torch.int64):
@@ -74,7 +76,7 @@ def _validate_topk_inputs(
         raise ValueError(
             "hidden_states, topk_ids and topk_weights must be on one device."
         )
-    return topk_ids.reshape(-1).to(torch.int64)
+    return topk_ids.reshape(-1)
 
 
 def _resolve_counts(
@@ -159,6 +161,40 @@ def _permute_topk_input(hidden_states: Any, topk_ids: Any) -> tuple[Any, Any]:
     )
 
 
+def _build_route_indices(
+    token_rows: Any,
+    topk_ids: Any,
+    topk_weights: Any,
+) -> tuple[Any, Any, Any]:
+    """Build both route maps and expert-major weights with one native permute."""
+    # pylint: disable=C0415
+    import torch_npu
+
+    torch = get_torch()
+
+    permuted_rows, inverse_order = torch_npu.npu_moe_token_permute(
+        token_rows,
+        topk_ids,
+    )
+    permute_src_index = permuted_rows.reshape(-1).to(torch.int32).contiguous()
+    inverse_order = inverse_order.reshape(-1).to(torch.int32).contiguous()
+    expert_route_weights = torch.empty(
+        topk_weights.numel(),
+        dtype=topk_weights.dtype,
+        device=topk_weights.device,
+    )
+    expert_route_weights.scatter_(
+        0,
+        inverse_order,
+        topk_weights.detach().reshape(-1),
+    )
+    return (
+        permute_src_index.contiguous(),
+        inverse_order.reshape_as(topk_ids).contiguous(),
+        expert_route_weights,
+    )
+
+
 def _compute_route_metadata(
     counts: Any,
     counts_by_source: Any,
@@ -166,7 +202,7 @@ def _compute_route_metadata(
     runtime: MegaMoeRuntime,
     maximum_received_slots: int,
 ) -> RouteMetadata:
-    """Build exact element offsets without padding or route truncation."""
+    """Build exact row offsets without padding or route truncation."""
     torch = get_torch()
 
     config = runtime.config
@@ -228,7 +264,22 @@ def prepare_topk_route(
         # the cross-rank rendezvous for the next symmetric-buffer generation.
         workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, config)
-    routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
+    permute_fused = config.fusion_mode in {"permute", "both"}
+    if permute_fused:
+        token_rows = runtime.route_token_rows
+        if token_rows is None:
+            raise RuntimeError("route-fused MegaMoe is missing token-row metadata.")
+        permute_src_index, unpermute_mapping, expert_route_weights = (
+            _build_route_indices(token_rows, topk_ids, topk_weights)
+        )
+        routed_tokens = None
+    else:
+        routed_tokens, unpermute_mapping = _permute_topk_input(
+            hidden_states,
+            topk_ids,
+        )
+        permute_src_index = None
+        expert_route_weights = None
     received_counts, maximum_received_slots = _finish_count_gather(
         counts_by_source,
         count_work,
@@ -236,9 +287,16 @@ def prepare_topk_route(
     )
     receive_overflow = maximum_received_slots > config.receive_capacity
     if receive_overflow:
+        if routed_tokens is None:
+            routed_tokens, unpermute_mapping = _permute_topk_input(
+                hidden_states,
+                topk_ids,
+            )
         return PreparedTopKRoute(
             routed_tokens=routed_tokens,
             unpermute_mapping=unpermute_mapping,
+            permute_src_index=permute_src_index,
+            expert_route_weights=expert_route_weights,
             tokens_per_expert=counts,
             received_counts=received_counts,
             receive_overflow=True,
@@ -247,6 +305,8 @@ def prepare_topk_route(
     return PreparedTopKRoute(
         routed_tokens=routed_tokens,
         unpermute_mapping=unpermute_mapping,
+        permute_src_index=permute_src_index,
+        expert_route_weights=expert_route_weights,
         tokens_per_expert=counts,
         received_counts=received_counts,
         receive_overflow=False,
@@ -269,8 +329,16 @@ def restore_topk_output(
     # pylint: disable=C0415
     import torch_npu
 
+    torch = get_torch()
+    mapping = unpermute_mapping
+    if mapping.ndim != 1:
+        mapping = mapping.reshape(-1)
+    if mapping.dtype != torch.int32:
+        mapping = mapping.to(torch.int32)
+    if not mapping.is_contiguous():
+        mapping = mapping.contiguous()
     return torch_npu.npu_moe_token_unpermute(
         expert_output,
-        unpermute_mapping,
+        mapping,
         probs=topk_weights.float().contiguous(),
     )

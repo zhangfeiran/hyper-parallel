@@ -17,13 +17,17 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, cast
 
 from ._framework import get_torch, get_torch_distributed
 
 _COMMUNICATION_SPLIT = 128
+_FUSION_MODES = frozenset({"legacy", "permute", "unpermute", "both"})
+_FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_FUSION_MODE"
+FusionMode = Literal["legacy", "permute", "unpermute", "both"]
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,7 @@ class MegaMoeConfig:
     ep_group: Any | None
     rank_id: int
     num_cube_cores: int
+    fusion_mode: FusionMode = "legacy"
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
@@ -63,6 +68,19 @@ def _resolve_receive_capacity(expert_capacity_factor: float, routed_slots: int) 
         // _COMMUNICATION_SPLIT
         * _COMMUNICATION_SPLIT
     )
+
+
+def _resolve_fusion_mode(top_k: int | None = None) -> FusionMode:
+    """Resolve and validate the private route-fusion experiment selector."""
+    fusion_mode = os.getenv(_FUSION_MODE_ENV, "legacy")
+    if fusion_mode not in _FUSION_MODES:
+        expected = ", ".join(sorted(_FUSION_MODES))
+        raise ValueError(
+            f"{_FUSION_MODE_ENV} must be one of {expected}, got {fusion_mode!r}."
+        )
+    if top_k is not None and fusion_mode != "legacy" and top_k > 16:
+        raise ValueError("route-fused MegaMoe currently supports top_k <= 16.")
+    return cast(FusionMode, fusion_mode)
 
 
 def build_config(specification: Mapping[str, Any], tensor: Any) -> MegaMoeConfig:
@@ -120,6 +138,7 @@ def build_config(specification: Mapping[str, Any], tensor: Any) -> MegaMoeConfig
         specification["expert_capacity_factor"],
         local_num_tokens * top_k,
     )
+    fusion_mode = _resolve_fusion_mode(top_k)
     config = MegaMoeConfig(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],
@@ -131,6 +150,7 @@ def build_config(specification: Mapping[str, Any], tensor: Any) -> MegaMoeConfig
         ep_group=ep_group,
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
+        fusion_mode=fusion_mode,
     )
     if config.local_num_tokens % _COMMUNICATION_SPLIT:
         raise ValueError(

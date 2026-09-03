@@ -45,6 +45,16 @@ mega_moe:
       dtype: tensor
     all_event_counters:
       dtype: tensor
+    original_x:
+      dtype: tensor
+    permute_src_index:
+      dtype: tensor
+    reduce_route_index:
+      dtype: tensor
+    topk_weights:
+      dtype: tensor
+    final_out:
+      dtype: tensor
     rank_id:
       dtype: int
       default: 0
@@ -76,8 +86,11 @@ mega_moe:
     combine_target_output:
       dtype: tensor
       inplace: combine_target
+    final_out_output:
+      dtype: tensor
+      inplace: final_out
   args_signature:
-    rw_write: dispatch_target,up_proj_y,swiglu_out,down_proj_y,combine_target
+    rw_write: dispatch_target,up_proj_y,swiglu_out,down_proj_y,combine_target,final_out
   labels:
     side_effect_mem: True
   function:

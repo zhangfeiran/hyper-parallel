@@ -26,11 +26,17 @@ from typing import Any
 from hyper_parallel.core.multicore.scheduler.config import (
     EVENT_COUNTER_BYTES as _EVENT_COUNTER_BYTES,
     READY_CACHE_LINE_BYTES as _READY_CACHE_LINE_BYTES,
+    ROUTE_ARRIVAL_STRIDE_BYTES as _ROUTE_ARRIVAL_STRIDE_BYTES,
     event_workspace_bytes,
 )
 
 from ._framework import get_torch
-from .config import MegaMoeConfig, _resolve_receive_capacity
+from .config import (
+    _COMMUNICATION_SPLIT,
+    MegaMoeConfig,
+    _resolve_fusion_mode,
+    _resolve_receive_capacity,
+)
 
 _GMM_WORKSPACE_BYTES = 32 * 1024 * 1024
 _SWIGLU_GRAD_WORKSPACE_BYTES = 16 * 1024 * 1024
@@ -43,6 +49,27 @@ def _round_up(value: int, granularity: int) -> int:
     return (value + granularity - 1) // granularity * granularity
 
 
+def _event_workspace_bytes(
+    *,
+    ep_size: int,
+    local_num_tokens: int,
+    num_experts: int,
+    dispatch_split: int,
+    fusion_mode: str,
+) -> int:
+    """Return event storage including isolated route-dispatch arrivals."""
+    standard_bytes = event_workspace_bytes(ep_size)
+    if fusion_mode not in {"permute", "both"}:
+        return standard_bytes
+    tasks_per_expert = (
+        local_num_tokens + dispatch_split - 1
+    ) // dispatch_split
+    return (
+        standard_bytes
+        + num_experts * tasks_per_expert * _ROUTE_ARRIVAL_STRIDE_BYTES
+    )
+
+
 def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -> int:
     """Return planned symmetric bytes for one resource group."""
     local_tokens = specification["local_num_tokens"]
@@ -53,7 +80,14 @@ def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -
     tensor_bytes = (
         (capacity + routed_slots) * specification["hidden_size"] * element_size
     )
-    event_bytes = event_workspace_bytes(specification["ep_size"])
+    fusion_mode = _resolve_fusion_mode(specification["top_k"])
+    event_bytes = _event_workspace_bytes(
+        ep_size=specification["ep_size"],
+        local_num_tokens=local_tokens,
+        num_experts=specification["num_experts"],
+        dispatch_split=_COMMUNICATION_SPLIT,
+        fusion_mode=fusion_mode,
+    )
     return tensor_bytes + 2 * event_bytes + 4 * (_WORKSPACE_ALIGNMENT - 1)
 
 
@@ -116,6 +150,8 @@ class MegaMoeWorkspace:
     reuse_event_pending: bool = False
     forward_ready_initialized: bool = False
     backward_ready_initialized: bool = False
+    route_arrivals_enabled: bool = False
+    route_arrival_offset_bytes: int = 0
     lock: Any = field(default_factory=threading.Lock, repr=False)
 
     def ensure(
@@ -160,7 +196,19 @@ class MegaMoeWorkspace:
         self.routed_buffer = symm.aligned_empty(
             (config.routed_slots, config.hidden_size), dtype, _WORKSPACE_ALIGNMENT
         )
-        event_bytes = event_workspace_bytes(config.ep_size)
+        self.route_arrivals_enabled = config.fusion_mode in {"permute", "both"}
+        self.route_arrival_offset_bytes = (
+            event_workspace_bytes(config.ep_size)
+            if self.route_arrivals_enabled
+            else 0
+        )
+        event_bytes = _event_workspace_bytes(
+            ep_size=config.ep_size,
+            local_num_tokens=config.local_num_tokens,
+            num_experts=config.num_experts,
+            dispatch_split=config.dispatch_split,
+            fusion_mode=config.fusion_mode,
+        )
         self.forward_event_counters = symm.aligned_empty(
             (event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT
         )
@@ -187,6 +235,8 @@ class MegaMoeWorkspace:
         if events is None:
             raise RuntimeError(f"MegaMoe workspace {field_name} is not initialized.")
         events[:_EVENT_COUNTER_BYTES].zero_()
+        if self.route_arrivals_enabled:
+            events[self.route_arrival_offset_bytes:].zero_()
         if events.numel() == _EVENT_COUNTER_BYTES or ready_initialized:
             return events
 
@@ -262,3 +312,5 @@ class MegaMoeWorkspace:
         self.routed_slots = 0
         self.forward_ready_initialized = False
         self.backward_ready_initialized = False
+        self.route_arrivals_enabled = False
+        self.route_arrival_offset_bytes = 0

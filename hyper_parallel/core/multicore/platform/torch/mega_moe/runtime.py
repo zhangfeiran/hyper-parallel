@@ -24,6 +24,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data im
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
+    build_route_backward_graph,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
@@ -37,6 +38,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data imp
 )
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
     build_forward_graph,
+    build_route_forward_graph,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import (
     get_down_proj_tiling_bytes,
@@ -67,6 +69,21 @@ class MegaMoeRuntime:
     w1_grad_tiling: Any
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
+    route_token_rows: Any | None
+
+
+@dataclass(frozen=True)
+class _MegaMoeTilings:
+    """Device tiling tensors referenced by the forward and backward graphs."""
+
+    up_proj: Any
+    swiglu: Any
+    down_proj: Any
+    act_grad: Any
+    gate_grad: Any
+    w1_grad: Any
+    w2_grad: Any
+    swiglu_grad: Any
 
 
 def _tensor_from_bytes(data: bytes, device: Any) -> Any:
@@ -107,18 +124,15 @@ def _build_task_values(config: MegaMoeConfig) -> TaskSplitValue:
     )
 
 
-def build_mega_moe_runtime(config: MegaMoeConfig, device: Any) -> MegaMoeRuntime:
-    """Build the current legacy forward/backward ABI without fusion slots.
-
-    Args:
-        config: Validated local-token and expert topology configuration.
-        device: NPU device receiving serialized descriptors and tiling tensors.
-
-    Returns:
-        Rank-local forward and backward runtime resources.
-    """
-    task_values = _build_task_values(config)
-    forward_graph = build_forward_graph(
+def _build_forward_schedule(
+    config: MegaMoeConfig,
+    task_values: TaskSplitValue,
+    device: Any,
+) -> tuple[Any, Any]:
+    """Build the selected forward graph and its compact device descriptor."""
+    permute_fused = config.fusion_mode in {"permute", "both"}
+    builder = build_route_forward_graph if permute_fused else build_forward_graph
+    graph = builder(
         task_values,
         dispatch_sv=config.dispatch_split,
         swiglu_sv=config.swiglu_split,
@@ -126,16 +140,37 @@ def build_mega_moe_runtime(config: MegaMoeConfig, device: Any) -> MegaMoeRuntime
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
         num_cube_cores=config.num_cube_cores,
+        integrated_unpermute=config.fusion_mode in {"unpermute", "both"},
     )
-    forward_graph.propagate_splits(task_values)
-    forward_data = build_forward_config(
-        forward_graph,
+    graph.propagate_splits(task_values)
+    data = build_forward_config(
+        graph,
         task_values,
         config.rank_id,
         config.num_cube_cores,
     )
+    return graph, _tensor_from_bytes(serialize_runtime_config(data), device)
 
-    backward_graph = build_backward_graph(
+
+def _build_backward_schedule(
+    config: MegaMoeConfig,
+    task_values: TaskSplitValue,
+    device: Any,
+) -> tuple[Any, Any]:
+    """Build the selected backward graph and its compact device descriptor."""
+    permute_fused = config.fusion_mode in {"permute", "both"}
+    unpermute_fused = config.fusion_mode in {"unpermute", "both"}
+    route_fused = permute_fused or unpermute_fused
+    builder = build_route_backward_graph if route_fused else build_backward_graph
+    options = (
+        {
+            "integrated_permute": permute_fused,
+            "integrated_unpermute": unpermute_fused,
+        }
+        if route_fused
+        else {}
+    )
+    graph = builder(
         task_values,
         dispatch_sv=config.dispatch_split,
         swiglu_sv=config.swiglu_split,
@@ -143,15 +178,25 @@ def build_mega_moe_runtime(config: MegaMoeConfig, device: Any) -> MegaMoeRuntime
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
         num_cube_cores=config.num_cube_cores,
+        **options,
     )
-    backward_graph.propagate_splits(task_values)
-    backward_data = build_backward_config(
-        backward_graph,
+    graph.propagate_splits(task_values)
+    data = build_backward_config(
+        graph,
         task_values,
         config.rank_id,
         config.num_cube_cores,
     )
+    return graph, _tensor_from_bytes(serialize_runtime_config(data), device)
 
+
+def _build_tilings(
+    config: MegaMoeConfig,
+    forward_graph: Any,
+    backward_graph: Any,
+    device: Any,
+) -> _MegaMoeTilings:
+    """Materialize all tiling blobs referenced by the two schedules."""
     gmm_options = {
         "hidden_size": config.hidden_size,
         "intermediate_size": config.intermediate_size,
@@ -166,16 +211,11 @@ def build_mega_moe_runtime(config: MegaMoeConfig, device: Any) -> MegaMoeRuntime
     w1_grad = backward_graph.get_op("w1_grad")
     w2_grad = backward_graph.get_op("w2_grad")
     swiglu_grad = backward_graph.get_op("swiglu_grad")
-    return MegaMoeRuntime(
-        config=config,
-        fwd_runtime_config=_tensor_from_bytes(
-            serialize_runtime_config(forward_data),
-            device,
-        ),
-        up_proj_tiling=_tensor_from_bytes(
+    return _MegaMoeTilings(
+        up_proj=_tensor_from_bytes(
             get_up_proj_tiling_bytes(up_proj.split_value, **gmm_options), device
         ),
-        swiglu_tiling=_tensor_from_bytes(
+        swiglu=_tensor_from_bytes(
             _resize_swiglu_tiling(
                 get_swiglu_tiling_bytes(
                     swiglu.split_value,
@@ -185,26 +225,22 @@ def build_mega_moe_runtime(config: MegaMoeConfig, device: Any) -> MegaMoeRuntime
             ),
             device,
         ),
-        down_proj_tiling=_tensor_from_bytes(
+        down_proj=_tensor_from_bytes(
             get_down_proj_tiling_bytes(down_proj.split_value, **gmm_options), device
         ),
-        bwd_runtime_config=_tensor_from_bytes(
-            serialize_runtime_config(backward_data),
-            device,
-        ),
-        act_grad_tiling=_tensor_from_bytes(
+        act_grad=_tensor_from_bytes(
             get_act_grad_tiling_bytes(act_grad.split_value, **gmm_options), device
         ),
-        gate_grad_tiling=_tensor_from_bytes(
+        gate_grad=_tensor_from_bytes(
             get_gate_grad_tiling_bytes(gate_grad.split_value, **gmm_options), device
         ),
-        w1_grad_tiling=_tensor_from_bytes(
+        w1_grad=_tensor_from_bytes(
             get_w1_grad_tiling_bytes(w1_grad.split_value, **gmm_options), device
         ),
-        w2_grad_tiling=_tensor_from_bytes(
+        w2_grad=_tensor_from_bytes(
             get_w2_grad_tiling_bytes(w2_grad.split_value, **gmm_options), device
         ),
-        swiglu_grad_tiling=_tensor_from_bytes(
+        swiglu_grad=_tensor_from_bytes(
             _resize_swiglu_tiling(
                 get_swiglu_grad_tiling_bytes(
                     swiglu_grad.split_value,
@@ -214,4 +250,50 @@ def build_mega_moe_runtime(config: MegaMoeConfig, device: Any) -> MegaMoeRuntime
             ),
             device,
         ),
+    )
+
+
+def _build_route_token_rows(config: MegaMoeConfig, device: Any) -> Any | None:
+    """Cache the token-row payload used only by permute-fused routing."""
+    if config.fusion_mode not in {"permute", "both"}:
+        return None
+    torch = get_torch()
+    return torch.arange(
+        config.local_num_tokens,
+        dtype=torch.float32,
+        device=device,
+    ).reshape(-1, 1)
+
+
+def build_mega_moe_runtime(config: MegaMoeConfig, device: Any) -> MegaMoeRuntime:
+    """Build the selected forward/backward route endpoint schedules.
+
+    Args:
+        config: Validated local-token and expert topology configuration.
+        device: NPU device receiving serialized descriptors and tiling tensors.
+
+    Returns:
+        Rank-local forward and backward runtime resources.
+    """
+    task_values = _build_task_values(config)
+    forward_graph, forward_config = _build_forward_schedule(
+        config, task_values, device
+    )
+    backward_graph, backward_config = _build_backward_schedule(
+        config, task_values, device
+    )
+    tilings = _build_tilings(config, forward_graph, backward_graph, device)
+    return MegaMoeRuntime(
+        config=config,
+        fwd_runtime_config=forward_config,
+        up_proj_tiling=tilings.up_proj,
+        swiglu_tiling=tilings.swiglu,
+        down_proj_tiling=tilings.down_proj,
+        bwd_runtime_config=backward_config,
+        act_grad_tiling=tilings.act_grad,
+        gate_grad_tiling=tilings.gate_grad,
+        w1_grad_tiling=tilings.w1_grad,
+        w2_grad_tiling=tilings.w2_grad,
+        swiglu_grad_tiling=tilings.swiglu_grad,
+        route_token_rows=_build_route_token_rows(config, device),
     )

@@ -22,12 +22,12 @@
 // framework.  The function name "aclnnHyperMegaMoe" is resolved at runtime
 // from the loaded libcust_opapi.so — no compile-time declaration is needed.
 //
-// This op is INPLACE with 5 declared returns:
-//   dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target
+// This op is INPLACE with 6 declared returns:
+//   dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target, final_out
 //
 // Following the pyboost_aclnn_batch_norm.cpp pattern:
 //   - Inplace output tensors appear in BOTH the inputs and outputs vectors
-//   - The function returns std::vector<ms::Tensor> containing the 5 outputs
+//   - The function returns std::vector<ms::Tensor> containing the 6 outputs
 //   - No separate pyboost wrapper; npu_moe_fwd is bound directly
 //
 // Input tensor positions (for the runner->Run inputs vector):
@@ -53,6 +53,11 @@
 //   [19] down_proj_tiling
 //   [20] runtime_config
 //   [21] all_event_counters
+//   [22] original_x
+//   [23] permute_src_index
+//   [24] reduce_route_index
+//   [25] topk_weights
+//   [26] final_out             [inplace write, declared return]
 // =============================================================================
 
 #include <memory>
@@ -63,32 +68,36 @@
 
 namespace ms_multicore {
 
-// npu_mega_moe — returns the 5 inplace output tensors
-std::vector<ms::Tensor> npu_mega_moe(
-    const ms::Tensor &dispatch_target,      // pos  0 — inplace write, declared return
-    const ms::Tensor &dispatch_target_off,  // pos  1
-    const ms::Tensor &dispatch_src,         // pos  2
-    const ms::Tensor &dispatch_src_off,     // pos  3
-    const ms::Tensor &dispatch_size,        // pos  4
-    const ms::Tensor &up_proj_weight,       // pos  5
-    const ms::Tensor &up_proj_glist,        // pos  6
-    const ms::Tensor &up_proj_y,            // pos  7 — inplace write, declared return
-    const ms::Tensor &swiglu_out,           // pos  8 — inplace write, declared return
-    const ms::Tensor &down_proj_weight,     // pos  9
-    const ms::Tensor &down_proj_glist,      // pos 10
-    const ms::Tensor &down_proj_y,          // pos 11 — inplace write, declared return
-    const ms::Tensor &combine_target,       // pos 12 — inplace write, declared return
-    const ms::Tensor &combine_target_off,   // pos 13
-    const ms::Tensor &combine_src_off,      // pos 14
-    const ms::Tensor &combine_size,         // pos 15
-    const ms::Tensor &gmm_workspace,        // pos 16
-    const ms::Tensor &up_proj_tiling,       // pos 17
-    const ms::Tensor &swiglu_tiling,        // pos 18
-    const ms::Tensor &down_proj_tiling,     // pos 19
-    const ms::Tensor &runtime_config,       // pos 20
-    const ms::Tensor &all_event_counters,   // pos 21
-    int64_t rank_id, int64_t ep, int64_t expert_num,
-    int64_t hidden_size, int64_t seq_size) {
+// npu_mega_moe — returns the 6 inplace output tensors
+std::vector<ms::Tensor> npu_mega_moe(const ms::Tensor &dispatch_target,      // pos  0 — inplace write, declared return
+                                     const ms::Tensor &dispatch_target_off,  // pos  1
+                                     const ms::Tensor &dispatch_src,         // pos  2
+                                     const ms::Tensor &dispatch_src_off,     // pos  3
+                                     const ms::Tensor &dispatch_size,        // pos  4
+                                     const ms::Tensor &up_proj_weight,       // pos  5
+                                     const ms::Tensor &up_proj_glist,        // pos  6
+                                     const ms::Tensor &up_proj_y,            // pos  7 — inplace write, declared return
+                                     const ms::Tensor &swiglu_out,           // pos  8 — inplace write, declared return
+                                     const ms::Tensor &down_proj_weight,     // pos  9
+                                     const ms::Tensor &down_proj_glist,      // pos 10
+                                     const ms::Tensor &down_proj_y,          // pos 11 — inplace write, declared return
+                                     const ms::Tensor &combine_target,       // pos 12 — inplace write, declared return
+                                     const ms::Tensor &combine_target_off,   // pos 13
+                                     const ms::Tensor &combine_src_off,      // pos 14
+                                     const ms::Tensor &combine_size,         // pos 15
+                                     const ms::Tensor &gmm_workspace,        // pos 16
+                                     const ms::Tensor &up_proj_tiling,       // pos 17
+                                     const ms::Tensor &swiglu_tiling,        // pos 18
+                                     const ms::Tensor &down_proj_tiling,     // pos 19
+                                     const ms::Tensor &runtime_config,       // pos 20
+                                     const ms::Tensor &all_event_counters,   // pos 21
+                                     const ms::Tensor &original_x,           // pos 22
+                                     const ms::Tensor &permute_src_index,    // pos 23
+                                     const ms::Tensor &reduce_route_index,   // pos 24
+                                     const ms::Tensor &topk_weights,         // pos 25
+                                     const ms::Tensor &final_out,            // pos 26 — inplace write, declared return
+                                     int64_t rank_id, int64_t ep, int64_t expert_num, int64_t hidden_size,
+                                     int64_t seq_size) {
   auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MoeFwd");
   MS_EXCEPTION_IF_NULL(runner);
   // LAUNCH_ACLNN_FUNC captures all args via Arg() helpers (ms::Tensor →
@@ -96,38 +105,29 @@ std::vector<ms::Tensor> npu_mega_moe(
   //   1. calls aclnnHyperMegaMoeGetWorkspaceSize (via dynamic lookup + cache)
   //   2. allocates workspace through MindSpore's device memory manager
   //   3. dispatches aclnnHyperMegaMoe asynchronously on the current stream
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnHyperMegaMoe,
-      dispatch_target, dispatch_target_off,
-      dispatch_src, dispatch_src_off, dispatch_size,
-      up_proj_weight, up_proj_glist,
-      up_proj_y, swiglu_out,
-      down_proj_weight, down_proj_glist, down_proj_y,
-      combine_target, combine_target_off, combine_src_off, combine_size,
-      gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
-      runtime_config, all_event_counters,
-      rank_id, ep, expert_num, hidden_size, seq_size));
+  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(
+    aclnnHyperMegaMoe, dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off, dispatch_size,
+    up_proj_weight, up_proj_glist, up_proj_y, swiglu_out, down_proj_weight, down_proj_glist, down_proj_y,
+    combine_target, combine_target_off, combine_src_off, combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling,
+    down_proj_tiling, runtime_config, all_event_counters, original_x, permute_src_index, reduce_route_index,
+    topk_weights, final_out, rank_id, ep, expert_num, hidden_size, seq_size));
 
-  // All 22 tensors passed as inputs so the framework prepares their device
+  // All tensors are inputs so the framework prepares their device
   // addresses before the async launch.
-  // The 5 inplace output tensors also appear in outputs so the framework
+  // The 6 inplace output tensors also appear in outputs so the framework
   // tracks them as written — following pyboost_aclnn_batch_norm.cpp pattern.
   std::vector<ms::Tensor> inputs = {
-      dispatch_target, dispatch_target_off,
-      dispatch_src, dispatch_src_off, dispatch_size,
-      up_proj_weight, up_proj_glist,
-      up_proj_y, swiglu_out,
-      down_proj_weight, down_proj_glist, down_proj_y,
-      combine_target, combine_target_off, combine_src_off, combine_size,
-      gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
-      runtime_config, all_event_counters,
+    dispatch_target,    dispatch_target_off, dispatch_src,    dispatch_src_off,   dispatch_size,   up_proj_weight,
+    up_proj_glist,      up_proj_y,           swiglu_out,      down_proj_weight,   down_proj_glist, down_proj_y,
+    combine_target,     combine_target_off,  combine_src_off, combine_size,       gmm_workspace,   up_proj_tiling,
+    swiglu_tiling,      down_proj_tiling,    runtime_config,  all_event_counters, original_x,      permute_src_index,
+    reduce_route_index, topk_weights,        final_out,
   };
-  // outputs = the 5 inplace tensors declared as returns in mega_moe_op.yaml
+  // outputs = the 6 inplace tensors declared as returns in mega_moe_op.yaml
   runner->Run(inputs, {});
 
-  return {dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target};
+  return {dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target, final_out};
 }
 }  // namespace ms_multicore
 
-MS_CUSTOM_OPS_EXTENSION_MODULE(m) {
-  m.def("mega_moe", PYBOOST_CALLER(5, ms_multicore::npu_mega_moe));
-}
+MS_CUSTOM_OPS_EXTENSION_MODULE(m) { m.def("mega_moe", PYBOOST_CALLER(6, ms_multicore::npu_mega_moe)); }

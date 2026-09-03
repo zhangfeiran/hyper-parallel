@@ -116,8 +116,7 @@ class KernelWorkerBase {
     int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
     int64_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
     constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
-    __gm__ int32_t *ready =
-      (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + MAX_EVENT_NUM;
+    __gm__ int32_t *ready = (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + MAX_EVENT_NUM;
 
     GlobalTensor<int32_t> ready_state;
     ready_state.SetGlobalBuffer(ready, static_cast<uint32_t>((ep + 1) * ready_stride));
@@ -190,6 +189,64 @@ class KernelWorkerBase {
 #endif
   }
 
+  __aicore__ inline void PublishRouteDispatchArrival(uint32_t task_index, uint32_t task_split_num, int64_t target_pe) {
+#ifndef __DAV_C220_CUBE__
+    int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    int64_t expert_num = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 2);
+    int64_t local_experts = expert_num / ep;
+    int64_t tasks_per_expert = task_split_num / expert_num;
+    int64_t source_rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0);
+    int64_t source_pe = source_rank % ep;
+    int64_t expert_index = task_index / tasks_per_expert;
+    int64_t local_expert = expert_index % local_experts;
+    int64_t tile = task_index % tasks_per_expert;
+    int64_t slot = (local_expert * ep + source_pe) * tasks_per_expert + tile;
+    int64_t route_arrival_offset = MAX_EVENT_NUM * INT32_T_SIZE + (ep + 1) * DATA_CACHE_LINE_SIZE;
+    __gm__ int32_t *arrival = reinterpret_cast<__gm__ int32_t *>(input_list[Derived::EVENT_IDX] + route_arrival_offset +
+                                                                 slot * ROUTE_ARRIVAL_STRIDE_BYTES);
+    if (target_pe == source_pe) {
+      GlobalTensor<int32_t> local_arrival;
+      local_arrival.SetGlobalBuffer(arrival, 1);
+      local_arrival.SetValue(0, 1);
+      DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(local_arrival[0]);
+      PipeBarrier<PIPE_ALL>();
+    } else {
+      aclshmemx_signal_op(arrival, 1, ACLSHMEM_SIGNAL_SET, static_cast<int>(target_pe));
+    }
+#endif
+  }
+
+  __aicore__ inline void WaitForRouteDispatchArrivals(uint32_t event_index, int32_t needed) {
+    int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    int64_t expert_num = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 2);
+    int64_t local_experts = expert_num / ep;
+    int64_t tasks_per_source = needed / ep;
+    int64_t local_expert = (static_cast<int64_t>(event_index) - 1) % local_experts;
+    int64_t route_arrival_offset = MAX_EVENT_NUM * INT32_T_SIZE + (ep + 1) * DATA_CACHE_LINE_SIZE;
+    constexpr uint32_t stride = ROUTE_ARRIVAL_STRIDE_BYTES / INT32_T_SIZE;
+    GlobalTensor<int32_t> arrivals;
+    arrivals.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(input_list[Derived::EVENT_IDX] + route_arrival_offset),
+                             static_cast<uint32_t>(expert_num * tasks_per_source * stride));
+
+    for (int64_t source = 0; source < ep; ++source) {
+      for (int64_t tile = 0; tile < tasks_per_source; ++tile) {
+        uint32_t index = static_cast<uint32_t>(((local_expert * ep + source) * tasks_per_source + tile) * stride);
+        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(arrivals[index]);
+        int32_t current = arrivals.GetValue(index);
+        PipeBarrier<PIPE_ALL>();
+        int64_t system_cycle_before = AscendC::GetSystemCycle();
+        while (current < 1) {
+          int64_t system_cycle_after = AscendC::GetSystemCycle();
+          if ((system_cycle_after - system_cycle_before) / 50 > 150) {
+            DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(arrivals[index]);
+            current = arrivals.GetValue(index);
+            system_cycle_before = AscendC::GetSystemCycle();
+          }
+        }
+      }
+    }
+  }
+
   __aicore__ inline void ExecuteTask(TaskId task_id) {
     TaskDesc task_desc;
     getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
@@ -197,14 +254,18 @@ class KernelWorkerBase {
       WaitForDependency(task_desc.dependent_event);
     }
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
-    if (task_desc.task_type != TASK_SHMEM_PUT_MEM_SIGNAL) {
+    if (task_desc.task_type != TASK_SHMEM_PUT_MEM_SIGNAL && task_desc.trigger_event != EVENT_INVALID_ID) {
       TriggerEvent(task_desc.trigger_event);
     }
   }
 
   __aicore__ inline void WaitForDependency(uint32_t event_index) {
-#ifdef __DAV_C220_CUBE__
     int32_t needed = all_event_num_triggers.GetValue(event_index);
+    if (needed < 0) {
+      WaitForRouteDispatchArrivals(event_index, -needed);
+      return;
+    }
+#ifdef __DAV_C220_CUBE__
     DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
       all_event_counters[event_index]);
     int32_t current = all_event_counters.GetValue(event_index);
@@ -226,7 +287,6 @@ class KernelWorkerBase {
       }
     } while (1);
 #else
-    int32_t needed = all_event_num_triggers.GetValue(event_index);
     DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
       all_event_counters[event_index]);
     int32_t current = all_event_counters.GetValue(event_index);

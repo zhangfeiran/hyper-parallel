@@ -30,6 +30,7 @@ constexpr uint32_t RUNTIME_TASK_CAPACITY_MASK = RUNTIME_TASK_CAPACITY_MAGIC - 1;
 
 constexpr uint32_t UB_32B_ALIGN = 32;
 constexpr uint32_t DATA_CACHE_LINE_SIZE = 64;
+constexpr uint32_t ROUTE_ARRIVAL_STRIDE_BYTES = DATA_CACHE_LINE_SIZE;
 constexpr uint32_t EXP_TOKEN_COUNT_FLAG_CNT = UB_32B_ALIGN / sizeof(int32_t);  // 8
 constexpr uint32_t DISPATCH_TOKEN_UB_SIZE = 3 * 32;
 
@@ -58,6 +59,9 @@ enum TaskType : uint32_t {
   TASK_GROUPED_MATMUL = 104,
   TASK_SHMEM_PUT_MEM_SIGNAL = 105,
   TASK_SWI_GLU_GRAD = 106,
+  TASK_UNPERMUTE_REDUCE_GRAD = 110,
+  TASK_TOPK_WEIGHT_GRAD = 111,
+  TASK_WEIGHTED_UNPERMUTE = 112,
 };
 
 enum EventType : uint32_t {
@@ -156,9 +160,7 @@ __aicore__ inline uint32_t getConfigExtraValue(__gm__ uint8_t *tiling) {
 
 __aicore__ inline uint32_t getRuntimeTaskCapacity(__gm__ uint8_t *tiling) {
   uint32_t encoded = (*(__gm__ uint32_t *)(tiling + UINT32_T_SIZE * 2));
-  return (encoded & RUNTIME_TASK_CAPACITY_MAGIC) != 0
-    ? encoded & RUNTIME_TASK_CAPACITY_MASK
-    : MAX_TASK_NUM;
+  return (encoded & RUNTIME_TASK_CAPACITY_MAGIC) != 0 ? encoded & RUNTIME_TASK_CAPACITY_MASK : MAX_TASK_NUM;
 }
 
 __aicore__ inline uint32_t getAllEventNumTriggersOffset() { return UINT32_T_SIZE * 4; }
@@ -249,6 +251,16 @@ __aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData,
   tilingData->task_split_num = (*(__gm__ uint32_t *)(tiling + start_size));
   start_size = start_size + UINT32_T_SIZE;
   tilingData->task_split_value = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size = start_size + UINT32_T_SIZE;
+  tilingData->extra_value_0 = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size = start_size + UINT32_T_SIZE;
+  tilingData->extra_value_1 = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size = start_size + UINT32_T_SIZE;
+  tilingData->extra_value_2 = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size = start_size + UINT32_T_SIZE;
+  tilingData->extra_value_3 = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size = start_size + UINT32_T_SIZE;
+  tilingData->extra_value_4 = (*(__gm__ uint32_t *)(tiling + start_size));
 }
 
 __aicore__ inline void getEventDesc(__gm__ uint8_t *tiling, EventDesc *tilingData, uint32_t index_size) {

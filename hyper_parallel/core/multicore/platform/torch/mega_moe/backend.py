@@ -24,7 +24,7 @@ from ._framework import get_torch
 from .config import build_config
 from .execution import execute_mega_moe
 from .native import execute_native_from_permuted_route
-from .route import prepare_topk_route, restore_topk_output
+from .route import prepare_topk_route, restore_topk_output  # pylint: disable=unused-import
 from .runtime import build_mega_moe_runtime
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
 
@@ -81,15 +81,20 @@ class TorchMegaMoeBackend:
     ) -> Any:
         """Execute Top-K routing, legacy kernels and weighted restoration."""
         self._validate_tensors(hidden_states, weight1, weight2)
+        torch = get_torch()
+        route_weights = topk_weights.float().contiguous()
+        route_ids = topk_ids.to(torch.int32).contiguous()
         route = prepare_topk_route(
             hidden_states,
-            topk_ids,
-            topk_weights,
+            route_ids,
+            route_weights,
             self.runtime,
             tokens_per_expert,
             workspace=self.workspace,
         )
         if route.receive_overflow:
+            if route.routed_tokens is None:
+                raise RuntimeError("MegaMoe overflow route is missing native tokens.")
             return execute_native_from_permuted_route(
                 route.routed_tokens,
                 route.unpermute_mapping,
@@ -100,22 +105,15 @@ class TorchMegaMoeBackend:
                 route.received_counts,
                 self.config,
             )
-        if route.metadata is None:
-            raise RuntimeError(
-                "MegaMoe route data is incomplete without capacity overflow."
-            )
-        expert_output = execute_mega_moe(
-            route.routed_tokens,
+        return execute_mega_moe(
+            hidden_states,
+            route_ids,
+            route_weights,
             weight1,
             weight2,
-            route.metadata,
+            route,
             self.runtime,
             self.workspace,
-        )
-        return restore_topk_output(
-            expert_output,
-            route.unpermute_mapping,
-            topk_weights,
         )
 
     def _validate_tensors(self, hidden_states: Any, weight1: Any, weight2: Any) -> None:

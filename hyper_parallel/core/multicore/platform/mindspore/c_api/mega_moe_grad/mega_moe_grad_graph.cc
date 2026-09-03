@@ -21,19 +21,15 @@
 #include <vector>
 #include "framework/module.h"
 
-// moe_bwd has 7 declared returns (following mega_moe_grad_op.yaml):
-//   target, hidden_dw, y, grad_gate, gate_dx, grad_x, gate_dw
-// (permute_out is written in-place but not declared as a return)
+// moe_bwd has 8 declared returns (following mega_moe_grad_op.yaml):
+//   target, hidden_dw, y, grad_gate, gate_dx, grad_x, permute_out, gate_dw
 static const mindspore::ShapeArray kBwdFakeOutShapes{
-    mindspore::ShapeVector{1}, mindspore::ShapeVector{1},
-    mindspore::ShapeVector{1}, mindspore::ShapeVector{1},
-    mindspore::ShapeVector{1}, mindspore::ShapeVector{1},
-    mindspore::ShapeVector{1}};
+  mindspore::ShapeVector{1}, mindspore::ShapeVector{1}, mindspore::ShapeVector{1}, mindspore::ShapeVector{1},
+  mindspore::ShapeVector{1}, mindspore::ShapeVector{1}, mindspore::ShapeVector{1}, mindspore::ShapeVector{1}};
 static const std::vector<mindspore::TypeId> kBwdFakeOutTypes{
-    mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8,
-    mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8,
-    mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8,
-    mindspore::TypeId::kNumberTypeInt8};
+  mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8,
+  mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8,
+  mindspore::TypeId::kNumberTypeInt8, mindspore::TypeId::kNumberTypeInt8};
 
 namespace ms_multicore {
 using mindspore::PrimitivePtr;
@@ -65,15 +61,13 @@ class CustomMoeBwd : public KernelMod {
   using KernelMod::Init;
 
   bool Init(const std::vector<KernelTensor *> &inputs, const std::vector<KernelTensor *> &outputs) override {
-    MS_LOG(WARNING) << "CustomMoeBwd graph-mode stub: input=" << inputs.size()
-                    << " output=" << outputs.size();
+    MS_LOG(WARNING) << "CustomMoeBwd graph-mode stub: input=" << inputs.size() << " output=" << outputs.size();
     return true;
   }
 
   bool Launch(const std::vector<KernelTensor *> &inputs, const std::vector<KernelTensor *> &,
               const std::vector<KernelTensor *> &outputs, void *) override {
-    MS_LOG(WARNING) << "CustomMoeBwd graph-mode stub launch: input=" << inputs.size()
-                    << " output=" << outputs.size();
+    MS_LOG(WARNING) << "CustomMoeBwd graph-mode stub launch: input=" << inputs.size() << " output=" << outputs.size();
     return true;
   }
 

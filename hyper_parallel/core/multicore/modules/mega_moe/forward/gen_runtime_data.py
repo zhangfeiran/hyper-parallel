@@ -40,7 +40,11 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 from hyper_parallel.core.multicore.scheduler.scheduler import revise_task_queue
-from hyper_parallel.core.multicore.tasks.utils import add_terminate, add_dynamic_data
+from hyper_parallel.core.multicore.tasks.utils import (
+    add_dynamic_data,
+    add_terminate,
+    add_terminate_on_event,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import (
     get_up_proj_tiling_bytes,
     get_down_proj_tiling_bytes,
@@ -90,8 +94,30 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     dispatch_op = graph.get_op("dispatch")
     swiglu_op   = graph.get_op("swiglu")
     combine_op  = graph.get_op("combine")
-    add_terminate(cfg, tsv, combine_op.task_num // tsv.ep * tsv.ep)
-    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_op.task_num)
+    terminal_epilogue = next(
+        (
+            graph.get_op(name)
+            for name in ("weighted_unpermute", "external_output_acquire")
+            if graph.has_op(name)
+        ),
+        None,
+    )
+    if terminal_epilogue is None:
+        add_terminate(cfg, tsv, combine_op.task_num // tsv.ep * tsv.ep)
+    else:
+        add_terminate_on_event(
+            cfg,
+            tsv,
+            tsv.all_event_num,
+            terminal_epilogue.task_num,
+        )
+    revise_task_queue(
+        cfg,
+        tsv,
+        dispatch_op.task_num,
+        swiglu_op.task_num,
+        combine_op.task_num,
+    )
     add_dynamic_data(cfg, tsv, dynamic_input_position=6)
     configure_ready_handshake(cfg, tsv)
 
