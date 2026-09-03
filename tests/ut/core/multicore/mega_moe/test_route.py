@@ -51,6 +51,8 @@ class TestMegaMoeRoute(unittest.TestCase):
             ep_group=None,
             rank_id=rank_id,
             num_cube_cores=24,
+            forward_fusion_mode="legacy",
+            backward_fusion_mode="legacy",
         )
 
     def test_supplied_counts_skip_bincount_validation(self):

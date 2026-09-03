@@ -31,6 +31,8 @@ _FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_FUSION_MODE"
 _FORWARD_FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_FORWARD_FUSION_MODE"
 _BACKWARD_FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_BACKWARD_FUSION_MODE"
 FusionMode = Literal["legacy", "permute", "unpermute", "both"]
+_DEFAULT_FORWARD_FUSION_MODE: FusionMode = "permute"
+_DEFAULT_BACKWARD_FUSION_MODE: FusionMode = "both"
 
 
 @dataclass(frozen=True)
@@ -47,8 +49,8 @@ class MegaMoeConfig:
     ep_group: Any | None
     rank_id: int
     num_cube_cores: int
-    forward_fusion_mode: FusionMode = "legacy"
-    backward_fusion_mode: FusionMode = "legacy"
+    forward_fusion_mode: FusionMode = _DEFAULT_FORWARD_FUSION_MODE
+    backward_fusion_mode: FusionMode = _DEFAULT_BACKWARD_FUSION_MODE
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
@@ -99,7 +101,7 @@ def _validate_fusion_mode(
     environment_name: str,
     top_k: int | None,
 ) -> FusionMode:
-    """Validate one private route-fusion experiment selector."""
+    """Validate one private route-fusion selector."""
     if fusion_mode not in _FUSION_MODES:
         expected = ", ".join(sorted(_FUSION_MODES))
         raise ValueError(
@@ -112,9 +114,24 @@ def _validate_fusion_mode(
 
 def _resolve_fusion_modes(
     top_k: int | None = None,
+    routed_slots: int | None = None,
 ) -> tuple[FusionMode, FusionMode]:
-    """Resolve independent forward/backward modes with a shared shorthand."""
-    shared_mode = os.getenv(_FUSION_MODE_ENV, "legacy")
+    """Resolve optimized defaults while preserving legacy for unsupported shapes."""
+    fusion_supported = not (
+        (top_k is not None and top_k > 16)
+        or (
+            routed_slots is not None
+            and routed_slots > _MAX_EXACT_FLOAT32_INTEGER
+        )
+    )
+    default_modes = (
+        (_DEFAULT_FORWARD_FUSION_MODE, _DEFAULT_BACKWARD_FUSION_MODE)
+        if fusion_supported
+        else ("legacy", "legacy")
+    )
+    shared_mode = os.getenv(_FUSION_MODE_ENV)
+    if shared_mode is not None:
+        default_modes = (shared_mode, shared_mode)
     forward_name = (
         _FORWARD_FUSION_MODE_ENV
         if _FORWARD_FUSION_MODE_ENV in os.environ
@@ -126,12 +143,12 @@ def _resolve_fusion_modes(
         else _FUSION_MODE_ENV
     )
     forward_mode = _validate_fusion_mode(
-        os.getenv(_FORWARD_FUSION_MODE_ENV, shared_mode),
+        os.getenv(_FORWARD_FUSION_MODE_ENV, default_modes[0]),
         forward_name,
         top_k,
     )
     backward_mode = _validate_fusion_mode(
-        os.getenv(_BACKWARD_FUSION_MODE_ENV, shared_mode),
+        os.getenv(_BACKWARD_FUSION_MODE_ENV, default_modes[1]),
         backward_name,
         top_k,
     )
@@ -189,11 +206,15 @@ def build_config(specification: Mapping[str, Any], tensor: Any) -> MegaMoeConfig
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
+    routed_slots = local_num_tokens * top_k
     receive_capacity = _resolve_receive_capacity(
         specification["expert_capacity_factor"],
-        local_num_tokens * top_k,
+        routed_slots,
     )
-    forward_fusion_mode, backward_fusion_mode = _resolve_fusion_modes(top_k)
+    forward_fusion_mode, backward_fusion_mode = _resolve_fusion_modes(
+        top_k,
+        routed_slots,
+    )
     config = MegaMoeConfig(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],

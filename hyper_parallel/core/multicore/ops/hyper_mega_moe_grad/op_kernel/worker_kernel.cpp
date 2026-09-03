@@ -618,8 +618,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
     for (int64_t row = 0; row < rows; ++row) {
       int64_t route_row = logical_src_row + row;
-      int32_t token_row = route_index[route_row] / top_k;
-      float weight = route_weight[route_row];
+      int32_t route_slot = route_index[route_row];
+      int32_t token_row = route_slot / top_k;
+      float weight = route_weight[route_slot];
       for (int64_t col = 0; col < hidden_size; col += chunk_elems) {
         int64_t elements = hidden_size - col;
         if (elements > chunk_elems) {
