@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import unittest
 from typing import Any
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -25,7 +26,8 @@ import torch
 from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
 from hyper_parallel.core.multicore.modules.mega_moe.route import (
     _resolve_counts,
-    _validate_bounded_capacity,
+    _build_route_indices,
+    _finish_count_gather,
     prepare_topk_route,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -80,25 +82,29 @@ class TestMegaMoeRoute(unittest.TestCase):
         spec = self._spec(ep_size=2, expert_capacity_factor=None)
         counts = torch.ones((2, 4), dtype=torch.int32)
 
-        with patch.object(route_module, "_maximum_destination_load") as mock_maximum:
-            _validate_bounded_capacity(counts, spec)
+        with patch.object(torch.Tensor, "item", side_effect=AssertionError("unexpected scalar readback")):
+            _, maximum = _finish_count_gather(counts, None, spec)
+        self.assertEqual(maximum, spec.receive_capacity)
+        bounded_spec = self._spec(ep_size=2, expert_capacity_factor=1.0, receive_capacity=4)
+        counts = torch.tensor([[4, 0, 0, 0], [4, 0, 0, 0]], dtype=torch.int32)
+        _, maximum = _finish_count_gather(counts, None, bounded_spec)
+        self.assertEqual(maximum, 8)
+        self.assertGreater(maximum, bounded_spec.receive_capacity)
 
-        mock_maximum.assert_not_called()
-        bounded_spec = self._spec(
-            ep_size=2,
-            expert_capacity_factor=1.0,
-            receive_capacity=4,
-        )
-        counts = torch.tensor(
-            [[4, 0, 0, 0], [4, 0, 0, 0]],
-            dtype=torch.int32,
-        )
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "configured_capacity=4, actual_maximum=8",
-        ):
-            _validate_bounded_capacity(counts, bounded_spec)
+    def test_fused_route_indices_preserve_expert_major_route_slots(self):
+        """Keep route-slot identity so kernels can recover tokens and weights."""
+        route_slots = torch.arange(6, dtype=torch.float32).reshape(-1, 1)
+        topk_ids = torch.tensor([[2, 0], [1, 2], [0, 1]], dtype=torch.int32)
+        expert_order = torch.tensor([1, 4, 2, 5, 0, 3], dtype=torch.float32)
+        inverse_order = torch.tensor([4, 0, 2, 5, 1, 3], dtype=torch.int32)
+        mock_permute = Mock(return_value=(expert_order.reshape(-1, 1), inverse_order))
+        with patch.object(route_module.torch_npu, "npu_moe_token_permute", mock_permute):
+            route_index, unpermute_mapping = _build_route_indices(route_slots, topk_ids)
+        self.assertTrue(torch.equal(route_index, expert_order.to(torch.int32)))
+        self.assertTrue(torch.equal(unpermute_mapping, inverse_order.reshape_as(topk_ids)))
+        self.assertIs(mock_permute.call_args.args[0], route_slots)
+        self.assertEqual(tuple(mock_permute.call_args.args[1].shape), (6, 1))
+        self.assertTrue(torch.equal(mock_permute.call_args.args[1].reshape_as(topk_ids), topk_ids))
 
     def test_async_count_gather_overlaps_permute_and_builds_metadata(self) -> None:
         """Wait after permutation and derive every native offset from counts."""
@@ -151,7 +157,7 @@ class TestMegaMoeRoute(unittest.TestCase):
                 hidden_states,
                 topk_ids,
                 topk_weights,
-                spec,
+                SimpleNamespace(spec=spec),
                 supplied_counts,
             )
 

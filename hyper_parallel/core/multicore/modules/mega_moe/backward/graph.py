@@ -543,6 +543,7 @@ def build_route_backward_graph(
         dispatch.fill_config.dependent_event = 0
         dispatch.fill_config.route_index_position = _POS_PERMUTE_SRC_INDEX
         dispatch.fill_config.route_weight_position = _POS_ROUTE_WEIGHT
+        dispatch.fill_config.route_top_k = tsv.top_k
         dispatch.fill_config.isolated_route_signals = True
         # Keep the route-dispatch barrier separate from the production ready
         # handshake without shifting all_event_num, which is consumed by

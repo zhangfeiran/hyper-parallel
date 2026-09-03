@@ -70,6 +70,10 @@ class AllToAllFillConfig(FillConfig):
         dispatch (fwd/bwd): all_expert_num
         combine forward:    1
 
+    route_top_k : int | None
+        Encodes route-slot indices back to source-token rows inside a fused
+        dispatch task.
+
     """
     moe_type:    AllToAllType = AllToAllType.DISPATCH
     advance:     str          = "vector"   # "vector" | "vector_only"
@@ -78,6 +82,7 @@ class AllToAllFillConfig(FillConfig):
     trigger_event: int | None = None
     route_index_position: int | None = None
     route_weight_position: int | None = None
+    route_top_k: int | None = None
     route_completion_event: int | None = None
     isolated_route_signals: bool = False
 
@@ -168,6 +173,7 @@ class AllToAllFillConfig(FillConfig):
                 if self.route_completion_event is not None
                 else 0xFFFFFFFF
             )
+            task.extra_value_3 = self.route_top_k or 0
             cfg.all_tasks[tsv.pre_task_num + i] = task
             cfg.vector_task_indices[tsv.pre_vector_task_num + i] = tsv.pre_task_num + i
 

@@ -27,6 +27,7 @@ torch = import_module("torch")
 dist = import_module("torch.distributed")
 
 _COMMUNICATION_SPLIT = 128
+_MAX_EXACT_FLOAT32_INTEGER = 1 << 24
 _FUSION_MODES = frozenset({"legacy", "permute", "unpermute", "both"})
 _FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_FUSION_MODE"
 _FORWARD_FUSION_MODE_ENV = "HYPER_PARALLEL_MEGA_MOE_FORWARD_FUSION_MODE"
@@ -221,7 +222,7 @@ def bind_mega_moe_spec(
         ep_size,
     )
     forward_fusion_mode, backward_fusion_mode = _resolve_fusion_modes(top_k)
-    return MegaMoeSpec(
+    spec = MegaMoeSpec(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],
         intermediate_size=specification["intermediate_size"],
@@ -236,3 +237,11 @@ def bind_mega_moe_spec(
         forward_fusion_mode=forward_fusion_mode,
         backward_fusion_mode=backward_fusion_mode,
     )
+    if (
+        spec.forward_permute_fused or spec.backward_permute_fused
+    ) and spec.routed_slots > _MAX_EXACT_FLOAT32_INTEGER:
+        raise ValueError(
+            "route-fused MegaMoe requires local_num_tokens * top_k to be at "
+            f"most {_MAX_EXACT_FLOAT32_INTEGER}."
+        )
+    return spec

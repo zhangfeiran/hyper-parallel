@@ -27,7 +27,6 @@ from hyper_parallel.core.multicore.platform import torch as multicore_adapter
 from .route import (
     PreparedTopKRoute,
     RouteMetadata,
-    _build_expert_route_weights,
     _build_route_indices,
     restore_topk_output,
 )
@@ -74,7 +73,6 @@ class _SavedForwardState:
     topk_weights: Any
     reduce_route_index: Any
     permute_src_index: Any
-    expert_route_weights: Any
     expert_output: Any
 
 
@@ -247,11 +245,6 @@ def _save_forward_state(
             if route.permute_src_index is not None
             else metadata.dispatch_size
         ),
-        (
-            route.expert_route_weights
-            if route.expert_route_weights is not None
-            else topk_weights
-        ),
         expert_output,
     )
 
@@ -366,18 +359,18 @@ def _prepare_fused_backward_route(
     plan: MegaMoePlan,
     saved: _SavedForwardState,
 ) -> tuple[Any, Any]:
-    """Return expert-major route indices and weights for fused dispatch."""
+    """Return expert-major route slots and weights for fused dispatch."""
     if plan.spec.forward_permute_fused:
-        return saved.permute_src_index, saved.expert_route_weights
-
-    token_rows = _route_tensor(plan.route_token_rows, "token-row metadata")
-    permute_src_index, inverse_order = _build_route_indices(
-        token_rows,
-        saved.topk_ids,
-    )
-    route_weight = _build_expert_route_weights(
-        inverse_order,
-        saved.topk_weights,
+        permute_src_index = saved.permute_src_index
+    else:
+        route_slots = _route_tensor(plan.route_slots, "route-slot metadata")
+        permute_src_index, _ = _build_route_indices(
+            route_slots,
+            saved.topk_ids,
+        )
+    route_weight = saved.topk_weights.detach().reshape(-1).index_select(
+        0,
+        permute_src_index,
     )
     return permute_src_index, route_weight
 

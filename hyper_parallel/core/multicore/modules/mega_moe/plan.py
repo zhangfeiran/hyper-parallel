@@ -74,7 +74,7 @@ class MegaMoePlan:
     w1_grad_tiling: Any
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
-    route_token_rows: Any | None
+    route_slots: Any | None
 
 
 @dataclass(frozen=True)
@@ -258,12 +258,12 @@ def _build_tilings(
     )
 
 
-def _build_route_token_rows(spec: MegaMoeSpec, device: Any) -> Any | None:
-    """Cache the token-row payload used only by permute-fused routing."""
+def _build_route_slots(spec: MegaMoeSpec, device: Any) -> Any | None:
+    """Cache route-slot IDs used only by permute-fused routing."""
     if not (spec.forward_permute_fused or spec.backward_permute_fused):
         return None
     return torch.arange(
-        spec.local_num_tokens,
+        spec.routed_slots,
         dtype=torch.float32,
         device=device,
     ).reshape(-1, 1)
@@ -299,5 +299,5 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         w1_grad_tiling=tilings.w1_grad,
         w2_grad_tiling=tilings.w2_grad,
         swiglu_grad_tiling=tilings.swiglu_grad,
-        route_token_rows=_build_route_token_rows(spec, device),
+        route_slots=_build_route_slots(spec, device),
     )
