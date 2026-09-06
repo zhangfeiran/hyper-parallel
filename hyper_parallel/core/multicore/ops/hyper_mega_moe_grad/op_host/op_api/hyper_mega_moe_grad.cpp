@@ -42,13 +42,13 @@ const std::array<const aclTensor *, 8> HyperMegaMoeGrad(
   const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
   const aclTensor *permute_src_index, const aclTensor *route_weight, const aclTensor *reduce_route_index,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size,
-  int64_t receive_capacity, int64_t wave_count, int64_t cycle_profile, aclOpExecutor *executor) {
+  int64_t receive_capacity, int64_t wave_count, int64_t cycle_profile, int64_t home_experts, aclOpExecutor *executor) {
   L0_DFX(HyperMegaMoeGrad, dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, hidden, hidden_dw,
          weight, y, gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size,
          permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
          swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters,
          permute_src_index, route_weight, reduce_route_index, rankId, ep, expert_num, hidden_size, seq_size,
-         receive_capacity, wave_count, cycle_profile);
+         receive_capacity, wave_count, cycle_profile, home_experts);
   auto dispatch_target_out = const_cast<aclTensor *>(dispatch_target);
   auto hidden_dw_out = const_cast<aclTensor *>(hidden_dw);
   auto y_out = const_cast<aclTensor *>(y);
@@ -66,7 +66,7 @@ const std::array<const aclTensor *, 8> HyperMegaMoeGrad(
              reduce_route_index),
     OP_OUTPUT(dispatch_target_out, hidden_dw_out, y_out, grad_gate_out, gate_dx_out, grad_x_out, permute_out_out,
               gate_dw_out),
-    OP_ATTR(rankId, ep, expert_num, hidden_size, seq_size, receive_capacity, wave_count, cycle_profile));
+    OP_ATTR(rankId, ep, expert_num, hidden_size, seq_size, receive_capacity, wave_count, cycle_profile, home_experts));
   if (ret != ACL_SUCCESS) {
     OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "HyperMegaMoeGrad ADD_TO_LAUNCHER_LIST_AICORE failed.");
     return {dispatch_target_out, hidden_dw_out, y_out,           grad_gate_out,

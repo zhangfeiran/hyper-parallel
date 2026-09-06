@@ -38,6 +38,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
   static constexpr uint64_t GMM_WORKSPACE_BYTES = 32ULL * 1024ULL * 1024ULL;
   static constexpr uint32_t RECEIVE_CAPACITY_TILING_INDEX = 7;
   static constexpr uint32_t WAVE_COUNT_TILING_INDEX = 8;
+  static constexpr uint32_t HOME_EXPERTS_TILING_INDEX = 9;
   static constexpr bool HAS_MID_WAVE_ROUTE_BARRIER = true;
   static constexpr bool CYCLE_PROFILE_ENABLED = EnableCycleProfile;
   static constexpr uint32_t CYCLE_PROFILE_WORKSPACE_IDX = 26;
@@ -74,12 +75,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
       return;
     }
     const int64_t row_count = (rows - row_begin < rows_per_lane) ? rows - row_begin : rows_per_lane;
-    const uint64_t expert_offset =
-      static_cast<uint64_t>(expert) * static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
     const uint64_t row_offset = static_cast<uint64_t>(row_begin) * static_cast<uint64_t>(cols);
     GlobalTensor<T> output;
     output.SetGlobalBuffer((__gm__ T *)output_addr);
-    InitOutput<T>(output[expert_offset + row_offset], static_cast<uint32_t>(row_count * cols), 0);
+    InitOutput<T>(output[row_offset], static_cast<uint32_t>(row_count * cols), 0);
   }
 
   __aicore__ inline void ZeroEmptyWeightGradBlocks() {
@@ -92,11 +91,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
     }
     const int64_t local_experts = expert_num / ep;
     GM_ADDR group_list = input_list[19];
+    const int64_t dw2_bytes = intermediate_size * hidden_size * sizeof(DTYPE_DISPATCH_TARGET);
     for (int64_t expert = 0; expert < local_experts; ++expert) {
-      ZeroEmptyExpertMatrix<DTYPE_DISPATCH_TARGET>(input_list[6], group_list, expert, intermediate_size, hidden_size,
-                                                   local_experts);
-      ZeroEmptyExpertMatrix<DTYPE_DISPATCH_TARGET>(input_list[18], group_list, expert, hidden_size,
-                                                   intermediate_size * 2, local_experts);
+      ZeroEmptyExpertMatrix<DTYPE_DISPATCH_TARGET>(
+        this->GetExpertMatrix(6, expert, dw2_bytes, 3), group_list, expert,
+        intermediate_size, hidden_size, local_experts);
+      ZeroEmptyExpertMatrix<DTYPE_DISPATCH_TARGET>(
+        this->GetExpertMatrix(18, expert, dw2_bytes * 2, 2), group_list, expert,
+        hidden_size, intermediate_size * 2, local_experts);
     }
   }
 #endif
@@ -791,11 +793,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
     const int64_t lane_end = lane_begin + elements_per_lane < matrix_elements
       ? lane_begin + elements_per_lane
       : matrix_elements;
-    const int64_t persistent_offset =
-      static_cast<int64_t>(expert) * matrix_elements + lane_begin;
+    const int64_t persistent_offset = lane_begin;
+    const uint32_t output_position = task_desc.outputs[0].input_position;
     __gm__ DTYPE_DISPATCH_TARGET *persistent_base =
-      (__gm__ DTYPE_DISPATCH_TARGET *)input_list[
-        task_desc.outputs[0].input_position];
+      (__gm__ DTYPE_DISPATCH_TARGET *)this->GetExpertMatrix(
+        output_position, expert, matrix_elements * sizeof(DTYPE_DISPATCH_TARGET), output_position == 18 ? 2 : 3);
     __gm__ DTYPE_DISPATCH_TARGET *scratch_base =
       (__gm__ DTYPE_DISPATCH_TARGET *)GetWeightGradScratchMatrix(
         task_desc, expert);
@@ -1031,24 +1033,32 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
       ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
       : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
     GM_ADDR output_base = input_list[task_desc.outputs[0].input_position];
+    GM_ADDR input_1_base = input_list[task_desc.inputs[1].input_position];
     if (is_weight_grad) {
-      output_0_offset =
-        static_cast<int64_t>(data_index) * task_desc.inputs[0].dim[1] *
+      const int64_t matrix_bytes =
+        static_cast<int64_t>(task_desc.inputs[0].dim[1]) *
         task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
+      const uint32_t output_position = task_desc.outputs[0].input_position;
+      output_base = this->GetExpertMatrix(
+        output_position, data_index, matrix_bytes, output_position == 18 ? 2 : 3);
+      output_0_offset = 0;
       if (this->IsMultiWave() && this->wave_index_ > 0 &&
           !atomic_weight_grad) {
         output_base = GetWeightGradScratchMatrix(task_desc, data_index);
         output_0_offset = 0;
       }
     } else {
-      input_1_offset +=
-        static_cast<int64_t>(data_index) * task_desc.inputs[1].dim[1] *
+      const int64_t matrix_bytes =
+        static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
         task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+      const uint32_t weight_position = task_desc.inputs[1].input_position;
+      input_1_base = this->GetExpertMatrix(
+        weight_position, data_index, matrix_bytes, weight_position == 11 ? 0 : 1);
     }
 
     grouped_matmul(
       input_list[task_desc.inputs[0].input_position] + input_0_offset,
-      input_list[task_desc.inputs[1].input_position] + input_1_offset,
+      input_1_base + input_1_offset,
       nullptr, nullptr, nullptr, nullptr, nullptr, grouped_list_real, nullptr,
       output_base + output_0_offset,
       input_list[WORKSPACE_IDX], tiling_data_addr, is_weight_grad,

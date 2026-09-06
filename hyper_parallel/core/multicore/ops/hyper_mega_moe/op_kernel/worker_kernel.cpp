@@ -30,6 +30,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   static constexpr uint32_t WORKSPACE_IDX = 11;
   static constexpr uint32_t RECEIVE_CAPACITY_TILING_INDEX = 6;
   static constexpr uint32_t WAVE_COUNT_TILING_INDEX = 7;
+  static constexpr uint32_t HOME_EXPERTS_TILING_INDEX = 8;
   static constexpr bool HAS_MID_WAVE_ROUTE_BARRIER = false;
   static constexpr bool CYCLE_PROFILE_ENABLED = false;
 
@@ -393,12 +394,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     const int64_t output_0_offset = task_desc.outputs[0].dynamic_shape == 1
       ? output_row * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
       : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
-    const int64_t weight_offset =
-      static_cast<int64_t>(data_index) * task_desc.inputs[1].dim[1] *
+    const int64_t matrix_bytes =
+      static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
       task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+    const uint32_t weight_position = task_desc.inputs[1].input_position;
     grouped_matmul(
       input_list[task_desc.inputs[0].input_position] + input_0_offset,
-      input_list[task_desc.inputs[1].input_position] + weight_offset,
+      this->GetExpertMatrix(weight_position, data_index, matrix_bytes, weight_position == 5 ? 0 : 1),
       nullptr, nullptr, nullptr, nullptr, nullptr, grouped_list_real, nullptr,
       input_list[task_desc.outputs[0].input_position] + output_0_offset,
       input_list[WORKSPACE_IDX], tiling_data_addr, false, false);

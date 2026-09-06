@@ -38,6 +38,31 @@ _PRECISION_WORLD_SIZE = 2
 _PERFORMANCE_WORLD_SIZE = 4
 
 
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_shared_weight_pool_lifecycle(monkeypatch) -> None:
+    """Compare shared staging with native across layers and backward replay.
+
+    Feature: cross-layer physical-weight staging
+    Description: cover deferred graphs, checkpoint, retained graphs and updates
+    Expectation: stable storage and native-equivalent outputs and gradients
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    worker = str(Path(__file__).with_name("_test_mega_moe_shared_weights.py"))
+    with without_inherited_rank_environment():
+        parallel_run(
+            [TorchCase(worker, "test_shared_weight_pool_lifecycle", num_proc=_PRECISION_WORLD_SIZE)],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
 def _prepare_torch_multicore_test_environment() -> None:
     """Activate multicore and require a payload built for the Torch framework."""
     prepare_multicore_test_environment()

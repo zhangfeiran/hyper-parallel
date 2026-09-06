@@ -112,7 +112,7 @@ std::vector<ms::Tensor> npu_mega_moe_grad(const ms::Tensor &dispatch_target,  //
     permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
     swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, permute_src_index,
     route_weight, reduce_route_index, rank_id, ep, expert_num, hidden_size, seq_size,
-    receive_capacity, wave_count, 0));
+    receive_capacity, wave_count, 0, 0));
 
   std::vector<ms::Tensor> inputs = {
     dispatch_target,

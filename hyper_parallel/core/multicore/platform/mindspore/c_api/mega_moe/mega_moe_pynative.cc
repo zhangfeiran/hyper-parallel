@@ -110,7 +110,7 @@ std::vector<ms::Tensor> npu_mega_moe(const ms::Tensor &dispatch_target,      // 
     up_proj_weight, up_proj_glist, up_proj_y, swiglu_out, down_proj_weight, down_proj_glist, down_proj_y,
     combine_target, combine_target_off, combine_src_off, combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling,
     down_proj_tiling, runtime_config, all_event_counters, original_x, permute_src_index, reduce_route_index,
-    topk_weights, final_out, rank_id, ep, expert_num, hidden_size, seq_size, receive_capacity, wave_count));
+    topk_weights, final_out, rank_id, ep, expert_num, hidden_size, seq_size, receive_capacity, wave_count, 0));
 
   // All tensors are inputs so the framework prepares their device
   // addresses before the async launch.

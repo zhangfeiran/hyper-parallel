@@ -27,7 +27,7 @@ from hyper_parallel.platform.torch.symmetric_memory import acquire_symmetric_mem
 from ..module import MulticoreModule
 from .function import execute_mega_moe
 from .plan import build_mega_moe_plan
-from .replica import ExpertReplicaManager
+from .replica import ExpertReplicaManager, SharedExpertWeightLease
 from .route import prepare_topk_route
 from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
@@ -67,6 +67,7 @@ class _MegaMoeExecutionResources:
         active_specifications: tuple[Any, ...],
         pool_cache_size: int = 1,
         compact_physical_weights: bool = False,
+        shared_physical_weights: bool = False,
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
@@ -85,6 +86,7 @@ class _MegaMoeExecutionResources:
         except Exception:
             self.symmetric_memory.close()
             raise
+        self.shared_physical_weights = shared_physical_weights
         self.replica_manager = (
             ExpertReplicaManager(
                 self.spec, pool_cache_size=pool_cache_size,
@@ -123,6 +125,7 @@ class MegaMoeExperts(MulticoreModule):
         expert_capacity_factor: float | None = None,
         replica_slots_per_rank: int = 0,
         compact_physical_weights: bool = False,
+        shared_physical_weights: bool = False,
         ep_size: int = 1,
         ep_group: Any | None = None,
     ) -> None:
@@ -146,6 +149,12 @@ class MegaMoeExperts(MulticoreModule):
                 are not modified between their forward and backward. The first
                 active placement may rebind parameter storage, so callers must
                 not retain raw storage aliases across that boundary.
+            shared_physical_weights: Experimental B-slot replica weight and
+                gradient pools shared by execution-resource group members.
+                Kernels read home parameters directly and prefetch only replicas
+                before forward and backward; never rebinds parameters. Requires
+                replica slots and excludes compact storage. Extra pool capacity
+                is independent of layer count and requires the split-weight ABI.
             ep_size: Expert-parallel degree. The current SHMEM path requires it
                 to cover the complete Torch distributed world.
             ep_group: Torch expert-parallel process group with the same rank
@@ -160,6 +169,7 @@ class MegaMoeExperts(MulticoreModule):
             expert_capacity_factor=expert_capacity_factor,
             replica_slots_per_rank=replica_slots_per_rank,
             compact_physical_weights=compact_physical_weights,
+            shared_physical_weights=shared_physical_weights,
             ep_size=ep_size,
         )
         if expert_capacity_factor is not None:
@@ -173,6 +183,7 @@ class MegaMoeExperts(MulticoreModule):
             "expert_capacity_factor": expert_capacity_factor,
             "replica_slots_per_rank": replica_slots_per_rank,
             "compact_physical_weights": compact_physical_weights,
+            "shared_physical_weights": shared_physical_weights,
             "ep_size": ep_size,
             "ep_group": ep_group,
         }
@@ -185,6 +196,7 @@ class MegaMoeExperts(MulticoreModule):
             expert_capacity_factor,
             replica_slots_per_rank,
             compact_physical_weights,
+            shared_physical_weights,
             ep_size,
             id(ep_group),
         )
@@ -201,6 +213,7 @@ class MegaMoeExperts(MulticoreModule):
         self.expert_capacity_factor = expert_capacity_factor
         self.replica_slots_per_rank = replica_slots_per_rank
         self.compact_physical_weights = compact_physical_weights
+        self.shared_physical_weights = shared_physical_weights
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
@@ -214,6 +227,7 @@ class MegaMoeExperts(MulticoreModule):
     def _validate_replica_options(
         replica_slots_per_rank: int,
         compact_physical_weights: bool,
+        shared_physical_weights: bool,
     ) -> None:
         """Validate public physical-weight storage controls."""
         if (
@@ -230,6 +244,12 @@ class MegaMoeExperts(MulticoreModule):
                 "compact_physical_weights must be a bool, got "
                 f"{compact_physical_weights!r}."
             )
+        if not isinstance(shared_physical_weights, bool):
+            raise TypeError("shared_physical_weights must be a bool.")
+        if shared_physical_weights and (compact_physical_weights or not replica_slots_per_rank):
+            raise ValueError(
+                "shared_physical_weights requires replica slots and excludes compact_physical_weights."
+            )
 
     @staticmethod
     def _validate_topology(
@@ -242,6 +262,7 @@ class MegaMoeExperts(MulticoreModule):
         expert_capacity_factor: float | None,
         replica_slots_per_rank: int,
         compact_physical_weights: bool,
+        shared_physical_weights: bool,
         ep_size: int,
     ) -> None:
         """Validate static shape and topology values before allocation."""
@@ -267,6 +288,7 @@ class MegaMoeExperts(MulticoreModule):
         MegaMoeExperts._validate_replica_options(
             replica_slots_per_rank,
             compact_physical_weights,
+            shared_physical_weights,
         )
         if local_num_tokens % _COMMUNICATION_SPLIT:
             raise ValueError(
@@ -403,7 +425,8 @@ class MegaMoeExperts(MulticoreModule):
             resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
             route_options["home_runtime"] = resources.home_runtime
             route_options["placement_callback"] = partial(
-                resources.replica_manager.start_prefetch,
+                (resources.replica_manager.start_shared_prefetch
+                 if resources.shared_physical_weights else resources.replica_manager.start_prefetch),
                 self.gate_up_weight,
                 self.down_weight,
             )
@@ -417,24 +440,33 @@ class MegaMoeExperts(MulticoreModule):
         )
         physical_weight1 = self.gate_up_weight
         physical_weight2 = self.down_weight
+        shared_lease = None
         if route.placement is not None:
             if resources.replica_manager is None:
                 raise RuntimeError("MegaMoe route produced an unexpected replica placement.")
             pending_weights = route.placement_payload
             if pending_weights is None:
                 raise RuntimeError("MegaMoe replica placement did not prefetch weights.")
-            physical_weight1, physical_weight2 = pending_weights.wait()
-        output = execute_mega_moe(
-            hidden_flat,
-            route.physical_topk_ids,
-            route_weights,
-            physical_weight1,
-            physical_weight2,
-            route,
-            route.plan,
-            resources.workspace,
-        )
-        return output.reshape(hidden_states.shape)
+            if isinstance(pending_weights, SharedExpertWeightLease):
+                shared_lease = pending_weights
+            else:
+                physical_weight1, physical_weight2 = pending_weights.wait()
+        try:
+            output = execute_mega_moe(
+                hidden_flat,
+                route.physical_topk_ids,
+                route_weights,
+                physical_weight1,
+                physical_weight2,
+                route,
+                route.plan,
+                resources.workspace,
+            )
+            return output.reshape(hidden_states.shape)
+        finally:
+            if shared_lease is not None:
+                shared_lease.release()
+
 
     def _create_execution_resources(
         self,
@@ -451,4 +483,5 @@ class MegaMoeExperts(MulticoreModule):
             active_specifications=active_specifications,
             pool_cache_size=len(self._resource_group.members),
             compact_physical_weights=self.compact_physical_weights,
+            shared_physical_weights=self.shared_physical_weights,
         )

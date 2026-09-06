@@ -39,7 +39,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
   const aclTensor *original_x, const aclTensor *permute_src_index, const aclTensor *reduce_route_index,
   const aclTensor *topk_weights, const aclTensor *final_out, int64_t rankId, int64_t ep, int64_t expert_num,
   int64_t hidden_size, int64_t seq_size, int64_t receive_capacity,
-  int64_t wave_count, uint64_t *workspaceSize, aclOpExecutor **executor) {
+  int64_t wave_count, int64_t home_experts, uint64_t *workspaceSize, aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
   L2_DFX_PHASE_1(aclnnHyperMegaMoe,
                  DFX_IN(dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off, dispatch_size, weight,
@@ -47,7 +47,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
                         combine_target_off, combine_src_off, combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling,
                         down_proj_tiling, runtime_config, all_event_counters, original_x, permute_src_index,
                         reduce_route_index, topk_weights, final_out, rankId, ep, expert_num, hidden_size, seq_size,
-                        receive_capacity, wave_count),
+                        receive_capacity, wave_count, home_experts),
                  DFX_OUT(dispatch_target, y, swiglu_out, down_proj_y, combine_target, final_out));
   auto uniqueExecutor = CREATE_EXECUTOR();
   aclOpExecutor *executorPtr = uniqueExecutor.get();
@@ -58,7 +58,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
     swiglu_out, down_proj_weight, down_proj_glist, down_proj_y, combine_target, combine_target_off, combine_src_off,
     combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling, runtime_config, all_event_counters,
     original_x, permute_src_index, reduce_route_index, topk_weights, final_out, rankId, ep, expert_num, hidden_size,
-    seq_size, receive_capacity, wave_count, uniqueExecutor.get());
+    seq_size, receive_capacity, wave_count, home_experts, uniqueExecutor.get());
   bool fwd_output_success =
     std::all_of(fwd_output.begin(), fwd_output.end(), [](const aclTensor *ptr) { return ptr != nullptr; });
   CHECK_RET(fwd_output_success, ACLNN_ERR_INNER_NULLPTR);

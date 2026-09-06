@@ -67,6 +67,7 @@ REG_OP(HyperMegaMoeGrad)
   .ATTR(receive_capacity, Int, 0)
   .ATTR(wave_count, Int, 1)
   .ATTR(cycle_profile, Int, 0)
+  .ATTR(home_experts, Int, 0)
   .OP_END_FACTORY_REG(HyperMegaMoeGrad)
 }  // namespace ge
 

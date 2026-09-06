@@ -33,6 +33,55 @@ class TestMegaMoeExperts(unittest.TestCase):
     @patch.object(MegaMoeExperts, "_validate_forward_inputs")
     @patch.object(backend_module, "execute_mega_moe")
     @patch.object(backend_module, "prepare_topk_route")
+    def test_shared_prefetch_keeps_home_autograd_inputs_and_releases_on_error(
+        self, prepare_route, execute, _validate
+    ):
+        """Give autograd home tensors, and release shared scratch after a failed call.
+
+        Feature: backend shared-weight execution boundary
+        Description: route through shared prefetch then fail the kernel entry
+        Expectation: unchanged home arguments and the staging lease is released
+        """
+        backend = MegaMoeExperts(
+            local_num_tokens=128, hidden_size=4, intermediate_size=3,
+            num_experts=4, top_k=2, ep_size=2,
+        )
+        self.addCleanup(backend.close)
+        backend.spec = Mock()
+        backend.plan = Mock()
+        backend.home_runtime = Mock()
+        backend.workspace = Mock()
+        backend.replica_manager = Mock()
+        backend.shared_physical_weights = True
+        plan = Mock()
+        lease = backend_module.SharedExpertWeightLease(
+            backend.replica_manager, plan, (Mock(), Mock()), (), ()
+        )
+        backend.replica_manager.start_shared_prefetch.return_value = lease
+        route = SimpleNamespace(placement=plan, placement_payload=lease, plan=Mock(), physical_topk_ids=Mock())
+
+        def prepare(*_args: Any, **kwargs: Any) -> Any:
+            """Invoke the backend's actual prefetch callback before returning metadata."""
+            kwargs["placement_callback"](plan)
+            return route
+
+        prepare_route.side_effect = prepare
+        execute.side_effect = RuntimeError("kernel failed")
+        hidden, ids, route_weights = (Mock() for _ in range(3))
+        weight1, weight2 = backend.gate_up_weight, backend.down_weight
+        backend._get_execution_resources = Mock(return_value=backend)
+        backend._validate_forward_inputs.return_value = hidden
+        with self.assertRaisesRegex(RuntimeError, "kernel failed"):
+            backend.forward(hidden, ids, route_weights, tokens_per_expert=None)
+        backend.replica_manager.start_shared_prefetch.assert_called_once_with(weight1, weight2, plan)
+        self.assertIs(execute.call_args.args[3], weight1)
+        self.assertIs(execute.call_args.args[4], weight2)
+        backend.replica_manager.release_shared_pool.assert_called_once_with()
+        self.assertTrue(lease.released)
+
+    @patch.object(MegaMoeExperts, "_validate_forward_inputs")
+    @patch.object(backend_module, "execute_mega_moe")
+    @patch.object(backend_module, "prepare_topk_route")
     def test_receive_overflow_uses_kernel_multi_wave(
         self,
         mock_prepare_route,
@@ -69,6 +118,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         backend.plan = Mock(name="plan")
         backend.workspace = Mock(name="workspace")
         backend.replica_manager = None
+        backend.shared_physical_weights = False
 
         hidden_states = Mock(name="hidden_states")
         topk_ids = Mock(name="topk_ids")
@@ -137,6 +187,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         backend.home_runtime = Mock(name="home_runtime")
         backend.workspace = Mock(name="workspace")
         backend.replica_manager = Mock(name="replica_manager")
+        backend.shared_physical_weights = False
         pending = backend.replica_manager.start_prefetch.return_value
         physical_weight1 = Mock(name="physical_weight1")
         physical_weight2 = Mock(name="physical_weight2")

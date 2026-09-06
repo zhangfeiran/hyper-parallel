@@ -106,6 +106,7 @@ print(json.dumps({
                     "expert_capacity_factor": None,
                     "replica_slots_per_rank": 0,
                     "compact_physical_weights": False,
+                    "shared_physical_weights": False,
                     "ep_size": 2,
                     "ep_group": None,
                 },
@@ -139,6 +140,30 @@ print(json.dumps({
                 )
 
         mock_create_parameters.assert_not_called()
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_shared_physical_weights_validate_storage_contract(self, mock_create_parameters):
+        """Reject ambiguous flags and incompatible storage modes before allocation.
+
+        Feature: replayable shared-weight configuration
+        Description: validate mode types, replica budget and compact exclusion
+        Expectation: invalid modes fail and storage modes cannot share a backend
+        """
+        mock_create_parameters.return_value = (object(), object())
+        shape = {"local_num_tokens": 128, "hidden_size": 16, "intermediate_size": 8,
+                 "num_experts": 4, "top_k": 2, "ep_size": 2}
+        for flag in (0, 1, "true", None):
+            with self.subTest(flag=flag), self.assertRaisesRegex(TypeError, "shared_physical_weights"):
+                MegaMoeExperts(**shape, replica_slots_per_rank=1, shared_physical_weights=flag)
+        for slots, compact in ((0, False), (1, True)):
+            with self.subTest(slots=slots, compact=compact), self.assertRaisesRegex(ValueError, "requires"):
+                MegaMoeExperts(**shape, replica_slots_per_rank=slots,
+                               compact_physical_weights=compact, shared_physical_weights=True)
+        ordinary = MegaMoeExperts(**shape, replica_slots_per_rank=1)
+        shared = MegaMoeExperts(**shape, replica_slots_per_rank=1, shared_physical_weights=True)
+        with self.assertRaisesRegex(ValueError, "identical configuration"):
+            MegaMoeExperts.share_execution_resources((ordinary, shared))
+
 
     def test_forward_passes_router_inputs_and_restores_shape(self) -> None:
         """Preserve Router inputs, expert parameters and the caller's shape."""

@@ -481,6 +481,7 @@ class MegaMoeWorkspace:
         receive_capacity: int,
         reuse_retained_scratch: bool,
         atomic_dw_accumulation: bool,
+        physical_experts: int | None = None,
     ) -> None:
         """Grow dW scratch while preserving capacity for outstanding backwards.
 
@@ -497,9 +498,14 @@ class MegaMoeWorkspace:
                 first retained up-projection window.
             atomic_dw_accumulation: Whether later waves atomically add into the
                 persistent dW outputs and therefore need no matrix scratch.
+            physical_experts: Home plus replica groups when weights use separate
+                storage. Defaults to the supplied weight tensor's group count.
         """
 
         required_bytes = _GMM_WORKSPACE_BYTES
+        experts = weight1.shape[0] if physical_experts is None else physical_experts
+        if not isinstance(experts, int) or isinstance(experts, bool) or experts < weight1.shape[0]:
+            raise ValueError("physical_experts must cover all supplied home weight groups.")
         if wave_count > 1 and not atomic_dw_accumulation:
             if reuse_retained_scratch:
                 if (
@@ -514,7 +520,7 @@ class MegaMoeWorkspace:
                         "retained dW scratch requires matching gated-MLP weights."
                     )
                 plan = _plan_weight_grad_scratch(
-                    local_experts=weight1.shape[0],
+                    local_experts=experts,
                     hidden_size=weight1.shape[1],
                     intermediate_size=weight2.shape[1],
                     element_size=weight1.element_size(),
@@ -523,8 +529,10 @@ class MegaMoeWorkspace:
                 required_bytes += plan.tail_bytes
             else:
                 required_bytes += (
-                    weight1.numel() * weight1.element_size()
-                    + weight2.numel() * weight2.element_size()
+                    experts * (
+                        weight1[0].numel() * weight1.element_size()
+                        + weight2[0].numel() * weight2.element_size()
+                    )
                 )
         if self.gmm_workspace is None or self.device is None:
             raise RuntimeError("MegaMoe GMM workspace is not initialized.")

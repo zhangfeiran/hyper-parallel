@@ -105,7 +105,7 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
   const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
   const aclTensor *permute_src_index, const aclTensor *route_weight, const aclTensor *reduce_route_index,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size,
-  int64_t receive_capacity, int64_t wave_count, int64_t cycle_profile,
+  int64_t receive_capacity, int64_t wave_count, int64_t cycle_profile, int64_t home_experts,
   uint64_t *workspaceSize, aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
   L2_DFX_PHASE_1(
@@ -115,7 +115,7 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
            gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling, swiglu_grad_tiling,
            gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, permute_src_index, route_weight,
            reduce_route_index, rankId, ep, expert_num, hidden_size, seq_size, receive_capacity,
-           wave_count, cycle_profile),
+           wave_count, cycle_profile, home_experts),
     DFX_OUT(dispatch_target, hidden_dw, y, grad_gate, gate_dx, grad_x, permute_out, gate_dw));
 
   auto uniqueExecutor = CREATE_EXECUTOR();
@@ -135,7 +135,7 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
     params.permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
     swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, permute_src_index,
     route_weight, reduce_route_index, rankId, ep, expert_num, hidden_size, seq_size,
-    receive_capacity, wave_count, cycle_profile, executorPtr);
+    receive_capacity, wave_count, cycle_profile, home_experts, executorPtr);
   bool bwd_output_success =
     std::all_of(bwd_output.begin(), bwd_output.end(), [](const aclTensor *ptr) { return ptr != nullptr; });
   CHECK_RET(bwd_output_success, ACLNN_ERR_INNER_NULLPTR);

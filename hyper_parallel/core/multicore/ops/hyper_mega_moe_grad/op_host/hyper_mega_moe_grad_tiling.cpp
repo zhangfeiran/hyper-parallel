@@ -24,7 +24,7 @@ const uint64_t BLOCK_SIZE = 32;
 const uint64_t BUFFER_NUM = 2;
 
 static ge::graphStatus GetIntermediateSize(gert::TilingContext *context, int64_t hiddenSize, int64_t expertNum,
-                                           int64_t ep, int64_t *intermediateSize) {
+                                           int64_t ep, int64_t homeExperts, int64_t *intermediateSize) {
   constexpr size_t kWeight2Index = 7;
   constexpr size_t kWeight1Index = 11;
   auto weight2Shape = context->GetInputShape(kWeight2Index);
@@ -33,8 +33,13 @@ static ge::graphStatus GetIntermediateSize(gert::TilingContext *context, int64_t
   OP_CHECK_NULL_WITH_CONTEXT(context, weight1Shape);
   const auto &weight2 = weight2Shape->GetOriginShape();
   const auto &weight1 = weight1Shape->GetOriginShape();
-  if (weight2.GetDimNum() != 3 || weight1.GetDimNum() != 3 || ep <= 0 || expertNum <= 0 || expertNum % ep != 0 ||
-      weight2.GetDim(0) != expertNum / ep || weight1.GetDim(0) != expertNum / ep || weight2.GetDim(1) != hiddenSize ||
+  if (ep <= 0 || expertNum <= 0 || expertNum % ep != 0 || homeExperts < 0 || homeExperts >= expertNum / ep) {
+    OP_LOGE(context->GetNodeName(), "home_experts must be zero or a proper physical-expert prefix");
+    return ge::GRAPH_FAILED;
+  }
+  const int64_t weightExperts = homeExperts > 0 ? homeExperts : expertNum / ep;
+  if (weight2.GetDimNum() != 3 || weight1.GetDimNum() != 3 ||
+      weight2.GetDim(0) != weightExperts || weight1.GetDim(0) != weightExperts || weight2.GetDim(1) != hiddenSize ||
       weight1.GetDim(2) != hiddenSize || weight1.GetDim(1) != 2 * weight2.GetDim(2) || weight2.GetDim(2) <= 0) {
     OP_LOGE(context->GetNodeName(), "HyperMegaMoeGrad weights must have shapes [E,H,I] and [E,2I,H]");
     return ge::GRAPH_FAILED;
@@ -83,9 +88,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     tiling.set_hiddenSize((*(attr->GetAttrPointer<int64_t>(3))));
     tiling.set_seqSize((*(attr->GetAttrPointer<int64_t>(4))));
     tiling.set_coreNum(static_cast<int64_t>(coreNum));
+    auto homeExperts = attr->GetAttrPointer<int64_t>(8);
+    OP_CHECK_NULL_WITH_CONTEXT(context, homeExperts);
+    tiling.set_homeExperts(*homeExperts);
     int64_t intermediateSize = 0;
     if (GetIntermediateSize(context, tiling.get_hiddenSize(), tiling.get_expertNum(), tiling.get_ep(),
-                            &intermediateSize) != ge::GRAPH_SUCCESS) {
+                            *homeExperts, &intermediateSize) != ge::GRAPH_SUCCESS) {
       return ge::GRAPH_FAILED;
     }
     tiling.set_intermediateSize(intermediateSize);

@@ -24,6 +24,7 @@ from typing import Any
 
 from hyper_parallel.core.multicore.platform import torch as multicore_adapter
 
+from .replica import SharedExpertWeightLease
 from .route import (
     PreparedTopKRoute,
     RouteMetadata,
@@ -390,6 +391,7 @@ def _launch_forward(
     route: PreparedTopKRoute,
     topk_weights: Any,
     buffers: _ForwardBuffers,
+    shared_lease: SharedExpertWeightLease | None = None,
 ) -> None:
     """Launch the forward graph with route-mode-independent ABI arguments."""
     spec = plan.spec
@@ -414,7 +416,11 @@ def _launch_forward(
         plan.up_proj_tiling,
         plan.swiglu_tiling,
         plan.down_proj_tiling,
-        plan.fwd_runtime_config,
+        (
+            plan.fwd_runtime_config
+            if shared_lease is None
+            else shared_lease.runtime_config(plan.fwd_runtime_config)
+        ),
         buffers.events,
         hidden_states,
         buffers.permute_src_index,
@@ -428,6 +434,7 @@ def _launch_forward(
         spec.local_num_tokens,
         metadata.receive_capacity,
         metadata.wave_count,
+        spec.local_experts if shared_lease is not None else 0,
     )
 
 
@@ -576,10 +583,14 @@ def _launch_backward(
     saved: _SavedForwardState,
     route_state: _BackwardRouteState,
     buffers: _BackwardBuffers,
+    shared_lease: SharedExpertWeightLease | None = None,
 ) -> None:
     """Launch the backward graph with route-mode-independent ABI arguments."""
     plan = ctx.plan
     spec = plan.spec
+    runtime_config = plan.bwd_multi_wave_runtime_config if ctx.wave_count > 1 else plan.bwd_runtime_config
+    if shared_lease is not None:
+        runtime_config = shared_lease.runtime_config(runtime_config, backward=True)
     multicore_adapter.mega_moe_grad(
         route_state.dispatch,
         saved.dispatch_target_off,
@@ -608,11 +619,7 @@ def _launch_backward(
         plan.swiglu_grad_tiling,
         buffers.gmm_workspace,
         buffers.swiglu_workspace,
-        (
-            plan.bwd_multi_wave_runtime_config
-            if ctx.wave_count > 1
-            else plan.bwd_runtime_config
-        ),
+        runtime_config,
         buffers.events,
         route_state.permute_src_index,
         route_state.route_weight,
@@ -625,6 +632,7 @@ def _launch_backward(
         ctx.receive_capacity,
         ctx.wave_count,
         int(buffers.cycle_profile_enabled),
+        spec.local_experts if shared_lease is not None else 0,
     )
 
 
@@ -736,6 +744,16 @@ def _get_mega_moe_function() -> Any:
             metadata = route.metadata
             if metadata is None:
                 raise RuntimeError("MegaMoe route metadata is unavailable.")
+            shared_lease = (
+                route.placement_payload
+                if isinstance(route.placement_payload, SharedExpertWeightLease)
+                else None
+            )
+            ctx.weight_replay = (
+                None if shared_lease is None else (shared_lease.manager, shared_lease.plan)
+            )
+            if shared_lease is not None:
+                shared_lease.wait()
             kernel_input = (
                 hidden_states
                 if spec.forward_permute_fused
@@ -762,6 +780,7 @@ def _get_mega_moe_function() -> Any:
                     atomic_dw_accumulation=(
                         plan.atomic_dw_accumulation
                     ),
+                    physical_experts=spec.physical_local_experts,
                 )
                 # Exact route offsets cover every row consumed by GMM and
                 # unpermute. Clearing the capacity tail only adds device work.
@@ -783,6 +802,7 @@ def _get_mega_moe_function() -> Any:
                     route,
                     topk_weights,
                     buffers,
+                    shared_lease,
                 )
                 ctx.routed_buffer_generation = workspace.mark_routed_buffer_write()
                 expert_output = (
@@ -853,7 +873,13 @@ def _get_mega_moe_function() -> Any:
             workspace = ctx.workspace
             saved = _load_forward_state(ctx)
             workspace.claim()
+            shared_lease = None
+            replica_gradients = None
             try:
+                if ctx.weight_replay is not None:
+                    manager, plan = ctx.weight_replay
+                    shared_lease = manager.start_shared_prefetch(saved.weight1, saved.weight2, plan)
+                    replica_gradients = shared_lease.prepare_backward(multi_wave=ctx.wave_count > 1)
                 route_state = _prepare_backward_route(ctx, grad_output, saved)
                 buffers = _prepare_backward_buffers(
                     ctx,
@@ -862,17 +888,27 @@ def _get_mega_moe_function() -> Any:
                     saved,
                     route_state,
                 )
-                _launch_backward(ctx, saved, route_state, buffers)
+                _launch_backward(ctx, saved, route_state, buffers, shared_lease)
                 workspace.mark_routed_buffer_write()
                 _mark_retained_scratch_modified(ctx, saved)
-                return _finish_backward(
+                result = _finish_backward(
                     ctx,
                     grad_output,
                     saved,
                     route_state,
                     buffers,
                 )
+                if shared_lease is not None:
+                    home_grad1, home_grad2 = shared_lease.manager.reduce_replica_gradients(
+                        shared_lease.plan, result[3], result[4], replica_gradients=replica_gradients,
+                    )
+                    # Home outputs own only N matrices; no physical suffix or
+                    # gradient clone is retained by the layer's Parameter.grad.
+                    result = (*result[:3], home_grad1, home_grad2, *result[5:])
+                return result
             finally:
+                if shared_lease is not None:
+                    shared_lease.release()
                 workspace.release()
 
     _MEGA_MOE_FUNCTION = _MegaMoeFunction
@@ -895,8 +931,9 @@ def execute_mega_moe(
         hidden_states: Token-major local activations.
         topk_ids: Physical expert IDs selected for every route slot.
         topk_weights: Router weights paired with ``topk_ids``.
-        weight1: Rank-local physical gate/up weights, including replica slots.
-        weight2: Rank-local physical down-projection weights.
+        weight1: Rank-local gate/up weights; home-only with a shared B lease,
+            otherwise contiguous physical weights including replica slots.
+        weight2: Down-projection weights using the same layout as ``weight1``.
         route: Prepared route tensors and count metadata.
         plan: Static forward and backward plan descriptors.
         workspace: Directional buffers shared by this backend instance.

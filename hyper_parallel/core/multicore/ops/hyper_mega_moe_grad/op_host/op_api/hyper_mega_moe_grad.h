@@ -33,7 +33,7 @@ const std::array<const aclTensor *, 8> HyperMegaMoeGrad(
   const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
   const aclTensor *permute_src_index, const aclTensor *route_weight, const aclTensor *reduce_route_index,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size,
-  int64_t receive_capacity, int64_t wave_count, int64_t cycle_profile, aclOpExecutor *executor);
+  int64_t receive_capacity, int64_t wave_count, int64_t cycle_profile, int64_t home_experts, aclOpExecutor *executor);
 }  // namespace l0op
 
 #endif  // PTA_NPU_OP_API_INC_LEVEL0_OP_HYPER_MEGA_MOE_GRAD_H_

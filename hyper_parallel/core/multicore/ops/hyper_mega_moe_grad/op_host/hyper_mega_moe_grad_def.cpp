@@ -250,6 +250,7 @@ class HyperMegaMoeGrad : public OpDef {
     this->Attr("receive_capacity").AttrType(OPTIONAL).Int(0);
     this->Attr("wave_count").AttrType(OPTIONAL).Int(1);
     this->Attr("cycle_profile").AttrType(OPTIONAL).Int(0);
+    this->Attr("home_experts").AttrType(OPTIONAL).Int(0);
 
     OpAICoreConfig aicore_config;
     aicore_config.DynamicCompileStaticFlag(true)

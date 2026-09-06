@@ -15,9 +15,11 @@
 """Unit tests for bounded Torch expert weight replicas."""
 
 import gc
+import struct
 import unittest
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -32,6 +34,10 @@ from hyper_parallel.core.multicore.modules.mega_moe.spec import (
 )
 from hyper_parallel.core.multicore.modules.mega_moe.replica import (
     ExpertReplicaManager,
+)
+from hyper_parallel.core.multicore.scheduler.config import (
+    RuntimeConfigC,
+    serialize_runtime_config,
 )
 
 
@@ -584,6 +590,194 @@ class TestExpertReplicaManager(unittest.TestCase):
                     self._config(rank_id=0),
                     pool_cache_size=cache_size,
                 )
+
+    def test_shared_staging_restores_layers_without_rebinding_home(self):
+        """Reuse one pool across layers and restore a still-live graph's weights.
+
+        Feature: cross-layer replayable weight staging
+        Description: overwrite staging with a second layer before restoring the first
+        Expectation: fixed staging pointers, unchanged parameters and valid old graph
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        plan = self._hot_expert_zero_plan()
+        layers = [
+            (torch.full((2, 2, 2), value, requires_grad=True),
+             torch.full((2, 1, 2), value + 1, requires_grad=True))
+            for value in (2.0, 5.0)
+        ]
+        pointers = [(first.data_ptr(), second.data_ptr()) for first, second in layers]
+        old_loss = sum(weight.square().sum() for weight in layers[0])
+
+        def fill_replicas(transfers: tuple[Any, ...], _group: Any) -> tuple[Any, ...]:
+            """Populate only the remote receive slots of the real staging pool."""
+            for transfer in transfers:
+                if transfer.operation == "receive":
+                    transfer.tensor.fill_(11.0)
+            return ()
+
+        with patch.object(replica_module, "_launch_transfers", side_effect=fill_replicas):
+            pool_pointers = []
+            for layer in (layers[0], layers[1], layers[0]):
+                lease = manager.start_shared_prefetch(*layer, plan)
+                physical = lease.wait()
+                pool_pointers.append(tuple(weight.data_ptr() for weight in physical))
+                for staged, home in zip(physical, layer):
+                    self.assertEqual(tuple(staged.shape), (1, *home.shape[1:]))
+                    self.assertEqual(staged.untyped_storage().nbytes(), home[0].numel() * home.element_size())
+                    torch.testing.assert_close(staged, torch.full_like(staged, 11.0))
+                lease.release()
+        self.assertEqual(pool_pointers, [pool_pointers[0]] * 3)
+        self.assertEqual(pointers, [(first.data_ptr(), second.data_ptr()) for first, second in layers])
+        self.assertEqual(len(manager._physical_pools), 0)
+        old_loss.backward()
+        for weight in layers[0]:
+            torch.testing.assert_close(weight.grad, 2 * weight)
+
+    def test_shared_gradient_pool_reuses_only_b_slots(self):
+        """Keep replica dW independent of returned home gradient storage.
+
+        Feature: B-only gradient sharing
+        Description: reuse one suffix pool and build owner-directed sends from it
+        Expectation: suffix indices start at zero and multi-wave gradients are cleared
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        plan = self._hot_expert_zero_plan()
+        weights = (torch.ones(2, 2, 2), torch.ones(2, 1, 2))
+        with patch.object(replica_module, "_launch_transfers", return_value=()):
+            lease = manager.start_shared_prefetch(*weights, plan)
+            gradients = lease.prepare_backward(multi_wave=False)
+            for gradient, weight in zip(gradients, weights):
+                self.assertEqual(tuple(gradient.shape), (1, *weight.shape[1:]))
+                gradient.fill_(7)
+            transfers, received = manager._gradient_transfers(plan, *weights, replica_gradients=gradients)
+            self.assertEqual(received, ())
+            self.assertEqual([transfer.operation for transfer in transfers], ["send", "send"])
+            self.assertEqual([transfer.tensor.data_ptr() for transfer in transfers],
+                             [gradient.data_ptr() for gradient in gradients])
+            home_gradients = manager.reduce_replica_gradients(plan, *weights, replica_gradients=gradients)
+            for actual, expected in zip(home_gradients, weights):
+                self.assertEqual(actual.data_ptr(), expected.data_ptr())
+                self.assertEqual(actual.untyped_storage().nbytes(), expected.numel() * expected.element_size())
+            lease.release()
+            lease = manager.start_shared_prefetch(*weights, plan)
+            self.assertIs(lease.prepare_backward(multi_wave=True), gradients)
+            for gradient in gradients:
+                torch.testing.assert_close(gradient, torch.zeros_like(gradient))
+            lease.release()
+
+    def test_shared_runtime_extension_has_stable_versioned_b_addresses(self):
+        """Append the native pointer extension to a real compact plan image.
+
+        Feature: split-weight plan ABI
+        Description: alternate forward and backward descriptors across layer leases
+        Expectation: original wire bytes stay intact and only group-owned pointers are cached
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        weights = (torch.ones(2, 2, 2), torch.ones(2, 1, 2))
+        wire = serialize_runtime_config(RuntimeConfigC())
+        base = torch.tensor(list(wire), dtype=torch.uint8)
+        with patch.object(replica_module, "_launch_transfers", return_value=()):
+            lease = manager.start_shared_prefetch(*weights, self._hot_expert_zero_plan())
+            forward = lease.runtime_config(base)
+            self.assertEqual(forward.numel(), len(wire) + 40)
+            self.assertEqual(bytes(forward[:len(wire)].tolist()), wire)
+            self.assertEqual(struct.unpack("<II4Q", bytes(forward[-40:].tolist())),
+                             (0x53505754, 1, *(weight.data_ptr() for weight in lease.weights), 0, 0))
+            with self.assertRaisesRegex(RuntimeError, "gradients are not initialized"):
+                lease.runtime_config(base, backward=True)
+            gradients = lease.prepare_backward(multi_wave=True)
+            backward = lease.runtime_config(base, backward=True)
+            self.assertEqual(struct.unpack("<II4Q", bytes(backward[-40:].tolist())),
+                             (0x53505754, 1, *(weight.data_ptr() for weight in lease.weights),
+                              *(gradient.data_ptr() for gradient in gradients)))
+            lease.release()
+            next_lease = manager.start_shared_prefetch(*weights, self._hot_expert_zero_plan())
+            self.assertIs(next_lease.runtime_config(base), forward)
+            self.assertIs(next_lease.runtime_config(base, backward=True), backward)
+            next_lease.release()
+
+    def test_shared_runtime_rejects_misaligned_descriptor(self):
+        """Reject invalid wire layout before launching a kernel.
+
+        Feature: split-weight descriptor validation
+        Description: supply misaligned, non-byte and non-vector plan buffers
+        Expectation: no pointer extension is published for any invalid descriptor
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        weights = (torch.ones(2, 2, 2), torch.ones(2, 1, 2))
+        with patch.object(replica_module, "_launch_transfers", return_value=()):
+            lease = manager.start_shared_prefetch(*weights, self._hot_expert_zero_plan())
+            for base in (torch.zeros(7, dtype=torch.uint8), torch.zeros(8), torch.zeros(2, 8, dtype=torch.uint8)):
+                with (
+                    self.subTest(shape=base.shape, dtype=base.dtype),
+                    self.assertRaisesRegex(ValueError, "aligned device uint8"),
+                ):
+                    lease.runtime_config(base)
+            lease.release()
+
+    def test_shared_staging_requires_release_before_overwrite(self):
+        """Reject overlapping live leases and allow reuse after draining.
+
+        Feature: shared staging lease lifetime
+        Description: attempt another prefetch while the previous lease is active
+        Expectation: fail before writing and reject reads after release
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        plan = self._hot_expert_zero_plan()
+        weights = (torch.ones(2, 2, 2), torch.ones(2, 1, 2))
+        with patch.object(replica_module, "_launch_transfers", return_value=()):
+            lease = manager.start_shared_prefetch(*weights, plan)
+            with self.assertRaisesRegex(RuntimeError, "concurrent"):
+                manager.start_shared_prefetch(*weights, plan)
+            lease.drain()
+            lease.release()
+            with self.assertRaisesRegex(RuntimeError, "released"):
+                lease.wait()
+            manager.start_shared_prefetch(*weights, plan).drain()
+
+    def test_shared_staging_fails_closed_after_transfer_error(self):
+        """Do not reuse a pool whose P2P launch might be partially enqueued.
+
+        Feature: shared staging failure handling
+        Description: make transfer submission fail during an acquired lease
+        Expectation: subsequent prefetch fails without another communication call
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        plan = self._hot_expert_zero_plan()
+        weights = (torch.ones(2, 2, 2), torch.ones(2, 1, 2))
+        with patch.object(replica_module, "_launch_transfers", side_effect=RuntimeError("transfer")) as launch:
+            with self.assertRaisesRegex(RuntimeError, "transfer"):
+                manager.start_shared_prefetch(*weights, plan)
+            with self.assertRaisesRegex(RuntimeError, "cannot be reused"):
+                manager.start_shared_prefetch(*weights, plan)
+        launch.assert_called_once()
+
+    def test_shared_staging_orders_reuse_after_device_event(self):
+        """Record a consumer event on release and wait before the next prefetch.
+
+        Feature: cross-stream staging lifetime
+        Description: mock only device events while exercising the real pool reuse
+        Expectation: next acquire enqueues its event wait before weight transfers
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        weights = (torch.ones(2, 2, 2), torch.ones(2, 1, 2))
+        plan = self._hot_expert_zero_plan()
+        npu = Mock()
+        framework = SimpleNamespace(empty=torch.empty, no_grad=torch.no_grad, npu=npu)
+        with patch.object(replica_module, "_launch_transfers", return_value=()):
+            lease = manager.start_shared_prefetch(*weights, plan)
+            lease.wait()
+            pool = manager._shared_weights
+            device = SimpleNamespace(type="npu")
+            manager._shared_weights = (SimpleNamespace(device=device), None)
+            with patch.object(replica_module, "torch", new=framework):
+                lease.release()
+                event = npu.Event.return_value
+                event.record.assert_called_once_with(npu.current_stream.return_value)
+                manager._shared_weights = pool
+                next_lease = manager.start_shared_prefetch(*weights, plan)
+                npu.current_stream.return_value.wait_event.assert_called_once_with(event)
+                next_lease.release()
 
     def test_compact_physical_weights_must_be_boolean(self):
         """Reject ambiguous compact storage selectors.

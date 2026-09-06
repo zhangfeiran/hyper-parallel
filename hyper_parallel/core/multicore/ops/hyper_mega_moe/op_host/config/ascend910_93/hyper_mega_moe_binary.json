@@ -367,6 +367,11 @@
           "name": "wave_count",
           "dtype": "int",
           "value": 1
+        },
+        {
+          "name": "home_experts",
+          "dtype": "int",
+          "value": 0
         }
       ]
     }

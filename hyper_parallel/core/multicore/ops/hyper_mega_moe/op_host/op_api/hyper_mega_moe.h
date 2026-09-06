@@ -30,7 +30,7 @@ const std::array<const aclTensor *, 6> HyperMegaMoe(
   const aclTensor *original_x, const aclTensor *permute_src_index, const aclTensor *reduce_route_index,
   const aclTensor *topk_weights, const aclTensor *final_out, int64_t rankId, int64_t ep, int64_t expert_num,
   int64_t hidden_size, int64_t seq_size, int64_t receive_capacity,
-  int64_t wave_count, aclOpExecutor *executor);
+  int64_t wave_count, int64_t home_experts, aclOpExecutor *executor);
 }  // namespace l0op
 
 #endif  // PTA_NPU_OP_API_INC_LEVEL0_OP_HYPER_MEGA_MOE_H_

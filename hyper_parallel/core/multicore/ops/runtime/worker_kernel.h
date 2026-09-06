@@ -74,6 +74,11 @@ class KernelWorkerBase {
     int64_t wave_count = getExtraValueFromTiling(
       input_list[Derived::TILING_IDX], Derived::WAVE_COUNT_TILING_INDEX);
     this->wave_count_ = wave_count > 0 ? static_cast<uint32_t>(wave_count) : 1;
+    this->home_experts_ = getExtraValueFromTiling(
+      input_list[Derived::TILING_IDX], Derived::HOME_EXPERTS_TILING_INDEX);
+    if (this->home_experts_ > 0) {
+      getReplicaMatrixBases(this->runtimeConfigPtr, this->replica_matrix_bases_);
+    }
   }
 
   __aicore__ inline void Process() {
@@ -112,6 +117,15 @@ class KernelWorkerBase {
   }
 
  protected:
+  __aicore__ inline GM_ADDR GetExpertMatrix(
+      uint32_t input_position, int64_t expert, int64_t matrix_bytes, uint32_t replica_index) const {
+    if (this->home_experts_ > 0 && expert >= this->home_experts_) {
+      return this->replica_matrix_bases_[replica_index] +
+        (expert - this->home_experts_) * matrix_bytes;
+    }
+    return this->input_list[input_position] + expert * matrix_bytes;
+  }
+
   __aicore__ inline bool IsMultiWave() const {
     return this->wave_count_ > 1 && this->receive_capacity_ > 0;
   }
@@ -913,6 +927,8 @@ class KernelWorkerBase {
   int64_t core_num = 0;
   int64_t vector_num = 0;
   int64_t receive_capacity_ = 0;
+  int64_t home_experts_ = 0;
+  GM_ADDR replica_matrix_bases_[4] = {nullptr, nullptr, nullptr, nullptr};
   uint32_t wave_count_ = 1;
   uint32_t wave_index_ = 0;
   bool has_ready_handshake_ = false;

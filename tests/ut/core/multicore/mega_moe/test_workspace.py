@@ -314,6 +314,30 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                 self.assertEqual(workspace.gmm_workspace.numel(), maximum_bytes)
         self.assertEqual(mock_synchronize.call_count, 2)
 
+    def test_split_weights_keep_physical_multi_wave_scratch_capacity(self):
+        """Size non-atomic dW scratch for N+B even with N-only operator inputs.
+
+        Feature: split-weight multi-wave scratch
+        Description: pass two home groups while three physical groups execute
+        Expectation: each physical matrix has scratch with either retained-prefix policy
+        """
+        weight1 = torch.empty((2, 4, 6), dtype=torch.bfloat16)
+        weight2 = torch.empty((2, 3, 4), dtype=torch.bfloat16)
+        for retained in (False, True):
+            with self.subTest(retained=retained), patch.object(torch.npu, "synchronize"):
+                workspace = MegaMoeWorkspace(
+            symmetric_memory=Mock(),
+                    shared=True,
+                    device=torch.device("cpu"),
+                    gmm_workspace=torch.empty((_GMM_WORKSPACE_BYTES,), dtype=torch.uint8),
+                )
+                workspace.prepare_gmm_workspace(
+                    weight1, weight2, 2, receive_capacity=1, reuse_retained_scratch=retained,
+                    atomic_dw_accumulation=False, physical_experts=3,
+                )
+                # One retained row cannot fit any of these whole matrices.
+                self.assertEqual(workspace.gmm_workspace.numel(), _GMM_WORKSPACE_BYTES + 3 * (24 + 12) * 2)
+
     def test_retained_prefix_packs_whole_weight_gradient_matrices(self):
         """
         Feature: retained up-projection scratch reuse

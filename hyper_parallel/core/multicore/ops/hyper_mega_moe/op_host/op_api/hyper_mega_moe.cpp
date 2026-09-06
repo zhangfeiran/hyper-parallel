@@ -39,13 +39,13 @@ const std::array<const aclTensor *, 6> HyperMegaMoe(
   const aclTensor *original_x, const aclTensor *permute_src_index, const aclTensor *reduce_route_index,
   const aclTensor *topk_weights, const aclTensor *final_out, int64_t rankId, int64_t ep, int64_t expert_num,
   int64_t hidden_size, int64_t seq_size, int64_t receive_capacity,
-  int64_t wave_count, aclOpExecutor *executor) {
+  int64_t wave_count, int64_t home_experts, aclOpExecutor *executor) {
   L0_DFX(HyperMegaMoe, dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off, dispatch_size, weight,
          up_proj_glist, y, swiglu_out, down_proj_weight, down_proj_glist, down_proj_y, combine_target,
          combine_target_off, combine_src_off, combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling,
          down_proj_tiling, runtime_config, all_event_counters, original_x, permute_src_index, reduce_route_index,
          topk_weights, final_out, rankId, ep, expert_num, hidden_size, seq_size,
-         receive_capacity, wave_count);
+         receive_capacity, wave_count, home_experts);
   auto dispatch_target_out = const_cast<aclTensor *>(dispatch_target);
   auto y_out = const_cast<aclTensor *>(y);
   auto swiglu_out_out = const_cast<aclTensor *>(swiglu_out);
@@ -60,7 +60,7 @@ const std::array<const aclTensor *, 6> HyperMegaMoe(
              runtime_config, all_event_counters, original_x, permute_src_index, reduce_route_index, topk_weights,
              final_out),
     OP_OUTPUT(dispatch_target_out, y_out, swiglu_out_out, down_proj_y_out, combine_target_out, final_out_out),
-    OP_ATTR(rankId, ep, expert_num, hidden_size, seq_size, receive_capacity, wave_count));
+    OP_ATTR(rankId, ep, expert_num, hidden_size, seq_size, receive_capacity, wave_count, home_experts));
   if (ret != ACL_SUCCESS) {
     return {dispatch_target_out, y_out, swiglu_out_out, down_proj_y_out, combine_target_out, final_out_out};
   }

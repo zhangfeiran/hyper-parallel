@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from importlib import import_module
 
+import struct
+import threading
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -155,6 +157,63 @@ class PendingExpertWeights:
         self._complete_transfers()
 
 
+@dataclass
+class SharedExpertWeightLease:
+    """Exclusive, event-ordered use of replayable B-slot weights and gradients.
+
+    Only the manager and immutable plan may be retained for backward. The
+    returned weights are scratch and must never be saved by autograd.
+    """
+
+    manager: ExpertReplicaManager
+    plan: ExpertPlacementPlan
+    weights: tuple[Any, Any]
+    handles: tuple[Any, ...]
+    transfers: tuple[Any, ...]
+    released: bool = False
+    ready: bool = False
+
+    def wait(self) -> tuple[Any, Any]:
+        """Order expert reads after all prefetch transfers."""
+        if self.released:
+            raise RuntimeError("shared expert weight lease has been released.")
+        if self.ready:
+            return self.weights
+        _wait_handles(self.handles)
+        self.handles = ()
+        self.transfers = ()
+        # Replica pointers are carried in an opaque plan descriptor, not
+        # ordinary operator tensor inputs. Protect their allocator lifetime on
+        # the consuming stream even if the resource group is subsequently freed.
+        for weight in self.weights:
+            if weight.device.type != "cpu":
+                weight.record_stream(torch.npu.current_stream(weight.device))
+        self.ready = True
+        return self.weights
+
+    def drain(self) -> None:
+        """Finish abandoned route prefetch and release its staging lease."""
+        self.release()
+
+    def runtime_config(self, base_config: Any, *, backward: bool = False) -> Any:
+        """Bind the stable suffix addresses to one leased plan descriptor."""
+        self.wait()
+        return self.manager.shared_runtime_config(base_config, backward=backward)
+
+    def prepare_backward(self, *, multi_wave: bool) -> tuple[Any, Any]:
+        """Prepare reusable replica-gradient outputs without home storage."""
+        self.wait()
+        return self.manager.prepare_shared_gradients(multi_wave=multi_wave)
+
+    def release(self) -> None:
+        """Record completion after the last consumer before allowing reuse."""
+        if self.released:
+            return
+        self.wait()
+        self.manager.release_shared_pool()
+        self.released = True
+
+
 class ExpertReplicaManager:
     """Build physical weight pools and return replica gradients to home ranks."""
 
@@ -189,6 +248,130 @@ class ExpertReplicaManager:
         self._physical_pools: OrderedDict[
             tuple[int, int], _PhysicalWeightPool
         ] = OrderedDict()
+        self._shared_weights: tuple[Any, Any] | None = None
+        self._shared_gradients: tuple[Any, Any] | None = None
+        self._shared_runtime_configs: dict[tuple[int, bool], tuple[Any, Any]] = {}
+        self._shared_lock = threading.Lock()
+        self._shared_in_use = False
+        self._shared_event: Any | None = None
+        self._shared_failed = False
+
+    def start_shared_prefetch(
+        self,
+        weight1: Any,
+        weight2: Any,
+        plan: ExpertPlacementPlan,
+    ) -> SharedExpertWeightLease:
+        """Prefetch only B replicas without copying or rebinding home weights.
+
+        Callers must release the returned lease after all kernel consumers
+        have been enqueued. Backward must acquire a fresh lease with the
+        saved plan and unchanged home parameters, not save these scratch views.
+        """
+        self._validate_plan(plan)
+        self._validate_home_weights(weight1, weight2)
+        with self._shared_lock:
+            if self._shared_failed:
+                raise RuntimeError("shared expert weight pool failed and cannot be reused.")
+            if self._shared_in_use:
+                raise RuntimeError("shared expert weight pool does not support concurrent calls.")
+            self._shared_in_use = True
+        try:
+            if self._shared_weights is None:
+                self._shared_weights = tuple(
+                    torch.empty(
+                        (self.spec.replica_slots_per_rank, *weight.shape[1:]),
+                        dtype=weight.dtype,
+                        device=weight.device,
+                    )
+                    for weight in (weight1, weight2)
+                )
+            replica_weight1, replica_weight2 = self._shared_weights
+            if replica_weight1.device != weight1.device or replica_weight1.dtype != weight1.dtype:
+                raise ValueError("shared expert weight pool cannot change device or dtype.")
+            if any(
+                tuple(pool.shape[1:]) != tuple(home.shape[1:])
+                for pool, home in zip(self._shared_weights, (weight1, weight2))
+            ):
+                raise ValueError("shared expert weight pool cannot change matrix shapes.")
+            if self._shared_event is not None:
+                torch.npu.current_stream(weight1.device).wait_event(self._shared_event)
+            transfers = self._prefetch_transfers(
+                plan, weight1, weight2, replica_weight1, replica_weight2,
+                pool_start=self.spec.local_experts,
+            )
+            handles = _launch_transfers(transfers, self.spec.ep_group)
+            return SharedExpertWeightLease(self, plan, self._shared_weights, handles, transfers)
+        except Exception:
+            # A failed P2P launch may have enqueued only part of the batch.
+            # Reject further use instead of overwriting potentially live DMA.
+            with self._shared_lock:
+                self._shared_failed = True
+                self._shared_in_use = False
+            raise
+
+    def prepare_shared_gradients(self, *, multi_wave: bool) -> tuple[Any, Any]:
+        """Return group-owned B-slot gradients, cleared before multi-wave add."""
+        if not self._shared_in_use or self._shared_weights is None:
+            raise RuntimeError("shared expert weight pool is not claimed.")
+        if self._shared_gradients is None:
+            self._shared_gradients = tuple(torch.empty_like(weight) for weight in self._shared_weights)
+        if multi_wave:
+            for gradient in self._shared_gradients:
+                gradient.zero_()
+        for gradient in self._shared_gradients:
+            if gradient.device.type != "cpu":
+                gradient.record_stream(torch.npu.current_stream(gradient.device))
+        return self._shared_gradients
+
+    def shared_runtime_config(self, base_config: Any, *, backward: bool) -> Any:
+        """Cache a versioned suffix-address extension for the native scheduler.
+
+        Home addresses remain ordinary operator inputs. Only resource-group
+        storage appears in this table, so it is immutable across layer changes.
+        Its first device copy and all consumers are ordered by the pool lease.
+        """
+        if not self._shared_in_use or self._shared_weights is None:
+            raise RuntimeError("shared expert weight pool is not claimed.")
+        if backward and self._shared_gradients is None:
+            raise RuntimeError("shared expert gradients are not initialized.")
+        key = (id(base_config), backward)
+        if key not in self._shared_runtime_configs:
+            gradients = self._shared_gradients if backward else None
+            # The compact RuntimeConfig wire image is 8-byte aligned. The
+            # native reader locates this extension after ReadyHandshakeMeta.
+            if (
+                base_config.dtype != torch.uint8 or base_config.ndim != 1
+                or not base_config.is_contiguous() or base_config.numel() % 8
+                or base_config.device != self._shared_weights[0].device
+            ):
+                raise ValueError("split-weight plan descriptor must be aligned device uint8 storage.")
+            gradient_ptrs = (0, 0) if gradients is None else tuple(gradient.data_ptr() for gradient in gradients)
+            data = struct.pack(
+                "<II4Q", 0x53505754, 1,
+                *(weight.data_ptr() for weight in self._shared_weights),
+                *gradient_ptrs,
+            )
+            metadata = torch.tensor(list(data), dtype=torch.uint8, device=base_config.device)
+            # Retain the base object as well, preventing Python id reuse from
+            # ever matching an unrelated descriptor after plan replacement.
+            self._shared_runtime_configs[key] = (base_config, torch.cat((base_config, metadata)))
+        runtime_config = self._shared_runtime_configs[key][1]
+        if runtime_config.device.type != "cpu":
+            runtime_config.record_stream(torch.npu.current_stream(runtime_config.device))
+        return runtime_config
+
+    def release_shared_pool(self) -> None:
+        """Order the next lease after this stream's last staging consumer."""
+        with self._shared_lock:
+            if self._shared_weights is None or not self._shared_in_use:
+                raise RuntimeError("shared expert weight pool is not claimed.")
+            device = self._shared_weights[0].device
+            if device.type != "cpu":
+                if self._shared_event is None:
+                    self._shared_event = torch.npu.Event()
+                self._shared_event.record(torch.npu.current_stream(device))
+            self._shared_in_use = False
 
     @property
     def generation(self) -> int:
@@ -490,6 +673,8 @@ class ExpertReplicaManager:
         weight2: Any,
         physical_weight1: Any,
         physical_weight2: Any,
+        *,
+        pool_start: int = 0,
     ) -> tuple[_P2PTransfer, ...]:
         """Build this rank's matching weight send and receive descriptors."""
         rank_id = self.spec.rank_id
@@ -506,8 +691,8 @@ class ExpertReplicaManager:
                 )
             elif transfer.target_rank == rank_id:
                 tensors = (
-                    physical_weight1[transfer.target_slot],
-                    physical_weight2[transfer.target_slot],
+                    physical_weight1[transfer.target_slot - pool_start],
+                    physical_weight2[transfer.target_slot - pool_start],
                 )
                 transfers.extend(
                     _P2PTransfer("receive", tensor, transfer.owner_rank)
@@ -603,16 +788,22 @@ class ExpertReplicaManager:
         plan: ExpertPlacementPlan,
         grad_weight1: Any,
         grad_weight2: Any,
+        *,
+        replica_gradients: tuple[Any, Any] | None = None,
     ) -> tuple[tuple[_P2PTransfer, ...], tuple[tuple[int, Any, Any], ...]]:
         """Build replica-gradient transfers and owner accumulation records."""
         rank_id = self.spec.rank_id
         transfers = []
         received = []
+        source_grad1, source_grad2 = (
+            (grad_weight1, grad_weight2) if replica_gradients is None else replica_gradients
+        )
+        pool_start = 0 if replica_gradients is None else self.spec.local_experts
         for transfer in plan.replica_transfers:
             if transfer.target_rank == rank_id:
                 tensors = (
-                    grad_weight1[transfer.target_slot].contiguous(),
-                    grad_weight2[transfer.target_slot].contiguous(),
+                    source_grad1[transfer.target_slot - pool_start].contiguous(),
+                    source_grad2[transfer.target_slot - pool_start].contiguous(),
                 )
                 transfers.extend(
                     _P2PTransfer("send", tensor, transfer.owner_rank)
@@ -657,6 +848,8 @@ class ExpertReplicaManager:
         plan: ExpertPlacementPlan,
         grad_weight1: Any,
         grad_weight2: Any,
+        *,
+        replica_gradients: tuple[Any, Any] | None = None,
     ) -> tuple[Any, Any]:
         """Return gradients for only the optimizer-owned home parameters.
 
@@ -664,12 +857,16 @@ class ExpertReplicaManager:
             plan: Placement that produced the physical expert gradients.
             grad_weight1: Gate/up gradients for every local physical slot.
             grad_weight2: Down-projection gradients for every local physical slot.
+            replica_gradients: Optional separate B-slot outputs. When supplied,
+                the first two gradient arguments contain home experts only.
 
         Returns:
             Owner-local gate/up and down-projection gradients.
         """
         self._validate_plan(plan)
-        expected_experts = self.spec.physical_local_experts
+        expected_experts = (
+            self.spec.physical_local_experts if replica_gradients is None else self.spec.local_experts
+        )
         if (
             grad_weight1.ndim != 3
             or grad_weight2.ndim != 3
@@ -680,6 +877,16 @@ class ExpertReplicaManager:
                 "physical expert gradients must contain "
                 f"{expected_experts} groups on each rank."
             )
+        if replica_gradients is not None:
+            if len(replica_gradients) != 2:
+                raise ValueError("replica gradients must contain exactly W1 and W2.")
+            for replica, home in zip(replica_gradients, (grad_weight1, grad_weight2)):
+                if (
+                    tuple(replica.shape) != (self.spec.replica_slots_per_rank, *home.shape[1:])
+                    or replica.dtype != home.dtype
+                    or replica.device != home.device
+                ):
+                    raise ValueError("replica gradients must match the B-slot shape, dtype and device.")
         local_experts = self.spec.local_experts
         # Dense physical gradients can expose their home-prefix views directly.
         # ``contiguous`` still materializes broadcast/autograd-expanded inputs
@@ -690,6 +897,7 @@ class ExpertReplicaManager:
             plan,
             grad_weight1,
             grad_weight2,
+            replica_gradients=replica_gradients,
         )
         _wait_handles(_launch_transfers(transfers, self.spec.ep_group))
         for owner_slot, received_weight1, received_weight2 in received:

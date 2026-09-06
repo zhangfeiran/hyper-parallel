@@ -58,6 +58,34 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     tiling.set_coreNum(static_cast<int64_t>(coreNum));
     tiling.set_receiveCapacity((*(attr->GetAttrPointer<int64_t>(5))));
     tiling.set_waveCount((*(attr->GetAttrPointer<int64_t>(6))));
+    auto homeExperts = attr->GetAttrPointer<int64_t>(7);
+    OP_CHECK_NULL_WITH_CONTEXT(context, homeExperts);
+    tiling.set_homeExperts(*homeExperts);
+    if (*homeExperts < 0 || (*homeExperts > 0 &&
+        (tiling.get_ep() <= 0 || tiling.get_expertNum() % tiling.get_ep() != 0 ||
+         *homeExperts >= tiling.get_expertNum() / tiling.get_ep()))) {
+      OP_LOGE(context->GetNodeName(), "home_experts must be zero or a proper physical-expert prefix");
+      return ge::GRAPH_FAILED;
+    }
+    if (*homeExperts > 0) {
+      auto weight1Shape = context->GetInputShape(5);
+      auto weight2Shape = context->GetInputShape(9);
+      OP_CHECK_NULL_WITH_CONTEXT(context, weight1Shape);
+      OP_CHECK_NULL_WITH_CONTEXT(context, weight2Shape);
+      const auto &weight1 = weight1Shape->GetOriginShape();
+      const auto &weight2 = weight2Shape->GetOriginShape();
+      // ACL may normalize contiguous forward inputs to flat storage shapes.
+      // The managed boundary validates logical [N,H,2I]/[N,I,H] dimensions;
+      // tiling checks storage extents without requiring a preserved view rank.
+      const int64_t homeRows = *homeExperts * tiling.get_hiddenSize();
+      if (homeRows <= 0 || weight2.GetShapeSize() <= 0 || weight2.GetShapeSize() % homeRows != 0 ||
+          weight1.GetShapeSize() != 2 * weight2.GetShapeSize()) {
+        OP_LOGE(context->GetNodeName(),
+          "Split weights require N*H*2I/N*I*H elements; N=%ld H=%ld elements=%ld/%ld",
+          *homeExperts, tiling.get_hiddenSize(), weight1.GetShapeSize(), weight2.GetShapeSize());
+        return ge::GRAPH_FAILED;
+      }
+    }
   }
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
   context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());

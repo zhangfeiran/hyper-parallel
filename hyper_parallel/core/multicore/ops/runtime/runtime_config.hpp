@@ -360,6 +360,23 @@ __aicore__ inline void getReadyHandshakeMeta(__gm__ uint8_t *tiling, ReadyHandsh
   meta->ready_event = (*(__gm__ uint32_t *)(base + UINT32_T_SIZE * 2));
 }
 
+// Optional split-weight ABI v1, after the compact RuntimeConfig's 8-byte
+// aligned end. Home tensors remain operator inputs; only group-owned B-slot
+// weights and gradients are addressed here. Never read this for dense weights.
+__aicore__ inline void getReplicaMatrixBases(__gm__ uint8_t *tiling, GM_ADDR *bases) {
+  const uint32_t offset = (getReadyHandshakeMetaOffset(tiling) + 3 * UINT32_T_SIZE + 7U) & ~7U;
+  __gm__ uint8_t *base = tiling + offset;
+  const uint32_t magic = *reinterpret_cast<__gm__ uint32_t *>(base);
+  const uint32_t version = *reinterpret_cast<__gm__ uint32_t *>(base + UINT32_T_SIZE);
+  if (magic != 0x53505754U || version != 1U) {
+    AscendC::Trap();
+  }
+  for (uint32_t index = 0; index < 4; ++index) {
+    bases[index] = reinterpret_cast<GM_ADDR>(
+      *reinterpret_cast<__gm__ uint64_t *>(base + 2 * UINT32_T_SIZE + index * INT64_T_SIZE));
+  }
+}
+
 __aicore__ inline int64_t getExtraValueFromTiling(__gm__ uint8_t *tiling, uint32_t index) {
   return (*(__gm__ int64_t *)(tiling + index * INT64_T_SIZE));
 }
