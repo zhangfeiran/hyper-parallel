@@ -541,28 +541,35 @@ def _run_deferred_backward_pair(
     topk_weights: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     grad_outputs: tuple[torch.Tensor, torch.Tensor],
+    *,
+    second_route: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    reverse_backward: bool = False,
 ) -> tuple[_RunResult, _RunResult]:
     """Run two forwards before consuming either shared-workspace graph."""
     layer.zero_grad(set_to_none=True)
     inputs = tuple(
         value.detach().clone().requires_grad_(True) for value in hidden_states
     )
+    first_route = (topk_ids, topk_weights, tokens_per_expert)
+    routes = (first_route, first_route if second_route is None else second_route)
     route_weights = tuple(
-        topk_weights.detach().clone().requires_grad_(True) for _ in range(2)
+        route[1].detach().clone().requires_grad_(True) for route in routes
     )
     outputs = tuple(
         layer(
             value,
-            topk_ids,
+            route[0],
             weights,
-            tokens_per_expert=tokens_per_expert,
+            tokens_per_expert=route[2],
         )
-        for value, weights in zip(inputs, route_weights)
+        for value, weights, route in zip(inputs, route_weights, routes)
     )
 
-    results = []
-    for index, (output, grad_output) in enumerate(zip(outputs, grad_outputs)):
-        output.backward(grad_output)
+    results = {}
+    backward_order = (1, 0) if reverse_backward else (0, 1)
+    for index in backward_order:
+        output = outputs[index]
+        output.backward(grad_outputs[index])
         torch.npu.synchronize(_DEVICE)
         gradients = {
             "input": inputs[index].grad,
@@ -575,17 +582,15 @@ def _run_deferred_backward_pair(
             raise AssertionError(
                 f"rank={_RANK}: deferred backward {index} missed {missing}."
             )
-        results.append(
-            _RunResult(
-                output=output.detach().clone(),
-                input_grad=inputs[index].grad.detach().clone(),
-                route_weight_grad=route_weights[index].grad.detach().clone(),
-                gate_up_weight_grad=expert_weight_gradients(layer)[0].detach().clone(),
-                down_weight_grad=expert_weight_gradients(layer)[1].detach().clone(),
-            )
+        results[index] = _RunResult(
+            output=output.detach().clone(),
+            input_grad=inputs[index].grad.detach().clone(),
+            route_weight_grad=route_weights[index].grad.detach().clone(),
+            gate_up_weight_grad=expert_weight_gradients(layer)[0].detach().clone(),
+            down_weight_grad=expert_weight_gradients(layer)[1].detach().clone(),
         )
         layer.zero_grad(set_to_none=True)
-    return tuple(results)
+    return results[0], results[1]
 
 
 def _assert_finite(name: str, tensor: torch.Tensor) -> None:
@@ -1137,6 +1142,37 @@ def test_mega_moe_deferred_backward_capacity_fallback() -> None:
     )
     for native_result, mega_result in zip(native_results, mega_results):
         _assert_results_close(native_result, mega_result)
+
+
+def test_mega_moe_mixed_deferred_backward_capacity() -> None:
+    """Keep both W1 and W2 graphs live and compare both backward orders."""
+    shape = _MoeShape()
+    balanced = _make_balanced_route(shape)
+    overflow = _make_overflow_route(shape)
+    hidden, grad_output = _make_data(shape)
+    hidden_states = (hidden, hidden.flip(0).contiguous())
+    grad_outputs = (grad_output, grad_output.roll(1, dims=0).contiguous())
+    cases = (
+        ((overflow, balanced), (2, 1), True),
+        ((balanced, overflow), (1, 2), True),
+        ((overflow, balanced), (2, 1), False),
+    )
+    for routes, wave_counts, reverse_backward in cases:
+        mega, native = _new_layers(shape, expert_capacity_factor=1.0)
+        native_results = tuple(
+            _run_layer(native, value, *route, gradient)
+            for value, route, gradient in zip(hidden_states, routes, grad_outputs)
+        )
+        mega_results = _run_deferred_backward_pair(
+            mega,
+            hidden_states,
+            *routes[0],
+            grad_outputs,
+            second_route=routes[1],
+            reverse_backward=reverse_backward,
+        )
+        for reference, actual, waves in zip(native_results, mega_results, wave_counts):
+            _assert_results_close(reference, actual, weight_grad_wave_count=waves)
 
 
 def test_mega_moe_mixed_wave_replay() -> None:

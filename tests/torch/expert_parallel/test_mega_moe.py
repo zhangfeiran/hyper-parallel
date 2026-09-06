@@ -469,6 +469,38 @@ def test_mega_moe_deferred_backward_capacity_fallback(monkeypatch) -> None:
     card_mark="allcards",
     essential_mark="essential",
 )
+@pytest.mark.parametrize("atomic_dw", ["0", "1"])
+def test_mega_moe_mixed_deferred_backward_capacity(monkeypatch, atomic_dw: str) -> None:
+    """
+    Feature: outstanding W1 and W2 graphs sharing one workspace
+    Description: mix both wave counts before running backwards in either order
+    Expectation: output and all gradients match native with both dW scratch policies
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("HP_MEGA_MOE_ATOMIC_DW_ACCUMULATION", atomic_dw)
+    monkeypatch.setenv("HP_MEGA_MOE_REUSE_RETAINED_DW_SCRATCH", "0")
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_mixed_deferred_backward_capacity",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
 def test_mega_moe_mixed_wave_replay(monkeypatch) -> None:
     """
     Feature: repeated kernel-internal multi-wave execution

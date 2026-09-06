@@ -482,11 +482,11 @@ class MegaMoeWorkspace:
         reuse_retained_scratch: bool,
         atomic_dw_accumulation: bool,
     ) -> None:
-        """Size dW scratch only for calls that actually need accumulation.
+        """Grow dW scratch while preserving capacity for outstanding backwards.
 
-        A one-wave call writes both weight gradients directly and therefore
-        retains only the 32 MiB GMM workspace. Later waves write temporary dW
-        matrices into a model-shape-bounded tail before vector accumulation.
+        A workspace starts with only the 32 MiB GMM workspace. Non-atomic
+        multi-wave calls grow a model-shape-bounded tail for temporary dW.
+        Smaller calls retain that high-watermark until the workspace is freed.
 
         Args:
             weight1: First expert weight tensor used to size dW1 scratch.
@@ -528,7 +528,9 @@ class MegaMoeWorkspace:
                 )
         if self.gmm_workspace is None or self.device is None:
             raise RuntimeError("MegaMoe GMM workspace is not initialized.")
-        if self.gmm_workspace.numel() == required_bytes:
+        # A W1 forward may run before an earlier W2 backward consumes this
+        # workspace. Its smaller requirement must not discard the live tail.
+        if self.gmm_workspace.numel() >= required_bytes:
             return
         torch.npu.synchronize(self.device)
         self.gmm_workspace.resize_(0)

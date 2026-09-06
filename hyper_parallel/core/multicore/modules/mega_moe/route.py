@@ -139,6 +139,25 @@ def _resolve_counts(
     return supplied_counts.to(torch.int32).contiguous()
 
 
+def count_topk_experts(topk_ids: Any, num_experts: int) -> Any:
+    """Count known-valid router assignments without data-dependent output sizing.
+
+    Args:
+        topk_ids: Integer expert IDs produced by TopK over ``num_experts``
+            logits. Every ID must be in ``[0, num_experts)``; this trusted
+            helper does not perform a synchronizing range validation.
+        num_experts: Fixed number of bins. Assignment counts must fit INT32.
+
+    Returns:
+        A device-local INT32 histogram, including zero-count experts.
+    """
+    flat_ids = topk_ids.reshape(-1).to(torch.int64)
+    counts = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
+    return counts.scatter_add_(
+        0, flat_ids, torch.ones_like(flat_ids, dtype=torch.int32)
+    )
+
+
 def _start_count_gather(counts: Any, spec: MegaMoeSpec) -> tuple[Any, Any | None]:
     """Start the rank-major INT32 count gather used by route construction."""
 

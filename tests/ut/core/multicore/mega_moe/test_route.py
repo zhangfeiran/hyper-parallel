@@ -112,6 +112,43 @@ class TestMegaMoeRoute(unittest.TestCase):
 
         self.assertTrue(torch.equal(flat_ids, topk_ids.reshape(-1).to(torch.int64)))
 
+    def test_known_topk_histogram_matches_independent_counts(self):
+        """
+        Feature: fixed-size histogram for known-valid TopK ids
+        Description: count empty, skewed, repeated and noncontiguous assignments
+        Expectation: exact INT32 counts without bincount or scalar host reads
+        """
+        generator = torch.Generator().manual_seed(29)
+        cases = (
+            torch.empty((0, 8), dtype=torch.int64),
+            torch.zeros((128, 8), dtype=torch.int64),
+            torch.full((128, 8), 47, dtype=torch.int64),
+            torch.tensor([[0, 0, 47, 47], [0, 1, 1, 47]], dtype=torch.int64),
+            torch.randint(0, 48, (8, 4096), generator=generator).T,
+        )
+        for ids in cases:
+            expected_values = [0] * 48
+            for expert in ids.reshape(-1).tolist():
+                expected_values[expert] += 1
+            expected = torch.tensor(expected_values, dtype=torch.int32)
+            for dtype in (torch.int32, torch.int64):
+                with self.subTest(shape=ids.shape, dtype=dtype):
+                    with (
+                        patch.object(
+                            torch,
+                            "bincount",
+                            side_effect=AssertionError("unexpected bincount"),
+                        ),
+                        patch.object(
+                            torch.Tensor,
+                            "item",
+                            side_effect=AssertionError("unexpected host read"),
+                        ),
+                    ):
+                        actual = route_module.count_topk_experts(ids.to(dtype), 48)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    self.assertTrue(actual.is_contiguous())
+
     def test_native_route_endpoints_use_large_npu_operators(self):
         """
         Feature: native large route operators

@@ -38,6 +38,7 @@ from hyper_parallel.auto_models.components.models.qwen3_moe_attention_common imp
     run_qwen3_moe_flash_attention,
 )
 from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore.modules.mega_moe.route import count_topk_experts
 from hyper_parallel.models.modules import (
     RMSNorm,
     RotaryEmbedding,
@@ -468,10 +469,7 @@ class QwenMoeBlock(nn.Module):
                 self.config.top_k,
                 self.config.routed_scaling_factor,
             )
-            tokens_per_expert = torch.bincount(
-                topk_ids.reshape(-1).to(torch.int64),
-                minlength=self.config.num_experts,
-            ).to(torch.int32)
+            tokens_per_expert = count_topk_experts(topk_ids, self.config.num_experts)
         self._last_route_counts = tokens_per_expert.detach()
         routed_output = self.experts(
             hidden_flat,

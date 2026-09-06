@@ -20,3 +20,6 @@ Do not keep raw storage aliases across that transition or modify parameters
 between forward and backward. Live graphs retain their required storage;
 incompatible placements use isolated snapshots. Optimizer updates invalidate
 the physical-weight cache and require a refresh.
+
+The learned route uses a fixed-size INT32 histogram to avoid data-dependent
+output sizing while retaining zero-count expert entries.

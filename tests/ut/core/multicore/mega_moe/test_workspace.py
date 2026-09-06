@@ -220,15 +220,15 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
 
         self.assertEqual(_spec_workspace_bytes(specification, 2), expected)
 
-    def test_one_wave_omits_weight_gradient_scratch(self):
+    def test_one_wave_preserves_outstanding_multi_wave_scratch(self):
         """
-        Feature: W1 GMM workspace compaction
-        Description: switch one workspace between one-wave and multi-wave shapes
-        Expectation: keep W1 at 32 MiB and allocate dW scratch only for W2+
+        Feature: GMM workspace high-watermark capacity
+        Description: enqueue W2 then W1 while the W2 backward is outstanding
+        Expectation: keep the W2 scratch without reallocating or synchronizing
         """
         workspace = MegaMoeWorkspace(
             symmetric_memory=Mock(),
-            shared=False,
+            shared=True,
             device=torch.device("cpu"),
             gmm_workspace=torch.empty((_GMM_WORKSPACE_BYTES,), dtype=torch.uint8),
         )
@@ -264,16 +264,54 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             )
             mock_synchronize.assert_called_once_with(workspace.device)
 
-            workspace.prepare_gmm_workspace(
-                weight1,
-                weight2,
-                wave_count=1,
-                receive_capacity=0,
-                reuse_retained_scratch=False,
-                atomic_dw_accumulation=False,
-            )
-            self.assertEqual(workspace.gmm_workspace.numel(), _GMM_WORKSPACE_BYTES)
-            self.assertEqual(mock_synchronize.call_count, 2)
+            grown_workspace = workspace.gmm_workspace
+            for wave_count in (1, 2, 1, 4):
+                workspace.prepare_gmm_workspace(
+                    weight1,
+                    weight2,
+                    wave_count=wave_count,
+                    receive_capacity=0,
+                    reuse_retained_scratch=False,
+                    atomic_dw_accumulation=False,
+                )
+                self.assertIs(workspace.gmm_workspace, grown_workspace)
+                self.assertEqual(
+                    workspace.gmm_workspace.numel(),
+                    _GMM_WORKSPACE_BYTES + scratch_bytes,
+                )
+            mock_synchronize.assert_called_once_with(workspace.device)
+
+    def test_weight_gradient_scratch_only_grows_for_larger_weights(self):
+        """
+        Feature: shared GMM scratch capacity
+        Description: vary matrix sizes while earlier backward graphs remain live
+        Expectation: grow for larger matrices and retain the maximum for smaller ones
+        """
+        workspace = MegaMoeWorkspace(
+            shared=True,
+            device=torch.device("cpu"),
+            gmm_workspace=torch.empty((_GMM_WORKSPACE_BYTES,), dtype=torch.uint8),
+        )
+        maximum_bytes = _GMM_WORKSPACE_BYTES
+        with patch.object(torch.npu, "synchronize") as mock_synchronize:
+            for hidden_size in (4, 8, 4):
+                weight1 = torch.empty((2, hidden_size, 6), dtype=torch.bfloat16)
+                weight2 = torch.empty((2, 3, hidden_size), dtype=torch.bfloat16)
+                maximum_bytes = max(
+                    maximum_bytes,
+                    _GMM_WORKSPACE_BYTES
+                    + (weight1.numel() + weight2.numel()) * weight1.element_size(),
+                )
+                workspace.prepare_gmm_workspace(
+                    weight1,
+                    weight2,
+                    wave_count=2,
+                    receive_capacity=0,
+                    reuse_retained_scratch=False,
+                    atomic_dw_accumulation=False,
+                )
+                self.assertEqual(workspace.gmm_workspace.numel(), maximum_bytes)
+        self.assertEqual(mock_synchronize.call_count, 2)
 
     def test_retained_prefix_packs_whole_weight_gradient_matrices(self):
         """
