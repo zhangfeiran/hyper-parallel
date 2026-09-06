@@ -324,6 +324,66 @@ def test_mega_moe_deferred_backward_hot_expert_replication(monkeypatch) -> None:
     card_mark="allcards",
     essential_mark="essential",
 )
+def test_mega_moe_lazy_compact_home_to_replica_deferred_backward(monkeypatch) -> None:
+    """Validate the lazy compact transition with a live home-only graph.
+
+    Feature: lazy compact storage with deferred backward
+    Description: Execute home forward A and first replica forward B before either backward
+    Expectation: Both gradients match native and compact rebind waits for graph release
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_lazy_compact_home_to_replica_deferred_backward",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_eager_compact_home_to_replica_deferred_backward(monkeypatch) -> None:
+    """Validate stable eager compact storage with a live home-only graph.
+
+    Feature: eager compact storage with deferred backward
+    Description: Prepare storage before home A, then execute replica B before backward
+    Expectation: Both gradients match native and the prepared pointers remain stable
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_eager_compact_home_to_replica_deferred_backward",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
 def test_mega_moe_replication_with_residual_multi_wave(monkeypatch) -> None:
     """
     Feature: bounded replication with residual multi-wave execution

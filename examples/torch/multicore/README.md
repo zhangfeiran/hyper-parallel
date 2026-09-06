@@ -14,9 +14,11 @@ execution. The API's default capacity remains `None`, reserving the lossless EP
 maximum.
 
 `--compact-physical-weights` opts into storing replica suffixes beside home
-parameters. The first active placement can rebind parameter storage while
-preserving parameter identity, optimizer ownership, and state-dict shape.
-Do not keep raw storage aliases across that transition or modify parameters
+parameters. The default `eager_on_first_forward` strategy prepares storage before
+the first forward graph. `lazy_on_first_replica` delays preparation until an
+active placement without an outstanding home-only graph. Both preserve
+parameter identity, optimizer ownership, and state-dict shape.
+Do not keep raw storage aliases across layout preparation or modify parameters
 between forward and backward. Live graphs retain their required storage;
 incompatible placements use isolated snapshots. Optimizer updates invalidate
 the physical-weight cache and require a refresh.

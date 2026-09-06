@@ -141,6 +141,10 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         def prepare_with_prefetch(*_args: Any, **kwargs: Any) -> Any:
             """Launch the backend callback at the route/weight overlap point."""
+            backend.replica_manager.prepare_for_forward.assert_called_once_with(
+                weight1,
+                weight2,
+            )
             route.placement_payload = kwargs["placement_callback"](placement)
             return route
 
@@ -165,6 +169,10 @@ class TestMegaMoeExperts(unittest.TestCase):
         )
 
         self.assertIs(result, mock_execute_mega_moe.return_value)
+        backend.replica_manager.prepare_for_forward.assert_called_once_with(
+            weight1,
+            weight2,
+        )
         backend.replica_manager.start_prefetch.assert_called_once_with(
             weight1,
             weight2,
@@ -193,6 +201,82 @@ class TestMegaMoeExperts(unittest.TestCase):
             route_weights,
             weight1,
             weight2,
+            route,
+            execution_runtime,
+            backend.workspace,
+        )
+
+    @patch.object(MegaMoeExperts, "_validate_forward_inputs")
+    @patch.object(backend_module, "execute_mega_moe")
+    @patch.object(backend_module, "prepare_topk_route")
+    def test_home_route_tracks_lazy_compact_graph_before_execution(
+        self,
+        mock_prepare_route,
+        mock_execute_mega_moe,
+        _mock_validate_tensors,
+    ):
+        """Track a home-only graph that can overlap first compact placement.
+
+        Feature: lazy compact-layout graph safety.
+        Description: Prepare a replica-free route with a replica manager.
+        Expectation: Eager preparation precedes routing and leased home weights execute.
+        """
+        execution_runtime = Mock(name="execution_runtime")
+        route = SimpleNamespace(
+            plan=execution_runtime,
+            physical_topk_ids=Mock(name="physical_topk_ids"),
+            placement=None,
+        )
+        mock_prepare_route.return_value = route
+        mock_execute_mega_moe.return_value = Mock(name="output")
+        backend = MegaMoeExperts(
+            local_num_tokens=128, hidden_size=4, intermediate_size=3,
+            num_experts=4, top_k=2, ep_size=2,
+        )
+        self.addCleanup(backend.close)
+        backend.spec = Mock(name="spec")
+        backend.plan = Mock(name="plan")
+        backend.home_runtime = Mock(name="home_runtime")
+        backend.workspace = Mock(name="workspace")
+        backend.replica_manager = Mock(name="replica_manager")
+        leased_weight1 = Mock(name="leased_weight1")
+        leased_weight2 = Mock(name="leased_weight2")
+        backend.replica_manager.materialize_home_weights.return_value = (
+            leased_weight1,
+            leased_weight2,
+        )
+        hidden_states = Mock(name="hidden_states")
+        topk_ids = Mock(name="topk_ids")
+        topk_weights = Mock(name="topk_weights")
+        route_weights = topk_weights.float.return_value.contiguous.return_value
+        weight1 = backend.gate_up_weight
+        weight2 = backend.down_weight
+
+        backend._get_execution_resources = Mock(return_value=backend)
+        backend._validate_forward_inputs.return_value = hidden_states
+        mock_execute_mega_moe.return_value.reshape.return_value = mock_execute_mega_moe.return_value
+        result = backend.forward(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            tokens_per_expert=None,
+        )
+
+        self.assertIs(result, mock_execute_mega_moe.return_value)
+        backend.replica_manager.prepare_for_forward.assert_called_once_with(
+            weight1,
+            weight2,
+        )
+        backend.replica_manager.materialize_home_weights.assert_called_once_with(
+            weight1,
+            weight2,
+        )
+        mock_execute_mega_moe.assert_called_once_with(
+            hidden_states,
+            route.physical_topk_ids,
+            route_weights,
+            leased_weight1,
+            leased_weight2,
             route,
             execution_runtime,
             backend.workspace,

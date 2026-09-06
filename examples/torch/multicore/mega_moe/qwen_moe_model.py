@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 __all__ = [
+    "CompactLayoutStrategy",
     "QwenMoeBlock",
     "QwenMoeConfig",
     "QwenMoeModel",
@@ -47,6 +48,10 @@ from hyper_parallel.models.modules import (
 )
 
 RoutingMode = Literal["balanced", "topk", "dirichlet"]
+CompactLayoutStrategy = Literal[
+    "lazy_on_first_replica",
+    "eager_on_first_forward",
+]
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,7 @@ class QwenMoeConfig:
     expert_capacity_factor: float | None = None
     replica_slots_per_rank: int = 0
     compact_physical_weights: bool = False
+    compact_layout_strategy: CompactLayoutStrategy = "eager_on_first_forward"
     ep_size: int = 8
 
     def __post_init__(self) -> None:
@@ -130,6 +136,14 @@ class QwenMoeConfig:
             raise ValueError(
                 "compact_physical_weights must be a bool, got "
                 f"{self.compact_physical_weights!r}."
+            )
+        if self.compact_layout_strategy not in (
+            "lazy_on_first_replica",
+            "eager_on_first_forward",
+        ):
+            raise ValueError(
+                "compact_layout_strategy must be 'lazy_on_first_replica' or "
+                f"'eager_on_first_forward', got {self.compact_layout_strategy!r}."
             )
         if self.local_num_tokens % 128:
             raise ValueError(
@@ -430,6 +444,7 @@ class QwenMoeBlock(nn.Module):
             expert_capacity_factor=config.expert_capacity_factor,
             replica_slots_per_rank=config.replica_slots_per_rank,
             compact_physical_weights=config.compact_physical_weights,
+            compact_layout_strategy=config.compact_layout_strategy,
             ep_size=config.ep_size,
             ep_group=ep_group,
         )

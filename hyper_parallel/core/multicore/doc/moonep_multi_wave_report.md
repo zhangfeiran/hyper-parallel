@@ -11,9 +11,9 @@
 | --- | --- |
 | 整理日期 | 2026-09-06 |
 | 代码分支 | `megamoe-perf-sun` |
-| 代码基线 | `d51ec884 perf(megamoe): port fixed routing and workspace reuse` |
-| 主功能提交 | `0157ed63`、`eadec971`、`d51ec884` |
-| 状态 | 已实现；Torch managed MegaMoe 默认关闭副本，multi-wave 保持 lossless |
+| 代码基线 | `megamoe-perf-sun`；以本文同提交代码为准 |
+| 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、本提交（compact layout 策略与首次切换修复） |
+| 状态 | 已实现；Torch managed MegaMoe 默认关闭副本，compact 默认 eager，multi-wave 保持 lossless |
 
 代码是最终事实来源；本文中的性能数字只对应第 10 节写明的硬件、模型、路由和测量方法。
 
@@ -24,7 +24,8 @@
   倾斜。
 - `replica_slots_per_rank=0` 时保持原有 home-only 路径。`B > 0` 也不会强制复制：如果 home placement
   已能在一个 receive window 内完成，会自动选择较小的 home runtime，跳过 placement、物理 ID remap
-  和权重 P2P。
+  和权重 P2P。compact 默认在每层第一次 forward 前准备 suffix；显式 lazy 策略才会同时跳过未使用的
+  suffix backing。
 - 在 8 卡 Qwen E48/K8、严重固定偏斜、每步 fused AdamW 的正式测试中，`B=1 + compact` 相比
   `B=0`，optimizer-step rank-max p50 从 `1155.271 ms` 降到 `631.915 ms`，降低 `45.302%`，
   等价吞吐提升 `1.828x`。
@@ -32,6 +33,9 @@
   模式的额外 HBM，已消除 `94.99%`；性能没有因省显存而回退。
 - 轻微偏斜、home-only 单 wave 时，`B=1 + compact` 与 `B=0` 的差异落在运行噪声内。因此当前实现的
   收益条件是“副本减少了足够多的 wave 或热点 GMM 尾部”，而不是任何路由都必然加速。
+- compact 同时支持默认 `eager_on_first_forward` 和可选 `lazy_on_first_replica`。lazy 的 home graph
+  通过 autograd lease 纳入生命周期；首次 replica 与未完成 home forward 交叠时临时使用 snapshot，
+  避免 `Parameter.set_()` 触发 saved-tensor version 错误。
 
 ## 2. 目标、边界与术语
 
@@ -147,8 +151,9 @@ Qwen router
 - home runtime：每 rank `H` 个 GMM group，全局 `E` 个 logical/home ID。
 
 全局 count 完成后先计算静态 home destination load。如果 `max(load) <= C`，直接使用 home runtime。
-这一分支不会创建 placement，不会分配 physical-weight pool，也不会启动 replica transfer。该设计消除了
-“只要配置了 B，均衡路由也支付扩展 descriptor、remap 和 P2P”的固定税。
+这一分支不会创建 placement 或启动 replica transfer；snapshot 和 lazy compact 也不会分配 physical-weight
+pool。默认 eager compact 的 suffix backing 已在该层第一次 forward 开始时准备好，因此仍支付 `B` 个
+suffix 的持久 HBM，但不支付 physical descriptor 执行、remap 和 P2P 税。
 
 ### 4.3 有界 placement 算法
 
@@ -218,7 +223,39 @@ physical count H2D、route remap 和 token permutation 之前启动，尽量掩�
 send 的 contiguous 临时 tensor 和每个 receive target 都保活到 handle 完成；kernel 读取前调用
 `wait()`，异常路径调用 `drain()`，避免提前释放或消费未完成 buffer。
 
-### 5.2 generation-aware pool cache
+### 5.2 compact layout 时机与首次交叠保护
+
+`compact_layout_strategy` 支持两种显式策略：
+
+| 策略 | 行为 | 主要取舍 |
+| --- | --- | --- |
+| `eager_on_first_forward`（默认） | 每对 layer 参数第一次进入 backend 时、route 和 autograd graph 建立前执行一次 `set_` | 地址在首次使用后稳定；无条件支付 `B` 个 suffix HBM |
+| `lazy_on_first_replica` | 直到首次真正需要 replica 才尝试 compact；纯 home workload 不分配 suffix | 保留最低 HBM；首次安全转换可能延后并临时使用 snapshot |
+
+旧 lazy 实现只跟踪已经物化的 physical graph，遗漏了尚未使用 compact 的 home-only graph：
+
+```text
+forward A (home, graph live)
+  -> forward B (first replica, Parameter.set_)
+  -> backward A (saved version mismatch)
+```
+
+修复后，compact 尚未准备时的 home forward 会通过 `_HomeWeightLeaseFunction` 返回共享原 storage/version
+的轻量 wrapper。manager 只保存 wrapper 的 weak reference，因此 graph 正常 backward 或释放后 lease
+自动消失，不延长 activation 生命周期。首次 replica placement 检查到 live home lease 时，不修改 Parameter，
+而为该 physical generation 分配隔离 snapshot：
+
+```text
+forward A (home lease live)
+  -> forward B (snapshot physical pool, no set_)
+  -> backward A / B
+  -> next replica forward (leases released, compact set_ is now safe)
+```
+
+reentrant checkpoint 的第一次 no-grad forward 不会建立 lease；backward recompute 使用当时有效的 home
+prefix。non-reentrant checkpoint 若仍保留 home tensor，则由同一 lease 机制阻止中途重绑。
+
+### 5.3 generation-aware pool cache
 
 每对 layer 参数拥有一个 cache entry。共享串行 decoder layer 时，cache 容量等于共享成员数，所以 8 层
 可以各自保留一个 pool，同时只共享一套 runtime/workspace。
@@ -241,7 +278,7 @@ optimizer step 推进参数版本后：
 缓存命中使用 EP group 上的 INT32 `MIN` all-reduce 达成一致决策。即使只有 owner rank 观察到版本变化，
 所有 sender/receiver 也会一起进入刷新协议，避免一侧发送、另一侧误判 cache hit。
 
-### 5.3 owner-directed autograd
+### 5.4 owner-directed autograd
 
 `_PhysicalExpertWeightFunction` 把 prefetched physical view 接入 autograd，但函数输入仍是两个 home
 Parameter。MegaMoe backward 先产生 `[H+B, ...]` 的 physical `dW1/dW2`，随后：
@@ -395,16 +432,19 @@ M_expert = (hidden * 2*intermediate + intermediate * hidden) * 2 bytes
 | 模式 | 持久 physical pool | 语义 |
 | --- | --- | --- |
 | snapshot（默认） | 每个激活 layer 额外 `(H+B) * M_expert` | home prefix 与 Parameter 隔离，graph isolation 最强 |
-| compact（opt-in） | 每个激活 layer 净增 `B * M_expert` | Parameter 重绑到大 storage 的 prefix，kernel 读取 full view |
+| compact eager（compact 默认） | 每个首次 forward 的 layer 净增 `B * M_expert` | graph 前重绑，首次使用后地址稳定 |
+| compact lazy（显式） | 每个安全激活 replica 的 layer 净增 `B * M_expert` | 未使用 replica 时零 suffix；首次交叠暂用 snapshot |
 
-compact 第一次实际发生 replica placement 时分配 `[H+B, ...]` backing storage，把 home rows 复制到
-prefix，再用 `Parameter.set_()` 保持 Parameter identity 和逻辑 shape。optimizer 之后直接更新该 prefix，
-不再每步复制 home rows；suffix 接收 replica。home Parameter 与 full physical view 共享 storage 和
-version counter。
+compact 分配 `[H+B, ...]` backing storage，把 home rows 复制到 prefix，再用 `Parameter.set_()` 保持
+Parameter identity 和逻辑 shape。eager 在该层第一次 forward 的 route/autograd 之前执行；lazy 在首次
+需要 replica 且没有 live home lease 时执行。optimizer 之后直接更新 prefix，不再每步复制 home rows；
+suffix 接收 replica。home Parameter 与 full physical view 共享 storage 和 version counter。
 
 标准约束是 forward 到对应 backward 之间不能原地修改 Parameter。违反时 version counter 会使 backward
-报错，而不是静默使用错误权重。当前已验证 fused AdamW 在先创建 moment state、后首次 compact 重绑的
-场景中可继续更新；其他持有 raw storage alias 或具有特殊参数存储假设的 optimizer/调用方需要单独验证。
+报错，而不是静默使用错误权重。默认 eager 消除了正常 route 切换造成的中途 `set_`；lazy 使用 home
+lease + transient snapshot 保护首次切换。当前 CPU 回归覆盖先创建 AdamW moment、再 eager 重绑和继续
+更新，以及 `state_dict` save/load shape 与 backing 地址。持有 raw storage alias 的调用方仍必须把 alias
+创建在 eager 首次 forward 之后；lazy 转换前创建的 raw alias 不会自动跟随新的 storage。
 
 ### 8.3 Qwen shape 的理论值
 
@@ -431,6 +471,7 @@ experts = MegaMoeExperts(
     expert_capacity_factor=1.5,
     replica_slots_per_rank=1,
     compact_physical_weights=True,
+    compact_layout_strategy="eager_on_first_forward",  # default
     ep_size=8,
     ep_group=ep_group,
 )
@@ -448,7 +489,7 @@ MegaMoeExperts.share_execution_resources(layer.experts for layer in layers)
 | --- | --- | --- | --- |
 | `B=0`，home load `<= C` | home | 无 | 1 |
 | `B=0`，home load `> C` | home | 无 | `ceil(max(home load)/C)` |
-| `B>0`，home load `<= C` | home fast path | 无 | 1 |
+| `B>0`，home load `<= C` | home fast path | snapshot/lazy compact 无；eager compact 有 suffix backing | 1 |
 | `B>0`，副本后 load `<= C` | physical | snapshot 或 compact | 1 |
 | `B>0`，副本后仍 `> C` | physical | snapshot 或 compact | residual multi-wave |
 
@@ -462,10 +503,15 @@ bash examples/torch/multicore/benchmark_qwen_moe_mega_moe.sh \
   --router-load-seed 42 \
   --replica-slots-per-rank 1 \
   --compact-physical-weights \
+  --compact-layout-strategy eager_on_first_forward \
   --warmup-steps 5 \
   --measured-steps 10 \
   --tag dirichlet_a01_b1_compact
 ```
+
+需要保留“从未使用 replica 就不增加权重 HBM”的策略时，改为
+`--compact-layout-strategy lazy_on_first_replica`。该选择会写入 benchmark JSON，避免把两种 layout
+时机的 first-step/HBM 结果混合比较。
 
 ## 10. 性能结果
 
@@ -490,6 +536,11 @@ bash examples/torch/multicore/benchmark_qwen_moe_mega_moe.sh \
 每个 step 先跨 rank 取 elapsed maximum，再对 10 个 rank-max sample 求 p50/p90。显存表来自独立的
 untimed stable optimizer step；sampled HBM 通过 `total-free` 每 10 ms 采样，单独列出以覆盖可能不计入
 PyTorch allocator 的 SHMEM。
+
+这些数据采集于 layout selector 引入之前，当时 compact 行为等价于现在显式的
+`lazy_on_first_replica`。严重偏斜 workload 在第一次 warmup 就激活 replica，故 stable-step 的 compact
+backing 与 eager 相同；home-only 的“零 pool”结论只适用于 lazy。默认 eager 的 first-step latency 和
+home-only HBM 需要作为新的独立数据组重测，不能从下表外推。
 
 ### 10.2 严重偏斜：B=0 与组合实现
 
@@ -544,7 +595,7 @@ learned TopK 使用 `learning_rate=1e-6`，3 warmup + 5 measured：
 | --- | --- | ---: | ---: |
 | `B=0` | home 1 wave | 490.429 ms | 基线 |
 | `B=1`，双 runtime | 0 transfer，自动选 home runtime | 493.027 ms | +0.530% |
-| `B=1`, compact | 0 transfer，不分配 pool | 489.330 ms | -0.224% |
+| `B=1`, compact lazy | 0 transfer，不分配 pool | 489.330 ms | -0.224% |
 | `B=1`, compact + fixed histogram | 与上一行相同 route counts | 487.663 ms | -0.564% |
 
 这些小差异跨独立运行不稳定，应视为噪声；可靠结论是 home fast path 已把 `B>0` 的轻负载税压到不可见。
@@ -579,18 +630,26 @@ optimizer step，代表相同权重版本、pool 可直接命中的 micro-batch/
 
 ## 11. 正确性与验证
 
-### 11.1 当前 HEAD 重新验证
+### 11.1 当前工作树重新验证
 
-在 `d51ec884` 上执行：
+执行：
 
 ```bash
-pytest -q tests/ut/native tests/ut/core/multicore
+pytest -q tests/ut/native tests/ut/core/multicore tests/ut/examples/torch/multicore
 ```
 
-结果：`94 passed, 45 subtests passed in 1.81s`。
+结果：`115 passed, 65 subtests passed in 2.89s`。其中包括两种 compact layout 策略及首次 home-to-replica
+交叠的 CPU 回归。备份分支因为额外包含 `moonep_native` 代码和测试，其计数不能与当前分支混写。
 
-这才是当前主分支的计数。备份分支因为额外包含 `moonep_native` 测试，曾得到 `100 passed`，两者不能
-混写。
+完整 `pytest -q tests/ut` 也已尝试，但当前 Python 环境缺少 `transformers`、`toml`、`matplotlib` 和
+`pulp`，在 16 个无关测试模块的 collection 阶段终止；没有进入测试执行，因此不把它计作代码回归。
+
+新增的两卡 fused-kernel eager/lazy 切换 ST 在显式激活系统 CANN 9.2.0 后结果为
+`2 passed in 58.36s`。两条用例分别验证 eager 首次 forward 前重绑及后续地址稳定，以及 lazy 首次
+交叠 snapshot 和 graph 释放后 compact。第一次尝试曾在 `symm.initialize()` 报告
+`undefined symbol: aclrtGetFuncBySymbol`；检查发现继承 shell 的 `LD_LIBRARY_PATH` 把用户目录中的
+CANN 9.0 放在系统 9.2 之前。重新 source `/usr/local/Ascend/cann/set_env.sh` 后，同一 native payload 和
+同一用例通过，因此该报错属于 runtime 搜索路径污染，不是 layout 逻辑或 native 构建失败。
 
 ### 11.2 实施周期内已经完成的验证
 
@@ -602,11 +661,14 @@ pytest -q tests/ut/native tests/ut/core/multicore
 - 两卡真实 fused kernel：in-place、tile ACK、destination fence、retained dW scratch、atomic dW 及合法组合。
 - 8 卡 Ascend 910B3：E48/K8 近均衡、四态 placement 性能矩阵、Qwen 每步 optimizer。
 - CANN 9.1 Ascend 910B Torch multicore + SHMEM 严格 native build。<!-- codespell:ignore cann -->
-- compact storage：home/physical alias、Parameter shape、shared version、optimizer 后原地刷新、中途非法
-  修改失败关闭、overlapping graph 临时 snapshot。
+- compact storage：eager/lazy 选择、home/physical alias、Parameter shape、shared version、已有 AdamW
+  moment 后更新、`state_dict` round trip、activation checkpoint、中途非法修改失败关闭和 overlapping
+  graph 临时 snapshot。
+- eager/lazy 首次切换：CPU 复现覆盖 `home forward A -> replica forward B -> backward A/B`；两卡
+  fused-kernel ST 同时覆盖 eager 地址稳定，以及 lazy snapshot 过渡和 graph 释放后的 compact 激活。
 
-本次文档整理只重新执行了 11.1 节 UT，没有重跑多卡 ST 或 native build；第 10 节保留的是同一实现
-周期内采集的结果。原始 aggregate JSON 位于被 `.gitignore` 排除的
+本次文档整理重新执行了 11.1 节 UT 和新增的两卡 ST；没有重建 native payload。第 10 节保留的是
+同一实现周期内采集的结果。原始 aggregate JSON 位于被 `.gitignore` 排除的
 `output/qwen_moe_optimizer/optimizer_step_*.json`，因此不作为仓库发布物。
 
 ## 12. 已落地优化与被否决方案
@@ -669,18 +731,20 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 2. Ascend rank-local GMM 需要连续 `[H+B, ...]` 权重，尚无上游 MoonEP 式全局 `E+B` symmetric VMM。
 3. optimizer 每步更新会使 physical pool version 失效；固定 placement 仍需刷新 replica。pool hit 的最佳
    收益主要出现在同版本 micro-batch 或梯度累积。
-4. compact 首次激活会重绑 Parameter storage；持有 raw storage alias 的调用方不兼容。overlapping
+4. eager compact 在每层第一次 forward 建图前重绑 Parameter storage；lazy 在首次无 live home lease 的
+   replica route 重绑。跨该边界持有的 raw storage alias 不兼容；lazy 的首次交叠和后续 overlapping
    placement 可能临时退回 snapshot，瞬时 HBM 高于 steady state。
 5. 共享 workspace 只支持串行 layer/call；真正并发的 MoE 调用必须使用独立 resource group。
 6. 当前 Torch backend 要求 NPU BF16、固定 token shape、`E % R == 0`，route-fused `top_k <= 16`。
-7. benchmark 是随机权重集成负载；尚未完成真实 checkpoint 的长时收敛和动态 skew 压力测试。
+7. benchmark 是随机权重集成负载；虽已覆盖 activation/state-dict checkpoint 契约，尚未完成真实
+   checkpoint 的长时收敛、默认 eager 的新 HBM 基线和动态 skew 压力测试。
 
 ## 15. 下一步优先级
 
 1. 把 histogram、placement、physical IDs/counts/group-list 生成和 transfer table 消费一起下沉到 NPU；
    只移动 planner 而保留 Python `P2POp(peer_rank=...)` 不能消除 control-plane 同步。
-2. 评估 VMM/映射适配层，使 snapshot 语义也不复制 home prefix，并消除 compact 首次 `set_` 的瞬时
-   storage 切换。
+2. 评估 VMM/映射适配层，使 snapshot 语义也不复制 home prefix，并最终消除 eager/lazy 首次 `set_`
+   的瞬时 storage 切换。
 3. 降低 remote-weight prefetch 和 replica-gradient return 成本，加入 planner/P2P/remap/GMM/grad-return
    分段计时。
 4. 评估上一 histogram 预测与 count gather overlap，但必须用 generation 校验避免错误 plan 被静默复用。
