@@ -692,9 +692,25 @@ class ExpertReplicaManager:
             grad_weight2,
         )
         _wait_handles(_launch_transfers(transfers, self.spec.ep_group))
+        received_by_owner: dict[int, list[tuple[Any, Any]]] = {}
         for owner_slot, received_weight1, received_weight2 in received:
-            home_grad_weight1[owner_slot].add_(received_weight1)
-            home_grad_weight2[owner_slot].add_(received_weight2)
+            received_by_owner.setdefault(owner_slot, []).append(
+                (received_weight1, received_weight2)
+            )
+        for owner_slot, contributions in received_by_owner.items():
+            # Round only after all copies have contributed. Repeated BF16/FP16
+            # in-place adds lose small gradients when replica sums cancel.
+            # Process one owner at a time to bound the FP32 scratch footprint.
+            for weight_index, home_grad in enumerate((home_grad_weight1, home_grad_weight2)):
+                home = home_grad[owner_slot]
+                accumulator = (
+                    home.float()
+                    if home.dtype in (torch.bfloat16, torch.float16)
+                    else home
+                )
+                for contribution in contributions:
+                    accumulator.add_(contribution[weight_index])
+                home.copy_(accumulator)
         return home_grad_weight1, home_grad_weight2
 
 

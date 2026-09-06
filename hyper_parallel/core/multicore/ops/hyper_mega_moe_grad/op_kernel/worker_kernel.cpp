@@ -93,9 +93,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
     const int64_t local_experts = expert_num / ep;
     GM_ADDR group_list = input_list[19];
     for (int64_t expert = 0; expert < local_experts; ++expert) {
-      ZeroEmptyExpertMatrix<DTYPE_DISPATCH_TARGET>(input_list[6], group_list, expert, intermediate_size, hidden_size,
+      ZeroEmptyExpertMatrix<DTYPE_HIDDEN_DW>(input_list[6], group_list, expert, intermediate_size, hidden_size,
                                                    local_experts);
-      ZeroEmptyExpertMatrix<DTYPE_DISPATCH_TARGET>(input_list[18], group_list, expert, hidden_size,
+      ZeroEmptyExpertMatrix<DTYPE_GATE_DW>(input_list[18], group_list, expert, hidden_size,
                                                    intermediate_size * 2, local_experts);
     }
   }
@@ -203,7 +203,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
     const uint64_t w2_bytes = hidden_size * intermediate_size * data_type;
     const uint64_t w1_bytes = 2 * w2_bytes;
     uint64_t available = static_cast<uint64_t>(this->receive_capacity_) *
-      2 * intermediate_size * data_type;
+      2 * intermediate_size * sizeof(DTYPE_DISPATCH_TARGET);
     *w1_experts = available / w1_bytes;
     if (*w1_experts > local_experts) {
       *w1_experts = local_experts;
@@ -793,29 +793,29 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
       : matrix_elements;
     const int64_t persistent_offset =
       static_cast<int64_t>(expert) * matrix_elements + lane_begin;
-    __gm__ DTYPE_DISPATCH_TARGET *persistent_base =
-      (__gm__ DTYPE_DISPATCH_TARGET *)input_list[
+    __gm__ DTYPE_HIDDEN_DW *persistent_base =
+      (__gm__ DTYPE_HIDDEN_DW *)input_list[
         task_desc.outputs[0].input_position];
-    __gm__ DTYPE_DISPATCH_TARGET *scratch_base =
-      (__gm__ DTYPE_DISPATCH_TARGET *)GetWeightGradScratchMatrix(
+    __gm__ DTYPE_HIDDEN_DW *scratch_base =
+      (__gm__ DTYPE_HIDDEN_DW *)GetWeightGradScratchMatrix(
         task_desc, expert);
 
     __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
     const uint64_t accumulate_ub = device_state->mte_config.aclshmem_ub;
     constexpr int64_t chunk_elements = 2048;
     constexpr uint64_t value_bytes =
-      chunk_elements * sizeof(DTYPE_DISPATCH_TARGET);
+      chunk_elements * sizeof(DTYPE_HIDDEN_DW);
     constexpr uint64_t float_bytes = chunk_elements * sizeof(float);
-    __ubuf__ DTYPE_DISPATCH_TARGET *persistent_ub =
-      reinterpret_cast<__ubuf__ DTYPE_DISPATCH_TARGET *>(accumulate_ub);
-    __ubuf__ DTYPE_DISPATCH_TARGET *scratch_ub =
-      reinterpret_cast<__ubuf__ DTYPE_DISPATCH_TARGET *>(
+    __ubuf__ DTYPE_HIDDEN_DW *persistent_ub =
+      reinterpret_cast<__ubuf__ DTYPE_HIDDEN_DW *>(accumulate_ub);
+    __ubuf__ DTYPE_HIDDEN_DW *scratch_ub =
+      reinterpret_cast<__ubuf__ DTYPE_HIDDEN_DW *>(
         accumulate_ub + value_bytes);
-    LocalTensor<DTYPE_DISPATCH_TARGET> persistent =
-      MakeLocalTensorFromUb<DTYPE_DISPATCH_TARGET>(
+    LocalTensor<DTYPE_HIDDEN_DW> persistent =
+      MakeLocalTensorFromUb<DTYPE_HIDDEN_DW>(
         accumulate_ub, chunk_elements);
-    LocalTensor<DTYPE_DISPATCH_TARGET> scratch =
-      MakeLocalTensorFromUb<DTYPE_DISPATCH_TARGET>(
+    LocalTensor<DTYPE_HIDDEN_DW> scratch =
+      MakeLocalTensorFromUb<DTYPE_HIDDEN_DW>(
         accumulate_ub + value_bytes, chunk_elements);
     LocalTensor<float> persistent_float = MakeLocalTensorFromUb<float>(
       accumulate_ub + value_bytes * 2, chunk_elements);
@@ -830,7 +830,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
         elements = chunk_elements;
       }
       const uint64_t bytes =
-        static_cast<uint64_t>(elements) * sizeof(DTYPE_DISPATCH_TARGET);
+        static_cast<uint64_t>(elements) * sizeof(DTYPE_HIDDEN_DW);
       AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
       aclshmemi_copy_gm2ub(
         persistent_ub,
@@ -842,12 +842,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
         bytes);
       AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
       AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-      Cast(persistent_float, persistent, RoundMode::CAST_NONE, elements);
-      Cast(scratch_float, scratch, RoundMode::CAST_NONE, elements);
-      PipeBarrier<PIPE_V>();
-      Add(persistent_float, persistent_float, scratch_float, elements);
-      PipeBarrier<PIPE_V>();
-      Cast(persistent, persistent_float, RoundMode::CAST_RINT, elements);
+      if constexpr (AscendC::IsSameType<DTYPE_HIDDEN_DW, float>::value) {
+        Add(persistent, persistent, scratch, elements);
+      } else {
+        Cast(persistent_float, persistent, RoundMode::CAST_NONE, elements);
+        Cast(scratch_float, scratch, RoundMode::CAST_NONE, elements);
+        PipeBarrier<PIPE_V>();
+        Add(persistent_float, persistent_float, scratch_float, elements);
+        PipeBarrier<PIPE_V>();
+        Cast(persistent, persistent_float, RoundMode::CAST_RINT, elements);
+      }
       PipeBarrier<PIPE_V>();
       AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
       AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
@@ -1052,7 +1056,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
       nullptr, nullptr, nullptr, nullptr, nullptr, grouped_list_real, nullptr,
       output_base + output_0_offset,
       input_list[WORKSPACE_IDX], tiling_data_addr, is_weight_grad,
-      getTransposeData(task_desc.inputs[1].transpose_flag));
+      getTransposeData(task_desc.inputs[1].transpose_flag),
+      task_desc.outputs[0].data_type == sizeof(float));
   }
 
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {

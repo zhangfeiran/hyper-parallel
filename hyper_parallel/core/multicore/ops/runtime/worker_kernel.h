@@ -708,6 +708,14 @@ class KernelWorkerBase {
       WaitForDependency(task_desc.extra_value_2);
       ProfileRecord(CYCLE_PROFILE_DEPENDENCY_WAIT, profile_start);
     }
+    if constexpr (Derived::HAS_MID_WAVE_ROUTE_BARRIER) {
+      if (task_desc.task_type == TASK_SHMEM_PUT_MEM_SIGNAL &&
+          (task_desc.extra_value_3 & 0xFFU) == 2U) {
+        profile_start = ProfileStart();
+        SynchronizeCombineReuse(task_desc);
+        ProfileRecord(CYCLE_PROFILE_SYNCHRONIZATION, profile_start);
+      }
+    }
     const uint32_t route_generation_phase =
       (task_desc.extra_value_3 >> 8) & 0xFFU;
     const uint32_t route_generation_count =
@@ -861,6 +869,34 @@ class KernelWorkerBase {
     this->mid_wave_route_synchronized_ = true;
   }
 
+  __aicore__ inline void SynchronizeCombineReuse(const TaskDesc &task_desc) {
+#ifndef __DAV_C220_CUBE__
+    if (this->combine_reuse_synchronized_ || !this->has_ready_handshake_ ||
+        (IsMultiWave() && this->wave_index_ != 0)) {
+      return;
+    }
+    if (task_desc.outputs[0].input_position != 0 &&
+        task_desc.extra_value_2 == EVENT_INVALID_ID) {
+      return;
+    }
+    // A local gate dependency cannot release a peer's dY buffer. In the
+    // one-wave Cube queue, every act-grad/dW2 precedes every gate-grad, so
+    // reaching Combine proves local dY consumption is complete. Early dTopK
+    // has its own local dependency above and also needs peer completion
+    // before Combine can overwrite the retained forward expert output.
+    // Rendezvous after those local readers, before any remote overwrite.
+    ReadyHandshakeMeta reuse_meta = this->ready_handshake_meta_;
+    // Keep the release counter separate from wave/hidden-dispatch readiness;
+    // the persistent dissemination generation still advances on every rank.
+    reuse_meta.ready_event += 1;
+    if (this->worker_id_ == 1) {
+      PublishDeviceReady(reuse_meta);
+    }
+    WaitForEventCount(reuse_meta.ready_event, 1);
+    this->combine_reuse_synchronized_ = true;
+#endif
+  }
+
   __aicore__ inline void TriggerEvent(uint32_t event_index) { AtomicAddForAllEventCounters(event_index); }
 
   __aicore__ inline void FlushCycleProfile() {
@@ -917,6 +953,7 @@ class KernelWorkerBase {
   uint32_t wave_index_ = 0;
   bool has_ready_handshake_ = false;
   bool mid_wave_route_synchronized_ = false;
+  bool combine_reuse_synchronized_ = false;
   int32_t destination_ready_generation_ = 0;
   ReadyHandshakeMeta ready_handshake_meta_;
   int64_t cycle_profile_[CYCLE_PROFILE_CATEGORY_COUNT];

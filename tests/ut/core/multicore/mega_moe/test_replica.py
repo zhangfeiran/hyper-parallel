@@ -16,6 +16,7 @@
 
 import gc
 import unittest
+from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
 
@@ -186,6 +187,37 @@ class TestExpertReplicaManager(unittest.TestCase):
         self.assertTrue(home_grad_weight2.is_contiguous())
         self.assertTrue(torch.equal(home_grad_weight1, grad_weight1[:2]))
         self.assertTrue(torch.equal(home_grad_weight2, grad_weight2[:2]))
+
+    def test_multiple_replica_gradients_round_only_after_owner_reduction(self) -> None:
+        """Preserve small contributions when low-precision replica sums cancel."""
+        manager = ExpertReplicaManager(replace(self._config(rank_id=0), ep_size=3, num_experts=6))
+        plan = build_constrained_expert_placement(((9, 0, 0, 0, 0, 0),) * 3, 1, receive_capacity=9)
+
+        for dtype, large in ((torch.bfloat16, 256), (torch.float16, 2048)):
+            with self.subTest(dtype=dtype):
+                grad_weight1 = torch.full((3, 2, 2), 7.0, dtype=dtype)
+                grad_weight2 = torch.full((3, 1, 2), 7.0, dtype=dtype)
+                grad_weight1[0].fill_(large)
+                grad_weight2[0].fill_(large)
+
+                def complete_receives(transfers: tuple[Any, ...], _group: Any) -> tuple[Any, ...]:
+                    """Deliver two replicas whose sum cancels the owner's large value."""
+                    for transfer in transfers:
+                        self.assertEqual(transfer.operation, "receive")
+                        transfer.tensor.fill_(1 if transfer.peer_rank == 1 else -large)
+                    return ()
+
+                with patch.object(replica_module, "_launch_transfers", side_effect=complete_receives):
+                    home1, home2 = manager.reduce_replica_gradients(plan, grad_weight1, grad_weight2)
+
+                torch.testing.assert_close(home1[0], torch.ones_like(home1[0]), atol=0, rtol=0)
+                torch.testing.assert_close(home2[0], torch.ones_like(home2[0]), atol=0, rtol=0)
+                self.assertEqual(home1.dtype, dtype)
+                self.assertEqual(home2.dtype, dtype)
+                self.assertEqual(home1.data_ptr(), grad_weight1.data_ptr())
+                self.assertEqual(home2.data_ptr(), grad_weight2.data_ptr())
+                torch.testing.assert_close(home1[1], torch.full_like(home1[1], 7.0), atol=0, rtol=0)
+                torch.testing.assert_close(home2[1], torch.full_like(home2[1], 7.0), atol=0, rtol=0)
 
     def test_ready_pool_reuses_storage_until_a_parameter_changes(self):
         """

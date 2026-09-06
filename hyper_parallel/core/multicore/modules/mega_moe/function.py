@@ -197,9 +197,10 @@ def _allocate_backward_intermediates(
     allocate_weight_gradient = (
         torch_module.zeros if multi_wave else torch_module.empty
     )
+    weight_gradient_dtype = torch_module.float32 if spec.replica_slots_per_rank else weight1.dtype
     grad_weight2 = allocate_weight_gradient(
         tuple(weight2.shape),
-        dtype=weight2.dtype,
+        dtype=weight_gradient_dtype,
         device=weight2.device,
     )
     act_grad = torch_module.empty(
@@ -223,7 +224,7 @@ def _allocate_backward_intermediates(
     )
     grad_weight1 = allocate_weight_gradient(
         tuple(weight1.shape),
-        dtype=weight1.dtype,
+        dtype=weight_gradient_dtype,
         device=weight1.device,
     )
     return grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx
@@ -678,12 +679,18 @@ def _finish_backward(
             saved.topk_ids,
             reduce_route_index,
         )
+    grad_weight1, grad_weight2 = buffers.grad_weight1, buffers.grad_weight2
+    if ctx.replica_pending is not None:
+        pending = ctx.replica_pending
+        grad_weight1, grad_weight2 = pending.manager.reduce_replica_gradients(
+            pending.plan, grad_weight1, grad_weight2,
+        )
     return (
         grad_hidden,
         None,
         grad_topk_weights,
-        buffers.grad_weight1,
-        buffers.grad_weight2,
+        grad_weight1,
+        grad_weight2,
         None,
         None,
         None,
@@ -736,6 +743,12 @@ def _get_mega_moe_function() -> Any:
             metadata = route.metadata
             if metadata is None:
                 raise RuntimeError("MegaMoe route metadata is unavailable.")
+            # The autograd inputs remain logical home weights. Materializing
+            # inside forward avoids a BF16 intermediate gradient edge before
+            # the FP32 physical partials are reduced to their home owners.
+            ctx.replica_pending = route.placement_payload
+            if ctx.replica_pending is not None:
+                weight1, weight2 = ctx.replica_pending.wait()
             kernel_input = (
                 hidden_states
                 if spec.forward_permute_fused
@@ -762,6 +775,7 @@ def _get_mega_moe_function() -> Any:
                     atomic_dw_accumulation=(
                         plan.atomic_dw_accumulation
                     ),
+                    weight_gradient_element_size=(4 if spec.replica_slots_per_rank else weight1.element_size()),
                 )
                 # Exact route offsets cover every row consumed by GMM and
                 # unpermute. Clearing the capacity tail only adds device work.
@@ -895,8 +909,8 @@ def execute_mega_moe(
         hidden_states: Token-major local activations.
         topk_ids: Physical expert IDs selected for every route slot.
         topk_weights: Router weights paired with ``topk_ids``.
-        weight1: Rank-local physical gate/up weights, including replica slots.
-        weight2: Rank-local physical down-projection weights.
+        weight1: Rank-local logical home gate/up weights.
+        weight2: Rank-local logical home down-projection weights.
         route: Prepared route tensors and count metadata.
         plan: Static forward and backward plan descriptors.
         workspace: Directional buffers shared by this backend instance.

@@ -107,16 +107,16 @@ class TestMegaMoeExperts(unittest.TestCase):
     @patch.object(MegaMoeExperts, "_validate_forward_inputs")
     @patch.object(backend_module, "execute_mega_moe")
     @patch.object(backend_module, "prepare_topk_route")
-    def test_replica_route_prefetches_physical_weights_before_execution(
+    def test_replica_route_prefetches_before_entering_logical_weight_autograd(
         self,
-        mock_prepare_route,
-        mock_execute_mega_moe,
-        _mock_validate_tensors,
-    ):
+        mock_prepare_route: Mock,
+        mock_execute_mega_moe: Mock,
+        _mock_validate_tensors: Mock,
+    ) -> None:
         """
         Feature: physical expert backend integration
         Description: prepare a route carrying a hot-expert placement
-        Expectation: wait for prefetch and launch kernels with physical IDs and weights
+        Expectation: defer materialization to MoE autograd while passing logical home weights
         """
         placement = Mock(name="placement")
         execution_runtime = Mock(name="execution_runtime")
@@ -138,9 +138,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         backend.workspace = Mock(name="workspace")
         backend.replica_manager = Mock(name="replica_manager")
         pending = backend.replica_manager.start_prefetch.return_value
-        physical_weight1 = Mock(name="physical_weight1")
-        physical_weight2 = Mock(name="physical_weight2")
-        pending.wait.return_value = (physical_weight1, physical_weight2)
 
         def prepare_with_prefetch(*_args: Any, **kwargs: Any) -> Any:
             """Launch the backend callback at the route/weight overlap point."""
@@ -173,7 +170,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             weight2,
             placement,
         )
-        pending.wait.assert_called_once_with()
+        pending.wait.assert_not_called()
         prepare_call = mock_prepare_route.call_args
         self.assertEqual(
             prepare_call.args,
@@ -194,8 +191,8 @@ class TestMegaMoeExperts(unittest.TestCase):
             hidden_states,
             route.physical_topk_ids,
             route_weights,
-            physical_weight1,
-            physical_weight2,
+            weight1,
+            weight2,
             route,
             execution_runtime,
             backend.workspace,

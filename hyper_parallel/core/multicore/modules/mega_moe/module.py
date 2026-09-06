@@ -415,21 +415,18 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
             **route_options,
         )
-        physical_weight1 = self.gate_up_weight
-        physical_weight2 = self.down_weight
         if route.placement is not None:
             if resources.replica_manager is None:
                 raise RuntimeError("MegaMoe route produced an unexpected replica placement.")
             pending_weights = route.placement_payload
             if pending_weights is None:
                 raise RuntimeError("MegaMoe replica placement did not prefetch weights.")
-            physical_weight1, physical_weight2 = pending_weights.wait()
         output = execute_mega_moe(
             hidden_flat,
             route.physical_topk_ids,
             route_weights,
-            physical_weight1,
-            physical_weight2,
+            self.gate_up_weight,
+            self.down_weight,
             route,
             route.plan,
             resources.workspace,

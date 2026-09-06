@@ -90,6 +90,7 @@ def _plan_weight_grad_scratch(
     intermediate_size: int,
     element_size: int,
     receive_capacity: int,
+    activation_element_size: int | None = None,
 ) -> _WeightGradScratchPlan:
     """Pack whole dW matrices into one dead retained up-projection window.
 
@@ -97,11 +98,14 @@ def _plan_weight_grad_scratch(
     second therefore maximizes occupied prefix bytes without splitting a
     matrix. Remaining W2 and W1 matrices retain deterministic tail order.
     """
+    if activation_element_size is None:
+        activation_element_size = element_size
     dimensions = (
         local_experts,
         hidden_size,
         intermediate_size,
         element_size,
+        activation_element_size,
     )
     if any(value <= 0 for value in dimensions):
         raise ValueError("weight-gradient scratch dimensions must be positive.")
@@ -112,7 +116,7 @@ def _plan_weight_grad_scratch(
         hidden_size * 2 * intermediate_size * element_size
     )
     w2_matrix_bytes = hidden_size * intermediate_size * element_size
-    prefix_bytes = receive_capacity * 2 * intermediate_size * element_size
+    prefix_bytes = receive_capacity * 2 * intermediate_size * activation_element_size
     retained_w1_experts = min(local_experts, prefix_bytes // w1_matrix_bytes)
     prefix_bytes -= retained_w1_experts * w1_matrix_bytes
     retained_w2_experts = min(local_experts, prefix_bytes // w2_matrix_bytes)
@@ -481,6 +485,7 @@ class MegaMoeWorkspace:
         receive_capacity: int,
         reuse_retained_scratch: bool,
         atomic_dw_accumulation: bool,
+        weight_gradient_element_size: int | None = None,
     ) -> None:
         """Grow dW scratch while preserving capacity for outstanding backwards.
 
@@ -497,7 +502,13 @@ class MegaMoeWorkspace:
                 first retained up-projection window.
             atomic_dw_accumulation: Whether later waves atomically add into the
                 persistent dW outputs and therefore need no matrix scratch.
+            weight_gradient_element_size: Bytes per gradient element; defaults
+                to the weight dtype when no replica reduction is required.
         """
+        if weight_gradient_element_size is None:
+            weight_gradient_element_size = weight1.element_size()
+        if weight_gradient_element_size not in (2, 4):
+            raise ValueError("weight-gradient elements must use two or four bytes.")
 
         required_bytes = _GMM_WORKSPACE_BYTES
         if wave_count > 1 and not atomic_dw_accumulation:
@@ -517,14 +528,14 @@ class MegaMoeWorkspace:
                     local_experts=weight1.shape[0],
                     hidden_size=weight1.shape[1],
                     intermediate_size=weight2.shape[1],
-                    element_size=weight1.element_size(),
+                    element_size=weight_gradient_element_size,
+                    activation_element_size=weight1.element_size(),
                     receive_capacity=receive_capacity,
                 )
                 required_bytes += plan.tail_bytes
             else:
                 required_bytes += (
-                    weight1.numel() * weight1.element_size()
-                    + weight2.numel() * weight2.element_size()
+                    (weight1.numel() + weight2.numel()) * weight_gradient_element_size
                 )
         if self.gmm_workspace is None or self.device is None:
             raise RuntimeError("MegaMoe GMM workspace is not initialized.")
