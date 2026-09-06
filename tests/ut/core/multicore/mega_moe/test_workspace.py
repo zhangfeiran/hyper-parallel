@@ -288,6 +288,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         Expectation: grow for larger matrices and retain the maximum for smaller ones
         """
         workspace = MegaMoeWorkspace(
+            symmetric_memory=Mock(),
             shared=True,
             device=torch.device("cpu"),
             gmm_workspace=torch.empty((_GMM_WORKSPACE_BYTES,), dtype=torch.uint8),
