@@ -323,8 +323,8 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         """
         weight1 = torch.empty((2, 4, 6), dtype=torch.bfloat16)
         weight2 = torch.empty((2, 3, 4), dtype=torch.bfloat16)
-        for retained in (False, True):
-            with self.subTest(retained=retained), patch.object(torch.npu, "synchronize"):
+        for retained, element_size in ((False, 2), (True, 2), (False, 4), (True, 4)):
+            with self.subTest(retained=retained, element_size=element_size), patch.object(torch.npu, "synchronize"):
                 workspace = MegaMoeWorkspace(
             symmetric_memory=Mock(),
                     shared=True,
@@ -333,10 +333,10 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                 )
                 workspace.prepare_gmm_workspace(
                     weight1, weight2, 2, receive_capacity=1, reuse_retained_scratch=retained,
-                    atomic_dw_accumulation=False, physical_experts=3,
+                    atomic_dw_accumulation=False, physical_experts=3, weight_gradient_element_size=element_size,
                 )
                 # One retained row cannot fit any of these whole matrices.
-                self.assertEqual(workspace.gmm_workspace.numel(), _GMM_WORKSPACE_BYTES + 3 * (24 + 12) * 2)
+                self.assertEqual(workspace.gmm_workspace.numel(), _GMM_WORKSPACE_BYTES + 3 * (24 + 12) * element_size)
 
     def test_retained_prefix_packs_whole_weight_gradient_matrices(self):
         """

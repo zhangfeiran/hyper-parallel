@@ -212,8 +212,9 @@ def test_shared_weight_pool_lifecycle(*, checkpoint_modes: tuple[bool, ...] = (F
     pool_bytes = sum(weight.untyped_storage().nbytes() for weight in manager._shared_weights)
     gradient_bytes = sum(gradient.untyped_storage().nbytes() for gradient in manager._shared_gradients)
     assert pool_bytes == expected_pool_bytes, f"weight pool is not B-only: {pool_bytes} != {expected_pool_bytes}"
-    assert gradient_bytes == expected_pool_bytes, (
-        f"gradient pool is not B-only: {gradient_bytes} != {expected_pool_bytes}"
+    expected_gradient_bytes = expected_pool_bytes * 2
+    assert gradient_bytes == expected_gradient_bytes, (
+        f"gradient pool is not FP32 B-only: {gradient_bytes} != {expected_gradient_bytes}"
     )
     result = {
         "passed_groups": checks + 1,

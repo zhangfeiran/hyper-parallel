@@ -148,6 +148,10 @@ HyperParallel payload 的 `set_env.bash`，设置 CANN 运行环境及 custom OP
 
 [MOE-FFN 说明](../../hyper_parallel/core/multicore/doc/README.md)
 
+MoonEP 风格有界热专家副本与 lossless multi-wave 的实现细节和性能验证：
+
+[MegaMoe MoonEP + multi-wave 技术报告](../../hyper_parallel/core/multicore/doc/moonep_multi_wave_report.md)
+
 ---
 
 ## 性能建议

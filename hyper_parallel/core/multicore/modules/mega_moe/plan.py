@@ -164,6 +164,14 @@ def _use_token_a2a_offsets(graph: Any) -> None:
             op.fill_config.offsets_in_tokens = True
 
 
+def _use_fp32_weight_gradients(graph: Any) -> None:
+    """Keep dW GMM outputs and later-wave accumulator views in FP32."""
+    for op in graph.topological_sort():
+        for spec in (*op.inputs, *op.outputs):
+            if spec.param_position in (6, 18):
+                spec.dtype_size = 4
+
+
 def _inplace_wave_backward_enabled() -> bool:
     """Return the validated internal selector for the P2.1 A/B experiment."""
     value = os.getenv(_INPLACE_WAVE_BACKWARD_ENV, "0")
@@ -282,6 +290,8 @@ def _build_backward_schedule(
         num_cube_cores=spec.num_cube_cores,
         **options,
     )
+    if spec.replica_slots_per_rank:
+        _use_fp32_weight_gradients(graph)
     _use_token_a2a_offsets(graph)
     graph.propagate_splits(task_values)
     data = build_backward_config(
@@ -328,6 +338,8 @@ def _build_backward_schedule(
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
     )
+    if spec.replica_slots_per_rank:
+        _use_fp32_weight_gradients(multi_wave_graph)
     _use_token_a2a_offsets(multi_wave_graph)
     multi_wave_graph.propagate_splits(task_values)
     recompute_activation = multi_wave_graph.get_op("recompute_activation")

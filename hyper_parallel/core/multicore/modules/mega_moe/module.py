@@ -418,18 +418,27 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
         )
         resources = self._get_execution_resources(hidden_flat)
-        route_ids = topk_ids.to(torch.int32).contiguous()
         route_weights = topk_weights.float().contiguous()
+        route_ids = topk_ids.to(torch.int32).contiguous()
         route_options: dict[str, Any] = {"workspace": resources.workspace}
         if resources.replica_manager is not None:
-            resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
-            route_options["home_runtime"] = resources.home_runtime
+            # Size route-event storage for the widest physical plan before
+            # a replica-free step is allowed to select the narrower plan.
+            resources.workspace.ensure(
+                resources.spec,
+                hidden_flat.dtype,
+                hidden_flat.device,
+            )
             route_options["placement_callback"] = partial(
-                (resources.replica_manager.start_shared_prefetch
-                 if resources.shared_physical_weights else resources.replica_manager.start_prefetch),
+                (
+                    resources.replica_manager.start_shared_prefetch
+                    if resources.shared_physical_weights
+                    else resources.replica_manager.start_prefetch
+                ),
                 self.gate_up_weight,
                 self.down_weight,
             )
+            route_options["home_runtime"] = resources.home_runtime
         route = prepare_topk_route(
             hidden_flat,
             route_ids,
@@ -438,8 +447,6 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
             **route_options,
         )
-        physical_weight1 = self.gate_up_weight
-        physical_weight2 = self.down_weight
         shared_lease = None
         if route.placement is not None:
             if resources.replica_manager is None:
@@ -449,15 +456,13 @@ class MegaMoeExperts(MulticoreModule):
                 raise RuntimeError("MegaMoe replica placement did not prefetch weights.")
             if isinstance(pending_weights, SharedExpertWeightLease):
                 shared_lease = pending_weights
-            else:
-                physical_weight1, physical_weight2 = pending_weights.wait()
         try:
             output = execute_mega_moe(
                 hidden_flat,
                 route.physical_topk_ids,
                 route_weights,
-                physical_weight1,
-                physical_weight2,
+                self.gate_up_weight,
+                self.down_weight,
                 route,
                 route.plan,
                 resources.workspace,
@@ -466,7 +471,6 @@ class MegaMoeExperts(MulticoreModule):
         finally:
             if shared_lease is not None:
                 shared_lease.release()
-
 
     def _create_execution_resources(
         self,

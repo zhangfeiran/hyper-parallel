@@ -17,6 +17,7 @@
 import gc
 import struct
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
@@ -192,6 +193,39 @@ class TestExpertReplicaManager(unittest.TestCase):
         self.assertTrue(home_grad_weight2.is_contiguous())
         self.assertTrue(torch.equal(home_grad_weight1, grad_weight1[:2]))
         self.assertTrue(torch.equal(home_grad_weight2, grad_weight2[:2]))
+
+    def test_multiple_replica_gradients_round_only_after_owner_reduction(self) -> None:
+        """Preserve small contributions when low-precision replica sums cancel."""
+        manager = ExpertReplicaManager(replace(self._config(rank_id=0), ep_size=3, num_experts=6))
+        plan = build_constrained_expert_placement(((9, 0, 0, 0, 0, 0),) * 3, 1, receive_capacity=9)
+
+        for dtype, large in ((torch.bfloat16, 256), (torch.float16, 2048)):
+            with self.subTest(dtype=dtype):
+                grad_weight1 = torch.full((3, 2, 2), 7.0, dtype=dtype)
+                grad_weight2 = torch.full((3, 1, 2), 7.0, dtype=dtype)
+                grad_weight1[0].fill_(large)
+                grad_weight2[0].fill_(large)
+
+                def complete_receives(
+                    transfers: tuple[Any, ...], _group: Any, *, magnitude: int = large
+                ) -> tuple[Any, ...]:
+                    """Deliver two replicas whose sum cancels the owner's large value."""
+                    for transfer in transfers:
+                        self.assertEqual(transfer.operation, "receive")
+                        transfer.tensor.fill_(1 if transfer.peer_rank == 1 else -magnitude)
+                    return ()
+
+                with patch.object(replica_module, "_launch_transfers", side_effect=complete_receives):
+                    home1, home2 = manager.reduce_replica_gradients(plan, grad_weight1, grad_weight2)
+
+                torch.testing.assert_close(home1[0], torch.ones_like(home1[0]), atol=0, rtol=0)
+                torch.testing.assert_close(home2[0], torch.ones_like(home2[0]), atol=0, rtol=0)
+                self.assertEqual(home1.dtype, dtype)
+                self.assertEqual(home2.dtype, dtype)
+                self.assertEqual(home1.data_ptr(), grad_weight1.data_ptr())
+                self.assertEqual(home2.data_ptr(), grad_weight2.data_ptr())
+                torch.testing.assert_close(home1[1], torch.full_like(home1[1], 7.0), atol=0, rtol=0)
+                torch.testing.assert_close(home2[1], torch.full_like(home2[1], 7.0), atol=0, rtol=0)
 
     def test_ready_pool_reuses_storage_until_a_parameter_changes(self):
         """
@@ -638,24 +672,27 @@ class TestExpertReplicaManager(unittest.TestCase):
 
         Feature: B-only gradient sharing
         Description: reuse one suffix pool and build owner-directed sends from it
-        Expectation: suffix indices start at zero and multi-wave gradients are cleared
+        Expectation: FP32 suffix indices start at zero and multi-wave gradients are cleared
         """
         manager = ExpertReplicaManager(self._config(rank_id=1))
         plan = self._hot_expert_zero_plan()
-        weights = (torch.ones(2, 2, 2), torch.ones(2, 1, 2))
+        weights = (torch.ones(2, 2, 2, dtype=torch.bfloat16), torch.ones(2, 1, 2, dtype=torch.bfloat16))
+        home_partials = tuple(torch.ones_like(weight, dtype=torch.float32) for weight in weights)
         with patch.object(replica_module, "_launch_transfers", return_value=()):
             lease = manager.start_shared_prefetch(*weights, plan)
             gradients = lease.prepare_backward(multi_wave=False)
             for gradient, weight in zip(gradients, weights):
                 self.assertEqual(tuple(gradient.shape), (1, *weight.shape[1:]))
+                self.assertEqual(gradient.dtype, torch.float32)
+                self.assertEqual(gradient.untyped_storage().nbytes(), weight[0].numel() * 4)
                 gradient.fill_(7)
-            transfers, received = manager._gradient_transfers(plan, *weights, replica_gradients=gradients)
+            transfers, received = manager._gradient_transfers(plan, *home_partials, replica_gradients=gradients)
             self.assertEqual(received, ())
             self.assertEqual([transfer.operation for transfer in transfers], ["send", "send"])
             self.assertEqual([transfer.tensor.data_ptr() for transfer in transfers],
                              [gradient.data_ptr() for gradient in gradients])
-            home_gradients = manager.reduce_replica_gradients(plan, *weights, replica_gradients=gradients)
-            for actual, expected in zip(home_gradients, weights):
+            home_gradients = manager.reduce_replica_gradients(plan, *home_partials, replica_gradients=gradients)
+            for actual, expected in zip(home_gradients, home_partials):
                 self.assertEqual(actual.data_ptr(), expected.data_ptr())
                 self.assertEqual(actual.untyped_storage().nbytes(), expected.numel() * expected.element_size())
             lease.release()

@@ -311,11 +311,13 @@ class ExpertReplicaManager:
             raise
 
     def prepare_shared_gradients(self, *, multi_wave: bool) -> tuple[Any, Any]:
-        """Return group-owned B-slot gradients, cleared before multi-wave add."""
+        """Return FP32 B-slot partials, cleared before multi-wave accumulation."""
         if not self._shared_in_use or self._shared_weights is None:
             raise RuntimeError("shared expert weight pool is not claimed.")
         if self._shared_gradients is None:
-            self._shared_gradients = tuple(torch.empty_like(weight) for weight in self._shared_weights)
+            self._shared_gradients = tuple(
+                torch.empty_like(weight, dtype=torch.float32) for weight in self._shared_weights
+            )
         if multi_wave:
             for gradient in self._shared_gradients:
                 gradient.zero_()
@@ -900,9 +902,25 @@ class ExpertReplicaManager:
             replica_gradients=replica_gradients,
         )
         _wait_handles(_launch_transfers(transfers, self.spec.ep_group))
+        received_by_owner: dict[int, list[tuple[Any, Any]]] = {}
         for owner_slot, received_weight1, received_weight2 in received:
-            home_grad_weight1[owner_slot].add_(received_weight1)
-            home_grad_weight2[owner_slot].add_(received_weight2)
+            received_by_owner.setdefault(owner_slot, []).append(
+                (received_weight1, received_weight2)
+            )
+        for owner_slot, contributions in received_by_owner.items():
+            # Round only after all copies have contributed. Repeated BF16/FP16
+            # in-place adds lose small gradients when replica sums cancel.
+            # Process one owner at a time to bound the FP32 scratch footprint.
+            for weight_index, home_grad in enumerate((home_grad_weight1, home_grad_weight2)):
+                home = home_grad[owner_slot]
+                accumulator = (
+                    home.float()
+                    if home.dtype in (torch.bfloat16, torch.float16)
+                    else home
+                )
+                for contribution in contributions:
+                    accumulator.add_(contribution[weight_index])
+                home.copy_(accumulator)
         return home_grad_weight1, home_grad_weight2
 
 

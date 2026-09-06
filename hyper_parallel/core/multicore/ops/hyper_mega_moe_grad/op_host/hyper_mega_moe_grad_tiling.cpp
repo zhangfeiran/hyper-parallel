@@ -62,15 +62,27 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   OP_CHECK_NULL_WITH_CONTEXT(context, cycleProfileAttr);
   uint32_t cycleProfile = *cycleProfileAttr == 0 ? 0U : 1U;
   ge::DataType input0DType = input0Desc->GetDataType();
+  auto weightGrad1Desc = context->GetInputDesc(18);
+  auto weightGrad2Desc = context->GetInputDesc(6);
+  OP_CHECK_NULL_WITH_CONTEXT(context, weightGrad1Desc);
+  OP_CHECK_NULL_WITH_CONTEXT(context, weightGrad2Desc);
+  ge::DataType weightGradDType = weightGrad1Desc->GetDataType();
+  if (weightGrad2Desc->GetDataType() != weightGradDType ||
+      (weightGradDType != input0DType && weightGradDType != ge::DT_FLOAT)) {
+    OP_LOGE(context->GetNodeName(), "Weight gradients must share the activation dtype or both use float32");
+    return ge::GRAPH_FAILED;
+  }
   if (input0DType == ge::DT_FLOAT16) {
     uint64_t tilingKey_ = GET_TPL_TILING_KEY(
-      static_cast<uint32_t>(1), static_cast<uint32_t>(1), static_cast<uint32_t>(1), 0UL, 0UL, static_cast<uint32_t>(0),
+      static_cast<uint32_t>(1), static_cast<uint32_t>(1), static_cast<uint32_t>(weightGradDType),
+      0UL, 0UL, static_cast<uint32_t>(0),
       static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0),
       cycleProfile);
     context->SetTilingKey(tilingKey_);
   } else if (input0DType == ge::DT_BF16) {
     uint64_t tilingKey_ =
-      GET_TPL_TILING_KEY(static_cast<uint32_t>(27), static_cast<uint32_t>(27), static_cast<uint32_t>(27), 0UL, 0UL,
+      GET_TPL_TILING_KEY(static_cast<uint32_t>(27), static_cast<uint32_t>(27),
+                         static_cast<uint32_t>(weightGradDType), 0UL, 0UL,
                          static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0),
                          static_cast<uint32_t>(0), static_cast<uint32_t>(0), cycleProfile);
     context->SetTilingKey(tilingKey_);

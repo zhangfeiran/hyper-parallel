@@ -36,7 +36,6 @@ from .workspace import MegaMoeWorkspace
 
 torch = import_module("torch")
 
-
 _MEGA_MOE_FUNCTION = None
 _CYCLE_PROFILE_ENV = "HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"
 
@@ -198,9 +197,10 @@ def _allocate_backward_intermediates(
     allocate_weight_gradient = (
         torch_module.zeros if multi_wave else torch_module.empty
     )
+    weight_gradient_dtype = torch_module.float32 if spec.replica_slots_per_rank else weight1.dtype
     grad_weight2 = allocate_weight_gradient(
         tuple(weight2.shape),
-        dtype=weight2.dtype,
+        dtype=weight_gradient_dtype,
         device=weight2.device,
     )
     act_grad = torch_module.empty(
@@ -224,7 +224,7 @@ def _allocate_backward_intermediates(
     )
     grad_weight1 = allocate_weight_gradient(
         tuple(weight1.shape),
-        dtype=weight1.dtype,
+        dtype=weight_gradient_dtype,
         device=weight1.device,
     )
     return grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx
@@ -686,12 +686,18 @@ def _finish_backward(
             saved.topk_ids,
             reduce_route_index,
         )
+    grad_weight1, grad_weight2 = buffers.grad_weight1, buffers.grad_weight2
+    if ctx.replica_pending is not None:
+        pending = ctx.replica_pending
+        grad_weight1, grad_weight2 = pending.manager.reduce_replica_gradients(
+            pending.plan, grad_weight1, grad_weight2,
+        )
     return (
         grad_hidden,
         None,
         grad_topk_weights,
-        buffers.grad_weight1,
-        buffers.grad_weight2,
+        grad_weight1,
+        grad_weight2,
         None,
         None,
         None,
@@ -700,7 +706,7 @@ def _finish_backward(
 
 
 def _get_mega_moe_function() -> Any:
-    """Create the Torch autograd.Function lazily inside the Torch execution module."""
+    """Create the Torch autograd.Function lazily inside the Torch backend."""
     # pylint: disable=global-statement
     global _MEGA_MOE_FUNCTION
     if _MEGA_MOE_FUNCTION is not None:
@@ -752,8 +758,14 @@ def _get_mega_moe_function() -> Any:
             ctx.weight_replay = (
                 None if shared_lease is None else (shared_lease.manager, shared_lease.plan)
             )
+            # The autograd inputs remain logical home weights. Materializing
+            # inside forward avoids a BF16 intermediate gradient edge before
+            # the FP32 physical partials are reduced to their home owners.
+            ctx.replica_pending = route.placement_payload if shared_lease is None else None
             if shared_lease is not None:
                 shared_lease.wait()
+            elif ctx.replica_pending is not None:
+                weight1, weight2 = ctx.replica_pending.wait()
             kernel_input = (
                 hidden_states
                 if spec.forward_permute_fused
@@ -781,6 +793,7 @@ def _get_mega_moe_function() -> Any:
                         plan.atomic_dw_accumulation
                     ),
                     physical_experts=spec.physical_local_experts,
+                    weight_gradient_element_size=(4 if spec.replica_slots_per_rank else weight1.element_size()),
                 )
                 # Exact route offsets cover every row consumed by GMM and
                 # unpermute. Clearing the capacity tail only adds device work.
@@ -931,9 +944,8 @@ def execute_mega_moe(
         hidden_states: Token-major local activations.
         topk_ids: Physical expert IDs selected for every route slot.
         topk_weights: Router weights paired with ``topk_ids``.
-        weight1: Rank-local gate/up weights; home-only with a shared B lease,
-            otherwise contiguous physical weights including replica slots.
-        weight2: Down-projection weights using the same layout as ``weight1``.
+        weight1: Rank-local logical home gate/up weights.
+        weight2: Rank-local logical home down-projection weights.
         route: Prepared route tensors and count metadata.
         plan: Static forward and backward plan descriptors.
         workspace: Directional buffers shared by this backend instance.

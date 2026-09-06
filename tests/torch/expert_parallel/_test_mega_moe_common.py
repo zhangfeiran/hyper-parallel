@@ -523,21 +523,17 @@ def _run_precision_case() -> None:
             shape,
             "single_destination",
         )
-        try:
-            bounded(
-                hidden_states,
-                overflow_ids,
-                overflow_weights,
-                tokens_per_expert=overflow_counts,
-            )
-        except RuntimeError as error:
-            assert "capacity overflow" in str(error), (
-                f"rank={RANK}: bounded overflow reported the wrong error: {error}."
-            )
-        else:
-            raise AssertionError(
-                f"rank={RANK}: bounded MegaMoe accepted an overflowing route."
-            )
+        # Bounded capacity now loops losslessly inside the kernel. Retain the
+        # reference comparison across the W1-to-multi-wave transition.
+        overflow_common_result = run_layer(
+            bounded_common, hidden_states, overflow_ids, overflow_weights,
+            overflow_counts, grad_output,
+        )
+        overflow_result = run_layer(
+            bounded, hidden_states, overflow_ids, overflow_weights,
+            overflow_counts, grad_output,
+        )
+        assert_results_close(overflow_common_result, overflow_result)
     finally:
         bounded.close()
 
