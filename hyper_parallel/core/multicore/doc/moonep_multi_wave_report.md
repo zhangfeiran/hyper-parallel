@@ -9,10 +9,10 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 整理日期 | 2026-09-06 |
+| 整理日期 | 2026-09-07 |
 | 代码分支 | `megamoe-perf-sun` |
 | 代码基线 | `megamoe-perf-sun`；以本文同提交代码为准 |
-| 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、本提交（compact layout 策略与首次切换修复） |
+| 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、`43aa7d6c`、本提交（compact layout 与集成修复） |
 | 状态 | 已实现；Torch managed MegaMoe 默认关闭副本，compact 默认 eager，multi-wave 保持 lossless |
 
 代码是最终事实来源；本文中的性能数字只对应第 10 节写明的硬件、模型、路由和测量方法。
@@ -36,6 +36,9 @@
 - compact 同时支持默认 `eager_on_first_forward` 和可选 `lazy_on_first_replica`。lazy 的 home graph
   通过 autograd lease 纳入生命周期；首次 replica 与未完成 home forward 交叠时临时使用 snapshot，
   避免 `Parameter.set_()` 触发 saved-tensor version 错误。
+- 精度修复后，replica route 的 physical dW 保持 FP32，所有 copy 在 owner 侧聚合后才回到 logical
+  Parameter；外层 MegaMoe autograd 同时负责等待 physical weight 和返回 logical gradient，避免中间
+  BF16 autograd edge。第 10 节历史性能/HBM 数据早于该修复，不能当作当前提交的复测结果。
 
 ## 2. 目标、边界与术语
 
@@ -280,15 +283,18 @@ optimizer step 推进参数版本后：
 
 ### 5.4 owner-directed autograd
 
-`_PhysicalExpertWeightFunction` 把 prefetched physical view 接入 autograd，但函数输入仍是两个 home
-Parameter。MegaMoe backward 先产生 `[H+B, ...]` 的 physical `dW1/dW2`，随后：
+生产执行中，外层 `_MegaMoeFunction` 的 autograd 输入始终是两个 logical home Parameter。replica
+prefetch 的 `PendingExpertWeights` 只作为 route payload 传入，在该 custom Function 的 forward 内等待并
+换成 physical kernel view；因此 physical view 与 home Parameter 之间不会建立一个提前把梯度舍入到
+BF16 的中间 autograd edge。MegaMoe backward 先产生 `[H+B, ...]` 的 FP32 physical `dW1/dW2`，随后：
 
 1. 本地 home prefix 作为 owner gradient 基底；
-2. replica rank 把 suffix gradient P2P 发回 logical expert 的 home owner；
-3. owner 等待 receive 完成并累加到对应 home row；
+2. replica rank 以 FP32 把 suffix gradient P2P 发回 logical expert 的 home owner；
+3. owner 等待 receive 完成，同一 expert 的所有 contribution 在 FP32 中聚合后再统一舍入；
 4. autograd 只向原 Parameter 返回 `[H, ...]` gradient。
 
-因此 replica 不产生新的 optimizer parameter，也不会被 optimizer 独立更新。
+`_PhysicalExpertWeightFunction` 仍保留给 replica manager 的直接调用接口，但 backend 生产路径的归并在
+外层 MegaMoe backward 完成。因此 replica 不产生新的 optimizer parameter，也不会被 optimizer 独立更新。
 
 ## 6. lossless multi-wave 数据面
 
@@ -457,6 +463,11 @@ lease + transient snapshot 保护首次切换。当前 CPU 回归覆盖先创建
 实际 peak 还包含 runtime descriptor、route arena、activation、allocator 对齐以及 overlapping graph 的
 临时保护，因此不会精确等于上式。
 
+精度修复后，replica route 的 physical dW 使用 FP32。单个活跃 layer 的 W1+W2 dW 总量为
+`2 * (H+B) * M_expert`，相对旧 BF16 dW 多 `(H+B) * M_expert`；multi-wave retained dW scratch 也按
+4-byte element 规划。第 10 节 shape 下单层额外理论量为 `7 * 52.5 MiB = 367.5 MiB`。这是临时 backward
+buffer，不改变 compact physical weight 的持久 suffix 公式，但会改变 allocator/HBM peak，必须纳入新基线。
+
 ## 9. API 与执行状态
 
 模型侧显式启用方式：
@@ -513,7 +524,7 @@ bash examples/torch/multicore/benchmark_qwen_moe_mega_moe.sh \
 `--compact-layout-strategy lazy_on_first_replica`。该选择会写入 benchmark JSON，避免把两种 layout
 时机的 first-step/HBM 结果混合比较。
 
-## 10. 性能结果
+## 10. 历史性能结果（精度修复前）
 
 ### 10.1 测量口径
 
@@ -537,7 +548,11 @@ bash examples/torch/multicore/benchmark_qwen_moe_mega_moe.sh \
 untimed stable optimizer step；sampled HBM 通过 `total-free` 每 10 ms 采样，单独列出以覆盖可能不计入
 PyTorch allocator 的 SHMEM。
 
-这些数据采集于 layout selector 引入之前，当时 compact 行为等价于现在显式的
+以下所有数字采集于 FP32 replica dW 精度修复 `43aa7d6c` 之前，只用于说明有界副本减少 wave 时的历史
+收益和 compact 对持久权重 pool 的影响，不能代表当前提交的端到端性能或 HBM。精度修复增加了 physical
+dW/scratch 字节数并改变 owner reduction，当前版本必须用相同命令重新测量后才能更新结论。
+
+这些数据也采集于 layout selector 引入之前，当时 compact 行为等价于现在显式的
 `lazy_on_first_replica`。严重偏斜 workload 在第一次 warmup 就激活 replica，故 stable-step 的 compact
 backing 与 eager 相同；home-only 的“零 pool”结论只适用于 lazy。默认 eager 的 first-step latency 和
 home-only HBM 需要作为新的独立数据组重测，不能从下表外推。
@@ -638,14 +653,15 @@ optimizer step，代表相同权重版本、pool 可直接命中的 micro-batch/
 pytest -q tests/ut/native tests/ut/core/multicore tests/ut/examples/torch/multicore
 ```
 
-结果：`115 passed, 65 subtests passed in 2.89s`。其中包括两种 compact layout 策略及首次 home-to-replica
+结果：`124 passed, 75 subtests passed in 3.81s`。其中包括两种 compact layout 策略及首次 home-to-replica
 交叠的 CPU 回归。备份分支因为额外包含 `moonep_native` 代码和测试，其计数不能与当前分支混写。
 
 完整 `pytest -q tests/ut` 也已尝试，但当前 Python 环境缺少 `transformers`、`toml`、`matplotlib` 和
 `pulp`，在 16 个无关测试模块的 collection 阶段终止；没有进入测试执行，因此不把它计作代码回归。
 
-新增的两卡 fused-kernel eager/lazy 切换 ST 在显式激活系统 CANN 9.2.0 后结果为
-`2 passed in 58.36s`。两条用例分别验证 eager 首次 forward 前重绑及后续地址稳定，以及 lazy 首次
+新增的两卡 fused-kernel eager/lazy 切换 ST 在显式激活系统 CANN 9.2.0 和本提交重新构建的
+Ascend910B native payload 后结果为 `2 passed in 126.20s`。两条用例分别验证 eager 首次 forward 前重绑
+及后续地址稳定，以及 lazy 首次
 交叠 snapshot 和 graph 释放后 compact。第一次尝试曾在 `symm.initialize()` 报告
 `undefined symbol: aclrtGetFuncBySymbol`；检查发现继承 shell 的 `LD_LIBRARY_PATH` 把用户目录中的
 CANN 9.0 放在系统 9.2 之前。重新 source `/usr/local/Ascend/cann/set_env.sh` 后，同一 native payload 和
@@ -666,9 +682,11 @@ CANN 9.0 放在系统 9.2 之前。重新 source `/usr/local/Ascend/cann/set_env
   graph 临时 snapshot。
 - eager/lazy 首次切换：CPU 复现覆盖 `home forward A -> replica forward B -> backward A/B`；两卡
   fused-kernel ST 同时覆盖 eager 地址稳定，以及 lazy snapshot 过渡和 graph 释放后的 compact 激活。
+- peer-buffer reuse fence：CPU source harness 覆盖首个 Combine tile 选举 publisher；双卡小 shape 验证
+  publisher 不依赖固定 worker 获得 Combine 任务，避免所有实际 worker 等待未发布 event。
 
-本次文档整理重新执行了 11.1 节 UT 和新增的两卡 ST；没有重建 native payload。第 10 节保留的是
-同一实现周期内采集的结果。原始 aggregate JSON 位于被 `.gitignore` 排除的
+本次 rebase 集成重新执行了 11.1 节 UT，重建 Torch/Ascend910B native payload 并运行新增的两卡 ST。
+第 10 节仍保留精度修复前同一实现周期内采集的历史结果。原始 aggregate JSON 位于被 `.gitignore` 排除的
 `output/qwen_moe_optimizer/optimizer_step_*.json`，因此不作为仓库发布物。
 
 ## 12. 已落地优化与被否决方案
@@ -737,7 +755,8 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 5. 共享 workspace 只支持串行 layer/call；真正并发的 MoE 调用必须使用独立 resource group。
 6. 当前 Torch backend 要求 NPU BF16、固定 token shape、`E % R == 0`，route-fused `top_k <= 16`。
 7. benchmark 是随机权重集成负载；虽已覆盖 activation/state-dict checkpoint 契约，尚未完成真实
-   checkpoint 的长时收敛、默认 eager 的新 HBM 基线和动态 skew 压力测试。
+   checkpoint 的长时收敛、FP32 replica dW 后的性能/HBM 基线、默认 eager 的新 HBM 基线和动态 skew
+   压力测试。
 
 ## 15. 下一步优先级
 

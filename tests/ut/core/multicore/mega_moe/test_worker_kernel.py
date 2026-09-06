@@ -68,7 +68,11 @@ class TestWorkerKernel(unittest.TestCase):
 #define __aicore__
 constexpr uint32_t EVENT_INVALID_ID = 0xFFFFFFFF;
 struct TensorDesc { uint32_t input_position = 0; };
-struct TaskDesc { TensorDesc outputs[1]; uint32_t extra_value_2 = EVENT_INVALID_ID; };
+struct TaskDesc {
+  TensorDesc outputs[1];
+  uint32_t task_index = 0;
+  uint32_t extra_value_2 = EVENT_INVALID_ID;
+};
 struct ReadyHandshakeMeta { uint32_t ready_event = 100; };
 struct Harness {
   bool combine_reuse_synchronized_ = false, has_ready_handshake_ = true, multi = false;
@@ -86,13 +90,14 @@ struct Harness {
 };
 int main() {
   TaskDesc dispatch_reuse;
-  Harness leader;
+  Harness leader; leader.worker_id_ = 3;
   leader.SynchronizeCombineReuse(dispatch_reuse);
   leader.SynchronizeCombineReuse(dispatch_reuse);
   assert(leader.publishes == 1 && leader.waits == 1);
   assert(leader.ready_handshake_meta_.ready_event == 100);
-  Harness follower; follower.worker_id_ = 3;
-  follower.SynchronizeCombineReuse(dispatch_reuse);
+  TaskDesc later_dispatch_reuse; later_dispatch_reuse.task_index = 4;
+  Harness follower; follower.worker_id_ = 1;
+  follower.SynchronizeCombineReuse(later_dispatch_reuse);
   assert(follower.publishes == 0 && follower.waits == 1);
   TaskDesc expert_output_reuse; expert_output_reuse.outputs[0].input_position = 13;
   Harness legacy; legacy.SynchronizeCombineReuse(expert_output_reuse);
