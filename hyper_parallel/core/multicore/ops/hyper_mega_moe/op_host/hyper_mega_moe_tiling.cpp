@@ -56,6 +56,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     tiling.set_hiddenSize((*(attr->GetAttrPointer<int64_t>(3))));
     tiling.set_seqSize((*(attr->GetAttrPointer<int64_t>(4))));
     tiling.set_coreNum(static_cast<int64_t>(coreNum));
+    tiling.set_receiveCapacity((*(attr->GetAttrPointer<int64_t>(5))));
+    tiling.set_waveCount((*(attr->GetAttrPointer<int64_t>(6))));
   }
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
   context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());

@@ -104,6 +104,7 @@ print(json.dumps({
                     "num_experts": 4,
                     "top_k": 2,
                     "expert_capacity_factor": None,
+                    "replica_slots_per_rank": 0,
                     "ep_size": 2,
                     "ep_group": None,
                 },
@@ -154,11 +155,11 @@ print(json.dumps({
         topk_weights = torch.full((128, 2), 0.5)
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
-        resources = SimpleNamespace(spec=object(), plan=object(), workspace=object())
+        resources = SimpleNamespace(spec=object(), plan=object(), workspace=object(), replica_manager=None)
         route = SimpleNamespace(
-            routed_tokens=object(), metadata=object(), unpermute_mapping=object()
+            routed_tokens=object(), metadata=object(), unpermute_mapping=object(),
+            physical_topk_ids=topk_ids, placement=None,
         )
-        expert_output = object()
 
         with (
             patch.object(
@@ -169,11 +170,8 @@ print(json.dumps({
                 mega_moe_module, "prepare_topk_route", return_value=route
             ) as mock_prepare,
             patch.object(
-                mega_moe_module, "execute_mega_moe", return_value=expert_output
+                mega_moe_module, "execute_mega_moe", return_value=expected
             ) as mock_execute,
-            patch.object(
-                mega_moe_module, "restore_topk_output", return_value=expected
-            ) as mock_restore,
         ):
             actual = experts(
                 hidden_states,
@@ -186,18 +184,18 @@ print(json.dumps({
         hidden_flat = mock_prepare.call_args.args[0]
         torch.testing.assert_close(hidden_flat, hidden_states.reshape(128, 16))
         mock_prepare.assert_called_once_with(
-            hidden_flat, topk_ids, topk_weights, resources.spec, tokens_per_expert
+            hidden_flat, topk_ids, topk_weights, resources.plan, tokens_per_expert,
+            workspace=resources.workspace,
         )
         mock_execute.assert_called_once_with(
-            route.routed_tokens,
+            hidden_flat,
+            topk_ids,
+            topk_weights,
             experts.gate_up_weight,
             experts.down_weight,
-            route.metadata,
+            route,
             resources.plan,
             resources.workspace,
-        )
-        mock_restore.assert_called_once_with(
-            expert_output, route.unpermute_mapping, topk_weights
         )
 
     def test_forward_rejects_invalid_weights_before_resource_creation(self) -> None:
@@ -279,6 +277,59 @@ print(json.dumps({
         resources.close.assert_not_called()
         layers[-1].close()
         resources.close.assert_called_once_with()
+
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_constructor_validates_replica_slot_budget(self, mock_create_parameters):
+        """Reject negative and non-integer replica slot budgets."""
+        mock_create_parameters.return_value = (object(), object())
+
+        for replica_slots_per_rank in (-1, True, 1.5, "1"):
+            with (
+                self.subTest(replica_slots_per_rank=replica_slots_per_rank),
+                self.assertRaisesRegex(ValueError, "replica_slots_per_rank"),
+            ):
+                MegaMoeExperts(
+                    local_num_tokens=128,
+                    hidden_size=16,
+                    intermediate_size=8,
+                    num_experts=4,
+                    top_k=2,
+                    replica_slots_per_rank=replica_slots_per_rank,
+                    ep_size=2,
+                )
+
+        mock_create_parameters.assert_not_called()
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_replica_budget_participates_in_resource_compatibility(
+        self,
+        mock_create_parameters,
+    ):
+        """Prevent modules with different physical group counts from sharing."""
+        mock_create_parameters.return_value = (object(), object())
+        static_layer = MegaMoeExperts(
+            local_num_tokens=128,
+            hidden_size=16,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            ep_size=2,
+        )
+        replicated_layer = MegaMoeExperts(
+            local_num_tokens=128,
+            hidden_size=16,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            replica_slots_per_rank=1,
+            ep_size=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "identical configuration"):
+            MegaMoeExperts.share_execution_resources(
+                (static_layer, replicated_layer)
+            )
 
 
 if __name__ == "__main__":

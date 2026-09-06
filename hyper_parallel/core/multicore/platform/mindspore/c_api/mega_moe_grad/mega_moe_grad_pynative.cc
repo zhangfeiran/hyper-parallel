@@ -103,7 +103,7 @@ std::vector<ms::Tensor> npu_mega_moe_grad(const ms::Tensor &dispatch_target,  //
                                           const ms::Tensor &route_weight,           // pos 30
                                           const ms::Tensor &reduce_route_index,     // pos 31
                                           int64_t rank_id, int64_t ep, int64_t expert_num, int64_t hidden_size,
-                                          int64_t seq_size) {
+                                          int64_t seq_size, int64_t receive_capacity, int64_t wave_count) {
   auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MoeBwd");
   MS_EXCEPTION_IF_NULL(runner);
   runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(
@@ -111,7 +111,8 @@ std::vector<ms::Tensor> npu_mega_moe_grad(const ms::Tensor &dispatch_target,  //
     w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size,
     permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
     swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, permute_src_index,
-    route_weight, reduce_route_index, rank_id, ep, expert_num, hidden_size, seq_size));
+    route_weight, reduce_route_index, rank_id, ep, expert_num, hidden_size, seq_size,
+    receive_capacity, wave_count, 0));
 
   std::vector<ms::Tensor> inputs = {
     dispatch_target,

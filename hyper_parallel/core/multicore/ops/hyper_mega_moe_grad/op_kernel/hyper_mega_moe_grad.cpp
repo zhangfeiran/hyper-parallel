@@ -19,7 +19,7 @@
 using namespace AscendC;
 
 template <int D_T_A, int D_T_B, int D_T_Y, int TRANS_A, int TRANS_B, int GROUP_LIST_TYPE, int IS_STATIC_TILING_API,
-          int A8W4_KERNEL_TEMPLATE, int A16W8_KERNEL_TEMPLATE, int AIV_AIC_RATIO>
+          int A8W4_KERNEL_TEMPLATE, int A16W8_KERNEL_TEMPLATE, int AIV_AIC_RATIO, int CYCLE_PROFILE>
 __global__ __aicore__ void hyper_mega_moe_grad(
   GM_ADDR dispatch_target, GM_ADDR dispatch_target_off, GM_ADDR dy, GM_ADDR dispatch_src_off, GM_ADDR dispatch_size,
   GM_ADDR hidden, GM_ADDR hidden_dw, GM_ADDR weight, GM_ADDR y, GM_ADDR gate, GM_ADDR grad_gate, GM_ADDR w1,
@@ -66,10 +66,10 @@ __global__ __aicore__ void hyper_mega_moe_grad(
                               route_weight,
                               reduce_route_index,
                               workspace,
-                              tiling,  // 30
+                              tiling,
                               all_event_counters};
       uint32_t idx = GetBlockIdx();
-      worker_kernel(idx, runtime_config, input_list);
+      worker_kernel<CYCLE_PROFILE != 0>(idx, runtime_config, input_list);
     } else if constexpr (TRANS_A == 0 && TRANS_B == 1 && AIV_AIC_RATIO == GROUPED_MATMUL_CUBE_ONLY) {
     } else if constexpr (TRANS_A == 1 && AIV_AIC_RATIO == GROUPED_MATMUL_AIV_AIC_RATIO_1) {
     }

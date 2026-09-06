@@ -23,7 +23,6 @@ import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
 
-
 # ── Constants (match runtime_head.hpp exactly) ────────────────────────────────
 MAX_TENSOR_DIMS      = 4
 MAX_INPUTS_PER_TASK  = 4
@@ -31,6 +30,7 @@ MAX_OUTPUTS_PER_TASK = 4
 
 MAX_TASK_NUM         = 256 * 100
 MAX_EVENT_NUM        = 1024
+PHASE_BARRIER_EVENT  = MAX_EVENT_NUM - 2
 NUM_WORKERS_VECTOR   = 48
 NUM_WORKERS_CUBE     = 24
 QUEUE_CAPACITY       = 100
@@ -39,9 +39,17 @@ MAX_GROUP_LIST       = 512
 ATOMIC_ADD_VALUE_LEN = 8
 READY_HANDSHAKE_MAGIC   = 0x4D4D5231
 READY_HANDSHAKE_VERSION = 1
+READY_HANDSHAKE_COPY_ACK_VERSION = 2
+READY_HANDSHAKE_DESTINATION_FENCE_VERSION = 3
 EVENT_COUNTER_BYTES     = MAX_EVENT_NUM * ctypes.sizeof(ctypes.c_int32)
 READY_CACHE_LINE_BYTES  = 64
 ROUTE_ARRIVAL_STRIDE_BYTES = READY_CACHE_LINE_BYTES
+ROUTE_COPY_ACK_FLAG = 1 << 24
+ROUTE_ARRIVAL_WAIT_FLAG = 1 << 25
+ROUTE_COMPUTE_ACK_FLAG = 1 << 26
+ROUTE_EXPERT_ACK_FLAG = 1 << 27
+RETAINED_DW_SCRATCH_FLAG = 1 << 28
+ATOMIC_DW_ACCUMULATION_FLAG = 1 << 29
 RUNTIME_TASK_CAPACITY_MAGIC = 0x80000000
 RUNTIME_TASK_CAPACITY_MASK = RUNTIME_TASK_CAPACITY_MAGIC - 1
 RUNTIME_TASK_CAPACITY_ALIGNMENT = 16
@@ -67,6 +75,9 @@ class TaskType(IntEnum):
     TASK_UNPERMUTE_REDUCE_GRAD = 110
     TASK_TOPK_WEIGHT_GRAD     = 111
     TASK_WEIGHTED_UNPERMUTE   = 112
+    TASK_LOCAL_COPY           = 113
+    TASK_LOCAL_ACCUMULATE     = 114
+    TASK_PHASE_BARRIER        = 115
 
 
 class EventType(IntEnum):
@@ -190,7 +201,14 @@ RUNTIME_CONFIG_BYTES_PER_TASK_CAPACITY = (
 
 
 def runtime_config_task_capacity(cfg: RuntimeConfigC) -> int:
-    """Return the aligned wire capacity required by populated task queues."""
+    """Return the aligned wire capacity required by populated task queues.
+
+    Args:
+        cfg: Populated runtime configuration.
+
+    Returns:
+        Aligned number of serialized task slots.
+    """
     counts = [int(cfg.task_index_num[index]) for index in range(3)]
     for count in counts:
         if count < 0 or count > TASK_TYPE_INDEX_NUM:
@@ -217,7 +235,14 @@ def runtime_config_task_capacity(cfg: RuntimeConfigC) -> int:
 
 
 def runtime_config_serialized_size(task_capacity: int) -> int:
-    """Return the dynamic wire size for an aligned full task capacity."""
+    """Return the dynamic wire size for an aligned full task capacity.
+
+    Args:
+        task_capacity: Aligned number of serialized task slots.
+
+    Returns:
+        Runtime descriptor size in bytes.
+    """
     if (
         task_capacity < 0
         or task_capacity > MAX_TASK_NUM
@@ -235,6 +260,12 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
 
     The high bit in the legacy ``queue_capacity`` header word marks a dynamic
     image. Unmarked offline descriptors retain the fixed-capacity ABI.
+
+    Args:
+        cfg: Populated runtime configuration.
+
+    Returns:
+        Compact runtime descriptor bytes.
     """
     capacity = runtime_config_task_capacity(cfg)
     raw = bytes(cfg)
@@ -371,7 +402,11 @@ class TaskSplitValue:
 
 
 def init_task_split_value(tsv: TaskSplitValue) -> None:
-    """Reset per-rank runtime counters to zero."""
+    """Reset per-rank runtime counters to zero.
+
+    Args:
+        tsv: Mutable scheduler counters to reset.
+    """
     tsv.pre_pre_event_num   = 0
     tsv.pre_event_num       = 0
     tsv.pre_task_num        = 0
@@ -380,22 +415,46 @@ def init_task_split_value(tsv: TaskSplitValue) -> None:
     tsv.pre_mix_task_num    = 0
 
 
-def configure_ready_handshake(cfg: RuntimeConfigC, tsv: TaskSplitValue) -> None:
-    """Enable the device-side workspace-ready fence for multi-rank EP."""
+def configure_ready_handshake(
+    cfg: RuntimeConfigC,
+    tsv: TaskSplitValue,
+    *,
+    version: int = READY_HANDSHAKE_VERSION,
+) -> None:
+    """Enable the device-side workspace-ready fence for multi-rank EP.
+
+    Args:
+        cfg: Runtime configuration receiving handshake metadata.
+        tsv: Scheduler dimensions used to allocate the ready event.
+        version: Ready-handshake protocol version selected by the graph.
+    """
     if tsv.ep == 1:
         return
     ready_event = tsv.all_event_num + 3
     if ready_event >= MAX_EVENT_NUM:
         raise ValueError("ready handshake event exceeds MAX_EVENT_NUM.")
     cfg.ready_handshake_meta.magic = READY_HANDSHAKE_MAGIC
-    cfg.ready_handshake_meta.version = READY_HANDSHAKE_VERSION
+    if version not in {
+        READY_HANDSHAKE_VERSION,
+        READY_HANDSHAKE_COPY_ACK_VERSION,
+        READY_HANDSHAKE_DESTINATION_FENCE_VERSION,
+    }:
+        raise ValueError(f"unsupported ready handshake version {version}.")
+    cfg.ready_handshake_meta.version = version
     cfg.ready_handshake_meta.ready_event = ready_event
     cfg.all_event_num_triggers[ready_event] = 1
     cfg.config_extra_value = READY_HANDSHAKE_MAGIC
 
 
 def event_workspace_bytes(ep_size: int) -> int:
-    """Return event-counter plus persistent ready-state storage."""
+    """Return event-counter plus persistent ready-state storage.
+
+    Args:
+        ep_size: Number of ranks in the expert-parallel group.
+
+    Returns:
+        Required event workspace size in bytes.
+    """
     if ep_size <= 1:
         return EVENT_COUNTER_BYTES
     return EVENT_COUNTER_BYTES + (ep_size + 1) * READY_CACHE_LINE_BYTES

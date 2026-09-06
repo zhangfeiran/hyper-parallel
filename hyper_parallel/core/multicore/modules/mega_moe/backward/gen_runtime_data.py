@@ -35,28 +35,40 @@ Outputs (per rank):
 import argparse
 import os
 
+from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
+    build_backward_graph,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
+    get_act_grad_tiling_bytes,
+    get_gate_grad_tiling_bytes,
+    get_swiglu_grad_tiling_bytes,
+    get_w1_grad_tiling_bytes,
+    get_w2_grad_tiling_bytes,
+)
 from hyper_parallel.core.multicore.scheduler.config import (
-    RuntimeConfigC, QUEUE_CAPACITY,
-    TaskSplitValue, configure_ready_handshake, event_workspace_bytes,
-    init_task_split_value, serialize_runtime_config,
+    QUEUE_CAPACITY,
+    READY_HANDSHAKE_COPY_ACK_VERSION,
+    READY_HANDSHAKE_DESTINATION_FENCE_VERSION,
+    READY_HANDSHAKE_VERSION,
+    RuntimeConfigC,
+    TaskSplitValue,
+    TaskType,
+    configure_ready_handshake,
+    event_workspace_bytes,
+    init_task_split_value,
+    serialize_runtime_config,
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 from hyper_parallel.core.multicore.scheduler.scheduler import (
-    revise_task_queue, revise_gmm_task_queue_bwd,
+    revise_gmm_task_queue_bwd,
+    revise_rank_aware_alltoall_segment,
+    revise_task_queue,
 )
 from hyper_parallel.core.multicore.tasks.utils import (
     add_dynamic_data,
     add_terminate,
     add_terminate_on_event,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
-    get_act_grad_tiling_bytes,
-    get_gate_grad_tiling_bytes,
-    get_w1_grad_tiling_bytes,
-    get_w2_grad_tiling_bytes,
-    get_swiglu_grad_tiling_bytes,
-)
-from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,17 +96,23 @@ def _add_backward_termination(
     cfg: RuntimeConfigC,
     graph: ComputeGraph,
     tsv: TaskSplitValue,
+    *,
+    kernel_multi_wave: bool = False,
 ) -> None:
     """Append termination after weight gradients and the selected route epilogue."""
     w1_grad_op = graph.get_op("w1_grad")
     w2_grad_op = graph.get_op("w2_grad")
     combine_op = graph.get_op("combine")
-    weight_grad_triggers = w1_grad_op.task_num + w2_grad_op.task_num
-    topk_grad_tasks = (
-        graph.get_op("topk_weight_grad").task_num
-        if graph.has_op("topk_weight_grad")
-        else 0
+    weight_grad_triggers = (
+        0
+        if kernel_multi_wave
+        else w1_grad_op.task_num + w2_grad_op.task_num
     )
+    topk_grad_tasks = 0
+    if graph.has_op("topk_weight_grad"):
+        topk_op = graph.get_op("topk_weight_grad")
+        if not topk_op.fill_config.first_wave_only:
+            topk_grad_tasks = topk_op.task_num
     has_terminal_epilogue = graph.has_op("unpermute_grad") or graph.has_op(
         "external_output_acquire"
     )
@@ -133,9 +151,26 @@ def _add_backward_termination(
         )
 
 
-def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
-                          num_cube_cores: int = 24) -> RuntimeConfigC:
-    """Build backward RuntimeConfig for a single rank."""
+def build_config_for_rank(
+    graph: ComputeGraph,
+    tsv: TaskSplitValue,
+    rank_id: int,
+    num_cube_cores: int = 24,
+    *,
+    kernel_multi_wave: bool = False,
+) -> RuntimeConfigC:
+    """Build backward RuntimeConfig for a single rank.
+
+    Args:
+        graph: Backward compute graph to lower into runtime descriptors.
+        tsv: Mutable scheduler counters and model dimensions.
+        rank_id: Rank whose task queues are being generated.
+        num_cube_cores: Number of Cube workers available to the schedule.
+        kernel_multi_wave: Whether to apply the in-kernel multi-wave passes.
+
+    Returns:
+        Runtime descriptors and worker queues for the selected rank.
+    """
     cfg = RuntimeConfigC()
     cfg.num_workers    = 2 * num_cube_cores   # NUM_WORKERS_VECTOR = 2 × NUM_WORKERS_CUBE
     cfg.queue_capacity = QUEUE_CAPACITY
@@ -145,7 +180,9 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     tsv.rank_id = rank_id
 
     # Fill tasks in topological order (dispatch, act_grad, w2_grad, swiglu_grad, gate_grad, combine, w1_grad)
+    vector_segment_starts = {}
     for op in graph.topological_sort():
+        vector_segment_starts[op.name] = tsv.pre_vector_task_num
         op.fill_config.fill(cfg, op, tsv)
 
     # task_num_all = sum of all op tasks + 1 (terminate)
@@ -155,18 +192,101 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     swiglu_grad_op = graph.get_op("swiglu_grad")
     act_grad_op    = graph.get_op("act_grad")
     combine_op     = graph.get_op("combine")
-
-    _add_backward_termination(cfg, graph, tsv)
-    revise_task_queue(
-        cfg,
-        tsv,
-        dispatch_op.task_num,
-        swiglu_grad_op.task_num,
-        combine_op.task_num,
+    dispatch_hidden_op = (
+        graph.get_op("dispatch_hidden")
+        if graph.has_op("dispatch_hidden")
+        else None
     )
-    revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
+
+    _add_backward_termination(
+        cfg,
+        graph,
+        tsv,
+        kernel_multi_wave=kernel_multi_wave,
+    )
+    if not kernel_multi_wave:
+        early_topk_task_num = 0
+        if graph.has_op("topk_weight_grad"):
+            topk_op = graph.get_op("topk_weight_grad")
+            if topk_op.fill_config.first_wave_only:
+                early_topk_task_num = topk_op.task_num
+        revise_task_queue(
+            cfg,
+            tsv,
+            dispatch_op.task_num,
+            swiglu_grad_op.task_num,
+            combine_op.task_num,
+            combine_start=(
+                dispatch_op.task_num
+                + early_topk_task_num
+                + swiglu_grad_op.task_num
+            ),
+        )
+        revise_gmm_task_queue_bwd(
+            cfg,
+            tsv,
+            act_grad_op.task_num,
+            num_cube_cores=num_cube_cores,
+        )
+    else:
+        if dispatch_op.fill_config.destination_wave_fence:
+            revise_rank_aware_alltoall_segment(
+                cfg,
+                tsv,
+                start=vector_segment_starts[dispatch_op.name],
+                task_num=dispatch_op.task_num,
+            )
+            if dispatch_hidden_op is not None:
+                revise_rank_aware_alltoall_segment(
+                    cfg,
+                    tsv,
+                    start=vector_segment_starts[dispatch_hidden_op.name],
+                    task_num=dispatch_hidden_op.task_num,
+                )
+            revise_rank_aware_alltoall_segment(
+                cfg,
+                tsv,
+                start=vector_segment_starts[combine_op.name],
+                task_num=combine_op.task_num,
+            )
+        topk_task_num = 0
+        if graph.has_op("topk_weight_grad"):
+            topk_op = graph.get_op("topk_weight_grad")
+            if not topk_op.fill_config.first_wave_only:
+                topk_task_num = topk_op.task_num
+        final_task_num = 0
+        for task_index in range(tsv.pre_task_num):
+            task = cfg.all_tasks[task_index]
+            if task.task_type in {
+                TaskType.TASK_UNPERMUTE_REDUCE_GRAD,
+                TaskType.TASK_WEIGHTED_UNPERMUTE,
+            }:
+                task.extra_value_3 = topk_task_num
+                final_task_num += 1
+        terminate = cfg.all_tasks[tsv.pre_task_num]
+        terminate.extra_value_3 = final_task_num or topk_task_num
     add_dynamic_data(cfg, tsv, dynamic_input_position=19)
-    configure_ready_handshake(cfg, tsv)
+    ready_version = READY_HANDSHAKE_VERSION
+    if (
+        kernel_multi_wave
+        and graph.has_op("dispatch")
+        and graph.get_op("dispatch").fill_config.destination_wave_fence
+    ):
+        ready_version = READY_HANDSHAKE_DESTINATION_FENCE_VERSION
+    elif (
+        kernel_multi_wave
+        and (
+            graph.has_op("release_dy_tiles")
+            or (
+                graph.has_op("copy_hidden")
+                and graph.get_op("copy_hidden").fill_config.route_tile_ack
+                and graph.has_op("dispatch")
+                and graph.get_op("dispatch").fill_config.wait_for_copy_ack
+            )
+        )
+    ):
+        ready_version = READY_HANDSHAKE_COPY_ACK_VERSION
+    configure_ready_handshake(cfg, tsv, version=ready_version)
 
     cfg.task_num = task_num_all
     cfg.atomic_add_values[0] = 1
@@ -174,7 +294,12 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
 
 
 def write_bin(path: str, data: bytes) -> None:
-    """Write binary data to a file, creating parent directories if needed."""
+    """Write binary data to a file, creating parent directories if needed.
+
+    Args:
+        path: Destination file path.
+        data: Binary payload to write.
+    """
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     with open(path, 'wb') as f:
         f.write(data)

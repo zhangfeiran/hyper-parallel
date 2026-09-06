@@ -13,17 +13,26 @@
 # limitations under the License.
 # ============================================================================
 """GMM fill config: all GroupedMatMul variants (fwd up_proj/down_proj, bwd act/gate/w1/w2 grad)."""
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Set
 
 from hyper_parallel.core.multicore.scheduler.config import (
-    TaskDescC, TensorDescC, RuntimeConfigC,
-    TaskAiCoreType, TaskType,
+    ATOMIC_DW_ACCUMULATION_FLAG,
     MAX_TENSOR_DIMS,
+    RETAINED_DW_SCRATCH_FLAG,
+    RuntimeConfigC,
+    TaskAiCoreType,
+    TaskDescC,
+    TaskSplitValue,
+    TaskType,
+    TensorDescC,
 )
+from hyper_parallel.core.multicore.scheduler.graph import OperatorNode
 from hyper_parallel.core.multicore.tasks.task_base import FillConfig
 from hyper_parallel.core.multicore.tasks.utils import (
-    advance_tsv_cube, advance_tsv_cube_only,
+    advance_tsv_cube,
+    advance_tsv_cube_only,
 )
 
 
@@ -68,21 +77,54 @@ class GmmFillConfig(FillConfig):
         Only used when advance="cube_custom".
         GMM4 bwd: single_rank_expert_num.  GMM3 bwd: 1.
 
+    dependent_event : int | None
+        Optional shared dependency used by every expert task.
+
     num_cube_cores : int
         Number of AI Cube cores (910B=24).
+
+    reuse_retained_scratch : bool
+        Mark weight-gradient tasks whose later waves may reuse the dead
+        retained up-projection prefix instead of a full workspace tail.
+
+    atomic_accumulation : bool
+        Mark weight-gradient tasks whose later waves atomically add directly
+        into the persistent gradient output.
     """
-    offset_inputs:  Set[int] = field(default_factory=lambda: {0})
+    offset_inputs:  set[int] = field(default_factory=lambda: {0})
     rank_in_event:  bool     = False
     global_trigger: bool     = False
     out_offset:     bool     = True
     advance:        str      = "cube"   # "cube" | "cube_only" | "cube_custom"
     event_delta:    int      = 0        # only used when advance="cube_custom"
+    completion_event_offset: int = 0
+    dependent_event: int | None = None
     num_cube_cores: int      = 24
+    reuse_retained_scratch: bool = False
+    atomic_accumulation: bool = False
+    completion_event_base: int | None = field(default=None, init=False)
 
-    def fill(self, cfg: RuntimeConfigC, op, tsv) -> None:
+    def fill(
+        self,
+        cfg: RuntimeConfigC,
+        op: OperatorNode,
+        tsv: TaskSplitValue,
+    ) -> None:
+        """Append grouped-matmul tasks and advance scheduler counters.
+
+        Args:
+            cfg: Runtime descriptor receiving the generated tasks.
+            op: Grouped-matmul node whose tensor layout is serialized.
+            tsv: Mutable scheduler counters and topology values.
+        """
         task_num = op.task_num
         param    = op.param_positions
         glist_j  = len(op.inputs) - 1   # last input is always group_list
+        self.completion_event_base = (
+            None
+            if self.global_trigger
+            else tsv.pre_event_num + self.completion_event_offset
+        )
 
         for i in range(task_num):
             data_index = i // self.num_cube_cores
@@ -129,17 +171,30 @@ class GmmFillConfig(FillConfig):
 
             dep_extra = (tsv.single_rank_expert_num * tsv.rank_id
                          if self.rank_in_event else 0)
-            task.dependent_event = tsv.pre_pre_event_num + dep_extra + data_index + 1
+            task.dependent_event = (
+                self.dependent_event
+                if self.dependent_event is not None
+                else tsv.pre_pre_event_num + dep_extra + data_index + 1
+            )
             if self.global_trigger:
                 task.trigger_event = tsv.all_event_num
             else:
-                task.trigger_event = tsv.pre_event_num + data_index + 1
+                task.trigger_event = (
+                    tsv.pre_event_num
+                    + self.completion_event_offset
+                    + data_index
+                    + 1
+                )
             cfg.all_event_num_triggers[task.trigger_event] = self.num_cube_cores
 
             task.task_index           = i
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
             task.tiling_data_position = op.tiling_position
+            if self.reuse_retained_scratch:
+                task.extra_value_0 |= RETAINED_DW_SCRATCH_FLAG
+            if self.atomic_accumulation:
+                task.extra_value_0 |= ATOMIC_DW_ACCUMULATION_FLAG
 
             cfg.all_tasks[tsv.pre_task_num + i]              = task
             cfg.cube_task_indices[tsv.pre_cube_task_num + i] = tsv.pre_task_num + i

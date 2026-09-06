@@ -103,7 +103,6 @@ class PutMemSignalKernel {
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
 
     // Write signal after data transfer
-    auto signal_ptr = signal_ + signal_offset_;
     if (non_blocking_) {
       aclshmem_fence();
     } else {
@@ -116,6 +115,7 @@ class PutMemSignalKernel {
       localwork.FreeTensor(workLocal);
     }
 
+    auto signal_ptr = signal_ + signal_offset_;
     if (aiv_idx_ == 0) {
       aclshmemx_signal_op(signal_ptr, signal_value_, signal_op_ == 1 ? ACLSHMEM_SIGNAL_ADD : ACLSHMEM_SIGNAL_SET,
                           target_pe_);

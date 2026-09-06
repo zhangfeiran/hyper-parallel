@@ -32,7 +32,8 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
   const aclTensor *down_proj_tiling, const aclTensor *runtime_config, const aclTensor *all_event_counters,
   const aclTensor *original_x, const aclTensor *permute_src_index, const aclTensor *reduce_route_index,
   const aclTensor *topk_weights, const aclTensor *final_out, int64_t rankId, int64_t ep, int64_t expert_num,
-  int64_t hidden_size, int64_t seq_size, uint64_t *workspaceSize, aclOpExecutor **executor);
+  int64_t hidden_size, int64_t seq_size, int64_t receive_capacity,
+  int64_t wave_count, uint64_t *workspaceSize, aclOpExecutor **executor);
 
 /**
  */

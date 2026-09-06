@@ -13,14 +13,20 @@
 # limitations under the License.
 # ============================================================================
 """SwiGLU fill config: forward (TASK_SWI_GLU) and backward gradient (TASK_SWI_GLU_GRAD)."""
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from hyper_parallel.core.multicore.scheduler.config import (
-    TaskDescC, TensorDescC, RuntimeConfigC,
-    TaskAiCoreType, TaskType,
     MAX_TENSOR_DIMS,
+    RuntimeConfigC,
+    TaskAiCoreType,
+    TaskDescC,
+    TaskSplitValue,
+    TaskType,
+    TensorDescC,
 )
-from hyper_parallel.core.multicore.scheduler.graph import OpType
+from hyper_parallel.core.multicore.scheduler.graph import OperatorNode, OpType
 from hyper_parallel.core.multicore.tasks.task_base import FillConfig
 from hyper_parallel.core.multicore.tasks.utils import advance_tsv_vector
 
@@ -34,7 +40,23 @@ class SwiGLUFillConfig(FillConfig):
     tensor_type values are always 1 (vector operator convention).
     """
 
-    def fill(self, cfg: RuntimeConfigC, op, tsv) -> None:
+    global_trigger_event: int | None = None
+    dependent_event: int | None = None
+    tiling_data_offset: int = 0
+
+    def fill(
+        self,
+        cfg: RuntimeConfigC,
+        op: OperatorNode,
+        tsv: TaskSplitValue,
+    ) -> None:
+        """Append forward or backward SwiGLU tasks to the runtime config.
+
+        Args:
+            cfg: Runtime descriptor receiving the generated tasks.
+            op: SwiGLU graph node whose tensor layout is serialized.
+            tsv: Mutable scheduler counters and topology values.
+        """
         task_type = (TaskType.TASK_SWI_GLU if op.op_type == OpType.SWIGLU
                      else TaskType.TASK_SWI_GLU_GRAD)
 
@@ -72,14 +94,27 @@ class SwiGLUFillConfig(FillConfig):
                 task.outputs[j] = td
 
             ev_idx = i // num_triggers
-            task.dependent_event = tsv.pre_pre_event_num + ev_idx + 1
-            task.trigger_event   = tsv.pre_event_num + ev_idx + 1
-            cfg.all_event_num_triggers[task.trigger_event] = num_triggers
+            task.dependent_event = (
+                self.dependent_event
+                if self.dependent_event is not None
+                else tsv.pre_pre_event_num + ev_idx + 1
+            )
+            task.trigger_event = (
+                self.global_trigger_event
+                if self.global_trigger_event is not None
+                else tsv.pre_event_num + ev_idx + 1
+            )
+            cfg.all_event_num_triggers[task.trigger_event] = (
+                task_num
+                if self.global_trigger_event is not None
+                else num_triggers
+            )
 
             task.task_index           = i
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
             task.tiling_data_position = op.tiling_position
+            task.tiling_data_offset   = self.tiling_data_offset
 
             cfg.all_tasks[tsv.pre_task_num + i]               = task
             cfg.vector_task_indices[tsv.pre_vector_task_num + i] = tsv.pre_task_num + i

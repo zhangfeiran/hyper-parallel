@@ -133,7 +133,7 @@ index 59e0f9d..5e9a7a6 100644
      }
      GlobalTensor<BT> weightGmLocal = SetGlobalBufferW(groupIdx, tailN, mnConfig);
      mm.SetOrgShape(mnConfig.m, mnConfig.n, mnConfig.k);
-@@ -583,12 +569,12 @@ __aicore__ inline void GMMCompute<mmType, sync>::MMCompute(
+@@ -583,16 +569,16 @@ __aicore__ inline void GMMCompute<mmType, sync>::MMCompute(
      SetGlobalBufferBias(groupIdx, tailN, mnConfig);
      if (singleY == 0) {
          if (groupListType == GROUP_LIST_TYPE_SPARSE && groupType == 0) {
@@ -149,3 +149,8 @@ index 59e0f9d..5e9a7a6 100644
      }
      #if defined(GMM_ANTI_QUANT)
          mm.template IterateAll<false>(yGm[outOffset], 0, false, true);
+         mmWaitStatus = true;
+     #else
+-        mm.template IterateAll<sync>(yGm[outOffset], 0);
++        mm.template IterateAll<sync>(yGm[outOffset], activeType);
+     #endif

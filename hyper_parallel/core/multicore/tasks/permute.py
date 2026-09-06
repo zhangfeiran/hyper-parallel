@@ -46,13 +46,24 @@ class _RouteFillConfig(FillConfig):
         """Return the optional task-specific second scalar."""
         return 0
 
+    def _extra_value_2(self, task_index: int) -> int:
+        """Return the optional task-specific third scalar."""
+        del task_index
+        return 0
+
     def fill(
         self,
         cfg: RuntimeConfigC,
         op: OperatorNode,
         tsv: TaskSplitValue,
     ) -> None:
-        """Append route vector tasks with identical tensor descriptors."""
+        """Append route vector tasks with identical tensor descriptors.
+
+        Args:
+            cfg: Runtime configuration receiving task descriptors.
+            op: Route operator graph node being lowered.
+            tsv: Mutable scheduler counters and dimensions.
+        """
         task_num = op.task_num
         param = op.param_positions
         for i in range(task_num):
@@ -65,6 +76,7 @@ class _RouteFillConfig(FillConfig):
             task.trigger_event = self.trigger_event
             task.extra_value_0 = self.top_k
             task.extra_value_1 = self._extra_value_1()
+            task.extra_value_2 = self._extra_value_2(i)
 
             for j, spec in enumerate(op.inputs):
                 task.inputs[j] = make_tensor_desc(
@@ -111,16 +123,29 @@ class WeightedUnpermuteFillConfig(_RouteFillConfig):
     """Fill forward weighted reductions or acquire-only terminal epilogues."""
 
     acquire_remote_writes: bool = False
+    static_acquire_task_num: int = 0
     _task_type = TaskType.TASK_WEIGHTED_UNPERMUTE
 
     def _extra_value_1(self) -> int:
         """Encode whether this task is an acquire-only terminal epilogue."""
         return int(self.acquire_remote_writes)
 
+    def _extra_value_2(self, task_index: int) -> int:
+        """Mark the first descriptor assigned to each active vector lane."""
+        return int(
+            self.acquire_remote_writes
+            and task_index < self.static_acquire_task_num
+        )
+
 
 @dataclass
 class TopKWeightGradFillConfig(_RouteFillConfig):
     """Fill independent route-output/dy dot products for router gradients."""
 
+    first_wave_only: bool = False
     _task_type = TaskType.TASK_TOPK_WEIGHT_GRAD
     _advance_event = False
+
+    def _extra_value_1(self) -> int:
+        """Encode one-time execution before the first multi-wave Combine."""
+        return int(self.first_wave_only)

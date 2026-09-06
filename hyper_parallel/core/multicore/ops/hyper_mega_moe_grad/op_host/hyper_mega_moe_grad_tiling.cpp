@@ -51,17 +51,23 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
 
   auto input0Desc = context->GetInputDesc(0);
   OP_CHECK_NULL_WITH_CONTEXT(context, input0Desc);
+  auto attr = context->GetAttrs();
+  OP_CHECK_NULL_WITH_CONTEXT(context, attr);
+  auto cycleProfileAttr = attr->GetAttrPointer<int64_t>(7);
+  OP_CHECK_NULL_WITH_CONTEXT(context, cycleProfileAttr);
+  uint32_t cycleProfile = *cycleProfileAttr == 0 ? 0U : 1U;
   ge::DataType input0DType = input0Desc->GetDataType();
   if (input0DType == ge::DT_FLOAT16) {
     uint64_t tilingKey_ = GET_TPL_TILING_KEY(
       static_cast<uint32_t>(1), static_cast<uint32_t>(1), static_cast<uint32_t>(1), 0UL, 0UL, static_cast<uint32_t>(0),
-      static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0));
+      static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0),
+      cycleProfile);
     context->SetTilingKey(tilingKey_);
   } else if (input0DType == ge::DT_BF16) {
     uint64_t tilingKey_ =
       GET_TPL_TILING_KEY(static_cast<uint32_t>(27), static_cast<uint32_t>(27), static_cast<uint32_t>(27), 0UL, 0UL,
                          static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0),
-                         static_cast<uint32_t>(0), static_cast<uint32_t>(0));
+                         static_cast<uint32_t>(0), static_cast<uint32_t>(0), cycleProfile);
     context->SetTilingKey(tilingKey_);
   } else {
     OP_LOGE(context->GetNodeName(), "Input0[dispatch_target]:%s is only support float16, bfloat16",
@@ -70,7 +76,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   }
 
   HyperMegaMoeGradTilingData tiling;
-  auto attr = context->GetAttrs();
   if (attr != nullptr) {
     tiling.set_rankId((*(attr->GetAttrPointer<int64_t>(0))));
     tiling.set_ep((*(attr->GetAttrPointer<int64_t>(1))));
@@ -84,6 +89,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
       return ge::GRAPH_FAILED;
     }
     tiling.set_intermediateSize(intermediateSize);
+    tiling.set_receiveCapacity((*(attr->GetAttrPointer<int64_t>(5))));
+    tiling.set_waveCount((*(attr->GetAttrPointer<int64_t>(6))));
   }
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
   context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());

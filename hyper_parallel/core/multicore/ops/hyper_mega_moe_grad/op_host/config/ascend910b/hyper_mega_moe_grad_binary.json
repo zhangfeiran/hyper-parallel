@@ -448,6 +448,21 @@
           "name": "seq_size",
           "dtype": "int",
           "value": 0
+        },
+        {
+          "name": "receive_capacity",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "wave_count",
+          "dtype": "int",
+          "value": 1
+        },
+        {
+          "name": "cycle_profile",
+          "dtype": "int",
+          "value": 0
         }
       ]
     }

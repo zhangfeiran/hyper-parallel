@@ -52,7 +52,9 @@ TORCH_LIBRARY(hyper_parallel, m) {
     "  int ep,"
     "  int expert_num,"
     "  int hidden_size,"
-    "  int seq_size"
+    "  int seq_size,"
+    "  int receive_capacity,"
+    "  int wave_count"
     ") -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!))");
 
   // -------------------------------------------------------------------------
@@ -101,6 +103,9 @@ TORCH_LIBRARY(hyper_parallel, m) {
     "  int ep,"
     "  int expert_num,"
     "  int hidden_size,"
-    "  int seq_size"
+    "  int seq_size,"
+    "  int receive_capacity,"
+    "  int wave_count,"
+    "  int cycle_profile"
     ") -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!))");
 }

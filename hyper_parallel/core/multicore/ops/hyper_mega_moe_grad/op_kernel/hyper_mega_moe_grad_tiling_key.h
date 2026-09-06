@@ -46,7 +46,7 @@
 #define GROUPED_MATMUL_AIV_AIC_RATIO_1 1
 #define GROUPED_MATMUL_AIV_AIC_RATIO_2 2
 
-#define SET_GMM_NO_QUANT_TPL_ARGS(kernel_type, dtype, trans_a, trans_b, aiv_aic_ratio)                                \
+#define SET_GMM_NO_QUANT_TPL_ARGS(kernel_type, dtype, trans_a, trans_b, aiv_aic_ratio, cycle_profile)                 \
   ASCENDC_TPL_KERNEL_TYPE_SEL(kernel_type), ASCENDC_TPL_DTYPE_SEL(D_T_A, dtype), ASCENDC_TPL_DTYPE_SEL(D_T_B, dtype), \
     ASCENDC_TPL_DTYPE_SEL(D_T_Y, dtype), ASCENDC_TPL_BOOL_SEL(TRANS_A, trans_a),                                      \
     ASCENDC_TPL_BOOL_SEL(TRANS_B, trans_b),                                                                           \
@@ -55,7 +55,8 @@
     ASCENDC_TPL_BOOL_SEL(IS_STATIC_TILING_API, 0),                                                                    \
     ASCENDC_TPL_UINT_SEL(A8W4_KERNEL_TEMPLATE, ASCENDC_TPL_UI_LIST, GROUPED_MATMUL_A8W4_KERNEL_TEMPLATE_NONE),        \
     ASCENDC_TPL_UINT_SEL(A16W8_KERNEL_TEMPLATE, ASCENDC_TPL_UI_LIST, GROUPED_MATMUL_A16W8_KERNEL_TEMPLATE_NONE),      \
-    ASCENDC_TPL_UINT_SEL(AIV_AIC_RATIO, ASCENDC_TPL_UI_LIST, aiv_aic_ratio)
+    ASCENDC_TPL_UINT_SEL(AIV_AIC_RATIO, ASCENDC_TPL_UI_LIST, aiv_aic_ratio),                                         \
+    ASCENDC_TPL_BOOL_SEL(CYCLE_PROFILE, cycle_profile)
 
 ASCENDC_TPL_ARGS_DECL(
   HyperMegaMoeGrad,
@@ -90,11 +91,17 @@ ASCENDC_TPL_ARGS_DECL(
                         GROUPED_MATMUL_A16W8_KERNEL_TEMPLATE_ANTIQUANT),  // A16W8 antiquant template
   // ratio of AIV:AIC
   ASCENDC_TPL_UINT_DECL(AIV_AIC_RATIO, ASCENDC_TPL_2_BW, ASCENDC_TPL_UI_LIST, GROUPED_MATMUL_CUBE_ONLY,
-                        GROUPED_MATMUL_AIV_AIC_RATIO_1, GROUPED_MATMUL_AIV_AIC_RATIO_2));
+                        GROUPED_MATMUL_AIV_AIC_RATIO_1, GROUPED_MATMUL_AIV_AIC_RATIO_2),
+  // test-only cycle counter instrumentation
+  ASCENDC_TPL_BOOL_DECL(CYCLE_PROFILE, 0, 1));
 
 ASCENDC_TPL_SEL(ASCENDC_TPL_ARGS_SEL(SET_GMM_NO_QUANT_TPL_ARGS(ASCENDC_TPL_MIX_AIC_1_2, GMM_TPL_BF16, 0, 0,
-                                                               GROUPED_MATMUL_CUBE_ONLY)),
+                                                               GROUPED_MATMUL_CUBE_ONLY, 0)),
                 ASCENDC_TPL_ARGS_SEL(SET_GMM_NO_QUANT_TPL_ARGS(ASCENDC_TPL_MIX_AIC_1_2, GMM_TPL_FLOAT16, 0, 0,
-                                                               GROUPED_MATMUL_CUBE_ONLY)));
+                                                               GROUPED_MATMUL_CUBE_ONLY, 0)),
+                ASCENDC_TPL_ARGS_SEL(SET_GMM_NO_QUANT_TPL_ARGS(ASCENDC_TPL_MIX_AIC_1_2, GMM_TPL_BF16, 0, 0,
+                                                               GROUPED_MATMUL_CUBE_ONLY, 1)),
+                ASCENDC_TPL_ARGS_SEL(SET_GMM_NO_QUANT_TPL_ARGS(ASCENDC_TPL_MIX_AIC_1_2, GMM_TPL_FLOAT16, 0, 0,
+                                                               GROUPED_MATMUL_CUBE_ONLY, 1)));
 
 #endif  // HYPER_MEGA_MOE_GRAD_TILING_KEY_H

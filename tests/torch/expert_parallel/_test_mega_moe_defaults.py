@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.multicore import MegaMoeExperts
-from tests.torch.expert_parallel import _test_mega_moe as baseline
+from tests.torch.expert_parallel import _test_mega_moe_common as baseline
 from tests.torch.expert_parallel._mega_moe_utils import (
     assert_stable_memory,
     collect_memory,

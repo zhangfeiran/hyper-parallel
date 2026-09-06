@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+from functools import partial
 from importlib import import_module
 from typing import Any
 
@@ -25,6 +26,7 @@ from hyper_parallel.platform.torch.symmetric_memory import acquire_symmetric_mem
 from ..module import MulticoreModule
 from .function import execute_mega_moe
 from .plan import build_mega_moe_plan
+from .replica import ExpertReplicaManager
 from .route import prepare_topk_route
 from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
@@ -76,6 +78,9 @@ class _MegaMoeExecutionResources:
         except Exception:
             self.symmetric_memory.close()
             raise
+        self.replica_manager = (
+            ExpertReplicaManager(self.spec) if self.spec.replica_slots_per_rank else None
+        )
         self._closed = False
 
     def close(self) -> None:
@@ -106,6 +111,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         expert_capacity_factor: float | None = None,
+        replica_slots_per_rank: int = 0,
         ep_size: int = 1,
         ep_group: Any | None = None,
     ) -> None:
@@ -120,7 +126,9 @@ class MegaMoeExperts(MulticoreModule):
             expert_capacity_factor: Optional bounded receive-capacity multiplier.
                 ``None`` reserves the maximum lossless capacity. A finite value
                 of at least 1.0 reserves that multiple of the local routed rows
-                and raises a clear error if a route exceeds it.
+                and executes larger routes losslessly in fixed-capacity waves.
+            replica_slots_per_rank: Bounded temporary expert-weight slots on
+                each EP rank. Zero preserves static home-expert execution.
             ep_size: Expert-parallel degree. The current SHMEM path requires it
                 to cover the complete Torch distributed world.
             ep_group: Torch expert-parallel process group with the same rank
@@ -133,6 +141,7 @@ class MegaMoeExperts(MulticoreModule):
             num_experts=num_experts,
             top_k=top_k,
             expert_capacity_factor=expert_capacity_factor,
+            replica_slots_per_rank=replica_slots_per_rank,
             ep_size=ep_size,
         )
         if expert_capacity_factor is not None:
@@ -144,6 +153,7 @@ class MegaMoeExperts(MulticoreModule):
             "num_experts": num_experts,
             "top_k": top_k,
             "expert_capacity_factor": expert_capacity_factor,
+            "replica_slots_per_rank": replica_slots_per_rank,
             "ep_size": ep_size,
             "ep_group": ep_group,
         }
@@ -154,6 +164,7 @@ class MegaMoeExperts(MulticoreModule):
             num_experts,
             top_k,
             expert_capacity_factor,
+            replica_slots_per_rank,
             ep_size,
             id(ep_group),
         )
@@ -168,6 +179,7 @@ class MegaMoeExperts(MulticoreModule):
         self.num_experts = num_experts
         self.top_k = top_k
         self.expert_capacity_factor = expert_capacity_factor
+        self.replica_slots_per_rank = replica_slots_per_rank
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
@@ -186,6 +198,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         expert_capacity_factor: float | None,
+        replica_slots_per_rank: int,
         ep_size: int,
     ) -> None:
         """Validate static shape and topology values before allocation."""
@@ -207,6 +220,15 @@ class MegaMoeExperts(MulticoreModule):
         if num_experts % ep_size:
             raise ValueError(
                 f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})."
+            )
+        if (
+            not isinstance(replica_slots_per_rank, int)
+            or isinstance(replica_slots_per_rank, bool)
+            or replica_slots_per_rank < 0
+        ):
+            raise ValueError(
+                "replica_slots_per_rank must be a nonnegative integer, "
+                f"got {replica_slots_per_rank!r}."
             )
         if local_num_tokens % _COMMUNICATION_SPLIT:
             raise ValueError(
@@ -338,22 +360,36 @@ class MegaMoeExperts(MulticoreModule):
         resources = self._get_execution_resources(hidden_flat)
         route_ids = topk_ids.to(torch.int32).contiguous()
         route_weights = topk_weights.float().contiguous()
+        route_options: dict[str, Any] = {"workspace": resources.workspace}
+        if resources.replica_manager is not None:
+            route_options["placement_callback"] = partial(
+                resources.replica_manager.start_prefetch,
+                self.gate_up_weight,
+                self.down_weight,
+            )
         route = prepare_topk_route(
             hidden_flat,
             route_ids,
             route_weights,
             resources.plan,
             tokens_per_expert,
-            workspace=resources.workspace,
+            **route_options,
         )
-        if route.receive_overflow:
-            raise RuntimeError("MegaMoe route exceeds the explicitly bounded receive capacity.")
+        physical_weight1 = self.gate_up_weight
+        physical_weight2 = self.down_weight
+        if route.placement is not None:
+            if resources.replica_manager is None:
+                raise RuntimeError("MegaMoe route produced an unexpected replica placement.")
+            pending_weights = route.placement_payload
+            if pending_weights is None:
+                raise RuntimeError("MegaMoe replica placement did not prefetch weights.")
+            physical_weight1, physical_weight2 = pending_weights.wait()
         output = execute_mega_moe(
             hidden_flat,
-            route_ids,
+            route.physical_topk_ids,
             route_weights,
-            self.gate_up_weight,
-            self.down_weight,
+            physical_weight1,
+            physical_weight2,
             route,
             resources.plan,
             resources.workspace,

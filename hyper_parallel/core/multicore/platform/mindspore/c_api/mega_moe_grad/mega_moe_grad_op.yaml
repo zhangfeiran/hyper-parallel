@@ -80,6 +80,12 @@ mega_moe_grad:
     seq_size:
       dtype: int
       default: 0
+    receive_capacity:
+      dtype: int
+      default: 0
+    wave_count:
+      dtype: int
+      default: 1
   returns:
     dispatch_target_output:
       dtype: tensor

@@ -44,8 +44,9 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
   const aclTensor *w2_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
   const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
   const aclTensor *permute_src_index, const aclTensor *route_weight, const aclTensor *reduce_route_index,
-  int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, uint64_t *workspaceSize,
-  aclOpExecutor **executor);
+  int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size,
+  int64_t receive_capacity, int64_t wave_count, int64_t cycle_profile,
+  uint64_t *workspaceSize, aclOpExecutor **executor);
 
 /**
  */

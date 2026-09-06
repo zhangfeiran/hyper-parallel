@@ -18,19 +18,27 @@ from __future__ import annotations
 
 from importlib import import_module
 
+import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch_npu
 
+from hyper_parallel.core.multicore.modules.mega_moe.placement import (
+    ExpertPlacementPlan,
+    build_constrained_expert_placement,
+)
+
 from .spec import MegaMoeSpec
 from .plan import MegaMoePlan
 
-torch = import_module("torch")
-dist = import_module("torch.distributed")
-
 if TYPE_CHECKING:
     from .workspace import MegaMoeWorkspace
+
+
+torch = import_module("torch")
+dist = import_module("torch.distributed")
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,9 @@ class RouteMetadata:
     combine_size: Any
     group_list: Any
     expert_capacity: int
+    retained_capacity: int
+    receive_capacity: int
+    wave_count: int
 
 
 @dataclass(frozen=True)
@@ -52,12 +63,15 @@ class PreparedTopKRoute:
     """Permuted payload, count metadata and the capacity decision for one route."""
 
     routed_tokens: Any | None
+    physical_topk_ids: Any
     unpermute_mapping: Any
     permute_src_index: Any | None
     tokens_per_expert: Any
     received_counts: Any
     receive_overflow: bool
     metadata: RouteMetadata | None
+    placement: ExpertPlacementPlan | None
+    placement_payload: Any | None
 
 
 def _validate_topk_inputs(
@@ -125,12 +139,12 @@ def _start_count_gather(counts: Any, spec: MegaMoeSpec) -> tuple[Any, Any | None
     return gathered_counts.reshape(spec.ep_size, spec.num_experts), work
 
 
-def _finish_count_gather(
+def _finish_static_count_gather(
     counts_by_source: Any,
     work: Any | None,
     spec: MegaMoeSpec,
 ) -> tuple[Any, int]:
-    """Wait for gathered counts and return this rank's receive matrix and global maximum."""
+    """Finish a home-only gather and return local receives and global maximum."""
 
     if work is not None:
         work.wait()
@@ -145,6 +159,112 @@ def _finish_count_gather(
         spec.local_experts,
     ).sum(dim=(0, 2), dtype=torch.int32)
     return received_counts, int(destination_loads.max().item())
+
+
+def _wait_count_gather(work: Any | None) -> None:
+    """Wait before consuming an asynchronously gathered count matrix."""
+    if work is not None:
+        work.wait()
+
+
+def _physical_copy_runs(
+    plan: ExpertPlacementPlan,
+    source_rank: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return physical IDs and row counts ordered by logical expert."""
+    physical_ids = []
+    copy_counts = []
+    physical_to_logical = plan.physical_to_logical_expert
+    source_counts = plan.dispatch_counts[source_rank]
+    for logical_expert in range(plan.logical_num_experts):
+        for physical_expert, mapped_expert in enumerate(physical_to_logical):
+            count = source_counts[physical_expert]
+            if mapped_expert == logical_expert and count:
+                physical_ids.append(physical_expert)
+                copy_counts.append(count)
+    return tuple(physical_ids), tuple(copy_counts)
+
+
+def _remap_topk_ids_to_physical(
+    topk_ids: Any,
+    plan: ExpertPlacementPlan,
+    source_rank: int,
+) -> Any:
+    """Remap logical IDs on device while preserving every Top-K route slot."""
+    physical_ids, copy_counts = _physical_copy_runs(plan, source_rank)
+    device = topk_ids.device
+    expert_major_physical_ids = torch.repeat_interleave(
+        torch.tensor(physical_ids, dtype=torch.int32, device=device),
+        torch.tensor(copy_counts, dtype=torch.int64, device=device),
+    )
+    flat_ids = topk_ids.reshape(-1)
+    route_slots = torch.arange(
+        flat_ids.numel(),
+        dtype=torch.float32,
+        device=device,
+    ).reshape(-1, 1)
+    expert_major_slots, _ = _build_route_indices(route_slots, topk_ids)
+    # Building from shape avoids inheriting an unsupported private format from
+    # the logical-ID tensor on NPU; route metadata must stay in base format.
+    physical_ids_by_route = torch.empty(
+        flat_ids.shape,
+        dtype=torch.int32,
+        device=device,
+    )
+    physical_ids_by_route.scatter_(
+        0,
+        expert_major_slots.to(torch.int64),
+        expert_major_physical_ids,
+    )
+    return physical_ids_by_route.reshape_as(topk_ids).contiguous()
+
+
+def _build_replica_plan(
+    counts_by_source: Any,
+    spec: MegaMoeSpec,
+) -> ExpertPlacementPlan:
+    """Build one bounded host reference placement from gathered counts."""
+    # The first Ascend integration uses a bounded host reference planner. The
+    # explicit opt-in keeps this synchronization out of the default path until
+    # the planner is moved into the device route kernel.
+    logical_counts = tuple(
+        tuple(int(count) for count in source_counts)
+        for source_counts in counts_by_source.tolist()
+    )
+    return build_constrained_expert_placement(
+        logical_counts,
+        spec.replica_slots_per_rank,
+        # Every EP rank contributes the same S*K rows, so routed_slots is the
+        # exact global mean. Target it for compute balance even when the wider
+        # multi-wave receive window could tolerate residual skew.
+        receive_capacity=spec.routed_slots,
+    )
+
+
+def _materialize_replica_counts(
+    plan: ExpertPlacementPlan,
+    counts_by_source: Any,
+    spec: MegaMoeSpec,
+) -> tuple[Any, Any, int]:
+    """Copy planned physical counts to device and select local receives."""
+    physical_counts = torch.tensor(
+        plan.dispatch_counts,
+        dtype=torch.int32,
+        device=counts_by_source.device,
+    )
+    local_start = spec.rank_id * spec.physical_local_experts
+    local_end = local_start + spec.physical_local_experts
+    received_counts = physical_counts[:, local_start:local_end].contiguous()
+    return physical_counts, received_counts, max(plan.destination_loads)
+
+
+def _drain_placement_payload(payload: Any | None) -> None:
+    """Complete an optional asynchronous placement payload after route failure."""
+    if payload is None:
+        return
+    drain = getattr(payload, "drain", None)
+    if callable(drain):
+        drain()
 
 
 def _permute_topk_input(hidden_states: Any, topk_ids: Any) -> tuple[Any, Any]:
@@ -176,6 +296,29 @@ def _build_route_indices(
     return permute_src_index, inverse_order.reshape_as(topk_ids).contiguous()
 
 
+def _prepare_route_endpoints(
+    hidden_states: Any,
+    topk_ids: Any,
+    plan: MegaMoePlan,
+) -> tuple[Any | None, Any, Any | None]:
+    """Prepare payload and route indices for one physical expert-ID layout."""
+    spec = plan.spec
+    if spec.forward_permute_fused:
+        route_slots = plan.route_slots
+        if route_slots is None:
+            raise RuntimeError("route-fused MegaMoe is missing route-slot metadata.")
+        permute_src_index, unpermute_mapping = _build_route_indices(
+            route_slots,
+            topk_ids,
+        )
+        return None, unpermute_mapping, permute_src_index
+    routed_tokens, unpermute_mapping = _permute_topk_input(
+        hidden_states,
+        topk_ids,
+    )
+    return routed_tokens, unpermute_mapping, None
+
+
 def _compute_route_metadata(
     counts: Any,
     counts_by_source: Any,
@@ -188,15 +331,26 @@ def _compute_route_metadata(
     spec = plan.spec
     counts_i32 = counts.to(dtype=torch.int32).contiguous()
     split = max(spec.dispatch_split, spec.combine_split)
-    rounded_capacity = (maximum_received_slots + split - 1) // split * split
-    expert_capacity = max(spec.routed_slots, rounded_capacity)
+    rounded_capacity = (
+        (maximum_received_slots + split - 1) // split * split
+    )
+    wave_count = max(
+        1,
+        math.ceil(maximum_received_slots / spec.receive_capacity),
+    )
+    # A single wave keeps the existing exact-capacity allocation. Overflow is
+    # split into fixed receive-capacity windows so every peer reuses the same
+    # symmetric address range for each kernel-internal wave.
+    expert_capacity = (
+        rounded_capacity if wave_count == 1 else spec.receive_capacity
+    )
 
     source_prefix = counts_by_source.cumsum(dim=1, dtype=torch.int32) - counts_by_source
     destination_layout = (
         counts_by_source.reshape(
             spec.ep_size,
             spec.ep_size,
-            spec.local_experts,
+            spec.physical_local_experts,
         )
         .permute(1, 2, 0)
         .contiguous()
@@ -204,11 +358,11 @@ def _compute_route_metadata(
     destination_flat = destination_layout.reshape(spec.ep_size, -1)
     destination_prefix = (
         destination_flat.cumsum(dim=1, dtype=torch.int32) - destination_flat
-    ).reshape(spec.ep_size, spec.local_experts, spec.ep_size)
+    ).reshape(spec.ep_size, spec.physical_local_experts, spec.ep_size)
     local_destination_prefix = destination_prefix[spec.rank_id]
     local_destination_counts = destination_layout[spec.rank_id]
-    local_start = spec.rank_id * spec.local_experts
-    local_end = local_start + spec.local_experts
+    local_start = spec.rank_id * spec.physical_local_experts
+    local_end = local_start + spec.physical_local_experts
     return RouteMetadata(
         dispatch_src_off=source_prefix[spec.rank_id].to(torch.int64),
         dispatch_target_off=(
@@ -224,6 +378,11 @@ def _compute_route_metadata(
             local_destination_prefix[:, -1] + local_destination_counts[:, -1]
         ).to(torch.int64),
         expert_capacity=expert_capacity,
+        retained_capacity=(
+            expert_capacity if wave_count == 1 else maximum_received_slots
+        ),
+        receive_capacity=spec.receive_capacity,
+        wave_count=wave_count,
     )
 
 
@@ -234,8 +393,23 @@ def prepare_topk_route(
     plan: MegaMoePlan,
     tokens_per_expert: Any | None,
     workspace: MegaMoeWorkspace | None = None,
+    placement_callback: Callable[[ExpertPlacementPlan], Any] | None = None,
 ) -> PreparedTopKRoute:
-    """Overlap native TopK permutation with count gathering and build route metadata."""
+    """Prepare physical Top-K routing with count and weight-transfer overlap.
+
+    Args:
+        hidden_states: Token-major local activations.
+        topk_ids: Logical expert IDs selected for every token.
+        topk_weights: Router weights paired with ``topk_ids``.
+        plan: Static MegaMoe plan and topology.
+        tokens_per_expert: Optional trusted local route histogram.
+        workspace: Optional workspace whose prior generation must be complete.
+        placement_callback: Optional callback launched after placement but
+            before device remap, allowing weight prefetch to overlap route work.
+
+    Returns:
+        Prepared payload, route mappings, counts, and multi-wave metadata.
+    """
     spec = plan.spec
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
@@ -244,56 +418,77 @@ def prepare_topk_route(
         # the cross-rank rendezvous for the next symmetric-buffer generation.
         workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
-    if spec.forward_permute_fused:
-        route_slots = plan.route_slots
-        if route_slots is None:
-            raise RuntimeError("route-fused MegaMoe is missing route-slot metadata.")
-        permute_src_index, unpermute_mapping = _build_route_indices(
-            route_slots,
-            topk_ids,
-        )
-        routed_tokens = None
-    else:
-        routed_tokens, unpermute_mapping = _permute_topk_input(
-            hidden_states,
-            topk_ids,
-        )
-        permute_src_index = None
-    received_counts, maximum_received_slots = _finish_count_gather(
-        counts_by_source,
-        count_work,
-        spec,
-    )
-    receive_overflow = maximum_received_slots > spec.receive_capacity
-    if receive_overflow:
-        if routed_tokens is None:
-            routed_tokens, unpermute_mapping = _permute_topk_input(
-                hidden_states,
-                topk_ids,
+    placement = None
+    placement_payload = None
+    if spec.replica_slots_per_rank:
+        _wait_count_gather(count_work)
+        placement = _build_replica_plan(counts_by_source, spec)
+        if placement_callback is not None:
+            placement_payload = placement_callback(placement)
+        try:
+            (
+                physical_counts_by_source,
+                received_counts,
+                maximum_received_slots,
+            ) = _materialize_replica_counts(
+                placement,
+                counts_by_source,
+                spec,
             )
-        return PreparedTopKRoute(
-            routed_tokens=routed_tokens,
-            unpermute_mapping=unpermute_mapping,
-            permute_src_index=permute_src_index,
-            tokens_per_expert=counts,
-            received_counts=received_counts,
-            receive_overflow=True,
-            metadata=None,
+            physical_topk_ids = _remap_topk_ids_to_physical(
+                topk_ids,
+                placement,
+                spec.rank_id,
+            )
+            physical_counts = physical_counts_by_source[spec.rank_id]
+            routed_tokens, unpermute_mapping, permute_src_index = (
+                _prepare_route_endpoints(
+                    hidden_states,
+                    physical_topk_ids,
+                    plan,
+                )
+            )
+        except Exception:
+            _drain_placement_payload(placement_payload)
+            raise
+    else:
+        physical_topk_ids = topk_ids
+        physical_counts_by_source = counts_by_source
+        physical_counts = counts
+        routed_tokens, unpermute_mapping, permute_src_index = (
+            _prepare_route_endpoints(
+                hidden_states,
+                physical_topk_ids,
+                plan,
+            )
         )
-    return PreparedTopKRoute(
-        routed_tokens=routed_tokens,
-        unpermute_mapping=unpermute_mapping,
-        permute_src_index=permute_src_index,
-        tokens_per_expert=counts,
-        received_counts=received_counts,
-        receive_overflow=False,
-        metadata=_compute_route_metadata(
-            counts,
+        received_counts, maximum_received_slots = _finish_static_count_gather(
             counts_by_source,
+            count_work,
+            spec,
+        )
+    try:
+        metadata = _compute_route_metadata(
+            physical_counts,
+            physical_counts_by_source,
             received_counts,
             plan,
             maximum_received_slots,
-        ),
+        )
+    except Exception:
+        _drain_placement_payload(placement_payload)
+        raise
+    return PreparedTopKRoute(
+        routed_tokens=routed_tokens,
+        physical_topk_ids=physical_topk_ids,
+        unpermute_mapping=unpermute_mapping,
+        permute_src_index=permute_src_index,
+        tokens_per_expert=physical_counts,
+        received_counts=received_counts,
+        receive_overflow=False,
+        metadata=metadata,
+        placement=placement,
+        placement_payload=placement_payload,
     )
 
 
@@ -302,7 +497,16 @@ def restore_topk_output(
     unpermute_mapping: Any,
     topk_weights: Any,
 ) -> Any:
-    """Restore token order and route weights with the native NPU MoE operator."""
+    """Restore token order and route weights with the native NPU MoE operator.
+
+    Args:
+        expert_output: Expert-major local route outputs.
+        unpermute_mapping: Inverse permutation from routes to token slots.
+        topk_weights: Token-major routing probabilities.
+
+    Returns:
+        Weighted token-major output.
+    """
 
     mapping = unpermute_mapping
     if mapping.ndim != 1:

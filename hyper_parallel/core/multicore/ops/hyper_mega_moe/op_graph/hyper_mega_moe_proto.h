@@ -57,6 +57,8 @@ REG_OP(HyperMegaMoe)
   .ATTR(expert_num, Int, 0)
   .ATTR(hidden_size, Int, 0)
   .ATTR(seq_size, Int, 0)
+  .ATTR(receive_capacity, Int, 0)
+  .ATTR(wave_count, Int, 1)
   .OP_END_FACTORY_REG(HyperMegaMoe)
 }  // namespace ge
 

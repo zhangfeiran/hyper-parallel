@@ -18,9 +18,9 @@ from __future__ import annotations
 
 from importlib import import_module
 
+import os
 from dataclasses import dataclass
 from typing import Any
-
 
 from hyper_parallel.core.multicore.platform import torch as multicore_adapter
 
@@ -35,7 +35,9 @@ from .workspace import MegaMoeWorkspace
 
 torch = import_module("torch")
 
+
 _MEGA_MOE_FUNCTION = None
+_CYCLE_PROFILE_ENV = "HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"
 
 
 @dataclass(frozen=True)
@@ -57,7 +59,7 @@ class _ForwardBuffers:
 class _SavedForwardState:
     """Named view of tensors retained by the autograd forward pass."""
 
-    dispatch: Any
+    forward_input: Any
     up_proj: Any
     activation: Any
     weight1: Any
@@ -86,6 +88,7 @@ class _BackwardRouteState:
     grad_topk_weights: Any | None
     dispatch: Any
     grad_x: Any
+    reduce_route_index: Any
     route_graph: bool
 
 
@@ -101,6 +104,7 @@ class _BackwardBuffers:
     gmm_workspace: Any
     swiglu_workspace: Any
     events: Any
+    cycle_profile_enabled: bool
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -117,25 +121,61 @@ def _route_tensor(tensor: Any | None, name: str) -> Any:
     return tensor
 
 
+def _cycle_profile_enabled() -> bool:
+    """Return the validated opt-in state for the diagnostic backward key."""
+    value = os.getenv(_CYCLE_PROFILE_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{_CYCLE_PROFILE_ENV} must be 0 or 1, got {value!r}.")
+    return value == "1"
+
+
+def _mark_retained_scratch_modified(
+    ctx: Any,
+    saved: _SavedForwardState,
+) -> None:
+    """Make a second backward fail closed after saved storage is reused."""
+    if ctx.wave_count <= 1 or not ctx.plan.reuse_retained_dw_scratch:
+        return
+    torch.autograd.graph.increment_version(saved.up_proj)
+
+
+def _preserve_forward_input(
+    metadata: RouteMetadata,
+    dispatch: Any,
+    down_proj: Any,
+    kernel_input: Any,
+    *,
+    redispatch_w1_input: bool,
+) -> Any:
+    """Retain the backward W1 input without allocating another capacity buffer."""
+    if metadata.wave_count > 1 or redispatch_w1_input:
+        return kernel_input
+    # Forward Combine has consumed down-projection output when the custom op
+    # returns. Recycle that equally shaped dead storage for the dispatched
+    # hidden input that W1-gradient needs, replacing dispatch.clone().
+    return down_proj.copy_(dispatch)
+
+
 def _allocate_forward_intermediates(
     torch_module: Any,
     spec: Any,
-    capacity: int,
+    rolling_capacity: int,
+    retained_capacity: int,
     reference: Any,
 ) -> tuple[Any, Any, Any]:
-    """Allocate forward tensors at the route's actual bounded capacity."""
+    """Allocate retained GMM1 output and bounded rolling intermediates."""
     up_proj = torch_module.empty(
-        (capacity, spec.intermediate_size * 2),
+        (retained_capacity, spec.intermediate_size * 2),
         dtype=reference.dtype,
         device=reference.device,
     )
     activation = torch_module.empty(
-        (capacity, spec.intermediate_size),
+        (rolling_capacity, spec.intermediate_size),
         dtype=reference.dtype,
         device=reference.device,
     )
     down_proj = torch_module.empty(
-        (capacity, spec.hidden_size),
+        (rolling_capacity, spec.hidden_size),
         dtype=reference.dtype,
         device=reference.device,
     )
@@ -149,9 +189,19 @@ def _allocate_backward_intermediates(
     grad_output: Any,
     weight1: Any,
     weight2: Any,
+    *,
+    multi_wave: bool,
+    inplace_backward: bool,
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Allocate backward tensors that the device kernel fully initializes."""
-    grad_weight2 = torch_module.empty_like(weight2)
+    allocate_weight_gradient = (
+        torch_module.zeros if multi_wave else torch_module.empty
+    )
+    grad_weight2 = allocate_weight_gradient(
+        tuple(weight2.shape),
+        dtype=weight2.dtype,
+        device=weight2.device,
+    )
     act_grad = torch_module.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -162,12 +212,20 @@ def _allocate_backward_intermediates(
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
-    gate_dx = torch_module.empty(
-        (capacity, spec.hidden_size),
-        dtype=grad_output.dtype,
-        device=grad_output.device,
+    gate_dx = (
+        None
+        if inplace_backward
+        else torch_module.empty(
+            (capacity, spec.hidden_size),
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
     )
-    grad_weight1 = torch_module.empty_like(weight1)
+    grad_weight1 = allocate_weight_gradient(
+        tuple(weight1.shape),
+        dtype=weight1.dtype,
+        device=weight1.device,
+    )
     return grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx
 
 
@@ -206,11 +264,20 @@ def _permute_grad(
     ).contiguous()
 
 
+def _rebuild_unpermute_mapping(
+    route_slots: Any,
+    topk_ids: Any,
+) -> Any:
+    """Rebuild the compact route map after multi-wave dTopK reuses its slot."""
+    _, mapping = _build_route_indices(route_slots, topk_ids)
+    return mapping
+
+
 def _save_forward_state(
     ctx: Any,
     plan: MegaMoePlan,
     workspace: MegaMoeWorkspace,
-    dispatch: Any,
+    forward_input: Any,
     up_proj: Any,
     activation: Any,
     weight1: Any,
@@ -224,8 +291,19 @@ def _save_forward_state(
     """Save owned forward tensors, route indices and static execution state."""
     ctx.plan = plan
     ctx.workspace = workspace
+    ctx.permute_fused = plan.spec.backward_permute_fused
+    ctx.inplace_backward = plan.inplace_wave_backward and ctx.permute_fused
+    ctx.backward_unpermute_fused = (
+        metadata.wave_count == 1
+        and plan.spec.backward_unpermute_fused
+        and not ctx.inplace_backward
+    )
+    ctx.expert_capacity = metadata.expert_capacity
+    ctx.receive_capacity = metadata.receive_capacity
+    ctx.wave_count = metadata.wave_count
+    ctx.replay_reduce_route_index = None
     ctx.save_for_backward(
-        dispatch.clone(),
+        forward_input,
         up_proj,
         activation,
         weight1,
@@ -268,6 +346,7 @@ def _prepare_forward_buffers(
         torch_module,
         spec,
         capacity,
+        metadata.retained_capacity,
         hidden_states,
     )
     combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
@@ -316,10 +395,10 @@ def _launch_forward(
     spec = plan.spec
     multicore_adapter.mega_moe(
         buffers.dispatch,
-        metadata.dispatch_target_off * spec.hidden_size,
+        metadata.dispatch_target_off,
         kernel_input.contiguous(),
-        metadata.dispatch_src_off * spec.hidden_size,
-        metadata.dispatch_size * spec.hidden_size,
+        metadata.dispatch_src_off,
+        metadata.dispatch_size,
         weight1.contiguous(),
         metadata.group_list,
         buffers.up_proj,
@@ -328,9 +407,9 @@ def _launch_forward(
         metadata.group_list,
         buffers.down_proj,
         buffers.combine,
-        metadata.combine_target_off * spec.hidden_size,
-        metadata.combine_src_off * spec.hidden_size,
-        metadata.combine_size * spec.hidden_size,
+        metadata.combine_target_off,
+        metadata.combine_src_off,
+        metadata.combine_size,
         buffers.gmm_workspace,
         plan.up_proj_tiling,
         plan.swiglu_tiling,
@@ -344,9 +423,11 @@ def _launch_forward(
         buffers.final_out,
         spec.rank_id,
         spec.ep_size,
-        spec.num_experts,
+        spec.physical_num_experts,
         spec.hidden_size,
         spec.local_num_tokens,
+        metadata.receive_capacity,
+        metadata.wave_count,
     )
 
 
@@ -386,6 +467,12 @@ def _prepare_backward_route(
             ctx.plan,
             saved,
         )
+        # One-wave dTopK writes its result back into ABI position 30. Keep the
+        # autograd-saved token-major weights immutable for retain_graph and
+        # deferred replay. Multi-wave dTopK instead reuses position 31 after
+        # its compact inverse mapping has been consumed.
+        if ctx.wave_count == 1:
+            route_weight = route_weight.clone()
         grad_topk_weights = None
     else:
         kernel_grad_output, grad_topk_weights = _unpermute_grad(
@@ -397,17 +484,26 @@ def _prepare_backward_route(
         kernel_grad_output = kernel_grad_output.contiguous()
         # This stable ABI slot has no consumer in the non-permute graph.
         route_weight = saved.topk_weights.reshape(-1).narrow(0, 0, 1)
-        permute_src_index = saved.dispatch_size
+        permute_src_index = (
+            saved.permute_src_index
+            if ctx.wave_count > 1 and spec.forward_permute_fused
+            else saved.dispatch_size
+        )
 
-    capacity = saved.dispatch.shape[0]
+    capacity = ctx.expert_capacity
     dispatch = _workspace_tensor(
         workspace.expert_buffer,
         "expert_buffer",
     ).narrow(0, 0, capacity)
-    route_graph = spec.backward_permute_fused or spec.backward_unpermute_fused
-    if route_graph and spec.backward_permute_fused:
-        # dTopK reads the saved expert output while Combine writes dispatch.
-        grad_x = saved.expert_output
+    route_graph = ctx.permute_fused or ctx.backward_unpermute_fused
+    if ctx.wave_count > 1 or (route_graph and ctx.permute_fused):
+        # Keep the saved expert output immutable. The common forward/backward
+        # path can consume the copy already present in SHMEM. A retained graph
+        # or an intervening forward restores it only when the generation shows
+        # that the shared buffer has since been overwritten.
+        grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
+        if ctx.routed_buffer_generation != workspace.routed_buffer_generation:
+            grad_x.copy_(saved.expert_output)
     elif route_graph:
         grad_x = torch.empty(
             (spec.local_num_tokens, spec.hidden_size),
@@ -416,6 +512,11 @@ def _prepare_backward_route(
         )
     else:
         grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
+    reduce_route_index = saved.reduce_route_index
+    if ctx.wave_count > 1 and ctx.permute_fused:
+        replay_route_index = ctx.replay_reduce_route_index
+        if replay_route_index is not None:
+            reduce_route_index = replay_route_index
     return _BackwardRouteState(
         kernel_grad_output=kernel_grad_output,
         permute_src_index=permute_src_index,
@@ -423,11 +524,13 @@ def _prepare_backward_route(
         grad_topk_weights=grad_topk_weights,
         dispatch=dispatch,
         grad_x=grad_x,
+        reduce_route_index=reduce_route_index,
         route_graph=route_graph,
     )
 
 
 def _prepare_backward_buffers(
+    ctx: Any,
     plan: MegaMoePlan,
     workspace: MegaMoeWorkspace,
     saved: _SavedForwardState,
@@ -437,12 +540,18 @@ def _prepare_backward_buffers(
     intermediates = _allocate_backward_intermediates(
         torch,
         plan.spec,
-        saved.dispatch.shape[0],
+        ctx.expert_capacity,
         route_state.kernel_grad_output,
         saved.weight1,
         saved.weight2,
+        multi_wave=ctx.wave_count > 1,
+        inplace_backward=ctx.inplace_backward,
     )
     grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx = intermediates
+    if gate_dx is None:
+        gate_dx = route_state.dispatch
+    cycle_profile_enabled = _cycle_profile_enabled()
+    workspace.prepare_cycle_profile(enabled=cycle_profile_enabled)
     return _BackwardBuffers(
         grad_weight1=grad_weight1,
         grad_weight2=grad_weight2,
@@ -458,6 +567,7 @@ def _prepare_backward_buffers(
             "swiglu_grad_workspace",
         ),
         events=workspace.prepare_event_counters(forward=False),
+        cycle_profile_enabled=cycle_profile_enabled,
     )
 
 
@@ -472,10 +582,10 @@ def _launch_backward(
     spec = plan.spec
     multicore_adapter.mega_moe_grad(
         route_state.dispatch,
-        saved.dispatch_target_off * spec.hidden_size,
+        saved.dispatch_target_off,
         route_state.kernel_grad_output,
-        saved.dispatch_src_off * spec.hidden_size,
-        saved.dispatch_size * spec.hidden_size,
+        saved.dispatch_src_off,
+        saved.dispatch_size,
         saved.activation,
         buffers.grad_weight2,
         saved.weight2,
@@ -485,10 +595,10 @@ def _launch_backward(
         saved.weight1,
         buffers.gate_dx,
         route_state.grad_x,
-        saved.combine_target_off * spec.hidden_size,
-        saved.combine_src_off * spec.hidden_size,
-        saved.combine_size * spec.hidden_size,
-        saved.dispatch,
+        saved.combine_target_off,
+        saved.combine_src_off,
+        saved.combine_size,
+        saved.forward_input,
         buffers.grad_weight1,
         saved.group_list,
         plan.act_grad_tiling,
@@ -498,16 +608,23 @@ def _launch_backward(
         plan.swiglu_grad_tiling,
         buffers.gmm_workspace,
         buffers.swiglu_workspace,
-        plan.bwd_runtime_config,
+        (
+            plan.bwd_multi_wave_runtime_config
+            if ctx.wave_count > 1
+            else plan.bwd_runtime_config
+        ),
         buffers.events,
         route_state.permute_src_index,
         route_state.route_weight,
-        saved.reduce_route_index,
+        route_state.reduce_route_index,
         spec.rank_id,
         spec.ep_size,
-        spec.num_experts,
+        spec.physical_num_experts,
         spec.hidden_size,
         spec.local_num_tokens,
+        ctx.receive_capacity,
+        ctx.wave_count,
+        int(buffers.cycle_profile_enabled),
     )
 
 
@@ -521,23 +638,45 @@ def _finish_backward(
     """Restore public gradient layouts after the backward custom operator."""
     spec = ctx.plan.spec
     grad_topk_weights = route_state.grad_topk_weights
-    if spec.backward_permute_fused:
-        grad_topk_weights = route_state.route_weight.reshape_as(
-            saved.topk_weights
-        ).to(saved.topk_weights.dtype)
-    if spec.backward_unpermute_fused:
+    if ctx.permute_fused:
+        if ctx.wave_count > 1:
+            route_grad = route_state.reduce_route_index.view(
+                torch.float32
+            ).reshape_as(saved.topk_weights)
+            grad_topk_weights = route_grad.to(saved.topk_weights.dtype)
+        else:
+            grad_topk_weights = route_state.route_weight.reshape_as(
+                saved.topk_weights
+            ).to(saved.topk_weights.dtype)
+    if ctx.backward_unpermute_fused:
         grad_hidden = route_state.grad_x.narrow(0, 0, spec.local_num_tokens)
     else:
+        reduce_route_index = saved.reduce_route_index
+        if ctx.permute_fused and ctx.wave_count > 1:
+            route_slots = ctx.plan.route_slots
+            if route_slots is None:
+                raise RuntimeError(
+                    "MegaMoe cannot rebuild the multi-wave route mapping."
+                )
+            reduce_route_index = _rebuild_unpermute_mapping(
+                route_slots,
+                saved.topk_ids,
+            )
+            ctx.replay_reduce_route_index = reduce_route_index
         expert_grad = (
             route_state.dispatch.narrow(0, 0, spec.routed_slots)
-            if route_state.route_graph
+            if (
+                route_state.route_graph
+                and ctx.wave_count == 1
+                and not ctx.inplace_backward
+            )
             else route_state.grad_x.narrow(0, 0, spec.routed_slots)
         )
         grad_hidden = _permute_grad(
             grad_output,
             expert_grad,
             saved.topk_ids,
-            saved.reduce_route_index,
+            reduce_route_index,
         )
     return (
         grad_hidden,
@@ -553,7 +692,7 @@ def _finish_backward(
 
 
 def _get_mega_moe_function() -> Any:
-    """Create the Torch autograd.Function lazily inside the Torch backend."""
+    """Create the Torch autograd.Function lazily inside the Torch execution module."""
     # pylint: disable=global-statement
     global _MEGA_MOE_FUNCTION
     if _MEGA_MOE_FUNCTION is not None:
@@ -576,7 +715,23 @@ def _get_mega_moe_function() -> Any:
             plan: MegaMoePlan,
             workspace: MegaMoeWorkspace,
         ) -> Any:
-            """Launch the selected forward route endpoints and expert graph."""
+            """Launch the selected forward route endpoints and expert graph.
+
+            Args:
+                ctx: Autograd context used to retain backward state.
+                hidden_states: Token-order input activations.
+                topk_ids: Selected expert ids for every token.
+                topk_weights: Router weights for the selected experts.
+                weight1: Gate/up projection weights.
+                weight2: Down-projection weights.
+                routed_tokens: Optional externally permuted activations.
+                route: Prepared routing metadata and mappings.
+                plan: Compiled MegaMoe plan configuration.
+                workspace: Shared execution workspace.
+
+            Returns:
+                Token-order or expert-major output selected by the fusion mode.
+            """
             spec = plan.spec
             metadata = route.metadata
             if metadata is None:
@@ -586,6 +741,9 @@ def _get_mega_moe_function() -> Any:
                 if spec.forward_permute_fused
                 else _route_tensor(routed_tokens, "routed_tokens")
             )
+            backward_input = (
+                hidden_states if spec.backward_permute_fused else kernel_input
+            )
             workspace.ensure(
                 spec,
                 hidden_states.dtype,
@@ -593,6 +751,18 @@ def _get_mega_moe_function() -> Any:
             )
             workspace.claim()
             try:
+                workspace.prepare_gmm_workspace(
+                    weight1,
+                    weight2,
+                    metadata.wave_count,
+                    receive_capacity=metadata.receive_capacity,
+                    reuse_retained_scratch=(
+                        plan.reuse_retained_dw_scratch
+                    ),
+                    atomic_dw_accumulation=(
+                        plan.atomic_dw_accumulation
+                    ),
+                )
                 # Exact route offsets cover every row consumed by GMM and
                 # unpermute. Clearing the capacity tail only adds device work.
                 buffers = _prepare_forward_buffers(
@@ -614,9 +784,10 @@ def _get_mega_moe_function() -> Any:
                     topk_weights,
                     buffers,
                 )
+                ctx.routed_buffer_generation = workspace.mark_routed_buffer_write()
                 expert_output = (
                     buffers.down_proj
-                    if spec.forward_unpermute_fused
+                    if spec.forward_unpermute_fused and metadata.wave_count == 1
                     else buffers.combine.clone()
                 )
                 output = (
@@ -628,11 +799,32 @@ def _get_mega_moe_function() -> Any:
                         topk_weights,
                     )
                 )
+                redispatch_w1_input = (
+                    metadata.wave_count == 1
+                    and plan.inplace_wave_backward
+                    and spec.backward_permute_fused
+                )
+                if (
+                    metadata.wave_count == 1
+                    and spec.forward_unpermute_fused
+                    and not redispatch_w1_input
+                ):
+                    # Integrated forward unpermute reuses down_proj as the
+                    # expert-output snapshot needed by dTopK.
+                    forward_input = buffers.dispatch.clone()
+                else:
+                    forward_input = _preserve_forward_input(
+                        metadata,
+                        buffers.dispatch,
+                        buffers.down_proj,
+                        backward_input,
+                        redispatch_w1_input=redispatch_w1_input,
+                    )
                 _save_forward_state(
                     ctx,
                     plan,
                     workspace,
-                    buffers.dispatch,
+                    forward_input,
                     buffers.up_proj,
                     buffers.activation,
                     weight1,
@@ -649,19 +841,30 @@ def _get_mega_moe_function() -> Any:
 
         @staticmethod
         def backward(ctx: Any, grad_output: Any) -> tuple[Any, ...]:
-            """Launch the selected backward route endpoints and expert graph."""
+            """Launch the selected backward route endpoints and expert graph.
+
+            Args:
+                ctx: Autograd context populated by the forward launch.
+                grad_output: Gradient of the layer output.
+
+            Returns:
+                Gradients aligned with the forward arguments.
+            """
             workspace = ctx.workspace
             saved = _load_forward_state(ctx)
             workspace.claim()
             try:
                 route_state = _prepare_backward_route(ctx, grad_output, saved)
                 buffers = _prepare_backward_buffers(
+                    ctx,
                     ctx.plan,
                     workspace,
                     saved,
                     route_state,
                 )
                 _launch_backward(ctx, saved, route_state, buffers)
+                workspace.mark_routed_buffer_write()
+                _mark_retained_scratch_modified(ctx, saved)
                 return _finish_backward(
                     ctx,
                     grad_output,
@@ -686,7 +889,21 @@ def execute_mega_moe(
     plan: MegaMoePlan,
     workspace: MegaMoeWorkspace,
 ) -> Any:
-    """Execute Top-K routing endpoints and expert compute as one autograd unit."""
+    """Execute Top-K routing endpoints and expert compute as one autograd unit.
+
+    Args:
+        hidden_states: Token-major local activations.
+        topk_ids: Physical expert IDs selected for every route slot.
+        topk_weights: Router weights paired with ``topk_ids``.
+        weight1: Rank-local physical gate/up weights, including replica slots.
+        weight2: Rank-local physical down-projection weights.
+        route: Prepared route tensors and count metadata.
+        plan: Static forward and backward plan descriptors.
+        workspace: Directional buffers shared by this backend instance.
+
+    Returns:
+        Token-major local expert output.
+    """
     function = _get_mega_moe_function()
     return function.apply(
         hidden_states,

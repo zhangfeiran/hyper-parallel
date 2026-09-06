@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +29,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data im
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
+    build_multi_wave_backward_graph,
     build_route_backward_graph,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
@@ -50,13 +52,22 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_up_proj_tiling_bytes,
 )
 from hyper_parallel.core.multicore.scheduler.config import (
+    SwiGluTilingDataC,
     TaskSplitValue,
     serialize_runtime_config,
 )
+from hyper_parallel.core.multicore.scheduler.graph import OpType
 
 from .spec import MegaMoeSpec
 
 torch = import_module("torch")
+
+
+_INPLACE_WAVE_BACKWARD_ENV = "HP_MEGA_MOE_INPLACE_WAVE_BACKWARD"
+_TILE_PHASE_ACK_ENV = "HP_MEGA_MOE_TILE_PHASE_ACK"
+_REUSE_RETAINED_DW_SCRATCH_ENV = "HP_MEGA_MOE_REUSE_RETAINED_DW_SCRATCH"
+_ATOMIC_DW_ACCUMULATION_ENV = "HP_MEGA_MOE_ATOMIC_DW_ACCUMULATION"
+_DESTINATION_WAVE_FENCE_ENV = "HP_MEGA_MOE_DESTINATION_WAVE_FENCE"
 
 
 @dataclass(frozen=True)
@@ -69,12 +80,17 @@ class MegaMoePlan:
     swiglu_tiling: Any
     down_proj_tiling: Any
     bwd_runtime_config: Any
+    bwd_multi_wave_runtime_config: Any
     act_grad_tiling: Any
     gate_grad_tiling: Any
     w1_grad_tiling: Any
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
     route_slots: Any | None
+    inplace_wave_backward: bool
+    reuse_retained_dw_scratch: bool
+    atomic_dw_accumulation: bool
+    destination_wave_fence: bool
 
 
 @dataclass(frozen=True)
@@ -99,13 +115,28 @@ def _tensor_from_bytes(data: bytes, device: Any) -> Any:
     return torch.from_numpy(array).to(device=device, dtype=torch.uint8)
 
 
-def _resize_swiglu_tiling(data: bytes, num_cube_cores: int) -> bytes:
-    """Resize the baseline 24-core repeated struct for the active workers."""
+def _resize_swiglu_tiling(
+    data: bytes,
+    num_cube_cores: int,
+    split_value: int,
+) -> bytes:
+    """Resize worker records and append exact tail-row tilings."""
     baseline_workers = 49
     if len(data) % baseline_workers:
         raise RuntimeError("invalid baseline SwiGLU tiling byte length.")
     struct_size = len(data) // baseline_workers
-    return data[:struct_size] * (2 * num_cube_cores + 1)
+    if struct_size != len(bytes(SwiGluTilingDataC())):
+        raise RuntimeError("invalid baseline SwiGLU tiling struct size.")
+    base = SwiGluTilingDataC.from_buffer_copy(data[:struct_size])
+    base.baseColLen = min(base.baseColLen, base.colLen)
+    worker_tilings = bytes(base) * (2 * num_cube_cores + 1)
+    tail_tilings = []
+    for rows in range(1, split_value):
+        tail = SwiGluTilingDataC.from_buffer_copy(bytes(base))
+        tail.rowLen = rows
+        tail.baseRowLen = min(tail.baseRowLen, rows)
+        tail_tilings.append(bytes(tail))
+    return worker_tilings + b"".join(tail_tilings)
 
 
 def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
@@ -121,9 +152,66 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
         tp=1,
         ep=spec.ep_size,
         seq_size=spec.local_num_tokens,
-        all_expert_num=spec.num_experts,
+        all_expert_num=spec.physical_num_experts,
         top_k=spec.top_k,
     )
+
+
+def _use_token_a2a_offsets(graph: Any) -> None:
+    """Keep route metadata in token rows through the custom-op boundary."""
+    for op in graph.topological_sort():
+        if op.op_type == OpType.ALLTOALL:
+            op.fill_config.offsets_in_tokens = True
+
+
+def _inplace_wave_backward_enabled() -> bool:
+    """Return the validated internal selector for the P2.1 A/B experiment."""
+    value = os.getenv(_INPLACE_WAVE_BACKWARD_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(
+            f"{_INPLACE_WAVE_BACKWARD_ENV} must be 0 or 1, got {value!r}."
+        )
+    return value == "1"
+
+
+def _tile_phase_ack_enabled() -> bool:
+    """Return the validated internal selector for the P2.2 A/B experiment."""
+    value = os.getenv(_TILE_PHASE_ACK_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(
+            f"{_TILE_PHASE_ACK_ENV} must be 0 or 1, got {value!r}."
+        )
+    return value == "1"
+
+
+def _reuse_retained_dw_scratch_enabled() -> bool:
+    """Return the validated internal selector for the P3 HBM experiment."""
+    value = os.getenv(_REUSE_RETAINED_DW_SCRATCH_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(
+            f"{_REUSE_RETAINED_DW_SCRATCH_ENV} must be 0 or 1, got {value!r}."
+        )
+    return value == "1"
+
+
+def _atomic_dw_accumulation_enabled() -> bool:
+    """Return the validated internal selector for direct Matmul dW add."""
+    value = os.getenv(_ATOMIC_DW_ACCUMULATION_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(
+            f"{_ATOMIC_DW_ACCUMULATION_ENV} must be 0 or 1, got {value!r}."
+        )
+    return value == "1"
+
+
+def _destination_wave_fence_enabled() -> bool:
+    """Return whether each next-wave dispatch waits on its destination rank."""
+    value = os.getenv(_DESTINATION_WAVE_FENCE_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(
+            f"{_DESTINATION_WAVE_FENCE_ENV} must be 0 or 1, got {value!r}."
+        )
+    return value == "1"
 
 
 def _build_forward_schedule(
@@ -147,6 +235,7 @@ def _build_forward_schedule(
         num_cube_cores=spec.num_cube_cores,
         integrated_unpermute=spec.forward_unpermute_fused,
     )
+    _use_token_a2a_offsets(graph)
     graph.propagate_splits(task_values)
     data = build_forward_config(
         graph,
@@ -161,16 +250,24 @@ def _build_backward_schedule(
     spec: MegaMoeSpec,
     task_values: TaskSplitValue,
     device: Any,
-) -> tuple[Any, Any]:
-    """Build the selected backward graph and its compact device descriptor."""
+    *,
+    inplace_wave_backward: bool,
+    tile_phase_ack: bool,
+    reuse_retained_dw_scratch: bool,
+    atomic_dw_accumulation: bool,
+    destination_wave_fence: bool,
+) -> tuple[Any, Any, Any]:
+    """Build ordinary and multi-wave backward device descriptors."""
     permute_fused = spec.backward_permute_fused
     unpermute_fused = spec.backward_unpermute_fused
+    inplace_gate_dx = inplace_wave_backward and permute_fused
     route_fused = permute_fused or unpermute_fused
     builder = build_route_backward_graph if route_fused else build_backward_graph
     options = (
         {
             "integrated_permute": permute_fused,
-            "integrated_unpermute": unpermute_fused,
+            "integrated_unpermute": unpermute_fused and not inplace_gate_dx,
+            "inplace_gate_dx": inplace_gate_dx,
         }
         if route_fused
         else {}
@@ -185,6 +282,7 @@ def _build_backward_schedule(
         num_cube_cores=spec.num_cube_cores,
         **options,
     )
+    _use_token_a2a_offsets(graph)
     graph.propagate_splits(task_values)
     data = build_backward_config(
         graph,
@@ -192,7 +290,62 @@ def _build_backward_schedule(
         spec.rank_id,
         spec.num_cube_cores,
     )
-    return graph, _tensor_from_bytes(serialize_runtime_config(data), device)
+    swiglu_grad = graph.get_op("swiglu_grad")
+    swiglu_grad_tiling = _resize_swiglu_tiling(
+        get_swiglu_grad_tiling_bytes(
+            swiglu_grad.split_value,
+            intermediate_size=spec.intermediate_size,
+        ),
+        spec.num_cube_cores,
+        swiglu_grad.split_value,
+    )
+    multi_wave_graph = build_multi_wave_backward_graph(
+        task_values,
+        integrated_permute=permute_fused,
+        # The retained W1 input is token-major whenever either direction
+        # avoided materializing the forward expert-major permutation. This is
+        # independent from whether dY itself uses route-fused dispatch.
+        integrated_hidden_permute=(
+            spec.forward_permute_fused or permute_fused
+        ),
+        # In-place replay depends on the fused dispatch endpoint. Keep the
+        # global opt-in compatible with topologies where route fusion is not
+        # available by building their existing non-in-place fallback graph.
+        inplace_wave_backward=inplace_gate_dx,
+        tile_phase_ack=tile_phase_ack,
+        reuse_retained_dw_scratch=reuse_retained_dw_scratch,
+        atomic_dw_accumulation=atomic_dw_accumulation,
+        destination_wave_fence=destination_wave_fence,
+        # The rolling dispatch buffer is overwritten by the next wave, while
+        # final dX needs one full routed staging tensor. Keep the final inverse
+        # permutation outside the multi-wave kernel so it can consume that
+        # staging tensor without an additional full-size copy.
+        integrated_unpermute=False,
+        dispatch_sv=spec.dispatch_split,
+        swiglu_sv=spec.swiglu_split,
+        combine_sv=spec.combine_split,
+        hidden_size=spec.hidden_size,
+        intermediate_size=spec.intermediate_size,
+        num_cube_cores=spec.num_cube_cores,
+    )
+    _use_token_a2a_offsets(multi_wave_graph)
+    multi_wave_graph.propagate_splits(task_values)
+    recompute_activation = multi_wave_graph.get_op("recompute_activation")
+    recompute_activation.fill_config.tiling_data_offset = len(
+        swiglu_grad_tiling
+    )
+    multi_wave_data = build_backward_config(
+        multi_wave_graph,
+        task_values,
+        spec.rank_id,
+        spec.num_cube_cores,
+        kernel_multi_wave=True,
+    )
+    return (
+        graph,
+        _tensor_from_bytes(serialize_runtime_config(data), device),
+        _tensor_from_bytes(serialize_runtime_config(multi_wave_data), device),
+    )
 
 
 def _build_tilings(
@@ -205,7 +358,7 @@ def _build_tilings(
     gmm_options = {
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
-        "num_groups": spec.local_experts,
+        "num_groups": spec.physical_local_experts,
         "num_cube_cores": spec.num_cube_cores,
     }
     up_proj = forward_graph.get_op("up_proj")
@@ -216,6 +369,22 @@ def _build_tilings(
     w1_grad = backward_graph.get_op("w1_grad")
     w2_grad = backward_graph.get_op("w2_grad")
     swiglu_grad = backward_graph.get_op("swiglu_grad")
+    swiglu_grad_tiling = _resize_swiglu_tiling(
+        get_swiglu_grad_tiling_bytes(
+            swiglu_grad.split_value,
+            intermediate_size=spec.intermediate_size,
+        ),
+        spec.num_cube_cores,
+        swiglu_grad.split_value,
+    )
+    recompute_activation_tiling = _resize_swiglu_tiling(
+        get_swiglu_tiling_bytes(
+            spec.swiglu_split,
+            intermediate_size=spec.intermediate_size,
+        ),
+        spec.num_cube_cores,
+        spec.swiglu_split,
+    )
     return _MegaMoeTilings(
         up_proj=_tensor_from_bytes(
             get_up_proj_tiling_bytes(up_proj.split_value, **gmm_options), device
@@ -227,6 +396,7 @@ def _build_tilings(
                     intermediate_size=spec.intermediate_size,
                 ),
                 spec.num_cube_cores,
+                swiglu.split_value,
             ),
             device,
         ),
@@ -246,13 +416,7 @@ def _build_tilings(
             get_w2_grad_tiling_bytes(w2_grad.split_value, **gmm_options), device
         ),
         swiglu_grad=_tensor_from_bytes(
-            _resize_swiglu_tiling(
-                get_swiglu_grad_tiling_bytes(
-                    swiglu_grad.split_value,
-                    intermediate_size=spec.intermediate_size,
-                ),
-                spec.num_cube_cores,
-            ),
+            swiglu_grad_tiling + recompute_activation_tiling,
             device,
         ),
     )
@@ -280,11 +444,38 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         Rank-local forward and backward plan resources.
     """
     task_values = _build_task_values(spec)
+    inplace_wave_backward = _inplace_wave_backward_enabled()
+    tile_phase_ack = _tile_phase_ack_enabled()
+    reuse_retained_dw_scratch = _reuse_retained_dw_scratch_enabled()
+    atomic_dw_accumulation = _atomic_dw_accumulation_enabled()
+    destination_wave_fence = _destination_wave_fence_enabled()
+    if tile_phase_ack and not inplace_wave_backward:
+        raise ValueError(
+            f"{_TILE_PHASE_ACK_ENV}=1 requires {_INPLACE_WAVE_BACKWARD_ENV}=1."
+        )
+    if reuse_retained_dw_scratch and atomic_dw_accumulation:
+        raise ValueError(
+            f"{_REUSE_RETAINED_DW_SCRATCH_ENV}=1 cannot be combined with "
+            f"{_ATOMIC_DW_ACCUMULATION_ENV}=1."
+        )
+    if destination_wave_fence and not tile_phase_ack:
+        raise ValueError(
+            f"{_DESTINATION_WAVE_FENCE_ENV}=1 requires {_TILE_PHASE_ACK_ENV}=1."
+        )
     forward_graph, forward_config = _build_forward_schedule(
         spec, task_values, device
     )
-    backward_graph, backward_config = _build_backward_schedule(
-        spec, task_values, device
+    backward_graph, backward_config, multi_wave_backward_config = (
+        _build_backward_schedule(
+            spec,
+            task_values,
+            device,
+            inplace_wave_backward=inplace_wave_backward,
+            tile_phase_ack=tile_phase_ack,
+            reuse_retained_dw_scratch=reuse_retained_dw_scratch,
+            atomic_dw_accumulation=atomic_dw_accumulation,
+            destination_wave_fence=destination_wave_fence,
+        )
     )
     tilings = _build_tilings(spec, forward_graph, backward_graph, device)
     return MegaMoePlan(
@@ -294,10 +485,15 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         swiglu_tiling=tilings.swiglu,
         down_proj_tiling=tilings.down_proj,
         bwd_runtime_config=backward_config,
+        bwd_multi_wave_runtime_config=multi_wave_backward_config,
         act_grad_tiling=tilings.act_grad,
         gate_grad_tiling=tilings.gate_grad,
         w1_grad_tiling=tilings.w1_grad,
         w2_grad_tiling=tilings.w2_grad,
         swiglu_grad_tiling=tilings.swiglu_grad,
         route_slots=_build_route_slots(spec, device),
+        inplace_wave_backward=inplace_wave_backward,
+        reuse_retained_dw_scratch=reuse_retained_dw_scratch,
+        atomic_dw_accumulation=atomic_dw_accumulation,
+        destination_wave_fence=destination_wave_fence,
     )

@@ -55,15 +55,19 @@ aclTensor *CreateContiguousTensorList(const aclTensor *tensorList, aclOpExecutor
   return tensor;
 }
 
-static void SetTransposedTensorListContiguous(HyperMegaMoeGradParams &params, aclOpExecutor *executorPtr) {
+static void SetTransposedTensorListContiguous(
+    HyperMegaMoeGradParams &params, aclOpExecutor *executorPtr,
+    bool transposePermuteOut) {
   aclTensor *hidden = CreateContiguousTensorList(params.hidden, executorPtr);
   params.hidden = hidden;
 
   aclTensor *w1 = CreateContiguousTensorList(params.w1, executorPtr);
   params.w1 = w1;
 
-  aclTensor *permute_out = CreateContiguousTensorList(params.permute_out, executorPtr);
-  params.permute_out = permute_out;
+  if (transposePermuteOut) {
+    aclTensor *permute_out = CreateContiguousTensorList(params.permute_out, executorPtr);
+    params.permute_out = permute_out;
+  }
 
   aclTensor *weight = CreateContiguousTensorList(params.weight, executorPtr);
   params.weight = weight;
@@ -100,8 +104,9 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
   const aclTensor *w2_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
   const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
   const aclTensor *permute_src_index, const aclTensor *route_weight, const aclTensor *reduce_route_index,
-  int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, uint64_t *workspaceSize,
-  aclOpExecutor **executor) {
+  int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size,
+  int64_t receive_capacity, int64_t wave_count, int64_t cycle_profile,
+  uint64_t *workspaceSize, aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
   L2_DFX_PHASE_1(
     aclnnHyperMegaMoeGrad,
@@ -109,7 +114,8 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
            gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size, permute_out,
            gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling, swiglu_grad_tiling,
            gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, permute_src_index, route_weight,
-           reduce_route_index, rankId, ep, expert_num, hidden_size, seq_size),
+           reduce_route_index, rankId, ep, expert_num, hidden_size, seq_size, receive_capacity,
+           wave_count, cycle_profile),
     DFX_OUT(dispatch_target, hidden_dw, y, grad_gate, gate_dx, grad_x, permute_out, gate_dw));
 
   auto uniqueExecutor = CREATE_EXECUTOR();
@@ -117,7 +123,10 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
   CHECK_RET(executorPtr != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
 
   HyperMegaMoeGradParams params{hidden, w1, permute_out, weight};
-  SetTransposedTensorListContiguous(params, executorPtr);
+  // Multi-wave dW1 reads its wave-local hidden copy from position 12, while
+  // position 17 remains the symmetric Combine staging buffer. Only the
+  // ordinary graph needs the historical transposed dW1 input view.
+  SetTransposedTensorListContiguous(params, executorPtr, wave_count <= 1);
 
   // Invoke the underlying operator.
   auto bwd_output = l0op::HyperMegaMoeGrad(
@@ -125,7 +134,8 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
     y, gate, grad_gate, params.w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size,
     params.permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
     swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, permute_src_index,
-    route_weight, reduce_route_index, rankId, ep, expert_num, hidden_size, seq_size, executorPtr);
+    route_weight, reduce_route_index, rankId, ep, expert_num, hidden_size, seq_size,
+    receive_capacity, wave_count, cycle_profile, executorPtr);
   bool bwd_output_success =
     std::all_of(bwd_output.begin(), bwd_output.end(), [](const aclTensor *ptr) { return ptr != nullptr; });
   CHECK_RET(bwd_output_success, ACLNN_ERR_INNER_NULLPTR);

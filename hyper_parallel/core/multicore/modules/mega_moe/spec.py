@@ -52,6 +52,7 @@ class MegaMoeSpec:
     ep_group: Any | None
     rank_id: int
     num_cube_cores: int
+    replica_slots_per_rank: int = 0
     forward_fusion_mode: FusionMode = _DEFAULT_FORWARD_FUSION_MODE
     backward_fusion_mode: FusionMode = _DEFAULT_BACKWARD_FUSION_MODE
     dispatch_split: int = _COMMUNICATION_SPLIT
@@ -62,6 +63,16 @@ class MegaMoeSpec:
     def local_experts(self) -> int:
         """Return experts owned by this expert-parallel rank."""
         return self.num_experts // self.ep_size
+
+    @property
+    def physical_local_experts(self) -> int:
+        """Return home plus temporary replica groups executed on each rank."""
+        return self.local_experts + self.replica_slots_per_rank
+
+    @property
+    def physical_num_experts(self) -> int:
+        """Return the flattened physical expert-ID space used by kernels."""
+        return self.physical_local_experts * self.ep_size
 
     @property
     def routed_slots(self) -> int:
@@ -241,6 +252,16 @@ def bind_mega_moe_spec(
     forward_fusion_mode, backward_fusion_mode = _resolve_fusion_modes(
         top_k, local_num_tokens * top_k,
     )
+    replica_slots_per_rank = specification.get("replica_slots_per_rank", 0)
+    if (
+        not isinstance(replica_slots_per_rank, int)
+        or isinstance(replica_slots_per_rank, bool)
+        or replica_slots_per_rank < 0
+    ):
+        raise ValueError(
+            "replica_slots_per_rank must be a nonnegative integer, "
+            f"got {replica_slots_per_rank!r}."
+        )
     spec = MegaMoeSpec(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],
@@ -253,14 +274,28 @@ def bind_mega_moe_spec(
         ep_group=ep_group,
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
+        replica_slots_per_rank=replica_slots_per_rank,
         forward_fusion_mode=forward_fusion_mode,
         backward_fusion_mode=backward_fusion_mode,
     )
-    if (
-        spec.forward_permute_fused or spec.backward_permute_fused
-    ) and spec.routed_slots > _MAX_EXACT_FLOAT32_INTEGER:
+    if spec.local_num_tokens % _COMMUNICATION_SPLIT:
         raise ValueError(
-            "route-fused MegaMoe requires local_num_tokens * top_k to be at "
+            "local_num_tokens must be divisible by the fixed "
+            f"communication split {_COMMUNICATION_SPLIT}, got {spec.local_num_tokens}."
+        )
+    if spec.receive_capacity < spec.routed_slots:
+        raise ValueError(
+            "receive_capacity cannot be smaller than the local routed row count "
+            f"{spec.routed_slots}, got {spec.receive_capacity}."
+        )
+    uses_float_route_slots = (
+        spec.forward_permute_fused
+        or spec.backward_permute_fused
+        or bool(spec.replica_slots_per_rank)
+    )
+    if uses_float_route_slots and spec.routed_slots > _MAX_EXACT_FLOAT32_INTEGER:
+        raise ValueError(
+            "route-indexed MegaMoe requires local_num_tokens * top_k to be at "
             f"most {_MAX_EXACT_FLOAT32_INTEGER}."
         )
     return spec

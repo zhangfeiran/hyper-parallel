@@ -21,9 +21,10 @@ automatically computes task_num / split_dim for every node from their SplitSpec.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any
 
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
@@ -37,6 +38,9 @@ class OpType(Enum):
     TOPK_WEIGHT_GRAD = "topk_weight_grad"
     WEIGHTED_UNPERMUTE = "weighted_unpermute"
     REMOTE_WRITE_ACQUIRE = "remote_write_acquire"
+    LOCAL_COPY = "local_copy"
+    LOCAL_ACCUMULATE = "local_accumulate"
+    PHASE_BARRIER = "phase_barrier"
 
 
 @dataclass
@@ -71,9 +75,9 @@ class SplitSpec:
     task_num_fn
         Callable(tsv) -> int.  Returns task_num when the split condition holds.
     """
-    split_inputs:      Optional[List[Tuple[int, int]]]
+    split_inputs:      list[tuple[int, int]] | None
     task_num_fn:       Callable
-    split_output_dims: List[int] = field(default_factory=lambda: [0])
+    split_output_dims: list[int] = field(default_factory=lambda: [0])
 
 
 @dataclass
@@ -81,17 +85,17 @@ class OperatorNode:
     """A single operator node in the compute DAG."""
     name:            str
     op_type:         OpType
-    inputs:          List[TensorSpec]
-    outputs:         List[TensorSpec]
-    param_positions: List[int]
+    inputs:          list[TensorSpec]
+    outputs:         list[TensorSpec]
+    param_positions: list[int]
     split_value:     int
     split_spec:      SplitSpec
     tiling_position: int
     fill_config:     Any                       # FillConfig subclass instance
     kernel_spec:     Any = None                # reserved for @MultiCore decorator path
 
-    predecessors:    List['OperatorNode'] = field(default_factory=list)
-    successors:      List['OperatorNode'] = field(default_factory=list)
+    predecessors:    list[OperatorNode] = field(default_factory=list)
+    successors:      list[OperatorNode] = field(default_factory=list)
     task_num:        int = field(default=0, init=False)
 
 
@@ -103,8 +107,15 @@ class ComputeGraph:
         self._nodes: dict[str, OperatorNode] = {}
         self._insertion_order: list[str] = []
 
-    def add_op(self, op: OperatorNode) -> 'ComputeGraph':
-        """Add an operator node to the graph."""
+    def add_op(self, op: OperatorNode) -> ComputeGraph:
+        """Add an operator node to the graph.
+
+        Args:
+            op: Operator node to register.
+
+        Returns:
+            This graph for fluent construction.
+        """
         self._nodes[op.name] = op
         self._insertion_order.append(op.name)
         return self
@@ -113,8 +124,16 @@ class ComputeGraph:
         self,
         src: OperatorNode | str,
         dst: OperatorNode | str,
-    ) -> 'ComputeGraph':
-        """src / dst can be an OperatorNode or a name string."""
+    ) -> ComputeGraph:
+        """Connect two nodes by object or registered name.
+
+        Args:
+            src: Predecessor node or its registered name.
+            dst: Successor node or its registered name.
+
+        Returns:
+            This graph for fluent construction.
+        """
         s = src if isinstance(src, OperatorNode) else self._nodes[src]
         d = dst if isinstance(dst, OperatorNode) else self._nodes[dst]
         s.successors.append(d)
@@ -122,14 +141,28 @@ class ComputeGraph:
         return self
 
     def get_op(self, name: str) -> OperatorNode:
-        """Retrieve an operator node by name."""
+        """Retrieve an operator node by name.
+
+        Args:
+            name: Registered operator name.
+
+        Returns:
+            Matching operator node.
+        """
         return self._nodes[name]
 
     def has_op(self, name: str) -> bool:
-        """Return whether an operator node exists."""
+        """Return whether an operator node exists.
+
+        Args:
+            name: Registered operator name to query.
+
+        Returns:
+            Whether the graph contains ``name``.
+        """
         return name in self._nodes
 
-    def topological_sort(self) -> List[OperatorNode]:
+    def topological_sort(self) -> list[OperatorNode]:
         """Kahn's algorithm; insertion order used for tie-breaking."""
         in_deg = {n: len(op.predecessors) for n, op in self._nodes.items()}
         queue  = deque(n for n in self._insertion_order if in_deg[n] == 0)
@@ -151,6 +184,9 @@ class ComputeGraph:
 
         Must be called once after graph construction and before any fill loop.
         Resets all TensorSpec split annotations before traversal.
+
+        Args:
+            tsv: Scheduler dimensions used to resolve task counts.
         """
         for op in self._nodes.values():
             for t in op.inputs + op.outputs:

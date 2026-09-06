@@ -25,7 +25,7 @@ from hyper_parallel.platform.torch.symmetric_memory import (
     TorchSymmetricMemoryHandler,
     lifecycle,
 )
-from tests.torch.expert_parallel import _test_mega_moe as baseline
+from tests.torch.expert_parallel import _test_mega_moe_common as baseline
 from tests.torch.expert_parallel._mega_moe_utils import (
     assert_stable_memory,
     collect_memory,

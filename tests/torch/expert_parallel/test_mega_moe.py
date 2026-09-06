@@ -33,6 +33,7 @@ from tests.common.parallel_case import TorchCase, parallel_run
 from tests.common.port_utils import allocate_port
 
 _WORKER = str(Path(__file__).resolve().parent / "_test_mega_moe.py")
+_COMMON_WORKER = str(Path(__file__).resolve().parent / "_test_mega_moe_common.py")
 _PRECISION_WORLD_SIZE = 2
 _PERFORMANCE_WORLD_SIZE = 4
 
@@ -57,7 +58,7 @@ def _run_precision_worker(monkeypatch) -> None:
         parallel_run(
             [
                 TorchCase(
-                    _WORKER,
+                    _COMMON_WORKER,
                     "test_mega_moe_level0_balanced",
                     num_proc=_PRECISION_WORLD_SIZE,
                 )
@@ -92,7 +93,7 @@ def _run_performance_worker(monkeypatch, result_dir: Path) -> dict:
         parallel_run(
             [
                 TorchCase(
-                    _WORKER,
+                    _COMMON_WORKER,
                     "test_mega_moe_fwd_bwd_performance",
                     num_proc=_PERFORMANCE_WORLD_SIZE,
                 )
@@ -199,3 +200,348 @@ def test_mega_moe_default_interface(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     Expectation: Outputs and gradients agree; stable latency, peak memory and software identity are recorded.
     """
     _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_default_capacity_acceptance", 4)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_receive_capacity_fallback(monkeypatch) -> None:
+    """
+    Feature: kernel-internal multi-wave overflow precision
+    Description: compare a two-rank route above receive capacity with native MoE
+    Expectation: all forward and backward tensors satisfy tolerances
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_level0_capacity_fallback",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_non_power_of_two_topk_multi_wave(monkeypatch) -> None:
+    """
+    Feature: non-power-of-two route-slot decoding across waves
+    Description: execute an overflowing Top-K=3 route in two waves
+    Expectation: forward and backward tensors match native MoE
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_non_power_of_two_topk_multi_wave",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_hot_expert_replication(monkeypatch) -> None:
+    """
+    Feature: bounded hot-expert replication
+    Description: rebalance an overflowing route with one replica slot per rank
+    Expectation: one-wave output and owner-reduced gradients match native MoE
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_hot_expert_replication",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_replication_with_residual_multi_wave(monkeypatch) -> None:
+    """
+    Feature: bounded replication with residual multi-wave execution
+    Description: leave overflow after one replica slot and execute two waves
+    Expectation: output and owner-reduced gradients match native MoE
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_replication_with_residual_multi_wave",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_checkpointed_capacity_fallback(monkeypatch) -> None:
+    """
+    Feature: checkpointed one-wave and kernel-internal multi-wave execution
+    Description: replay balanced and overflowing routes with both checkpoint modes
+    Expectation: every W1/W2 output and backward tensor matches the native oracle
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_checkpointed_capacity_fallback",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_retained_graph_capacity_fallback(monkeypatch) -> None:
+    """
+    Feature: retained autograd graph with kernel-internal multi-wave execution
+    Description: execute backward twice from one overflowing forward graph
+    Expectation: both complete backward results match the native MoE oracle
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_retained_graph_capacity_fallback",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_retained_graph_one_wave(monkeypatch) -> None:
+    """
+    Feature: retained autograd graph with one-wave hidden redispatch
+    Description: execute backward twice from one balanced fused-route graph
+    Expectation: both complete backward results match the native MoE oracle
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_retained_graph_one_wave",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_deferred_backward_capacity_fallback(monkeypatch) -> None:
+    """
+    Feature: multiple live W1/W2 graphs sharing one MegaMoe workspace
+    Description: enqueue two forwards per wave count before either backward
+    Expectation: each W1/W2 forward and backward tensor matches its native oracle
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_deferred_backward_capacity_fallback",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_mixed_wave_replay(monkeypatch) -> None:
+    """
+    Feature: repeated kernel-internal multi-wave execution
+    Description: reuse one layer across one hundred W1-W2-W1-W4 sequences
+    Expectation: every forward and backward tensor matches native
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PERFORMANCE_WORLD_SIZE))
+    monkeypatch.setenv("HP_MEGA_MOE_MIXED_WAVE_REPETITIONS", "100")
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_mixed_wave_replay",
+                    num_proc=_PERFORMANCE_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PERFORMANCE_WORLD_SIZE,
+        )
+
+
+def _run_performance_backend(
+    monkeypatch,
+    result_dir: Path,
+    backend: str,
+    tag: str,
+    npu_port_range: str,
+) -> dict:
+    """Run one fresh eight-rank backend process and load its result."""
+    result_path = result_dir / f"{tag}.json"
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PERFORMANCE_WORLD_SIZE))
+    monkeypatch.setenv("HP_MEGA_MOE_PERF_BACKEND", backend)
+    monkeypatch.setenv("HP_MEGA_MOE_PERF_WARMUP", "5")
+    monkeypatch.setenv("HP_MEGA_MOE_PERF_MEASURED", "10")
+    monkeypatch.setenv("HP_MEGA_MOE_PERF_RESULT", str(result_path))
+    monkeypatch.setenv("HCCL_NPU_SOCKET_PORT_RANGE", npu_port_range)
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_fwd_bwd_performance",
+                    num_proc=_PERFORMANCE_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PERFORMANCE_WORLD_SIZE,
+        )
+    return json.loads(result_path.read_text(encoding="utf-8"))
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="unessential",
+)
+def test_mega_moe_extended_representative_performance(monkeypatch, tmp_path: Path) -> None:
+    """
+    Feature: representative MegaMoe performance baseline
+    Description: run native and MegaMoe forward-backward in separate eight-rank jobs
+    Expectation: both runs remain healthy and report positive comparable latency
+    """
+    _prepare_torch_multicore_test_environment()
+    specs = (
+        ("native", "native", "62000-62063"),
+        ("mega_moe", "mega_moe", "62100-62163"),
+    )
+    results = {
+        tag: _run_performance_backend(
+            monkeypatch,
+            tmp_path,
+            backend,
+            tag,
+            port_range,
+        )
+        for backend, tag, port_range in specs
+    }
+    reference = results["native"]
+    for tag, result in results.items():
+        assert result["shape"] == reference["shape"], (
+            f"performance shape drifted for {tag}: expected={reference['shape']}, got={result['shape']}"
+        )
+        assert result["topology"] == reference["topology"], (
+            f"performance topology drifted for {tag}: "
+            f"expected={reference['topology']}, got={result['topology']}"
+        )
+        assert result["device_healthy"], f"performance device health failed for {tag}: result={result}"
+        assert all(result["validation"].values()), (
+            f"performance validation failed for {tag}: validation={result['validation']}"
+        )
+
+    native_median = results["native"]["rank_max_fwd_bwd_ms"]["median"]
+    mega_median = results["mega_moe"]["rank_max_fwd_bwd_ms"]["median"]
+    assert native_median > 0.0, f"native median latency must be positive, got {native_median}."
+    assert mega_median > 0.0, f"MegaMoe median latency must be positive, got {mega_median}."
+    ratio = mega_median / native_median
+    print(
+        "MegaMoe representative A/B: "
+        f"native_ms={native_median}, mega_ms={mega_median}, ratio={ratio:.6f}"
+    )

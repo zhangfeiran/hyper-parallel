@@ -51,13 +51,14 @@ BwdReturn mega_moe_grad_npu(at::Tensor &dispatch_target,              // pos  0 
                             const at::Tensor &permute_src_index,      // pos 29
                             const at::Tensor &route_weight,           // pos 30
                             const at::Tensor &reduce_route_index,     // pos 31
-                            int64_t rank_id, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size) {
+                            int64_t rank_id, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size,
+                            int64_t receive_capacity, int64_t wave_count, int64_t cycle_profile) {
   EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeGrad, dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size,
                    hidden, hidden_dw, w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x, combine_target_off,
                    combine_src_off, combine_size, permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling,
                    w1_grad_tiling, w2_grad_tiling, swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
-                   runtime_config, all_event_counters, permute_src_index, route_weight, reduce_route_index, rank_id, ep,
-                   expert_num, hidden_size, seq_size);
+                   runtime_config, all_event_counters, permute_src_index, route_weight, reduce_route_index, rank_id,
+                   ep, expert_num, hidden_size, seq_size, receive_capacity, wave_count, cycle_profile);
   return BwdReturn(dispatch_target, hidden_dw, act_grad_y, grad_gate, gate_dx, grad_x, permute_out, gate_dw);
 }
 
@@ -78,7 +79,8 @@ BwdReturn mega_moe_grad_meta(at::Tensor &dispatch_target, const at::Tensor & /*d
                              const at::Tensor & /*runtime_config*/, const at::Tensor & /*all_event_counters*/,
                              const at::Tensor & /*permute_src_index*/, const at::Tensor & /*route_weight*/,
                              const at::Tensor & /*reduce_route_index*/, int64_t /*rank_id*/, int64_t /*ep*/,
-                             int64_t /*expert_num*/, int64_t /*hidden_size*/, int64_t /*seq_size*/) {
+                             int64_t /*expert_num*/, int64_t /*hidden_size*/, int64_t /*seq_size*/,
+                             int64_t /*receive_capacity*/, int64_t /*wave_count*/, int64_t /*cycle_profile*/) {
   return BwdReturn(dispatch_target, hidden_dw, act_grad_y, grad_gate, gate_dx, grad_x, permute_out, gate_dw);
 }
 

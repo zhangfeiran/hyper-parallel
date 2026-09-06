@@ -25,8 +25,12 @@ from typing import Any
 
 from hyper_parallel.core.multicore.scheduler.config import (
     EVENT_COUNTER_BYTES as _EVENT_COUNTER_BYTES,
-    ROUTE_ARRIVAL_STRIDE_BYTES as _ROUTE_ARRIVAL_STRIDE_BYTES,
+    NUM_WORKERS_CUBE,
+    READY_CACHE_LINE_BYTES,
     event_workspace_bytes,
+)
+from hyper_parallel.core.multicore.scheduler.config import (
+    ROUTE_ARRIVAL_STRIDE_BYTES as _ROUTE_ARRIVAL_STRIDE_BYTES,
 )
 
 from .spec import (
@@ -40,13 +44,87 @@ torch = import_module("torch")
 
 _GMM_WORKSPACE_BYTES = 32 * 1024 * 1024
 _SWIGLU_GRAD_WORKSPACE_BYTES = 16 * 1024 * 1024
+_CYCLE_PROFILE_STORAGE_BYTES = 4 * 1024
+_CYCLE_PROFILE_CATEGORIES = (
+    "descriptor_decode",
+    "dependency_wait",
+    "gmm",
+    "dispatch_dy",
+    "dispatch_hidden",
+    "combine",
+    "local_compute",
+    "synchronization",
+)
+_CYCLE_PROFILE_VALUES_PER_WORKER = len(_CYCLE_PROFILE_CATEGORIES)
+_CYCLE_PROFILE_WORKER_SLOTS = 2 * NUM_WORKERS_CUBE
+_CYCLE_PROFILE_BYTES = (
+    _CYCLE_PROFILE_WORKER_SLOTS
+    * _CYCLE_PROFILE_VALUES_PER_WORKER
+    * 8
+)
+_ROUTE_SIGNAL_ARENAS = 2
 _WORKSPACE_ALIGNMENT = 512
 _HEAP_GRANULARITY_BYTES = 64 * 1024 * 1024
+# Retain the private alias used by the workspace sizing tests.
+_READY_CACHE_LINE_BYTES = READY_CACHE_LINE_BYTES
+
+
+@dataclass(frozen=True)
+class _WeightGradScratchPlan:
+    """Whole-matrix placement shared conceptually with the device helper."""
+
+    retained_w1_experts: int
+    retained_w2_experts: int
+    tail_bytes: int
 
 
 def _round_up(value: int, granularity: int) -> int:
     """Round ``value`` up to a positive ``granularity``."""
     return (value + granularity - 1) // granularity * granularity
+
+
+def _plan_weight_grad_scratch(
+    *,
+    local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    element_size: int,
+    receive_capacity: int,
+) -> _WeightGradScratchPlan:
+    """Pack whole dW matrices into one dead retained up-projection window.
+
+    W1 is exactly twice W2 for the gated-MLP layout. Packing W1 first and W2
+    second therefore maximizes occupied prefix bytes without splitting a
+    matrix. Remaining W2 and W1 matrices retain deterministic tail order.
+    """
+    dimensions = (
+        local_experts,
+        hidden_size,
+        intermediate_size,
+        element_size,
+    )
+    if any(value <= 0 for value in dimensions):
+        raise ValueError("weight-gradient scratch dimensions must be positive.")
+    if receive_capacity < 0:
+        raise ValueError("receive_capacity cannot be negative.")
+
+    w1_matrix_bytes = (
+        hidden_size * 2 * intermediate_size * element_size
+    )
+    w2_matrix_bytes = hidden_size * intermediate_size * element_size
+    prefix_bytes = receive_capacity * 2 * intermediate_size * element_size
+    retained_w1_experts = min(local_experts, prefix_bytes // w1_matrix_bytes)
+    prefix_bytes -= retained_w1_experts * w1_matrix_bytes
+    retained_w2_experts = min(local_experts, prefix_bytes // w2_matrix_bytes)
+    tail_bytes = (
+        (local_experts - retained_w2_experts) * w2_matrix_bytes
+        + (local_experts - retained_w1_experts) * w1_matrix_bytes
+    )
+    return _WeightGradScratchPlan(
+        retained_w1_experts=retained_w1_experts,
+        retained_w2_experts=retained_w2_experts,
+        tail_bytes=tail_bytes,
+    )
 
 
 def _event_workspace_bytes(
@@ -64,10 +142,12 @@ def _event_workspace_bytes(
     tasks_per_expert = (
         local_num_tokens + dispatch_split - 1
     ) // dispatch_split
-    return (
-        standard_bytes
-        + num_experts * tasks_per_expert * _ROUTE_ARRIVAL_STRIDE_BYTES
+    route_arena_bytes = (
+        num_experts * tasks_per_expert * _ROUTE_ARRIVAL_STRIDE_BYTES
     )
+    # The first arena carries dispatch arrivals. The second carries the
+    # receiver's copy-complete acknowledgement before dY reuses that tile.
+    return standard_bytes + _ROUTE_SIGNAL_ARENAS * route_arena_bytes
 
 
 def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -> int:
@@ -86,19 +166,30 @@ def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -
         specification["top_k"],
         routed_slots,
     )
+    physical_num_experts = (
+        specification["num_experts"]
+        + specification["ep_size"]
+        * specification.get("replica_slots_per_rank", 0)
+    )
     forward_event_bytes = _event_workspace_bytes(
         ep_size=specification["ep_size"],
         local_num_tokens=local_tokens,
-        num_experts=specification["num_experts"],
+        num_experts=physical_num_experts,
         dispatch_split=_COMMUNICATION_SPLIT,
         fusion_mode=forward_mode,
+    )
+    backward_route_arrivals = any(
+        mode in {"permute", "both"}
+        for mode in (forward_mode, backward_mode)
     )
     backward_event_bytes = _event_workspace_bytes(
         ep_size=specification["ep_size"],
         local_num_tokens=local_tokens,
-        num_experts=specification["num_experts"],
+        num_experts=physical_num_experts,
         dispatch_split=_COMMUNICATION_SPLIT,
-        fusion_mode=backward_mode,
+        # Multi-wave W1 replay route-gathers a token-major forward input even
+        # when backward dY dispatch itself uses the legacy endpoint.
+        fusion_mode="permute" if backward_route_arrivals else backward_mode,
     )
     return (
         tensor_bytes
@@ -172,6 +263,7 @@ class MegaMoeWorkspace:
     completion_event: Any | None = None
     in_use: bool = False
     used: bool = False
+    routed_buffer_generation: int = 0
     forward_ready_initialized: bool = False
     backward_ready_initialized: bool = False
     forward_route_arrivals_enabled: bool = False
@@ -206,7 +298,9 @@ class MegaMoeWorkspace:
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
         self.forward_route_arrivals_enabled = spec.forward_permute_fused
-        self.backward_route_arrivals_enabled = spec.backward_permute_fused
+        self.backward_route_arrivals_enabled = (
+            spec.forward_permute_fused or spec.backward_permute_fused
+        )
         self.route_arrival_offset_bytes = (
             event_workspace_bytes(spec.ep_size)
             if (
@@ -218,16 +312,20 @@ class MegaMoeWorkspace:
         forward_event_bytes = _event_workspace_bytes(
             ep_size=spec.ep_size,
             local_num_tokens=spec.local_num_tokens,
-            num_experts=spec.num_experts,
+            num_experts=spec.physical_num_experts,
             dispatch_split=spec.dispatch_split,
             fusion_mode=spec.forward_fusion_mode,
         )
         backward_event_bytes = _event_workspace_bytes(
             ep_size=spec.ep_size,
             local_num_tokens=spec.local_num_tokens,
-            num_experts=spec.num_experts,
+            num_experts=spec.physical_num_experts,
             dispatch_split=spec.dispatch_split,
-            fusion_mode=spec.backward_fusion_mode,
+            fusion_mode=(
+                "permute"
+                if self.backward_route_arrivals_enabled
+                else spec.backward_fusion_mode
+            ),
         )
         try:
             self.expert_buffer = self.symmetric_memory.aligned_empty(
@@ -256,7 +354,7 @@ class MegaMoeWorkspace:
                 device=device,
             )
             self.swiglu_grad_workspace = torch.empty(
-                (_SWIGLU_GRAD_WORKSPACE_BYTES,),
+                (_SWIGLU_GRAD_WORKSPACE_BYTES + _CYCLE_PROFILE_STORAGE_BYTES,),
                 dtype=torch.uint8,
                 device=device,
             )
@@ -265,6 +363,79 @@ class MegaMoeWorkspace:
             self._free_symmetric_tensors()
             self._free_local_tensors()
             raise
+
+    def prepare_cycle_profile(self, *, enabled: bool) -> None:
+        """Clear the fixed diagnostic tail only for an instrumented launch."""
+        if not enabled:
+            return
+        workspace = self.swiglu_grad_workspace
+        if workspace is None:
+            raise RuntimeError("MegaMoe SwiGLU-grad workspace is not initialized.")
+        workspace.narrow(
+            0,
+            _SWIGLU_GRAD_WORKSPACE_BYTES,
+            _CYCLE_PROFILE_STORAGE_BYTES,
+        ).zero_()
+
+    def collect_cycle_profile(self, num_cube_cores: int) -> dict[str, Any]:
+        """Return counters from the last profiled backward.
+
+        Args:
+            num_cube_cores: Number of populated Cube and Vector worker slots.
+
+        Returns:
+            Per-core counters and aggregate sums and maxima.
+        """
+        if not 0 < num_cube_cores <= NUM_WORKERS_CUBE:
+            raise ValueError(
+                f"num_cube_cores must be in [1, {NUM_WORKERS_CUBE}], got "
+                f"{num_cube_cores}."
+            )
+        workspace = self.swiglu_grad_workspace
+        if workspace is None:
+            raise RuntimeError("MegaMoe SwiGLU-grad workspace is not initialized.")
+        values = (
+            workspace.narrow(
+                0,
+                _SWIGLU_GRAD_WORKSPACE_BYTES,
+                _CYCLE_PROFILE_BYTES,
+            )
+            .view(torch.int64)
+            .reshape(
+                _CYCLE_PROFILE_WORKER_SLOTS,
+                _CYCLE_PROFILE_VALUES_PER_WORKER,
+            )
+            .cpu()
+            .tolist()
+        )
+
+        def _summarize(rows: list[list[int]]) -> dict[str, Any]:
+            return {
+                "per_core": rows,
+                "sum": {
+                    category: sum(row[index] for row in rows)
+                    for index, category in enumerate(_CYCLE_PROFILE_CATEGORIES)
+                },
+                "max": {
+                    category: max(row[index] for row in rows)
+                    for index, category in enumerate(_CYCLE_PROFILE_CATEGORIES)
+                },
+            }
+
+        cube_rows = values[:num_cube_cores]
+        vector_rows = values[
+            NUM_WORKERS_CUBE : NUM_WORKERS_CUBE + num_cube_cores
+        ]
+        return {
+            "unit": "system_cycle",
+            "categories": list(_CYCLE_PROFILE_CATEGORIES),
+            "cube": _summarize(cube_rows),
+            "vector": _summarize(vector_rows),
+            "accounting": (
+                "worker categories are sequential within one core, but worker "
+                "maxima are diagnostic and are not additive wall time"
+            ),
+        }
 
     def prepare_event_counters(self, *, forward: bool) -> Any:
         """Reset per-call counters while preserving the ready generation."""
@@ -301,6 +472,72 @@ class MegaMoeWorkspace:
             if self.used:
                 torch.npu.current_stream(self.device).wait_event(self.completion_event)
 
+    def prepare_gmm_workspace(
+        self,
+        weight1: Any,
+        weight2: Any,
+        wave_count: int,
+        *,
+        receive_capacity: int,
+        reuse_retained_scratch: bool,
+        atomic_dw_accumulation: bool,
+    ) -> None:
+        """Size dW scratch only for calls that actually need accumulation.
+
+        A one-wave call writes both weight gradients directly and therefore
+        retains only the 32 MiB GMM workspace. Later waves write temporary dW
+        matrices into a model-shape-bounded tail before vector accumulation.
+
+        Args:
+            weight1: First expert weight tensor used to size dW1 scratch.
+            weight2: Second expert weight tensor used to size dW2 scratch.
+            wave_count: Number of kernel-internal communication waves.
+            receive_capacity: Fixed number of receive rows in each wave.
+            reuse_retained_scratch: Whether whole matrices may occupy the dead
+                first retained up-projection window.
+            atomic_dw_accumulation: Whether later waves atomically add into the
+                persistent dW outputs and therefore need no matrix scratch.
+        """
+
+        required_bytes = _GMM_WORKSPACE_BYTES
+        if wave_count > 1 and not atomic_dw_accumulation:
+            if reuse_retained_scratch:
+                if (
+                    weight1.dim() != 3
+                    or weight2.dim() != 3
+                    or weight1.shape[0] != weight2.shape[0]
+                    or weight1.shape[1] != weight2.shape[2]
+                    or weight1.shape[2] != 2 * weight2.shape[1]
+                    or weight1.element_size() != weight2.element_size()
+                ):
+                    raise ValueError(
+                        "retained dW scratch requires matching gated-MLP weights."
+                    )
+                plan = _plan_weight_grad_scratch(
+                    local_experts=weight1.shape[0],
+                    hidden_size=weight1.shape[1],
+                    intermediate_size=weight2.shape[1],
+                    element_size=weight1.element_size(),
+                    receive_capacity=receive_capacity,
+                )
+                required_bytes += plan.tail_bytes
+            else:
+                required_bytes += (
+                    weight1.numel() * weight1.element_size()
+                    + weight2.numel() * weight2.element_size()
+                )
+        if self.gmm_workspace is None or self.device is None:
+            raise RuntimeError("MegaMoe GMM workspace is not initialized.")
+        if self.gmm_workspace.numel() == required_bytes:
+            return
+        torch.npu.synchronize(self.device)
+        self.gmm_workspace.resize_(0)
+        self.gmm_workspace = torch.empty(
+            (required_bytes,),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+
     def claim(self) -> None:
         """Claim the serial workspace and order it after the previous stream."""
         with self.lock:
@@ -311,6 +548,16 @@ class MegaMoeWorkspace:
             if self.used:
                 torch.npu.current_stream().wait_event(self.completion_event)
             self.in_use = True
+
+    def mark_routed_buffer_write(self) -> int:
+        """Record one enqueued launch that changes the routed SHMEM buffer."""
+        with self.lock:
+            if not self.in_use:
+                raise RuntimeError(
+                    "MegaMoe routed-buffer writes require an active workspace lease."
+                )
+            self.routed_buffer_generation += 1
+            return self.routed_buffer_generation
 
     def release(self) -> None:
         """Record completion ordering and release the serial workspace lease."""

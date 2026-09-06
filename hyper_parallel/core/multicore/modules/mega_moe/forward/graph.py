@@ -275,9 +275,8 @@ def _append_remote_write_acquire(
         split_spec=SplitSpec(
             split_inputs=None,
             split_output_dims=[-1],
-            # One descriptor per active AIV is sufficient: every descriptor
-            # performs its acquire before publishing terminal completion.
-            task_num_fn=lambda _tsv: num_cube_cores,
+            # The static scheduler executes two acquire tasks on each active lane.
+            task_num_fn=lambda _tsv: 2 * num_cube_cores,
         ),
         tiling_position=-1,
         fill_config=WeightedUnpermuteFillConfig(
@@ -285,6 +284,7 @@ def _append_remote_write_acquire(
             trigger_event=tsv.all_event_num,
             top_k=0,
             acquire_remote_writes=True,
+            static_acquire_task_num=num_cube_cores,
         ),
     )
     combine.fill_config.trigger_event = tsv.all_event_num - 1
