@@ -158,6 +158,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--router-load-seed", type=int, default=42)
     parser.add_argument("--replica-slots-per-rank", type=int, default=0)
     parser.add_argument("--compact-physical-weights", action="store_true")
+    parser.add_argument(
+        "--compact-layout-strategy",
+        choices=("lazy_on_first_replica", "eager_on_first_forward"),
+        default="eager_on_first_forward",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--output",
@@ -733,6 +738,7 @@ def main(argv: list[str] | None = None) -> int:
         QwenMoeConfig(),
         replica_slots_per_rank=args.replica_slots_per_rank,
         compact_physical_weights=args.compact_physical_weights,
+        compact_layout_strategy=args.compact_layout_strategy,
         expert_capacity_factor=args.expert_capacity_factor,
         routing=args.routing,
         router_load_alpha=args.router_load_alpha,

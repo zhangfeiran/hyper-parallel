@@ -36,6 +36,11 @@ dist = import_module("torch.distributed")
 
 
 _PHYSICAL_WEIGHT_FUNCTION = None
+_HOME_WEIGHT_LEASE_FUNCTION = None
+_COMPACT_LAYOUT_STRATEGIES = frozenset(
+    {"lazy_on_first_replica", "eager_on_first_forward"}
+)
+_DEFAULT_COMPACT_LAYOUT_STRATEGY = "eager_on_first_forward"
 
 
 @dataclass(frozen=True)
@@ -223,6 +228,7 @@ class ExpertReplicaManager:
         pool_cache_size: int = 1,
         *,
         compact_physical_weights: bool = False,
+        compact_layout_strategy: str = _DEFAULT_COMPACT_LAYOUT_STRATEGY,
     ) -> None:
         """Initialize empty placement-generation state."""
         if spec.replica_slots_per_rank <= 0:
@@ -240,14 +246,26 @@ class ExpertReplicaManager:
                 "compact_physical_weights must be a bool, got "
                 f"{compact_physical_weights!r}."
             )
+        if (
+            not isinstance(compact_layout_strategy, str)
+            or compact_layout_strategy not in _COMPACT_LAYOUT_STRATEGIES
+        ):
+            expected = ", ".join(sorted(_COMPACT_LAYOUT_STRATEGIES))
+            raise ValueError(
+                "compact_layout_strategy must be one of "
+                f"{expected}, got {compact_layout_strategy!r}."
+            )
         self.spec = spec
         self._generation = 0
         self._slot_map: tuple[tuple[int, ...], ...] | None = None
         self._pool_cache_size = pool_cache_size
         self._compact_physical_weights = compact_physical_weights
+        self._compact_layout_strategy = compact_layout_strategy
         self._physical_pools: OrderedDict[
             tuple[int, int], _PhysicalWeightPool
         ] = OrderedDict()
+        self._compact_pools: dict[tuple[int, int], _PhysicalWeightPool] = {}
+        self._home_materializations: dict[tuple[int, int], tuple[Any, ...]] = {}
         self._shared_weights: tuple[Any, Any] | None = None
         self._shared_gradients: tuple[Any, Any] | None = None
         self._shared_runtime_configs: dict[tuple[int, bool], tuple[Any, Any]] = {}
@@ -437,6 +455,22 @@ class ExpertReplicaManager:
             weight2_version=int(getattr(weight2, "_version")),
         )
 
+    @staticmethod
+    def _unbound_cache_key(
+        weight1: Any,
+        weight2: Any,
+    ) -> _PhysicalWeightCacheKey:
+        """Describe compact storage prepared before a placement is selected."""
+        return _PhysicalWeightCacheKey(
+            slot_map=(),
+            weight1_identity=id(weight1),
+            weight1_data_ptr=weight1.data_ptr(),
+            weight1_version=int(getattr(weight1, "_version")),
+            weight2_identity=id(weight2),
+            weight2_data_ptr=weight2.data_ptr(),
+            weight2_version=int(getattr(weight2, "_version")),
+        )
+
     def _all_ranks_can_reuse(self, locally_reusable: bool, weight: Any) -> bool:
         """Require every EP rank to make the same cache/P2P protocol decision."""
         if self.spec.ep_size == 1:
@@ -460,6 +494,23 @@ class ExpertReplicaManager:
         """Identify one optimizer-owned expert parameter pair."""
         return id(weight1), id(weight2)
 
+    def _registered_compact_pool(
+        self,
+        weight1: Any,
+        weight2: Any,
+    ) -> _PhysicalWeightPool | None:
+        """Return compact storage that still backs this parameter pair."""
+        cache_id = self._pool_cache_id(weight1, weight2)
+        pool = self._compact_pools.get(cache_id)
+        if pool is None:
+            return None
+        if self._aliases_home_parameter_storage(pool, weight1, weight2):
+            return pool
+        self._compact_pools.pop(cache_id, None)
+        if self._physical_pools.get(cache_id) is pool:
+            self._physical_pools.pop(cache_id, None)
+        return None
+
     def _cached_pool(
         self,
         weight1: Any,
@@ -469,7 +520,10 @@ class ExpertReplicaManager:
         cache_id = self._pool_cache_id(weight1, weight2)
         pool = self._physical_pools.get(cache_id)
         if pool is None:
-            return None
+            pool = self._registered_compact_pool(weight1, weight2)
+            if pool is None:
+                return None
+            self._store_pool(pool)
         if (
             pool.home_weight1_ref() is not weight1
             or pool.home_weight2_ref() is not weight2
@@ -481,6 +535,8 @@ class ExpertReplicaManager:
 
     def _store_pool(self, pool: _PhysicalWeightPool) -> None:
         """Publish one pool and enforce the shared-layer cache bound."""
+        if pool.aliases_home:
+            self._compact_pools[pool.cache_id] = pool
         self._physical_pools[pool.cache_id] = pool
         self._physical_pools.move_to_end(pool.cache_id)
         while len(self._physical_pools) > self._pool_cache_size:
@@ -490,9 +546,13 @@ class ExpertReplicaManager:
         """Return whether the cache still maps this parameter pair to ``pool``."""
         return self._physical_pools.get(pool.cache_id) is pool
 
+    def _is_registered_compact_pool(self, pool: _PhysicalWeightPool) -> bool:
+        """Return whether ``pool`` remains the backing for its home parameters."""
+        return self._compact_pools.get(pool.cache_id) is pool
+
     def _mark_pool_ready(self, pool: _PhysicalWeightPool) -> None:
-        """Publish a completed pool only if it is still the current candidate."""
-        if self._is_current_pool(pool):
+        """Publish a completed cached or registered compact pool."""
+        if self._is_current_pool(pool) or self._is_registered_compact_pool(pool):
             if pool.aliases_home:
                 weight1 = pool.home_weight1_ref()
                 weight2 = pool.home_weight2_ref()
@@ -509,9 +569,25 @@ class ExpertReplicaManager:
             pool.ready = True
 
     def _invalidate_pool(self, pool: _PhysicalWeightPool) -> None:
-        """Drop a failed current pool without disturbing an intervening generation."""
+        """Invalidate a failed generation without discarding attached storage."""
         if self._is_current_pool(pool):
             self._physical_pools.pop(pool.cache_id)
+        if not self._is_registered_compact_pool(pool):
+            return
+        weight1 = pool.home_weight1_ref()
+        weight2 = pool.home_weight2_ref()
+        if (
+            weight1 is None
+            or weight2 is None
+            or not self._aliases_home_parameter_storage(pool, weight1, weight2)
+        ):
+            self._compact_pools.pop(pool.cache_id, None)
+            return
+        # The Parameter cannot be rebound safely to its previous allocation.
+        # Keep the attached suffix, but force the next placement to repopulate
+        # it instead of treating a partially completed transfer as reusable.
+        pool.key = self._unbound_cache_key(weight1, weight2)
+        pool.ready = True
 
     @staticmethod
     def _track_materialization(
@@ -527,6 +603,97 @@ class ExpertReplicaManager:
         pool.materializations = live_materializations + tuple(
             weakref.ref(weight) for weight in physical_weights
         )
+
+    def _has_live_home_materializations(
+        self,
+        weight1: Any,
+        weight2: Any,
+    ) -> bool:
+        """Return whether an unfinished home graph still reads these parameters."""
+        cache_id = self._pool_cache_id(weight1, weight2)
+        materializations = tuple(
+            reference
+            for reference in self._home_materializations.get(cache_id, ())
+            if reference() is not None
+        )
+        if materializations:
+            self._home_materializations[cache_id] = materializations
+        else:
+            self._home_materializations.pop(cache_id, None)
+        return bool(materializations)
+
+    def _track_home_materialization(
+        self,
+        weight1: Any,
+        weight2: Any,
+        materialized_weights: tuple[Any, Any],
+    ) -> None:
+        """Retain weak leases until the corresponding home graph is released."""
+        cache_id = self._pool_cache_id(weight1, weight2)
+        live_materializations = tuple(
+            reference
+            for reference in self._home_materializations.get(cache_id, ())
+            if reference() is not None
+        )
+        self._home_materializations[cache_id] = live_materializations + tuple(
+            weakref.ref(weight) for weight in materialized_weights
+        )
+
+    def prepare_for_forward(self, weight1: Any, weight2: Any) -> None:
+        """Prepare eager compact storage before a forward graph can save weights.
+
+        Args:
+            weight1: Rank-local optimizer-owned gate/up weights.
+            weight2: Rank-local optimizer-owned down-projection weights.
+        """
+        if (
+            not self._compact_physical_weights
+            or self._compact_layout_strategy != "eager_on_first_forward"
+        ):
+            return
+        self._validate_home_weights(weight1, weight2)
+        if self._registered_compact_pool(weight1, weight2) is not None:
+            return
+        # A direct manager caller may switch policy after creating a home graph.
+        # Falling back to the lazy safety path is preferable to invalidating it.
+        if self._has_live_home_materializations(weight1, weight2):
+            return
+        pool = self._allocate_compact_pool(None, weight1, weight2)
+        pool.ready = True
+        self._store_pool(pool)
+
+    def materialize_home_weights(
+        self,
+        weight1: Any,
+        weight2: Any,
+    ) -> tuple[Any, Any]:
+        """Expose home weights while tracking graphs that forbid a later rebind.
+
+        Args:
+            weight1: Rank-local optimizer-owned gate/up weights.
+            weight2: Rank-local optimizer-owned down-projection weights.
+
+        Returns:
+            Autograd-bound home weights, or the original parameters once compact
+            storage has already been prepared.
+        """
+        if not self._compact_physical_weights:
+            return weight1, weight2
+        self._validate_home_weights(weight1, weight2)
+        if self._registered_compact_pool(weight1, weight2) is not None:
+            return weight1, weight2
+        if not torch.is_grad_enabled() or not (
+            weight1.requires_grad or weight2.requires_grad
+        ):
+            return weight1, weight2
+        function = _get_home_weight_lease_function()
+        materialized_weights = function.apply(weight1, weight2)
+        self._track_home_materialization(
+            weight1,
+            weight2,
+            materialized_weights,
+        )
+        return materialized_weights
 
     @staticmethod
     def _aliases_home_parameter_storage(
@@ -572,7 +739,7 @@ class ExpertReplicaManager:
 
     def _allocate_compact_pool(
         self,
-        plan: ExpertPlacementPlan,
+        plan: ExpertPlacementPlan | None,
         weight1: Any,
         weight2: Any,
     ) -> _PhysicalWeightPool:
@@ -601,7 +768,11 @@ class ExpertReplicaManager:
         physical_weight1 = weight1.detach().as_strided(shape1, backing_weight1.stride())
         physical_weight2 = weight2.detach().as_strided(shape2, backing_weight2.stride())
         return _PhysicalWeightPool(
-            key=self._cache_key(plan, weight1, weight2),
+            key=(
+                self._cache_key(plan, weight1, weight2)
+                if plan is not None
+                else self._unbound_cache_key(weight1, weight2)
+            ),
             cache_id=self._pool_cache_id(weight1, weight2),
             home_weight1_ref=weakref.ref(weight1),
             home_weight2_ref=weakref.ref(weight2),
@@ -743,6 +914,16 @@ class ExpertReplicaManager:
         store_pool = True
         if pool is not None and self._can_refresh_pool(pool, weight1, weight2):
             self._refresh_pool(pool, key, weight1, weight2)
+        elif (
+            pool is None
+            and self._compact_physical_weights
+            and self._has_live_home_materializations(weight1, weight2)
+        ):
+            # A home-only graph saved the original Parameter storage before the
+            # first replica placement. Its physical generation must use an
+            # isolated pool so compact ``set_`` cannot invalidate that graph.
+            pool = self._allocate_snapshot_pool(plan, weight1, weight2)
+            store_pool = False
         elif pool is not None and self._aliases_home_parameter_storage(
             pool,
             weight1,
@@ -922,6 +1103,40 @@ class ExpertReplicaManager:
                     accumulator.add_(contribution[weight_index])
                 home.copy_(accumulator)
         return home_grad_weight1, home_grad_weight2
+
+
+def _get_home_weight_lease_function() -> Any:
+    """Create the lazy-layout home-weight autograd bridge."""
+    # pylint: disable=global-statement
+    global _HOME_WEIGHT_LEASE_FUNCTION
+    if _HOME_WEIGHT_LEASE_FUNCTION is not None:
+        return _HOME_WEIGHT_LEASE_FUNCTION
+
+    class _HomeWeightLeaseFunction(  # pylint: disable=abstract-method
+        torch.autograd.Function
+    ):
+        """Keep a weakly observable tensor alive while a home graph needs it."""
+
+        @staticmethod
+        def forward(
+            _ctx: Any,
+            home_weight1: Any,
+            home_weight2: Any,
+        ) -> tuple[Any, Any]:
+            """Return distinct wrappers sharing the home parameter storage."""
+            return home_weight1.detach(), home_weight2.detach()
+
+        @staticmethod
+        def backward(
+            _ctx: Any,
+            grad_weight1: Any,
+            grad_weight2: Any,
+        ) -> tuple[Any, Any]:
+            """Pass home gradients back to the optimizer-owned parameters."""
+            return grad_weight1, grad_weight2
+
+    _HOME_WEIGHT_LEASE_FUNCTION = _HomeWeightLeaseFunction
+    return _HOME_WEIGHT_LEASE_FUNCTION
 
 
 def _get_physical_weight_function() -> Any:

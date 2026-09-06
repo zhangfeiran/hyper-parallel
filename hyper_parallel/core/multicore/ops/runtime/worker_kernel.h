@@ -903,7 +903,9 @@ class KernelWorkerBase {
     // Keep the release counter separate from wave/hidden-dispatch readiness;
     // the persistent dissemination generation still advances on every rank.
     reuse_meta.ready_event += 1;
-    if (this->worker_id_ == 1) {
+    // The first Combine tile always exists, while a fixed worker may receive
+    // no Combine tile for small schedules.
+    if (task_desc.task_index == 0) {
       PublishDeviceReady(reuse_meta);
     }
     WaitForEventCount(reuse_meta.ready_event, 1);

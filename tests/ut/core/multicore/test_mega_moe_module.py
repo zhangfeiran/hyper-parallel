@@ -107,6 +107,7 @@ print(json.dumps({
                     "replica_slots_per_rank": 0,
                     "compact_physical_weights": False,
                     "shared_physical_weights": False,
+                    "compact_layout_strategy": "eager_on_first_forward",
                     "ep_size": 2,
                     "ep_group": None,
                 },
@@ -387,6 +388,35 @@ print(json.dumps({
         mock_create_parameters.assert_not_called()
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_constructor_validates_compact_layout_strategy(self, mock_create_parameters):
+        """Reject unknown compact-layout timing policies.
+
+        Feature: compact physical-weight layout timing.
+        Description: Try unsupported string and non-string strategy values.
+        Expectation: Every invalid selector fails before parameter allocation.
+        """
+        mock_create_parameters.return_value = (object(), object())
+
+        for compact_layout_strategy in ("first_use", 1, None):
+            with (
+                self.subTest(compact_layout_strategy=compact_layout_strategy),
+                self.assertRaisesRegex(ValueError, "compact_layout_strategy"),
+            ):
+                MegaMoeExperts(
+                    local_num_tokens=128,
+                    hidden_size=16,
+                    intermediate_size=8,
+                    num_experts=4,
+                    top_k=2,
+                    replica_slots_per_rank=1,
+                    compact_physical_weights=True,
+                    compact_layout_strategy=compact_layout_strategy,
+                    ep_size=2,
+                )
+
+        mock_create_parameters.assert_not_called()
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_compact_mode_participates_in_resource_compatibility(
         self,
         mock_create_parameters,
@@ -420,6 +450,43 @@ print(json.dumps({
 
         with self.assertRaisesRegex(ValueError, "identical configuration"):
             MegaMoeExperts.share_execution_resources((snapshot_layer, compact_layer))
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_compact_layout_strategy_participates_in_resource_compatibility(
+        self,
+        mock_create_parameters,
+    ):
+        """Keep incompatible compact-layout timing in separate resource groups.
+
+        Feature: compact physical-weight resource compatibility.
+        Description: Combine eager and lazy compact modules.
+        Expectation: Resource sharing rejects the incompatible storage timing.
+        """
+        mock_create_parameters.return_value = (object(), object())
+        eager_layer = MegaMoeExperts(
+            local_num_tokens=128,
+            hidden_size=16,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            replica_slots_per_rank=1,
+            compact_physical_weights=True,
+            ep_size=2,
+        )
+        lazy_layer = MegaMoeExperts(
+            local_num_tokens=128,
+            hidden_size=16,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            replica_slots_per_rank=1,
+            compact_physical_weights=True,
+            compact_layout_strategy="lazy_on_first_replica",
+            ep_size=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "identical configuration"):
+            MegaMoeExperts.share_execution_resources((eager_layer, lazy_layer))
 
 
 if __name__ == "__main__":

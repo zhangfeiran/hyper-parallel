@@ -68,6 +68,7 @@ class _MegaMoeExecutionResources:
         pool_cache_size: int = 1,
         compact_physical_weights: bool = False,
         shared_physical_weights: bool = False,
+        compact_layout_strategy: str = "eager_on_first_forward",
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
@@ -91,6 +92,7 @@ class _MegaMoeExecutionResources:
             ExpertReplicaManager(
                 self.spec, pool_cache_size=pool_cache_size,
                 compact_physical_weights=compact_physical_weights,
+                compact_layout_strategy=compact_layout_strategy,
             ) if self.spec.replica_slots_per_rank else None
         )
         self._closed = False
@@ -104,6 +106,10 @@ class _MegaMoeExecutionResources:
             self.workspace.close()
         finally:
             self.symmetric_memory.close()
+
+_COMPACT_LAYOUT_STRATEGIES = frozenset(
+    {"lazy_on_first_replica", "eager_on_first_forward"}
+)
 
 
 class MegaMoeExperts(MulticoreModule):
@@ -126,6 +132,7 @@ class MegaMoeExperts(MulticoreModule):
         replica_slots_per_rank: int = 0,
         compact_physical_weights: bool = False,
         shared_physical_weights: bool = False,
+        compact_layout_strategy: str = "eager_on_first_forward",
         ep_size: int = 1,
         ep_group: Any | None = None,
     ) -> None:
@@ -146,9 +153,11 @@ class MegaMoeExperts(MulticoreModule):
             compact_physical_weights: Store replica suffixes in spare storage
                 attached to home parameters instead of snapshotting home rows.
                 This reduces HBM under the standard contract that parameters
-                are not modified between their forward and backward. The first
-                active placement may rebind parameter storage, so callers must
-                not retain raw storage aliases across that boundary.
+                are not modified between their forward and backward.
+            compact_layout_strategy: Choose whether compact storage is prepared
+                before the first forward graph, or delayed until the first
+                replica placement without a live home-only graph. Eager layout
+                is the default and keeps parameter storage stable after first use.
             shared_physical_weights: Experimental B-slot replica weight and
                 gradient pools shared by execution-resource group members.
                 Kernels read home parameters directly and prefetch only replicas
@@ -170,6 +179,7 @@ class MegaMoeExperts(MulticoreModule):
             replica_slots_per_rank=replica_slots_per_rank,
             compact_physical_weights=compact_physical_weights,
             shared_physical_weights=shared_physical_weights,
+            compact_layout_strategy=compact_layout_strategy,
             ep_size=ep_size,
         )
         if expert_capacity_factor is not None:
@@ -184,6 +194,7 @@ class MegaMoeExperts(MulticoreModule):
             "replica_slots_per_rank": replica_slots_per_rank,
             "compact_physical_weights": compact_physical_weights,
             "shared_physical_weights": shared_physical_weights,
+            "compact_layout_strategy": compact_layout_strategy,
             "ep_size": ep_size,
             "ep_group": ep_group,
         }
@@ -197,6 +208,7 @@ class MegaMoeExperts(MulticoreModule):
             replica_slots_per_rank,
             compact_physical_weights,
             shared_physical_weights,
+            compact_layout_strategy,
             ep_size,
             id(ep_group),
         )
@@ -214,6 +226,7 @@ class MegaMoeExperts(MulticoreModule):
         self.replica_slots_per_rank = replica_slots_per_rank
         self.compact_physical_weights = compact_physical_weights
         self.shared_physical_weights = shared_physical_weights
+        self.compact_layout_strategy = compact_layout_strategy
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
@@ -228,6 +241,7 @@ class MegaMoeExperts(MulticoreModule):
         replica_slots_per_rank: int,
         compact_physical_weights: bool,
         shared_physical_weights: bool,
+        compact_layout_strategy: str,
     ) -> None:
         """Validate public physical-weight storage controls."""
         if (
@@ -250,6 +264,15 @@ class MegaMoeExperts(MulticoreModule):
             raise ValueError(
                 "shared_physical_weights requires replica slots and excludes compact_physical_weights."
             )
+        if (
+            not isinstance(compact_layout_strategy, str)
+            or compact_layout_strategy not in _COMPACT_LAYOUT_STRATEGIES
+        ):
+            expected = ", ".join(sorted(_COMPACT_LAYOUT_STRATEGIES))
+            raise ValueError(
+                "compact_layout_strategy must be one of "
+                f"{expected}, got {compact_layout_strategy!r}."
+            )
 
     @staticmethod
     def _validate_topology(
@@ -263,6 +286,7 @@ class MegaMoeExperts(MulticoreModule):
         replica_slots_per_rank: int,
         compact_physical_weights: bool,
         shared_physical_weights: bool,
+        compact_layout_strategy: str,
         ep_size: int,
     ) -> None:
         """Validate static shape and topology values before allocation."""
@@ -289,6 +313,7 @@ class MegaMoeExperts(MulticoreModule):
             replica_slots_per_rank,
             compact_physical_weights,
             shared_physical_weights,
+            compact_layout_strategy,
         )
         if local_num_tokens % _COMMUNICATION_SPLIT:
             raise ValueError(
@@ -418,6 +443,8 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
         )
         resources = self._get_execution_resources(hidden_flat)
+        if resources.replica_manager is not None:
+            resources.replica_manager.prepare_for_forward(self.gate_up_weight, self.down_weight)
         route_weights = topk_weights.float().contiguous()
         route_ids = topk_ids.to(torch.int32).contiguous()
         route_options: dict[str, Any] = {"workspace": resources.workspace}
@@ -448,6 +475,8 @@ class MegaMoeExperts(MulticoreModule):
             **route_options,
         )
         shared_lease = None
+        execution_weight1 = self.gate_up_weight
+        execution_weight2 = self.down_weight
         if route.placement is not None:
             if resources.replica_manager is None:
                 raise RuntimeError("MegaMoe route produced an unexpected replica placement.")
@@ -456,13 +485,17 @@ class MegaMoeExperts(MulticoreModule):
                 raise RuntimeError("MegaMoe replica placement did not prefetch weights.")
             if isinstance(pending_weights, SharedExpertWeightLease):
                 shared_lease = pending_weights
+        elif resources.replica_manager is not None:
+            execution_weight1, execution_weight2 = (
+                resources.replica_manager.materialize_home_weights(self.gate_up_weight, self.down_weight)
+            )
         try:
             output = execute_mega_moe(
                 hidden_flat,
                 route.physical_topk_ids,
                 route_weights,
-                self.gate_up_weight,
-                self.down_weight,
+                execution_weight1,
+                execution_weight2,
                 route,
                 route.plan,
                 resources.workspace,
@@ -488,4 +521,5 @@ class MegaMoeExperts(MulticoreModule):
             pool_cache_size=len(self._resource_group.members),
             compact_physical_weights=self.compact_physical_weights,
             shared_physical_weights=self.shared_physical_weights,
+            compact_layout_strategy=self.compact_layout_strategy,
         )

@@ -15,6 +15,7 @@
 """Unit tests for bounded Torch expert weight replicas."""
 
 import gc
+import io
 import struct
 import unittest
 from dataclasses import replace
@@ -23,6 +24,7 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.core.multicore.modules.mega_moe.placement import (
     build_constrained_expert_placement,
@@ -476,6 +478,199 @@ class TestExpertReplicaManager(unittest.TestCase):
         )
         self.assertEqual(mock_launch.call_count, 3)
 
+    def test_eager_layout_rebinds_before_first_graph_and_stays_stable(self):
+        """Prepare compact backing before either home or replica autograd use.
+
+        Feature: eager compact-layout strategy
+        Description: Construct an optimizer, prepare storage, then overlap home and replica graphs
+        Expectation: Both backwards succeed and optimizer state owns only home rows
+        """
+        manager = ExpertReplicaManager(
+            self._config(rank_id=0),
+            compact_physical_weights=True,
+        )
+        plan = self._hot_expert_zero_plan()
+        weight1 = torch.nn.Parameter(torch.ones((2, 2, 2)))
+        weight2 = torch.nn.Parameter(torch.ones((2, 1, 2)))
+        optimizer = torch.optim.AdamW((weight1, weight2), lr=0.01)
+        weight1.grad = torch.ones_like(weight1)
+        weight2.grad = torch.ones_like(weight2)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        original_pointers = weight1.data_ptr(), weight2.data_ptr()
+
+        manager.prepare_for_forward(weight1, weight2)
+        prepared_pointers = weight1.data_ptr(), weight2.data_ptr()
+        alias_weight1 = weight1.detach()  # pylint: disable=not-callable
+        alias_weight2 = weight2.detach()  # pylint: disable=not-callable
+        home_weight1, home_weight2 = manager.materialize_home_weights(
+            weight1,
+            weight2,
+        )
+        home_loss = home_weight1.square().sum() + home_weight2.square().sum()
+
+        with patch.object(replica_module, "_launch_transfers", return_value=()):
+            physical_weight1, physical_weight2 = manager.start_prefetch(
+                weight1,
+                weight2,
+                plan,
+            ).wait()
+            replica_loss = (
+                physical_weight1[:2].square().sum()
+                + physical_weight2[:2].square().sum()
+            )
+            home_loss.backward()
+            replica_loss.backward()
+            optimizer.step()
+
+        self.assertNotEqual(prepared_pointers, original_pointers)
+        self.assertEqual(
+            (physical_weight1.data_ptr(), physical_weight2.data_ptr()),
+            prepared_pointers,
+        )
+        self.assertEqual(alias_weight1.data_ptr(), weight1.data_ptr())
+        self.assertEqual(alias_weight2.data_ptr(), weight2.data_ptr())
+        self.assertTrue(torch.equal(alias_weight1, weight1))
+        self.assertTrue(torch.equal(alias_weight2, weight2))
+        self.assertEqual(tuple(optimizer.state[weight1]["exp_avg"].shape), tuple(weight1.shape))
+        self.assertEqual(tuple(optimizer.state[weight2]["exp_avg"].shape), tuple(weight2.shape))
+
+    def test_lazy_layout_snapshots_first_replica_while_home_graph_is_live(self):
+        """Avoid rebinding storage retained by an unfinished home-only graph.
+
+        Feature: lazy compact-layout transition safety
+        Description: Run home forward A, replica forward B, then backward A and B
+        Expectation: B uses a snapshot and compact storage starts only after A releases
+        """
+        manager = ExpertReplicaManager(
+            self._config(rank_id=1),
+            compact_physical_weights=True,
+            compact_layout_strategy="lazy_on_first_replica",
+        )
+        plan = self._hot_expert_zero_plan()
+        weight1 = torch.nn.Parameter(torch.ones((2, 2, 2)))
+        weight2 = torch.nn.Parameter(torch.ones((2, 1, 2)))
+        original_pointers = weight1.data_ptr(), weight2.data_ptr()
+        home_weight1, home_weight2 = manager.materialize_home_weights(
+            weight1,
+            weight2,
+        )
+        home_loss = home_weight1.square().sum() + home_weight2.square().sum()
+        del home_weight1, home_weight2
+        gc.collect()
+
+        with patch.object(replica_module, "_launch_transfers", return_value=()):
+            physical_weight1, physical_weight2 = manager.start_prefetch(
+                weight1,
+                weight2,
+                plan,
+            ).wait()
+            replica_loss = (
+                physical_weight1[:2].square().sum()
+                + physical_weight2[:2].square().sum()
+            )
+
+            self.assertEqual((weight1.data_ptr(), weight2.data_ptr()), original_pointers)
+            self.assertNotEqual(physical_weight1.data_ptr(), weight1.data_ptr())
+            self.assertNotEqual(physical_weight2.data_ptr(), weight2.data_ptr())
+            home_loss.backward()
+            replica_loss.backward()
+            del physical_weight1, physical_weight2
+            gc.collect()
+
+            compact_weight1, compact_weight2 = manager.start_prefetch(
+                weight1,
+                weight2,
+                plan,
+            ).wait()
+
+        self.assertNotEqual((weight1.data_ptr(), weight2.data_ptr()), original_pointers)
+        self.assertEqual(compact_weight1.data_ptr(), weight1.data_ptr())
+        self.assertEqual(compact_weight2.data_ptr(), weight2.data_ptr())
+
+    def test_eager_compact_storage_preserves_state_dict_checkpoint_shape(self):
+        """Round-trip only optimizer-owned home rows through a checkpoint.
+
+        Feature: compact storage checkpoint compatibility
+        Description: Save, mutate, and restore parameters after eager layout
+        Expectation: Logical shapes and backing pointers survive the round trip
+        """
+        manager = ExpertReplicaManager(
+            self._config(rank_id=0),
+            compact_physical_weights=True,
+        )
+        module = torch.nn.Module()
+        module.weight1 = torch.nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(2, 2, 2))
+        module.weight2 = torch.nn.Parameter(torch.arange(4, dtype=torch.float32).reshape(2, 1, 2))
+        manager.prepare_for_forward(module.weight1, module.weight2)
+        prepared_pointers = module.weight1.data_ptr(), module.weight2.data_ptr()
+        checkpoint_buffer = io.BytesIO()
+        torch.save(module.state_dict(), checkpoint_buffer)
+        checkpoint_buffer.seek(0)
+        checkpoint_state = torch.load(checkpoint_buffer, weights_only=True)
+
+        with torch.no_grad():
+            module.weight1.add_(10.0)
+            module.weight2.add_(20.0)
+        module.load_state_dict(checkpoint_state)
+
+        self.assertEqual(tuple(module.weight1.shape), (2, 2, 2))
+        self.assertEqual(tuple(module.weight2.shape), (2, 1, 2))
+        self.assertEqual(
+            (module.weight1.data_ptr(), module.weight2.data_ptr()),
+            prepared_pointers,
+        )
+        self.assertTrue(torch.equal(module.weight1, checkpoint_state["weight1"]))
+        self.assertTrue(torch.equal(module.weight2, checkpoint_state["weight2"]))
+
+    def test_lazy_layout_transition_composes_with_activation_checkpoint(self):
+        """Keep checkpoint recomputation valid across first replica placement.
+
+        Feature: lazy compact layout with activation checkpoint
+        Description: Trigger first replica placement between checkpoint forward and backward
+        Expectation: Reentrant and non-reentrant checkpoint backwards both succeed
+        """
+        for use_reentrant in (True, False):
+            with self.subTest(use_reentrant=use_reentrant):
+                manager = ExpertReplicaManager(
+                    self._config(rank_id=0),
+                    compact_physical_weights=True,
+                    compact_layout_strategy="lazy_on_first_replica",
+                )
+                weight1 = torch.nn.Parameter(torch.ones((2, 2, 2)))
+                weight2 = torch.nn.Parameter(torch.ones((2, 1, 2)))
+                hidden = torch.ones((), requires_grad=True)
+
+                def home_forward(
+                    value: torch.Tensor,
+                    bound_manager: ExpertReplicaManager = manager,
+                    bound_weight1: torch.Tensor = weight1,
+                    bound_weight2: torch.Tensor = weight2,
+                ) -> torch.Tensor:
+                    """Build a checkpointed home-only graph through tracked weights."""
+                    home_weight1, home_weight2 = bound_manager.materialize_home_weights(
+                        bound_weight1,
+                        bound_weight2,
+                    )
+                    return value * (home_weight1.square().sum() + home_weight2.square().sum())
+
+                loss = checkpoint(
+                    home_forward,
+                    hidden,
+                    use_reentrant=use_reentrant,
+                )
+                with patch.object(replica_module, "_launch_transfers", return_value=()):
+                    manager.start_prefetch(
+                        weight1,
+                        weight2,
+                        self._hot_expert_zero_plan(),
+                    ).drain()
+                loss.backward()
+
+                self.assertIsNotNone(hidden.grad)
+                self.assertIsNotNone(weight1.grad)
+                self.assertIsNotNone(weight2.grad)
+
     def test_compact_pool_detects_parameter_mutation_before_backward(self):
         """Fail closed when compact aliased weights change under a live graph.
 
@@ -607,6 +802,90 @@ class TestExpertReplicaManager(unittest.TestCase):
         self.assertEqual(
             tuple(weight.data_ptr() for weight in first_physical),
             tuple(weight.data_ptr() for weight in reused_physical),
+        )
+
+    def test_eager_compact_pool_survives_lru_eviction_during_prefetch(self):
+        """Retain compact backing independently from the bounded ready-pool LRU.
+
+        Feature: eager compact storage with shared-layer cache pressure
+        Description: Evict one layer while its first replica transfer is pending
+        Expectation: Completion publishes its backing and a revisit reuses it
+        """
+        manager = ExpertReplicaManager(
+            self._config(rank_id=0),
+            pool_cache_size=1,
+            compact_physical_weights=True,
+        )
+        plan = self._hot_expert_zero_plan()
+        first_weights = (
+            torch.ones((2, 2, 2), requires_grad=True),
+            torch.ones((2, 1, 2), requires_grad=True),
+        )
+        second_weights = tuple(
+            torch.full_like(weight, 2.0, requires_grad=True)
+            for weight in first_weights
+        )
+        manager.prepare_for_forward(*first_weights)
+        first_pointers = tuple(weight.data_ptr() for weight in first_weights)
+
+        with patch.object(
+            replica_module,
+            "_launch_transfers",
+            return_value=(),
+        ) as mock_launch:
+            pending = manager.start_prefetch(*first_weights, plan)
+            manager.prepare_for_forward(*second_weights)
+            first_physical = pending.wait()
+            del first_physical
+            gc.collect()
+            reused_physical = manager.start_prefetch(*first_weights, plan).wait()
+
+        self.assertEqual(mock_launch.call_count, 1)
+        self.assertEqual(
+            tuple(weight.data_ptr() for weight in reused_physical),
+            first_pointers,
+        )
+
+    def test_failed_compact_prefetch_retries_in_attached_storage(self):
+        """Recover a compact pool after an asynchronous transfer failure.
+
+        Feature: compact storage transfer retry
+        Description: Fail the first pending wait and retry the same placement
+        Expectation: The retry repopulates the already attached suffix storage
+        """
+        manager = ExpertReplicaManager(
+            self._config(rank_id=0),
+            compact_physical_weights=True,
+        )
+        plan = self._hot_expert_zero_plan()
+        weights = (
+            torch.ones((2, 2, 2), requires_grad=True),
+            torch.ones((2, 1, 2), requires_grad=True),
+        )
+        manager.prepare_for_forward(*weights)
+        compact_pointers = tuple(weight.data_ptr() for weight in weights)
+
+        class _FailedHandle:
+            """Raise one deterministic asynchronous transfer failure."""
+
+            @staticmethod
+            def wait() -> None:
+                """Fail transfer completion."""
+                raise RuntimeError("transfer failed")
+
+        with patch.object(
+            replica_module,
+            "_launch_transfers",
+            side_effect=((_FailedHandle(),), ()),
+        ) as mock_launch:
+            with self.assertRaisesRegex(RuntimeError, "transfer failed"):
+                manager.start_prefetch(*weights, plan).wait()
+            physical_weights = manager.start_prefetch(*weights, plan).wait()
+
+        self.assertEqual(mock_launch.call_count, 2)
+        self.assertEqual(
+            tuple(weight.data_ptr() for weight in physical_weights),
+            compact_pointers,
         )
 
     def test_pool_cache_size_must_be_positive(self):
@@ -831,6 +1110,24 @@ class TestExpertReplicaManager(unittest.TestCase):
                 ExpertReplicaManager(
                     self._config(rank_id=0),
                     compact_physical_weights=compact_physical_weights,
+                )
+
+    def test_compact_layout_strategy_must_be_supported(self):
+        """Reject unknown compact-layout timing policies.
+
+        Feature: compact-layout strategy validation
+        Description: Construct managers with invalid strategy selectors
+        Expectation: Every unsupported value fails at the manager boundary
+        """
+        for compact_layout_strategy in ("first_use", 1, None):
+            with (
+                self.subTest(compact_layout_strategy=compact_layout_strategy),
+                self.assertRaisesRegex(ValueError, "compact_layout_strategy"),
+            ):
+                ExpertReplicaManager(
+                    self._config(rank_id=0),
+                    compact_physical_weights=True,
+                    compact_layout_strategy=compact_layout_strategy,
                 )
 
     def test_generation_changes_only_when_slot_binding_changes(self):

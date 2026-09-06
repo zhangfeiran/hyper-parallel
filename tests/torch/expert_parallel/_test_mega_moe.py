@@ -365,12 +365,16 @@ def _new_layers(
     *,
     expert_capacity_factor: float = 1.5,
     replica_slots_per_rank: int = 0,
+    compact_physical_weights: bool = False,
+    compact_layout_strategy: str = "eager_on_first_forward",
 ) -> tuple[MegaMoeExperts, torch.nn.Module]:
     """Construct MegaMoe and the standard EP reference with identical weights."""
     return new_common_layers(
         shape,
         expert_capacity_factor=expert_capacity_factor,
         replica_slots_per_rank=replica_slots_per_rank,
+        compact_physical_weights=compact_physical_weights,
+        compact_layout_strategy=compact_layout_strategy,
     )
 
 
@@ -920,6 +924,107 @@ def test_mega_moe_deferred_backward_hot_expert_replication() -> None:
         refreshed_native,
         refreshed_mega,
         weight_grad_wave_count=2,
+    )
+
+
+def _run_compact_home_to_replica_deferred_backward(
+    compact_layout_strategy: str,
+    *,
+    defer_rebind: bool,
+) -> None:
+    """Compare one compact layout transition with native deferred backward."""
+    shape = _MoeShape()
+    home_route = _make_balanced_route(shape)
+    replica_route = _make_overflow_route(shape)
+    hidden_states, grad_output = _make_data(shape)
+    second_hidden = hidden_states.flip(0).contiguous()
+    second_grad_output = grad_output.roll(1, dims=0).contiguous()
+    mega, native = _new_layers(
+        shape,
+        expert_capacity_factor=1.0,
+        replica_slots_per_rank=1,
+        compact_physical_weights=True,
+        compact_layout_strategy=compact_layout_strategy,
+    )
+    initial_pointers = (
+        mega.gate_up_weight.data_ptr(),
+        mega.down_weight.data_ptr(),
+    )
+    native_results = (
+        _run_layer(native, hidden_states, *home_route, grad_output),
+        _run_layer(native, second_hidden, *replica_route, second_grad_output),
+    )
+
+    mega_results = _run_deferred_backward_pair(
+        mega,
+        (hidden_states, second_hidden),
+        *home_route,
+        (grad_output, second_grad_output),
+        second_route=replica_route,
+    )
+
+    deferred_pointers = (
+        mega.gate_up_weight.data_ptr(),
+        mega.down_weight.data_ptr(),
+    )
+    if defer_rebind:
+        assert deferred_pointers == initial_pointers, (
+            f"rank={_RANK}: live home graph should defer compact rebind: "
+            f"initial={initial_pointers}, deferred={deferred_pointers}."
+        )
+    else:
+        assert deferred_pointers != initial_pointers, (
+            f"rank={_RANK}: eager layout should rebind before the home graph: "
+            f"initial={initial_pointers}, prepared={deferred_pointers}."
+        )
+    _assert_results_close(native_results[0], mega_results[0])
+    _assert_results_close(
+        native_results[1],
+        mega_results[1],
+        weight_grad_wave_count=2,
+    )
+
+    compact_result = _run_layer(
+        mega,
+        second_hidden,
+        *replica_route,
+        second_grad_output,
+    )
+    compact_pointers = (
+        mega.gate_up_weight.data_ptr(),
+        mega.down_weight.data_ptr(),
+    )
+    expected_pointers = deferred_pointers if not defer_rebind else None
+    if expected_pointers is None:
+        assert compact_pointers != initial_pointers, (
+            f"rank={_RANK}: released home graph should permit compact rebind: "
+            f"initial={initial_pointers}, compact={compact_pointers}."
+        )
+    else:
+        assert compact_pointers == expected_pointers, (
+            f"rank={_RANK}: eager compact storage should remain stable: "
+            f"prepared={expected_pointers}, compact={compact_pointers}."
+        )
+    _assert_results_close(
+        native_results[1],
+        compact_result,
+        weight_grad_wave_count=2,
+    )
+
+
+def test_mega_moe_lazy_compact_home_to_replica_deferred_backward() -> None:
+    """Defer the first lazy compact rebind while a home graph is live."""
+    _run_compact_home_to_replica_deferred_backward(
+        "lazy_on_first_replica",
+        defer_rebind=True,
+    )
+
+
+def test_mega_moe_eager_compact_home_to_replica_deferred_backward() -> None:
+    """Keep eager compact storage stable across a deferred route switch."""
+    _run_compact_home_to_replica_deferred_backward(
+        "eager_on_first_forward",
+        defer_rebind=False,
     )
 
 
