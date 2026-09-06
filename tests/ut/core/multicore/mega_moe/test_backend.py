@@ -45,7 +45,9 @@ class TestMegaMoeExperts(unittest.TestCase):
         Expectation: execute MegaMoe directly without selecting native fallback
         """
         metadata = Mock(name="metadata")
+        execution_runtime = Mock(name="execution_runtime")
         route = SimpleNamespace(
+            plan=execution_runtime,
             routed_tokens=Mock(name="routed_tokens"),
             physical_topk_ids=Mock(name="physical_topk_ids"),
             unpermute_mapping=Mock(name="unpermute_mapping"),
@@ -63,8 +65,8 @@ class TestMegaMoeExperts(unittest.TestCase):
             num_experts=4, top_k=2, ep_size=2,
         )
         self.addCleanup(backend.close)
-        backend.config = Mock(name="config")
-        backend.runtime = Mock(name="runtime")
+        backend.spec = Mock(name="spec")
+        backend.plan = Mock(name="plan")
         backend.workspace = Mock(name="workspace")
         backend.replica_manager = None
 
@@ -78,7 +80,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         weight1 = backend.gate_up_weight
         weight2 = backend.down_weight
         backend._get_execution_resources = Mock(return_value=backend)
-        backend.plan = backend.runtime
         backend._validate_forward_inputs.return_value = hidden_states
         mock_execute_mega_moe.return_value.reshape.return_value = mock_execute_mega_moe.return_value
         result = backend.forward(
@@ -99,7 +100,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             weight1,
             weight2,
             route,
-            backend.runtime,
+            execution_runtime,
             backend.workspace,
         )
 
@@ -118,7 +119,9 @@ class TestMegaMoeExperts(unittest.TestCase):
         Expectation: wait for prefetch and launch kernels with physical IDs and weights
         """
         placement = Mock(name="placement")
+        execution_runtime = Mock(name="execution_runtime")
         route = SimpleNamespace(
+            plan=execution_runtime,
             physical_topk_ids=Mock(name="physical_topk_ids"),
             placement=placement,
             placement_payload=None,
@@ -129,8 +132,9 @@ class TestMegaMoeExperts(unittest.TestCase):
             num_experts=4, top_k=2, ep_size=2,
         )
         self.addCleanup(backend.close)
-        backend.config = Mock(name="config")
-        backend.runtime = Mock(name="runtime")
+        backend.spec = Mock(name="spec")
+        backend.plan = Mock(name="plan")
+        backend.home_runtime = Mock(name="home_runtime")
         backend.workspace = Mock(name="workspace")
         backend.replica_manager = Mock(name="replica_manager")
         pending = backend.replica_manager.start_prefetch.return_value
@@ -153,7 +157,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         weight2 = backend.down_weight
 
         backend._get_execution_resources = Mock(return_value=backend)
-        backend.plan = backend.runtime
+        backend.plan = backend.plan
         backend._validate_forward_inputs.return_value = hidden_states
         mock_execute_mega_moe.return_value.reshape.return_value = mock_execute_mega_moe.return_value
         result = backend.forward(
@@ -173,10 +177,19 @@ class TestMegaMoeExperts(unittest.TestCase):
         prepare_call = mock_prepare_route.call_args
         self.assertEqual(
             prepare_call.args,
-            (hidden_states, route_ids, route_weights, backend.runtime, None),
+            (hidden_states, route_ids, route_weights, backend.plan, None),
         )
         self.assertIs(prepare_call.kwargs["workspace"], backend.workspace)
         self.assertTrue(callable(prepare_call.kwargs["placement_callback"]))
+        self.assertIs(
+            prepare_call.kwargs["home_runtime"],
+            backend.home_runtime,
+        )
+        backend.workspace.ensure.assert_called_once_with(
+            backend.spec,
+            hidden_states.dtype,
+            hidden_states.device,
+        )
         mock_execute_mega_moe.assert_called_once_with(
             hidden_states,
             route.physical_topk_ids,
@@ -184,7 +197,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             physical_weight1,
             physical_weight2,
             route,
-            backend.runtime,
+            execution_runtime,
             backend.workspace,
         )
 

@@ -105,6 +105,7 @@ print(json.dumps({
                     "top_k": 2,
                     "expert_capacity_factor": None,
                     "replica_slots_per_rank": 0,
+                    "compact_physical_weights": False,
                     "ep_size": 2,
                     "ep_group": None,
                 },
@@ -158,7 +159,7 @@ print(json.dumps({
         resources = SimpleNamespace(spec=object(), plan=object(), workspace=object(), replica_manager=None)
         route = SimpleNamespace(
             routed_tokens=object(), metadata=object(), unpermute_mapping=object(),
-            physical_topk_ids=topk_ids, placement=None,
+            physical_topk_ids=topk_ids, placement=None, plan=resources.plan,
         )
 
         with (
@@ -330,6 +331,70 @@ print(json.dumps({
             MegaMoeExperts.share_execution_resources(
                 (static_layer, replicated_layer)
             )
+
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_constructor_validates_compact_physical_weights(self, mock_create_parameters):
+        """Reject non-Boolean compact physical-weight selectors.
+
+        Feature: compact physical-weight configuration.
+        Description: Try integer, string, and null compact-mode values.
+        Expectation: Every invalid selector fails before parameter allocation.
+        """
+        mock_create_parameters.return_value = (object(), object())
+
+        for compact_physical_weights in (0, 1, "true", None):
+            with (
+                self.subTest(compact_physical_weights=compact_physical_weights),
+                self.assertRaisesRegex(ValueError, "compact_physical_weights"),
+            ):
+                MegaMoeExperts(
+                    local_num_tokens=128,
+                    hidden_size=16,
+                    intermediate_size=8,
+                    num_experts=4,
+                    top_k=2,
+                    replica_slots_per_rank=1,
+                    compact_physical_weights=compact_physical_weights,
+                    ep_size=2,
+                )
+
+        mock_create_parameters.assert_not_called()
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_compact_mode_participates_in_resource_compatibility(
+        self,
+        mock_create_parameters,
+    ):
+        """Keep snapshot and compact storage backends in separate groups.
+
+        Feature: compact physical-weight resource compatibility.
+        Description: Combine replicated modules whose storage modes differ.
+        Expectation: Resource sharing rejects the incompatible storage contract.
+        """
+        mock_create_parameters.return_value = (object(), object())
+        snapshot_layer = MegaMoeExperts(
+            local_num_tokens=128,
+            hidden_size=16,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            replica_slots_per_rank=1,
+            ep_size=2,
+        )
+        compact_layer = MegaMoeExperts(
+            local_num_tokens=128,
+            hidden_size=16,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            replica_slots_per_rank=1,
+            compact_physical_weights=True,
+            ep_size=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "identical configuration"):
+            MegaMoeExperts.share_execution_resources((snapshot_layer, compact_layer))
 
 
 if __name__ == "__main__":

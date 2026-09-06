@@ -21,6 +21,7 @@ from importlib import import_module
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import torch_npu
@@ -62,6 +63,7 @@ class RouteMetadata:
 class PreparedTopKRoute:
     """Permuted payload, count metadata and the capacity decision for one route."""
 
+    plan: MegaMoePlan
     routed_tokens: Any | None
     physical_topk_ids: Any
     unpermute_mapping: Any
@@ -72,6 +74,23 @@ class PreparedTopKRoute:
     metadata: RouteMetadata | None
     placement: ExpertPlacementPlan | None
     placement_payload: Any | None
+
+
+@dataclass(frozen=True)
+class _PreparedRouteLayout:
+    """Physical layout selected before exact route metadata is constructed."""
+
+    plan: MegaMoePlan
+    routed_tokens: Any | None
+    physical_topk_ids: Any
+    unpermute_mapping: Any
+    permute_src_index: Any | None
+    physical_counts: Any
+    physical_counts_by_source: Any
+    received_counts: Any
+    maximum_received_slots: int
+    placement: ExpertPlacementPlan | None = None
+    placement_payload: Any | None = None
 
 
 def _validate_topk_inputs(
@@ -219,11 +238,25 @@ def _remap_topk_ids_to_physical(
     return physical_ids_by_route.reshape_as(topk_ids).contiguous()
 
 
+@lru_cache(maxsize=128)
+def _cached_replica_plan(
+    logical_counts: tuple[tuple[int, ...], ...],
+    replica_slots_per_rank: int,
+    receive_capacity: int,
+) -> ExpertPlacementPlan:
+    """Return a bounded cached placement for an immutable count matrix."""
+    return build_constrained_expert_placement(
+        logical_counts,
+        replica_slots_per_rank,
+        receive_capacity=receive_capacity,
+    )
+
+
 def _build_replica_plan(
     counts_by_source: Any,
     spec: MegaMoeSpec,
 ) -> ExpertPlacementPlan:
-    """Build one bounded host reference placement from gathered counts."""
+    """Build or reuse one bounded host placement from gathered counts."""
     # The first Ascend integration uses a bounded host reference planner. The
     # explicit opt-in keeps this synchronization out of the default path until
     # the planner is moved into the device route kernel.
@@ -231,13 +264,23 @@ def _build_replica_plan(
         tuple(int(count) for count in source_counts)
         for source_counts in counts_by_source.tolist()
     )
-    return build_constrained_expert_placement(
+    global_counts = tuple(map(sum, zip(*logical_counts)))
+    destination_loads = tuple(
+        sum(global_counts[start:start + spec.local_experts])
+        for start in range(0, spec.num_experts, spec.local_experts)
+    )
+    planning_capacity = (
+        spec.routed_slots
+        if max(destination_loads) > spec.receive_capacity
+        else spec.receive_capacity
+    )
+    return _cached_replica_plan(
         logical_counts,
         spec.replica_slots_per_rank,
-        # Every EP rank contributes the same S*K rows, so routed_slots is the
-        # exact global mean. Target it for compute balance even when the wider
-        # multi-wave receive window could tolerate residual skew.
-        receive_capacity=spec.routed_slots,
+        # Once overflow requires another wave, target the exact mean so the
+        # slowest expert rank does not retain a long GMM tail. A route already
+        # inside the one-wave window stops without needless replica traffic.
+        planning_capacity,
     )
 
 
@@ -319,6 +362,114 @@ def _prepare_route_endpoints(
     return routed_tokens, unpermute_mapping, None
 
 
+def _prepare_home_layout(
+    hidden_states: Any,
+    topk_ids: Any,
+    counts: Any,
+    counts_by_source: Any,
+    count_work: Any | None,
+    plan: MegaMoePlan,
+) -> _PreparedRouteLayout:
+    """Finish counts and prepare endpoints for the static home layout."""
+    routed_tokens, unpermute_mapping, permute_src_index = _prepare_route_endpoints(
+        hidden_states,
+        topk_ids,
+        plan,
+    )
+    received_counts, maximum_received_slots = _finish_static_count_gather(
+        counts_by_source,
+        count_work,
+        plan.spec,
+    )
+    return _PreparedRouteLayout(
+        plan=plan,
+        routed_tokens=routed_tokens,
+        physical_topk_ids=topk_ids,
+        unpermute_mapping=unpermute_mapping,
+        permute_src_index=permute_src_index,
+        physical_counts=counts,
+        physical_counts_by_source=counts_by_source,
+        received_counts=received_counts,
+        maximum_received_slots=maximum_received_slots,
+    )
+
+
+def _prepare_bounded_layout(
+    hidden_states: Any,
+    topk_ids: Any,
+    counts: Any,
+    counts_by_source: Any,
+    plan: MegaMoePlan,
+    placement_callback: Callable[[ExpertPlacementPlan], Any] | None,
+    home_runtime: MegaMoePlan | None,
+) -> _PreparedRouteLayout:
+    """Select a replica-free layout or materialize one bounded placement."""
+    spec = plan.spec
+    received_counts, maximum_received_slots = _finish_static_count_gather(
+        counts_by_source,
+        None,
+        spec,
+    )
+    if home_runtime is not None and maximum_received_slots <= spec.receive_capacity:
+        routed_tokens, unpermute_mapping, permute_src_index = _prepare_route_endpoints(
+            hidden_states,
+            topk_ids,
+            home_runtime,
+        )
+        return _PreparedRouteLayout(
+            plan=home_runtime,
+            routed_tokens=routed_tokens,
+            physical_topk_ids=topk_ids,
+            unpermute_mapping=unpermute_mapping,
+            permute_src_index=permute_src_index,
+            physical_counts=counts,
+            physical_counts_by_source=counts_by_source,
+            received_counts=received_counts,
+            maximum_received_slots=maximum_received_slots,
+        )
+
+    placement = _build_replica_plan(counts_by_source, spec)
+    placement_payload = (
+        placement_callback(placement) if placement_callback is not None else None
+    )
+    try:
+        physical_counts_by_source, received_counts, maximum_received_slots = (
+            _materialize_replica_counts(
+                placement,
+                counts_by_source,
+                spec,
+            )
+        )
+        physical_topk_ids = _remap_topk_ids_to_physical(
+            topk_ids,
+            placement,
+            spec.rank_id,
+        )
+        routed_tokens, unpermute_mapping, permute_src_index = (
+            _prepare_route_endpoints(
+                hidden_states,
+                physical_topk_ids,
+                plan,
+            )
+        )
+    except Exception:
+        _drain_placement_payload(placement_payload)
+        raise
+    return _PreparedRouteLayout(
+        plan=plan,
+        routed_tokens=routed_tokens,
+        physical_topk_ids=physical_topk_ids,
+        unpermute_mapping=unpermute_mapping,
+        permute_src_index=permute_src_index,
+        physical_counts=physical_counts_by_source[spec.rank_id],
+        physical_counts_by_source=physical_counts_by_source,
+        received_counts=received_counts,
+        maximum_received_slots=maximum_received_slots,
+        placement=placement,
+        placement_payload=placement_payload,
+    )
+
+
 def _compute_route_metadata(
     counts: Any,
     counts_by_source: Any,
@@ -394,6 +545,7 @@ def prepare_topk_route(
     tokens_per_expert: Any | None,
     workspace: MegaMoeWorkspace | None = None,
     placement_callback: Callable[[ExpertPlacementPlan], Any] | None = None,
+    home_runtime: MegaMoePlan | None = None,
 ) -> PreparedTopKRoute:
     """Prepare physical Top-K routing with count and weight-transfer overlap.
 
@@ -406,6 +558,8 @@ def prepare_topk_route(
         workspace: Optional workspace whose prior generation must be complete.
         placement_callback: Optional callback launched after placement but
             before device remap, allowing weight prefetch to overlap route work.
+        home_runtime: Optional replica-free plan used when static home
+            placement already fits one receive window.
 
     Returns:
         Prepared payload, route mappings, counts, and multi-wave metadata.
@@ -418,77 +572,49 @@ def prepare_topk_route(
         # the cross-rank rendezvous for the next symmetric-buffer generation.
         workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
-    placement = None
-    placement_payload = None
     if spec.replica_slots_per_rank:
         _wait_count_gather(count_work)
-        placement = _build_replica_plan(counts_by_source, spec)
-        if placement_callback is not None:
-            placement_payload = placement_callback(placement)
-        try:
-            (
-                physical_counts_by_source,
-                received_counts,
-                maximum_received_slots,
-            ) = _materialize_replica_counts(
-                placement,
-                counts_by_source,
-                spec,
-            )
-            physical_topk_ids = _remap_topk_ids_to_physical(
-                topk_ids,
-                placement,
-                spec.rank_id,
-            )
-            physical_counts = physical_counts_by_source[spec.rank_id]
-            routed_tokens, unpermute_mapping, permute_src_index = (
-                _prepare_route_endpoints(
-                    hidden_states,
-                    physical_topk_ids,
-                    plan,
-                )
-            )
-        except Exception:
-            _drain_placement_payload(placement_payload)
-            raise
-    else:
-        physical_topk_ids = topk_ids
-        physical_counts_by_source = counts_by_source
-        physical_counts = counts
-        routed_tokens, unpermute_mapping, permute_src_index = (
-            _prepare_route_endpoints(
-                hidden_states,
-                physical_topk_ids,
-                plan,
-            )
+        layout = _prepare_bounded_layout(
+            hidden_states,
+            topk_ids,
+            counts,
+            counts_by_source,
+            plan,
+            placement_callback,
+            home_runtime,
         )
-        received_counts, maximum_received_slots = _finish_static_count_gather(
+    else:
+        layout = _prepare_home_layout(
+            hidden_states,
+            topk_ids,
+            counts,
             counts_by_source,
             count_work,
-            spec,
+            plan,
         )
     try:
         metadata = _compute_route_metadata(
-            physical_counts,
-            physical_counts_by_source,
-            received_counts,
-            plan,
-            maximum_received_slots,
+            layout.physical_counts,
+            layout.physical_counts_by_source,
+            layout.received_counts,
+            layout.plan,
+            layout.maximum_received_slots,
         )
     except Exception:
-        _drain_placement_payload(placement_payload)
+        _drain_placement_payload(layout.placement_payload)
         raise
     return PreparedTopKRoute(
-        routed_tokens=routed_tokens,
-        physical_topk_ids=physical_topk_ids,
-        unpermute_mapping=unpermute_mapping,
-        permute_src_index=permute_src_index,
-        tokens_per_expert=physical_counts,
-        received_counts=received_counts,
+        plan=layout.plan,
+        routed_tokens=layout.routed_tokens,
+        physical_topk_ids=layout.physical_topk_ids,
+        unpermute_mapping=layout.unpermute_mapping,
+        permute_src_index=layout.permute_src_index,
+        tokens_per_expert=layout.physical_counts,
+        received_counts=layout.received_counts,
         receive_overflow=False,
         metadata=metadata,
-        placement=placement,
-        placement_payload=placement_payload,
+        placement=layout.placement,
+        placement_payload=layout.placement_payload,
     )
 
 

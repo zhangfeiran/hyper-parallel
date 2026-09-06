@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from functools import partial
 from importlib import import_module
 from typing import Any
@@ -64,6 +65,8 @@ class _MegaMoeExecutionResources:
         *,
         shared: bool,
         active_specifications: tuple[Any, ...],
+        pool_cache_size: int = 1,
+        compact_physical_weights: bool = False,
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
@@ -71,6 +74,10 @@ class _MegaMoeExecutionResources:
         self.symmetric_memory = acquire_symmetric_memory(self.spec.ep_group)
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
+            self.home_runtime = (
+                build_mega_moe_plan(replace(self.spec, replica_slots_per_rank=0), tensor.device)
+                if self.spec.replica_slots_per_rank else self.plan
+            )
             self.workspace = MegaMoeWorkspace(
                 symmetric_memory=self.symmetric_memory,
                 shared=shared,
@@ -79,7 +86,10 @@ class _MegaMoeExecutionResources:
             self.symmetric_memory.close()
             raise
         self.replica_manager = (
-            ExpertReplicaManager(self.spec) if self.spec.replica_slots_per_rank else None
+            ExpertReplicaManager(
+                self.spec, pool_cache_size=pool_cache_size,
+                compact_physical_weights=compact_physical_weights,
+            ) if self.spec.replica_slots_per_rank else None
         )
         self._closed = False
 
@@ -112,6 +122,7 @@ class MegaMoeExperts(MulticoreModule):
         top_k: int,
         expert_capacity_factor: float | None = None,
         replica_slots_per_rank: int = 0,
+        compact_physical_weights: bool = False,
         ep_size: int = 1,
         ep_group: Any | None = None,
     ) -> None:
@@ -129,6 +140,12 @@ class MegaMoeExperts(MulticoreModule):
                 and executes larger routes losslessly in fixed-capacity waves.
             replica_slots_per_rank: Bounded temporary expert-weight slots on
                 each EP rank. Zero preserves static home-expert execution.
+            compact_physical_weights: Store replica suffixes in spare storage
+                attached to home parameters instead of snapshotting home rows.
+                This reduces HBM under the standard contract that parameters
+                are not modified between their forward and backward. The first
+                active placement may rebind parameter storage, so callers must
+                not retain raw storage aliases across that boundary.
             ep_size: Expert-parallel degree. The current SHMEM path requires it
                 to cover the complete Torch distributed world.
             ep_group: Torch expert-parallel process group with the same rank
@@ -142,6 +159,7 @@ class MegaMoeExperts(MulticoreModule):
             top_k=top_k,
             expert_capacity_factor=expert_capacity_factor,
             replica_slots_per_rank=replica_slots_per_rank,
+            compact_physical_weights=compact_physical_weights,
             ep_size=ep_size,
         )
         if expert_capacity_factor is not None:
@@ -154,6 +172,7 @@ class MegaMoeExperts(MulticoreModule):
             "top_k": top_k,
             "expert_capacity_factor": expert_capacity_factor,
             "replica_slots_per_rank": replica_slots_per_rank,
+            "compact_physical_weights": compact_physical_weights,
             "ep_size": ep_size,
             "ep_group": ep_group,
         }
@@ -165,6 +184,7 @@ class MegaMoeExperts(MulticoreModule):
             top_k,
             expert_capacity_factor,
             replica_slots_per_rank,
+            compact_physical_weights,
             ep_size,
             id(ep_group),
         )
@@ -180,6 +200,7 @@ class MegaMoeExperts(MulticoreModule):
         self.top_k = top_k
         self.expert_capacity_factor = expert_capacity_factor
         self.replica_slots_per_rank = replica_slots_per_rank
+        self.compact_physical_weights = compact_physical_weights
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
@@ -188,6 +209,27 @@ class MegaMoeExperts(MulticoreModule):
             hidden_size,
             intermediate_size,
         )
+
+    @staticmethod
+    def _validate_replica_options(
+        replica_slots_per_rank: int,
+        compact_physical_weights: bool,
+    ) -> None:
+        """Validate public physical-weight storage controls."""
+        if (
+            not isinstance(replica_slots_per_rank, int)
+            or isinstance(replica_slots_per_rank, bool)
+            or replica_slots_per_rank < 0
+        ):
+            raise ValueError(
+                "replica_slots_per_rank must be a nonnegative integer, "
+                f"got {replica_slots_per_rank!r}."
+            )
+        if not isinstance(compact_physical_weights, bool):
+            raise ValueError(
+                "compact_physical_weights must be a bool, got "
+                f"{compact_physical_weights!r}."
+            )
 
     @staticmethod
     def _validate_topology(
@@ -199,6 +241,7 @@ class MegaMoeExperts(MulticoreModule):
         top_k: int,
         expert_capacity_factor: float | None,
         replica_slots_per_rank: int,
+        compact_physical_weights: bool,
         ep_size: int,
     ) -> None:
         """Validate static shape and topology values before allocation."""
@@ -221,15 +264,10 @@ class MegaMoeExperts(MulticoreModule):
             raise ValueError(
                 f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})."
             )
-        if (
-            not isinstance(replica_slots_per_rank, int)
-            or isinstance(replica_slots_per_rank, bool)
-            or replica_slots_per_rank < 0
-        ):
-            raise ValueError(
-                "replica_slots_per_rank must be a nonnegative integer, "
-                f"got {replica_slots_per_rank!r}."
-            )
+        MegaMoeExperts._validate_replica_options(
+            replica_slots_per_rank,
+            compact_physical_weights,
+        )
         if local_num_tokens % _COMMUNICATION_SPLIT:
             raise ValueError(
                 "local_num_tokens must be divisible by the fixed communication "
@@ -362,6 +400,8 @@ class MegaMoeExperts(MulticoreModule):
         route_weights = topk_weights.float().contiguous()
         route_options: dict[str, Any] = {"workspace": resources.workspace}
         if resources.replica_manager is not None:
+            resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
+            route_options["home_runtime"] = resources.home_runtime
             route_options["placement_callback"] = partial(
                 resources.replica_manager.start_prefetch,
                 self.gate_up_weight,
@@ -391,7 +431,7 @@ class MegaMoeExperts(MulticoreModule):
             physical_weight1,
             physical_weight2,
             route,
-            resources.plan,
+            route.plan,
             resources.workspace,
         )
         return output.reshape(hidden_states.shape)
@@ -409,4 +449,6 @@ class MegaMoeExperts(MulticoreModule):
             tensor,
             shared=shared,
             active_specifications=active_specifications,
+            pool_cache_size=len(self._resource_group.members),
+            compact_physical_weights=self.compact_physical_weights,
         )

@@ -295,6 +295,35 @@ def test_mega_moe_hot_expert_replication(monkeypatch) -> None:
     card_mark="allcards",
     essential_mark="essential",
 )
+def test_mega_moe_deferred_backward_hot_expert_replication(monkeypatch) -> None:
+    """
+    Feature: persistent replica pool with multiple live autograd graphs
+    Description: reuse one physical binding, then update only its owner rank
+    Expectation: shared graphs and collective refresh match native execution
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [
+                TorchCase(
+                    _WORKER,
+                    "test_mega_moe_deferred_backward_hot_expert_replication",
+                    num_proc=_PRECISION_WORLD_SIZE,
+                )
+            ],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
 def test_mega_moe_replication_with_residual_multi_wave(monkeypatch) -> None:
     """
     Feature: bounded replication with residual multi-wave execution
@@ -470,17 +499,29 @@ def _run_performance_backend(
     backend: str,
     tag: str,
     npu_port_range: str,
+    settings: dict[str, str] | None = None,
 ) -> dict:
     """Run one fresh eight-rank backend process and load its result."""
     result_path = result_dir / f"{tag}.json"
     monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
-    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PERFORMANCE_WORLD_SIZE))
-    monkeypatch.setenv("HP_MEGA_MOE_PERF_BACKEND", backend)
-    monkeypatch.setenv("HP_MEGA_MOE_PERF_WARMUP", "5")
-    monkeypatch.setenv("HP_MEGA_MOE_PERF_MEASURED", "10")
-    monkeypatch.setenv("HP_MEGA_MOE_PERF_RESULT", str(result_path))
-    monkeypatch.setenv("HCCL_NPU_SOCKET_PORT_RANGE", npu_port_range)
-    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    environment = {
+        "HP_MEGA_MOE_WORLD_SIZE": str(_PERFORMANCE_WORLD_SIZE),
+        "HP_MEGA_MOE_PERF_BACKEND": backend,
+        "HP_MEGA_MOE_PERF_WARMUP": "5",
+        "HP_MEGA_MOE_PERF_MEASURED": "10",
+        "HP_MEGA_MOE_PERF_RESULT": str(result_path),
+        "HP_MEGA_MOE_PERF_ROUTE_PROFILE": "dirichlet",
+        "HP_MEGA_MOE_PERF_DIRICHLET_ALPHA": "10000",
+        "HP_MEGA_MOE_PERF_DIRICHLET_SEED": "42",
+        "HP_MEGA_MOE_PERF_CLUSTERED_EXPERTS": "12",
+        "HP_MEGA_MOE_PERF_REPLICA_SLOTS": "0",
+        "HP_MEGA_MOE_CAPACITY_FACTOR": "1.5",
+        "HCCL_NPU_SOCKET_PORT_RANGE": npu_port_range,
+        "SHMEM_IP_PORT": f"tcp://127.0.0.1:{allocate_port()}",
+    }
+    environment.update(settings or {})
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
     with without_inherited_rank_environment():
         parallel_run(
             [
@@ -545,3 +586,106 @@ def test_mega_moe_extended_representative_performance(monkeypatch, tmp_path: Pat
         "MegaMoe representative A/B: "
         f"native_ms={native_median}, mega_ms={mega_median}, ratio={ratio:.6f}"
     )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="unessential",
+)
+def test_mega_moe_placement_performance_matrix(monkeypatch, tmp_path: Path) -> None:
+    """
+    Feature: bounded-placement performance regimes
+    Description: measure home, multi-wave, replica, and residual E48/K8 routes
+    Expectation: every route reaches its planned wave regime with finite gradients
+    """
+    _prepare_torch_multicore_test_environment()
+    common_skew = {
+        "HP_MEGA_MOE_PERF_ROUTE_PROFILE": "clustered",
+        "HP_MEGA_MOE_PERF_CLUSTERED_EXPERTS": "12",
+        "HP_MEGA_MOE_CAPACITY_FACTOR": "1.0",
+        "HP_MEGA_MOE_PERF_WARMUP": "3",
+        "HP_MEGA_MOE_PERF_MEASURED": "6",
+    }
+    specs = (
+        (
+            "home_only",
+            "62200-62263",
+            {},
+            "home-only",
+            1,
+        ),
+        (
+            "multi_wave_only",
+            "62300-62363",
+            common_skew,
+            "multi-wave-only",
+            5,
+        ),
+        (
+            "replica_only",
+            "62400-62463",
+            {**common_skew, "HP_MEGA_MOE_PERF_REPLICA_SLOTS": "2"},
+            "replica-only",
+            1,
+        ),
+        (
+            "replica_residual",
+            "62500-62563",
+            {**common_skew, "HP_MEGA_MOE_PERF_REPLICA_SLOTS": "1"},
+            "replica+residual-multi-wave",
+            2,
+        ),
+    )
+    results = {}
+    for tag, port_range, settings, expected_mode, expected_waves in specs:
+        result = _run_performance_backend(
+            monkeypatch,
+            tmp_path,
+            "mega_moe",
+            tag,
+            port_range,
+            settings,
+        )
+        route = result["route"]
+        assert result["device_healthy"], (
+            f"performance device health failed for {tag}: result={result}"
+        )
+        assert all(result["validation"].values()), (
+            f"performance validation failed for {tag}: "
+            f"validation={result['validation']}"
+        )
+        assert route["execution_mode"] == expected_mode, (
+            f"performance mode mismatch for {tag}: "
+            f"expected={expected_mode}, got={route['execution_mode']}"
+        )
+        assert route["expected_wave_count"] == expected_waves, (
+            f"performance wave count mismatch for {tag}: "
+            f"expected={expected_waves}, got={route['expected_wave_count']}"
+        )
+        median = result["rank_max_fwd_bwd_ms"]["median"]
+        assert median > 0.0, (
+            f"performance median must be positive for {tag}: got={median}"
+        )
+        results[tag] = result
+
+    clustered_loads = results["multi_wave_only"]["route"]["destination_loads"]
+    for tag in ("replica_only", "replica_residual"):
+        actual_loads = results[tag]["route"]["destination_loads"]
+        assert actual_loads == clustered_loads, (
+            f"clustered logical route drifted for {tag}: "
+            f"expected={clustered_loads}, got={actual_loads}"
+        )
+    summary = {
+        tag: {
+            "mode": result["route"]["execution_mode"],
+            "waves": result["route"]["expected_wave_count"],
+            "median_ms": result["rank_max_fwd_bwd_ms"]["median"],
+            "peak_bytes": result["memory"]["rank_max"][
+                "conservative_total_peak_bytes"
+            ],
+        }
+        for tag, result in results.items()
+    }
+    print("MegaMoe placement performance matrix: " + json.dumps(summary, sort_keys=True))

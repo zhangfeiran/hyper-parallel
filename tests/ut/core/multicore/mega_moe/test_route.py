@@ -328,7 +328,7 @@ class TestMegaMoeRoute(unittest.TestCase):
             intermediate_size=2,
             num_experts=4,
             top_k=2,
-            receive_capacity=8,
+            receive_capacity=4,
             ep_size=2,
             ep_group=None,
             rank_id=1,
@@ -423,6 +423,114 @@ class TestMegaMoeRoute(unittest.TestCase):
         self.assertTrue(torch.equal(route.metadata.group_list, torch.tensor([0, 0, 4])))
         self.assertIs(mock_permute.call_args.args[1], route.physical_topk_ids)
 
+    def test_one_wave_route_does_not_create_replica_traffic(self):
+        """Stop replica planning when static placement already fits one wave.
+
+        Feature: adaptive replica planning threshold
+        Description: plan an imbalanced route whose slowest rank still fits capacity
+        Expectation: leave both replica suffixes empty and preserve home loads
+        """
+        spec = MegaMoeSpec(
+            expert_capacity_factor=1.5,
+            local_num_tokens=2,
+            hidden_size=4,
+            intermediate_size=2,
+            num_experts=4,
+            top_k=2,
+            receive_capacity=8,
+            ep_size=2,
+            ep_group=None,
+            rank_id=0,
+            num_cube_cores=24,
+            replica_slots_per_rank=1,
+        )
+        counts_by_source = torch.tensor(
+            [[2, 2, 0, 0], [2, 2, 0, 0]],
+            dtype=torch.int32,
+        )
+
+        plan = route_module._build_replica_plan(  # pylint: disable=W0212
+            counts_by_source,
+            spec,
+        )
+
+        self.assertEqual(plan.baseline_destination_loads, (8, 0))
+        self.assertEqual(plan.destination_loads, (8, 0))
+        self.assertEqual(plan.replica_expert_ids, ((-1,), (-1,)))
+        self.assertEqual(plan.replica_transfers, ())
+
+    def test_one_wave_route_selects_replica_free_runtime(self):
+        """Execute an in-capacity route without the physical replica adapter.
+
+        Feature: replica-free plan fast path
+        Description: provide a second home plan for a one-wave logical route
+        Expectation: skip placement/prefetch and retain logical IDs and counts
+        """
+        spec = MegaMoeSpec(
+            expert_capacity_factor=1.5,
+            local_num_tokens=2,
+            hidden_size=4,
+            intermediate_size=2,
+            num_experts=4,
+            top_k=2,
+            receive_capacity=8,
+            ep_size=2,
+            ep_group=None,
+            rank_id=0,
+            num_cube_cores=24,
+            replica_slots_per_rank=1,
+            forward_fusion_mode="legacy",
+            backward_fusion_mode="legacy",
+        )
+        plan = SimpleNamespace(spec=spec)
+        home_runtime = SimpleNamespace(
+            spec=replace(spec, replica_slots_per_rank=0),
+        )
+        hidden_states = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+        topk_ids = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+        topk_weights = torch.full((2, 2), 0.5, dtype=torch.float32)
+        local_counts = torch.tensor([2, 2, 0, 0], dtype=torch.int32)
+        global_counts = torch.tensor(
+            [[2, 2, 0, 0], [2, 2, 0, 0]],
+            dtype=torch.int32,
+        )
+        routed_tokens = hidden_states.repeat_interleave(2, dim=0)
+        unpermute_mapping = torch.arange(4, dtype=torch.int32)
+        prefetch = Mock(name="prefetch")
+
+        def gather_counts(output: Any, _input_tensor: Any, **_kwargs: Any) -> Any:
+            """Populate one completed mocked logical count gather."""
+            output.copy_(global_counts.reshape(-1))
+            return Mock(wait=Mock())
+
+        with (
+            patch(
+                "torch.distributed.all_gather_into_tensor",
+                side_effect=gather_counts,
+            ),
+            patch.object(
+                route_module,
+                "_permute_topk_input",
+                return_value=(routed_tokens, unpermute_mapping),
+            ),
+        ):
+            route = prepare_topk_route(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                plan,
+                local_counts,
+                placement_callback=prefetch,
+                home_runtime=home_runtime,
+            )
+
+        prefetch.assert_not_called()
+        self.assertIs(route.plan, home_runtime)
+        self.assertIs(route.physical_topk_ids, topk_ids)
+        self.assertIsNone(route.placement)
+        self.assertTrue(torch.equal(route.tokens_per_expert, local_counts))
+        self.assertTrue(torch.equal(route.received_counts, global_counts[:, :2]))
+
     def test_device_remap_matches_host_quotas_when_one_source_is_split(self):
         """
         Feature: per-source physical copy quotas
@@ -454,6 +562,37 @@ class TestMegaMoeRoute(unittest.TestCase):
         ).reshape_as(logical_ids)
         self.assertTrue(torch.equal(physical_ids, expected))
         self.assertTrue(torch.equal(physical_ids, torch.tensor([[0, 3], [5, 5]])))
+
+    def test_repeated_replica_counts_reuse_cached_host_plan(self):
+        """
+        Feature: bounded host placement cache
+        Description: plan the same immutable count matrix twice
+        Expectation: run the placement heuristic once and reuse its result
+        """
+        logical_counts = ((3, 0, 1, 0), (3, 0, 1, 0))
+        route_module._cached_replica_plan.cache_clear()  # pylint: disable=W0212
+        with patch.object(
+            route_module,
+            "build_constrained_expert_placement",
+            wraps=build_constrained_expert_placement,
+        ) as mock_build:
+            first = route_module._cached_replica_plan(  # pylint: disable=W0212
+                logical_counts,
+                1,
+                4,
+            )
+            second = route_module._cached_replica_plan(  # pylint: disable=W0212
+                logical_counts,
+                1,
+                4,
+            )
+
+        self.assertIs(first, second)
+        mock_build.assert_called_once_with(
+            logical_counts,
+            1,
+            receive_capacity=4,
+        )
 
 
 if __name__ == "__main__":

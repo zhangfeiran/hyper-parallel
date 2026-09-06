@@ -54,7 +54,7 @@ class QwenMoeConfig:
 
     The example intentionally models one TP1/EP8 optimizer-step workload. Its
     deterministic balanced default gives every destination the same load;
-    optional Dirichlet routing reproduces load-skew and fallback behavior.
+    optional Dirichlet routing reproduces load-skew and multi-wave behavior.
     """
 
     vocab_size: int = 32000
@@ -75,6 +75,8 @@ class QwenMoeConfig:
     router_load_seed: int = 42
     local_num_tokens: int = 4096
     expert_capacity_factor: float | None = None
+    replica_slots_per_rank: int = 0
+    compact_physical_weights: bool = False
     ep_size: int = 8
 
     def __post_init__(self) -> None:
@@ -113,6 +115,20 @@ class QwenMoeConfig:
         if self.top_k > self.num_experts:
             raise ValueError(
                 f"top_k ({self.top_k}) cannot exceed num_experts ({self.num_experts})."
+            )
+        if (
+            not isinstance(self.replica_slots_per_rank, int)
+            or isinstance(self.replica_slots_per_rank, bool)
+            or self.replica_slots_per_rank < 0
+        ):
+            raise ValueError(
+                "replica_slots_per_rank must be a nonnegative integer, "
+                f"got {self.replica_slots_per_rank!r}."
+            )
+        if not isinstance(self.compact_physical_weights, bool):
+            raise ValueError(
+                "compact_physical_weights must be a bool, got "
+                f"{self.compact_physical_weights!r}."
             )
         if self.local_num_tokens % 128:
             raise ValueError(
@@ -182,7 +198,15 @@ class QwenAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Run fused causal grouped-query attention."""
+        """Run fused causal grouped-query attention.
+
+        Args:
+            hidden_states: Token states shaped ``[batch, sequence, hidden]``.
+            position_ids: Sequence positions used by rotary embeddings.
+
+        Returns:
+            Attention output with the same shape as ``hidden_states``.
+        """
         batch_size, sequence_length, _ = hidden_states.shape
         query = (
             self.q_proj(hidden_states)
@@ -403,6 +427,8 @@ class QwenMoeBlock(nn.Module):
             num_experts=config.num_experts,
             top_k=config.top_k,
             expert_capacity_factor=config.expert_capacity_factor,
+            replica_slots_per_rank=config.replica_slots_per_rank,
+            compact_physical_weights=config.compact_physical_weights,
             ep_size=config.ep_size,
             ep_group=ep_group,
         )
@@ -413,7 +439,14 @@ class QwenMoeBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run routed experts and the always-active shared expert."""
+        """Run routed experts and the always-active shared expert.
+
+        Args:
+            hidden_states: Token states shaped ``[..., hidden_size]``.
+
+        Returns:
+            Sum of routed- and shared-expert outputs in the input shape.
+        """
         hidden_shape = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, hidden_shape[-1])
         if self.config.routing in ("balanced", "dirichlet"):
@@ -485,7 +518,15 @@ class QwenDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Run residual attention followed by residual MoE."""
+        """Run residual attention followed by residual MoE.
+
+        Args:
+            hidden_states: Decoder input shaped ``[batch, sequence, hidden]``.
+            position_ids: Sequence positions used by rotary embeddings.
+
+        Returns:
+            Decoder output with both residual updates applied.
+        """
         hidden_states = hidden_states + self.self_attn(
             self.input_layernorm(hidden_states),
             position_ids,
@@ -525,7 +566,15 @@ class QwenMoeModel(nn.Module):
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
-        """Return token logits and optional next-token loss."""
+        """Return token logits and optional next-token loss.
+
+        Args:
+            input_ids: Token IDs shaped ``[batch, sequence]``.
+            labels: Optional next-token training targets in the same shape.
+
+        Returns:
+            Token logits and an optional cross-entropy loss.
+        """
         hidden_states = self.embed_tokens(input_ids)
         position_ids = torch.arange(
             hidden_states.shape[1],

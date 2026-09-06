@@ -28,7 +28,7 @@ from pathlib import Path
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
-# The launcher activates CANN and the multicore payload before importing this
+# The launcher activates the Ascend toolkit and multicore payload before importing this
 # worker. Framework imports stay out of the ``test_mega_moe.py`` launcher.
 # pylint: disable=wrong-import-position
 import torch
@@ -36,6 +36,9 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.core.multicore.modules.mega_moe import MegaMoeExperts
+from hyper_parallel.core.multicore.modules.mega_moe.placement import (
+    build_constrained_expert_placement,
+)
 from tests.torch.expert_parallel._test_mega_moe_common import (
     DEVICE as _DEVICE,
     RANK as _RANK,
@@ -82,6 +85,16 @@ class _RunResult:
     route_weight_grad: torch.Tensor
     gate_up_weight_grad: torch.Tensor
     down_weight_grad: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _PerformanceRouteSpec:
+    """Reproducible route distribution selected by the performance worker."""
+
+    profile: str
+    dirichlet_alpha: float = 10000.0
+    dirichlet_seed: int = 42
+    clustered_experts: int = 12
 
 
 def _make_balanced_route(
@@ -220,6 +233,42 @@ def _make_dirichlet_route(
         .clone()
     )
     return topk_ids.to(torch.int32), topk_weights, counts.to(torch.int32)
+
+
+def _make_clustered_route(
+    shape: _MoeShape,
+    active_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a valid route concentrated in the leading expert home ranks."""
+    if not shape.top_k <= active_experts <= shape.num_experts:
+        raise ValueError(
+            f"clustered_experts must be in [{shape.top_k}, {shape.num_experts}], "
+            f"got {active_experts}."
+        )
+    token_positions = torch.arange(shape.local_num_tokens).reshape(-1, 1)
+    choice_offsets = torch.arange(shape.top_k).reshape(1, -1)
+    topk_ids = (token_positions + choice_offsets).remainder(active_experts)
+    tokens_per_expert = torch.bincount(
+        topk_ids.reshape(-1),
+        minlength=shape.num_experts,
+    ).to(torch.int32)
+    base_weights = torch.arange(
+        shape.top_k,
+        0,
+        -1,
+        dtype=torch.float32,
+        device=_DEVICE,
+    )
+    topk_weights = (
+        (base_weights / base_weights.sum())
+        .expand(shape.local_num_tokens, -1)
+        .clone()
+    )
+    return (
+        topk_ids.to(device=_DEVICE, dtype=torch.int32),
+        topk_weights,
+        tokens_per_expert.to(device=_DEVICE),
+    )
 
 
 def _make_overflow_route(
@@ -793,6 +842,82 @@ def test_mega_moe_hot_expert_replication() -> None:
     )
 
 
+def test_mega_moe_deferred_backward_hot_expert_replication() -> None:
+    """Compare shared and owner-invalidated persistent pools with native."""
+    shape = _MoeShape()
+    topk_ids, topk_weights, tokens_per_expert = _make_overflow_route(shape)
+    hidden_states, grad_output = _make_data(shape)
+    second_hidden = hidden_states.flip(0).contiguous()
+    second_grad_output = grad_output.roll(1, dims=0).contiguous()
+    mega, native = _new_layers(
+        shape,
+        expert_capacity_factor=1.0,
+        replica_slots_per_rank=1,
+    )
+    native_results = (
+        _run_layer(
+            native,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            tokens_per_expert,
+            grad_output,
+        ),
+        _run_layer(
+            native,
+            second_hidden,
+            topk_ids,
+            topk_weights,
+            tokens_per_expert,
+            second_grad_output,
+        ),
+    )
+    mega_results = _run_deferred_backward_pair(
+        mega,
+        (hidden_states, second_hidden),
+        topk_ids,
+        topk_weights,
+        tokens_per_expert,
+        (grad_output, second_grad_output),
+    )
+    for native_result, mega_result in zip(native_results, mega_results):
+        _assert_results_close(
+            native_result,
+            mega_result,
+            weight_grad_wave_count=2,
+        )
+
+    # Only the owner changes its local version counters. The cache decision
+    # must still invalidate collectively so every matching P2P peer refreshes.
+    if _RANK == 0:
+        with torch.no_grad():
+            native.gate_up_weight.add_(0.125)
+            mega.gate_up_weight.add_(0.125)
+            native.down_weight.sub_(0.0625)
+            mega.down_weight.sub_(0.0625)
+    refreshed_native = _run_layer(
+        native,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        tokens_per_expert,
+        grad_output,
+    )
+    refreshed_mega = _run_layer(
+        mega,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        tokens_per_expert,
+        grad_output,
+    )
+    _assert_results_close(
+        refreshed_native,
+        refreshed_mega,
+        weight_grad_wave_count=2,
+    )
+
+
 def test_mega_moe_replication_with_residual_multi_wave() -> None:
     """Compare bounded replication plus residual multi-wave with native MoE."""
     shape = _MoeShape(num_experts=8, top_k=4)
@@ -1087,10 +1212,13 @@ def _performance_shape() -> _MoeShape:
 def _new_performance_layer(
     shape: _MoeShape,
     backend: str,
+    replica_slots_per_rank: int,
 ) -> MegaMoeExperts | torch.nn.Module:
     """Construct one seeded backend without retaining its comparison peer."""
     torch.manual_seed(2026 + _RANK)
     if backend == "native":
+        if replica_slots_per_rank:
+            raise ValueError("native performance backend does not support replicas.")
         return new_common_moe(shape)
     if backend != "mega_moe":
         raise ValueError(
@@ -1105,6 +1233,7 @@ def _new_performance_layer(
         expert_capacity_factor=float(
             os.getenv("HP_MEGA_MOE_CAPACITY_FACTOR", "1.5")
         ),
+        replica_slots_per_rank=replica_slots_per_rank,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(
@@ -1386,21 +1515,138 @@ def _performance_receive_capacity(shape: _MoeShape) -> int:
     return (requested + granularity - 1) // granularity * granularity
 
 
+def _performance_route_spec_from_environment() -> _PerformanceRouteSpec:
+    """Return the validated route selector configured by the launcher."""
+    profile = os.getenv("HP_MEGA_MOE_PERF_ROUTE_PROFILE", "dirichlet")
+    if profile not in {"dirichlet", "clustered"}:
+        raise ValueError(
+            "HP_MEGA_MOE_PERF_ROUTE_PROFILE must be dirichlet or clustered, "
+            f"got {profile!r}."
+        )
+    return _PerformanceRouteSpec(
+        profile=profile,
+        dirichlet_alpha=float(
+            os.getenv("HP_MEGA_MOE_PERF_DIRICHLET_ALPHA", "10000")
+        ),
+        dirichlet_seed=int(os.getenv("HP_MEGA_MOE_PERF_DIRICHLET_SEED", "42")),
+        clustered_experts=int(
+            os.getenv("HP_MEGA_MOE_PERF_CLUSTERED_EXPERTS", "12")
+        ),
+    )
+
+
+def _make_performance_route(
+    shape: _MoeShape,
+    route_spec: _PerformanceRouteSpec,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    """Materialize one configured route and its reproducibility metadata."""
+    if route_spec.profile == "dirichlet":
+        topk_ids, topk_weights, tokens_per_expert = _make_dirichlet_route(
+            shape,
+            route_spec.dirichlet_alpha,
+            route_spec.dirichlet_seed,
+        )
+        descriptor = {
+            "profile": route_spec.profile,
+            "dirichlet_alpha": route_spec.dirichlet_alpha,
+            "dirichlet_seed": route_spec.dirichlet_seed,
+        }
+    else:
+        topk_ids, topk_weights, tokens_per_expert = _make_clustered_route(
+            shape,
+            route_spec.clustered_experts,
+        )
+        descriptor = {
+            "profile": route_spec.profile,
+            "clustered_experts": route_spec.clustered_experts,
+        }
+    return topk_ids, topk_weights, tokens_per_expert, descriptor
+
+
+def _classify_performance_route(
+    replica_slots_per_rank: int,
+    baseline_wave_count: int,
+    planned_wave_count: int,
+) -> str:
+    """Name the home, replica, and residual multi-wave execution regime."""
+    if replica_slots_per_rank == 0:
+        return "home-only" if planned_wave_count == 1 else "multi-wave-only"
+    if planned_wave_count > 1:
+        return "replica+residual-multi-wave"
+    if baseline_wave_count > 1:
+        return "replica-only"
+    return "replica-on-one-wave"
+
+
+def _summarize_performance_route(
+    shape: _MoeShape,
+    tokens_per_expert: torch.Tensor,
+    replica_slots_per_rank: int,
+    descriptor: dict,
+) -> dict:
+    """Gather rank counts and predict the exact physical placement regime."""
+    gathered_counts = torch.empty(
+        shape.ep_size * shape.num_experts,
+        dtype=torch.int32,
+        device=_DEVICE,
+    )
+    dist.all_gather_into_tensor(gathered_counts, tokens_per_expert)
+    logical_counts = tuple(
+        tuple(int(count) for count in source_counts)
+        for source_counts in gathered_counts.reshape(
+            shape.ep_size,
+            shape.num_experts,
+        )
+        .cpu()
+        .tolist()
+    )
+    planner_capacity = shape.local_num_tokens * shape.top_k
+    plan = build_constrained_expert_placement(
+        logical_counts,
+        replica_slots_per_rank,
+        receive_capacity=planner_capacity,
+    )
+    receive_capacity = _performance_receive_capacity(shape)
+    baseline_wave_count = plan.baseline_wave_count(receive_capacity)
+    planned_wave_count = plan.wave_count(receive_capacity)
+    expert_loads = [
+        sum(source_counts[expert] for source_counts in logical_counts)
+        for expert in range(shape.num_experts)
+    ]
+    baseline_loads = plan.baseline_destination_loads
+    planned_loads = plan.destination_loads
+    mean_destination_load = sum(baseline_loads) / len(baseline_loads)
+    return {
+        **descriptor,
+        "expert_loads": expert_loads,
+        "destination_loads": list(baseline_loads),
+        "physical_destination_loads": list(planned_loads),
+        "realized_destination_skew": max(baseline_loads) / mean_destination_load,
+        "physical_destination_skew": max(planned_loads) / mean_destination_load,
+        "receive_capacity": receive_capacity,
+        "planner_target_capacity": planner_capacity,
+        "baseline_wave_count": baseline_wave_count,
+        "expected_wave_count": planned_wave_count,
+        "replica_slots_per_rank": replica_slots_per_rank,
+        "replica_slots_used": len(plan.replica_transfers),
+        "replica_slot_bindings": [list(row) for row in plan.replica_expert_ids],
+        "execution_mode": _classify_performance_route(
+            replica_slots_per_rank,
+            baseline_wave_count,
+            planned_wave_count,
+        ),
+    }
+
+
 def _build_performance_result(
     backend: str,
     shape: _MoeShape,
-    alpha: float,
-    seed: int,
-    expert_loads: list[int],
-    destination_loads: list[int],
+    route: dict,
     warmup_steps: int,
     latencies: list[float],
     memory: dict,
 ) -> dict:
     """Build one route-matched latency and HBM record."""
-    receive_capacity = _performance_receive_capacity(shape)
-    mean_destination_load = sum(destination_loads) / len(destination_loads)
-    maximum_destination_load = max(destination_loads)
     return {
         "backend": backend,
         "topology": {
@@ -1415,22 +1661,7 @@ def _build_performance_result(
             "top_k": shape.top_k,
             "dtype": "bfloat16",
         },
-        "route": {
-            "profile": "dirichlet",
-            "dirichlet_alpha": alpha,
-            "dirichlet_seed": seed,
-            "expert_loads": expert_loads,
-            "destination_loads": destination_loads,
-            "realized_destination_skew": (
-                maximum_destination_load / mean_destination_load
-            ),
-            "receive_capacity": receive_capacity,
-            "expected_wave_count": max(
-                1,
-                (maximum_destination_load + receive_capacity - 1)
-                // receive_capacity,
-            ),
-        },
+        "route": route,
         "warmup_steps": warmup_steps,
         "measured_steps": len(latencies),
         "validation": {"gradients_present": True, "gradients_finite": True},
@@ -1450,29 +1681,24 @@ def _measure_performance_route(
     layer: MegaMoeExperts | torch.nn.Module,
     backend: str,
     shape: _MoeShape,
-    alpha: float,
-    seed: int,
+    route_spec: _PerformanceRouteSpec,
+    replica_slots_per_rank: int,
     hidden_states: torch.Tensor,
     grad_output: torch.Tensor,
     warmup_steps: int,
     measured_steps: int,
 ) -> dict:
-    """Measure one alpha/seed route while reusing a backend instance."""
-    topk_ids, topk_weights, tokens_per_expert = _make_dirichlet_route(
+    """Measure one route profile while reusing a backend instance."""
+    topk_ids, topk_weights, tokens_per_expert, route_descriptor = _make_performance_route(
         shape,
-        alpha,
-        seed,
+        route_spec,
     )
-    global_counts = tokens_per_expert.clone()
-    dist.all_reduce(global_counts, op=dist.ReduceOp.SUM)
-    expert_loads = [int(load) for load in global_counts.cpu().tolist()]
-    destination_loads = [
-        int(load)
-        for load in global_counts.reshape(shape.ep_size, shape.local_experts)
-        .sum(dim=1)
-        .cpu()
-        .tolist()
-    ]
+    route_summary = _summarize_performance_route(
+        shape,
+        tokens_per_expert,
+        replica_slots_per_rank,
+        route_descriptor,
+    )
 
     _timed_fwd_bwd(
         layer,
@@ -1512,10 +1738,7 @@ def _measure_performance_route(
     result = _build_performance_result(
         backend,
         shape,
-        alpha,
-        seed,
-        expert_loads,
-        destination_loads,
+        route_summary,
         warmup_steps,
         latencies,
         memory,
@@ -1538,15 +1761,17 @@ def test_mega_moe_fwd_bwd_performance() -> None:
 
     shape = _performance_shape()
     hidden_states, grad_output = _make_data(shape)
-    layer = _new_performance_layer(shape, backend)
-    alpha = float(os.getenv("HP_MEGA_MOE_PERF_DIRICHLET_ALPHA", "10000"))
-    seed = int(os.getenv("HP_MEGA_MOE_PERF_DIRICHLET_SEED", "42"))
+    replica_slots_per_rank = int(
+        os.getenv("HP_MEGA_MOE_PERF_REPLICA_SLOTS", "0")
+    )
+    layer = _new_performance_layer(shape, backend, replica_slots_per_rank)
+    route_spec = _performance_route_spec_from_environment()
     result = _measure_performance_route(
         layer,
         backend,
         shape,
-        alpha,
-        seed,
+        route_spec,
+        replica_slots_per_rank,
         hidden_states,
         grad_output,
         warmup_steps,
@@ -1583,15 +1808,23 @@ def test_mega_moe_dirichlet_performance_sweep() -> None:
 
     shape = _performance_shape()
     hidden_states, grad_output = _make_data(shape)
-    layer = _new_performance_layer(shape, backend)
+    replica_slots_per_rank = int(
+        os.getenv("HP_MEGA_MOE_PERF_REPLICA_SLOTS", "0")
+    )
+    layer = _new_performance_layer(shape, backend, replica_slots_per_rank)
     results = []
     for alpha, seed in points:
+        route_spec = _PerformanceRouteSpec(
+            profile="dirichlet",
+            dirichlet_alpha=alpha,
+            dirichlet_seed=seed,
+        )
         result = _measure_performance_route(
             layer,
             backend,
             shape,
-            alpha,
-            seed,
+            route_spec,
+            replica_slots_per_rank,
             hidden_states,
             grad_output,
             warmup_steps,
