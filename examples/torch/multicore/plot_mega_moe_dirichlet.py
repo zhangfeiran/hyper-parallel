@@ -39,7 +39,9 @@ _LOGICAL_FIELDS = (
     "destination_loads", "realized_destination_skew", "receive_capacity", "baseline_wave_count",
 )
 _SOURCE_FIELDS = ("git_head", "worker_sha256", "adapter_sha256", "native_artifacts")
-_STACK_DEFAULTS = {"layers": 1, "checkpoint": "none", "scope": "single expert layer", "optimizer": "none"}
+_STACK_DEFAULTS = {"layers": 1, "checkpoint": "none", "scope": "single expert layer", "optimizer": "none",
+                   "optimizer_timing": None, "validation_protocol": None, "latency_metric": "fwd_bwd"}
+_LATENCY_FIELDS = {"fwd_bwd": "rank_max_fwd_bwd_ms", "train_step": "rank_max_train_step_ms"}
 
 
 @dataclass(frozen=True)
@@ -65,7 +67,22 @@ def _logical_signature(point: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_point(point: dict[str, Any], variant: str) -> tuple[float, int]:
+def _validate_latencies(point: dict[str, Any], latency_metric: str) -> None:
+    if latency_metric not in _LATENCY_FIELDS:
+        raise ValueError(f"Unknown latency metric: {latency_metric}.")
+    for metric in dict.fromkeys(("fwd_bwd", latency_metric)):
+        samples = point.get(_LATENCY_FIELDS[metric], {}).get("samples", [])
+        if not samples or len(samples) != point["measured_steps"]:
+            raise ValueError(f"Latency sample count does not match measured_steps: {metric}.")
+        for sample in samples:
+            _number(sample, "latency sample", minimum=1e-300)
+    if latency_metric == "train_step" and any(
+            total < fwd_bwd for total, fwd_bwd in zip(point["rank_max_train_step_ms"]["samples"],
+                                                    point["rank_max_fwd_bwd_ms"]["samples"])):
+        raise ValueError("Train-step latency cannot be shorter than its F+B interval.")
+
+
+def _validate_point(point: dict[str, Any], variant: str, latency_metric: str) -> tuple[float, int]:
     route = point["route"]
     alpha = _number(route["dirichlet_alpha"], "alpha", minimum=1e-300)
     seed = route["dirichlet_seed"]
@@ -77,11 +94,7 @@ def _validate_point(point: dict[str, Any], variant: str) -> tuple[float, int]:
     expected_backend = "native" if variant == "native" else "mega_moe"
     if point["backend"] != expected_backend:
         raise ValueError(f"Backend mismatch for {variant}.")
-    samples = point["rank_max_fwd_bwd_ms"]["samples"]
-    if not samples or len(samples) != point["measured_steps"]:
-        raise ValueError("Latency sample count does not match measured_steps.")
-    for sample in samples:
-        _number(sample, "latency sample", minimum=1e-300)
+    _validate_latencies(point, latency_metric)
     if not all(point["validation"].get(name) is True for name in ("gradients_present", "gradients_finite")):
         raise ValueError("Performance record did not validate gradients.")
     loads = route["destination_loads"]
@@ -130,7 +143,13 @@ def _load_variant(paths: Sequence[Path], variant: str) -> tuple[dict, dict]:
         header = current_header
         keys = set()
         for point in payload["points"]:
-            key = _validate_point(point, variant)
+            key = _validate_point(point, variant, config.get("latency_metric", "fwd_bwd"))
+            if config.get("validation_protocol") is not None:
+                if not all(point["validation"].get(name) is True
+                           for name in ("post_measurement_finite", "optimizer_states_finite")):
+                    raise ValueError("Performance record did not validate after optimizer updates.")
+                if len(point.get("optimizer_state_per_rank", [])) != point["topology"]["ep"]:
+                    raise ValueError("Optimizer state ledger does not match EP topology.")
             if (point.get("layers", 1) != layers
                     or point.get("checkpoint", "none") != config.get("checkpoint", "none")):
                 raise ValueError("Layer count or checkpoint record disagrees with the configuration.")
@@ -150,15 +169,19 @@ def _load_variant(paths: Sequence[Path], variant: str) -> tuple[dict, dict]:
     return dict(records), header
 
 
-def _aggregate(points: list[dict[str, Any]]) -> dict[str, Any]:
-    samples = [sample for point in points for sample in point["rank_max_fwd_bwd_ms"]["samples"]]
+def _aggregate(points: list[dict[str, Any]], latency_metric: str) -> dict[str, Any]:
+    field = _LATENCY_FIELDS[latency_metric]
+    samples = [sample for point in points for sample in point[field]["samples"]]
     ordered = sorted(samples)
     return {
         "latency_ms": statistics.median(samples),
         "p90_ms": ordered[math.ceil(len(ordered) * 0.9) - 1],
         "process_medians_ms": [
-            statistics.median(point["rank_max_fwd_bwd_ms"]["samples"]) for point in points
+            statistics.median(point[field]["samples"]) for point in points
         ],
+        "fwd_bwd_latency_ms": statistics.median(
+            sample for point in points for sample in point["rank_max_fwd_bwd_ms"]["samples"]
+        ),
         "samples": len(samples),
         "hbm_gib": max(
             point["memory"]["rank_max"]["conservative_total_peak_bytes"] for point in points
@@ -208,6 +231,7 @@ def load_results(inputs: Mapping[str, Sequence[Path]]) -> CurveDataset:
             raise ValueError("Shared B requires B=1 and excludes compact physical weights.")
     rows = []
     workload = None
+    latency_metric = reference_header["configuration"].get("latency_metric", "fwd_bwd")
     for key, references in reference_records.items():
         signature = _logical_signature(references[0])
         current_workload = (signature["shape"], signature["topology"], signature["route"]["receive_capacity"])
@@ -222,7 +246,7 @@ def load_results(inputs: Mapping[str, Sequence[Path]]) -> CurveDataset:
         for variant, (records, _) in loaded.items():
             if any(_logical_signature(point) != signature for point in records[key]):
                 raise ValueError(f"Logical route or shape mismatch at {key} for {variant}.")
-            for name, value in _aggregate(records[key]).items():
+            for name, value in _aggregate(records[key], latency_metric).items():
                 row[f"{variant}_{name}"] = value
         rows.append(row)
     rows.sort(key=lambda row: (row["original_skew"], row["alpha"], row["seed"]))
@@ -237,7 +261,8 @@ def load_results(inputs: Mapping[str, Sequence[Path]]) -> CurveDataset:
         "input_files": {variant: [str(path.resolve()) for path in paths] for variant, paths in inputs.items()},
         "independent_runs_per_variant": len(inputs["native"]),
         "hbm_definition": "max_rank(allocator peak + full external SHMEM heap); maximum over repeated runs",
-        "latency_definition": "median of pooled rank-max F+B samples; independent process medians retained separately",
+        "latency_metric": latency_metric,
+        "latency_definition": f"pooled rank-max {latency_metric} median; per-process medians retained",
         "x_definition": "original home-destination max(rows) / mean(rows), before replication",
         "line_definition": "connected route measurements, not a fitted performance model",
     }
@@ -298,13 +323,17 @@ def _render(dataset: CurveDataset, output_dir: Path) -> None:
             axis.axvline(boundary, color="#888888", linestyle=":", linewidth=0.9)
             axis.text(boundary + 0.025, 0.04, f"B=0: W{wave + 1}",
                       transform=axis.get_xaxis_transform(), fontsize=9, color="#666666")
-    axes[0].set_ylabel("Median forward + backward (ms)")
+    includes_optimizer = metadata["latency_metric"] == "train_step"
+    axes[0].set_ylabel("Median F+B + optimizer step (ms)" if includes_optimizer else "Median forward + backward (ms)")
     weight_state = "weights updated every step" if config["optimizer_step"] else "warmed weight cache"
+    optimizer_label = "included" if includes_optimizer else "excluded"
     axes[0].set_title(
-        f"{layers} MoE layer(s); checkpoint={checkpoint}; {weight_state}; optimizer excluded", fontsize=11,
+        f"{layers} MoE layer(s); checkpoint={checkpoint}; {weight_state}; optimizer {optimizer_label}", fontsize=11,
     )
     axes[1].set_ylabel("Total peak HBM / rank (GiB)")
-    axes[1].set_title("Allocator peak + full SHMEM heap; persistent high-watermarks retained", fontsize=11)
+    optimizer = config.get("optimizer")
+    state_label = f" (includes {optimizer['name']} states)" if isinstance(optimizer, dict) else ""
+    axes[1].set_title(f"Allocator peak{state_label} + full SHMEM heap; high-watermarks retained", fontsize=11)
     axes[1].set_xlabel("Original routing skew S = max home-destination rows / mean rows (before replication)")
     figure.suptitle(
         f"Native / MegaMoe B=0 / B=1 across routing skew — {layers} MoE layer(s)\n"

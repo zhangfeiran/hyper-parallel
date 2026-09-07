@@ -83,11 +83,20 @@ same original route in a step, making the skew coordinate unambiguous.
 
 Both MegaMoe variants share execution resources before first forward. B1 uses
 `shared_physical_weights=True`, leaving home parameters intact and sharing only
-the B-slot weight/FP32-gradient pools. SGD updates parameters every iteration,
-outside F+B timing; subsequent replica refresh and checkpoint recomputation are
-timed. HBM includes all 16 layers' home parameters/gradients, inputs, live outputs,
-retained resources, and the full SHMEM heap. The peak window also includes SGD,
-which uses no momentum or extra optimizer state. It is not a full AdamW estimate.
+the B-slot weight/FP32-gradient pools. `torch.optim.AdamW` updates parameters
+every iteration (`lr=1e-4`, `betas=(0.9, 0.999)`, `eps=1e-8`,
+`weight_decay=0.01`, `foreach=False`, `fused=False`). The latency plot uses the
+directly measured full step (zero-grad + F+B + AdamW update), while JSON and CSV
+also retain F+B-only latency. Both synchronized wall timers use the same start;
+cross-rank timing aggregation happens after both stop, not between phases.
+The full-step rank-max is not a sum of phase rank-maxima. Subsequent replica
+refresh and checkpoint recomputation are timed. HBM includes
+all 16 layers' home parameters/gradients, inputs, live outputs, retained resources,
+AdamW states/update temporaries, and the full SHMEM heap. State is initialized
+before resetting peak statistics. The per-rank optimizer-state byte/dtype ledger
+is diagnostic, not an extra term added to the allocator peak. Standard AdamW
+uses parameter-dtype moments (BF16 here); this example does not add FP32 master
+parameters or model a full transformer's optimizer memory.
 
 After activating matching native artifacts and verifying the editable checkout,
 run each variant in a fresh, idle-gated process, for example:
@@ -100,16 +109,20 @@ python -m torch.distributed.run --nproc_per_node=8 --master_port=29500 \
 
 The default route set is the same 55 alpha/seed pairs used by the single-layer
 curve, including high-skew W3/W4 routes. `--pairs 10000:42,0.005:943` selects a
-short smoke sweep. Use the same command/configuration for native, b0, and b1,
+short smoke sweep; `--limit 4` replays the first four routes of the full shuffled
+sequence without changing their order. Use the same command/configuration for native, b0, and b1,
 then repeat in reverse order (`native, b0, b1, b1, b0, native`). Pass all six JSON
 files to the plot command above. Each point validates finite outputs and all
-input/router/parameter gradients before warmup; this is not a numerical oracle
-comparison. Run the shared-weight and compact-transition precision regressions
+input/router/parameter gradients before warmup and after all measured updates.
+The post-measurement check also validates parameters and AdamW state, outside
+both timing and the HBM peak window; this is not a numerical oracle comparison.
+Run the shared-weight and compact-transition precision regressions
 separately when changing runtime code.
 
 The plotter rejects mixed layer counts, checkpoint modes, optimizer protocols,
-and workload scope. Latency is measured for the complete multi-layer F+B, not
-single-layer latency multiplied by the layer count.
+and workload scope, including whether latency includes the optimizer update.
+Latency is measured for the complete multi-layer step, not single-layer latency
+multiplied by the layer count.
 
 The legacy single-layer fixed-route F+B workload excludes optimizer updates and activation
 checkpointing. In particular, B1 can reuse same-version physical weights

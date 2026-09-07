@@ -130,7 +130,8 @@ class TestPlotMegaMoeDirichlet(unittest.TestCase):
         for variant in ("native", "b0", "b1"):
             payload = self._payload(variant)
             payload["configuration"].update(
-                layers=16, checkpoint="reentrant", scope="independent MoE layers", optimizer="SGD",
+                layers=16, checkpoint="reentrant", scope="independent MoE layers",
+                optimizer={"name": "AdamW", "lr": 1e-4, "weight_decay": 0.01, "foreach": False},
                 compact_physical_weights=False, shared_physical_weights=variant == "b1",
                 optimizer_step=True,
             )
@@ -146,10 +147,51 @@ class TestPlotMegaMoeDirichlet(unittest.TestCase):
         self.assertEqual(dataset.rows[0]["b1_latency_ms"], 8.0)
         self.assertAlmostEqual(dataset.rows[0]["b1_hbm_gib"], 1.5 + 7 / GIB)
 
+    def _train_step_inputs(self):
+        inputs = self._stack_inputs()
+        for variant, paths in inputs.items():
+            payload = json.loads(paths[0].read_text(encoding="utf-8"))
+            payload["configuration"]["latency_metric"] = "train_step"
+            point = payload["points"][0]
+            point["rank_max_train_step_ms"] = {
+                "samples": [sample + 100 for sample in point["rank_max_fwd_bwd_ms"]["samples"]],
+            }
+            self._write(variant, payload)
+        return inputs
+
+    def test_plot_full_step_and_retain_fwd_bwd_for_export(self):
+        """Full-step curves use direct totals while keeping F+B separately in CSV."""
+        dataset = load_results(self._train_step_inputs())
+        self.assertEqual(dataset.metadata["latency_metric"], "train_step")
+        self.assertEqual(dataset.rows[0]["b1_latency_ms"], 108.0)
+        self.assertEqual(dataset.rows[0]["b1_process_medians_ms"], [108.0])
+        self.assertEqual(dataset.rows[0]["b1_fwd_bwd_latency_ms"], 8.0)
+        self.assertAlmostEqual(dataset.rows[0]["b1_hbm_gib"], 1.5 + 7 / GIB)
+
+    def test_reject_missing_or_shorter_full_step_samples(self):
+        """Optimizer-inclusive records need valid direct intervals, not estimates."""
+        for samples in ([], [7, 8, 9], [10, 11], [math.inf, 20, 30]):
+            with self.subTest(samples=samples):
+                inputs = self._train_step_inputs()
+                payload = json.loads(inputs["native"][0].read_text(encoding="utf-8"))
+                payload["points"][0]["rank_max_train_step_ms"]["samples"] = samples
+                self._write("native", payload)
+                with self.assertRaisesRegex(ValueError, "[Ll]atency"):
+                    load_results(inputs)
+
+    def test_reject_mixed_optimizer_timing_in_curves(self):
+        """F+B and optimizer-inclusive variants cannot share a comparison curve."""
+        inputs = self._train_step_inputs()
+        payload = json.loads(inputs["b1"][0].read_text(encoding="utf-8"))
+        payload["configuration"]["latency_metric"] = "fwd_bwd"
+        self._write("b1", payload)
+        with self.assertRaisesRegex(ValueError, "latency_metric"):
+            load_results(inputs)
+
     def test_reject_mixed_layer_checkpoint_and_storage_contracts(self):
         """Different stack sizes or checkpoint lifetimes are not paired work."""
         for key, value in (("layers", 1), ("checkpoint", "none"), ("scope", "connected"),
-                           ("optimizer", "AdamW"), ("compact_physical_weights", True)):
+                           ("optimizer", "SGD"), ("compact_physical_weights", True)):
             with self.subTest(key=key):
                 inputs = self._stack_inputs()
                 payload = json.loads(inputs["b1"][0].read_text(encoding="utf-8"))
@@ -159,6 +201,26 @@ class TestPlotMegaMoeDirichlet(unittest.TestCase):
                 self._write("b1", payload)
                 with self.assertRaises(ValueError):
                     load_results(inputs)
+
+    def test_require_post_update_validation_when_declared(self):
+        """Do not plot a run that omits or fails its post-update finite checks."""
+        inputs = self._stack_inputs()
+        for variant, paths in inputs.items():
+            payload = json.loads(paths[0].read_text(encoding="utf-8"))
+            payload["configuration"]["validation_protocol"] = "before and after measurement"
+            payload["points"][0]["validation"].update(post_measurement_finite=True, optimizer_states_finite=True)
+            payload["points"][0]["optimizer_state_per_rank"] = [{"tensor_bytes": GIB}] * 8
+            self._write(variant, payload)
+        self.assertEqual(len(load_results(inputs).rows), 1)
+        for field in ("post_measurement_finite", "optimizer_states_finite"):
+            with self.subTest(field=field):
+                payload = json.loads(inputs["b1"][0].read_text(encoding="utf-8"))
+                payload["points"][0]["validation"][field] = False
+                self._write("b1", payload)
+                with self.assertRaisesRegex(ValueError, "after optimizer updates"):
+                    load_results(inputs)
+                payload["points"][0]["validation"][field] = True
+                self._write("b1", payload)
 
     def test_reject_point_with_different_stack_metadata(self):
         """A point cannot silently inherit an incompatible sweep header."""

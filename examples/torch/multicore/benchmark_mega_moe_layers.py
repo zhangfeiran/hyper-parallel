@@ -16,8 +16,8 @@
 
 Run this worker with torchrun from an editable repository checkout. Inputs and
 parameters are independent per layer; all forwards precede reverse backwards.
-This is not a connected transformer model. Route sampling and SGD updates are
-outside F+B timing, but every update invalidates replica weight versions.
+This is not a connected transformer model. Both F+B and F+B + AdamW step are
+timed directly; route sampling is excluded. Updates invalidate replica versions.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import json
 import math
 import os
 import random
+import statistics
 import subprocess
 import time
 from functools import partial
@@ -39,13 +40,15 @@ ALPHAS = (10000, 3000, 1000, 300, 100, 30, 10, 3, 1, 0.5, 0.2, 0.1, 0.05, 0.02, 
 EXTRA_PAIRS = ((0.01, 1942), (0.01, 1708), (0.01, 0), (0.005, 943), (0.01, 2104),
                (0.01, 4050), (0.01, 2486), (0.01, 1164), (0.01, 29), (0.02, 1942))
 SCOPE = "independent MoE layers; all forwards then reverse backwards; no attention or router network"
+ADAMW_OPTIONS = {"lr": 1e-4, "betas": (0.9, 0.999), "eps": 1e-8,
+                 "weight_decay": 0.01, "foreach": False, "fused": False}
 
 # Reuse the ST's route generator, native implementation and non-overlapping HBM
 # ledger so the multi-layer example and single-layer curves compare the same work.
 # pylint: disable=protected-access
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", choices=("native", "b0", "b1"), required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -54,9 +57,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--measured", type=int, default=7)
     parser.add_argument("--pairs", help="Override the 55-route sweep, e.g. 10000:42,0.005:943.")
     parser.add_argument("--shuffle-seed", type=int, default=20260903)
-    args = parser.parse_args()
+    parser.add_argument("--limit", type=int, help="Only run this many routes from the shuffled sweep prefix.")
+    args = parser.parse_args(argv)
     if args.layers <= 0 or args.warmup < 0 or args.measured <= 0:
         parser.error("layers and measured must be positive; warmup must be nonnegative")
+    if args.limit is not None and args.limit <= 0:
+        parser.error("limit must be positive")
     if args.output.exists():
         parser.error(f"refusing to overwrite {args.output}")
     return args
@@ -72,7 +78,28 @@ def _route_pairs(args: argparse.Namespace) -> list[tuple[float, int]]:
     if any(not math.isfinite(alpha) or alpha <= 0 or seed < 0 for alpha, seed in points):
         raise ValueError("alpha must be positive and finite; seed must be nonnegative")
     random.Random(args.shuffle_seed).shuffle(points)
-    return points
+    return points[:args.limit]
+
+
+def _make_optimizer(torch: Any, parameters: Any) -> Any:
+    return torch.optim.AdamW(parameters, **ADAMW_OPTIONS)
+
+
+def _optimizer_state_ledger(torch: Any, optimizer: Any) -> dict[str, Any]:
+    # These tensors already belong to the allocator peak, not an extra HBM term.
+    by_device, by_dtype = {}, {}
+    for state in optimizer.state.values():
+        for name, tensor in state.items():
+            if not torch.is_tensor(tensor):
+                continue
+            if not bool(torch.isfinite(tensor).all().item()):
+                raise AssertionError(f"nonfinite AdamW state: {name}")
+            size = tensor.numel() * tensor.element_size()
+            device, dtype = tensor.device.type, str(tensor.dtype)
+            by_device[device] = by_device.get(device, 0) + size
+            by_dtype[dtype] = by_dtype.get(dtype, 0) + size
+    return {"parameter_state_count": len(optimizer.state), "tensor_bytes": sum(by_device.values()),
+            "tensor_bytes_by_device": by_device, "tensor_bytes_by_dtype": by_dtype}
 
 
 def _source_identity() -> dict[str, Any]:
@@ -108,7 +135,7 @@ class _LayerSweep:
         self.layers = self._make_layers()
         hidden, self.grad_output = worker._make_data(self.shape)
         self.inputs = [hidden.clone() for _ in self.layers]
-        self.optimizer = worker.torch.optim.SGD(self.layers.parameters(), lr=1e-5, foreach=False)
+        self.optimizer = _make_optimizer(worker.torch, self.layers.parameters())
 
     def _make_layers(self) -> Any:
         worker, shape = self.worker, self.shape
@@ -174,8 +201,26 @@ class _LayerSweep:
             raise AssertionError("shared B changed the home parameter storage size")
         return ledger
 
+    def _measure_steps(self, route: tuple) -> tuple[list[float], list[float]]:
+        worker = self.worker
+        latencies, step_latencies = [], []
+        for _ in range(self.args.measured):
+            worker.dist.barrier()
+            worker.torch.npu.synchronize(worker._DEVICE)
+            started = time.perf_counter()
+            self._train_step(route)
+            worker.torch.npu.synchronize(worker._DEVICE)
+            elapsed = (time.perf_counter() - started) * 1000
+            self.optimizer.step()
+            worker.torch.npu.synchronize(worker._DEVICE)
+            step_elapsed = (time.perf_counter() - started) * 1000
+            # Aggregate only after both timers stop: diagnostics are not training.
+            latencies.append(worker._rank_max_latency(elapsed))
+            step_latencies.append(worker._rank_max_latency(step_elapsed))
+        return latencies, step_latencies
+
     def measure(self, alpha: float, seed: int) -> dict[str, Any]:
-        """Validate gradients, then measure one route with fresh weights each step."""
+        """Measure one route, validating before warmup and after all updates."""
         worker = self.worker
         route = worker._make_dirichlet_route(self.shape, alpha, seed)
         summary = worker._summarize_performance_route(
@@ -192,26 +237,29 @@ class _LayerSweep:
         worker.torch.npu.synchronize(worker._DEVICE)
         baseline = worker._device_memory_snapshot()
         worker.torch.npu.reset_peak_memory_stats(worker._DEVICE)
-        latencies = []
-        for _ in range(self.args.measured):
-            worker.dist.barrier()
-            worker.torch.npu.synchronize(worker._DEVICE)
-            started = time.perf_counter()
-            self._train_step(route)
-            worker.torch.npu.synchronize(worker._DEVICE)
-            elapsed = (time.perf_counter() - started) * 1000
-            latencies.append(worker._rank_max_latency(elapsed))
-            # Refresh parameter versions between measurements without timing SGD.
-            self.optimizer.step()
-            worker.torch.npu.synchronize(worker._DEVICE)
+        latencies, step_latencies = self._measure_steps(route)
         memory = worker._collect_memory_result(self.layers[0], baseline)
+        # Capture memory first: finite checks allocate untimed diagnostic tensors.
+        self._train_step(route, validate=True)
+        for parameter in self.layers.parameters():
+            if not bool(worker.torch.isfinite(parameter).all().item()):
+                raise AssertionError("nonfinite parameter after AdamW updates")
+        local_ledger = {"shared_pool": self._pool_ledger(),
+                        "optimizer_state": _optimizer_state_ledger(worker.torch, self.optimizer)}
+        ledgers = [None] * self.shape.ep_size
+        worker.dist.all_gather_object(ledgers, local_ledger)
         result = worker._build_performance_result(
             "native" if self.args.variant == "native" else "mega_moe",
             self.shape, summary, self.args.warmup, latencies, memory,
         )
-        ledgers = [None] * self.shape.ep_size
-        worker.dist.all_gather_object(ledgers, self._pool_ledger())
-        result["shared_pool_per_rank"] = ledgers
+        result["rank_max_train_step_ms"] = {
+            "samples": step_latencies, "median": statistics.median(step_latencies),
+            "p90": worker._percentile(step_latencies, 0.9),
+            "minimum": min(step_latencies), "maximum": max(step_latencies),
+        }
+        result["shared_pool_per_rank"] = [ledger["shared_pool"] for ledger in ledgers]
+        result["optimizer_state_per_rank"] = [ledger["optimizer_state"] for ledger in ledgers]
+        result["validation"].update(post_measurement_finite=True, optimizer_states_finite=True)
         result["layers"] = self.args.layers
         result["checkpoint"] = "reentrant"
         self.optimizer.zero_grad(set_to_none=True)
@@ -224,7 +272,10 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
         "compact_physical_weights": False, "shared_physical_weights": args.variant == "b1",
         "layers": args.layers, "checkpoint": "reentrant", "scope": SCOPE,
         "warmup_steps": args.warmup, "measured_steps": args.measured, "shuffle_seed": args.shuffle_seed,
-        "optimizer_step": True, "optimizer": "SGD lr=1e-5 foreach=False; outside timing, inside HBM peak window",
+        "optimizer_step": True, "optimizer": {"name": "AdamW", **ADAMW_OPTIONS},
+        "latency_metric": "train_step",
+        "optimizer_timing": "direct F+B and full AdamW-step wall timers; states/updates inside HBM peak window",
+        "validation_protocol": "finite forward and gradients before warmup and after measurement; finite AdamW state",
         "weight_refresh": "parameters updated every iteration; replica refresh included in next F+B",
         "workspace_lifetime": "one shared execution group across layers and routes; high-watermarks retained",
         "runtime_environment": {key: value for key, value in os.environ.items()
