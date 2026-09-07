@@ -10,7 +10,7 @@
 | 项目 | 内容 |
 | --- | --- |
 | 整理日期 | 2026-09-07 |
-| 代码分支 | `megamoe-perf-sun` |
+| 代码分支 | `megamoe-sun`；历史性能数据来自重基前的 `megamoe-perf-sun` |
 | 代码基线 | 重基于 `megamoe-minimal-api@c24cfe7a`；以本文同提交代码为准 |
 | 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、`43aa7d6c`、`b255b821`、`40b6963b`、`9f75fd20`、`86f4b433`、`364af596`、`50a4e68c`、`5d2a3e38`、`ce089b10` |
 | 状态 | 已实现；multi-wave 保持 lossless；副本默认关闭；串行多层可显式启用 shared-B |
@@ -22,6 +22,11 @@
 owned-SHMEM 生命周期、`expert_capacity_factor=None` 默认值及按绑定容量分配的 SHMEM workspace；
 显式设置有限 capacity factor 后才使用有界接收窗口。标准 EP reference 已替换旧私有 native 实现。
 重新比较 latency/HBM 前必须从当前源码重建 native payload，并重新执行精度与性能验证。
+
+2026-09-07 已完成针对 `02082125 → fa1a1859` 的同配置复核，见
+[重基精度与性能复核](megamoe_sun_rebase_validation_20260907.md)。shared-B 主比较无明显性能
+或新增数值损失，HBM 不变；但发现 Conda 构建探测、测试 reference 适配问题，并确认重基前已存在
+的串联 workspace 梯度别名缺陷。不能把历史通过项或本轮局部 A/B 表述为整个新分支验收通过。
 
 ### 1.1 结论摘要
 
@@ -1101,6 +1106,20 @@ refresh / gradient return 的实际 payload、等待与 overlap 分解提升为�
 补到具体 expert 的就绪与非空 transfer 完成事件，再考虑调度。FP32 dW 第三位，双 buffer 仍最后。
 本轮未取得可保留的端到端加速，当前性能路径保持不变。
 
+#### 10.2.7 重基后的独立复核
+
+`megamoe-perf-sun@02082125` 与 `megamoe-sun@fa1a1859` 做新的 A/B/B/A，固定八个 rank 的
+全部初始参数、路由、capacity=1.5、16 独立层、B1、checkpoint 和每步 AdamW。
+偏斜 full-step 两次中位数均值为 `1361.275 → 1359.927 ms`（-0.099%），平衡为
+`802.988 → 804.218 ms`（+0.153%）。对应各 rank allocator / SHMEM 指标逐字节相同。
+本轮未观察到有意义的性能回退；亚百分比差异不作为收益。
+
+四步 optimizer 和路由切换的 312 个张量跨分支逐位一致，但正式 NPU 用例仍有两个失败。
+其中 connected shared-workspace 的梯度覆盖在旧分支同样复现，需先处理 dX storage ownership，
+再继续性能优化。新 adapter 使用当前 C++ 源码的 Conda-aware 诊断构建，常规 CMake 构建未通过。
+完整方法、失败归因、默认 None 的 HBM 差异及原始证据见
+[本轮复核报告](megamoe_sun_rebase_validation_20260907.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1393,6 +1412,10 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
    配对、逐 step 动态 skew、B1 residual waves 性能和长时收敛仍未覆盖。
 
 ## 15. 下一步优先级
+
+**重基复核后的前置项：** 先修复已复现的串联 dX / shared-workspace alias，再处理 Conda include
+探测及新 reference 的测试适配，重新通过真实设备验收；见第 10.2.7 节。下面的性能优化顺序在这些
+正确性和可复现构建问题解决后恢复，不能以同配置的性能无损跳过失败项。
 
 本轮按“扫测 → backward 诊断 → sizing 小改动 → A/B/B/A → forward 诊断 → 否决两种 peer 轮转”
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
