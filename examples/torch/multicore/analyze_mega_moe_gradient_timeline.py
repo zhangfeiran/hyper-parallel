@@ -35,6 +35,46 @@ def _contains(scope: dict[str, Any], host: dict[str, Any]) -> bool:
             and scope['start_ns'] <= host['start_ns'] <= scope['end_ns'])
 
 
+def _communication_events(
+    joined: list[tuple[dict[str, Any], dict[str, Any]]],
+    native: dict[str, Any],
+    scopes: dict[str, dict[str, Any]],
+    *,
+    receive_only: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate a P2P wait from its eventual compute-stream join through exact scopes."""
+    barriers = [device for device, host in joined if _contains(scopes['wait'], host)
+                and device['name'] == 'EVENT_WAIT']
+    streams = {(event['pid'], event['tid']) for event in barriers}
+    if len(streams) != 1:
+        raise ValueError('Non-unique P2P wait stream')
+    stream = next(iter(streams))
+    caller = (native['pid'], native['tid'])
+    independent = stream != caller
+    if independent and not receive_only:
+        raise ValueError('Gradient send lost its native producer dependency')
+    records = [device for device, host in joined if _contains(scopes['launch'], host)
+               and (device['pid'], device['tid']) == stream and device['name'] == 'EVENT_RECORD']
+    caller_barriers = ([device for device, host in joined
+                        if _contains(scopes['reduction'], host) and not _contains(scopes['wait'], host)
+                        and (device['pid'], device['tid']) == caller and device['name'] == 'EVENT_WAIT']
+                       if independent else barriers)
+    if not records or not caller_barriers:
+        raise ValueError('Missing P2P ready record or caller-stream join')
+    return records, barriers, caller_barriers
+
+
+def _validate_stream_order(row: dict[str, Any]) -> None:
+    """Require native production and P2P completion before owner consumption."""
+    if ((not row['independent_receive'] and row['ready_ns'] < row['native_end_ns'])
+            or row['p2p_wait_start_ns'] < row['ready_ns']
+            or row['wait_start_ns'] < row['native_end_ns']
+            or row['wait_end_ns'] < row['p2p_wait_end_ns']):
+        raise ValueError('Invalid producer/communication/consumer stream order')
+    if row['owner_start_ns'] is not None and row['owner_start_ns'] < row['wait_end_ns']:
+        raise ValueError('Owner starts before P2P completion')
+
+
 def _rank_timeline(path: Path, rank: int, payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize one host's clock and join its device events to launch/wait scopes."""
     raw_roots = list(path.parent.glob(path.stem + '_*_ascend_pt'))
@@ -89,23 +129,27 @@ def _rank_timeline(path: Path, rank: int, payload: dict[str, Any]) -> dict[str, 
         if not all(len(group) == 1 for group in (native, batch, launch, wait)):
             raise ValueError(f'Non-unique native/P2P launch/wait association: {rank} {index}')
         native, batch, launch, wait = native[0], batch[0], launch[0], wait[0]
-        records = [device for device, host in joined if _contains(launch, host)
-                   and device['tid'] == native['tid'] and device['name'] == 'EVENT_RECORD']
-        barriers = [device for device, host in joined if _contains(wait, host)
-                    and device['tid'] == native['tid'] and device['name'] == 'EVENT_WAIT']
+        records, barriers, caller_barriers = _communication_events(
+            joined, native, {'reduction': reduction, 'launch': launch, 'wait': wait},
+            receive_only=bool(gradient['transfers']) and all(
+                entry['operation'] == 'receive' for entry in gradient['transfers']
+            ),
+        )
         additions = [device for device, host in joined if _contains(reduction, host)
                      and device['args']['Task Type'].startswith('KERNEL')
                      and device['name'] != 'batch_send_recvAicpuKernel']
-        if not records or not barriers:
-            raise ValueError(f'Missing caller-stream ready record/wait: {rank} {index}')
         row = {
             'backward_index': index, 'layer': 15 - index,
             'native_start_ns': native['start_ns'], 'native_end_ns': native['end_ns'],
             'batch_control_start_ns': batch['start_ns'], 'batch_control_end_ns': batch['end_ns'],
             'ready_ns': max(event['end_ns'] for event in records),
-            'wait_start_ns': min(event['start_ns'] for event in barriers),
-            'wait_end_ns': max(event['end_ns'] for event in barriers),
-            'wait_task_count': len(barriers), 'ready_record_count': len(records),
+            'wait_start_ns': min(event['start_ns'] for event in caller_barriers),
+            'wait_end_ns': max(event['end_ns'] for event in caller_barriers),
+            'wait_task_count': len(caller_barriers), 'ready_record_count': len(records),
+            'p2p_stream_id': barriers[0]['tid'], 'caller_stream_id': native['tid'],
+            'independent_receive': barriers[0]['tid'] != native['tid'],
+            'p2p_wait_start_ns': min(event['start_ns'] for event in barriers),
+            'p2p_wait_end_ns': max(event['end_ns'] for event in barriers),
             'owner_start_ns': min((event['start_ns'] for event in additions), default=None),
             'owner_end_ns': max((event['end_ns'] for event in additions), default=None),
             'owner_kernel_names': [event['name'] for event in additions],
@@ -113,10 +157,7 @@ def _rank_timeline(path: Path, rank: int, payload: dict[str, Any]) -> dict[str, 
             'receive_from': sorted({entry['peer_rank'] for entry in gradient['transfers']
                                     if entry['operation'] == 'receive'}),
         }
-        if row['ready_ns'] < row['native_end_ns'] or row['wait_start_ns'] < row['ready_ns']:
-            raise ValueError(f'Invalid caller stream order: {rank} {index}')
-        if row['owner_start_ns'] is not None and row['owner_start_ns'] < row['wait_end_ns']:
-            raise ValueError(f'Owner starts before P2P completion: {rank} {index}')
+        _validate_stream_order(row)
         rows.append(row)
     return {'rank': rank, 'wall_offset_ns': offset, 'trace_events': len(events), 'rows': rows}
 
@@ -150,6 +191,8 @@ def main() -> None:
             'native_duration_ms': sum(row['native_end_ns'] - row['native_start_ns'] for row in rows) / 1e6,
             'ready_after_native_ms': sum(row['ready_ns'] - row['native_end_ns'] for row in rows) / 1e6,
             'wait_ms': sum(row['wait_end_ns'] - row['wait_start_ns'] for row in rows) / 1e6,
+            'independent_receive_calls': sum(row['independent_receive'] for row in rows),
+            'p2p_stream_wait_ms': sum(row['p2p_wait_end_ns'] - row['p2p_wait_start_ns'] for row in rows) / 1e6,
             'late_neighbor_ms': sum(row['late_neighbor_ns'] for row in rows) / 1e6,
             'after_neighbors_ready_ms': sum(row['after_neighbors_ready_ns'] for row in rows) / 1e6,
             'owner_kernels_ms': sum(row['owner_end_ns'] - row['owner_start_ns'] for row in rows

@@ -50,6 +50,11 @@ Conda 构建探测与 reference 适配随后也已修复，常规完整构建及
 rank 4/7 的约 88/82 ms 累计等待窗口与较晚邻居重合。下一候选收敛为仅接收路径的独立接收，
 尚非已兑现收益，见第 10.2.13 节及 [梯度就绪报告](megamoe_gradient_readiness_20260908.md)。
 
+receive-only 解耦随后已完成并保留：排查启动阶段进程竞争后重跑 A/B/B/A，偏斜完整 step
+减少 4.086%、F+B 减少 4.490%，平衡点基本不变。312 个张量逐位一致；只有 rank 5 的峰值
+allocated 增加约 1 MiB、reserved 增加 36 MiB，B pool 不变。详见第 10.2.14 节和
+[独立接收报告](megamoe_receive_only_overlap_20260908.md)。这仍不是整模型 Qwen 训练的性能结论。
+
 ### 1.1 结论摘要
 
 - 当前组合不是把 MoonEP CUDA 实现直接移植到 Ascend，而是把其“按路由热度动态复制专家”的思想，
@@ -1240,6 +1245,34 @@ rank 5 的 native backward 累计约 417 ms，rank 4/7 约 332/334 ms；其 rece
 无进程后重采并复现同一模式。剩余就绪后等待仍明显，不能将重合窗口或各 rank 累计值当作可
 节省的 step。详细方法、验收和复现见 [梯度就绪报告](megamoe_gradient_readiness_20260908.md)。
 
+#### 10.2.14 receive-only 梯度接收与本地 backward 重叠
+
+只对 NPU shared-B 且本 rank 无发送的梯度 batch，复用已有 control stream 分配 receive buffer、
+launch/wait，再由 native caller stream join 后进行原 FP32 owner 聚合。发送路径、CPU、legacy、
+kernel、planner、通信 payload 和 dX owned-storage clone 均不改变。跨流 buffer 使用
+`record_stream(consumer)`，异常使 pool 失效，防止后续 lease 继续复用。
+
+最终 fresh-process A/B/B/A 的每轮中位数均值：
+
+| 场景 | 旧 F+B → 新 F+B | 旧 full step → 新 full step | full step 变化 |
+| --- | ---: | ---: | ---: |
+| 偏斜 `0.1:42` | 1234.996 → 1179.547 ms | 1366.232 → 1310.406 ms | -4.086% |
+| 平衡 `10000:42` | 673.108 → 672.506 ms | 804.569 → 803.669 ms | -0.112% |
+
+首轮 B1 启动遇到额外 `akg_benchmark`，其数据保留但不作最终验收；表格来自随后重跑，四轮
+census 均只有各自八个 worker。配置、参数初始化、route、helper、17 个正式 native artifacts、
+P2P 描述符、optimizer 和 shared pool 一致。离散 census 不是排除所有瞬时竞争的独占保证。
+
+rank 5 的 trace caller wait 从前一轮 S2 的累计 105.269 ms 降到 39.812 ms；独立 control-stream
+wait 为 650.287 ms，二者不能混用。分析器已支持显式 caller join，原 S2 的全部已有字段重解析
+不变。312 个张量与旧代码逐位一致，5 项 ST、实际 EP8 B1/B2 各 21 组通过，最终 CPU
+217 passed / 196 subtests。
+
+偏斜 peak allocated/conservative peak 增加 1048064 bytes（约 1 MiB），平衡 allocated 不变；
+rank 5 reserved 增加 37748736 bytes（36 MiB），其他 rank 不变，final allocated 和 B pool 不变。
+先偏斜后平衡导致后者保留 reserve，不外推为纯平衡路径的固定成本。详细证据及后续优先级见
+[独立接收报告](megamoe_receive_only_overlap_20260908.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1547,10 +1580,10 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **优先验证 receive-only 梯度接收解耦。** 第 10.2.13 节两轮共同时间线显示 rank 5 只接收却
-   每层最晚 ready，平均 ready spread 约 5.5 ms，rank 4/7 约 88/82 ms 的等待窗口与晚邻居重合。
-   先从 plan 确认无发送，验证独立流分配/接收、owner 流读取前等待和跨流 storage 生命周期；
-   优先复用已有 control stream，不复制 B pool，实际 allocator HBM 必须重测。
+1. **优先补真实 Qwen 整模型的 shared-B 接入与训练验收，再重查剩余梯度等待。**
+   receive-only 解耦已经保留，独立 16 层 MoE 的偏斜 step 减少 4.086%，只增加约 1 MiB allocated
+   和 36 MiB reserved（第 10.2.14 节）。原整模型 example 尚未显式传入 shared-B，先补这一覆盖，
+   不把独立层收益直接外推整网。rank 1 的约 57.6 ms 晚邻居窗口及 rank 3 native 计算仍需归因。
    整专家合包已回退 1.806%，独立收尾也无确认收益（第 10.2.11--10.2.12 节），不再盲目叠加；
    含发送 batch 必须保留 native dW 的真实就绪依赖，不能泛化删除 caller wait。
    owner receive contribution 必须全部完成 FP32
