@@ -46,6 +46,10 @@ Conda 构建探测与 reference 适配随后也已修复，常规完整构建及
 0.68--1.33 ms/rank/step，未确认端到端收益，候选亦已撤回。下一项转向高等待 rank 的共同时间线，
 见第 10.2.12 节及 [收尾重叠报告](megamoe_gradient_epilogue_overlap_20260908.md)。
 
+随后两轮八卡共同时间线确认 receive-only rank 5 每层最晚 ready，平均 ready spread 约 5.5 ms；
+rank 4/7 的约 88/82 ms 累计等待窗口与较晚邻居重合。下一候选收敛为仅接收路径的独立接收，
+尚非已兑现收益，见第 10.2.13 节及 [梯度就绪报告](megamoe_gradient_readiness_20260908.md)。
+
 ### 1.1 结论摘要
 
 - 当前组合不是把 MoonEP CUDA 实现直接移植到 Ascend，而是把其“按路由热度动态复制专家”的思想，
@@ -1220,6 +1224,22 @@ reserved 增加 6 MiB，虽然 shared pool/SHMEM 的逻辑字节不变。
 rank 4/5/7 与 peer 的共同时间线，而非继续扩大消息、叠加 callback 或增加双 buffer。
 详细数值和证据见 [收尾重叠报告](megamoe_gradient_epilogue_overlap_20260908.md)。
 
+#### 10.2.13 全 rank 时间线收敛到 receive-only 依赖
+
+新增默认关闭的 `--profile-all-ranks` 和固定 16 层 EP8 的精确 flow 分析器。两轮各导出八份 trace，
+分别有 406692/407843 个 events，128/128 个梯度调用均能关联 native、input-ready、caller wait
+和 owner kernel。使用 CANN 标定恢复同机 monotonic 坐标，不把 AICPU control 的提前启动当作
+payload 就绪；无有效 peer/size 的 SDMA 明细不作逐链路因果解释。
+
+两轮全部 32 次逐层比较中，只接收梯度的 rank 5 始终最晚 ready；ready spread 均值为
+5.541/5.522 ms。rank 4/7 的暴露等待分别约 190--193/184--187 ms，其中晚邻居窗口约 88/82 ms。
+rank 5 的 native backward 累计约 417 ms，rank 4/7 约 332/334 ms；其 receive-only 批次仍依赖
+本地 caller-ready。下一项优先验证独立接收、计算流消费前等待和跨流 storage 保护。
+
+生产代码及 HBM 账本未改变，本轮没有新的加速结论。S1 启动与 UT 收尾有短暂重合，S2 已在设备
+无进程后重采并复现同一模式。剩余就绪后等待仍明显，不能将重合窗口或各 rank 累计值当作可
+节省的 step。详细方法、验收和复现见 [梯度就绪报告](megamoe_gradient_readiness_20260908.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1527,11 +1547,12 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **优先补 FP32 gradient return 高等待 rank 的共同时间线。** 两轮初始诊断的累计暴露等待为
-   `85--192 ms/rank`，权重仅 `34--55 ms/rank`。整专家合包导致完整训练回退 1.806%，已按第
-   10.2.11 节否决；第 10.2.12 节的独立收尾只建立 0.68--1.33 ms/rank/step 的等待前窗口，亦无
-   确认的端到端收益，已撤回。下一项关联 rank 4/5/7 与 peer 的 native backward 完成、通信到达、
-   排队和 owner 累加，分离可调度等待与必要传输；不凭 payload 大小直接轮转或继续放大消息。
+1. **优先验证 receive-only 梯度接收解耦。** 第 10.2.13 节两轮共同时间线显示 rank 5 只接收却
+   每层最晚 ready，平均 ready spread 约 5.5 ms，rank 4/7 约 88/82 ms 的等待窗口与晚邻居重合。
+   先从 plan 确认无发送，验证独立流分配/接收、owner 流读取前等待和跨流 storage 生命周期；
+   优先复用已有 control stream，不复制 B pool，实际 allocator HBM 必须重测。
+   整专家合包已回退 1.806%，独立收尾也无确认收益（第 10.2.11--10.2.12 节），不再盲目叠加；
+   含发送 batch 必须保留 native dW 的真实就绪依赖，不能泛化删除 caller wait。
    owner receive contribution 必须全部完成 FP32
    聚合后才能 cast；shared-B dW 发送完成前不能复用 storage，不能只移走 wait 破坏消费/复用依赖。
    默认 HBM 不增加优先；若合批需要额外复制或池，必须单独核算并经匹配 ABBA 才保留。局部事件

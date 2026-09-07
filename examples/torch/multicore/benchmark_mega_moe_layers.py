@@ -39,6 +39,7 @@ from typing import Any
 from examples.torch.multicore.mega_moe_layer_profile import (
     profile_layer_cycles,
     profile_layer_step,
+    profile_trace_paths,
 )
 from examples.torch.multicore.mega_moe_p2p_profile import profile_layer_p2p
 
@@ -73,6 +74,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, help="Only run this many routes from the shuffled sweep prefix.")
     parser.add_argument("--profile-output", type=Path,
                         help="After all measurements, trace one extra step of the first route on rank zero.")
+    parser.add_argument("--profile-all-ranks", action="store_true",
+                        help="With --profile-output, write one .rankN.json trace per rank instead of rank zero only.")
     parser.add_argument("--profile-kernel-cycles", action="store_true",
                         help="After timing, gather last forward/backward cycles on all ranks (first route, MegaMoe).")
     parser.add_argument("--profile-p2p", action="store_true",
@@ -90,11 +93,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("profile-p2p requires a MegaMoe variant")
     if os.getenv("HP_MEGA_MOE_KERNEL_CYCLE_PROFILE", "0") == "1":
         parser.error("unset HP_MEGA_MOE_KERNEL_CYCLE_PROFILE for timing; use --profile-kernel-cycles instead")
+    if args.profile_all_ranks and args.profile_output is None:
+        parser.error("profile-all-ranks requires profile-output")
     if args.profile_output is not None:
         if args.profile_output.exists() or args.profile_output.resolve() == args.output.resolve():
             parser.error("profile-output must be a new path distinct from output")
         if args.profile_output.suffix != ".json":
             parser.error("profile-output must have a .json suffix")
+        try:
+            paths = profile_trace_paths(args.profile_output, int(os.getenv("WORLD_SIZE", "8")),
+                                        all_ranks=args.profile_all_ranks)
+        except ValueError as exc:
+            parser.error(str(exc))
+        for path in paths:
+            if path.exists() or path.resolve() == args.output.resolve():
+                parser.error(f"trace destination must be new and distinct from output: {path}")
     return args
 
 
@@ -379,8 +392,12 @@ def main() -> None:
             if worker._RANK == 0:
                 results.append(result)
                 print("LAYER_SWEEP_POINT=" + json.dumps(result, sort_keys=True), flush=True)
+        trace_paths = ()
         if args.profile_output is not None:
-            profile_layer_step(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]), args.profile_output)
+            trace_paths = profile_trace_paths(args.profile_output, worker.dist.get_world_size(),
+                                              all_ranks=args.profile_all_ranks)
+            profile_layer_step(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]), args.profile_output,
+                               all_ranks=args.profile_all_ranks)
         kernel_cycles = None
         if args.profile_kernel_cycles:
             kernel_cycles = profile_layer_cycles(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]))
@@ -394,9 +411,13 @@ def main() -> None:
                        "source": source, "configuration": _configuration(args)}
             if args.profile_output is not None:
                 payload["diagnostic_trace"] = {
-                    "path": str(args.profile_output), "rank": 0, "alpha": points[0][0], "seed": points[0][1],
+                    "path": str(trace_paths[0]), "rank": 0, "alpha": points[0][0], "seed": points[0][1],
                     "timing": "one extra post-update step after all performance and memory measurements",
                 }
+                if args.profile_all_ranks:
+                    payload["diagnostic_trace"]["per_rank"] = [
+                        {"rank": rank, "path": str(path)} for rank, path in enumerate(trace_paths)
+                    ]
             if kernel_cycles is not None:
                 payload["diagnostic_kernel_cycles"] = {"alpha": points[0][0], "seed": points[0][1], **kernel_cycles}
             if p2p_profile is not None:
