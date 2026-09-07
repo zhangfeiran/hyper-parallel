@@ -1293,6 +1293,12 @@ EP8、两层 H1024/I256/T1024/V2048、B1、capacity=1.5，平衡/Dirichlet 0.1:4
 pool bytes 不是 allocator peak，短测 A/B 不是整模型优化 ABBA。下一项先扩展原宽度正确性再
 建立完整模型性能/HBM 基准，详见 [完整模型报告](megamoe_qwen_shared_integration_20260908.md)。
 
+随后在 `51d87203` 上补齐原 H5120/I1792/T4096/V32000 的两层、四层倾斜训练复验，均通过；
+每 rank 的 B weight/gradient 仍只有 52.5/105 MiB。发现现有 benchmark 同时常驻两个 backend
+及其 FP32 AdamW；按参数/dtype 下界，八层仅两套参数、master、moments 和 main grad 即需
+73.216 GiB，不含激活和 workspace，不能在 64 GiB 卡上当作单模型基准。下一项优先拆分两侧
+fresh process，再补默认八层 matched ABBA，详见完整模型报告第 5 节；尚无整模型优化收益结论。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1600,10 +1606,11 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **优先补真实 Qwen 原宽度验收及 matched ABBA，再重查剩余梯度等待。**
+1. **优先消除完整 Qwen 基准的双模型常驻，再做 matched ABBA。**
    receive-only 解耦已经保留，独立 16 层 MoE 的偏斜 step 减少 4.086%，只增加约 1 MiB allocated
    和 36 MiB reserved（第 10.2.14 节）。整模型 shared-B 接入及三种路由的小形状训练验收已完成
-   （第 10.2.15 节）；先补原宽度和完整模型 HBM/profile，不把独立层收益直接外推整网。
+   （第 10.2.15 节），原宽度两层/四层也已通过。先分离两侧 fresh process，避免八层双套训练状态
+   的 73.216 GiB 下界淹没 shared-B 成本，再补完整模型 HBM/profile，不把独立层收益外推整网。
    rank 1 的约 57.6 ms 晚邻居窗口及 rank 3 native 计算仍需归因。
    整专家合包已回退 1.806%，独立收尾也无确认收益（第 10.2.11--10.2.12 节），不再盲目叠加；
    含发送 batch 必须保留 native dW 的真实就绪依赖，不能泛化删除 caller wait。

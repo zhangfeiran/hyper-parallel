@@ -1,6 +1,6 @@
 # MegaMoe Qwen optimizer benchmark
 
-This directory contains a deliberately small end-to-end training benchmark:
+This directory contains a focused end-to-end training benchmark:
 
 - `qwen_moe_model.py` defines a random-weight Qwen MoE model with learned TopK
   routing, routed experts, shared experts, attention, and a language-model loss.
@@ -52,6 +52,14 @@ overload that replica planning does not remove.
 | Optimizer | HyperParallel AdamW, FP32 master / BF16 model |
 | Comparison order | common A, then MegaMoe B |
 | Default timing | 3 warmup + 5 measured optimizer steps |
+
+Memory caveat: the current comparison keeps **both** backends and both AdamW
+optimizers resident. At the default eight-layer shape, the model/master/moment/
+main-gradient tensors alone require about 73.2 GiB per rank, before activations
+or workspaces. This is not a single-model HBM measurement. Use the smaller
+correctness command below on 64 GiB devices; isolated-backend performance runs
+are the next benchmark improvement. Original-width two- and four-layer
+correctness checks have passed; the default eight-layer pair has not been run.
 
 ## Single-node run
 

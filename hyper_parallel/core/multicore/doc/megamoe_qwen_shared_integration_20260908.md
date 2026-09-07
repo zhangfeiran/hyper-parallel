@@ -112,11 +112,107 @@ modules/__init__.py  f9e4eb9637a000c9fda28553972797ce0d1e1b4912a7dce3d22539439f5
 
 ## 4. 本轮后优先级
 
-1. 扩展到原 H5120/I1792/T4096 宽度，再建立 connected model 的完整 optimizer-step matched ABBA、
-   全 rank HBM 和真实路由/层间反向 profile。先补原宽度正确性，不直接外推小形状或独立层结果。
+1. 原 H5120/I1792/T4096 宽度的两层/四层正确性已补齐（第 5 节）。接下来先拆开 benchmark 的
+   双模型/optimizer 常驻，再建立 connected model 的完整 optimizer-step matched ABBA、全 rank
+   HBM 和真实路由/层间反向 profile。不直接外推小形状或独立层结果。
 2. 从整模型 trace 重新定位剩余 receive/mixed batch 等待。rank 1 晚邻居窗口仍只是独立层证据；
    mixed send/receive 必须保留 native dW producer、owner FP32 聚合和 shared-B 复用依赖。
 3. 后续仍需逐 step 换路由、connected checkpoint、更大层数以及 B/capacity 曲线。不因跨层 B
    变大就取消 residual multi-wave，也不无条件加入额外 persistent pool。
 
 本轮没有证明优化达到上限；后续工作仍以正确性、端到端实测和 HBM 成本决定取舍。
+
+## 5. 原目标宽度复验与基准内存限制
+
+接入轮已直接本地提交为 `51d87203`。随后保持生产代码不变，另外启动 fresh-process 八卡
+两层、四层 Qwen：H5120/I1792/T4096/V32000，E48/K8、B1、capacity=1.5、Dirichlet 0.1:42，
+仍为每 backend 1 warmup + 2 measured optimizer steps。两个进程组均正常退出，原精度阈值下
+全部 first-step 比较通过：
+
+| 层数 | 参数/梯度张量数 | forward 最大绝对误差 | 梯度最大绝对误差 | 更新后最大归一化误差 |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 23 | 2.8610e-6 | 1.9073e-6 | 0.957214 |
+| 4 | 43 | 2.8610e-6 | 3.8147e-6 | 0.967874 |
+
+所有初始 canonical 参数逐位相同，更新后参数最大绝对误差均为 0.001953125。每个 rank 的
+B weight/gradient 均为 `55050240/110100480 bytes`，即 52.5/105 MiB，四层没有变成四份池。
+这些仍是短程正确性复验，不是旧/新 receive-only 版本的 matched ABBA，也没有验证收敛。
+
+进一步审查发现，现有 benchmark 同时构造 common 和 MegaMoe，并一直持有两套模型和
+FP32-master AdamW。`mixed_precision_optimizer.py` 为 BF16 模型建立 FP32 master，并保留
+FP32 `.grad` 到下一次 `zero_grad`；`core/optimizer/adamw.py` 的两个 moment 按 FP32 grad 分配。
+因此不能将该进程的总 HBM 当成单个 shared-B 模型的训练峰值。
+
+固定 synthetic route 没有 learned gate 参数。按当前模型结构，每 rank 的本地参数数量为：
+
+```text
+P_layer = 3 * (E / EP) * H * I
+          + 2 * H^2 + 2 * H * (num_key_value_heads * head_dim)
+          + 3 * H * shared_intermediate + 2 * H
+        = 232007680
+P_other = 2 * V * H + H = 327685120
+P_total = L * P_layer + P_other
+```
+
+每个 backend 的 BF16 模型、FP32 master、两个 FP32 moment 和 FP32 main grad 合计 `18 * P`
+bytes；两个 backend 为 `36 * P`。以下是逻辑张量下界推导，**不是实测 allocator peak**，
+不含激活、首次梯度快照、临时 comparison/GMM tensor、SHMEM、B pool 和 allocator reserve：
+
+| 层数 | 每 backend 本地参数数 | 双模型+master+moments | 再含两套 main grad |
+| --- | ---: | ---: | ---: |
+| 2 | 791700480 | 20.645 GiB | 26.544 GiB |
+| 4 | 1255715840 | 32.745 GiB | 42.101 GiB |
+| 8 | 2183746560 | 56.946 GiB | 73.216 GiB |
+
+在相同两层配置上另起 fresh 八卡进程，只在全部计时窗口结束后的 `_write_result` 前读取实际
+tensor 元数据。没有改模型、optimizer 或通信，也没有在计时窗口采样。两个 backend、全部八个
+rank 的账本完全一致，逐项验证了上述两层参数计数和 dtype 下界：
+
+| 每 backend 项目 | 实际持有 bytes |
+| --- | ---: |
+| BF16 model | 1583400960 |
+| FP32 master | 3166801920 |
+| FP32 main grad | 3166801920 |
+| FP32 AdamW moments | 6333603840 |
+
+该进程的跨 rank 最大 allocator peak allocated/reserved 为 `36853763584/40489713664 bytes`
+（34.323/37.709 GiB）。这是两套 backend 加首次准确性比较及整个训练过程的混合峰值，不是
+MegaMoe 单独的 HBM，不能与独立层 benchmark 的峰值直接相减。本次诊断仍通过全部 accuracy
+比较，更新后最大归一化误差为 0.957854。临时审计脚本仅保留 workload 引用、统计 local tensor
+字节并在结果输出前 gather；原 benchmark 本来就持有这些 workload 到退出，没有延长计时窗口
+内的 storage 生命周期。
+
+所以不再直接启动 64 GiB 卡上的默认八层双模型进程来反复触发 OOM。本轮未实跑八层；此处的
+不可容纳判断来自当前持有关系和 dtype 的下界，不是将两层实测峰值按比例外推。
+
+**优先级因此调整：** 下一轮先将 full-model accuracy 与 performance runner 解耦；common/MegaMoe
+分别使用独立 fresh process，在 CPU 侧保存/比较逐 tensor 的初始化、loss/logits、梯度及更新后
+参数，保留原 oracle。计时只驻留一个 backend，完成对称 warmup 与 ABBA，再采单模型全 rank HBM。
+不能只删除 common 的 optimizer 或快照而让两侧计时占用不对称，也不能以取消每步 AdamW、
+降低精度或缩小默认形状来掩盖基准限制。这个方案尚未实现，不计作 HBM 优化收益。
+
+原始证据在 `output/qwen_moe_optimizer/`，SHA256：
+
+```text
+qwen_shared_original_width_2layers_20260908.json
+  846bc2050c5aa456cc47ecac14f75f4ef5917bf1d89c34ada899214f4f3d0799
+qwen_shared_original_width_4layers_20260908.json
+  aa2c99773d508b269b569215d978b67ebcd62860ca6357174874aff133f1a4e1
+qwen_shared_original_width_2layers_20260908.log
+  5667f31dbea87cff4ae0d2d7b6dad5dc887c3e7126383c5d20ee3ed87c2afaa0
+qwen_shared_original_width_4layers_20260908.log
+  53de6637313ae808cc451c4abe113fa292a21ef8bb5b94ee7a07652a757b253b
+qwen_shared_resident_ledger_20260908.json
+  c0336b543e3267f5639d3ccd01fe4d1f7b6fa2a1de508a5371689d4b0b4f1aff
+qwen_shared_resident_ledger_20260908.log
+  9e67243f1ef487ded81cf91be9c492a4e7d518a8e0b6754b45c482e5d0d1926d
+/tmp/megamoe-qwen-shared.0MYlWz/inspect_ledger.py
+  73b8b3453badbaefbe4236867e34a64e8061cd2a55000cbf7b57fdd7fe6f3e38
+```
+
+## 6. 本次停止边界
+
+按用户要求在 2026-09-08 03:00（Asia/Shanghai）前收尾，保留已验收并直接本地提交的改动，
+不 push，不在截止前仓促修改 mixed-batch/native 调度。**这是时间边界，不是优化上限。**
+下一轮首项是第 5 节的单 backend 驻留基准改造；新的整模型性能结论必须等匹配 ABBA 和
+单模型 HBM 完成后再给出。原 receive-only 的独立层收益与本轮 connected model 正确性证据分别保留。
