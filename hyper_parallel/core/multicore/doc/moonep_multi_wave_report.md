@@ -42,6 +42,10 @@ Conda 构建探测与 reference 适配随后也已修复，常规完整构建及
 仍回退 1.806%，候选已完整撤回。下一项验证不新增池的梯度通信/收尾重叠，见第 10.2.11 节及
 [梯度 P2P 实验报告](megamoe_gradient_p2p_optimization_20260908.md)。
 
+同日完成独立收尾重叠实验：312/312 张量仍逐位一致，但偏斜 F+B 几乎不变，等待前窗口仅
+0.68--1.33 ms/rank/step，未确认端到端收益，候选亦已撤回。下一项转向高等待 rank 的共同时间线，
+见第 10.2.12 节及 [收尾重叠报告](megamoe_gradient_epilogue_overlap_20260908.md)。
+
 ### 1.1 结论摘要
 
 - 当前组合不是把 MoonEP CUDA 实现直接移植到 Ascend，而是把其“按路由热度动态复制专家”的思想，
@@ -1199,6 +1203,23 @@ allocated 增加约 1 MiB，后续平衡 reserved 增加 240 MiB，不能用逻�
 通信的重叠；若窗口不足，再补高等待 rank 的共同时间线，不继续盲目放大消息或重排 peer。
 完整方法、补丁及原始 hashes 见 [实验报告](megamoe_gradient_p2p_optimization_20260908.md)。
 
+#### 10.2.12 独立 backward 收尾重叠未带来可确认收益
+
+在 `59d4736f` 上保持两段 FP32 梯度协议，将 dX owned clone / route 收尾调度在 P2P launch 与
+wait 之间。callback 异常也先等待通信，再释放 shared-B/workspace；owner FP32 聚合顺序未改。
+207 项 CPU / 171 subtests、五项 NPU launcher、八卡 B1/B2 各 21 组及跨版本 312/312 张量逐位
+对照通过，未降低精度或删掉 dX ownership 修复。
+
+完整训练 ABBA：偏斜 F+B `1230.282 → 1230.270 ms`，full step `1361.513 → 1361.009 ms`
+（−0.037%，未确认收益）；平衡 full step `800.617 → 805.759 ms`（+0.642%）。各 rank 等待前
+窗口从约 0.003--0.005 ms 增至 0.68--1.33 ms/step，但没有普遍改善 owner/fan-in 等待；这段
+事件时间也不能全部等同于有效 wire overlap。偏斜 peak allocated 增加约 1 MiB，两点 peak
+reserved 增加 6 MiB，虽然 shared pool/SHMEM 的逻辑字节不变。
+
+候选 runtime/test 改动已完整撤回并通过恢复回归，只保留实验补丁与反证。下一优先项是
+rank 4/5/7 与 peer 的共同时间线，而非继续扩大消息、叠加 callback 或增加双 buffer。
+详细数值和证据见 [收尾重叠报告](megamoe_gradient_epilogue_overlap_20260908.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1506,11 +1527,12 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **优先验证 FP32 gradient return 与独立收尾的重叠。** 两轮初始诊断的累计暴露等待为
-   `85--192 ms/rank`，权重仅 `34--55 ms/rank`；梯度 pre-wait 几乎为零。整专家合包虽让隔离传输
-   更快，完整训练却回退 1.806%，已按第 10.2.11 节否决。下一项先将安全的独立收尾工作放在 wait
-   前；若窗口不足，再关联高等待 rank 4/5/7 的共同时间线、peer 到达与批次依赖，不凭 payload
-   大小直接轮转或继续放大消息。owner receive contribution 必须全部完成 FP32
+1. **优先补 FP32 gradient return 高等待 rank 的共同时间线。** 两轮初始诊断的累计暴露等待为
+   `85--192 ms/rank`，权重仅 `34--55 ms/rank`。整专家合包导致完整训练回退 1.806%，已按第
+   10.2.11 节否决；第 10.2.12 节的独立收尾只建立 0.68--1.33 ms/rank/step 的等待前窗口，亦无
+   确认的端到端收益，已撤回。下一项关联 rank 4/5/7 与 peer 的 native backward 完成、通信到达、
+   排队和 owner 累加，分离可调度等待与必要传输；不凭 payload 大小直接轮转或继续放大消息。
+   owner receive contribution 必须全部完成 FP32
    聚合后才能 cast；shared-B dW 发送完成前不能复用 storage，不能只移走 wait 破坏消费/复用依赖。
    默认 HBM 不增加优先；若合批需要额外复制或池，必须单独核算并经匹配 ABBA 才保留。局部事件
    和 rank-zero 约 `169 ms` 的 SDMA 并集均不是预计可节省的 wall time。

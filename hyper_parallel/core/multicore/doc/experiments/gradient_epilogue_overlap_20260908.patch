@@ -1,0 +1,222 @@
+diff --git a/hyper_parallel/core/multicore/modules/mega_moe/function.py b/hyper_parallel/core/multicore/modules/mega_moe/function.py
+index 94ca3c94..bdc6639c 100644
+--- a/hyper_parallel/core/multicore/modules/mega_moe/function.py
++++ b/hyper_parallel/core/multicore/modules/mega_moe/function.py
+@@ -917,6 +917,12 @@ def _get_mega_moe_function() -> Any:
+-                result = _finish_backward(
+-                    ctx,
+-                    grad_output,
+-                    saved,
+-                    route_state,
+-                    buffers,
++                if shared_lease is None:
++                    return _finish_backward(ctx, grad_output, saved, route_state, buffers)
++                result = ()
++
++                def finish_layouts() -> None:
++                    """Schedule independent dX ownership and route-gradient work before the P2P wait."""
++                    nonlocal result
++                    result = _finish_backward(ctx, grad_output, saved, route_state, buffers)
++
++                home_grad1, home_grad2 = shared_lease.manager.reduce_replica_gradients(
++                    shared_lease.plan, buffers.grad_weight1, buffers.grad_weight2,
++                    replica_gradients=replica_gradients, before_wait=finish_layouts,
+@@ -924,8 +930,3 @@ def _get_mega_moe_function() -> Any:
+-                if shared_lease is not None:
+-                    home_grad1, home_grad2 = shared_lease.manager.reduce_replica_gradients(
+-                        shared_lease.plan, result[3], result[4], replica_gradients=replica_gradients,
+-                    )
+-                    # Home outputs own only N matrices; no physical suffix or
+-                    # gradient clone is retained by the layer's Parameter.grad.
+-                    result = (*result[:3], home_grad1, home_grad2, *result[5:])
+-                return result
++                # Home outputs own only N matrices; no physical suffix or
++                # gradient clone is retained by the layer's Parameter.grad.
++                return (*result[:3], home_grad1, home_grad2, *result[5:])
+diff --git a/hyper_parallel/core/multicore/modules/mega_moe/replica.py b/hyper_parallel/core/multicore/modules/mega_moe/replica.py
+index 645e58b1..646cf797 100644
+--- a/hyper_parallel/core/multicore/modules/mega_moe/replica.py
++++ b/hyper_parallel/core/multicore/modules/mega_moe/replica.py
+@@ -25 +25 @@ from importlib import import_module
+-from typing import Any, Literal
++from typing import Any, Callable, Literal
+@@ -1081,0 +1082 @@ class ExpertReplicaManager:
++        before_wait: Callable[[], None] | None = None,
+@@ -1090,0 +1092,3 @@ class ExpertReplicaManager:
++            before_wait: Optional independent work scheduled after communication
++                launch, including empty batches. It must not read receive buffers
++                or modify gradient storage. Handles are waited even if it raises.
+@@ -1131 +1135,8 @@ class ExpertReplicaManager:
+-        _wait_handles(_launch_transfers(transfers, self.spec.ep_group))
++        handles = _launch_transfers(transfers, self.spec.ep_group)
++        try:
++            if before_wait is not None:
++                before_wait()
++        finally:
++            # The caller may release shared gradient storage while unwinding.
++            # Preserve its completion dependency even if independent work fails.
++            _wait_handles(handles)
+diff --git a/tests/ut/core/multicore/mega_moe/test_execution.py b/tests/ut/core/multicore/mega_moe/test_execution.py
+index bbeafccd..aec9c015 100644
+--- a/tests/ut/core/multicore/mega_moe/test_execution.py
++++ b/tests/ut/core/multicore/mega_moe/test_execution.py
+@@ -247,0 +248,67 @@ class TestBackwardGradientOwnership(unittest.TestCase):
++    def test_shared_backward_finishes_layouts_before_wait_and_releases_afterward(self) -> None:
++        """Launch replica reduction before independent dX work without shortening either lease."""
++        for fail_epilogue in (False, True):
++            with self.subTest(fail_epilogue=fail_epilogue):
++                events = []
++                manager = Mock()
++                lease = manager.start_shared_prefetch.return_value
++                lease.manager = manager
++                lease.release.side_effect = lambda: events.append("replica_release")
++                scratch = torch.arange(12, dtype=torch.bfloat16).reshape(4, 3)
++                context = SimpleNamespace(
++                    workspace=Mock(), weight_replay=(manager, lease.plan),
++                    plan=SimpleNamespace(spec=SimpleNamespace(local_num_tokens=2)),
++                    permute_fused=True, backward_unpermute_fused=True, wave_count=1, replica_pending=None,
++                )
++                context.workspace.release.side_effect = lambda: events.append("workspace_release")
++                saved = SimpleNamespace(
++                    topk_weights=torch.ones((2, 2)), weight1=torch.ones(2, 3, 2), weight2=torch.ones(2, 1, 3),
++                )
++                route = SimpleNamespace(
++                    grad_x=scratch, grad_topk_weights=torch.zeros((2, 2)), route_weight=torch.zeros(4),
++                )
++                buffers = SimpleNamespace(
++                    grad_weight1=torch.full((2, 3, 2), 256.5), grad_weight2=torch.full((2, 1, 3), 256.5),
++                )
++                original_finish = execution._finish_backward
++
++                def finish(*args: Any) -> tuple[Any, ...]:
++                    """Use the real ownership boundary or inject a failure before it completes."""
++                    events.append("epilogue")
++                    if fail_epilogue:
++                        raise RuntimeError("layout failure")
++                    return original_finish(*args)
++
++                def reduce(_plan: Any, dw1: Any, dw2: Any, **kwargs: Any) -> tuple[Any, Any]:
++                    """Model the reduction contract while checking its inputs are native FP32 outputs."""
++                    events.append("launch")
++                    self.assertIs(dw1, buffers.grad_weight1)
++                    self.assertIs(dw2, buffers.grad_weight2)
++                    self.assertIs(kwargs["replica_gradients"], lease.prepare_backward.return_value)
++                    try:
++                        kwargs["before_wait"]()
++                    finally:
++                        events.append("wait")
++                    return dw1 - 256.0, dw2 - 256.0
++
++                manager.reduce_replica_gradients.side_effect = reduce
++                with (
++                    patch.object(execution, "_load_forward_state", return_value=saved),
++                    patch.object(execution, "_prepare_backward_route", return_value=route),
++                    patch.object(execution, "_prepare_backward_buffers", return_value=buffers),
++                    patch.object(execution, "_launch_backward"),
++                    patch.object(execution, "_mark_retained_scratch_modified"),
++                    patch.object(execution, "_finish_backward", side_effect=finish),
++                ):
++                    if fail_epilogue:
++                        with self.assertRaisesRegex(RuntimeError, "layout failure"):
++                            execution._get_mega_moe_function().backward(context, torch.ones(2, 3))
++                    else:
++                        result = execution._get_mega_moe_function().backward(context, torch.ones(2, 3))
++                        expected = scratch[:2].clone()
++                        scratch.fill_(-17)
++                        torch.testing.assert_close(result[0], expected, rtol=0, atol=0)
++                        for gradient in result[3:5]:
++                            torch.testing.assert_close(gradient, torch.full_like(gradient, 0.5), rtol=0, atol=0)
++                self.assertEqual(events, ["launch", "epilogue", "wait", "replica_release", "workspace_release"])
++
+diff --git a/tests/ut/core/multicore/mega_moe/test_replica.py b/tests/ut/core/multicore/mega_moe/test_replica.py
+index dc2d3747..068b2afd 100644
+--- a/tests/ut/core/multicore/mega_moe/test_replica.py
++++ b/tests/ut/core/multicore/mega_moe/test_replica.py
+@@ -231,0 +232,87 @@ class TestExpertReplicaManager(unittest.TestCase):
++    def test_gradient_epilogue_runs_before_wait_and_drains_on_failure(self) -> None:
++        """Overlap independent work without consuming receives or releasing sends early."""
++        for rank_id in (0, 1):
++            for fail_epilogue in (False, True):
++                with self.subTest(rank_id=rank_id, fail_epilogue=fail_epilogue):
++                    manager = ExpertReplicaManager(self._config(rank_id=rank_id))
++                    plan = self._hot_expert_zero_plan()
++                    home = (torch.full((2, 2, 2), 256.5), torch.full((2, 1, 2), 256.5))
++                    replica = (torch.full((1, 2, 2), -256.0), torch.full((1, 1, 2), -256.0))
++                    events = []
++
++                    def launch(transfers: tuple[Any, ...], _group: Any) -> tuple[Any, ...]:
++                        """Make receive data available only when the completion handle is waited."""
++                        events.append("launch")
++
++                        def complete() -> None:
++                            """Finish both matrix transfers before owner accumulation."""
++                            events.append("wait")
++                            for transfer in transfers:
++                                if transfer.operation == "receive":
++                                    transfer.tensor.fill_(-256.0)
++                                else:
++                                    torch.testing.assert_close(
++                                        transfer.tensor, torch.full_like(transfer.tensor, -256.0), rtol=0, atol=0,
++                                    )
++
++                        return (Mock(wait=Mock(side_effect=complete)), Mock(wait=Mock(
++                            side_effect=lambda: events.append("last_wait"),
++                        )))
++
++                    def epilogue() -> None:
++                        """Check home partials are unmodified until every receive has completed."""
++                        events.append("epilogue")
++                        for partial in home:
++                            torch.testing.assert_close(partial, torch.full_like(partial, 256.5), rtol=0, atol=0)
++                        if fail_epilogue:
++                            raise RuntimeError("epilogue failure")
++
++                    with patch.object(replica_module, "_launch_transfers", side_effect=launch):
++                        if fail_epilogue:
++                            with self.assertRaisesRegex(RuntimeError, "epilogue failure"):
++                                manager.reduce_replica_gradients(
++                                    plan, *home, replica_gradients=replica, before_wait=epilogue,
++                                )
++                        else:
++                            reduced = manager.reduce_replica_gradients(
++                                plan, *home, replica_gradients=replica, before_wait=epilogue,
++                            )
++                            for actual, partial in zip(reduced, home):
++                                self.assertEqual(actual.data_ptr(), partial.data_ptr())
++                                expected = torch.full_like(actual, 256.5)
++                                if rank_id == 0:
++                                    expected[0].fill_(0.5)
++                                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++
++                    self.assertEqual(events, ["launch", "epilogue", "wait", "last_wait"])
++                    if fail_epilogue:
++                        for partial in home:
++                            torch.testing.assert_close(partial, torch.full_like(partial, 256.5), rtol=0, atol=0)
++
++    def test_gradient_epilogue_runs_once_without_remote_transfers(self) -> None:
++        """Empty P2P batches still execute the caller's independent epilogue."""
++        manager = ExpertReplicaManager(self._config(rank_id=0))
++        plan = build_constrained_expert_placement(((1, 1, 1, 1),) * 2, 1, receive_capacity=4)
++        gradients = (torch.ones((3, 2, 2)), torch.ones((3, 1, 2)))
++        epilogue = Mock()
++
++        with patch.object(replica_module.dist, "batch_isend_irecv") as batch:
++            reduced = manager.reduce_replica_gradients(plan, *gradients, before_wait=epilogue)
++
++        batch.assert_not_called()
++        epilogue.assert_called_once_with()
++        for actual, original in zip(reduced, gradients):
++            torch.testing.assert_close(actual, original[:2], rtol=0, atol=0)
++
++    def test_invalid_gradients_do_not_launch_or_run_epilogue(self) -> None:
++        """Validate physical gradient shapes before scheduling any independent work."""
++        manager = ExpertReplicaManager(self._config(rank_id=0))
++        epilogue = Mock()
++        with patch.object(replica_module, "_launch_transfers") as launch:
++            with self.assertRaisesRegex(ValueError, "3 groups"):
++                manager.reduce_replica_gradients(
++                    self._hot_expert_zero_plan(), torch.ones(2, 2, 2), torch.ones(2, 1, 2), before_wait=epilogue,
++                )
++        launch.assert_not_called()
++        epilogue.assert_not_called()
++
