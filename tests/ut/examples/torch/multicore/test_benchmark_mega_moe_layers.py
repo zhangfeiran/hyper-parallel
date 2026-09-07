@@ -15,6 +15,8 @@
 """CPU contracts for the checkpointed multi-layer benchmark protocol."""
 
 import argparse
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,6 +36,7 @@ from examples.torch.multicore.benchmark_mega_moe_layers import (
     _route_pairs,
 )
 from examples.torch.multicore import mega_moe_layer_profile
+from examples.torch.multicore import benchmark_mega_moe_layers as benchmark
 
 
 class TestBenchmarkMegaMoeLayers(unittest.TestCase):
@@ -183,3 +186,77 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         import_module.assert_not_called()
         self.assertEqual(sweep._train_step.call_count, 2)
         self.assertEqual(sweep.optimizer.step.call_count, 2)
+
+    def test_cycle_profile_rejects_native_and_instrumented_timing(self):
+        """Diagnostic cycles must not silently contaminate ordinary measurements."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "timing.json")
+            with self.assertRaises(SystemExit):
+                _parse_args(["--variant", "native", "--output", output, "--profile-kernel-cycles"])
+            with patch.dict(os.environ, {"HP_MEGA_MOE_KERNEL_CYCLE_PROFILE": "1"}), \
+                    self.assertRaises(SystemExit):
+                _parse_args(["--variant", "b1", "--output", output])
+            with patch.dict(os.environ, {"HP_MEGA_MOE_KERNEL_CYCLE_PROFILE": "0"}):
+                args = _parse_args(["--variant", "b1", "--output", output, "--profile-kernel-cycles"])
+        self.assertTrue(args.profile_kernel_cycles)
+
+    def test_cycle_profile_warms_updates_collects_and_restores_environment(self):
+        """Enable counters only for the extra post-update step, including nonzero ranks."""
+        name = "HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"
+        for previous in (None, "0"):
+            with self.subTest(previous=previous), patch.dict(os.environ):
+                os.environ.pop(name, None)
+                if previous is not None:
+                    os.environ[name] = previous
+                observed = []
+                sweep = MagicMock()
+                sweep.worker._RANK = 1
+                sweep._train_step.side_effect = lambda route: observed.append(os.environ.get(name))
+                counters = {"unit": "system_cycle", "per_rank": [{"rank": 0}, {"rank": 1}]}
+                sweep.worker._collect_kernel_cycle_profile.return_value = counters
+                result = mega_moe_layer_profile.profile_layer_cycles(sweep, (1, 2, 3))
+                self.assertEqual(observed, [previous, "1"])
+                self.assertEqual(os.environ.get(name), previous)
+                self.assertIs(result["counters"], counters)
+                self.assertEqual(result["layer_index"], 0)
+                self.assertEqual(sweep.optimizer.step.call_count, 2)
+                sweep.worker._collect_kernel_cycle_profile.assert_called_once_with(sweep.layers[0])
+
+    def test_cycle_profile_restores_environment_after_failed_collection(self):
+        """A diagnostic failure must not leave future kernels instrumented."""
+        name = "HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"
+        for previous in (None, "0"):
+            with self.subTest(previous=previous), patch.dict(os.environ):
+                os.environ.pop(name, None)
+                if previous is not None:
+                    os.environ[name] = previous
+                sweep = MagicMock()
+                sweep.worker._collect_kernel_cycle_profile.side_effect = RuntimeError("collection failed")
+                with self.assertRaisesRegex(RuntimeError, "collection failed"):
+                    mega_moe_layer_profile.profile_layer_cycles(sweep, (1, 2, 3))
+                self.assertEqual(os.environ.get(name), previous)
+
+    def test_main_collects_cycles_only_after_all_measurements(self):
+        """Keep diagnostics outside every route's latency and memory window."""
+        events = []
+        worker = MagicMock()
+        worker._RANK = 0
+        worker.dist.is_initialized.return_value = False
+        sweep = MagicMock()
+        sweep.measure.side_effect = lambda alpha, seed: events.append("measure") or {"seed": seed}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
+            output = Path(directory) / "timing.json"
+            args = argparse.Namespace(variant="b1", layers=16, warmup=3, measured=7, shuffle_seed=1,
+                                      output=output, profile_output=None, profile_kernel_cycles=True)
+            with patch.object(benchmark, "_parse_args", return_value=args), \
+                    patch.object(benchmark, "_route_pairs", return_value=[(1.0, 7), (0.1, 42)]), \
+                    patch.object(benchmark, "_source_identity", return_value={}), \
+                    patch.object(benchmark.importlib, "import_module", return_value=worker), \
+                    patch.object(benchmark, "_LayerSweep", return_value=sweep), \
+                    patch.object(benchmark, "profile_layer_cycles",
+                                 side_effect=lambda *_args: events.append("cycles") or {"layer_index": 0}):
+                benchmark.main()
+            payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(events, ["measure", "measure", "cycles"])
+        self.assertEqual(payload["points"], [{"seed": 7}, {"seed": 42}])
+        self.assertEqual(payload["diagnostic_kernel_cycles"], {"alpha": 1.0, "seed": 7, "layer_index": 0})

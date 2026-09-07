@@ -586,7 +586,7 @@ class TestMegaMoeRoute(unittest.TestCase):
             route_module,
             "_build_route_indices",
             return_value=(stable_slots, torch.arange(4, dtype=torch.int32)),
-        ):
+        ), patch("torch.repeat_interleave", wraps=torch.repeat_interleave) as repeat:
             physical_ids = _remap_topk_ids_to_physical(
                 logical_ids,
                 plan,
@@ -599,6 +599,45 @@ class TestMegaMoeRoute(unittest.TestCase):
         ).reshape_as(logical_ids)
         self.assertTrue(torch.equal(physical_ids, expected))
         self.assertTrue(torch.equal(physical_ids, torch.tensor([[0, 3], [5, 5]])))
+        self.assertEqual(repeat.call_args.kwargs.get("output_size"), logical_ids.numel())
+
+    def test_device_remap_keeps_empty_sources_and_unused_experts(self):
+        """
+        Feature: fixed-size physical route expansion
+        Description: remap empty and sparse sources with unused replica slots
+        Expectation: shape and deterministic per-source quotas match the host oracle
+        """
+        counts = ((0, 0, 0, 0), (1, 2, 1, 0))
+        for slots in (0, 1, 2):
+            plan = build_constrained_expert_placement(counts, slots, receive_capacity=2)
+            for source_rank, ids in enumerate(([], [1, 0, 2, 1])):
+                with self.subTest(slots=slots, source_rank=source_rank):
+                    logical_ids = torch.tensor(ids, dtype=torch.int32, device="cpu").reshape(-1, 2)
+                    stable_slots = torch.argsort(logical_ids.reshape(-1), stable=True).to(torch.int32)
+                    with patch.object(route_module, "_build_route_indices", return_value=(stable_slots, None)):
+                        actual = _remap_topk_ids_to_physical(logical_ids, plan, source_rank)
+                    expected = torch.tensor(remap_logical_routes(ids, source_rank, plan), dtype=torch.int32)
+                    self.assertEqual(actual.shape, logical_ids.shape)
+                    self.assertEqual(actual.dtype, torch.int32)
+                    self.assertTrue(actual.is_contiguous())
+                    torch.testing.assert_close(actual.reshape(-1), expected, rtol=0, atol=0)
+
+    def test_device_remap_rejects_wrong_total_before_device_expansion(self):
+        """
+        Feature: fixed-size expansion safety
+        Description: give a plan whose host quota total differs from the route shape
+        Expectation: reject both short and oversized quotas before a device launch
+        """
+        logical_ids = torch.tensor([[0, 2], [0, 0]], dtype=torch.int32, device="cpu")
+        for counts in ((2, 0, 1, 0), (4, 0, 1, 0)):
+            with self.subTest(counts=counts):
+                plan = build_constrained_expert_placement((counts, counts), 1, receive_capacity=4)
+                with patch("torch.repeat_interleave") as repeat, \
+                        patch.object(route_module, "_build_route_indices") as permute, \
+                        self.assertRaisesRegex(ValueError, "quota total.*route slots"):
+                    _remap_topk_ids_to_physical(logical_ids, plan, 0)
+                repeat.assert_not_called()
+                permute.assert_not_called()
 
     def test_repeated_replica_counts_reuse_cached_host_plan(self):
         """

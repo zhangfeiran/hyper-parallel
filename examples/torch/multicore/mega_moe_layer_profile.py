@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Opt-in, untimed rank-zero trace annotations for the multi-layer benchmark."""
+"""Opt-in, untimed traces and all-rank backward cycles for the layer benchmark."""
 
 from __future__ import annotations
 
 import importlib
+import os
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import wraps
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 _PACKAGE = "hyper_parallel.core.multicore.platform.torch.mega_moe"
+_CYCLE_PROFILE_ENV = "HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"
 _SPANS = {
     "route": ("_start_count_gather", "_finish_static_count_gather", "_build_replica_plan",
               "_remap_topk_ids_to_physical", "_materialize_replica_counts", "_prepare_route_endpoints"),
@@ -115,3 +117,45 @@ def profile_layer_step(sweep: Any, route: tuple, output: Path) -> None:
         if not output.is_file():
             raise RuntimeError(f"NPU profiler did not export {output}")
     worker.dist.barrier()
+
+
+def profile_layer_cycles(sweep: Any, route: tuple) -> dict[str, Any]:
+    """Collect all ranks' last backward counters in an extra post-update step.
+
+    Args:
+        sweep: Initialized MegaMoe benchmark; every EP rank must participate.
+        route: Already sampled route for the diagnostic step.
+
+    Returns:
+        Counters for layer zero's final backward, not the entire training step.
+        The shared workspace overwrites counters on each backward launch.
+
+    Note:
+        Call only after performance and memory measurements. Instrumentation
+        changes kernel execution; neither counters nor worker maxima are wall
+        timings. The native counter layout currently covers backward only.
+    """
+    # Reuse the ST collector so rank aggregation and native counter decoding
+    # have one contract; this coupling is confined to diagnostic example code.
+    worker = sweep.worker
+    previous = os.environ.get(_CYCLE_PROFILE_ENV)
+    sweep._train_step(route)  # pylint: disable=protected-access
+    sweep.optimizer.step()
+    worker.dist.barrier()
+    worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
+    os.environ[_CYCLE_PROFILE_ENV] = "1"
+    try:
+        sweep._train_step(route)  # pylint: disable=protected-access
+        worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
+        counters = worker._collect_kernel_cycle_profile(sweep.layers[0])  # pylint: disable=protected-access
+        if counters is None:
+            raise RuntimeError("MegaMoe backward cycle counters were not collected")
+        sweep.optimizer.step()
+        worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
+    finally:
+        if previous is None:
+            os.environ.pop(_CYCLE_PROFILE_ENV, None)
+        else:
+            os.environ[_CYCLE_PROFILE_ENV] = previous
+    return {"layer_index": 0, "scope": "last backward launch only; not all layers or forward",
+            "timing": "extra post-update step after all performance and memory measurements", "counters": counters}

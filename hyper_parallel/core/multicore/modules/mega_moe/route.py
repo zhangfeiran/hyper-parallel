@@ -230,10 +230,16 @@ def _remap_topk_ids_to_physical(
 ) -> Any:
     """Remap logical IDs on device while preserving every Top-K route slot."""
     physical_ids, copy_counts = _physical_copy_runs(plan, source_rank)
+    route_count = topk_ids.numel()
+    if sum(copy_counts) != route_count:
+        raise ValueError("physical copy quota total does not match the number of route slots")
     device = topk_ids.device
+    # The host plan already determines the length. Avoid a device reduction
+    # and scalar readback solely to size this fixed-shape metadata tensor.
     expert_major_physical_ids = torch.repeat_interleave(
         torch.tensor(physical_ids, dtype=torch.int32, device=device),
         torch.tensor(copy_counts, dtype=torch.int64, device=device),
+        output_size=route_count,
     )
     flat_ids = topk_ids.reshape(-1)
     route_slots = torch.arange(

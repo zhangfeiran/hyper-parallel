@@ -142,6 +142,15 @@ be added together. Use the NPU timeline for asynchronous attribution and indepen
 profiler-free runs for final performance/HBM comparisons. The output path must be
 new and distinct from the benchmark JSON.
 
+For MegaMoe variants, `--profile-kernel-cycles` runs a separate extra post-update
+step after all measurements and writes `diagnostic_kernel_cycles` into the JSON.
+It gathers per-core counters from every EP rank. The shared workspace retains
+only the **last backward launch** (layer zero), not all layers or forward kernels.
+Counters use system cycles; per-category worker maxima are not additive wall time.
+The option temporarily enables native instrumentation and restores its environment
+even on failure. An inherited `HP_MEGA_MOE_KERNEL_CYCLE_PROFILE=1` is rejected by
+this timed benchmark: unset it and use the diagnostic option instead.
+
 The multi-layer adapter reports the actual home-runtime bypass for routes already
 inside one receive window: no active replica bindings and unchanged destination
 loads, even with a configured B budget. It does not report the ST helper's
