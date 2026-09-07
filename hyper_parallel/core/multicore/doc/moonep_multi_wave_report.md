@@ -9,7 +9,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 整理日期 | 2026-09-07 |
+| 整理日期 | 2026-09-08 |
 | 代码分支 | `megamoe-sun`；历史性能数据来自重基前的 `megamoe-perf-sun` |
 | 代码基线 | 重基于 `megamoe-minimal-api@c24cfe7a`；以本文同提交代码为准 |
 | 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、`43aa7d6c`、`b255b821`、`40b6963b`、`9f75fd20`、`86f4b433`、`364af596`、`50a4e68c`、`5d2a3e38`、`ce089b10` |
@@ -37,6 +37,10 @@ Conda 构建探测与 reference 适配随后也已修复，常规完整构建及
 约 85--192 ms/rank，权重刷新约 34--55 ms/rank。下一项优先研究梯度回传，权重双缓冲仍后置；
 这不是已实现的加速或可直接兑现的等待节省，详见第 10.2.10 节及
 [P2P 归因报告](megamoe_p2p_attribution_20260907.md)。
+
+2026-09-08 随后验证并否决 B1 梯度整专家合包：虽保持 312 个张量逐位一致，偏斜训练 ABBA
+仍回退 1.806%，候选已完整撤回。下一项验证不新增池的梯度通信/收尾重叠，见第 10.2.11 节及
+[梯度 P2P 实验报告](megamoe_gradient_p2p_optimization_20260908.md)。
 
 ### 1.1 结论摘要
 
@@ -1179,6 +1183,22 @@ weight refresh 总发送 `11392.5 MiB`，16 次 FP32 gradient return 总发送 `
 没有推广新的 runtime 调度。详细 per-rank 结果、计时/HBM 隔离验收、复现命令和局限见
 [P2P 归因报告](megamoe_p2p_attribution_20260907.md)。
 
+#### 10.2.11 否决 B1 梯度整专家合包
+
+在 `5a2ae4b0` 上尝试将 gate/up + down 的两个 FP32 梯度存成一块 flat pool 的不重叠 view，
+B1 每个 expert 以一个 105 MiB payload 发回 owner。真实 NPU 确认发送 view 零拷贝；owner 仍先
+wait 再按原次序 FP32 聚合。207 项 CPU、五项 NPU launcher、八卡 B1/B2 生命周期及跨版本
+312/312 张量逐位对照通过，未放宽精度。
+
+隔离 16-batch 传输的 ABBA 降低 3.663%，但同配置完整 16 层 Qwen-shape 训练的偏斜 full step
+均值 `1365.100 → 1389.760 ms`，回退 **1.806%**；平衡 `804.293 → 803.246 ms`，基本不变。
+梯度字节数相同、描述符减半，但 rank 4/5/7 的暴露等待反而增大。池的逻辑字节不变，实际偏斜
+allocated 增加约 1 MiB，后续平衡 reserved 增加 240 MiB，不能用逻辑池账本代替完整 HBM 验收。
+
+候选生产代码及测试改动已撤回，仅保留实验补丁与反证。下一轮先验证独立 backward 收尾与梯度
+通信的重叠；若窗口不足，再补高等待 rank 的共同时间线，不继续盲目放大消息或重排 peer。
+完整方法、补丁及原始 hashes 见 [实验报告](megamoe_gradient_p2p_optimization_20260908.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1486,10 +1506,11 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **优先优化 FP32 gradient return 的批次与等待位置。** 两轮诊断的累计暴露等待为
-   `85--192 ms/rank`，权重仅 `34--55 ms/rank`；梯度 pre-wait 几乎为零。先关联高等待的 rank 4/7
-   与 peer 到达/批次依赖，再验证同 peer gate/up + down 合批，或将安全的独立收尾工作放在 wait 前。
-   二者均是待验证假设，不凭 payload 大小直接轮转。owner receive contribution 必须全部完成 FP32
+1. **优先验证 FP32 gradient return 与独立收尾的重叠。** 两轮初始诊断的累计暴露等待为
+   `85--192 ms/rank`，权重仅 `34--55 ms/rank`；梯度 pre-wait 几乎为零。整专家合包虽让隔离传输
+   更快，完整训练却回退 1.806%，已按第 10.2.11 节否决。下一项先将安全的独立收尾工作放在 wait
+   前；若窗口不足，再关联高等待 rank 4/5/7 的共同时间线、peer 到达与批次依赖，不凭 payload
+   大小直接轮转或继续放大消息。owner receive contribution 必须全部完成 FP32
    聚合后才能 cast；shared-B dW 发送完成前不能复用 storage，不能只移走 wait 破坏消费/复用依赖。
    默认 HBM 不增加优先；若合批需要额外复制或池，必须单独核算并经匹配 ABBA 才保留。局部事件
    和 rank-zero 约 `169 ms` 的 SDMA 并集均不是预计可节省的 wall time。
