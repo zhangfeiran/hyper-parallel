@@ -109,7 +109,101 @@ runtime、example、helper 和 native artifacts 在四轮中冻结，CPU 回归�
 `55050240 / 110100480 bytes/rank`，没有层数相关的新增持久池；不把 reserved 与 live allocation
 相加，也不把该小规模增量说成“零 HBM 成本”。
 
-## 2. 本地证据与后续优先级
+## 2. 常规 native 构建与标准 EP reference 适配
+
+### 2.1 构建输入探测
+
+multicore 和 symmetric-memory 两个 Torch CMake 都改用公开的
+`torch.utils.cpp_extension.include_paths()`，不再假定 frontend 头文件位于 Python package 内。
+过滤返回列表中的不存在目录，并检查 `ATen/ATen.h`、`torch/extension.h`、`torch/torch.h` 至少在一个
+有效 root 内。ABI 查询保持原样；两个 Torch 查询都设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`。
+Torch-NPU 仍用 `find_spec` 查安装位置，不在配置阶段主动加载设备后端。
+
+新 UT 使用临时的 wheel / Conda 安装布局，运行仓内真实 CMake configure 并检查生成的 compiler
+arguments，不编译假库、不需要设备或实际 Torch 安装。覆盖路径含空格、Conda 返回不存在的 wheel
+fallback、两种 C++ ABI、缺失必要 frontend header 时的提前报错。旧代码有四处预期失败，修复后
+完整 CPU 回归为 **189 passed / 156 subtests，30.37 s**，新增三个测试共六个 component 子测试通过。
+修改的 Python 文件 pylint 和 `git diff --check` 通过。
+
+### 2.2 reference 参数更新
+
+`_check_control_stream` 的 owner-only 更新不再对 `GroupedExperts` 访问旧的 `gate_up_weight`。
+candidate 更新 packed gate/up；标准 reference 分别通过已有 `_local_tensor` 更新 `w1` 和 `w3`，
+不改 `w2`。保持只在 rank 0 更新版本的原始条件，继续验证全组 cache-miss agreement 与独立 control
+stream；没有删掉失效检查、跳过通信或放宽精度容差。
+
+### 2.3 常规源码构建
+
+以下两个命令均完成 configure / compile / install，退出码为 0：
+
+```bash
+source /usr/local/Ascend/cann/set_env.sh
+bash scripts/build_symmetric_memory.sh --framework torch --soc-list ascend910b --jobs 32
+bash scripts/build_multicore.sh --framework torch --soc-list ascend910b --jobs 32
+```
+
+multicore 的六个 kernel 本轮重新生成；它们及 vendor host 库、SHMEM kernel 的 SHA256 与第一阶段
+产物相同。两个 Torch adapters 和四个重新构建的 SHMEM host / bootstrap 库 hashes 改变。
+没有修改这些 C++ / device 源码。普通构建覆盖生成的 component / payload，修复前副本仍保留在
+隔离 baseline 中；未删除源码或用户结果。
+
+正式 adapter hashes：
+
+```text
+libhyper_parallel_mega_moe_torch.so 6a3e7934b3d995248712f2ddb91d0e6b1611b290127a5fe746755fb6dc88346e
+libaclshmem_torch.so               78b4a5aed63a1e0da16052c0e214be311de4c20103595f23f31176b3d7c7cfcb
+```
+
+`readelf -d` 确认两个 adapter 不再额外依赖 `torch_python`，SHMEM 的 DT_NEEDED 使用库名而非
+诊断构建的 checkout 绝对路径；RUNPATH 分别为：
+
+```text
+multicore: $ORIGIN/../../vendors/hyper_parallel_multicore_nn/op_api/lib
+SHMEM:     $ORIGIN:$ORIGIN/../..:$ORIGIN/../../shmem
+```
+
+这是当前 Conda 环境的常规源码构建验收；wheel 布局由 configure UT 覆盖，不代表完整 wheel
+打包、异机分发或其他框架 / SoC 已验证。
+
+### 2.4 正式产物的设备验收
+
+正式产物的回归为 **12 passed / 11 deselected，621.66 s**；pytest 另报告六个已有 marker warning。
+覆盖 shared-weight lifecycle、shared resources、新串联训练、四卡 default interface、level0、cycle
+profile、hot/deferred replication、lazy/eager compact、residual multi-wave 和 checkpoint fallback。
+没有失败或 skip；dX 阶段的 960 组 connected tensor 对照与资源关闭检查在正式产物上再次通过。
+
+shared-weight lifecycle 先以 T=128 小配置单独通过：**1 passed / 22 deselected，34.25 s**。
+随后 T=2048 同配置复测也通过；两次 rank 日志均报告 21 组数值检查、`checkpoint_modes=[false,true]`，
+shared weight / FP32 gradient pool 为 `393216 / 786432 bytes/rank`，均未拒绝本配置的 repeated backward。
+每组比较输出、input / route gradient 和两组 expert gradient，保留 owner-only cache 失效与跨流检查。
+
+这里以实际 worker 日志确认 checkpoint 覆盖：历史 `HP_MEGA_MOE_SHARED_REENTRANT_ONLY` 开关只在
+直接执行 worker 的 `__main__` 中生效；pytest launcher 会直接调用函数，使用默认的两种模式。
+本轮没有依赖该开关缩小验收，也不据此泛化其他 shape 或 retained-scratch 组合。
+
+另完成四卡 default-interface worker：T=4096、H=5120、I=1792、E=32、K=8，覆盖
+`capacity=None / 1.5` × `experts / router_experts`，与标准 EP 对比输出、梯度和参数更新；四种组合
+全部通过。默认 None 保持不变。该 worker 自带单层计时，不将其与第一阶段的 16 层 B1 step 混算。
+
+### 2.5 正式产物的 16 层复测
+
+设备回归结束后再次独立运行第一阶段相同的 matched-weight benchmark，参数、八卡全部初始权重、
+Python implementation fingerprint、route / placement、shared pool 和 optimizer-state ledger 与 B1/B2
+相同；使用本阶段新建的正式 native payload。未与其他本轮 NPU 测试、编译或 CPU 回归并行。
+
+| 路由 | F+B median | full-step median | conservative peak bytes |
+| --- | ---: | ---: | ---: |
+| 偏斜 `0.1:42` | 1229.056 ms | 1360.044 ms | 25411773440 |
+| 平衡 `10000:42` | 670.697 ms | 801.564 ms | 24929816576 |
+
+对应各 rank 的 allocator / SHMEM ledger 与第一阶段修复版逐字节相同；仅 runtime free / used
+等外部观测量不要求相同。首尾 source/native freeze 与 finite 检查通过，九份设备 census 只观察到
+本轮八个 worker；结束后八张卡均无残留 NPU 进程。采样不构成硬件独占保证。
+该补充运行没有显示额外性能 / HBM 回退，但只有一轮，不用它代替第一阶段的 ABBA 或声称新的加速。
+完整 JSON SHA256：`7a9d73c92f009b3fb24642597a174daa78e5cf2e1e68848e1319687f7cd22b27`。
+复现脚本为 `/tmp/megamoe-fixes.EJ9KbG/run_canonical.bash`。
+
+## 3. 本地证据与后续优先级
 
 原始结果位于 `output/qwen_moe_optimizer/`：
 
@@ -117,6 +211,11 @@ runtime、example、helper 和 native artifacts 在四轮中冻结，CPU 回归�
 - `fix_dx_connected_st_20260907.log`、`fix_dx_regression_st_20260907.log`；
 - `fix_dx_evidence_20260907/`：新串联矩阵与原 shared-resource 验收 JSON；
 - `fix_dx_{old_a1,fixed_b1,fixed_b2,old_a2}_20260907.json` 及对应运行 / monitor 日志。
+- `fix_cmake_red_20260907.log`、`fix_build_full_ut_20260907.log`、`fix_build_lint_20260907.log`；
+- `fix_cmake_{shmem,multicore}_build_20260907.log`：常规完整构建；
+- `fix_cmake_shared_default_st_20260907.log`、`fix_cmake_regression_st_20260907.log`；
+- `fix_cmake_evidence_20260907/`：正式产物的串联、资源生命周期和默认接口 JSON；
+- `fix_cmake_current_c1_20260907.json` 及相邻运行 / monitor 日志：正式产物的 16 层复测。
 
 四个 JSON 的 SHA256：
 
@@ -131,7 +230,11 @@ old_a2   8bad6bf35ecf91d633e90815098a61c9f56a2dea05a93f3daf10f931d00bfae5
 matched-initialization helper 仍为 `/tmp/megamoe-sun-audit.y8Gp0T/benchmark_matched.py`，SHA256
 `0880112e26b197dc348d8e5ab0394b86a0452cafbaa93f528c29520e64f1d593`。
 
-P0 完成后，下一项是两个 Torch CMake 的 Conda-aware include discovery，以及 shared-weight
-control-stream 测试对 `GroupedExperts.w1/w3` 的正确更新。应以常规 native 构建产物重新跑验收，
-再恢复主报告中 P2P payload / wait / overlap 的优化顺序；不为消掉这次正确性修复的复制而重新
-暴露 workspace alias，也不在没有 profile 证据时扩大 persistent pool。
+P0 已以 `d5698b72` 本地提交；随后两个 Torch CMake 的 Conda-aware include discovery 和
+`GroupedExperts.w1/w3` 测试适配也已通过常规构建与设备验收。两阶段没有撤销默认 None 的语义，
+没有改 placement / multi-wave device schedule，也没有降低 FP32 physical dW 的聚合精度。
+
+复审后恢复主报告中 P2P payload / wait / overlap 的优化顺序。先定位 weight refresh / gradient
+return 的真实传输和不可重叠等待，再决定合批或调度；当前没有证据将 dX 的小幅复制成本提升为
+新的首要瓶颈。不为消掉这次正确性修复的复制而重新暴露 workspace alias，也不在没有 profile
+证据时扩大 persistent pool。第二阶段验证结果与代码在本报告同一提交中直接本地 commit。

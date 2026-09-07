@@ -90,7 +90,30 @@ if(NOT torch_abi_status EQUAL 0 OR
         "Cannot determine the active Torch C++ ABI: ${torch_abi_error}")
 endif()
 
-set(TORCH_INCLUDE_ROOT "${TORCH_PACKAGE_ROOT}/include")
+# Conda can install headers outside the Python package. Public discovery may
+# also report nonexistent wheel fallback directories, which must be filtered.
+string(CONCAT torch_include_code
+    "import sys; from pathlib import Path; "
+    "from torch.utils.cpp_extension import include_paths; "
+    "roots = [Path(path) for path in include_paths() if Path(path).is_dir()]; "
+    "headers = ['ATen/ATen.h', 'torch/extension.h', 'torch/torch.h']; "
+    "missing = [header for header in headers if not any((root / header).is_file() for root in roots)]; "
+    "sys.exit('Missing Torch C++ headers: ' + ', '.join(missing)) "
+    "if missing else print(';'.join(map(str, roots)))")
+execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env TORCH_DEVICE_BACKEND_AUTOLOAD=0
+            ${Python3_EXECUTABLE} -c "${torch_include_code}"
+    RESULT_VARIABLE torch_include_status
+    OUTPUT_VARIABLE TORCH_INCLUDE_DIRS
+    ERROR_VARIABLE torch_include_error
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT torch_include_status EQUAL 0 OR NOT TORCH_INCLUDE_DIRS)
+    message(FATAL_ERROR
+        "Cannot locate Torch C++ include directories for ${Python3_EXECUTABLE}: "
+        "${torch_include_error}")
+endif()
+
 set(TORCH_NPU_INCLUDE_ROOT "${TORCH_NPU_PACKAGE_ROOT}/include")
 set(TORCH_LINK_LIBRARIES
     "${TORCH_PACKAGE_ROOT}/lib/libc10.so"
@@ -100,8 +123,7 @@ set(TORCH_LINK_LIBRARIES
 
 foreach(required_path IN ITEMS
     ${Python3_INCLUDE_DIRS}
-    "${TORCH_INCLUDE_ROOT}"
-    "${TORCH_INCLUDE_ROOT}/torch/csrc/api/include"
+    ${TORCH_INCLUDE_DIRS}
     "${TORCH_NPU_INCLUDE_ROOT}/torch_npu/csrc/core/npu/NPUStream.h"
     ${TORCH_LINK_LIBRARIES})
     if(NOT EXISTS "${required_path}")
@@ -116,8 +138,7 @@ add_compile_definitions(
 
 include_directories(
     ${Python3_INCLUDE_DIRS}
-    ${TORCH_INCLUDE_ROOT}
-    ${TORCH_INCLUDE_ROOT}/torch/csrc/api/include
+    ${TORCH_INCLUDE_DIRS}
     ${TORCH_NPU_INCLUDE_ROOT}
     ${SHMEM_HOME_PATH}/shmem/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../ops/include

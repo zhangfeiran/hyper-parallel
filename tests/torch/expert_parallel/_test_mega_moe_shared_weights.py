@@ -159,8 +159,9 @@ def _check_control_stream(candidate, reference, shape, route) -> int:
             # enter P2P when agreement observes this one-rank cache miss.
             if iteration == 1 and moe._RANK == 0:
                 with torch.no_grad():
-                    for layer in (candidate, reference):
-                        layer.gate_up_weight.add_(0.00390625)
+                    candidate.gate_up_weight.add_(0.00390625)
+                    common._local_tensor(reference.w1).add_(0.00390625)
+                    common._local_tensor(reference.w3).add_(0.00390625)
             expected = moe._run_layer(reference, hidden, *route, grad_output)
             actual = moe._run_checkpointed_layer(candidate, hidden, *route, grad_output, use_reentrant=True)
             control = manager._shared_agreement_stream

@@ -30,7 +30,8 @@ owned-SHMEM 生命周期、`expert_capacity_factor=None` 默认值及按绑定�
 
 后续 P0 已修复 fused backward 的 dX ownership，并通过串联图 / checkpoint / optimizer 验收；
 同配置 ABBA 的偏斜 / 平衡 step 差为 +0.068% / +0.173%，偏斜 conservative peak 增加 39.001 MiB。
-详见第 10.2.8 节及 [修复报告](megamoe_sun_fix_report_20260907.md)。
+Conda 构建探测与 reference 适配随后也已修复，常规完整构建及 12 项 NPU 回归通过。
+详见第 10.2.8--10.2.9 节及 [修复报告](megamoe_sun_fix_report_20260907.md)。
 
 ### 1.1 结论摘要
 
@@ -1138,6 +1139,23 @@ final allocated、SHMEM heap 和 shared-B pool 均不变。这是 correctness �
 不是零开销，也没有观察到明显的 step 回退。测试边界、原始 hashes 及构建限制见
 [修复报告](megamoe_sun_fix_report_20260907.md)。
 
+#### 10.2.9 恢复常规构建和 reference 生命周期验收
+
+multicore / SHMEM 的两个 Torch CMake 改用公开 include discovery，支持 Conda prefix 头文件，
+过滤缺失 fallback 并在 compile 前检查必要 header。补齐 wheel/Conda/缺失 header 的真实 CMake
+configure UT；CPU 回归为 189 passed / 156 subtests。control-stream 测试同步更新标准 reference
+的 `w1/w3`，不再访问旧 packed 参数名，也未放宽容差或删掉 rank-local cache 失效验证。
+
+常规 SHMEM 和 multicore 构建全部通过；六个重新生成的 kernels 与前一阶段逐位一致。正式
+adapters 恢复相对 RUNPATH，不再使用诊断构建的绝对路径和额外 `torch_python` 依赖。使用这些
+产物的 12 项 NPU 回归全部通过，另测 T=128 的 shared lifecycle 通过，T=2048 和 T=128 均实际
+覆盖两种 checkpoint 模式。还补验了四卡 None/1.5 × experts/router 的默认接口矩阵。
+正式产物再测同权重 16 层 B1，每步 AdamW：偏斜 / 平衡 full step 为 `1360.044 / 801.564 ms`，
+各 rank allocator / SHMEM ledger 与第 10.2.8 节修复版逐字节相同，未观察到额外回退；这是单次
+补充运行，不替代 ABBA 或作为新的加速结论。
+这不代表整网长期收敛、所有 shape、其他平台或完整 wheel 分发已验证。复现命令及证据见
+[修复报告](megamoe_sun_fix_report_20260907.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1265,7 +1283,11 @@ optimizer step，代表相同权重版本、pool 可直接命中的 micro-batch/
 
 ## 11. 正确性与验证
 
-### 11.1 当前工作树重新验证
+### 11.1 分阶段验证记录
+
+2026-09-07 重基复核与修复后的新证据分别见第 10.2.7--10.2.9 节及
+[修复报告](megamoe_sun_fix_report_20260907.md)。下列“本轮 / 本阶段”数字保留重基前各优化周期
+的历史记录，不替代当前分支的验收结果。
 
 执行：
 
@@ -1432,9 +1454,9 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 ## 15. 下一步优先级
 
 **重基复核后的前置项：** 串联 dX / shared-workspace alias 已修复并完成 ABBA，见第 10.2.8 节。
-下一项处理 Conda include 探测及新 reference 的测试适配，用常规构建产物重新通过真实设备验收。
-下面的性能优化顺序在这些
-正确性和可复现构建问题解决后恢复，不能以同配置的性能无损跳过失败项。
+Conda include 探测及新 reference 测试适配随后也已完成，常规完整构建和 12 项 NPU 回归通过，
+见第 10.2.9 节。复审后恢复下面的性能优化顺序；dX 小幅复制暂不优先于 P2P 传输 / 等待归因，
+不能为省去该复制重新暴露已修复的 alias。
 
 本轮按“扫测 → backward 诊断 → sizing 小改动 → A/B/B/A → forward 诊断 → 否决两种 peer 轮转”
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，

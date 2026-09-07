@@ -55,7 +55,30 @@ if(NOT torch_abi_status EQUAL 0 OR
         "Cannot determine the active Torch C++ ABI: ${torch_abi_error}")
 endif()
 
-set(TORCH_INCLUDE_ROOT "${TORCH_PACKAGE_ROOT}/include")
+# Conda can install headers outside the Python package. Public discovery may
+# also report nonexistent wheel fallback directories, which must be filtered.
+string(CONCAT torch_include_code
+    "import sys; from pathlib import Path; "
+    "from torch.utils.cpp_extension import include_paths; "
+    "roots = [Path(path) for path in include_paths() if Path(path).is_dir()]; "
+    "headers = ['ATen/ATen.h', 'torch/extension.h', 'torch/torch.h']; "
+    "missing = [header for header in headers if not any((root / header).is_file() for root in roots)]; "
+    "sys.exit('Missing Torch C++ headers: ' + ', '.join(missing)) "
+    "if missing else print(';'.join(map(str, roots)))")
+execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env TORCH_DEVICE_BACKEND_AUTOLOAD=0
+            ${Python3_EXECUTABLE} -c "${torch_include_code}"
+    RESULT_VARIABLE torch_include_status
+    OUTPUT_VARIABLE TORCH_INCLUDE_DIRS
+    ERROR_VARIABLE torch_include_error
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT torch_include_status EQUAL 0 OR NOT TORCH_INCLUDE_DIRS)
+    message(FATAL_ERROR
+        "Cannot locate Torch C++ include directories for ${Python3_EXECUTABLE}: "
+        "${torch_include_error}")
+endif()
+
 set(TORCH_NPU_INCLUDE_ROOT "${TORCH_NPU_PACKAGE_ROOT}/include")
 set(OP_PLUGIN_ROOT "${TORCH_NPU_INCLUDE_ROOT}/third_party/op-plugin")
 set(TORCH_LINK_LIBRARIES
@@ -66,8 +89,7 @@ set(TORCH_LINK_LIBRARIES
 
 foreach(required_path IN ITEMS
     ${Python3_INCLUDE_DIRS}
-    "${TORCH_INCLUDE_ROOT}"
-    "${TORCH_INCLUDE_ROOT}/torch/csrc/api/include"
+    ${TORCH_INCLUDE_DIRS}
     "${TORCH_NPU_INCLUDE_ROOT}"
     "${OP_PLUGIN_ROOT}/op_plugin/include/npu_cpp_extension.h"
     ${TORCH_LINK_LIBRARIES})
@@ -86,8 +108,7 @@ target_compile_definitions(hyper_parallel_mega_moe_torch PRIVATE
     _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI})
 target_include_directories(hyper_parallel_mega_moe_torch PRIVATE
     ${Python3_INCLUDE_DIRS}
-    ${TORCH_INCLUDE_ROOT}
-    ${TORCH_INCLUDE_ROOT}/torch/csrc/api/include
+    ${TORCH_INCLUDE_DIRS}
     ${TORCH_NPU_INCLUDE_ROOT}
     ${TORCH_NPU_INCLUDE_ROOT}/third_party/acl/inc
     ${OP_PLUGIN_ROOT}
