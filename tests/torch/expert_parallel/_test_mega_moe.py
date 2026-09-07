@@ -759,7 +759,7 @@ def test_mega_moe_kernel_cycle_profile() -> None:
         reference = _run_layer(native, hidden, *balanced, grad_output)
         actual = _run_layer(mega, hidden, *balanced, grad_output)
         _assert_results_close(reference, actual)
-        workspace = mega._resource_group.backend.workspace  # pylint: disable=protected-access
+        workspace = mega._resource_group.resources.workspace  # pylint: disable=protected-access
         assert workspace.forward_cycle_profile is None, "disabled forward allocated diagnostic HBM"
 
         os.environ[name] = "1"
@@ -957,9 +957,10 @@ def test_mega_moe_deferred_backward_hot_expert_replication() -> None:
     # must still invalidate collectively so every matching P2P peer refreshes.
     if _RANK == 0:
         with torch.no_grad():
-            native.gate_up_weight.add_(0.125)
+            _local_tensor(native.w1).add_(0.125)
+            _local_tensor(native.w3).add_(0.125)
             mega.gate_up_weight.add_(0.125)
-            native.down_weight.sub_(0.0625)
+            _local_tensor(native.w2).sub_(0.0625)
             mega.down_weight.sub_(0.0625)
     refreshed_native = _run_layer(
         native,

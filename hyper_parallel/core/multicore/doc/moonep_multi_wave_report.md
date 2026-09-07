@@ -995,6 +995,112 @@ backward dX/dW 细分继续保留，但不要混淆前后向瓶颈。本文没�
 就绪、rank 到达与依赖事件，把前向等待拆到具体 transfer/task，再决定排队顺序或 overlap 改动。
 P2P payload 分解紧随其后；FP32 dW 细分仍保留第三位，直接调前向 GMM tiling 和增加双 buffer 暂不优先。
 
+#### 10.2.6 第五步：验证并否决前向 peer 轮转
+
+本轮先将前向诊断直接本地提交为 `fdea4970`，后续每轮验证完成后也直接本地 commit，不使用 autogit、
+不 push。本项检查上一节排在首位的通信排队问题，不改 placement 或增加 shared-B buffer。
+
+原 RATR 的队列次序是 `local expert → tile → destination rank`。目标 rank 按本 rank 循环偏移，但
+`ProcessStatic` 只有奇数 Vector lane 工作，实际有 `num_workers / 2` 个 worker；910B 是 24 个，
+而不是 48 个。每个 worker 按 24 的 stride 取下一任务，因此 EP8 时它长期固定服务同一个 peer。
+planner 平衡的是各目标 rank 的接收总量，不能保证每个源 rank 到各 peer 的发送量也均匀。
+
+第一种候选只在每个 tile 的 peer 排列中加入轮转。令 `q = local_expert * tiles_per_expert + tile`、
+`W = num_workers / 2`，第 `lane` 个 peer 为 `(rank_id + lane + floor(q * EP / W)) % EP`。
+当 `EP` 整除 `W` 时，同一 worker 每个完整取任务 round 换一个目标，避免固定 peer。每个 segment
+独立计算偏移；combine 的起始队列位置只改变 worker 编号的排列，不改变这一负载分散性质。
+
+保持不变的协议边界：
+
+- 仅重排前向 dispatch/combine 的 `vector_task_indices`；不改任何 `TaskDesc`、tile index、目标地址、
+  route arrival slot、trigger 次数、ready handshake 或 Cube/SwiGLU/epilogue 队列。
+- 不跨 local-expert/tile 的优先级边界；空 payload 的 tile 仍发布到达信号，不能删除。
+- backward 普通与 multi-wave 的队列均不改，copy/compute ack 与 wave reuse fence 也不变。
+- 构造时选择顺序，不依赖运行时路由重建描述符；序列化长度、buffer 数量、通信字节数不变。
+
+CPU 使用 `0.1:42` 已记录的相同逻辑 histogram 和真实 planner 重建 EP8/B1 quotas：各 rank 都接收
+32768 tokens，但旧次序最忙 Vector worker 的 dispatch/combine 都承担 3189 tokens；轮转后分别为
+1872 / 1664 tokens，总量保持不变。这是任务负载模型，不是 wall-time 加速比例；还没有包含
+MTE 争用、远端就绪、信号成本及流水 overlap。平衡 `10000:42` 的最大负载均为 1379 tokens。
+
+第一种候选按 A/B/B/A 测量，A 为原顺序，B 为轮转。四次源码与 native payload 完全相同，只切换
+实验用 `HP_MEGA_MOE_FORWARD_PEER_ROTATION=0/1`，每个过程结束时再次校验 source identity。
+仍是 EP8、16 独立层、reentrant checkpoint、每步 AdamW、3 warmup + 7 measured；本轮统一先测
+偏斜 `0.1:42`，再测平衡 `10000:42`，不与上一节相反路由历史的 HBM 混算。
+
+| 运行 | 偏斜 F+B / step | 平衡 F+B / step |
+| --- | ---: | ---: |
+| A1 | 1231.460 / 1362.433 ms | 670.406 / 801.879 ms |
+| B1 | 1264.568 / 1395.723 ms | 669.964 / 801.100 ms |
+| B2 | 1266.980 / 1398.548 ms | 674.330 / 805.534 ms |
+| A2 | 1229.503 / 1360.795 ms | 671.894 / 803.149 ms |
+| A 两次中位数的均值 | 1230.482 / 1361.614 ms | 671.150 / 802.514 ms |
+| B 两次中位数的均值 | 1265.774 / 1397.136 ms | 672.147 / 803.317 ms |
+
+偏斜 full step 回退 `2.609%`、F+B 回退 `2.868%`；平衡 full step 为 `+0.100%`，不称为收益。
+因而不采用这一更均匀的静态负载排列。
+
+随后验证第二种更保守的候选：只在切换 local expert 时轮转，即 peer 为
+`(rank_id + lane + local_expert) % EP`，保留同一 expert 内原有的 tile/peer 节奏。
+CPU 最忙 worker dispatch/combine 为 `3160 / 2595` tokens。重新固定该候选源码做 B/A 对照，
+其余配置和路由顺序不变：
+
+| 按 expert 轮转 | 原顺序 A：F+B / step | 候选 B：F+B / step | full-step 差异 |
+| --- | ---: | ---: | ---: |
+| 偏斜 `0.1:42` | 1233.534 / 1364.572 ms | 1285.700 / 1415.691 ms | +3.746% |
+| 平衡 `10000:42` | 671.463 / 802.991 ms | 671.334 / 802.045 ms | -0.118% |
+
+这一组不是重复四次的统计证据，也不把平衡的亚百分比差异称为加速；偏斜回退已足以否决默认启用。
+
+两种候选都在计时结束后才开启 cycle 诊断，采样口径仍是 layer 0 最后一次 forward recomputation。
+下表分别取各自配对 A/B 的 rank/core category maximum，不能相加当 wall time：
+
+| 偏斜 forward 类别 | 按 worker round：A → B | 按 expert：A → B |
+| --- | ---: | ---: |
+| Cube dependency wait | 267926 → 303208 | 260082 → 381221 |
+| Vector dispatch hidden | 297701 → 314080 | 297169 → 416470 |
+| Vector combine | 269006 → 269694 | 263836 → 266555 |
+| Vector dependency wait | 531340 → 455548 | 530986 → 652085 |
+
+尤其第一种候选的 Vector wait 降低，但 Cube wait 和总 step 增加，说明不能把单类等待降低或
+worker 字节均衡直接当作流水改善。信号就绪、peer/MTE 争用及跨 worker 的进度相互影响是后续需
+分离的因素；现有聚合计数尚不能断言是哪一个 expert/peer 的首次到达导致回退。
+
+六次对应路线、shared pool、optimizer 配置一致；各 rank 的 baseline allocated、peak allocated、
+peak reserved、conservative total peak 和 SHMEM heap 均逐字节一致。偏斜/后续平衡的 rank-max
+`peak_allocated` 分别为 `24498462720 / 24057401344 bytes`，加 heap 后分别为
+`25370877952 / 24929816576 bytes`，heap 均为 `872415232 bytes`。runtime free/used 不在逐字节
+声明内。本轮没有增加 HBM。约每 10 秒的 NPU process census 只观察到每次本轮的 8 个 worker；
+CPU 上同时有其他用户的 gzip 作业，且没有硬件独占锁，不能宣称整个机器无竞争或排除采样间隙。
+
+验证与保留范围：
+
+- 第一种候选 CPU 为 `173 passed / 174 subtests passed`；balanced、hot replica、residual multi-wave
+  与 shared-weight lifecycle 四项双卡 ST 通过，`122.82 s`。
+- shared-weight lifecycle 使用 `HP_MEGA_MOE_SHARED_TOKENS=2048`，确保队列真正跨多个 worker round，
+  覆盖混合 home/replica 路由、延迟反向、保留图、reentrant checkpoint、跨层复用及权重更新。
+  仍使用 `HP_MEGA_MOE_SHARED_REENTRANT_ONLY=1`，不扩展已有 non-reentrant 限制的验证声明。
+- 第二种候选的六项调度 UT 与上述扩大 shape 的 lifecycle ST 通过，共 `7 passed / 52 subtests passed`。
+- 性能回退后，**两种候选和实验 selector 均撤掉**，不是保留为默认关闭的运行时功能。Torch runtime、
+  scheduler、forward descriptor builder 与 `fdea4970` 逐字节一致；native 和 MindSpore 路径未改。
+- 按 `add-unit-test` 保留五项针对真实现有 RATR 的回归：EP/worker 组合、非对齐段边界、空 tile 保留、
+  正反向两个重排入口一致、非法 segment count，以及三种 forward endpoint 图只改 Vector queue。
+  另保留真实 planner quotas 的 payload 守恒与接收均衡不等于 worker 均衡的案例。最终全套 CPU 回归
+  为 `172 passed / 151 subtests passed`；不把负收益候选的期望输出固化为运行时要求。
+- 撤回后再次运行 2048-token shared-weight lifecycle，`1 passed / 33.43 s`，与 native 比较通过。
+  最终 Python pylint、Markdown lint、AGENTS catalog 和 `git diff --check` 通过。
+
+原始数据：`output/qwen_moe_optimizer/peer_rotation_{a1,b1,b2,a2}_20260907.json`，及
+`peer_expert_rotation_{b1,a1}_20260907.json`；相邻 `*_monitor_20260907.log` 保存进程采样。
+第一种实验 runtime SHA 为 `6b7941f8aa3b52e7607bbceec33bf36e20af740364d1586ac0e278350bf020cc`，
+第二种为 `bac8e174592e8393154c4720c68e95001782d8ceec8404cf25a705e0086e8ac1`；每一组成对源码、
+helper、worker 和 native fingerprint 相同。撤回后恢复上一节的 `22da77a4...` runtime SHA。
+
+**完成后的优先级复审：** 不继续泛化两种静态轮转，也不直接推广到 backward。下一项把 P2P weight
+refresh / gradient return 的实际 payload、等待与 overlap 分解提升为第一位；前向保持第二位，但先
+补到具体 expert 的就绪与非空 transfer 完成事件，再考虑调度。FP32 dW 第三位，双 buffer 仍最后。
+本轮未取得可保留的端到端加速，当前性能路径保持不变。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1288,19 +1394,21 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 
 ## 15. 下一步优先级
 
-本轮按“扫测 → backward 诊断 → sizing 小改动 → A/B/B/A → forward 诊断与重采”逐步复审，结果见
-第 10.2.2--10.2.5 节。当前顺序如下；每项落地后都先验证正确性、wall time 和 HBM，再决定下一项。
+本轮按“扫测 → backward 诊断 → sizing 小改动 → A/B/B/A → forward 诊断 → 否决两种 peer 轮转”
+逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
+直接本地 commit，再决定下一项。
 
-1. **优先定位前向 dispatch/combine 就绪及跨 rank 尾部。** forward counter 已补齐；最后一次重算中
-   up/down GMM maximum 基本不变，Cube dependency wait 从 `55562` 增至 `260231`。下一步关联具体
-   dependency/event 与 rank 到达时间，区分 sender 排队、数据搬运、reader readiness 和等待远端进入
-   kernel；再做有证据的排队/overlap 改动。暂不优先调 GMM tiling，也不能删除真实 producer/consumer
-   dependency。schedule 改动须同时验证单 wave 与 residual multi-wave，默认路径的亚百分比开销也
-   要继续用匹配、无竞争的 wall-time 对照约束。
-2. **把 P2P 数据面归因提升到第二位。** rank-zero 的 SDMA 区间并集约 `169 ms`，CPU launch scope 和
+1. **把 P2P 数据面归因提升到第一位。** rank-zero 的 SDMA 区间并集约 `169 ms`，CPU launch scope 和
    profiler 的 `Communication` 汇总都不足以代表 payload。先区分 31 次 weight refresh 与 16 次 gradient
    return 的传输、等待和 overlap，再选择 peer 合批或调度改动。owner receive contribution 必须完成
    FP32 聚合后才能 cast；不能直接把区间并集当成预计可节省的 wall time。
+2. **前向调度先补 expert 就绪证据，不继续盲目轮转。** 两种 peer 重排虽保持通信字节数与 HBM，
+   偏斜 full step 分别回退 `2.609%` / `3.746%`，均已撤回。接收 rank 或 worker 的 payload 均衡不能
+   替代 GMM readiness 和跨 rank 进度；下一步关联具体 expert 的 dependency/event、非空 transfer 完成
+   和 rank 到达时间，分离 sender 排队、MTE/peer 争用、reader readiness 与等待远端进入 kernel。
+   先有上述证据再改前向队列，不直接推广失败策略到 backward，也不优先调 GMM tiling。
+   不删除真实 dependency；后续 schedule 改动仍须同时验证单 wave、residual multi-wave、匹配且记录
+   竞争情况的 wall time，以及默认 HBM。
 3. **按内存证据缩短 FP32 dW 与 owner receive 生命周期。** 用 allocator snapshot/trace 验证 `[H, ...]`
    FP32 dW、owner receive tensors 和 retained scratch 的真实峰值；只在确认 churn 后实现 event-ordered
    high-watermark/ring buffer，或在所有 replica contribution FP32 聚合完成后尽早 cast/release。不能提前
@@ -1328,6 +1436,7 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 | Torch route control plane | `hyper_parallel/core/multicore/modules/mega_moe/route.py` |
 | replica pool/autograd | `hyper_parallel/core/multicore/modules/mega_moe/replica.py` |
 | runtime/schedule | `hyper_parallel/core/multicore/modules/mega_moe/plan.py` |
+| RATR 队列合约回归 | `tests/ut/core/multicore/mega_moe/test_scheduler.py` |
 | workspace lifecycle | `hyper_parallel/core/multicore/modules/mega_moe/workspace.py` |
 | differentiable execution | `hyper_parallel/core/multicore/modules/mega_moe/function.py` |
 | multi-wave backward DAG | `hyper_parallel/core/multicore/modules/mega_moe/backward/graph.py` |

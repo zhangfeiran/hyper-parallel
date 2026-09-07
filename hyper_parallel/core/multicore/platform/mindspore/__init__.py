@@ -34,6 +34,13 @@ Forward and backward ACLNN symbols are packaged in one component-owned
 ``hyper_parallel_multicore_nn`` vendor. Source the packaged ``set_env.bash``
 before starting the application or framework Python process so CANN can discover that vendor.
 """
+
+from __future__ import annotations
+
+from functools import lru_cache
+from importlib import import_module
+from typing import Any
+
 __all__ = ["mega_moe", "mega_moe_grad"]
 
 from hyper_parallel.core.multicore._loader import (
@@ -41,10 +48,6 @@ from hyper_parallel.core.multicore._loader import (
     load_cpython_extension,
     preload_vendor_library,
 )
-
-# Lazily import the compiled MindSpore extension on first use to avoid a
-# circular import triggered by MindSpore's custom-op scan at load time.
-_ms_ops = None
 
 
 def _check_pynative_mode(fn_name: str) -> None:
@@ -55,7 +58,7 @@ def _check_pynative_mode(fn_name: str) -> None:
     graph compilation, so these ops cannot be traced or lowered by the
     MindSpore compiler.
     """
-    import mindspore as ms  # pylint: disable=import-outside-toplevel
+    ms = import_module("mindspore")
     if ms.get_context("mode") != ms.PYNATIVE_MODE:
         raise RuntimeError(
             f"'{fn_name}' only supports MindSpore PyNative mode. "
@@ -66,29 +69,44 @@ def _check_pynative_mode(fn_name: str) -> None:
         )
 
 
-def _get_ms_ops():
+@lru_cache(maxsize=1)
+def _get_ms_ops() -> Any:
     """Lazily load and return the compiled MindSpore extension module."""
-    global _ms_ops
-    if _ms_ops is None:
-        vendor_root, adapter_path = get_multicore_paths("mindspore")
-        __import__("mindspore")
-        preload_vendor_library(vendor_root)
-        _ms_ops = load_cpython_extension("hyper_parallel_mega_moe_ms", adapter_path)
-    return _ms_ops
+    vendor_root, adapter_path = get_multicore_paths("mindspore")
+    import_module("mindspore")
+    preload_vendor_library(vendor_root)
+    return load_cpython_extension("hyper_parallel_mega_moe_ms", adapter_path)
 
 
 def mega_moe(
-    dispatch_target, dispatch_target_off,
-    dispatch_src, dispatch_src_off, dispatch_size,
-    up_proj_weight, up_proj_glist,
-    up_proj_y, swiglu_out,
-    down_proj_weight, down_proj_glist, down_proj_y,
-    combine_target, combine_target_off, combine_src_off, combine_size,
-    gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
-    runtime_config, all_event_counters,
-    rank_id: int, ep: int, expert_num: int,
-    hidden_size: int, seq_size: int,
-):
+    dispatch_target: Any,
+    dispatch_target_off: Any,
+    dispatch_src: Any,
+    dispatch_src_off: Any,
+    dispatch_size: Any,
+    up_proj_weight: Any,
+    up_proj_glist: Any,
+    up_proj_y: Any,
+    swiglu_out: Any,
+    down_proj_weight: Any,
+    down_proj_glist: Any,
+    down_proj_y: Any,
+    combine_target: Any,
+    combine_target_off: Any,
+    combine_src_off: Any,
+    combine_size: Any,
+    gmm_workspace: Any,
+    up_proj_tiling: Any,
+    swiglu_tiling: Any,
+    down_proj_tiling: Any,
+    runtime_config: Any,
+    all_event_counters: Any,
+    rank_id: int,
+    ep: int,
+    expert_num: int,
+    hidden_size: int,
+    seq_size: int,
+) -> None:
     """MoE-FFN forward operator (MindSpore).
 
     .. note:: Only PyNative mode is supported. Raises ``RuntimeError`` if
@@ -98,37 +116,83 @@ def mega_moe(
     shared-B pools, or cycle profiling.
     """
     _check_pynative_mode("mega_moe")
-    import mindspore as ms  # pylint: disable=C0415
+    ms = import_module("mindspore")
 
     route_weight = dispatch_size[:1].astype(ms.float32)
     _get_ms_ops().mega_moe(
-        dispatch_target, dispatch_target_off,
-        dispatch_src, dispatch_src_off, dispatch_size,
-        up_proj_weight, up_proj_glist,
-        up_proj_y, swiglu_out,
-        down_proj_weight, down_proj_glist, down_proj_y,
-        combine_target, combine_target_off, combine_src_off, combine_size,
-        gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
-        runtime_config, all_event_counters,
-        dispatch_src, dispatch_size, dispatch_size, route_weight, combine_target,
-        rank_id, ep, expert_num, hidden_size, seq_size,
-        dispatch_target.shape[0], 1,
+        dispatch_target,
+        dispatch_target_off,
+        dispatch_src,
+        dispatch_src_off,
+        dispatch_size,
+        up_proj_weight,
+        up_proj_glist,
+        up_proj_y,
+        swiglu_out,
+        down_proj_weight,
+        down_proj_glist,
+        down_proj_y,
+        combine_target,
+        combine_target_off,
+        combine_src_off,
+        combine_size,
+        gmm_workspace,
+        up_proj_tiling,
+        swiglu_tiling,
+        down_proj_tiling,
+        runtime_config,
+        all_event_counters,
+        dispatch_src,
+        dispatch_size,
+        dispatch_size,
+        route_weight,
+        combine_target,
+        rank_id,
+        ep,
+        expert_num,
+        hidden_size,
+        seq_size,
+        dispatch_target.shape[0],
+        1,
     )
 
 
 def mega_moe_grad(
-    dispatch_target, dispatch_target_off,
-    dy, dispatch_src_off, dispatch_size,
-    hidden, hidden_dw,
-    w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x,
-    combine_target_off, combine_src_off, combine_size,
-    permute_out, gate_dw, group_list,
-    act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
-    swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
-    runtime_config, all_event_counters,
-    rank_id: int, ep: int, expert_num: int,
-    hidden_size: int, seq_size: int,
-):
+    dispatch_target: Any,
+    dispatch_target_off: Any,
+    dy: Any,
+    dispatch_src_off: Any,
+    dispatch_size: Any,
+    hidden: Any,
+    hidden_dw: Any,
+    w2: Any,
+    act_grad_y: Any,
+    gate: Any,
+    grad_gate: Any,
+    w1: Any,
+    gate_dx: Any,
+    grad_x: Any,
+    combine_target_off: Any,
+    combine_src_off: Any,
+    combine_size: Any,
+    permute_out: Any,
+    gate_dw: Any,
+    group_list: Any,
+    act_grad_tiling: Any,
+    gate_grad_tiling: Any,
+    w1_grad_tiling: Any,
+    w2_grad_tiling: Any,
+    swiglu_grad_tiling: Any,
+    gmm_workspace: Any,
+    swiglu_grad_workspace: Any,
+    runtime_config: Any,
+    all_event_counters: Any,
+    rank_id: int,
+    ep: int,
+    expert_num: int,
+    hidden_size: int,
+    seq_size: int,
+) -> None:
     """MoE-FFN backward operator (MindSpore).
 
     .. note:: Only PyNative mode is supported. Raises ``RuntimeError`` if
@@ -137,20 +201,47 @@ def mega_moe_grad(
     Route-fusion ABI inputs are unused by the legacy expert-major graph.
     """
     _check_pynative_mode("mega_moe_grad")
-    import mindspore as ms  # pylint: disable=C0415
+    ms = import_module("mindspore")
 
     route_weight = dispatch_size[:1].astype(ms.float32)
     _get_ms_ops().mega_moe_grad(
-        dispatch_target, dispatch_target_off,
-        dy, dispatch_src_off, dispatch_size,
-        hidden, hidden_dw,
-        w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x,
-        combine_target_off, combine_src_off, combine_size,
-        permute_out, gate_dw, group_list,
-        act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
-        swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
-        runtime_config, all_event_counters,
-        dispatch_size, route_weight, dispatch_size,
-        rank_id, ep, expert_num, hidden_size, seq_size,
-        dispatch_target.shape[0], 1,
+        dispatch_target,
+        dispatch_target_off,
+        dy,
+        dispatch_src_off,
+        dispatch_size,
+        hidden,
+        hidden_dw,
+        w2,
+        act_grad_y,
+        gate,
+        grad_gate,
+        w1,
+        gate_dx,
+        grad_x,
+        combine_target_off,
+        combine_src_off,
+        combine_size,
+        permute_out,
+        gate_dw,
+        group_list,
+        act_grad_tiling,
+        gate_grad_tiling,
+        w1_grad_tiling,
+        w2_grad_tiling,
+        swiglu_grad_tiling,
+        gmm_workspace,
+        swiglu_grad_workspace,
+        runtime_config,
+        all_event_counters,
+        dispatch_size,
+        route_weight,
+        dispatch_size,
+        rank_id,
+        ep,
+        expert_num,
+        hidden_size,
+        seq_size,
+        dispatch_target.shape[0],
+        1,
     )
