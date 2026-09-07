@@ -664,6 +664,10 @@ def _finish_backward(
             ).to(saved.topk_weights.dtype)
     if ctx.backward_unpermute_fused:
         grad_hidden = route_state.grad_x.narrow(0, 0, spec.local_num_tokens)
+        if ctx.permute_fused:
+            # Fused dispatch/combine leaves dX in the reusable SHMEM buffer.
+            # Autograd consumers and leaf gradients must survive its next use.
+            grad_hidden = grad_hidden.clone()
     else:
         reduce_route_index = saved.reduce_route_index
         if ctx.permute_fused and ctx.wave_count > 1:

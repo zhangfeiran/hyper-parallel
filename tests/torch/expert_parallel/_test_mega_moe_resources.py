@@ -200,8 +200,15 @@ def _mixed_owner_close_order(public_first: bool) -> dict:
         output.backward(upstream)
         torch.npu.synchronize()
         baseline.assert_finite("mixed-owner input gradient", hidden.grad)
+        expected_gradient = hidden.grad.detach().cpu()
         layer.close()
         _assert_invalidated(workspace_tensors)
+        gradient_bytes = hidden.grad.untyped_storage().nbytes()
+        expected_bytes = hidden.numel() * hidden.element_size()
+        assert gradient_bytes == expected_bytes, (
+            f"closed workspace changed gradient storage: expected={expected_bytes}, got={gradient_bytes}."
+        )
+        baseline.assert_close("gradient survives layer close", hidden.grad.detach().cpu(), expected_gradient)
         if not public_first:
             assert state.manager is manager and state.clients == 1, (
                 f"rank={baseline.RANK}: managed close finalized the public owner."

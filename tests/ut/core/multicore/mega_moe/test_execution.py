@@ -179,6 +179,73 @@ class TestReplicaGradientPrecision(unittest.TestCase):
         torch.testing.assert_close(weight2.grad, torch.full_like(weight2, 0.5), atol=0, rtol=0)
 
 
+class TestBackwardGradientOwnership(unittest.TestCase):
+    """Autograd outputs must outlive subsequent directional workspace reuse."""
+
+    @staticmethod
+    def _finish_input_gradient(grad_x: torch.Tensor, *, permute_fused: bool) -> torch.Tensor:
+        """Exercise the real return boundary without a device kernel or communicator."""
+        context = SimpleNamespace(
+            plan=SimpleNamespace(spec=SimpleNamespace(local_num_tokens=2)),
+            permute_fused=permute_fused, backward_unpermute_fused=True,
+            wave_count=1, replica_pending=None,
+        )
+        saved = SimpleNamespace(topk_weights=torch.ones((2, 2)))
+        route = SimpleNamespace(
+            grad_x=grad_x, grad_topk_weights=torch.zeros((2, 2)), route_weight=torch.zeros(4),
+        )
+        buffers = SimpleNamespace(grad_weight1=torch.ones(1), grad_weight2=torch.ones(1))
+        return execution._finish_backward(context, torch.ones((2, 3)), saved, route, buffers)[0]
+
+    def test_fused_input_gradient_survives_workspace_reuse(self) -> None:
+        """
+        Feature: fused backward output ownership
+        Description: overwrite shared directional storage after returning token-order dX
+        Expectation: the returned gradient retains its values in exact-size owned storage
+        """
+        for dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                scratch = torch.arange(24, dtype=dtype).reshape(8, 3)
+                expected = scratch[:2].clone()
+
+                gradient = self._finish_input_gradient(scratch, permute_fused=True)
+                scratch.fill_(-17)
+
+                torch.testing.assert_close(gradient, expected, rtol=0, atol=0)
+                self.assertEqual(gradient.untyped_storage().nbytes(), expected.numel() * expected.element_size())
+                self.assertNotEqual(gradient.untyped_storage().data_ptr(), scratch.untyped_storage().data_ptr())
+
+    def test_consecutive_fused_input_gradients_have_independent_ownership(self) -> None:
+        """
+        Feature: delayed autograd consumers
+        Description: return two gradients from successive uses of the same workspace
+        Expectation: neither later backward writes nor consumer mutations affect the earlier gradient
+        """
+        scratch = torch.ones((4, 3))
+        first = self._finish_input_gradient(scratch, permute_fused=True)
+        scratch.fill_(2)
+        second = self._finish_input_gradient(scratch, permute_fused=True)
+
+        second.add_(3)
+
+        torch.testing.assert_close(first, torch.ones((2, 3)), rtol=0, atol=0)
+        torch.testing.assert_close(second, torch.full((2, 3), 5.0), rtol=0, atol=0)
+        torch.testing.assert_close(scratch, torch.full((4, 3), 2.0), rtol=0, atol=0)
+
+    def test_unpermute_only_keeps_already_owned_output_without_copy(self) -> None:
+        """
+        Feature: independently fused backward endpoints
+        Description: return the privately allocated unpermute-only output
+        Expectation: no redundant clone or extra storage is introduced
+        """
+        owned = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+
+        gradient = self._finish_input_gradient(owned, permute_fused=False)
+
+        self.assertEqual(gradient.untyped_storage().data_ptr(), owned.untyped_storage().data_ptr())
+        torch.testing.assert_close(gradient, owned, rtol=0, atol=0)
+
+
 class TestForwardCycleProfiling(unittest.TestCase):
     """Keep opt-in native arguments and default allocation behavior consistent."""
 

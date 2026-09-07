@@ -174,12 +174,14 @@ def test_mega_moe_representative_performance(monkeypatch, tmp_path: Path) -> Non
     )
 
 
-def _run_acceptance_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str, cards: int) -> dict:
+def _run_acceptance_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str, cards: int, *, worker_name: str | None = None,
+) -> dict:
     """Launch one real-device acceptance worker and require its rank evidence."""
     _prepare_torch_multicore_test_environment()
     result_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path)))
     result_path = result_dir / f"{case}.json"
-    worker = "_test_mega_moe_resources.py" if cards == 2 else "_test_mega_moe_defaults.py"
+    worker = worker_name or ("_test_mega_moe_resources.py" if cards == 2 else "_test_mega_moe_defaults.py")
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(cards))
     monkeypatch.setenv("HP_MEGA_MOE_LEVEL1_RESULT", str(result_path))
     monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
@@ -210,6 +212,24 @@ def test_mega_moe_shared_resources(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     Expectation: Outputs, gradients and updates match, memory stabilizes and the last owner finalizes.
     """
     _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_shared_resource_acceptance", 2)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_connected_shared_gradients(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Feature: Connected shared-B backward ownership.
+
+    Description: Overlap connected graphs with changing routes, checkpoint and real AdamW updates.
+    Expectation: All outputs, gradients and optimizer states match independent execution resources.
+    """
+    _run_acceptance_worker(
+        monkeypatch, tmp_path, "test_mega_moe_connected_shared_gradients", 2,
+        worker_name="_test_mega_moe_connected.py",
+    )
 
 
 @arg_mark(

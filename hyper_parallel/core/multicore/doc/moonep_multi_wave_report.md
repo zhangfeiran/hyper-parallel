@@ -28,6 +28,10 @@ owned-SHMEM 生命周期、`expert_capacity_factor=None` 默认值及按绑定�
 或新增数值损失，HBM 不变；但发现 Conda 构建探测、测试 reference 适配问题，并确认重基前已存在
 的串联 workspace 梯度别名缺陷。不能把历史通过项或本轮局部 A/B 表述为整个新分支验收通过。
 
+后续 P0 已修复 fused backward 的 dX ownership，并通过串联图 / checkpoint / optimizer 验收；
+同配置 ABBA 的偏斜 / 平衡 step 差为 +0.068% / +0.173%，偏斜 conservative peak 增加 39.001 MiB。
+详见第 10.2.8 节及 [修复报告](megamoe_sun_fix_report_20260907.md)。
+
 ### 1.1 结论摘要
 
 - 当前组合不是把 MoonEP CUDA 实现直接移植到 Ascend，而是把其“按路由热度动态复制专家”的思想，
@@ -1120,6 +1124,20 @@ refresh / gradient return 的实际 payload、等待与 overlap 分解提升为�
 完整方法、失败归因、默认 None 的 HBM 差异及原始证据见
 [本轮复核报告](megamoe_sun_rebase_validation_20260907.md)。
 
+#### 10.2.8 P0 修复：fused dX 不再别名共享 workspace
+
+`_finish_backward` 在双向 fused 的 one-wave 路径，只对有效 `[T, hidden]` dX 返回 owned clone，
+复制位于 workspace release event 之前。其他已有私有输出的路径不增加复制。新增 CPU ownership
+回归和真实 NPU 串联训练矩阵，覆盖两份 outstanding graph、home/shared-B 切换、W1/W2、
+reentrant checkpoint、每步 AdamW 与 resource close；186 项 CPU 和本轮 10 项 NPU launcher 通过。
+
+从 `7fe7db65` 的修复前基线做新的 matched-weight ABBA，16 独立 Qwen MoE 层、B1、capacity=1.5，
+偏斜 full-step 均值 `1360.145 → 1361.070 ms`（+0.068%），平衡 `801.770 → 803.155 ms`（+0.173%）。
+偏斜 conservative peak 增加 `39.001 MiB/rank`，平衡不变；reserved 增加 `36 MiB/rank`，
+final allocated、SHMEM heap 和 shared-B pool 均不变。这是 correctness 修复的小幅内存成本，
+不是零开销，也没有观察到明显的 step 回退。测试边界、原始 hashes 及构建限制见
+[修复报告](megamoe_sun_fix_report_20260907.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1413,8 +1431,9 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 
 ## 15. 下一步优先级
 
-**重基复核后的前置项：** 先修复已复现的串联 dX / shared-workspace alias，再处理 Conda include
-探测及新 reference 的测试适配，重新通过真实设备验收；见第 10.2.7 节。下面的性能优化顺序在这些
+**重基复核后的前置项：** 串联 dX / shared-workspace alias 已修复并完成 ABBA，见第 10.2.8 节。
+下一项处理 Conda include 探测及新 reference 的测试适配，用常规构建产物重新通过真实设备验收。
+下面的性能优化顺序在这些
 正确性和可复现构建问题解决后恢复，不能以同配置的性能无损跳过失败项。
 
 本轮按“扫测 → backward 诊断 → sizing 小改动 → A/B/B/A → forward 诊断 → 否决两种 peer 轮转”
