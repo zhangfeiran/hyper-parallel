@@ -15,7 +15,9 @@
 """CPU contracts for the checkpointed multi-layer benchmark protocol."""
 
 import argparse
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -24,6 +26,7 @@ from examples.torch.multicore.benchmark_mega_moe_layers import (
     _configuration,
     _make_optimizer,
     _optimizer_state_ledger,
+    _python_source_identity,
     _route_pairs,
 )
 
@@ -75,3 +78,17 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         args.limit = 4
         self.assertEqual(len(full), 55)
         self.assertEqual(_route_pairs(args), full[:4])
+
+    def test_source_identity_detects_dirty_runtime_changes(self):
+        """Include uncommitted Python implementation edits in benchmark provenance."""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = repo / "hyper_parallel/core/multicore/runtime.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            first = _python_source_identity(repo)
+            source.write_text("VALUE = 2\n", encoding="utf-8")
+            second = _python_source_identity(repo)
+        self.assertEqual(first["file_count"], 1)
+        self.assertEqual(second["file_count"], 1)
+        self.assertNotEqual(first["sha256"], second["sha256"])

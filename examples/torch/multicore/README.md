@@ -51,8 +51,9 @@ initializes an accelerator or imports a training framework.
 Each input is a performance sweep with `variant`, `kind`, `source`,
 `configuration`, and `points` fields. Points use the routed-expert ST's
 `shape`, `topology`, `route`, `rank_max_fwd_bwd_ms`, `validation`, and `memory`
-records. Source identity includes the commit, worker/adapter hashes, and
-native artifact hashes. The tool rejects unmatched alpha/seed sets, different
+records. Source identity includes the commit, worker/adapter hashes, Torch
+MegaMoe Python implementation digest (including dirty-tree edits), and native
+artifact hashes. The tool rejects unmatched alpha/seed sets, different
 logical routes or shapes, incompatible settings, duplicate samples, and
 inconsistent memory accounting instead of silently joining unlike runs.
 

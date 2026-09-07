@@ -174,7 +174,9 @@ class SharedExpertWeightLease:
     plan: ExpertPlacementPlan
     weights: tuple[Any, Any]
     handles: tuple[Any, ...]
-    transfers: tuple[Any, ...]
+    transfers: tuple[_P2PTransfer, ...]
+    key: _PhysicalWeightCacheKey | None = None
+    reused: bool = False
     released: bool = False
     ready: bool = False
 
@@ -187,6 +189,8 @@ class SharedExpertWeightLease:
         _wait_handles(self.handles)
         self.handles = ()
         self.transfers = ()
+        if self.key is not None:
+            self.manager._mark_shared_pool_ready(self.key)  # pylint: disable=W0212
         # Replica pointers are carried in an opaque plan descriptor, not
         # ordinary operator tensor inputs. Protect their allocator lifetime on
         # the consuming stream even if the resource group is subsequently freed.
@@ -268,6 +272,7 @@ class ExpertReplicaManager:
         self._home_materializations: dict[tuple[int, int], tuple[Any, ...]] = {}
         self._shared_weights: tuple[Any, Any] | None = None
         self._shared_gradients: tuple[Any, Any] | None = None
+        self._shared_key: _PhysicalWeightCacheKey | None = None
         self._shared_runtime_configs: dict[tuple[int, bool], tuple[Any, Any]] = {}
         self._shared_lock = threading.Lock()
         self._shared_in_use = False
@@ -295,6 +300,7 @@ class ExpertReplicaManager:
                 raise RuntimeError("shared expert weight pool does not support concurrent calls.")
             self._shared_in_use = True
         try:
+            key = self._cache_key(plan, weight1, weight2)
             if self._shared_weights is None:
                 self._shared_weights = tuple(
                     torch.empty(
@@ -314,19 +320,46 @@ class ExpertReplicaManager:
                 raise ValueError("shared expert weight pool cannot change matrix shapes.")
             if self._shared_event is not None:
                 torch.npu.current_stream(weight1.device).wait_event(self._shared_event)
+            locally_reusable = self._shared_key == key
+            if self._all_ranks_can_reuse(locally_reusable, weight1):
+                return SharedExpertWeightLease(
+                    self,
+                    plan,
+                    self._shared_weights,
+                    (),
+                    (),
+                    key,
+                    reused=True,
+                )
+            self._shared_key = None
             transfers = self._prefetch_transfers(
                 plan, weight1, weight2, replica_weight1, replica_weight2,
                 pool_start=self.spec.local_experts,
             )
             handles = _launch_transfers(transfers, self.spec.ep_group)
-            return SharedExpertWeightLease(self, plan, self._shared_weights, handles, transfers)
+            return SharedExpertWeightLease(
+                self,
+                plan,
+                self._shared_weights,
+                handles,
+                transfers,
+                key,
+            )
         except Exception:
             # A failed P2P launch may have enqueued only part of the batch.
             # Reject further use instead of overwriting potentially live DMA.
             with self._shared_lock:
                 self._shared_failed = True
                 self._shared_in_use = False
+                self._shared_key = None
             raise
+
+    def _mark_shared_pool_ready(self, key: _PhysicalWeightCacheKey) -> None:
+        """Publish one fully transferred shared-weight binding for reuse."""
+        with self._shared_lock:
+            if self._shared_failed or not self._shared_in_use:
+                raise RuntimeError("shared expert weight pool is not claimed.")
+            self._shared_key = key
 
     def prepare_shared_gradients(self, *, multi_wave: bool) -> tuple[Any, Any]:
         """Return FP32 B-slot partials, cleared before multi-wave accumulation."""

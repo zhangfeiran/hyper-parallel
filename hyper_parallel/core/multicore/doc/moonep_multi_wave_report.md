@@ -12,8 +12,8 @@
 | 整理日期 | 2026-09-07 |
 | 代码分支 | `megamoe-perf-sun` |
 | 代码基线 | `megamoe-perf-sun`；以本文同提交代码为准 |
-| 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、`43aa7d6c`、本提交（compact layout 与集成修复） |
-| 状态 | 已实现；Torch managed MegaMoe 默认关闭副本，compact 默认 eager，multi-wave 保持 lossless |
+| 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、`43aa7d6c`、`b255b821`、`40b6963b`、`9f75fd20`、`86f4b433`、`364af596` |
+| 状态 | 已实现；multi-wave 保持 lossless；副本默认关闭；串行多层可显式启用 shared-B |
 
 代码是最终事实来源；本文中的性能数字只对应第 10 节写明的硬件、模型、路由和测量方法。
 
@@ -22,15 +22,28 @@
 - 当前组合不是把 MoonEP CUDA 实现直接移植到 Ascend，而是把其“按路由热度动态复制专家”的思想，
   适配成有界的 rank-local physical expert pool，再用 MegaMoe multi-wave 无损承接副本预算不足后的残余
   倾斜。
+- 当前串行多层主路径使用 `shared_physical_weights=True`：每个 resource group 只保留一份 B-slot BF16
+  replica weight 和一份 B-slot FP32 replica gradient，home Parameter 继续作为普通算子输入。它不再为每层
+  建 `[H+B]` physical weight，也不执行 `Parameter.set_()`；persistent replica storage 与层数无关。
 - `replica_slots_per_rank=0` 时保持原有 home-only 路径。`B > 0` 也不会强制复制：如果 home placement
   已能在一个 receive window 内完成，会自动选择较小的 home runtime，跳过 placement、物理 ID remap
-  和权重 P2P。compact 默认在每层第一次 forward 前准备 suffix；显式 lazy 策略才会同时跳过未使用的
-  suffix backing。
-- 在 8 卡 Qwen E48/K8、严重固定偏斜、每步 fused AdamW 的正式测试中，`B=1 + compact` 相比
-  `B=0`，optimizer-step rank-max p50 从 `1155.271 ms` 降到 `631.915 ms`，降低 `45.302%`，
-  等价吞吐提升 `1.828x`。
-- 同一测试中，compact 模式相对 `B=0` 的 sampled HBM peak 只增加 `0.120 GiB`。相较 snapshot
-  模式的额外 HBM，已消除 `94.99%`；性能没有因省显存而回退。
+  和权重 P2P。非 shared-B 的 compact 路径仍默认在每层第一次 forward 前准备 suffix；显式 lazy 策略
+  才会同时跳过未使用的 suffix backing。
+- 在 8 卡 16 层 checkpointed Qwen MoE、严重固定偏斜、每步 AdamW 的当前复测中，`B=1 + shared-B`
+  相比 `B=0`，F+B 从 `1789.069 ms` 降到两次运行均值 `1247.859 ms`，降低 `30.251%`；full step 从
+  `1920.229 ms` 降到 `1379.185 ms`，降低 `28.176%`。conservative peak 只增加 `77.888 MiB`，而
+  allocator peak reserved 反而减少 `724 MiB`。
+- 本轮首先落地 shared-B 的同版本 cache hit：checkpoint recompute 紧接同层 backward 时复用 B-slot，
+  只有 transfer 全部完成后才发布 cache key；层、placement、storage 或参数版本变化都会失效，且 EP
+  group 用 `MIN` all-reduce 保证一致决策。两轮 A/B 的 F+B 均值降低 `1.321%`，full step 降低
+  `1.182%`，HBM 逐字节不变。
+- 旧的 8 层 compact 路径复测中，`B=1 + compact` 相比
+  `B=0`，optimizer-step rank-max p50 从 `1156.840 ms` 降到 `671.199 ms`，降低 `41.980%`，
+  等价吞吐提升 `1.724x`；该组数据用于比较 legacy per-layer storage，不是当前 shared-B 多层主结果。
+- FP32 physical dW 下，该 compact 配置相对 `B=0` 的 sampled HBM peak 增加 `3.783 GiB`，不再是旧数据的
+  `0.120 GiB`。它仍把 snapshot 的 `5.755 GiB` 增量压到 `3.783 GiB`，回收 `34.25%`；若只看 live
+  allocator allocation，则回收 `95.07%`。剩余 sampled HBM 主要体现瞬时 dW/workspace 推高并留在
+  allocator reserve 中。shared-B 已进一步消除了这类随层数增长的 replica weight persistence。
 - 轻微偏斜、home-only 单 wave 时，`B=1 + compact` 与 `B=0` 的差异落在运行噪声内。因此当前实现的
   收益条件是“副本减少了足够多的 wave 或热点 GMM 尾部”，而不是任何路由都必然加速。
 - compact 同时支持默认 `eager_on_first_forward` 和可选 `lazy_on_first_replica`。lazy 的 home graph
@@ -38,7 +51,7 @@
   避免 `Parameter.set_()` 触发 saved-tensor version 错误。
 - 精度修复后，replica route 的 physical dW 保持 FP32，所有 copy 在 owner 侧聚合后才回到 logical
   Parameter；外层 MegaMoe autograd 同时负责等待 physical weight 和返回 logical gradient，避免中间
-  BF16 autograd edge。第 10 节历史性能/HBM 数据早于该修复，不能当作当前提交的复测结果。
+  BF16 autograd edge。第 10.2 节是当前 shared-B 主结果；第 10.4--10.5 节保留 legacy compact 对照。
 
 ## 2. 目标、边界与术语
 
@@ -102,7 +115,8 @@ Qwen router
           │
           └─ max(home load) > C
                  ├─ bounded host planner: at most B replicas/rank
-                 ├─ start weight prefetch
+                 ├─ shared-B: prefetch B suffix only; home weights stay as op inputs
+                 │     └─ legacy: materialize per-layer [H+B] physical view
                  ├─ logical route -> physical route remap
                  └─ physical runtime: P=E+R*B
                               │
@@ -125,7 +139,7 @@ Qwen router
 | 模型接口 | 固定 shape、home 参数、显式副本/存储开关 | `modules/mega_moe/module.py` |
 | 路由控制面 | count gather、快路径选择、placement、physical remap、offset | `platform/torch/mega_moe/route.py` |
 | 放置算法 | 有界副本、负载搬移、计数守恒、transfer 描述 | `modules/mega_moe/placement.py` |
-| 权重控制面 | physical pool、P2P prefetch、owner-directed autograd | `platform/torch/mega_moe/replica.py` |
+| 权重控制面 | shared-B lease/cache、legacy physical pool、P2P、owner reduction | `platform/torch/mega_moe/replica.py` |
 | 执行与资源 | runtime DAG、workspace lease、forward/backward bridge | `runtime.py`、`workspace.py`、`execution.py` |
 | 设备数据面 | wave replay、窗口求交、任务依赖和 SHMEM 信号 | `ops/runtime/worker_kernel.h` 及两个 worker |
 
@@ -207,7 +221,7 @@ TopK 槽位以及 route weight 都保持逐槽语义。
 `C`，而 `retained_capacity=max(L)`，用于保存跨 wave 的必要前向状态。所有 offset 都描述真实行，不靠
 padding 或清空 capacity tail 保证正确性。
 
-## 5. physical weight 与 optimizer ownership
+## 5. physical weight、shared-B 与 optimizer ownership
 
 ### 5.1 固定本地布局
 
@@ -221,12 +235,47 @@ router 和 scheduler 使用展平的全局 physical ID：`rank * (H+B) + local_s
 仍是 `[H, ...]`，只有 kernel view 是 `[H+B, ...]`；因此 checkpoint、`state_dict` 和 optimizer 继续只
 拥有 home rows。
 
-placement callback 在 plan 产生后立刻调用 `ExpertReplicaManager.start_prefetch()`。P2P batch 在
-physical count H2D、route remap 和 token permutation 之前启动，尽量掩盖 remote weight 搬运。每个
-send 的 contiguous 临时 tensor 和每个 receive target 都保活到 handle 完成；kernel 读取前调用
-`wait()`，异常路径调用 `drain()`，避免提前释放或消费未完成 buffer。
+placement callback 在 plan 产生后立刻启动 prefetch。P2P batch 在 physical count H2D、route remap 和
+token permutation 之前启动，尽量掩盖 remote weight 搬运。每个 send tensor 和 receive target 都保活到
+handle 完成；kernel 读取前调用 `wait()`，异常路径调用 `drain()`，避免提前释放或消费未完成 buffer。
 
-### 5.2 compact layout 时机与首次交叠保护
+### 5.2 跨层 shared-B split-weight 路径
+
+`shared_physical_weights=True` 是当前串行多层降低副本 HBM 的主路径，并与
+`compact_physical_weights` 互斥。相同 resource group 的 layer 共享：
+
+- `[B, ...]` BF16 gate/up 与 down replica weight；
+- `[B, ...]` FP32 replica gradient；
+- split-weight runtime descriptor 和串行 lease/event。
+
+home Parameter 不复制、不重绑，forward/backward ACLNN schema 仍收到 `[H, ...]` home tensor。扩展的
+runtime descriptor 只携带稳定的 B-slot weight/gradient address，kernel 用 `local_experts` 划分 prefix 与
+suffix：slot `< H` 从普通算子输入取地址，slot `>= H` 从 shared descriptor 取地址。这样 optimizer、
+`state_dict`、saved tensor version 与 storage alias 都只观察原始 home Parameter，也彻底避开跨层共享时
+对每个 Parameter 执行 `set_()`。
+
+shared pool 是 exclusive scratch，不允许两个 MoE call 并发读取不同 binding。lease 在当前 stream 的最后
+一个 consumer 后记录 event，下一次 claim 先等待 event；forward graph 只保存 manager、immutable plan
+和 home Parameter，backward 会重新 claim pool。FP32 suffix dW 先通过 owner-directed P2P 聚合进当前层
+FP32 home dW，autograd 最终只返回 `[H, ...]`，因此 shared pool 不会成为 Parameter.grad 或 optimizer
+state 的所有者。
+
+初版 shared-B 每次 claim 都重传 replica，包括 checkpoint recompute forward 后立即发生的同层 backward。
+当前 cache key 包含完整 slot map、两个 Parameter identity/data pointer/version；所有 transfer handle 完成后
+才发布 key。相同 binding 的下一次 claim 跳过 P2P，以下任一变化会强制刷新：
+
+- 切换 layer 或 Parameter 对象；
+- optimizer/in-place update 推进 version；
+- storage address 变化；
+- placement 的任一 physical slot 改绑。
+
+cache hit 前仍在 EP group 上执行 INT32 `MIN` all-reduce。只要一个 rank miss，所有 rank 就一起走 P2P，
+避免 sender 和 receiver 选择不同协议。16 层 reentrant checkpoint 的一次 step 有 48 次 shared claim：16 次
+初始 forward、16 次 recompute forward、16 次 backward。固定同一路由时，首个 reverse layer 的 recompute
+以及每层 recompute 后的 backward 共 17 次可命中，transfer phase 从 48 降到 31；跨 layer 的 pool overwrite
+仍然 miss。
+
+### 5.3 compact layout 时机与首次交叠保护
 
 `compact_layout_strategy` 支持两种显式策略：
 
@@ -258,10 +307,10 @@ forward A (home lease live)
 reentrant checkpoint 的第一次 no-grad forward 不会建立 lease；backward recompute 使用当时有效的 home
 prefix。non-reentrant checkpoint 若仍保留 home tensor，则由同一 lease 机制阻止中途重绑。
 
-### 5.3 generation-aware pool cache
+### 5.4 generation-aware legacy pool cache
 
-每对 layer 参数拥有一个 cache entry。共享串行 decoder layer 时，cache 容量等于共享成员数，所以 8 层
-可以各自保留一个 pool，同时只共享一套 runtime/workspace。
+非 shared-B 的 snapshot/compact 路径中，每对 layer 参数拥有一个 cache entry。共享串行 decoder layer 时，
+cache 容量等于共享成员数，所以 8 层可以各自保留一个 pool，同时只共享一套 runtime/workspace。
 
 cache key 包含：
 
@@ -281,12 +330,13 @@ optimizer step 推进参数版本后：
 缓存命中使用 EP group 上的 INT32 `MIN` all-reduce 达成一致决策。即使只有 owner rank 观察到版本变化，
 所有 sender/receiver 也会一起进入刷新协议，避免一侧发送、另一侧误判 cache hit。
 
-### 5.4 owner-directed autograd
+### 5.5 owner-directed autograd
 
-生产执行中，外层 `_MegaMoeFunction` 的 autograd 输入始终是两个 logical home Parameter。replica
+生产执行中，外层 `_MegaMoeFunction` 的 autograd 输入始终是两个 logical home Parameter。legacy replica
 prefetch 的 `PendingExpertWeights` 只作为 route payload 传入，在该 custom Function 的 forward 内等待并
 换成 physical kernel view；因此 physical view 与 home Parameter 之间不会建立一个提前把梯度舍入到
-BF16 的中间 autograd edge。MegaMoe backward 先产生 `[H+B, ...]` 的 FP32 physical `dW1/dW2`，随后：
+BF16 的中间 autograd edge。legacy backward 产生 `[H+B, ...]` 的 FP32 physical `dW1/dW2`；shared-B
+backward 则分别写 `[H, ...]` call-local home dW 和 `[B, ...]` shared suffix dW。两者随后都执行：
 
 1. 本地 home prefix 作为 owner gradient 基底；
 2. replica rank 以 FP32 把 suffix gradient P2P 发回 logical expert 的 home owner；
@@ -426,7 +476,26 @@ fusion mode 会报错。
 GMM dW scratch 采用 high-watermark：只有需求增大时才同步并扩容，较小的后续调用不会 shrink 掉可能
 仍被 deferred backward 使用的 tail。代价是达到过的最大 scratch 会保留到 workspace 释放。
 
-### 8.2 snapshot 与 compact physical weights
+### 8.2 shared-B 的层数无关存储
+
+设一个 BF16 expert 的两组权重合计为 `M_expert`。shared-B 每个 resource group、每个 rank 的 persistent
+replica storage 为：
+
+```text
+BF16 replica weight = B * M_expert
+FP32 replica dW     = 2 * B * M_expert
+shared-B total      = 3 * B * M_expert
+```
+
+这个公式不乘 layer 数。home 参数、Parameter.grad 和 AdamW state 仍按层存在，但它们是训练本身的状态，
+不是 replica storage。shared-B backward 仍需要一个当前层的 FP32 `[H, ...]` home dW；在 owner reduction
+完成并交给 autograd 后即可释放，不会为所有层同时保留 FP32 physical dW。
+
+第 10.2 节的 `B=1`、H5120/I1792 下，每 rank 实测 shared weight `52.5 MiB`、shared gradient
+`105.0 MiB`，合计 `157.5 MiB`。16 层 per-layer compact 仅 BF16 suffix 理论上就需要 `840 MiB`；shared-B
+连同 FP32 suffix dW 后仍只需 `157.5 MiB`，且完全不修改 Parameter storage。
+
+### 8.3 snapshot 与 compact physical weights
 
 设一个 BF16 expert 的两组权重大小为：
 
@@ -452,9 +521,9 @@ lease + transient snapshot 保护首次切换。当前 CPU 回归覆盖先创建
 更新，以及 `state_dict` save/load shape 与 backing 地址。持有 raw storage alias 的调用方仍必须把 alias
 创建在 eager 首次 forward 之后；lazy 转换前创建的 raw alias 不会自动跟随新的 storage。
 
-### 8.3 Qwen shape 的理论值
+### 8.4 Qwen shape 的 legacy 理论值
 
-第 10 节 Qwen shape 中，`hidden=5120`、`intermediate=1792`，所以一个 BF16 expert 的 W1+W2 是
+第 10.3 节 legacy Qwen shape 中，`hidden=5120`、`intermediate=1792`，所以一个 BF16 expert 的 W1+W2 是
 `52.5 MiB`。`E=48`、`R=8`、`H=6`、8 层、`B=1` 时：
 
 - snapshot pool：`8 * (6+1) * 52.5 MiB = 2.871 GiB`；
@@ -470,28 +539,38 @@ buffer，不改变 compact physical weight 的持久 suffix 公式，但会改�
 
 ## 9. API 与执行状态
 
-模型侧显式启用方式：
+串行多层推荐显式启用 shared-B，并在第一次 forward 前绑定同一 resource group：
+
+```python
+layers = [
+    MegaMoeExperts(
+        local_num_tokens=4096,
+        hidden_size=5120,
+        intermediate_size=1792,
+        num_experts=48,
+        top_k=8,
+        expert_capacity_factor=1.5,
+        replica_slots_per_rank=1,
+        shared_physical_weights=True,
+        ep_size=8,
+        ep_group=ep_group,
+    )
+    for _ in range(num_layers)
+]
+
+MegaMoeExperts.share_execution_resources(layers)
+```
+
+`shared_physical_weights=True` 要求 `B > 0`，并排斥 `compact_physical_weights=True`。如果需要独立
+per-layer physical view，仍可选择 legacy compact：
 
 ```python
 experts = MegaMoeExperts(
-    local_num_tokens=4096,
-    hidden_size=5120,
-    intermediate_size=1792,
-    num_experts=48,
-    top_k=8,
-    expert_capacity_factor=1.5,
+    # Same shape/topology arguments as above.
     replica_slots_per_rank=1,
     compact_physical_weights=True,
     compact_layout_strategy="eager_on_first_forward",  # default
-    ep_size=8,
-    ep_group=ep_group,
 )
-```
-
-串行 decoder layer 构造完成后、第一次 forward 前调用：
-
-```python
-MegaMoeExperts.share_execution_resources(layer.experts for layer in layers)
 ```
 
 状态选择如下：
@@ -500,9 +579,9 @@ MegaMoeExperts.share_execution_resources(layer.experts for layer in layers)
 | --- | --- | --- | --- |
 | `B=0`，home load `<= C` | home | 无 | 1 |
 | `B=0`，home load `> C` | home | 无 | `ceil(max(home load)/C)` |
-| `B>0`，home load `<= C` | home fast path | snapshot/lazy compact 无；eager compact 有 suffix backing | 1 |
-| `B>0`，副本后 load `<= C` | physical | snapshot 或 compact | 1 |
-| `B>0`，副本后仍 `> C` | physical | snapshot 或 compact | residual multi-wave |
+| `B>0`，home load `<= C` | home fast path | shared/snapshot/lazy 无 transfer；eager compact 有 backing | 1 |
+| `B>0`，副本后 load `<= C` | physical | shared-B suffix 或 legacy snapshot/compact | 1 |
+| `B>0`，副本后仍 `> C` | physical | shared-B suffix 或 legacy snapshot/compact | residual multi-wave |
 
 完整 Qwen 命令由 `examples/torch/multicore/benchmark_qwen_moe_mega_moe.sh` 封装。例如：
 
@@ -524,15 +603,77 @@ bash examples/torch/multicore/benchmark_qwen_moe_mega_moe.sh \
 `--compact-layout-strategy lazy_on_first_replica`。该选择会写入 benchmark JSON，避免把两种 layout
 时机的 first-step/HBM 结果混合比较。
 
-## 10. 历史性能结果（精度修复前）
+## 10. 性能结果
 
-### 10.1 测量口径
+### 10.1 当前 shared-B 测量口径
 
-主结果使用以下固定 workload：
+本轮首先固定一个能稳定触发副本的 production-shape 路由，用于判断优化方向，而不是用单点代替完整
+55-route curve：
 
 | 项目 | 值 |
 | --- | --- |
-| 硬件/软件 | 8 张 Ascend 910B3，CANN 9.1 <!-- codespell:ignore cann --> |
+| 硬件/软件 | 8 张空闲 Ascend 910B3，CANN 9.2.0，Torch/Torch-NPU 2.9.1 <!-- codespell:ignore cann --> |
+| 模型范围 | 16 个独立 MoE layer；全部 forward 后 reverse backward；无 attention/router network |
+| checkpoint | reentrant；每层 backward 前重算 forward |
+| shape | 每 rank 4096 token，H5120，I1792，E48，TopK8，BF16，EP8 |
+| 路由 | Dirichlet `alpha=0.1, seed=42`；home 2 wave，`B=1` placement 后 1 wave |
+| optimizer | AdamW；每个 sample 更新参数；`foreach=False`、`fused=False` |
+| 测量 | 每进程 3 warmup + 7 measured；先取 rank-max，再求进程内 median |
+| 顺序 | cache-off、cache-on、cache-on、cache-off；每组 fresh 8-rank process |
+
+cache-off 使用 detached `364af596` worktree；cache-on 使用同一提交加本报告所述 working-tree patch。两者
+共用同一份由 `364af596` 源码构建的 Torch/Ascend910B native payload；本轮优化只改 Python replica
+control plane，不改 native ABI 或 kernel。四组 route、workspace、optimizer state、shared pool 字节数完全
+一致。原始 JSON 位于被 `.gitignore` 排除的
+`output/qwen_moe_optimizer/shared_cache_ab_{baseline,optimized}*_20260907.json`。
+
+### 10.2 当前结果：shared-B 整体收益与同版本 cache
+
+| 配置 | F+B median | full-step median |
+| --- | ---: | ---: |
+| `B=0`，multi-wave-only（1 run） | 1789.069 ms | 1920.229 ms |
+| shared-B，cache-off run 1 | 1262.698 ms | 1394.836 ms |
+| shared-B，cache-off run 2 | 1266.435 ms | 1396.517 ms |
+| shared-B，cache-off 两次均值 | 1264.567 ms | 1395.677 ms |
+| shared-B，cache-on run 1 | 1249.571 ms | 1380.989 ms |
+| shared-B，cache-on run 2 | 1246.147 ms | 1377.382 ms |
+| **shared-B，cache-on 两次均值** | **1247.859 ms** | **1379.185 ms** |
+
+当前 shared-B + cache 相对 `B=0`：
+
+- F+B 降低 `541.210 ms / 30.251%`，等价吞吐 `1.434x`；
+- full step 降低 `541.044 ms / 28.176%`，等价吞吐 `1.392x`；
+- optimizer 部分约 131 ms，`B=0/B=1` 基本一致，收益来自 MoE execution，不是减少 AdamW 工作。
+
+cache-on 相对 cache-off 的两次运行均值：
+
+- F+B 降低 `16.708 ms / 1.321%`；14 个 sample pooled median 为 `1264.139 -> 1247.539 ms`；
+- full step 降低 `16.492 ms / 1.182%`；pooled median 为 `1395.397 -> 1378.900 ms`；
+- 四组 measured sample 的 allocator/SHMEM 字段逐字节一致。
+
+内存是 allocator peak 加完整 SHMEM heap 的 conservative 口径，不是 `npu-smi` 高频采样：
+
+| 配置 | stable allocated | peak allocated | peak reserved | conservative peak | shared-B pool |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `B=0` | 15.840 GiB | 22.740 GiB | 24.795 GiB | 23.552 GiB | 0 |
+| `B=1`, shared-B | 15.707 GiB | 22.816 GiB | 24.088 GiB | 23.628 GiB | 157.5 MiB |
+| shared-B 相对 `B=0` | -136.367 MiB | +77.888 MiB | -724 MiB | **+77.888 MiB** | +157.5 MiB |
+
+shared-B 的 weight + gradient pool 虽是 157.5 MiB，但 `B=1` 把 2-wave workspace high-watermark 降低了
+314.938 MiB，所以整体 peak 没有按 pool 大小等量增加，reserved 反而下降。结论是：在该 16 层路由上，
+旧 per-layer compact 的 GiB 级 HBM 问题已经基本消失；后续不应继续以压 BF16 weight storage 为最高优先级。
+
+同版本 cache 理论上消掉 48 次 shared claim 中的 17 次 transfer phase，但端到端只收益约 1.2%。这说明
+weight P2P 已能部分 overlap 且不是主瓶颈；继续做复杂 weight cache/double-buffer 前，应先量化 FP32 dW、
+GMM 尾部、replica-gradient return 和 host control plane。
+
+### 10.3 Legacy per-layer compact 测量口径
+
+以下历史对照使用固定 workload：
+
+| 项目 | 值 |
+| --- | --- |
+| 硬件/软件 | 8 张 Ascend 910B3，CANN 9.2.0，Torch/Torch-NPU 2.9.1 <!-- codespell:ignore cann --> |
 | 并行 | TP1 / EP8 |
 | 模型 | 8 层 Qwen-compatible MoE 随机权重模型 |
 | token shape | batch 1，每 rank sequence/token 4096 |
@@ -548,61 +689,69 @@ bash examples/torch/multicore/benchmark_qwen_moe_mega_moe.sh \
 untimed stable optimizer step；sampled HBM 通过 `total-free` 每 10 ms 采样，单独列出以覆盖可能不计入
 PyTorch allocator 的 SHMEM。
 
-以下所有数字采集于 FP32 replica dW 精度修复 `43aa7d6c` 之前，只用于说明有界副本减少 wave 时的历史
-收益和 compact 对持久权重 pool 的影响，不能代表当前提交的端到端性能或 HBM。精度修复增加了 physical
-dW/scratch 字节数并改变 owner reduction，当前版本必须用相同命令重新测量后才能更新结论。
+主表采集于提交 `40b6963b`，已经包含 `43aa7d6c` 的 FP32 physical dW 精度修复和 `b255b821` 的
+graph-safe compact layout。三种配置分别使用 fresh 8-rank process；compact 使用默认
+`eager_on_first_forward`。三个 aggregate JSON 的 tag 分别为 `current_fp32dw_20260907_b0`、
+`current_fp32dw_20260907_b1_snapshot` 和 `current_fp32dw_20260907_b1_compact_eager`。原始 JSON 被
+`.gitignore` 排除，不作为仓库发布物。
 
-这些数据也采集于 layout selector 引入之前，当时 compact 行为等价于现在显式的
-`lazy_on_first_replica`。严重偏斜 workload 在第一次 warmup 就激活 replica，故 stable-step 的 compact
-backing 与 eager 相同；home-only 的“零 pool”结论只适用于 lazy。默认 eager 的 first-step latency 和
-home-only HBM 需要作为新的独立数据组重测，不能从下表外推。
-
-### 10.2 严重偏斜：B=0 与组合实现
+### 10.4 Legacy 严重偏斜：B=0 与 compact
 
 固定 Dirichlet `alpha=0.1, seed=42`，三组运行的 logical histogram 完全相同：
 
 | 配置 | 8 层执行状态 | rank-max p50 | rank-max p90 |
 | --- | --- | ---: | ---: |
-| `B=0` | 7 层 2 wave，1 层 3 wave | 1155.271 ms | 1157.133 ms |
-| `B=1`, snapshot | 每层 7 个 replica transfer，全部 1 wave | 635.781 ms | 636.746 ms |
-| `B=1`, compact | placement 同上，只移除 home snapshot | 631.915 ms | 633.549 ms |
+| `B=0` | 7 层 2 wave，1 层 3 wave | 1156.840 ms | 1158.258 ms |
+| `B=1`, snapshot | 每层 7 个 replica transfer，全部 1 wave | 671.685 ms | 675.701 ms |
+| `B=1`, compact eager | placement 同上，只移除 home snapshot | 671.199 ms | 672.549 ms |
 
 最终 compact 组合相对 `B=0`：
 
-- p50 降低 `45.302%`，等价吞吐为 `1.828x`；
-- p90 降低 `45.248%`；
-- 相对 snapshot p50 再降低 `0.608%`，没有观察到以性能换显存。
+- p50 降低 `41.980%`，等价吞吐为 `1.724x`；
+- p90 降低 `41.934%`；
+- 相对 snapshot p50 降低 `0.072%`、p90 降低 `0.467%`，差异很小，没有观察到 compact 造成性能回退。
 
 一次 untimed stable step 的 rank-max 分相如下：
 
 | 配置 | forward | backward | dense grad sync | AdamW | zero-grad |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `B=0` | 295.667 ms | 795.111 ms | 34.956 ms | 28.066 ms | 0.939 ms |
-| `B=1`, snapshot | 218.691 ms | 356.307 ms | 39.478 ms | 28.069 ms | 0.541 ms |
-| `B=1`, compact | 219.534 ms | 354.658 ms | 38.053 ms | 28.094 ms | 0.620 ms |
+| `B=0` | 298.148 ms | 796.337 ms | 35.053 ms | 28.089 ms | 0.475 ms |
+| `B=1`, snapshot | 218.226 ms | 392.777 ms | 41.264 ms | 28.085 ms | 0.468 ms |
+| `B=1`, compact eager | 216.320 ms | 393.528 ms | 40.995 ms | 28.093 ms | 0.453 ms |
 
-AdamW 时间基本不变，主要收益来自减少 forward/backward wave，而不是省略 optimizer 工作。
+AdamW 时间基本不变，主要收益仍来自减少 forward/backward wave，而不是省略 optimizer 工作。与精度修复前
+相比，`B=1` 的 backward 增加约 37--39 ms；这与 FP32 physical dW 及 owner 聚合路径变化方向一致，
+但由于 CANN 也从 9.1 切到 9.2，不能把差值完全归因于单个提交。
 
-### 10.3 HBM 结果
+### 10.5 Legacy compact HBM 结果
 
 stable-step rank-max：
 
 | 配置 | allocated | peak allocated | peak reserved | sampled HBM peak |
 | --- | ---: | ---: | ---: | ---: |
-| `B=0` | 16.661 GiB | 26.149 GiB | 27.338 GiB | 29.173 GiB |
-| `B=1`, snapshot | 19.666 GiB | 28.410 GiB | 29.674 GiB | 31.571 GiB |
-| `B=1`, compact | 17.203 GiB | 25.945 GiB | 27.393 GiB | 29.293 GiB |
-| compact 相对 `B=0` | +0.541 GiB | -0.204 GiB | +0.055 GiB | **+0.120 GiB** |
-| compact 相对 snapshot | -2.463 GiB | -2.465 GiB | -2.281 GiB | **-2.278 GiB** |
+| `B=0` | 16.661 GiB | 26.149 GiB | 27.338 GiB | 29.176 GiB |
+| `B=1`, snapshot | 19.257 GiB | 28.700 GiB | 33.027 GiB | 34.930 GiB |
+| `B=1`, compact eager | 16.789 GiB | 26.232 GiB | 31.053 GiB | 32.959 GiB |
+| compact 相对 `B=0` | +0.128 GiB | +0.083 GiB | +3.715 GiB | **+3.783 GiB** |
+| compact 相对 snapshot | -2.468 GiB | -2.467 GiB | -1.975 GiB | **-1.971 GiB** |
 
-snapshot 相对 `B=0` 的 sampled HBM 增量为 `2.399 GiB`，compact 后只剩 `0.120 GiB`，即消除
-`94.99%`。compact 的 steady allocated 增量 `0.541 GiB` 接近理论 suffix `0.410 GiB` 加 runtime/
-对齐成本；peak allocated 反而略低，是因为 `B=1` 把多 wave activation 和 scratch 峰值压成单 wave。
+snapshot 相对 `B=0` 的 sampled HBM 增量为 `5.755 GiB`，compact 后为 `3.783 GiB`，即消除 `34.25%`。
+这个比例不能代替 live allocation：compact 把 steady allocated 增量从 snapshot 的 `2.596 GiB` 压到
+`0.128 GiB`，消除 `95.07%`；peak allocated 也消除 `96.75%`。但 FP32 physical dW/workspace 的瞬时
+分配会扩大 allocator cache，stable-step 结束时 peak reserved 仍比 `B=0` 高 `3.715 GiB`，所以
+`total-free` 看到的 sampled HBM 不能随 live tensor 一起降到旧水平。若目标是继续消除 HBM 代价，下一步
+应直接复用/预分配 FP32 dW scratch 或主动控制 allocator reserve，而不是继续压缩 BF16 weight prefix。
 
-加入 overlapping-placement snapshot 保护后的补充运行（3 warmup + 5 measured）为 p50 `635.264 ms`、
-sampled HBM peak `29.270 GiB`，说明保护 retained graph 的分支没有破坏逐步 optimizer 的低显存路径。
+精度修复前的同口径历史值与当前复测对比如下；两轮同时跨越 CANN 9.1 到 9.2，因此只用于整体回归，
+不是单提交因果实验：
 
-### 10.4 轻微动态偏斜的成本
+| 配置 | 历史 p50 | 当前 p50 | 变化 | 历史 sampled HBM | 当前 sampled HBM | 变化 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `B=0` | 1155.271 ms | 1156.840 ms | +0.136% | 29.173 GiB | 29.176 GiB | +0.003 GiB |
+| `B=1`, snapshot | 635.781 ms | 671.685 ms | +5.647% | 31.571 GiB | 34.930 GiB | +3.359 GiB |
+| `B=1`, compact | 631.915 ms | 671.199 ms | +6.217% | 29.293 GiB | 32.959 GiB | +3.666 GiB |
+
+### 10.6 历史补充：轻微动态偏斜的成本
 
 learned TopK 使用 `learning_rate=1e-6`，3 warmup + 5 measured：
 
@@ -617,7 +766,7 @@ learned TopK 使用 `learning_rate=1e-6`，3 warmup + 5 measured：
 作为设计对照，曾经“无条件精确均衡”和“虽不复制但仍使用 E56 physical runtime”的中间实现分别为
 `562.396 ms` 和 `515.740 ms`，因此双 runtime 是必要优化。
 
-### 10.5 独立四态 fused-kernel 矩阵
+### 10.7 历史补充：独立四态 fused-kernel 矩阵
 
 另一组 8 卡测试使用 hidden 7168、intermediate 2048，只测 fused forward+backward；后三行共享相同
 clustered logical route：
@@ -630,10 +779,10 @@ clustered logical route：
 | replica-only, `B=2` | 每 rank 32768 | 1 | 76.652 ms | 5.126 GiB |
 
 同路由下，`B=1` 相对 multi-wave-only 降低 `43.2%`，`B=2` 降低 `74.0%`。该矩阵未在每轮间执行
-optimizer step，代表相同权重版本、pool 可直接命中的 micro-batch/梯度累积最佳情形；不能替代 10.2 节
+optimizer step，代表相同权重版本、pool 可直接命中的 micro-batch/梯度累积最佳情形；不能替代 10.4 节
 的完整 optimizer-step 结果。
 
-### 10.6 如何理解“是否提升”
+### 10.8 如何理解“是否提升”
 
 当前证据支持一个条件化结论：
 
@@ -650,19 +799,31 @@ optimizer step，代表相同权重版本、pool 可直接命中的 micro-batch/
 执行：
 
 ```bash
-pytest -q tests/ut/native tests/ut/core/multicore tests/ut/examples/torch/multicore
+pytest -q \
+  tests/ut/core/multicore/mega_moe \
+  tests/ut/core/multicore/test_mega_moe_module.py \
+  tests/ut/examples/torch/multicore
 ```
 
-结果：`124 passed, 75 subtests passed in 3.81s`。其中包括两种 compact layout 策略及首次 home-to-replica
-交叠的 CPU 回归。备份分支因为额外包含 `moonep_native` 代码和测试，其计数不能与当前分支混写。
+结果：`141 passed, 105 subtests passed in 11.73s`。新增回归覆盖 cache key 只在 transfer wait 后发布、
+相同 layer/version/placement 命中、layer/版本/placement 失效，以及本 rank 命中但任一远端 rank miss 时
+全组重新进入 P2P。benchmark UT 同时验证 Python implementation digest 能发现 dirty-tree 变化。
+
+目标文件 `pylint`、`git diff --check` 和本文 `markdownlint-cli2` 均通过。当前环境没有安装 Ruff 命令，
+因此不把 Ruff 计为已执行检查。
 
 完整 `pytest -q tests/ut` 也已尝试，但当前 Python 环境缺少 `transformers`、`toml`、`matplotlib` 和
 `pulp`，在 16 个无关测试模块的 collection 阶段终止；没有进入测试执行，因此不把它计作代码回归。
 
-新增的两卡 fused-kernel eager/lazy 切换 ST 在显式激活系统 CANN 9.2.0 和本提交重新构建的
-Ascend910B native payload 后结果为 `2 passed in 126.20s`。两条用例分别验证 eager 首次 forward 前重绑
-及后续地址稳定，以及 lazy 首次
-交叠 snapshot 和 graph 释放后 compact。第一次尝试曾在 `symm.initialize()` 报告
+当前 shared-B + reentrant checkpoint 两卡 fused-kernel ST 在系统 CANN 9.2.0 与新构建的
+Torch/Ascend910B payload 上结果为 `1 passed in 103.17s`。它使用 native MoE oracle 覆盖跨层 forward、
+reverse backward、checkpoint recompute、optimizer update、pool storage 稳定和 finite output/gradient。
+构建中的 multicore vendor、Torch adapter 与 Torch SHMEM 均成功；总 `build.sh` 最后只在无关的 MindSpore
+custom-ops 阶段失败，因为本机 MindSpore 2.9 不支持 CANN 9.2 headers，不影响上述 Torch payload/ST。
+
+此前两卡 fused-kernel eager/lazy 切换 ST 结果为 `2 passed in 126.20s`。两条用例分别验证 eager 首次
+forward 前重绑及后续地址稳定，以及 lazy 首次交叠 snapshot 和 graph 释放后 compact。第一次尝试曾在
+`symm.initialize()` 报告
 `undefined symbol: aclrtGetFuncBySymbol`；检查发现继承 shell 的 `LD_LIBRARY_PATH` 把用户目录中的
 CANN 9.0 放在系统 9.2 之前。重新 source `/usr/local/Ascend/cann/set_env.sh` 后，同一 native payload 和
 同一用例通过，因此该报错属于 runtime 搜索路径污染，不是 layout 逻辑或 native 构建失败。
@@ -682,12 +843,15 @@ CANN 9.0 放在系统 9.2 之前。重新 source `/usr/local/Ascend/cann/set_env
   graph 临时 snapshot。
 - eager/lazy 首次切换：CPU 复现覆盖 `home forward A -> replica forward B -> backward A/B`；两卡
   fused-kernel ST 同时覆盖 eager 地址稳定，以及 lazy snapshot 过渡和 graph 释放后的 compact 激活。
+- shared-B：两卡 native oracle 覆盖多层、reentrant checkpoint、retained/deferred graph、参数更新和
+  B-slot weight/gradient storage；当前 cache 增量继续复用这套真实 kernel 验证。
 - peer-buffer reuse fence：CPU source harness 覆盖首个 Combine tile 选举 publisher；双卡小 shape 验证
   publisher 不依赖固定 worker 获得 Combine 任务，避免所有实际 worker 等待未发布 event。
 
-本次 rebase 集成重新执行了 11.1 节 UT，重建 Torch/Ascend910B native payload 并运行新增的两卡 ST。
-第 10 节仍保留精度修复前同一实现周期内采集的历史结果。原始 aggregate JSON 位于被 `.gitignore` 排除的
-`output/qwen_moe_optimizer/optimizer_step_*.json`，因此不作为仓库发布物。
+本轮重新执行 11.1 节 UT、重建并验证 Torch/Ascend910B payload，再完成第 10.2 节五组 8 卡进程：一组
+`B=0`、cache-off/on 各两组。所有 finite 检查和 AdamW state 检查通过，logical histogram 与 placement
+完全相同；`B=0` 为 2 wave，`B=1` 为 7 个 replica binding 后 1 wave。第 10.4--10.5 节的三组 8 层
+legacy compact 结果来自前一轮 `40b6963b` 复测，不能与当前 16 层数字混成同一 aggregate。
 
 ## 12. 已落地优化与被否决方案
 
@@ -701,7 +865,18 @@ CANN 9.0 放在系统 9.2 之前。重新 source `/usr/local/Ascend/cann/set_env
 - 当前保留独立 source/destination route scan。hidden-dispatch copy、dispatch-service、route polling 和
   大诊断 descriptor 等无稳定收益实验没有进入默认路径。
 
-### 12.2 实测后回退
+### 12.2 当前 shared-B 优化周期
+
+- `9f75fd20` 把 B-slot BF16 weights 与 FP32 gradients 提升到 resource-group 级共享，并以 split-weight
+  descriptor 让 native kernel 同时读取 layer-local home inputs 与 shared suffix pointers。
+- `86f4b433`、`364af596` 加入 16 层 reentrant-checkpoint + AdamW 的 route-matched benchmark，避免用
+  单层同版本 pool hit 外推完整训练。
+- 本轮为 shared lease 增加 versioned binding cache，只在 transfer 完成后发布，并保留 EP-wide
+  cache/P2P agreement。第 10.2 节 A/B 证明性能小幅但稳定提升，HBM 不变。
+- benchmark provenance 现在额外散列 Torch MegaMoe Python implementation tree，能区分相同 Git HEAD
+  上的 dirty-tree runtime patch；原来的 worker/adapter/native-artifact fingerprint 保留。
+
+### 12.3 实测后回退
 
 | 候选 | 结果 | 决策 |
 | --- | --- | --- |
@@ -746,29 +921,41 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 ## 14. 已知限制与风险
 
 1. planner 的 `.tolist()` 以及 P2P peer table 仍在 host；overflow step 存在 D2H 和 Python 控制开销。
-2. Ascend rank-local GMM 需要连续 `[H+B, ...]` 权重，尚无上游 MoonEP 式全局 `E+B` symmetric VMM。
-3. optimizer 每步更新会使 physical pool version 失效；固定 placement 仍需刷新 replica。pool hit 的最佳
-   收益主要出现在同版本 micro-batch 或梯度累积。
-4. eager compact 在每层第一次 forward 建图前重绑 Parameter storage；lazy 在首次无 live home lease 的
+2. split-weight ABI 已允许 home 与 B suffix 分离，但 replica 仍通过显式 P2P 填充 rank-local pool；尚无
+   上游 MoonEP 式全局 `E+B` symmetric VMM 或 rank-level transport deduplication。
+3. optimizer 每步更新会使 shared/legacy pool version 失效；下一 step 的初始 forward 仍需刷新 replica。
+   当前新增命中主要覆盖 checkpoint recompute 后的同层 backward，以及同版本 micro-batch/梯度累积。
+4. shared cache agreement 每次 claim 都有一个 device scalar `MIN` all-reduce 和 `.item()`；它保证协议安全，
+   但也是 cache hit 的固定控制面税，尚未与已有 count exchange 合并。
+5. eager compact 在每层第一次 forward 建图前重绑 Parameter storage；lazy 在首次无 live home lease 的
    replica route 重绑。跨该边界持有的 raw storage alias 不兼容；lazy 的首次交叠和后续 overlapping
-   placement 可能临时退回 snapshot，瞬时 HBM 高于 steady state。
-5. 共享 workspace 只支持串行 layer/call；真正并发的 MoE 调用必须使用独立 resource group。
-6. 当前 Torch backend 要求 NPU BF16、固定 token shape、`E % R == 0`，route-fused `top_k <= 16`。
-7. benchmark 是随机权重集成负载；虽已覆盖 activation/state-dict checkpoint 契约，尚未完成真实
-   checkpoint 的长时收敛、FP32 replica dW 后的性能/HBM 基线、默认 eager 的新 HBM 基线和动态 skew
-   压力测试。
+   placement 可能临时退回 snapshot，瞬时 HBM 高于 steady state；shared-B 不走该 `set_` 路径。
+6. shared workspace/shared-B pool 只支持串行 layer/call；真正并发的 MoE 调用必须使用独立 resource
+   group，当前没有双 buffer 跨层预取。
+7. 当前 Torch backend 要求 NPU BF16、固定 token shape、`E % R == 0`，route-fused `top_k <= 16`。
+8. 当前性能单点是随机权重、独立 MoE layers，不是 connected transformer，也不做 native 数值 oracle；
+   已有 shared-weight ST 负责 native-equivalent 输出/梯度，仍需完整 route sweep、动态 skew 与长时收敛。
 
 ## 15. 下一步优先级
 
-1. 把 histogram、placement、physical IDs/counts/group-list 生成和 transfer table 消费一起下沉到 NPU；
-   只移动 planner 而保留 Python `P2POp(peer_rank=...)` 不能消除 control-plane 同步。
-2. 评估 VMM/映射适配层，使 snapshot 语义也不复制 home prefix，并最终消除 eager/lazy 首次 `set_`
-   的瞬时 storage 切换。
-3. 降低 remote-weight prefetch 和 replica-gradient return 成本，加入 planner/P2P/remap/GMM/grad-return
-   分段计时。
-4. 评估上一 histogram 预测与 count gather overlap，但必须用 generation 校验避免错误 plan 被静默复用。
-5. 扩展 `B`、capacity、active expert、更新频率和动态 skew sweep，并补频繁换绑、连续 generation 和
-   更长时长的 8 卡压力测试。
+1. **先补可归因 profile。** 在当前 16 层 shared-B benchmark 中分别记录 count gather、planner、remap、
+   cache agreement、weight P2P、forward GMM、backward dW 和 replica-gradient return；同时跑 55-route
+   sweep。cache 消掉 35.4% transfer phase 却只改善约 1.2%，不应继续凭 transfer 次数猜主瓶颈。
+2. **缩短 FP32 dW 与 owner receive 生命周期。** 用 allocator snapshot/trace 验证 call-local `[H, ...]`
+   FP32 dW、owner receive tensors 和 retained scratch 的真实峰值；只在确认 churn 后实现 event-ordered
+   high-watermark/ring buffer，或在所有 replica contribution FP32 聚合完成后尽早 cast/release。不能提前
+   BF16 累加，也不能为省临时 allocation 无条件增加更大的 persistent pool。
+3. **优化 replica-gradient return。** 评估复用 owner receive storage、按 peer 合批以及把通信/FP32
+   accumulation 与下一层 backward overlap；当前 weight prefetch 已不是首要瓶颈，gradient return 更接近
+   backward critical path。
+4. **合并 control-plane collective。** 把 cache agreement/version generation 与现有 histogram exchange
+   合并或异步 overlap，再把 placement、physical IDs/counts/group-list 和 transfer table 消费整体下沉到
+   NPU。只移动 planner 而保留 Python `P2POp(peer_rank=...)` 不能消除同步。
+5. **最后评估双 buffer 与预测 prefetch。** 若分段 profile 证明剩余 31 次 weight refresh 仍显著，再做
+   shared-B ping-pong pool和跨层 backward prefetch；上一 histogram 预测必须带 generation 校验，不能静默
+   使用错误 plan。
+6. **扩展边界。** 覆盖 `B=0/1/2/4/6`、capacity、active expert、更新频率、动态 skew、频繁换绑和连续
+   generation。重点确认本轮 `B=1` 的低 HBM 结论在更大 B、3+ residual waves 和 connected model 中成立。
 
 ## 16. 代码与测试索引
 
@@ -784,5 +971,6 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 | multi-wave backward DAG | `hyper_parallel/core/multicore/modules/mega_moe/backward/graph.py` |
 | shared device worker | `hyper_parallel/core/multicore/ops/runtime/worker_kernel.h` |
 | Qwen model/profile | `examples/torch/multicore/qwen_moe_mega_moe_model.py`、`qwen_moe_mega_moe_profile.py` |
+| checkpointed multi-layer benchmark | `examples/torch/multicore/benchmark_mega_moe_layers.py` |
 | planner/route/pool UT | `tests/ut/core/multicore/mega_moe/` |
-| real fused-kernel ST | `tests/torch/expert_parallel/test_mega_moe.py`、`_test_mega_moe.py` |
+| real fused-kernel ST | `tests/torch/expert_parallel/test_mega_moe.py`、`_test_mega_moe_shared_weights.py` |

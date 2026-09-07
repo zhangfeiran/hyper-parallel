@@ -928,7 +928,7 @@ class TestExpertReplicaManager(unittest.TestCase):
                     transfer.tensor.fill_(11.0)
             return ()
 
-        with patch.object(replica_module, "_launch_transfers", side_effect=fill_replicas):
+        with patch.object(replica_module, "_launch_transfers", side_effect=fill_replicas) as launch:
             pool_pointers = []
             for layer in (layers[0], layers[1], layers[0]):
                 lease = manager.start_shared_prefetch(*layer, plan)
@@ -940,11 +940,78 @@ class TestExpertReplicaManager(unittest.TestCase):
                     torch.testing.assert_close(staged, torch.full_like(staged, 11.0))
                 lease.release()
         self.assertEqual(pool_pointers, [pool_pointers[0]] * 3)
+        self.assertEqual(launch.call_count, 3)
         self.assertEqual(pointers, [(first.data_ptr(), second.data_ptr()) for first, second in layers])
         self.assertEqual(len(manager._physical_pools), 0)
         old_loss.backward()
         for weight in layers[0]:
             torch.testing.assert_close(weight.grad, 2 * weight)
+
+    def test_shared_staging_reuses_only_an_unchanged_binding(self):
+        """Skip duplicate P2P while invalidating on parameter or placement changes.
+
+        Feature: shared replica-weight cache hit
+        Description: reacquire one completed binding, then change its version and slot map
+        Expectation: only the identical version and placement skip weight transfers
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        plan = self._hot_expert_zero_plan()
+        shifted_plan = build_constrained_expert_placement(
+            ((0, 0, 4, 0), (0, 0, 4, 0)),
+            1,
+            receive_capacity=4,
+        )
+        weights = (
+            torch.ones(2, 2, 2, requires_grad=True),
+            torch.ones(2, 1, 2, requires_grad=True),
+        )
+
+        with patch.object(replica_module, "_launch_transfers", return_value=()) as launch:
+            first = manager.start_shared_prefetch(*weights, plan)
+            self.assertFalse(first.reused)
+            self.assertIsNone(manager._shared_key)
+            first.release()
+            self.assertIsNotNone(manager._shared_key)
+
+            cached = manager.start_shared_prefetch(*weights, plan)
+            self.assertTrue(cached.reused)
+            cached.release()
+
+            with torch.no_grad():
+                weights[0].add_(1)
+            updated = manager.start_shared_prefetch(*weights, plan)
+            self.assertFalse(updated.reused)
+            updated.release()
+
+            shifted = manager.start_shared_prefetch(*weights, shifted_plan)
+            self.assertFalse(shifted.reused)
+            shifted.release()
+
+        self.assertEqual(launch.call_count, 3)
+
+    def test_shared_staging_retransfers_when_any_rank_misses_cache(self):
+        """Honor the EP-wide decision even when this rank has a local cache hit.
+
+        Feature: shared replica-weight cache agreement
+        Description: make the collective report a remote miss for a locally cached binding
+        Expectation: this rank joins the transfer protocol instead of reusing asymmetrically
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        plan = self._hot_expert_zero_plan()
+        weights = (
+            torch.ones(2, 2, 2, requires_grad=True),
+            torch.ones(2, 1, 2, requires_grad=True),
+        )
+
+        with patch.object(replica_module, "_launch_transfers", return_value=()) as launch:
+            manager.start_shared_prefetch(*weights, plan).release()
+            with patch.object(manager, "_all_ranks_can_reuse", return_value=False) as agreement:
+                lease = manager.start_shared_prefetch(*weights, plan)
+                self.assertFalse(lease.reused)
+                lease.release()
+
+        agreement.assert_called_once_with(True, weights[0])
+        self.assertEqual(launch.call_count, 2)
 
     def test_shared_gradient_pool_reuses_only_b_slots(self):
         """Keep replica dW independent of returned home gradient storage.

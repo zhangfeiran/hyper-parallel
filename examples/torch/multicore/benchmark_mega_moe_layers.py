@@ -42,6 +42,11 @@ EXTRA_PAIRS = ((0.01, 1942), (0.01, 1708), (0.01, 0), (0.005, 943), (0.01, 2104)
 SCOPE = "independent MoE layers; all forwards then reverse backwards; no attention or router network"
 ADAMW_OPTIONS = {"lr": 1e-4, "betas": (0.9, 0.999), "eps": 1e-8,
                  "weight_decay": 0.01, "foreach": False, "fused": False}
+_PYTHON_SOURCE_ROOTS = (
+    "hyper_parallel/core/multicore",
+    "hyper_parallel/core/symmetric_memory",
+    "hyper_parallel/platform/torch/symmetric_memory",
+)
 
 # Reuse the ST's route generator, native implementation and non-overlapping HBM
 # ledger so the multi-layer example and single-layer curves compare the same work.
@@ -102,6 +107,25 @@ def _optimizer_state_ledger(torch: Any, optimizer: Any) -> dict[str, Any]:
             "tensor_bytes_by_device": by_device, "tensor_bytes_by_dtype": by_dtype}
 
 
+def _python_source_identity(repo: Path) -> dict[str, Any]:
+    """Hash Torch MegaMoe Python sources, including dirty-tree changes."""
+    paths = sorted(
+        path
+        for relative_root in _PYTHON_SOURCE_ROOTS
+        for path in (repo / relative_root).rglob("*.py")
+        if "mindspore" not in path.parts
+    )
+    digest = hashlib.sha256()
+    for path in paths:
+        relative = path.relative_to(repo).as_posix().encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return {"file_count": len(paths), "sha256": digest.hexdigest()}
+
+
 def _source_identity() -> dict[str, Any]:
     repo = Path(__file__).resolve().parents[3]
     roots = (repo / "build/native/payload/hyper_parallel/core", repo / "hyper_parallel/core/symmetric_memory/lib")
@@ -117,6 +141,7 @@ def _source_identity() -> dict[str, Any]:
             (repo / "tests/torch/expert_parallel/_test_mega_moe.py").read_bytes()
         ).hexdigest(),
         "adapter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "python_implementation": _python_source_identity(repo),
         "native_artifacts": artifacts,
     }
 
