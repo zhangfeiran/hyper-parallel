@@ -55,6 +55,11 @@ receive-only 解耦随后已完成并保留：排查启动阶段进程竞争后�
 allocated 增加约 1 MiB、reserved 增加 36 MiB，B pool 不变。详见第 10.2.14 节和
 [独立接收报告](megamoe_receive_only_overlap_20260908.md)。这仍不是整模型 Qwen 训练的性能结论。
 
+完整 Qwen example 已显式接入 shared-B，并修复 RoPE batch 维度、可选依赖导入和冷专家更新探针。
+两层 connected model 的平衡/倾斜/learned TopK 八卡回归全部通过，原精度阈值不变；倾斜组跨层
+仅一份 B pool。这是正确性接入，不是新的加速结论，见第 10.2.15 节及
+[完整模型报告](megamoe_qwen_shared_integration_20260908.md)。
+
 ### 1.1 结论摘要
 
 - 当前组合不是把 MoonEP CUDA 实现直接移植到 Ascend，而是把其“按路由热度动态复制专家”的思想，
@@ -1273,6 +1278,21 @@ rank 5 reserved 增加 37748736 bytes（36 MiB），其他 rank 不变，final a
 先偏斜后平衡导致后者保留 reserve，不外推为纯平衡路径的固定成本。详细证据及后续优先级见
 [独立接收报告](megamoe_receive_only_overlap_20260908.md)。
 
+#### 10.2.15 完整 Qwen shared-B 接入与 optimizer 验收
+
+为真实 `examples/torch/multicore/mega_moe/qwen_moe_model.py` 增加显式 shared-B 配置和小形状
+CLI，保留原默认形状；各 decoder 共享资源而不共享 home 参数。修复现有 RoPE `[sequence]`
+输入缺少 batch 维度、Qwen 导入被 DeepSeek-only custom ops 阻断，以及倾斜时只采样第一个冷
+专家导致的 optimizer-update 假失败。更新探针要求 active owner 更新、全局至少一次更新，
+完整梯度和更新后参数比较不变，不放宽 `rtol=0.02 / atol=0.002`。
+
+EP8、两层 H1024/I256/T1024/V2048、B1、capacity=1.5，平衡/Dirichlet 0.1:42/learned TopK 三组
+完整模型各执行每步 FP32-master AdamW。三组 ST 通过；最终 CPU 259 passed / 242 subtests。
+初始参数逐位一致；最大梯度绝对误差 1.5259e-5，更新后最大归一化误差均小于 1。倾斜组每 rank
+只持有一份 1572864-byte BF16 B weight 和 3145728-byte FP32 B gradient，其他两组未激活 replica。
+pool bytes 不是 allocator peak，短测 A/B 不是整模型优化 ABBA。下一项先扩展原宽度正确性再
+建立完整模型性能/HBM 基准，详见 [完整模型报告](megamoe_qwen_shared_integration_20260908.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1580,10 +1600,11 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **优先补真实 Qwen 整模型的 shared-B 接入与训练验收，再重查剩余梯度等待。**
+1. **优先补真实 Qwen 原宽度验收及 matched ABBA，再重查剩余梯度等待。**
    receive-only 解耦已经保留，独立 16 层 MoE 的偏斜 step 减少 4.086%，只增加约 1 MiB allocated
-   和 36 MiB reserved（第 10.2.14 节）。原整模型 example 尚未显式传入 shared-B，先补这一覆盖，
-   不把独立层收益直接外推整网。rank 1 的约 57.6 ms 晚邻居窗口及 rank 3 native 计算仍需归因。
+   和 36 MiB reserved（第 10.2.14 节）。整模型 shared-B 接入及三种路由的小形状训练验收已完成
+   （第 10.2.15 节）；先补原宽度和完整模型 HBM/profile，不把独立层收益直接外推整网。
+   rank 1 的约 57.6 ms 晚邻居窗口及 rank 3 native 计算仍需归因。
    整专家合包已回退 1.806%，独立收尾也无确认收益（第 10.2.11--10.2.12 节），不再盲目叠加；
    含发送 batch 必须保留 native dW 的真实就绪依赖，不能泛化删除 caller wait。
    owner receive contribution 必须全部完成 FP32

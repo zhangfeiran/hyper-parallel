@@ -19,12 +19,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import statistics
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +34,8 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 import torch_npu
-from qwen_moe_model import QwenMoeConfig, QwenMoeModel
+from examples.torch.multicore.mega_moe.qwen_moe_config import QwenMoeConfig, make_config, parse_args
+from examples.torch.multicore.mega_moe.qwen_moe_model import QwenMoeModel
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.components.optim import (
@@ -51,7 +51,6 @@ from hyper_parallel.platform.torch.common import GroupedExperts
 
 _WORLD_SIZE = 8
 _BATCH_SIZE = 1
-_SEQUENCE_LENGTH = 4096
 _DTYPE = torch.bfloat16
 _RTOL = 2e-2
 _ATOL = 2e-3
@@ -124,65 +123,6 @@ class _CommonExpertsAdapter(torch.nn.Module):
     @staticmethod
     def close() -> None:
         """Match the managed expert lifecycle without owning SHMEM."""
-
-
-def _capacity_factor(value: str) -> float | None:
-    """Parse ``none`` or a finite factor of at least one."""
-    if value.lower() == "none":
-        return None
-    try:
-        factor = float(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            f"capacity factor must be 'none' or a number, got {value!r}."
-        ) from error
-    if not math.isfinite(factor) or factor < 1.0:
-        raise argparse.ArgumentTypeError(
-            f"capacity factor must be finite and at least 1.0, got {value!r}."
-        )
-    return factor
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse the minimal optimizer benchmark interface."""
-    parser = argparse.ArgumentParser(
-        description="Run an eight-NPU Qwen MoE optimizer-step benchmark.",
-    )
-    parser.add_argument("--warmup-steps", type=int, default=3)
-    parser.add_argument("--measured-steps", type=int, default=5)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--expert-capacity-factor", type=_capacity_factor, default=None)
-    parser.add_argument("--routing", choices=("balanced", "topk", "dirichlet"), default="balanced")
-    parser.add_argument("--router-load-alpha", type=float, default=1.0)
-    parser.add_argument("--router-load-seed", type=int, default=42)
-    parser.add_argument("--replica-slots-per-rank", type=int, default=0)
-    parser.add_argument("--compact-physical-weights", action="store_true")
-    parser.add_argument(
-        "--compact-layout-strategy",
-        choices=("lazy_on_first_replica", "eager_on_first_forward"),
-        default="eager_on_first_forward",
-    )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--output",
-        default="output/qwen_moe_benchmark.json",
-        help="rank-zero JSON result path",
-    )
-    args = parser.parse_args(argv)
-    if args.warmup_steps < 1:
-        raise ValueError(f"warmup_steps must be positive, got {args.warmup_steps}.")
-    if args.measured_steps <= 0:
-        raise ValueError(f"measured_steps must be positive, got {args.measured_steps}.")
-    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
-        raise ValueError(
-            f"learning_rate must be finite and positive, got {args.learning_rate}."
-        )
-    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
-        raise ValueError(
-            f"weight_decay must be finite and nonnegative, got {args.weight_decay}."
-        )
-    return args
 
 
 def _init_runtime() -> tuple[int, int, torch.device]:
@@ -297,7 +237,7 @@ def _build_batch(
     input_ids = torch.randint(
         0,
         config.vocab_size,
-        (_BATCH_SIZE, _SEQUENCE_LENGTH),
+        (_BATCH_SIZE, config.local_num_tokens // _BATCH_SIZE),
         generator=generator,
         dtype=torch.int64,
     ).to(device)
@@ -395,6 +335,35 @@ def _timed_step(workload: _Workload) -> tuple[torch.Tensor, float]:
     return loss, _rank_max(elapsed_ms, workload.device)
 
 
+def _expert_update_sample(parameter: torch.Tensor) -> torch.Tensor:
+    """Sample every local expert, not only the possibly cold first expert."""
+    local = _local_tensor(parameter).detach()
+    return local.reshape(local.shape[0], -1)[:, :4096]
+
+
+def _expert_parameters_updated(
+    probes: list[tuple[torch.Tensor, torch.Tensor]],
+    gradients: dict[str, torch.Tensor],
+    device: torch.device,
+) -> bool:
+    """Require updates on active owners and at least one update globally.
+
+    This bounded first-step smoke check supplements the full tensor accuracy
+    comparison. Cold owners may stay unchanged under skewed routing.
+    """
+    updated = any(
+        not torch.equal(before, _expert_update_sample(parameter))
+        for parameter, before in probes
+    )
+    active = any(
+        bool(torch.count_nonzero(gradient).cpu().item())
+        for name, gradient in gradients.items() if name.startswith("experts.")
+    )
+    active_owners_updated = _all_ranks_true(not active or updated, device)
+    any_owner_updated = _rank_max(float(updated), device) > 0
+    return active_owners_updated and any_owner_updated
+
+
 def _validate_first_step(
     workload: _Workload,
 ) -> tuple[
@@ -406,9 +375,11 @@ def _validate_first_step(
 ]:
     """Validate finite work and dense/expert updates on the first step."""
     dense_parameter = workload.model.lm_head.weight
-    expert_parameter = _local_tensor(workload.model.expert_parameters()[0])
     dense_before = dense_parameter.detach().reshape(-1)[:4096].clone()
-    expert_before = expert_parameter.detach().reshape(-1)[:4096].clone()
+    expert_probes = [
+        (parameter, _expert_update_sample(parameter).clone())
+        for parameter in workload.model.expert_parameters()
+    ]
     dist.barrier()
     torch.npu.synchronize(workload.device)
     start = time.perf_counter()
@@ -434,10 +405,9 @@ def _validate_first_step(
             not torch.equal(dense_before, dense_parameter.detach().reshape(-1)[:4096]),
             workload.device,
         ),
-        "expert_parameter_updated": _all_ranks_true(
-            not torch.equal(
-                expert_before, expert_parameter.detach().reshape(-1)[:4096]
-            ),
+        "expert_parameter_updated": _expert_parameters_updated(
+            expert_probes,
+            gradients,
             workload.device,
         ),
     }
@@ -593,12 +563,31 @@ def _measure_backend(
     }
 
 
+def _shared_pool_ledger(model: QwenMoeModel) -> dict[str, int]:
+    """Inspect the actual shared pool after all accuracy and timing windows."""
+    # This diagnostic is confined to the example, not the library hot path.
+    # pylint: disable=protected-access
+    groups = [layer.mlp.experts._resource_group for layer in model.layers]
+    if any(group is not groups[0] for group in groups):
+        raise RuntimeError("Qwen decoder layers did not share their execution resources.")
+    resources = groups[0].resources
+    manager = resources.replica_manager if resources is not None else None
+    weights = manager._shared_weights if manager is not None else None
+    gradients = manager._shared_gradients if manager is not None else None
+    return {
+        "shared_weight_bytes": sum(tensor.numel() * tensor.element_size() for tensor in (weights or ())),
+        "shared_gradient_bytes": sum(tensor.numel() * tensor.element_size() for tensor in (gradients or ())),
+        "resource_group_count": 1,
+    }
+
+
 def _write_result(
     args: argparse.Namespace,
     config: QwenMoeConfig,
     rank: int,
     accuracy: dict[str, Any],
     backends: dict[str, dict[str, Any]],
+    shared_pools: list[dict[str, int]],
 ) -> None:
     """Write common-versus-MegaMoe accuracy and performance from rank zero."""
     common_median = backends["common"]["steady_state_optimizer_step_ms"]["median"]
@@ -606,10 +595,13 @@ def _write_result(
     ratio = mega_median / common_median
     if rank == 0:
         result = {
+            "configuration": asdict(config),
+            "initialization_seed": args.seed,
+            "shared_pool_per_rank": shared_pools,
             "topology": {"world_size": _WORLD_SIZE, "tp": 1, "ep": config.ep_size},
             "shape": {
                 "batch_size": _BATCH_SIZE,
-                "sequence_length": _SEQUENCE_LENGTH,
+                "sequence_length": config.local_num_tokens // _BATCH_SIZE,
                 "hidden_size": config.hidden_size,
                 "num_layers": config.num_layers,
                 "num_experts": config.num_experts,
@@ -734,16 +726,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = parse_args(argv)
     rank, world_size, device = _init_runtime()
-    config = replace(
-        QwenMoeConfig(),
-        replica_slots_per_rank=args.replica_slots_per_rank,
-        compact_physical_weights=args.compact_physical_weights,
-        compact_layout_strategy=args.compact_layout_strategy,
-        expert_capacity_factor=args.expert_capacity_factor,
-        routing=args.routing,
-        router_load_alpha=args.router_load_alpha,
-        router_load_seed=args.router_load_seed,
-    )
+    config = make_config(args)
     models: dict[str, QwenMoeModel] = {}
     try:
         input_ids, labels = _build_batch(config, rank, args.seed, device)
@@ -786,12 +769,15 @@ def main(argv: list[str] | None = None) -> int:
                 args,
             ),
         }
+        shared_pools = [None] * world_size
+        dist.all_gather_object(shared_pools, _shared_pool_ledger(models["mega_moe"]))
         _write_result(
             args,
             config,
             rank,
             accuracy,
             backends,
+            shared_pools,
         )
         return 0
     finally:

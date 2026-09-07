@@ -25,9 +25,7 @@ __all__ = [
     "RoutingMode",
 ]
 
-import math
-from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 # This is a Torch-only executable example, not a platform-agnostic library module.
 import torch  # pylint: disable=forbidden-backend-import
@@ -40,6 +38,11 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeRotaryEmbedding,
 )
 
+from examples.torch.multicore.mega_moe.qwen_moe_config import (
+    CompactLayoutStrategy,
+    QwenMoeConfig,
+    RoutingMode,
+)
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb
 from hyper_parallel.components.modules.rms_norm import RMSNorm
 from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
@@ -48,136 +51,6 @@ from hyper_parallel.core.multicore.modules.mega_moe.route import count_topk_expe
 from hyper_parallel.models.qwen3_moe.adapter.attention import (
     run_qwen3_moe_flash_attention,
 )
-
-RoutingMode = Literal["balanced", "topk", "dirichlet"]
-CompactLayoutStrategy = Literal[
-    "lazy_on_first_replica",
-    "eager_on_first_forward",
-]
-
-
-@dataclass(frozen=True)
-class QwenMoeConfig:
-    """Fixed-shape synthetic Qwen model configuration.
-
-    The example intentionally models one TP1/EP8 optimizer-step workload. Its
-    deterministic balanced default gives every destination the same load;
-    optional Dirichlet routing reproduces load-skew and multi-wave behavior.
-    """
-
-    vocab_size: int = 32000
-    hidden_size: int = 5120
-    num_layers: int = 8
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 2
-    max_seq_len: int = 4096
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 10_000_000.0
-    num_experts: int = 48
-    top_k: int = 8
-    intermediate_size: int = 1792
-    shared_expert_intermediate_size: int = 512
-    routed_scaling_factor: float = 1.0
-    routing: RoutingMode = "balanced"
-    router_load_alpha: float = 1.0
-    router_load_seed: int = 42
-    local_num_tokens: int = 4096
-    expert_capacity_factor: float | None = None
-    replica_slots_per_rank: int = 0
-    compact_physical_weights: bool = False
-    compact_layout_strategy: CompactLayoutStrategy = "eager_on_first_forward"
-    ep_size: int = 8
-
-    def __post_init__(self) -> None:
-        """Validate the fixed optimizer-step topology."""
-        positive = {
-            "vocab_size": self.vocab_size,
-            "hidden_size": self.hidden_size,
-            "num_layers": self.num_layers,
-            "num_attention_heads": self.num_attention_heads,
-            "num_key_value_heads": self.num_key_value_heads,
-            "max_seq_len": self.max_seq_len,
-            "num_experts": self.num_experts,
-            "top_k": self.top_k,
-            "intermediate_size": self.intermediate_size,
-            "shared_expert_intermediate_size": self.shared_expert_intermediate_size,
-            "local_num_tokens": self.local_num_tokens,
-            "ep_size": self.ep_size,
-        }
-        for name, value in positive.items():
-            if value <= 0:
-                raise ValueError(f"{name} must be positive, got {value}.")
-        if self.hidden_size % self.num_attention_heads:
-            raise ValueError(
-                f"hidden_size ({self.hidden_size}) must be divisible by "
-                f"num_attention_heads ({self.num_attention_heads})."
-            )
-        if self.num_attention_heads % self.num_key_value_heads:
-            raise ValueError(
-                f"num_attention_heads ({self.num_attention_heads}) must be divisible by "
-                f"num_key_value_heads ({self.num_key_value_heads})."
-            )
-        if self.num_experts % self.ep_size:
-            raise ValueError(
-                f"num_experts ({self.num_experts}) must be divisible by ep_size ({self.ep_size})."
-            )
-        if self.top_k > self.num_experts:
-            raise ValueError(
-                f"top_k ({self.top_k}) cannot exceed num_experts ({self.num_experts})."
-            )
-        if (
-            not isinstance(self.replica_slots_per_rank, int)
-            or isinstance(self.replica_slots_per_rank, bool)
-            or self.replica_slots_per_rank < 0
-        ):
-            raise ValueError(
-                "replica_slots_per_rank must be a nonnegative integer, "
-                f"got {self.replica_slots_per_rank!r}."
-            )
-        if not isinstance(self.compact_physical_weights, bool):
-            raise ValueError(
-                "compact_physical_weights must be a bool, got "
-                f"{self.compact_physical_weights!r}."
-            )
-        if self.compact_layout_strategy not in (
-            "lazy_on_first_replica",
-            "eager_on_first_forward",
-        ):
-            raise ValueError(
-                "compact_layout_strategy must be 'lazy_on_first_replica' or "
-                f"'eager_on_first_forward', got {self.compact_layout_strategy!r}."
-            )
-        if self.local_num_tokens % 128:
-            raise ValueError(
-                f"local_num_tokens ({self.local_num_tokens}) must be divisible by 128."
-            )
-        if self.max_seq_len > self.local_num_tokens:
-            raise ValueError(
-                f"max_seq_len ({self.max_seq_len}) cannot exceed local_num_tokens "
-                f"({self.local_num_tokens}) in the fixed batch-one workload."
-            )
-        self._validate_routing()
-
-    def _validate_routing(self) -> None:
-        """Validate learned and synthetic router parameters."""
-        if self.routing not in ("balanced", "topk", "dirichlet"):
-            raise ValueError(f"unsupported routing mode: {self.routing!r}.")
-        if self.routing == "balanced" and self.top_k != self.ep_size:
-            raise ValueError(
-                "balanced routing requires top_k to equal ep_size so every token "
-                f"selects one expert per destination, got top_k={self.top_k} and "
-                f"ep_size={self.ep_size}."
-            )
-        if not math.isfinite(self.router_load_alpha) or self.router_load_alpha < 0.01:
-            raise ValueError(
-                "router_load_alpha must be finite and at least 0.01, got "
-                f"{self.router_load_alpha}."
-            )
-        if not math.isfinite(self.routed_scaling_factor) or self.routed_scaling_factor <= 0:
-            raise ValueError(
-                "routed_scaling_factor must be finite and positive, got "
-                f"{self.routed_scaling_factor}."
-            )
 
 
 class QwenAttention(nn.Module):
@@ -193,13 +66,13 @@ class QwenAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = True
         self.rotary_emb = Qwen3MoeRotaryEmbedding(
-            Qwen3MoeConfig(
-                hidden_size=config.hidden_size,
-                num_attention_heads=config.num_attention_heads,
-                num_key_value_heads=config.num_key_value_heads,
-                max_position_embeddings=config.max_seq_len,
-                rope_theta=config.rope_theta,
-            )
+            Qwen3MoeConfig.from_dict({
+                "hidden_size": config.hidden_size,
+                "num_attention_heads": config.num_attention_heads,
+                "num_key_value_heads": config.num_key_value_heads,
+                "max_position_embeddings": config.max_seq_len,
+                "rope_theta": config.rope_theta,
+            })
         )
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.k_proj = nn.Linear(
@@ -450,16 +323,17 @@ class QwenMoeBlock(nn.Module):
             expert_capacity_factor=config.expert_capacity_factor,
             replica_slots_per_rank=config.replica_slots_per_rank,
             compact_physical_weights=config.compact_physical_weights,
+            shared_physical_weights=config.shared_physical_weights,
             compact_layout_strategy=config.compact_layout_strategy,
             ep_size=config.ep_size,
             ep_group=ep_group,
         )
         self.shared_expert = SwiGLUMLP(
             module=Qwen3MoeMLP(
-                Qwen3MoeConfig(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.shared_expert_intermediate_size,
-                )
+                Qwen3MoeConfig.from_dict({
+                    "hidden_size": config.hidden_size,
+                    "intermediate_size": config.shared_expert_intermediate_size,
+                })
             )
         )
 
@@ -602,7 +476,7 @@ class QwenMoeModel(nn.Module):
             hidden_states.shape[1],
             dtype=torch.int64,
             device=hidden_states.device,
-        )
+        ).unsqueeze(0).expand(hidden_states.shape[0], -1)
         for layer in self.layers:
             hidden_states = layer(hidden_states, position_ids)
         logits = self.lm_head(self.norm(hidden_states))
