@@ -120,7 +120,9 @@ def _check_deferred(
         torch.npu.synchronize(moe._DEVICE)
         actual = _capture(layer, inputs[position], weights[position], outputs[position])
         moe._assert_results_close(expected[position], actual, weight_grad_wave_count=shape.ep_size)
-        if check_storage:
+        # A home-only backward can precede the first replica backward. The
+        # shared gradient pool is deliberately allocated only when first used.
+        if check_storage and manager._shared_gradients is not None:
             current_ptrs = tuple(gradient.data_ptr() for gradient in manager._shared_gradients)
             if gradient_ptrs is None:
                 gradient_ptrs = current_ptrs
@@ -131,6 +133,8 @@ def _check_deferred(
                 f"gradient retains staging: storage={gradient.untyped_storage().nbytes()}, "
                 f"logical={gradient.numel() * gradient.element_size()}"
             )
+    if check_storage:
+        assert gradient_ptrs is not None, f"replica backwards never initialized the B gradient pool: {gradient_ptrs}"
     current_state = [
         (weight.data_ptr(), weight._version)
         for layer in candidates for weight in layer.parameters()

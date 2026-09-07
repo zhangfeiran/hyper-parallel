@@ -31,8 +31,8 @@ output sizing while retaining zero-count expert entries.
 `plot_mega_moe_dirichlet.py` renders a separate, expert-layer-only comparison:
 native, MegaMoe with zero replica slots per rank (`B=0`), and MegaMoe with one
 replica slot per rank (`B=1`). Both MegaMoe variants retain lossless multi-wave
-overflow handling. The B1 legend states whether compact physical weights or
-snapshot storage was measured; these storage modes must not be mixed.
+overflow handling. The B1 legend identifies compact, snapshot, or cross-layer
+shared B storage; these storage modes must not be mixed.
 
 Pass repeated sweep JSON files from independent processes:
 
@@ -71,7 +71,47 @@ are not added again, and the result is not an eight-card sum or whole-device
 `npu-smi` occupancy. A layer reused across routes retains its workspace and
 physical-weight high-watermarks, which remain part of this memory total.
 
-This fixed-route F+B workload excludes optimizer updates and activation
+### Checkpointed multi-layer sweep
+
+`benchmark_mega_moe_layers.py` measures 16 independent MoE layers by default,
+using EP8, 4096 tokens/rank, H5120, I1792, E48, TopK8, BF16, and capacity
+factor 1.5. All layer forwards precede reverse-order backwards. Each layer
+has its own parameters and input storage, with reentrant activation checkpoint.
+This exercises cross-layer resource lifetimes; it is not a connected transformer
+and excludes attention and router-network computation. Every layer receives the
+same original route in a step, making the skew coordinate unambiguous.
+
+Both MegaMoe variants share execution resources before first forward. B1 uses
+`shared_physical_weights=True`, leaving home parameters intact and sharing only
+the B-slot weight/FP32-gradient pools. SGD updates parameters every iteration,
+outside F+B timing; subsequent replica refresh and checkpoint recomputation are
+timed. HBM includes all 16 layers' home parameters/gradients, inputs, live outputs,
+retained resources, and the full SHMEM heap. The peak window also includes SGD,
+which uses no momentum or extra optimizer state. It is not a full AdamW estimate.
+
+After activating matching native artifacts and verifying the editable checkout,
+run each variant in a fresh, idle-gated process, for example:
+
+```bash
+python -m torch.distributed.run --nproc_per_node=8 --master_port=29500 \
+  examples/torch/multicore/benchmark_mega_moe_layers.py \
+  --variant b1 --layers 16 --warmup 3 --measured 7 --output output/b1_a.json
+```
+
+The default route set is the same 55 alpha/seed pairs used by the single-layer
+curve, including high-skew W3/W4 routes. `--pairs 10000:42,0.005:943` selects a
+short smoke sweep. Use the same command/configuration for native, b0, and b1,
+then repeat in reverse order (`native, b0, b1, b1, b0, native`). Pass all six JSON
+files to the plot command above. Each point validates finite outputs and all
+input/router/parameter gradients before warmup; this is not a numerical oracle
+comparison. Run the shared-weight and compact-transition precision regressions
+separately when changing runtime code.
+
+The plotter rejects mixed layer counts, checkpoint modes, optimizer protocols,
+and workload scope. Latency is measured for the complete multi-layer F+B, not
+single-layer latency multiplied by the layer count.
+
+The legacy single-layer fixed-route F+B workload excludes optimizer updates and activation
 checkpointing. In particular, B1 can reuse same-version physical weights
 after warmup; the curve does not include the refresh cost following an
 optimizer update. Use the complete optimizer-step example above when that

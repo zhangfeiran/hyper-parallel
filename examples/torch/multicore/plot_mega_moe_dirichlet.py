@@ -39,6 +39,7 @@ _LOGICAL_FIELDS = (
     "destination_loads", "realized_destination_skew", "receive_capacity", "baseline_wave_count",
 )
 _SOURCE_FIELDS = ("git_head", "worker_sha256", "adapter_sha256", "native_artifacts")
+_STACK_DEFAULTS = {"layers": 1, "checkpoint": "none", "scope": "single expert layer", "optimizer": "none"}
 
 
 @dataclass(frozen=True)
@@ -120,12 +121,19 @@ def _load_variant(paths: Sequence[Path], variant: str) -> tuple[dict, dict]:
             raise ValueError(f"Expected {variant} performance sweep in {path}.")
         source = {name: payload["source"][name] for name in _SOURCE_FIELDS}
         current_header = {"source": source, "configuration": payload["configuration"]}
+        config = payload["configuration"]
+        layers = config.get("layers", 1)
+        if isinstance(layers, bool) or not isinstance(layers, int) or layers <= 0:
+            raise ValueError("layers must be a positive integer.")
         if header is not None and header != current_header:
             raise ValueError(f"Mixed source or configuration within {variant}.")
         header = current_header
         keys = set()
         for point in payload["points"]:
             key = _validate_point(point, variant)
+            if (point.get("layers", 1) != layers
+                    or point.get("checkpoint", "none") != config.get("checkpoint", "none")):
+                raise ValueError("Layer count or checkpoint record disagrees with the configuration.")
             if (point["warmup_steps"] != payload["configuration"]["warmup_steps"]
                     or point["measured_steps"] != payload["configuration"]["measured_steps"]):
                 raise ValueError("Timing record disagrees with the sweep configuration.")
@@ -189,10 +197,15 @@ def load_results(inputs: Mapping[str, Sequence[Path]]) -> CurveDataset:
                     "weight_refresh", "workspace_lifetime", "runtime_environment"):
             if config[key] != reference_header["configuration"][key]:
                 raise ValueError(f"Measurement configuration mismatch for {variant}: {key}.")
+        for key, default in _STACK_DEFAULTS.items():
+            if config.get(key, default) != reference_header["configuration"].get(key, default):
+                raise ValueError(f"Measurement configuration mismatch for {variant}: {key}.")
         if config["replica_slots_per_rank"] != int(variant == "b1"):
             raise ValueError(f"Configuration replica budget mismatch for {variant}.")
         if variant != "b1" and config["compact_physical_weights"]:
             raise ValueError("Compact physical weights are only meaningful for B=1.")
+        if config.get("shared_physical_weights", False) and (variant != "b1" or config["compact_physical_weights"]):
+            raise ValueError("Shared B requires B=1 and excludes compact physical weights.")
     rows = []
     workload = None
     for key, references in reference_records.items():
@@ -264,7 +277,12 @@ def _render(dataset: CurveDataset, output_dir: Path) -> None:
     metadata = dataset.metadata
     shape, topology = metadata["shape"], metadata["topology"]
     compact = metadata["configuration"]["b1"]["compact_physical_weights"]
-    labels = ("Native", "MegaMoe B=0", f"MegaMoe B=1 ({'compact' if compact else 'snapshot'})")
+    shared = metadata["configuration"]["b1"].get("shared_physical_weights", False)
+    storage = "shared across layers" if shared else ("compact" if compact else "snapshot")
+    labels = ("Native", "MegaMoe B=0", f"MegaMoe B=1 ({storage})")
+    config = metadata["configuration"]["native"]
+    layers = config.get("layers", 1)
+    checkpoint = config.get("checkpoint", "none")
     colors = ("#454545", "#0072B2", "#D55E00")
     skew = [row["original_skew"] for row in dataset.rows]
     for axis, metric in zip(axes, ("latency_ms", "hbm_gib")):
@@ -281,17 +299,19 @@ def _render(dataset: CurveDataset, output_dir: Path) -> None:
             axis.text(boundary + 0.025, 0.04, f"B=0: W{wave + 1}",
                       transform=axis.get_xaxis_transform(), fontsize=9, color="#666666")
     axes[0].set_ylabel("Median forward + backward (ms)")
-    axes[0].set_title("Expert-layer latency (optimizer excluded; warmed weight cache)", fontsize=11)
+    weight_state = "weights updated every step" if config["optimizer_step"] else "warmed weight cache"
+    axes[0].set_title(
+        f"{layers} MoE layer(s); checkpoint={checkpoint}; {weight_state}; optimizer excluded", fontsize=11,
+    )
     axes[1].set_ylabel("Total peak HBM / rank (GiB)")
     axes[1].set_title("Allocator peak + full SHMEM heap; persistent high-watermarks retained", fontsize=11)
     axes[1].set_xlabel("Original routing skew S = max home-destination rows / mean rows (before replication)")
     figure.suptitle(
-        f"Native / MegaMoe B=0 / B=1 across routing skew\n"
+        f"Native / MegaMoe B=0 / B=1 across routing skew — {layers} MoE layer(s)\n"
         f"EP{topology['ep']}  |  {shape['local_num_tokens']} tokens/rank  |  "
         f"H{shape['hidden_size']}  I{shape['intermediate_size']}  E{shape['num_experts']}  "
         f"K{shape['top_k']}  {shape['dtype']}", fontsize=14,
     )
-    config = metadata["configuration"]["native"]
     figure.text(
         0.5, 0.015,
         f"{len(dataset.rows)} matched routes; {metadata['independent_runs_per_variant']} fresh processes/variant; "

@@ -125,6 +125,50 @@ class TestPlotMegaMoeDirichlet(unittest.TestCase):
         self.assertEqual(row["b1_samples"], 6)
         self.assertAlmostEqual(row["b1_hbm_gib"], 2.5 + 7 / GIB)
 
+    def _stack_inputs(self):
+        inputs = {}
+        for variant in ("native", "b0", "b1"):
+            payload = self._payload(variant)
+            payload["configuration"].update(
+                layers=16, checkpoint="reentrant", scope="independent MoE layers", optimizer="SGD",
+                compact_physical_weights=False, shared_physical_weights=variant == "b1",
+                optimizer_step=True,
+            )
+            payload["points"][0].update(layers=16, checkpoint="reentrant")
+            inputs[variant] = [self._write(variant, payload)]
+        return inputs
+
+    def test_shared_b_checkpointed_stack_keeps_measured_totals(self):
+        """Treat a measured 16-layer stack as one sample, never multiply by 16."""
+        dataset = load_results(self._stack_inputs())
+        self.assertEqual(dataset.metadata["configuration"]["b1"]["layers"], 16)
+        self.assertTrue(dataset.metadata["configuration"]["b1"]["shared_physical_weights"])
+        self.assertEqual(dataset.rows[0]["b1_latency_ms"], 8.0)
+        self.assertAlmostEqual(dataset.rows[0]["b1_hbm_gib"], 1.5 + 7 / GIB)
+
+    def test_reject_mixed_layer_checkpoint_and_storage_contracts(self):
+        """Different stack sizes or checkpoint lifetimes are not paired work."""
+        for key, value in (("layers", 1), ("checkpoint", "none"), ("scope", "connected"),
+                           ("optimizer", "AdamW"), ("compact_physical_weights", True)):
+            with self.subTest(key=key):
+                inputs = self._stack_inputs()
+                payload = json.loads(inputs["b1"][0].read_text(encoding="utf-8"))
+                payload["configuration"][key] = value
+                if key in ("layers", "checkpoint"):
+                    payload["points"][0][key] = value
+                self._write("b1", payload)
+                with self.assertRaises(ValueError):
+                    load_results(inputs)
+
+    def test_reject_point_with_different_stack_metadata(self):
+        """A point cannot silently inherit an incompatible sweep header."""
+        inputs = self._stack_inputs()
+        payload = json.loads(inputs["b0"][0].read_text(encoding="utf-8"))
+        payload["points"][0]["layers"] = 1
+        self._write("b0", payload)
+        with self.assertRaisesRegex(ValueError, "Layer count or checkpoint"):
+            load_results(inputs)
+
     def test_reject_duplicate_files_and_duplicate_routes(self):
         """A duplicated file or route must not inflate the sample count."""
         inputs = self._inputs()
