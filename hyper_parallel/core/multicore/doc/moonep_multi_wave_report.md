@@ -33,6 +33,11 @@ owned-SHMEM 生命周期、`expert_capacity_factor=None` 默认值及按绑定�
 Conda 构建探测与 reference 适配随后也已修复，常规完整构建及 12 项 NPU 回归通过。
 详见第 10.2.8--10.2.9 节及 [修复报告](megamoe_sun_fix_report_20260907.md)。
 
+随后完成当前正式产物的 all-rank P2P 归因：两轮偏斜诊断中，16 层累计梯度回传暴露等待
+约 85--192 ms/rank，权重刷新约 34--55 ms/rank。下一项优先研究梯度回传，权重双缓冲仍后置；
+这不是已实现的加速或可直接兑现的等待节省，详见第 10.2.10 节及
+[P2P 归因报告](megamoe_p2p_attribution_20260907.md)。
+
 ### 1.1 结论摘要
 
 - 当前组合不是把 MoonEP CUDA 实现直接移植到 Ascend，而是把其“按路由热度动态复制专家”的思想，
@@ -1156,6 +1161,24 @@ adapters 恢复相对 RUNPATH，不再使用诊断构建的绝对路径和额外
 这不代表整网长期收敛、所有 shape、其他平台或完整 wheel 分发已验证。复现命令及证据见
 [修复报告](megamoe_sun_fix_report_20260907.md)。
 
+#### 10.2.10 完成 P2P payload / wait 归因
+
+example 新增默认关闭的 `--profile-p2p`，在所有性能/HBM 测量结束后采一轮额外的已更新权重
+F+B。八卡分别记录真实 transfer bytes、CPU builder/launch/wait 和三个 caller-stream 时间戳，
+逐 phase-call、peer、shape、dtype 验证发送/接收匹配；不改原通信，不在 F+B 内加全设备同步。
+observer 不保留 tensor，异常时恢复原函数，默认路径不创建 observer/events 或额外持久池。
+
+当前正式 native payload 上的两轮 Qwen-shape 16 层 B1、每步 AdamW 偏斜诊断一致确认：31 次
+weight refresh 总发送 `11392.5 MiB`，16 次 FP32 gradient return 总发送 `11760 MiB`。
+前者累计暴露等待 `33.947--54.704 ms/rank`，后者 `85.038--191.673 ms/rank`；梯度累计 pre-wait
+只有 `0.003--0.005 ms/rank`，与立即 wait 结构一致。平衡 home-only 路由八卡均为零 batch/payload。
+
+新采 rank-zero trace 通过 host/device flow 唯一归因 47/47 个 AICPU batch；`SDMA_SQE` 区间并集
+为 `169.333 ms`，但无有效 connection ID 可逐条归入 phase。事件包含 enqueue/诊断空隙，pre-wait
+不是有效计算重叠；局部等待或 SDMA 并集均不是可预测的 step 收益。本轮只落地诊断和优先级依据，
+没有推广新的 runtime 调度。详细 per-rank 结果、计时/HBM 隔离验收、复现命令和局限见
+[P2P 归因报告](megamoe_p2p_attribution_20260907.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1285,9 +1308,9 @@ optimizer step，代表相同权重版本、pool 可直接命中的 micro-batch/
 
 ### 11.1 分阶段验证记录
 
-2026-09-07 重基复核与修复后的新证据分别见第 10.2.7--10.2.9 节及
-[修复报告](megamoe_sun_fix_report_20260907.md)。下列“本轮 / 本阶段”数字保留重基前各优化周期
-的历史记录，不替代当前分支的验收结果。
+2026-09-07 重基复核、修复和新诊断证据分别见第 10.2.7--10.2.10 节、
+[修复报告](megamoe_sun_fix_report_20260907.md)及 [P2P 归因报告](megamoe_p2p_attribution_20260907.md)。
+下列“本轮 / 本阶段”数字保留重基前各优化周期的历史记录，不替代当前分支的验收结果。
 
 执行：
 
@@ -1455,17 +1478,21 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 
 **重基复核后的前置项：** 串联 dX / shared-workspace alias 已修复并完成 ABBA，见第 10.2.8 节。
 Conda include 探测及新 reference 测试适配随后也已完成，常规完整构建和 12 项 NPU 回归通过，
-见第 10.2.9 节。复审后恢复下面的性能优化顺序；dX 小幅复制暂不优先于 P2P 传输 / 等待归因，
-不能为省去该复制重新暴露已修复的 alias。
+见第 10.2.9 节。随后完成第 10.2.10 节的 all-rank P2P payload / wait 归因，梯度回传累计暴露等待
+明显大于权重刷新，故下一项优先收敛 gradient return。dX 小幅复制暂不优先于它，也不能为省去
+该复制重新暴露已修复的 alias。
 
 本轮按“扫测 → backward 诊断 → sizing 小改动 → A/B/B/A → forward 诊断 → 否决两种 peer 轮转”
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **把 P2P 数据面归因提升到第一位。** rank-zero 的 SDMA 区间并集约 `169 ms`，CPU launch scope 和
-   profiler 的 `Communication` 汇总都不足以代表 payload。先区分 31 次 weight refresh 与 16 次 gradient
-   return 的传输、等待和 overlap，再选择 peer 合批或调度改动。owner receive contribution 必须完成
-   FP32 聚合后才能 cast；不能直接把区间并集当成预计可节省的 wall time。
+1. **优先优化 FP32 gradient return 的批次与等待位置。** 两轮诊断的累计暴露等待为
+   `85--192 ms/rank`，权重仅 `34--55 ms/rank`；梯度 pre-wait 几乎为零。先关联高等待的 rank 4/7
+   与 peer 到达/批次依赖，再验证同 peer gate/up + down 合批，或将安全的独立收尾工作放在 wait 前。
+   二者均是待验证假设，不凭 payload 大小直接轮转。owner receive contribution 必须全部完成 FP32
+   聚合后才能 cast；shared-B dW 发送完成前不能复用 storage，不能只移走 wait 破坏消费/复用依赖。
+   默认 HBM 不增加优先；若合批需要额外复制或池，必须单独核算并经匹配 ABBA 才保留。局部事件
+   和 rank-zero 约 `169 ms` 的 SDMA 并集均不是预计可节省的 wall time。
 2. **前向调度先补 expert 就绪证据，不继续盲目轮转。** 两种 peer 重排虽保持通信字节数与 HBM，
    偏斜 full step 分别回退 `2.609%` / `3.746%`，均已撤回。接收 rank 或 worker 的 payload 均衡不能
    替代 GMM readiness 和跨 rank 进度；下一步关联具体 expert 的 dependency/event、非空 transfer 完成
@@ -1486,9 +1513,9 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
    后续补 native/B0/B1 全曲线配对、逐 step 动态 skew、`B=0/1/2/4/6`、capacity、active expert、更新频率、
    频繁换绑和连续 generation。重点验证 B1 residual 3+ waves 及 connected model；不得用当前扫测作为
    取消 multi-wave 的依据。
-6. **最后评估双 buffer 与预测 prefetch。** 若分段 profile 证明 31 次 weight refresh 的未重叠部分显著，
-   且更低内存代价的调度仍不足，再做
-   shared-B ping-pong pool和跨层 backward prefetch；上一 histogram 预测必须带 generation 校验，不能静默
+6. **最后评估双 buffer 与预测 prefetch。** 新诊断已显示 31 次 weight refresh 的暴露等待小于梯度回传，
+   暂不增加权重双缓冲。只有其剩余等待在后续成为主要限制，且更低内存代价的调度仍不足，再做
+   shared-B ping-pong pool 和跨层 backward prefetch；上一 histogram 预测必须带 generation 校验，不能静默
    使用错误 plan。保持“性能收益足以覆盖新增 HBM 与生命周期复杂度”的进入条件。
 
 ## 16. 代码与测试索引
@@ -1508,5 +1535,6 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 | Qwen model/optimizer benchmark | `examples/torch/multicore/mega_moe/qwen_moe_model.py`、`qwen_moe_benchmark.py` |
 | checkpointed multi-layer benchmark | `examples/torch/multicore/benchmark_mega_moe_layers.py` |
 | opt-in rank-zero trace / all-rank forward/backward cycles | `examples/torch/multicore/mega_moe_layer_profile.py` |
+| opt-in all-rank P2P payload / readiness | `examples/torch/multicore/mega_moe_p2p_profile.py` |
 | planner/route/pool UT | `tests/ut/core/multicore/mega_moe/` |
 | real fused-kernel ST | `tests/torch/expert_parallel/test_mega_moe.py`、`_test_mega_moe_shared_weights.py` |

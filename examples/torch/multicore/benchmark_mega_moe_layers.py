@@ -40,6 +40,7 @@ from examples.torch.multicore.mega_moe_layer_profile import (
     profile_layer_cycles,
     profile_layer_step,
 )
+from examples.torch.multicore.mega_moe_p2p_profile import profile_layer_p2p
 
 ALPHAS = (10000, 3000, 1000, 300, 100, 30, 10, 3, 1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
 EXTRA_PAIRS = ((0.01, 1942), (0.01, 1708), (0.01, 0), (0.005, 943), (0.01, 2104),
@@ -74,6 +75,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="After all measurements, trace one extra step of the first route on rank zero.")
     parser.add_argument("--profile-kernel-cycles", action="store_true",
                         help="After timing, gather last forward/backward cycles on all ranks (first route, MegaMoe).")
+    parser.add_argument("--profile-p2p", action="store_true",
+                        help="After timing, collect all-rank P2P payload and readiness events (first route, MegaMoe).")
     args = parser.parse_args(argv)
     if args.layers <= 0 or args.warmup < 0 or args.measured <= 0:
         parser.error("layers and measured must be positive; warmup must be nonnegative")
@@ -83,6 +86,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"refusing to overwrite {args.output}")
     if args.profile_kernel_cycles and args.variant == "native":
         parser.error("profile-kernel-cycles requires a MegaMoe variant")
+    if args.profile_p2p and args.variant == "native":
+        parser.error("profile-p2p requires a MegaMoe variant")
     if os.getenv("HP_MEGA_MOE_KERNEL_CYCLE_PROFILE", "0") == "1":
         parser.error("unset HP_MEGA_MOE_KERNEL_CYCLE_PROFILE for timing; use --profile-kernel-cycles instead")
     if args.profile_output is not None:
@@ -190,6 +195,9 @@ def _source_identity() -> dict[str, Any]:
         "adapter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "profile_helper_sha256": hashlib.sha256(
             Path(__file__).with_name("mega_moe_layer_profile.py").read_bytes()
+        ).hexdigest(),
+        "p2p_profile_helper_sha256": hashlib.sha256(
+            Path(__file__).with_name("mega_moe_p2p_profile.py").read_bytes()
         ).hexdigest(),
         "python_implementation": _python_source_identity(repo),
         "native_artifacts": artifacts,
@@ -376,6 +384,9 @@ def main() -> None:
         kernel_cycles = None
         if args.profile_kernel_cycles:
             kernel_cycles = profile_layer_cycles(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]))
+        p2p_profile = None
+        if args.profile_p2p:
+            p2p_profile = profile_layer_p2p(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]))
         if source != _source_identity():
             raise RuntimeError("source or native artifacts changed during the sweep")
         if worker._RANK == 0:
@@ -388,6 +399,8 @@ def main() -> None:
                 }
             if kernel_cycles is not None:
                 payload["diagnostic_kernel_cycles"] = {"alpha": points[0][0], "seed": points[0][1], **kernel_cycles}
+            if p2p_profile is not None:
+                payload["diagnostic_p2p"] = {"alpha": points[0][0], "seed": points[0][1], **p2p_profile}
             args.output.parent.mkdir(parents=True, exist_ok=True)
             with args.output.open("x", encoding="utf-8") as stream:
                 stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")

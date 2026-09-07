@@ -149,6 +149,34 @@ be added together. Use the NPU timeline for asynchronous attribution and indepen
 profiler-free runs for final performance/HBM comparisons. The output path must be
 new and distinct from the benchmark JSON.
 
+Use `--profile-p2p` for a separate, post-update diagnostic step on every EP rank.
+It works independently of the Chrome profiler and stores `diagnostic_p2p` in the
+result JSON. Both weights and gradients retain their original communication:
+the example temporarily observes transfer builders, batch submission and the
+existing completion waits, without adding device-wide synchronization inside
+F+B. It restores all wrappers even on failure. No observer, timing events or
+payload metadata are created in the default path.
+
+Each nonempty batch reports its phase (`weight_refresh` or `gradient_return`),
+phase-call index, peer, operation, shape, dtype and actual tensor bytes. All ranks
+must agree on matching sends/receives for each phase round, peer, shape and dtype.
+Metadata retains no communication tensors. Empty batches and cache-hit waits
+create no events. Device events are read only after the diagnostic step completes.
+Three caller-stream timestamps distinguish:
+
+- `launch_to_ready_ms`: before submission to after the existing completion wait;
+- `pre_wait_ms`: before submission to entry at the wait site;
+- `exposed_wait_ms`: entry at the wait site to readiness for the next consumer.
+
+Separate CPU timers cover descriptor preparation, submission and `handle.wait()`.
+The device spans include host enqueue gaps and instrumentation overhead: they
+are **not** pure wire time, and `pre_wait_ms` is an opportunity window rather than
+measured useful-compute overlap. Per-phase sums and rank maxima are not predicted
+end-to-end savings. The serial layer example requires the wait to use the same
+caller stream as its submission; unsupported cross-stream attribution fails
+instead of reporting a misleading overlap. Final performance/HBM comes from the
+ordinary pre-diagnostic measurements and independent profiler-free runs.
+
 For MegaMoe variants, `--profile-kernel-cycles` runs a separate extra post-update
 step after all measurements and writes `diagnostic_kernel_cycles` into the JSON.
 It gathers per-core counters from every EP rank. The shared workspace retains

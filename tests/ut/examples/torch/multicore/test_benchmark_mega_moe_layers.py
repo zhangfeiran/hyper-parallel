@@ -292,12 +292,14 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
             output = Path(directory) / "timing.json"
             args = argparse.Namespace(variant="b1", layers=16, warmup=3, measured=7, shuffle_seed=1,
-                                      output=output, profile_output=None, profile_kernel_cycles=True)
+                                      output=output, profile_output=None, profile_kernel_cycles=True, profile_p2p=False)
             with patch.object(benchmark, "_parse_args", return_value=args), \
                     patch.object(benchmark, "_route_pairs", return_value=[(1.0, 7), (0.1, 42)]), \
                     patch.object(benchmark, "_source_identity", return_value={}), \
                     patch.object(benchmark.importlib, "import_module", return_value=worker), \
                     patch.object(benchmark, "_LayerSweep", return_value=sweep), \
+                    patch.object(benchmark, "profile_layer_p2p",
+                                 side_effect=AssertionError("unexpected P2P capture")), \
                     patch.object(benchmark, "profile_layer_cycles",
                                  side_effect=lambda *_args: events.append("cycles") or {"layer_index": 0}):
                 benchmark.main()
@@ -305,3 +307,37 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         self.assertEqual(events, ["measure", "measure", "cycles"])
         self.assertEqual(payload["points"], [{"seed": 7}, {"seed": 42}])
         self.assertEqual(payload["diagnostic_kernel_cycles"], {"alpha": 1.0, "seed": 7, "layer_index": 0})
+        self.assertNotIn("diagnostic_p2p", payload)
+
+    def test_p2p_profile_is_opt_in_and_rejects_native(self) -> None:
+        """P2P diagnostics must not activate accidentally or accept an unrelated backend."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "timing.json")
+            self.assertFalse(_parse_args(["--variant", "b1", "--output", output]).profile_p2p)
+            self.assertTrue(_parse_args(["--variant", "b1", "--output", output, "--profile-p2p"]).profile_p2p)
+            with self.assertRaises(SystemExit):
+                _parse_args(["--variant", "native", "--output", output, "--profile-p2p"])
+
+    def test_main_collects_p2p_only_after_all_measurements(self) -> None:
+        """P2P timestamps and aggregation must remain outside every timed route."""
+        events = []
+        worker = MagicMock()
+        worker._RANK = 0
+        worker.dist.is_initialized.return_value = False
+        sweep = MagicMock()
+        sweep.measure.side_effect = lambda alpha, seed: events.append("measure") or {"seed": seed}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
+            output = Path(directory) / "timing.json"
+            args = argparse.Namespace(variant="b1", layers=16, warmup=3, measured=7, shuffle_seed=1,
+                                      output=output, profile_output=None, profile_kernel_cycles=False, profile_p2p=True)
+            with patch.object(benchmark, "_parse_args", return_value=args), \
+                    patch.object(benchmark, "_route_pairs", return_value=[(1.0, 7), (0.1, 42)]), \
+                    patch.object(benchmark, "_source_identity", return_value={}), \
+                    patch.object(benchmark.importlib, "import_module", return_value=worker), \
+                    patch.object(benchmark, "_LayerSweep", return_value=sweep), \
+                    patch.object(benchmark, "profile_layer_p2p",
+                                 side_effect=lambda *_args: events.append("p2p") or {"per_rank": []}):
+                benchmark.main()
+            payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(events, ["measure", "measure", "p2p"])
+        self.assertEqual(payload["diagnostic_p2p"], {"alpha": 1.0, "seed": 7, "per_rank": []})
