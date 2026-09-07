@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -21,8 +21,10 @@
 
 using namespace AscendC;
 
-class KernelWorker : public KernelWorkerBase<KernelWorker> {
+template <bool EnableCycleProfile>
+class KernelWorker : public KernelWorkerBase<KernelWorker<EnableCycleProfile>> {
  public:
+  using KernelWorkerBase<KernelWorker<EnableCycleProfile>>::input_list;
   // input_list layout for hyper_mega_moe (forward):
   //   [28] = tiling params  [29] = all_event_counters  [11] = gmm_workspace
   static constexpr uint32_t TILING_IDX = 28;
@@ -32,9 +34,17 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   static constexpr uint32_t WAVE_COUNT_TILING_INDEX = 7;
   static constexpr uint32_t HOME_EXPERTS_TILING_INDEX = 8;
   static constexpr bool HAS_MID_WAVE_ROUTE_BARRIER = false;
-  static constexpr bool CYCLE_PROFILE_ENABLED = false;
+  static constexpr bool CYCLE_PROFILE_ENABLED = EnableCycleProfile;
+  static constexpr uint32_t CYCLE_PROFILE_WORKSPACE_IDX = 30;
+  static constexpr uint64_t CYCLE_PROFILE_OFFSET_BYTES = 0;
+  // Keep the shared eight-cell layout; forward slots 2/3 describe up/down
+  // projection, while backward uses them for GMM and dY dispatch.
+  static constexpr CycleProfileCategory PROFILE_UP_PROJ = CYCLE_PROFILE_GMM;
+  static constexpr CycleProfileCategory PROFILE_DOWN_PROJ = CYCLE_PROFILE_DISPATCH_DY;
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
+    int64_t profile_start = this->ProfileStart();
+    CycleProfileCategory profile_category = CYCLE_PROFILE_LOCAL_COMPUTE;
     switch (task_desc.task_type) {
       case TASK_BEGIN_TASK_GRAPH:
         break;
@@ -42,12 +52,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteMatmul(task_desc);
         break;
       case TASK_GROUPED_MATMUL:
+        profile_category = task_desc.outputs[0].input_position == 7 ? PROFILE_UP_PROJ : PROFILE_DOWN_PROJ;
         ExecuteGroupedMatmul(task_desc);
         break;
       case TASK_SWI_GLU:
         ExecuteSwiglu(task_desc);
         break;
       case TASK_SHMEM_PUT_MEM_SIGNAL:
+        profile_category = (task_desc.extra_value_3 & 0xFFU) == 1U
+          ? CYCLE_PROFILE_DISPATCH_HIDDEN : CYCLE_PROFILE_COMBINE;
         ExecuteShmemPutMem(task_desc);
         break;
 #ifndef __DAV_C220_CUBE__
@@ -58,6 +71,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       default:
         break;
     }
+    this->ProfileRecord(profile_category, profile_start);
   }
 
  private:
@@ -592,9 +606,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 };
 
-extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr,
-                                                GM_ADDR *input_list) {
-  KernelWorker worker;
+template <bool EnableCycleProfile>
+inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr, GM_ADDR *input_list) {
+  KernelWorker<EnableCycleProfile> worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
   worker.Process();
 }

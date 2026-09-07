@@ -188,10 +188,10 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
-def new_common_moe(shape: MoeShape) -> GroupedExperts:
+def new_common_moe(shape: MoeShape, *, seed: int = 2026) -> GroupedExperts:
     """Build common grouped experts and apply standard expert parallelism."""
-    torch.manual_seed(2026)
-    torch.npu.manual_seed(2026)
+    torch.manual_seed(seed)
+    torch.npu.manual_seed(seed)
     common_moe = GroupedExperts(
         dim=shape.hidden_size,
         hidden_dim=shape.intermediate_size,
@@ -233,9 +233,11 @@ def new_layers(
     replica_slots_per_rank: int = 0,
     compact_physical_weights: bool = False,
     compact_layout_strategy: str = "eager_on_first_forward",
+    shared_physical_weights: bool = False,
+    seed: int = 2026,
 ) -> tuple[MegaMoeExperts, torch.nn.Module]:
     """Construct parameter-aligned MegaMoe and common expert layers."""
-    common_moe = new_common_moe(shape)
+    common_moe = new_common_moe(shape, seed=seed)
     mega = MegaMoeExperts(
         local_num_tokens=shape.local_num_tokens,
         hidden_size=shape.hidden_size,
@@ -246,6 +248,7 @@ def new_layers(
         replica_slots_per_rank=replica_slots_per_rank,
         compact_physical_weights=compact_physical_weights,
         compact_layout_strategy=compact_layout_strategy,
+        shared_physical_weights=shared_physical_weights,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(device=DEVICE, dtype=torch.bfloat16)

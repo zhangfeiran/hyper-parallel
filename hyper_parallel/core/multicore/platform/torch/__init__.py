@@ -33,8 +33,8 @@ before starting the application or framework Python process so CANN can discover
 """
 __all__ = ["mega_moe", "mega_moe_grad"]
 
-from functools import lru_cache
 import importlib
+from functools import lru_cache
 
 from hyper_parallel.core.multicore._loader import (
     NativeComponentUnavailableError,
@@ -76,6 +76,11 @@ def mega_moe(
     runtime_config, all_event_counters,
     rank_id: int, ep: int, expert_num: int,
     hidden_size: int, seq_size: int,
+    *,
+    original_x=None, permute_src_index=None, reduce_route_index=None,
+    topk_weights=None, final_out=None, cycle_profile_workspace=None,
+    receive_capacity: int | None = None, wave_count: int = 1,
+    home_experts: int = 0, cycle_profile: int = 0,
 ):
     """
     MoE-FFN forward operator.
@@ -105,8 +110,16 @@ def mega_moe(
         Event synchronization counter tensor.
     rank_id, ep, expert_num, hidden_size, seq_size :
         Topology / shape attributes.
+    original_x, permute_src_index, reduce_route_index, topk_weights, final_out :
+        Managed route-fusion buffers. Omitted values preserve the legacy
+        expert-major, single-wave entry point; unused inputs use typed aliases.
+    cycle_profile_workspace, receive_capacity, wave_count, home_experts, cycle_profile :
+        Managed kernel workspace and multi-wave/shared-weight attributes.
     """
-    _get_torch().ops.hyper_parallel.mega_moe(
+    torch = _get_torch()
+    if topk_weights is None:
+        topk_weights = dispatch_size[:1].to(torch.float32)
+    torch.ops.hyper_parallel.mega_moe(
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,
@@ -115,7 +128,15 @@ def mega_moe(
         combine_target, combine_target_off, combine_src_off, combine_size,
         gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
         runtime_config, all_event_counters,
+        dispatch_src if original_x is None else original_x,
+        dispatch_size if permute_src_index is None else permute_src_index,
+        dispatch_size if reduce_route_index is None else reduce_route_index,
+        topk_weights,
+        combine_target if final_out is None else final_out,
+        gmm_workspace if cycle_profile_workspace is None else cycle_profile_workspace,
         rank_id, ep, expert_num, hidden_size, seq_size,
+        dispatch_target.shape[0] if receive_capacity is None else receive_capacity,
+        wave_count, home_experts, cycle_profile,
     )
 
 
@@ -131,6 +152,10 @@ def mega_moe_grad(
     runtime_config, all_event_counters,
     rank_id: int, ep: int, expert_num: int,
     hidden_size: int, seq_size: int,
+    *,
+    permute_src_index=None, route_weight=None, reduce_route_index=None,
+    receive_capacity: int | None = None, wave_count: int = 1,
+    cycle_profile: int = 0, home_experts: int = 0,
 ):
     """
     MoE-FFN backward operator.
@@ -181,8 +206,16 @@ def mega_moe_grad(
         Event synchronization counter tensor.
     rank_id, ep, expert_num, hidden_size, seq_size :
         Topology / shape attributes.
+    permute_src_index, route_weight, reduce_route_index :
+        Managed route-fusion inputs. Omitted values preserve the legacy
+        expert-major entry point and are unused by its descriptor graph.
+    receive_capacity, wave_count, cycle_profile, home_experts :
+        Managed multi-wave, diagnostic and shared-weight attributes.
     """
-    _get_torch().ops.hyper_parallel.mega_moe_grad(
+    torch = _get_torch()
+    if route_weight is None:
+        route_weight = dispatch_size[:1].to(torch.float32)
+    torch.ops.hyper_parallel.mega_moe_grad(
         dispatch_target, dispatch_target_off,
         dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw,
@@ -192,5 +225,10 @@ def mega_moe_grad(
         act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
         swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
         runtime_config, all_event_counters,
+        dispatch_size if permute_src_index is None else permute_src_index,
+        route_weight,
+        dispatch_size if reduce_route_index is None else reduce_route_index,
         rank_id, ep, expert_num, hidden_size, seq_size,
+        dispatch_target.shape[0] if receive_capacity is None else receive_capacity,
+        wave_count, cycle_profile, home_experts,
     )

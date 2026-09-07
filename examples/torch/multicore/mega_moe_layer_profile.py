@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Opt-in, untimed traces and all-rank backward cycles for the layer benchmark."""
+"""Opt-in, untimed traces and all-rank kernel cycles for the layer benchmark."""
 
 from __future__ import annotations
 
@@ -24,12 +24,12 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-_PACKAGE = "hyper_parallel.core.multicore.platform.torch.mega_moe"
+_PACKAGE = "hyper_parallel.core.multicore.modules.mega_moe"
 _CYCLE_PROFILE_ENV = "HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"
 _SPANS = {
     "route": ("_start_count_gather", "_finish_static_count_gather", "_build_replica_plan",
               "_remap_topk_ids_to_physical", "_materialize_replica_counts", "_prepare_route_endpoints"),
-    "execution": ("_prepare_forward_buffers", "_launch_forward", "_prepare_backward_route",
+    "function": ("_prepare_forward_buffers", "_launch_forward", "_prepare_backward_route",
                   "_allocate_backward_intermediates", "_launch_backward", "_finish_backward"),
     "replica": ("_launch_transfers", "_wait_handles"),
     "replica.ExpertReplicaManager": ("start_shared_prefetch", "_all_ranks_can_reuse", "_prefetch_transfers",
@@ -120,20 +120,21 @@ def profile_layer_step(sweep: Any, route: tuple, output: Path) -> None:
 
 
 def profile_layer_cycles(sweep: Any, route: tuple) -> dict[str, Any]:
-    """Collect all ranks' last backward counters in an extra post-update step.
+    """Collect all ranks' last forward/backward counters after an update.
 
     Args:
         sweep: Initialized MegaMoe benchmark; every EP rank must participate.
         route: Already sampled route for the diagnostic step.
 
     Returns:
-        Counters for layer zero's final backward, not the entire training step.
-        The shared workspace overwrites counters on each backward launch.
+        Counters for layer zero's final checkpoint recomputation and backward,
+        not the entire training step. Each direction has independent storage,
+        overwritten on every instrumented launch in that direction.
 
     Note:
         Call only after performance and memory measurements. Instrumentation
         changes kernel execution; neither counters nor worker maxima are wall
-        timings. The native counter layout currently covers backward only.
+        timings.
     """
     # Reuse the ST collector so rank aggregation and native counter decoding
     # have one contract; this coupling is confined to diagnostic example code.
@@ -148,8 +149,11 @@ def profile_layer_cycles(sweep: Any, route: tuple) -> dict[str, Any]:
         sweep._train_step(route)  # pylint: disable=protected-access
         worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
         counters = worker._collect_kernel_cycle_profile(sweep.layers[0])  # pylint: disable=protected-access
-        if counters is None:
-            raise RuntimeError("MegaMoe backward cycle counters were not collected")
+        forward_counters = worker._collect_kernel_cycle_profile(  # pylint: disable=protected-access
+            sweep.layers[0], forward=True,
+        )
+        if counters is None or forward_counters is None:
+            raise RuntimeError("MegaMoe forward/backward cycle counters were not collected")
         sweep.optimizer.step()
         worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
     finally:
@@ -157,5 +161,6 @@ def profile_layer_cycles(sweep: Any, route: tuple) -> dict[str, Any]:
             os.environ.pop(_CYCLE_PROFILE_ENV, None)
         else:
             os.environ[_CYCLE_PROFILE_ENV] = previous
-    return {"layer_index": 0, "scope": "last backward launch only; not all layers or forward",
-            "timing": "extra post-update step after all performance and memory measurements", "counters": counters}
+    return {"layer_index": 0, "scope": "last forward recomputation and backward launch only; not all layers",
+            "timing": "extra post-update step after all performance and memory measurements",
+            "counters": counters, "forward_counters": forward_counters}

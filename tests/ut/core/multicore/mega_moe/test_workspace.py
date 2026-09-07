@@ -25,20 +25,23 @@ from hyper_parallel.core.multicore.modules.mega_moe.spec import (
     _resolve_receive_capacity,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
-    _EVENT_COUNTER_BYTES,
     _CYCLE_PROFILE_CATEGORIES,
     _CYCLE_PROFILE_STORAGE_BYTES,
+    _EVENT_COUNTER_BYTES,
+    _FORWARD_CYCLE_PROFILE_CATEGORIES,
     _GMM_WORKSPACE_BYTES,
-    _event_workspace_bytes,
-    _plan_weight_grad_scratch,
     _ROUTE_ARRIVAL_STRIDE_BYTES,
     _ROUTE_SIGNAL_ARENAS,
     _SWIGLU_GRAD_WORKSPACE_BYTES,
     _WORKSPACE_ALIGNMENT,
     MegaMoeWorkspace,
+    _event_workspace_bytes,
+    _plan_weight_grad_scratch,
     _spec_workspace_bytes,
 )
-from hyper_parallel.core.multicore.scheduler.config import READY_CACHE_LINE_BYTES as _READY_CACHE_LINE_BYTES
+from hyper_parallel.core.multicore.scheduler.config import (
+    READY_CACHE_LINE_BYTES as _READY_CACHE_LINE_BYTES,
+)
 
 
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
@@ -486,6 +489,84 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         self.assertEqual(result["cube"]["sum"]["descriptor_decode"], 24)
         self.assertEqual(result["vector"]["per_core"][0][0], 17)
         self.assertEqual(result["vector"]["max"]["descriptor_decode"], 19)
+
+    def test_disabled_forward_profile_never_allocates_or_clears_storage(self):
+        """
+        Feature: zero-allocation default forward profiling
+        Description: prepare a disabled launch before and after enabling diagnostics
+        Expectation: return existing unused scratch without allocating or changing data
+        """
+        workspace = MegaMoeWorkspace(
+            symmetric_memory=Mock(), shared=False,
+            gmm_workspace=torch.full((16,), 37, dtype=torch.uint8),
+        )
+        with patch.object(torch, "empty") as allocate:
+            result = workspace.prepare_forward_cycle_profile(enabled=False)
+        allocate.assert_not_called()
+        self.assertIs(result, workspace.gmm_workspace)
+        self.assertIsNone(workspace.forward_cycle_profile)
+        torch.testing.assert_close(result, torch.full_like(result, 37), atol=0, rtol=0)
+
+        profile = workspace.prepare_forward_cycle_profile(enabled=True)
+        profile.fill_(17)
+        with patch.object(torch, "empty") as allocate:
+            result = workspace.prepare_forward_cycle_profile(enabled=False)
+        allocate.assert_not_called()
+        self.assertIs(result, workspace.gmm_workspace)
+        torch.testing.assert_close(profile, torch.full_like(profile, 17), atol=0, rtol=0)
+
+    def test_forward_counters_survive_backward_and_reuse_their_own_buffer(self):
+        """
+        Feature: independent forward and backward diagnostic storage
+        Description: populate both directions and reset each independently
+        Expectation: decode up/down and dispatch counters without overwriting backward
+        """
+        workspace = MegaMoeWorkspace(
+            symmetric_memory=Mock(),
+            shared=False, gmm_workspace=torch.empty(16, dtype=torch.uint8),
+            swiglu_grad_workspace=torch.zeros(
+                _SWIGLU_GRAD_WORKSPACE_BYTES + _CYCLE_PROFILE_STORAGE_BYTES, dtype=torch.uint8,
+            ),
+        )
+        profile = workspace.prepare_forward_cycle_profile(enabled=True)
+        self.assertEqual(profile.untyped_storage().nbytes(), _CYCLE_PROFILE_STORAGE_BYTES)
+        counters = profile.view(torch.int64).reshape(-1, len(_FORWARD_CYCLE_PROFILE_CATEGORIES))
+        counters[0, 2] = 11
+        counters[1, 2] = 13
+        counters[0, 3] = 17
+        counters[24, 4] = 19
+        workspace.prepare_cycle_profile(enabled=True)
+        result = workspace.collect_cycle_profile(num_cube_cores=2, forward=True)
+        self.assertEqual(result["categories"], list(_FORWARD_CYCLE_PROFILE_CATEGORIES))
+        self.assertEqual(result["cube"]["sum"]["up_proj"], 24)
+        self.assertEqual(result["cube"]["max"]["down_proj"], 17)
+        self.assertEqual(result["vector"]["max"]["dispatch_hidden"], 19)
+
+        backward = workspace.swiglu_grad_workspace.narrow(
+            0, _SWIGLU_GRAD_WORKSPACE_BYTES, _CYCLE_PROFILE_STORAGE_BYTES,
+        )
+        backward.view(torch.int64)[2] = 23
+        with patch.object(torch, "empty") as allocate:
+            reused = workspace.prepare_forward_cycle_profile(enabled=True)
+        allocate.assert_not_called()
+        self.assertIs(reused, profile)
+        self.assertEqual(torch.count_nonzero(profile).item(), 0)
+        self.assertEqual(workspace.collect_cycle_profile(2)["cube"]["max"]["gmm"], 23)
+
+    def test_forward_profile_rejects_missing_storage_and_invalid_core_counts(self):
+        """
+        Feature: cycle profile input validation
+        Description: request counters before initialization or with invalid worker counts
+        Expectation: reject incomplete storage and out-of-range counter slots
+        """
+        workspace = MegaMoeWorkspace(symmetric_memory=Mock(), shared=False)
+        with self.assertRaisesRegex(RuntimeError, "GMM workspace is not initialized"):
+            workspace.prepare_forward_cycle_profile(enabled=True)
+        with self.assertRaisesRegex(RuntimeError, "cycle profile workspace is not initialized"):
+            workspace.collect_cycle_profile(2, forward=True)
+        for count in (0, -1, 25):
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError, "num_cube_cores"):
+                workspace.collect_cycle_profile(count, forward=True)
 
 
 if __name__ == "__main__":

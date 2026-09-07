@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  *
  * PyTorch out-of-tree operator registration for MoE-FFN operators.
  * Registers into the 'hyper_parallel' namespace — does NOT modify aten:: or op-plugin.
@@ -48,6 +48,7 @@ TORCH_LIBRARY(hyper_parallel, m) {
     "  Tensor reduce_route_index,"
     "  Tensor topk_weights,"
     "  Tensor(f!) final_out,"
+    "  Tensor(g!) cycle_profile_workspace,"
     "  int rank_id,"
     "  int ep,"
     "  int expert_num,"
@@ -55,7 +56,8 @@ TORCH_LIBRARY(hyper_parallel, m) {
     "  int seq_size,"
     "  int receive_capacity,"
     "  int wave_count,"
-    "  int home_experts=0"
+    "  int home_experts=0,"
+    "  int cycle_profile=0"
     ") -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!))");
 
   // -------------------------------------------------------------------------

@@ -36,7 +36,10 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from examples.torch.multicore.mega_moe_layer_profile import profile_layer_cycles, profile_layer_step
+from examples.torch.multicore.mega_moe_layer_profile import (
+    profile_layer_cycles,
+    profile_layer_step,
+)
 
 ALPHAS = (10000, 3000, 1000, 300, 100, 30, 10, 3, 1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
 EXTRA_PAIRS = ((0.01, 1942), (0.01, 1708), (0.01, 0), (0.005, 943), (0.01, 2104),
@@ -48,6 +51,8 @@ _PYTHON_SOURCE_ROOTS = (
     "hyper_parallel/core/multicore",
     "hyper_parallel/core/symmetric_memory",
     "hyper_parallel/platform/torch/symmetric_memory",
+    "hyper_parallel/core/expert_parallel",
+    "hyper_parallel/platform/torch/common",
 )
 
 # Reuse the ST's route generator, native implementation and non-overlapping HBM
@@ -68,7 +73,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile-output", type=Path,
                         help="After all measurements, trace one extra step of the first route on rank zero.")
     parser.add_argument("--profile-kernel-cycles", action="store_true",
-                        help="After timing, gather all ranks' last-backward cycles for the first route (MegaMoe only).")
+                        help="After timing, gather last forward/backward cycles on all ranks (first route, MegaMoe).")
     args = parser.parse_args(argv)
     if args.layers <= 0 or args.warmup < 0 or args.measured <= 0:
         parser.error("layers and measured must be positive; warmup must be nonnegative")
@@ -129,6 +134,7 @@ def _optimizer_state_ledger(torch: Any, optimizer: Any) -> dict[str, Any]:
         for name, tensor in state.items():
             if not torch.is_tensor(tensor):
                 continue
+            tensor = _local_tensor(tensor)
             if not bool(torch.isfinite(tensor).all().item()):
                 raise AssertionError(f"nonfinite AdamW state: {name}")
             size = tensor.numel() * tensor.element_size()
@@ -137,6 +143,11 @@ def _optimizer_state_ledger(torch: Any, optimizer: Any) -> dict[str, Any]:
             by_dtype[dtype] = by_dtype.get(dtype, 0) + size
     return {"parameter_state_count": len(optimizer.state), "tensor_bytes": sum(by_device.values()),
             "tensor_bytes_by_device": by_device, "tensor_bytes_by_dtype": by_dtype}
+
+
+def _local_tensor(tensor: Any) -> Any:
+    """Use the rank-local shard for native DTensor validation and HBM accounting."""
+    return tensor.to_local() if hasattr(tensor, "to_local") else tensor
 
 
 def _python_source_identity(repo: Path) -> dict[str, Any]:
@@ -155,7 +166,7 @@ def _python_source_identity(repo: Path) -> dict[str, Any]:
         digest.update(relative)
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
-    return {"scope": "torch_runtime_without_generated_build_trees_v2",
+    return {"scope": "torch_runtime_with_standard_ep_without_generated_build_trees_v3",
             "file_count": len(paths), "sha256": digest.hexdigest()}
 
 
@@ -172,6 +183,9 @@ def _source_identity() -> dict[str, Any]:
         "git_head": subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip(),
         "worker_sha256": hashlib.sha256(
             (repo / "tests/torch/expert_parallel/_test_mega_moe.py").read_bytes()
+        ).hexdigest(),
+        "common_worker_sha256": hashlib.sha256(
+            (repo / "tests/torch/expert_parallel/_test_mega_moe_common.py").read_bytes()
         ).hexdigest(),
         "adapter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "profile_helper_sha256": hashlib.sha256(
@@ -202,20 +216,16 @@ class _LayerSweep:
         worker, shape = self.worker, self.shape
         layers = []
         for index in range(self.args.layers):
-            worker.torch.manual_seed(2026 + worker._RANK + index * 100)
-            kwargs = {
-                "hidden_size": shape.hidden_size, "intermediate_size": shape.intermediate_size,
-                "num_experts": shape.num_experts, "top_k": shape.top_k,
-                "ep_size": shape.ep_size, "ep_group": worker.dist.group.WORLD,
-            }
+            seed = 2026 + index * 100
             if self.args.variant == "native":
-                layer = worker.create_native_moe(**kwargs)
+                layer = worker.new_common_moe(shape, seed=seed)
             else:
-                layer = worker.MegaMoeExperts(
-                    **kwargs, local_num_tokens=shape.local_num_tokens, expert_capacity_factor=1.5,
+                layer, common = worker.new_common_layers(
+                    shape, seed=seed, expert_capacity_factor=1.5,
                     replica_slots_per_rank=self.slots, shared_physical_weights=bool(self.slots),
                 )
-            layers.append(layer.to(device=worker._DEVICE, dtype=worker.torch.bfloat16))
+                del common
+            layers.append(layer)
         if self.args.variant != "native":
             worker.MegaMoeExperts.share_execution_resources(layers)
         return worker.torch.nn.ModuleList(layers)
@@ -227,7 +237,7 @@ class _LayerSweep:
         for layer, data in zip(self.layers, self.inputs):
             hidden = data.detach().requires_grad_(True)
             weights = route[1].detach().requires_grad_(True)
-            function = partial(layer, tokens_per_expert=route[2])
+            function = partial(worker.forward_layer, layer, tokens_per_expert=route[2])
             output = self.checkpoint(function, hidden, route[0], weights, use_reentrant=True)
             outputs.append(output)
             if validate:
@@ -241,16 +251,17 @@ class _LayerSweep:
             del output
         if validate:
             for tensor in [*leaves, *self.layers.parameters()]:
-                if tensor.grad is None or not bool(worker.torch.isfinite(tensor.grad).all().item()):
+                gradient = _local_tensor(tensor.grad)
+                if gradient is None or not bool(worker.torch.isfinite(gradient).all().item()):
                     raise AssertionError("missing or nonfinite input/router/parameter gradient")
 
     def _pool_ledger(self) -> dict[str, Any]:
         if not self.slots:
             return {"shared_weight_bytes": 0, "shared_gradient_bytes": 0}
-        backend = self.layers[0]._get_execution_backend(self.inputs[0])
-        if any(layer._get_execution_backend(self.inputs[0]) is not backend for layer in self.layers):
-            raise AssertionError("layers do not share one execution backend")
-        manager = backend.replica_manager
+        resources = self.layers[0]._get_execution_resources(self.inputs[0])
+        if any(layer._get_execution_resources(self.inputs[0]) is not resources for layer in self.layers):
+            raise AssertionError("layers do not share one execution resource group")
+        manager = resources.replica_manager
         ledger = {
             "shared_weight_bytes": sum(tensor.numel() * tensor.element_size()
                                        for tensor in (manager._shared_weights or ())),
@@ -303,7 +314,7 @@ class _LayerSweep:
         # Capture memory first: finite checks allocate untimed diagnostic tensors.
         self._train_step(route, validate=True)
         for parameter in self.layers.parameters():
-            if not bool(worker.torch.isfinite(parameter).all().item()):
+            if not bool(worker.torch.isfinite(_local_tensor(parameter)).all().item()):
                 raise AssertionError("nonfinite parameter after AdamW updates")
         local_ledger = {"shared_pool": self._pool_ledger(),
                         "optimizer_state": _optimizer_state_ledger(worker.torch, self.optimizer)}

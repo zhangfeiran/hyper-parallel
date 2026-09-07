@@ -93,8 +93,14 @@ def mega_moe(
 
     .. note:: Only PyNative mode is supported. Raises ``RuntimeError`` if
         called in Graph mode or inside an ``@ms.jit`` function.
+
+    This legacy expert-major entry point uses one wave and no route fusion,
+    shared-B pools, or cycle profiling.
     """
     _check_pynative_mode("mega_moe")
+    import mindspore as ms  # pylint: disable=C0415
+
+    route_weight = dispatch_size[:1].astype(ms.float32)
     _get_ms_ops().mega_moe(
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
@@ -104,7 +110,9 @@ def mega_moe(
         combine_target, combine_target_off, combine_src_off, combine_size,
         gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
         runtime_config, all_event_counters,
+        dispatch_src, dispatch_size, dispatch_size, route_weight, combine_target,
         rank_id, ep, expert_num, hidden_size, seq_size,
+        dispatch_target.shape[0], 1,
     )
 
 
@@ -125,8 +133,13 @@ def mega_moe_grad(
 
     .. note:: Only PyNative mode is supported. Raises ``RuntimeError`` if
         called in Graph mode or inside an ``@ms.jit`` function.
+
+    Route-fusion ABI inputs are unused by the legacy expert-major graph.
     """
     _check_pynative_mode("mega_moe_grad")
+    import mindspore as ms  # pylint: disable=C0415
+
+    route_weight = dispatch_size[:1].astype(ms.float32)
     _get_ms_ops().mega_moe_grad(
         dispatch_target, dispatch_target_off,
         dy, dispatch_src_off, dispatch_size,
@@ -137,5 +150,7 @@ def mega_moe_grad(
         act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
         swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
         runtime_config, all_event_counters,
+        dispatch_size, route_weight, dispatch_size,
         rank_id, ep, expert_num, hidden_size, seq_size,
+        dispatch_target.shape[0], 1,
     )

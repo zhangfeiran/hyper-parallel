@@ -41,10 +41,17 @@ from hyper_parallel.core.multicore.modules.mega_moe.placement import (
 )
 from tests.torch.expert_parallel._test_mega_moe_common import (
     DEVICE as _DEVICE,
+)
+from tests.torch.expert_parallel._test_mega_moe_common import (
     RANK as _RANK,
+)
+from tests.torch.expert_parallel._test_mega_moe_common import (
+    _local_tensor,
     expert_weight_gradients,
     forward_layer,
     new_common_moe,
+)
+from tests.torch.expert_parallel._test_mega_moe_common import (
     new_layers as new_common_layers,
 )
 
@@ -738,6 +745,56 @@ def test_mega_moe_level0_balanced() -> None:
     _run_precision_case()
 
 
+def test_mega_moe_kernel_cycle_profile() -> None:
+    """Compare diagnostic kernels with native across checkpointed one/two-wave routes."""
+    shape = _MoeShape()
+    hidden, grad_output = _make_data(shape)
+    mega, native = _new_layers(shape, expert_capacity_factor=1.0)
+    balanced = _make_balanced_route(shape)
+    overflow = _make_overflow_route(shape)
+    name = "HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"
+    previous = os.environ.get(name)
+    try:
+        os.environ[name] = "0"
+        reference = _run_layer(native, hidden, *balanced, grad_output)
+        actual = _run_layer(mega, hidden, *balanced, grad_output)
+        _assert_results_close(reference, actual)
+        workspace = mega._resource_group.backend.workspace  # pylint: disable=protected-access
+        assert workspace.forward_cycle_profile is None, "disabled forward allocated diagnostic HBM"
+
+        os.environ[name] = "1"
+        for route, waves in ((balanced, 1), (overflow, 2)):
+            reference = _run_layer(native, hidden, *route, grad_output)
+            actual = _run_checkpointed_layer(mega, hidden, *route, grad_output, use_reentrant=True)
+            _assert_results_close(reference, actual, weight_grad_wave_count=waves)
+            forward = _collect_kernel_cycle_profile(mega, forward=True)
+            backward = _collect_kernel_cycle_profile(mega)
+            assert forward is not None and backward is not None, "missing instrumented counters"
+            for profile in forward["per_rank"]:
+                for category in ("up_proj", "down_proj"):
+                    assert profile["cube"]["sum"][category] > 0, f"missing forward {category} counters"
+                for category in ("dispatch_hidden", "combine"):
+                    assert profile["vector"]["sum"][category] > 0, f"missing forward {category} counters"
+            assert backward["rank_max"]["cube"]["gmm"] > 0, "missing backward GMM counters"
+            assert workspace.forward_cycle_profile.untyped_storage().nbytes() == 4096
+            if _RANK == 0:
+                print("KERNEL_CYCLE_PRECISION=" + json.dumps({
+                    "waves": waves, "forward": forward["rank_max"], "backward": backward["rank_max"],
+                }, sort_keys=True), flush=True)
+
+        saved_forward = workspace.forward_cycle_profile.clone()
+        os.environ[name] = "0"
+        reference = _run_layer(native, hidden, *balanced, grad_output)
+        actual = _run_layer(mega, hidden, *balanced, grad_output)
+        _assert_results_close(reference, actual)
+        torch.testing.assert_close(workspace.forward_cycle_profile, saved_forward, atol=0, rtol=0)
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
 def test_mega_moe_level0_capacity_fallback() -> None:
     """Compare overflowing native fallback F+B with the native oracle."""
     shape = _MoeShape()
@@ -1356,7 +1413,6 @@ def _new_performance_layer(
     replica_slots_per_rank: int,
 ) -> MegaMoeExperts | torch.nn.Module:
     """Construct one seeded backend without retaining its comparison peer."""
-    torch.manual_seed(2026 + _RANK)
     if backend == "native":
         if replica_slots_per_rank:
             raise ValueError("native performance backend does not support replicas.")
@@ -1365,22 +1421,15 @@ def _new_performance_layer(
         raise ValueError(
             f"HP_MEGA_MOE_PERF_BACKEND must be native or mega_moe, got {backend!r}."
         )
-    return MegaMoeExperts(
-        local_num_tokens=shape.local_num_tokens,
-        hidden_size=shape.hidden_size,
-        intermediate_size=shape.intermediate_size,
-        num_experts=shape.num_experts,
-        top_k=shape.top_k,
+    layer, common = new_common_layers(
+        shape,
         expert_capacity_factor=float(
             os.getenv("HP_MEGA_MOE_CAPACITY_FACTOR", "1.5")
         ),
         replica_slots_per_rank=replica_slots_per_rank,
-        ep_size=shape.ep_size,
-        ep_group=dist.group.WORLD,
-    ).to(
-        device=_DEVICE,
-        dtype=torch.bfloat16,
     )
+    del common
+    return layer
 
 
 def _rank_max_latency(elapsed_ms: float) -> float:
@@ -1509,8 +1558,8 @@ def _collect_memory_result(layer: object, baseline: dict[str, int]) -> dict:
     }
 
 
-def _collect_kernel_cycle_profile(layer: object) -> dict | None:
-    """Read and gather the last backward profile from every EP rank."""
+def _collect_kernel_cycle_profile(layer: object, *, forward: bool = False) -> dict | None:
+    """Read and gather the last profile in one direction from every EP rank."""
     if os.getenv("HP_MEGA_MOE_KERNEL_CYCLE_PROFILE", "0") != "1":
         return None
     resource_group = getattr(layer, "_resource_group", None)
@@ -1519,7 +1568,7 @@ def _collect_kernel_cycle_profile(layer: object) -> dict | None:
     config = getattr(backend, "spec", None)
     if workspace is None or config is None:
         raise RuntimeError("kernel cycle profiling requires a MegaMoe backend.")
-    local_profile = workspace.collect_cycle_profile(config.num_cube_cores)
+    local_profile = workspace.collect_cycle_profile(config.num_cube_cores, forward=forward)
     local_rows = (
         local_profile["cube"]["per_core"]
         + local_profile["vector"]["per_core"]
@@ -1609,8 +1658,7 @@ def _timed_fwd_bwd(
     gradients = (
         ("input", hidden.grad),
         ("route weight", route_weights.grad),
-        ("gate/up weight", expert_weight_gradients(layer)[0]),
-        ("down weight", expert_weight_gradients(layer)[1]),
+        *((name, _local_tensor(parameter.grad)) for name, parameter in layer.named_parameters()),
     )
     missing = [name for name, gradient in gradients if gradient is None]
     if missing:

@@ -25,6 +25,8 @@ from typing import Any
 
 from hyper_parallel.core.multicore.scheduler.config import (
     EVENT_COUNTER_BYTES as _EVENT_COUNTER_BYTES,
+)
+from hyper_parallel.core.multicore.scheduler.config import (
     NUM_WORKERS_CUBE,
     READY_CACHE_LINE_BYTES,
     event_workspace_bytes,
@@ -54,6 +56,10 @@ _CYCLE_PROFILE_CATEGORIES = (
     "combine",
     "local_compute",
     "synchronization",
+)
+_FORWARD_CYCLE_PROFILE_CATEGORIES = (
+    "descriptor_decode", "dependency_wait", "up_proj", "down_proj",
+    "dispatch_hidden", "combine", "local_compute", "synchronization",
 )
 _CYCLE_PROFILE_VALUES_PER_WORKER = len(_CYCLE_PROFILE_CATEGORIES)
 _CYCLE_PROFILE_WORKER_SLOTS = 2 * NUM_WORKERS_CUBE
@@ -265,6 +271,7 @@ class MegaMoeWorkspace:
     gmm_workspace: Any | None = None
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
+    forward_cycle_profile: Any | None = None
     in_use: bool = False
     used: bool = False
     routed_buffer_generation: int = 0
@@ -381,11 +388,25 @@ class MegaMoeWorkspace:
             _CYCLE_PROFILE_STORAGE_BYTES,
         ).zero_()
 
-    def collect_cycle_profile(self, num_cube_cores: int) -> dict[str, Any]:
-        """Return counters from the last profiled backward.
+    def prepare_forward_cycle_profile(self, *, enabled: bool) -> Any:
+        """Return a diagnostic-only buffer, or the existing scratch as an unused input."""
+        if self.gmm_workspace is None:
+            raise RuntimeError("MegaMoe GMM workspace is not initialized.")
+        if not enabled:
+            return self.gmm_workspace
+        if self.forward_cycle_profile is None:
+            self.forward_cycle_profile = torch.empty(
+                (_CYCLE_PROFILE_STORAGE_BYTES,), dtype=torch.uint8, device=self.gmm_workspace.device,
+            )
+        self.forward_cycle_profile.zero_()
+        return self.forward_cycle_profile
+
+    def collect_cycle_profile(self, num_cube_cores: int, *, forward: bool = False) -> dict[str, Any]:
+        """Return counters from the last profiled launch in one direction.
 
         Args:
             num_cube_cores: Number of populated Cube and Vector worker slots.
+            forward: Read independent forward counters instead of the backward tail.
 
         Returns:
             Per-core counters and aggregate sums and maxima.
@@ -395,13 +416,15 @@ class MegaMoeWorkspace:
                 f"num_cube_cores must be in [1, {NUM_WORKERS_CUBE}], got "
                 f"{num_cube_cores}."
             )
-        workspace = self.swiglu_grad_workspace
+        workspace = self.forward_cycle_profile if forward else self.swiglu_grad_workspace
         if workspace is None:
-            raise RuntimeError("MegaMoe SwiGLU-grad workspace is not initialized.")
+            raise RuntimeError("MegaMoe cycle profile workspace is not initialized.")
+        offset = 0 if forward else _SWIGLU_GRAD_WORKSPACE_BYTES
+        categories = _FORWARD_CYCLE_PROFILE_CATEGORIES if forward else _CYCLE_PROFILE_CATEGORIES
         values = (
             workspace.narrow(
                 0,
-                _SWIGLU_GRAD_WORKSPACE_BYTES,
+                offset,
                 _CYCLE_PROFILE_BYTES,
             )
             .view(torch.int64)
@@ -418,11 +441,11 @@ class MegaMoeWorkspace:
                 "per_core": rows,
                 "sum": {
                     category: sum(row[index] for row in rows)
-                    for index, category in enumerate(_CYCLE_PROFILE_CATEGORIES)
+                    for index, category in enumerate(categories)
                 },
                 "max": {
                     category: max(row[index] for row in rows)
-                    for index, category in enumerate(_CYCLE_PROFILE_CATEGORIES)
+                    for index, category in enumerate(categories)
                 },
             }
 
@@ -432,7 +455,7 @@ class MegaMoeWorkspace:
         ]
         return {
             "unit": "system_cycle",
-            "categories": list(_CYCLE_PROFILE_CATEGORIES),
+            "categories": list(categories),
             "cube": _summarize(cube_rows),
             "vector": _summarize(vector_rows),
             "accounting": (
@@ -612,7 +635,7 @@ class MegaMoeWorkspace:
 
     def _free_local_tensors(self) -> None:
         """Release local-only workspaces after all queued kernels complete."""
-        for field_name in ("gmm_workspace", "swiglu_grad_workspace"):
+        for field_name in ("gmm_workspace", "swiglu_grad_workspace", "forward_cycle_profile"):
             tensor = getattr(self, field_name)
             if tensor is None:
                 continue

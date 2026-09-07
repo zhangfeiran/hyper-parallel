@@ -21,10 +21,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
+from examples.torch.multicore import benchmark_mega_moe_layers as benchmark
+from examples.torch.multicore import mega_moe_layer_profile
 from examples.torch.multicore.benchmark_mega_moe_layers import (
     ADAMW_OPTIONS,
     _configuration,
@@ -35,8 +37,7 @@ from examples.torch.multicore.benchmark_mega_moe_layers import (
     _python_source_identity,
     _route_pairs,
 )
-from examples.torch.multicore import mega_moe_layer_profile
-from examples.torch.multicore import benchmark_mega_moe_layers as benchmark
+from hyper_parallel.core.dtensor.dtensor import DTensor
 
 
 class TestBenchmarkMegaMoeLayers(unittest.TestCase):
@@ -78,6 +79,47 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         optimizer.state[parameter]["exp_avg_sq"].fill_(float("inf"))
         with self.assertRaisesRegex(AssertionError, "nonfinite AdamW state: exp_avg_sq"):
             _optimizer_state_ledger(torch, optimizer)
+
+    def test_state_ledger_counts_local_dtensor_shard(self):
+        """EP parameters and AdamW moments must not count global logical bytes."""
+        shard = torch.ones(2, dtype=torch.bfloat16, device="cpu")
+        distributed = MagicMock(spec=DTensor)
+        distributed.to_local.return_value = shard
+        optimizer = SimpleNamespace(state={"parameter": {"exp_avg": distributed}})
+        ledger = _optimizer_state_ledger(torch, optimizer)
+        self.assertEqual(ledger["tensor_bytes"], shard.numel() * shard.element_size())
+        distributed.to_local.assert_called_once_with()
+        distributed.numel.assert_not_called()
+
+    def test_layer_factories_keep_variant_weights_aligned(self):
+        """Both backends use standard EP initialization with a distinct seed per layer."""
+        for variant in ("native", "b0", "b1"):
+            with self.subTest(variant=variant):
+                worker = MagicMock()
+                worker.torch = torch
+                layers = [torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)]
+                worker.new_common_moe.side_effect = layers
+                worker.new_common_layers.side_effect = [(layer, object()) for layer in layers]
+                sweep = benchmark._LayerSweep.__new__(benchmark._LayerSweep)
+                sweep.worker = worker
+                sweep.shape = object()
+                sweep.args = argparse.Namespace(variant=variant, layers=2)
+                sweep.slots = int(variant == "b1")
+                result = sweep._make_layers()
+                self.assertEqual(list(result), layers)
+                if variant == "native":
+                    self.assertEqual(worker.new_common_moe.call_args_list,
+                                     [call(sweep.shape, seed=2026), call(sweep.shape, seed=2126)])
+                    worker.new_common_layers.assert_not_called()
+                    worker.MegaMoeExperts.share_execution_resources.assert_not_called()
+                else:
+                    self.assertEqual(worker.new_common_layers.call_args_list, [
+                        call(sweep.shape, seed=seed, expert_capacity_factor=1.5,
+                             replica_slots_per_rank=sweep.slots, shared_physical_weights=bool(sweep.slots))
+                        for seed in (2026, 2126)
+                    ])
+                    worker.new_common_moe.assert_not_called()
+                    worker.MegaMoeExperts.share_execution_resources.assert_called_once_with(layers)
 
     def test_limit_preserves_full_sweep_prefix(self):
         """Stability smoke must replay the full sweep's route order exactly."""
@@ -147,7 +189,7 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
             after = _python_source_identity(repo)
         self.assertEqual(before, after)
         self.assertEqual(after["file_count"], 1)
-        self.assertEqual(after["scope"], "torch_runtime_without_generated_build_trees_v2")
+        self.assertEqual(after["scope"], "torch_runtime_with_standard_ep_without_generated_build_trees_v3")
 
     def test_profile_annotations_preserve_call_and_restore_after_error(self):
         """Diagnostic wrappers must preserve arguments and never leak into timing."""
@@ -213,14 +255,17 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
                 sweep.worker._RANK = 1
                 sweep._train_step.side_effect = lambda route: observed.append(os.environ.get(name))
                 counters = {"unit": "system_cycle", "per_rank": [{"rank": 0}, {"rank": 1}]}
-                sweep.worker._collect_kernel_cycle_profile.return_value = counters
+                forward_counters = {"unit": "system_cycle", "categories": ["up_proj", "down_proj"]}
+                sweep.worker._collect_kernel_cycle_profile.side_effect = [counters, forward_counters]
                 result = mega_moe_layer_profile.profile_layer_cycles(sweep, (1, 2, 3))
                 self.assertEqual(observed, [previous, "1"])
                 self.assertEqual(os.environ.get(name), previous)
                 self.assertIs(result["counters"], counters)
+                self.assertIs(result["forward_counters"], forward_counters)
                 self.assertEqual(result["layer_index"], 0)
                 self.assertEqual(sweep.optimizer.step.call_count, 2)
-                sweep.worker._collect_kernel_cycle_profile.assert_called_once_with(sweep.layers[0])
+                self.assertEqual(sweep.worker._collect_kernel_cycle_profile.call_args_list,
+                                 [call(sweep.layers[0]), call(sweep.layers[0], forward=True)])
 
     def test_cycle_profile_restores_environment_after_failed_collection(self):
         """A diagnostic failure must not leave future kernels instrumented."""

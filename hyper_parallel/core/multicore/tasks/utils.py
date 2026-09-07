@@ -20,11 +20,14 @@ add_terminate / add_dynamic_data are called from gen_runtime_data after
 the main fill loop.
 """
 from hyper_parallel.core.multicore.scheduler.config import (
-    TensorDescC, TaskDescC, RuntimeConfigC,
-    TaskType, DynamicType, TaskSplitValue,
     MAX_TENSOR_DIMS,
+    DynamicType,
+    RuntimeConfigC,
+    TaskDescC,
+    TaskSplitValue,
+    TaskType,
+    TensorDescC,
 )
-
 
 # ── TensorDescC quick constructor ─────────────────────────────────────────────
 

@@ -11,11 +11,17 @@
 | --- | --- |
 | 整理日期 | 2026-09-07 |
 | 代码分支 | `megamoe-perf-sun` |
-| 代码基线 | `megamoe-perf-sun`；以本文同提交代码为准 |
-| 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、`43aa7d6c`、`b255b821`、`40b6963b`、`9f75fd20`、`86f4b433`、`364af596`、`50a4e68c`、`5d2a3e38` |
+| 代码基线 | 重基于 `megamoe-minimal-api@c24cfe7a`；以本文同提交代码为准 |
+| 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、`43aa7d6c`、`b255b821`、`40b6963b`、`9f75fd20`、`86f4b433`、`364af596`、`50a4e68c`、`5d2a3e38`、`ce089b10` |
 | 状态 | 已实现；multi-wave 保持 lossless；副本默认关闭；串行多层可显式启用 shared-B |
 
 代码是最终事实来源；本文中的性能数字只对应第 10 节写明的硬件、模型、路由和测量方法。
+
+重基说明：下文实测数据及主功能提交号保留原分支的历史身份，不代表重基后的精度或性能验证。
+当前实现已迁到 `modules/mega_moe` 的 spec/plan/function/module 结构，保留 minimal API 的
+owned-SHMEM 生命周期、`expert_capacity_factor=None` 默认值及按绑定容量分配的 SHMEM workspace；
+显式设置有限 capacity factor 后才使用有界接收窗口。标准 EP reference 已替换旧私有 native 实现。
+重新比较 latency/HBM 前必须从当前源码重建 native payload，并重新执行精度与性能验证。
 
 ### 1.1 结论摘要
 
@@ -43,6 +49,9 @@
 - `5d2a3e38` 的 B1 完整 55-route 扫测通过，覆盖 33 次 home/replica 切换。31 个原始 W2--W4 路由
   均变为 W1；conservative peak 最高 `23.933 GiB`，共享 B 池首次启用后固定为 `157.5 MiB/rank`。
   这不是 native/B0/B1 全曲线对照，也不覆盖 B1 放置后仍需多 wave 的边界；详见第 10.2.2 节。
+- `ce089b10` 之后补齐默认关闭的 forward cycle 诊断，默认路径不增加持久 HBM。最后一次 checkpoint
+  recomputation 中，偏斜 up/down GMM 计数与平衡接近，而 Cube dependency wait 约为 `4.68x`。
+  下一步优先定位 dispatch/combine 就绪与跨 rank 等待；这不是新的端到端加速结论，见第 10.2.5 节。
 - 旧的 8 层 compact 路径复测中，`B=1 + compact` 相比
   `B=0`，optimizer-step rank-max p50 从 `1156.840 ms` 降到 `671.199 ms`，降低 `41.980%`，
   等价吞吐提升 `1.724x`；该组数据用于比较 legacy per-layer storage，不是当前 shared-B 多层主结果。
@@ -790,7 +799,7 @@ cycle 证据，再决定计算、通信等待与 control-plane 同步的相对�
 完整 step，最后恢复环境（异常也恢复）。普通 benchmark 拒绝继承
 `HP_MEGA_MOE_KERNEL_CYCLE_PROFILE=1`，避免把 instrumented kernel 当成默认路径计时。
 
-现有固定 workspace tail 只保留**最后一次 backward launch** 的计数，即本 benchmark 的 layer 0；
+本小节采集时的固定 workspace tail 只保留**最后一次 backward launch** 的计数，即本 benchmark 的 layer 0；
 不是全部 16 层，不包含 forward，也未把 GMM 进一步拆为 dX/dW。单位是 `system_cycle`，不假设设备
 频率换算毫秒。先完成 smoke，第三步复测后又补采了匹配协议的平衡路由：下表均使用显式长度版本、
 3 warmup + 7 measured、相同的 post-update trace/cycle 顺序，runtime/helper/adapter/native fingerprint
@@ -872,6 +881,119 @@ optimizer 参数四次完全一致。第二轮 A 后已恢复 B 代码，不保�
 **完成后的优先级复审：** 保留消除多余同步且不增加内存的固定形状路径，但不将其列为性能收益。
 本轮证据不支持继续围绕这几毫秒展开缓存改造；下一项转向 fused kernel 的前向流水、backward
 dX/dW 与跨 rank 等待。新增持久 buffer 或双 buffer 仍须先证明 wall-time 收益和峰值生命周期。
+
+#### 10.2.5 第四步：补齐前向流水计数
+
+先将上一阶段直接本地提交为 `ce089b10`，不使用 autogit、不 push，再按优先级补 forward 诊断。
+本项不修改 placement、GMM 数值运算、producer/consumer dependency 或 shared-B pool 协议。
+
+forward worker 复用已有 compile-time profiling 框架，新增 `CYCLE_PROFILE=0/1` template key。默认关闭
+时编译掉计数读写；开启后按 worker 记录 descriptor decode、dependency wait、up projection、down
+projection、hidden dispatch、combine、local compute 和 synchronization。local compute 包含 SwiGLU
+及适用的 epilogue，不是纯 SwiGLU 内核计时；dispatch/combine 也不是无等待的纯链路带宽指标。
+
+前向计数使用独立 `forward_cycle_profile`，每个 shared resource group 只在首次诊断时分配 `4 KiB`，
+之后清零复用。48 个 Cube/Vector worker 的 8 类 int64 计数使用其中 `3072 bytes`。backward 仍使用
+SwiGLU-grad workspace 原有固定 tail，互不覆盖。关闭前向诊断时传已有 GMM scratch 作为未使用的
+输入，不新增 allocation，也不清零诊断区；曾开启后关闭会保留这 `4 KiB`，纯默认执行不分配它。
+
+私有 forward operator ABI 新增 tensor input 27 和末尾 `cycle_profile` attribute，因此源码更新后必须
+重建 multicore payload。kernel runtime descriptor 的旧位置保持不变：tiling 为 28，events 为 29，
+诊断地址追加到 30。public `MegaMoeExperts` 签名不变。MindSpore C++ bridge 对新输入传已有 scratch、
+新 flag 传 0，维持其既有默认接口；本机 MindSpore 2.9 不满足当前 adapter 构建版本要求，这部分只做
+参数链路审查，未宣称 MindSpore 编译或运行验证。
+
+benchmark 的 `diagnostic_kernel_cycles.counters` 继续表示 backward，新增 `forward_counters`。
+它们分别保留最后一次 launch，即独立 16 层/reentrant 流程中 layer 0 的 forward recomputation 与
+backward，不汇总全部 layers。采集仍在**所有** timing/HBM 测量之后，先 warm F+B + AdamW，再开
+计数执行一个额外完整 step；环境在异常时也恢复。默认性能与 HBM 对照不能使用这些诊断计数当 wall time。
+
+验证已完成：
+
+- CPU 的 workspace/execution/route/replica/module/example/native-loader 回归共 `167 passed`、
+  `122 subtests passed`，覆盖默认零分配、双向隔离、4 KiB 复用与参数/开关一致性。
+- Torch/Ascend910B native payload 重建通过；5 项双卡 ST 通过，耗时 `161.75 s`。新增 ST 在开关切换、
+  reentrant checkpoint、单/双 wave 下与 native 比较全部输出/梯度，且检查双向计数非零和关闭后不写
+  诊断 buffer；另外回归 balanced、hot replica、residual multi-wave 与 shared-B lifecycle。
+- 另在全程 `HP_MEGA_MOE_KERNEL_CYCLE_PROFILE=1` 下重复 residual replica multi-wave 和 shared-B
+  lifecycle，`2 passed`、`62.39 s`，验证 instrumented forward 与 FP32 replica backward 组合的 native 精度。
+- shared-B lifecycle 沿用 `HP_MEGA_MOE_SHARED_REENTRANT_ONLY=1` 的已知验证范围，本项没有修复或
+  宣称覆盖其 non-reentrant checkpoint 限制。
+- changed Python pylint、ST launcher 无 framework import、AGENTS catalog 与 `git diff --check` 通过。
+
+默认关闭诊断的开销按 A/B/B/A 测量。A 是独立 editable worktree 中的 `ce089b10` 和保存的旧 payload，
+B 是新增前向计数后的源码与重建 payload；两边均为 16 层、EP8、每步 AdamW、3 warmup + 7 measured，
+每次先测 `10000:42` 再测 `0.1:42`。B1 在全部计时后采 cycle，另外三次不采诊断。
+
+| 运行 | 平衡 F+B | 平衡 full step | 偏斜 F+B | 偏斜 full step |
+| --- | ---: | ---: | ---: | ---: |
+| A1 | 670.698 ms | 801.962 ms | 1226.766 ms | 1357.810 ms |
+| B1 | 674.325 ms | 805.897 ms | 1235.207 ms | 1366.021 ms |
+| B2 | 671.292 ms | 802.669 ms | 1238.352 ms | 1369.396 ms |
+| A2 | 668.821 ms | 799.818 ms | 1235.397 ms | 1366.635 ms |
+| A 两次均值 | 669.760 ms | 800.890 ms | 1231.082 ms | 1362.222 ms |
+| B 两次均值 | 672.808 ms | 804.283 ms | 1236.779 ms | 1367.709 ms |
+
+这一组 full-step 均值为 `+0.424%` / `+0.403%`，不能称作加速或已证明零回退。四次各 rank 的
+baseline allocated、peak allocated、peak reserved、conservative peak、SHMEM heap 逐字节相同，
+路由、B pool 和 optimizer state ledger 也一致；runtime free/used 不在这一逐字节声明内。两条路线的
+conservative rank-max 分别为 `24755807232` / `25368836608 bytes`。纯默认路径没有新增持久 buffer。
+
+额外的首次单路线偏斜诊断出现 `1627--3794 ms` 的 full-step 波动；随后观察到其他用户的测试作业，
+但没有该异常窗口的连续进程记录，不能断言全部差异的原因。保留该原始文件，不用于下述性能或 cycle
+结论。重新采集时每约 10 秒记录 NPU process census；采样点只观察到本轮 8 个 worker。这不是硬件
+独占锁，也不能排除采样间隙内的短任务。
+
+两个单路线窗口又分别按 B/A 顺序做了新旧对照，仍为 3 warmup + 7 measured；新版本只在计时之后
+采 cycle，旧版本不采。结果单列，不与不同路由历史的 A/B/B/A 混合平均：
+
+| 单路线重采 | A 原实现 F+B / step | B 新实现 F+B / step | full-step 差异 |
+| --- | ---: | ---: | ---: |
+| 平衡 `10000:42` | 668.840 / 799.753 ms | 670.353 / 801.364 ms | +0.201% |
+| 偏斜 `0.1:42` | 1231.256 / 1362.608 ms | 1230.269 / 1361.760 ms | -0.062% |
+
+两组成对 HBM 指标仍逐字节一致；偏斜单路线的 conservative peak 为 `25370877952 bytes`，与先平衡
+后偏斜的过程略有不同，不能跨不同 allocator 历史比较“省了多少 HBM”。这些结果没有确认新增端到端
+加速，也不足以宣称严格零延迟开销；默认路径的亚百分比差异继续保留为后续约束，不把诊断功能算作
+性能优化收益。
+
+下面的 forward 计数来自重采的两个单路线过程：两边 runtime、adapter、native、helper、worker
+fingerprint 与 profiling 协议一致，仅路由不同；都在正常 timing 之后先 warm/update 再采一次额外 step。
+单位仍为 system cycles，表格每格是各 rank/core 的类别 maximum，**不能相加当 wall time**。
+
+| forward 类别 | 平衡 `10000:42` | 偏斜 `0.1:42` |
+| --- | ---: | ---: |
+| Cube up projection | 231936 | 228101 |
+| Cube down projection | 120301 | 118953 |
+| Cube dependency wait | 55562 | 260231 |
+| Vector dispatch hidden | 169434 | 297111 |
+| Vector combine | 177247 | 256922 |
+| Vector dependency wait | 221118 | 538596 |
+| Vector local compute | 23501 | 23760 |
+| Vector synchronization | 22789 | 37913 |
+
+若只比较实际存在的单个 Cube worker 顺序类别之和，平衡最大 row 是 rank 3/core 6 的 `413253`
+cycles，其中 up/down 共 `337024`、dependency wait `54760`；偏斜最大 row 是 rank 5/core 14 的
+`623612`，其中 up/down 共 `329149`、dependency wait `260122`。这支持优先检查就绪/依赖等待，
+不支持把前向差距主要归因于 GMM 执行段变慢。GMM 段本身也含内部 DMA/流水等待，不是纯算力计数；
+它只覆盖最后一次重算，不能外推全部 32 个前向 kernel。
+
+匹配 backward 的 Cube GMM maximum 仍从 `728129` 增至 `997736`，与 forward 的结论不同。因此
+backward dX/dW 细分继续保留，但不要混淆前后向瓶颈。本文没有用 instrumentation 的额外 step 声称
+端到端速度收益，也没有删掉任何 dependency、扩大 SHMEM 或新增 B 双 buffer。
+
+原始文件都在 `output/qwen_moe_optimizer/`：`forward_cycles_{baseline_a1,candidate_b1,candidate_b2,baseline_a2}_20260907.json`，
+以及 `forward_cycles_{balanced_recheck,skew_recheck}_20260907.json`；相邻 `*_monitor_*.log` 保留进程采样。
+单路线旧版本对应 `forward_cycles_baseline_balanced_recheck_20260907.json` 与
+`forward_cycles_baseline_recheck_20260907.json`。
+排除的异常文件为 `forward_cycles_skew_diagnostic_20260907.json`。A runtime SHA 是
+`c87f4c94426b59675cd831c3eeec5b5bedb54324e020c910e80fc6fe77017dd9`，B 是
+`22da77a42a1c8da5b9f538ad78a6191e5ea1e7255b7c43287f08cdeb3fd6478c`。各自重复运行的 source identity
+相同；原有 backward 与 SHMEM 二进制的 SHA256 在 A/B 间也不变。
+
+**完成后的优先级复审：** 前向 GMM 段没有随偏斜明显增大，先定位 dispatch/combine 的 producer
+就绪、rank 到达与依赖事件，把前向等待拆到具体 transfer/task，再决定排队顺序或 overlap 改动。
+P2P payload 分解紧随其后；FP32 dW 细分仍保留第三位，直接调前向 GMM tiling 和增加双 buffer 暂不优先。
 
 ### 10.3 Legacy per-layer compact 测量口径
 
@@ -1166,13 +1288,15 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 
 ## 15. 下一步优先级
 
-本轮按“扫测 → device/cycle 诊断 → sizing 小改动 → A/B/B/A → 匹配 trace”逐步复审，结果见
-第 10.2.2--10.2.4 节。当前顺序如下；每项落地后都先验证正确性、wall time 和 HBM，再决定下一项。
+本轮按“扫测 → backward 诊断 → sizing 小改动 → A/B/B/A → forward 诊断与重采”逐步复审，结果见
+第 10.2.2--10.2.5 节。当前顺序如下；每项落地后都先验证正确性、wall time 和 HBM，再决定下一项。
 
-1. **优先定位前向流水及跨 rank 尾部。** 同口径 trace 中偏斜前向 kernel 累计比平衡多约 `170 ms`，
-   不能只盯 backward dW。现有 cycle counter 只覆盖 backward；下一步补 forward 的 dispatch wait、
-   up/down GMM、SwiGLU、combine 分段，并关联各 rank 到达时间。任何 schedule/tiling 改动都须先证明
-   对单 wave 和 residual multi-wave 有利，不能删除真实 producer/consumer dependency。
+1. **优先定位前向 dispatch/combine 就绪及跨 rank 尾部。** forward counter 已补齐；最后一次重算中
+   up/down GMM maximum 基本不变，Cube dependency wait 从 `55562` 增至 `260231`。下一步关联具体
+   dependency/event 与 rank 到达时间，区分 sender 排队、数据搬运、reader readiness 和等待远端进入
+   kernel；再做有证据的排队/overlap 改动。暂不优先调 GMM tiling，也不能删除真实 producer/consumer
+   dependency。schedule 改动须同时验证单 wave 与 residual multi-wave，默认路径的亚百分比开销也
+   要继续用匹配、无竞争的 wall-time 对照约束。
 2. **把 P2P 数据面归因提升到第二位。** rank-zero 的 SDMA 区间并集约 `169 ms`，CPU launch scope 和
    profiler 的 `Communication` 汇总都不足以代表 payload。先区分 31 次 weight refresh 与 16 次 gradient
    return 的传输、等待和 overlap，再选择 peer 合批或调度改动。owner receive contribution 必须完成
@@ -1201,15 +1325,15 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 | --- | --- |
 | 公共模块 | `hyper_parallel/core/multicore/modules/mega_moe/module.py` |
 | placement contract/heuristic | `hyper_parallel/core/multicore/modules/mega_moe/placement.py` |
-| Torch route control plane | `hyper_parallel/core/multicore/platform/torch/mega_moe/route.py` |
-| replica pool/autograd | `hyper_parallel/core/multicore/platform/torch/mega_moe/replica.py` |
-| runtime/schedule | `hyper_parallel/core/multicore/platform/torch/mega_moe/runtime.py` |
-| workspace lifecycle | `hyper_parallel/core/multicore/platform/torch/mega_moe/workspace.py` |
-| differentiable execution | `hyper_parallel/core/multicore/platform/torch/mega_moe/execution.py` |
+| Torch route control plane | `hyper_parallel/core/multicore/modules/mega_moe/route.py` |
+| replica pool/autograd | `hyper_parallel/core/multicore/modules/mega_moe/replica.py` |
+| runtime/schedule | `hyper_parallel/core/multicore/modules/mega_moe/plan.py` |
+| workspace lifecycle | `hyper_parallel/core/multicore/modules/mega_moe/workspace.py` |
+| differentiable execution | `hyper_parallel/core/multicore/modules/mega_moe/function.py` |
 | multi-wave backward DAG | `hyper_parallel/core/multicore/modules/mega_moe/backward/graph.py` |
 | shared device worker | `hyper_parallel/core/multicore/ops/runtime/worker_kernel.h` |
-| Qwen model/profile | `examples/torch/multicore/qwen_moe_mega_moe_model.py`、`qwen_moe_mega_moe_profile.py` |
+| Qwen model/optimizer benchmark | `examples/torch/multicore/mega_moe/qwen_moe_model.py`、`qwen_moe_benchmark.py` |
 | checkpointed multi-layer benchmark | `examples/torch/multicore/benchmark_mega_moe_layers.py` |
-| opt-in rank-zero trace / all-rank backward cycles | `examples/torch/multicore/mega_moe_layer_profile.py` |
+| opt-in rank-zero trace / all-rank forward/backward cycles | `examples/torch/multicore/mega_moe_layer_profile.py` |
 | planner/route/pool UT | `tests/ut/core/multicore/mega_moe/` |
 | real fused-kernel ST | `tests/torch/expert_parallel/test_mega_moe.py`、`_test_mega_moe_shared_weights.py` |

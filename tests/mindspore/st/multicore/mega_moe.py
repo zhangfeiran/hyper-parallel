@@ -43,32 +43,43 @@ os.environ.setdefault('SYMMETRIC_MEMORY_HEAP_SIZE', str(1024 * 1024 * 1024))
 
 # Environment variables must be set before mindspore is imported to take effect.
 # pylint: disable=wrong-import-position
-import numpy as np
 import mindspore as ms
-from mindspore import context, Tensor
-from mindspore.communication.management import init, get_rank
+import numpy as np
+from mindspore import Tensor, context
+from mindspore.communication.management import get_rank, init
 from mindspore.ops.auto_generate import GroupedMatmul
 
 import hyper_parallel.core.multicore as mc
 from hyper_parallel.core import symmetric_memory as symm
-
-from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
-from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
-from hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data import build_config_for_rank as fwd_config
-from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import (
-    get_up_proj_tiling_bytes,
-    get_down_proj_tiling_bytes,
-    get_swiglu_tiling_bytes,
+from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import (
+    build_config_for_rank as bwd_config,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
-from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import build_config_for_rank as bwd_config
+from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
+    build_backward_graph,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
     get_gate_grad_tiling_bytes,
+    get_swiglu_grad_tiling_bytes,
     get_w1_grad_tiling_bytes,
     get_w2_grad_tiling_bytes,
-    get_swiglu_grad_tiling_bytes,
 )
+from hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data import (
+    build_config_for_rank as fwd_config,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
+    build_forward_graph,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import (
+    get_down_proj_tiling_bytes,
+    get_swiglu_tiling_bytes,
+    get_up_proj_tiling_bytes,
+)
+from hyper_parallel.core.multicore.scheduler.config import (
+    TaskSplitValue,
+    event_workspace_bytes,
+)
+
 # pylint: enable=wrong-import-position
 
 context.set_context(mode=context.PYNATIVE_MODE, device_target="Ascend")
@@ -526,7 +537,7 @@ def test_mega_moe_tp2ep2():
         flat_tokens_per_expert, "hccl_world_group")
 
     gmm_workspace      = ms.ops.zeros((_GMM_WORKSPACE_BYTES,), dtype=ms.uint8)
-    all_event_counters = symm.empty((4096,), dtype=ms.uint8)
+    all_event_counters = symm.empty((event_workspace_bytes(_EP),), dtype=ms.uint8)
     all_event_counters.fill_(0)
     ms.mint.distributed.barrier()
 
@@ -680,7 +691,7 @@ def test_mega_moe_grad_tp2ep2():
 
     gmm_workspace         = ms.ops.zeros((_GMM_WORKSPACE_BYTES,),         dtype=ms.uint8)
     swiglu_grad_workspace = ms.ops.zeros((_SWIGLU_GRAD_WORKSPACE_BYTES,), dtype=ms.uint8)
-    all_event_counters    = symm.empty((4096,), dtype=ms.uint8)
+    all_event_counters    = symm.empty((event_workspace_bytes(_EP),), dtype=ms.uint8)
     all_event_counters.fill_(0)
     ms.mint.distributed.barrier()
 

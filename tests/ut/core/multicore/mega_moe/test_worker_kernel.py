@@ -14,19 +14,20 @@
 # ============================================================================
 """Host checks for the backward peer-buffer reuse fence and its schedule."""
 
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
-from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import build_config_for_rank
+from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import (
+    build_config_for_rank,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_multi_wave_backward_graph,
     build_route_backward_graph,
 )
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
-
 
 _ROOT = Path(__file__).resolve().parents[5]
 _WORKER = _ROOT / "hyper_parallel/core/multicore/ops/runtime/worker_kernel.h"

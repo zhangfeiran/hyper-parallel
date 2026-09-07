@@ -57,9 +57,11 @@ artifact hashes. The tool rejects unmatched alpha/seed sets, different
 logical routes or shapes, incompatible settings, duplicate samples, and
 inconsistent memory accounting instead of silently joining unlike runs.
 
-The multi-layer worker's v2 Python digest excludes generated `build`/`prebuild`
-trees so a built checkout and a detached A/B worktree describe the same runtime
-source scope. Native payloads remain fingerprinted separately.
+The multi-layer worker's v3 Python digest includes the standard EP and common
+expert sources, and excludes generated `build`/`prebuild` trees. Both ST helper
+files are fingerprinted, and native payloads remain fingerprinted separately.
+Results from before the minimal-API rebase use a different native implementation
+and must not be reused as measurements of the current code.
 
 The outputs are `dirichlet_skew_latency_hbm.png`, an SVG, a point-level CSV,
 and `dirichlet_skew_summary.json`. The upper panel shows median forward plus
@@ -85,6 +87,11 @@ has its own parameters and input storage, with reentrant activation checkpoint.
 This exercises cross-layer resource lifetimes; it is not a connected transformer
 and excludes attention and router-network computation. Every layer receives the
 same original route in a step, making the skew coordinate unambiguous.
+
+All variants start from the same seeded standard EP expert weights for each
+layer; MegaMoe copies the rank-local shard into its packed layout before timing.
+Native parameters and optimizer states are DTensors: validation and the HBM
+ledger inspect their local shards, not the global logical tensor size.
 
 Both MegaMoe variants share execution resources before first forward. B1 uses
 `shared_physical_weights=True`, leaving home parameters intact and sharing only
@@ -145,11 +152,23 @@ new and distinct from the benchmark JSON.
 For MegaMoe variants, `--profile-kernel-cycles` runs a separate extra post-update
 step after all measurements and writes `diagnostic_kernel_cycles` into the JSON.
 It gathers per-core counters from every EP rank. The shared workspace retains
-only the **last backward launch** (layer zero), not all layers or forward kernels.
-Counters use system cycles; per-category worker maxima are not additive wall time.
+only the **last launch in each direction**: layer zero's forward checkpoint
+recomputation and backward, not all layers. The existing `counters` field remains
+backward-only; `forward_counters` separates up/down GMM, hidden dispatch, combine,
+local compute (SwiGLU/epilogue), dependency waits and synchronization. Counters use
+system cycles; per-category worker maxima are not additive wall time.
 The option temporarily enables native instrumentation and restores its environment
 even on failure. An inherited `HP_MEGA_MOE_KERNEL_CYCLE_PROFILE=1` is rejected by
 this timed benchmark: unset it and use the diagnostic option instead.
+
+Forward diagnostics lazily allocate a separate 4 KiB per shared resource group,
+so subsequent backward launches cannot overwrite them. This buffer is reused;
+disabled launches neither allocate nor clear it. Ordinary runs therefore add no
+persistent HBM. Diagnostic allocations happen after the timing/HBM window and
+are not part of the reported default memory peak. Rebuild the native multicore
+payload after updating: the private forward operator ABI has gained a byte
+workspace input and a `cycle_profile` attribute. The public `MegaMoeExperts`
+call signature and existing runtime descriptor positions are unchanged.
 
 The multi-layer adapter reports the actual home-runtime bypass for routes already
 inside one receive window: no active replica bindings and unchanged destination

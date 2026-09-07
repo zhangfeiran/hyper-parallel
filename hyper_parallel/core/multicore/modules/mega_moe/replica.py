@@ -16,13 +16,12 @@
 
 from __future__ import annotations
 
-from importlib import import_module
-
 import struct
 import threading
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any, Literal
 
 from hyper_parallel.core.multicore.modules.mega_moe.placement import (
@@ -80,9 +79,9 @@ class _PhysicalWeightPool:
     materializations: tuple[Any, ...] = ()
 
 
-def _global_peer_rank(dist: Any, group: Any | None, group_rank: int) -> int:
+def _global_peer_rank(distributed: Any, group: Any | None, group_rank: int) -> int:
     """Translate an EP-group rank to the global rank expected by P2POp."""
-    return group_rank if group is None else dist.get_global_rank(group, group_rank)
+    return group_rank if group is None else distributed.get_global_rank(group, group_rank)
 
 
 def _launch_transfers(

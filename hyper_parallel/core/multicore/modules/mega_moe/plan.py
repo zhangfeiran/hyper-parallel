@@ -16,10 +16,9 @@
 
 from __future__ import annotations
 
-from importlib import import_module
-
 import os
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any
 
 import numpy as np

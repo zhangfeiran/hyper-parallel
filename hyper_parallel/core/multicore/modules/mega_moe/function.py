@@ -16,14 +16,14 @@
 
 from __future__ import annotations
 
-from importlib import import_module
-
 import os
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any
 
 from hyper_parallel.core.multicore.platform import torch as multicore_adapter
 
+from .plan import MegaMoePlan
 from .replica import SharedExpertWeightLease
 from .route import (
     PreparedTopKRoute,
@@ -31,7 +31,6 @@ from .route import (
     _build_route_indices,
     restore_topk_output,
 )
-from .plan import MegaMoePlan
 from .workspace import MegaMoeWorkspace
 
 torch = import_module("torch")
@@ -53,6 +52,8 @@ class _ForwardBuffers:
     final_out: Any
     permute_src_index: Any
     events: Any
+    cycle_profile_workspace: Any
+    cycle_profile_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -122,7 +123,7 @@ def _route_tensor(tensor: Any | None, name: str) -> Any:
 
 
 def _cycle_profile_enabled() -> bool:
-    """Return the validated opt-in state for the diagnostic backward key."""
+    """Return the validated opt-in state for diagnostic native keys."""
     value = os.getenv(_CYCLE_PROFILE_ENV, "0")
     if value not in {"0", "1"}:
         raise ValueError(f"{_CYCLE_PROFILE_ENV} must be 0 or 1, got {value!r}.")
@@ -365,6 +366,7 @@ def _prepare_forward_buffers(
         if spec.forward_permute_fused
         else route.tokens_per_expert
     )
+    cycle_profile_enabled = _cycle_profile_enabled()
     return _ForwardBuffers(
         dispatch=dispatch,
         combine=combine,
@@ -378,6 +380,8 @@ def _prepare_forward_buffers(
         final_out=final_out,
         permute_src_index=permute_src_index,
         events=workspace.prepare_event_counters(forward=True),
+        cycle_profile_workspace=workspace.prepare_forward_cycle_profile(enabled=cycle_profile_enabled),
+        cycle_profile_enabled=cycle_profile_enabled,
     )
 
 
@@ -422,19 +426,21 @@ def _launch_forward(
             else shared_lease.runtime_config(plan.fwd_runtime_config)
         ),
         buffers.events,
-        hidden_states,
-        buffers.permute_src_index,
-        route.unpermute_mapping,
-        topk_weights,
-        buffers.final_out,
         spec.rank_id,
         spec.ep_size,
         spec.physical_num_experts,
         spec.hidden_size,
         spec.local_num_tokens,
-        metadata.receive_capacity,
-        metadata.wave_count,
-        spec.local_experts if shared_lease is not None else 0,
+        original_x=hidden_states,
+        permute_src_index=buffers.permute_src_index,
+        reduce_route_index=route.unpermute_mapping,
+        topk_weights=topk_weights,
+        final_out=buffers.final_out,
+        cycle_profile_workspace=buffers.cycle_profile_workspace,
+        receive_capacity=metadata.receive_capacity,
+        wave_count=metadata.wave_count,
+        home_experts=spec.local_experts if shared_lease is not None else 0,
+        cycle_profile=int(buffers.cycle_profile_enabled),
     )
 
 
@@ -621,18 +627,18 @@ def _launch_backward(
         buffers.swiglu_workspace,
         runtime_config,
         buffers.events,
-        route_state.permute_src_index,
-        route_state.route_weight,
-        route_state.reduce_route_index,
         spec.rank_id,
         spec.ep_size,
         spec.physical_num_experts,
         spec.hidden_size,
         spec.local_num_tokens,
-        ctx.receive_capacity,
-        ctx.wave_count,
-        int(buffers.cycle_profile_enabled),
-        spec.local_experts if shared_lease is not None else 0,
+        permute_src_index=route_state.permute_src_index,
+        route_weight=route_state.route_weight,
+        reduce_route_index=route_state.reduce_route_index,
+        receive_capacity=ctx.receive_capacity,
+        wave_count=ctx.wave_count,
+        cycle_profile=int(buffers.cycle_profile_enabled),
+        home_experts=spec.local_experts if shared_lease is not None else 0,
     )
 
 

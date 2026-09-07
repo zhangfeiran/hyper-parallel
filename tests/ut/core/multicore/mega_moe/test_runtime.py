@@ -22,6 +22,9 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_parallel.core.multicore.modules.mega_moe import (
+    spec as config_module,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import (
     build_config_for_rank as build_backward_config,
 )
@@ -35,15 +38,6 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data imp
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
     build_route_forward_graph,
 )
-from hyper_parallel.core.multicore.modules.mega_moe import (
-    spec as config_module,
-)
-from hyper_parallel.core.multicore.modules.mega_moe.spec import (
-    _MAX_EXACT_FLOAT32_INTEGER,
-    MegaMoeSpec,
-    _resolve_fusion_modes,
-    bind_mega_moe_spec,
-)
 from hyper_parallel.core.multicore.modules.mega_moe.function import (
     _mark_retained_scratch_modified,
     _prepare_backward_route,
@@ -53,6 +47,12 @@ from hyper_parallel.core.multicore.modules.mega_moe.plan import (
     _build_route_slots,
     _build_task_values,
     _use_token_a2a_offsets,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.spec import (
+    _MAX_EXACT_FLOAT32_INTEGER,
+    MegaMoeSpec,
+    _resolve_fusion_modes,
+    bind_mega_moe_spec,
 )
 from hyper_parallel.core.multicore.scheduler.config import (
     ATOMIC_DW_ACCUMULATION_FLAG,

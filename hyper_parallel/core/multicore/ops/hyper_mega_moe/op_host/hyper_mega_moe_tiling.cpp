@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -29,17 +29,35 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
 
   auto input0Desc = context->GetInputDesc(0);
   OP_CHECK_NULL_WITH_CONTEXT(context, input0Desc);
+  auto attr = context->GetAttrs();
+  OP_CHECK_NULL_WITH_CONTEXT(context, attr);
+  auto cycleProfileAttr = attr->GetAttrPointer<int64_t>(8);
+  OP_CHECK_NULL_WITH_CONTEXT(context, cycleProfileAttr);
+  if (*cycleProfileAttr != 0 && *cycleProfileAttr != 1) {
+    OP_LOGE(context->GetNodeName(), "cycle_profile must be 0 or 1");
+    return ge::GRAPH_FAILED;
+  }
+  uint32_t cycleProfile = static_cast<uint32_t>(*cycleProfileAttr);
+  if (cycleProfile != 0) {
+    auto profileShape = context->GetInputShape(27);
+    OP_CHECK_NULL_WITH_CONTEXT(context, profileShape);
+    if (profileShape->GetOriginShape().GetShapeSize() < 4096) {
+      OP_LOGE(context->GetNodeName(), "cycle_profile_workspace requires at least 4096 bytes");
+      return ge::GRAPH_FAILED;
+    }
+  }
   ge::DataType input0DType = input0Desc->GetDataType();
   if (input0DType == ge::DT_FLOAT16) {
     uint64_t tilingKey_ = GET_TPL_TILING_KEY(
       static_cast<uint32_t>(1), static_cast<uint32_t>(1), static_cast<uint32_t>(1), 0UL, 0UL, static_cast<uint32_t>(0),
-      static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0));
+      static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0),
+      cycleProfile);
     context->SetTilingKey(tilingKey_);
   } else if (input0DType == ge::DT_BF16) {
     uint64_t tilingKey_ =
       GET_TPL_TILING_KEY(static_cast<uint32_t>(27), static_cast<uint32_t>(27), static_cast<uint32_t>(27), 0UL, 0UL,
                          static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0),
-                         static_cast<uint32_t>(0), static_cast<uint32_t>(0));
+                         static_cast<uint32_t>(0), static_cast<uint32_t>(0), cycleProfile);
     context->SetTilingKey(tilingKey_);
   } else {
     OP_LOGE(context->GetNodeName(), "Input0[dispatch_target]:%s is only support float16, bfloat16",
@@ -48,7 +66,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   }
 
   HyperMegaMoeTilingData tiling;
-  auto attr = context->GetAttrs();
   if (attr != nullptr) {
     tiling.set_rankId((*(attr->GetAttrPointer<int64_t>(0))));
     tiling.set_ep((*(attr->GetAttrPointer<int64_t>(1))));

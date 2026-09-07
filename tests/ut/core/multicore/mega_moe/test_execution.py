@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Regression tests for unrounded physical expert gradients."""
+"""Regression tests for execution precision and diagnostic launch contracts."""
 
+import os
 import unittest
 from types import SimpleNamespace
 from typing import Any
@@ -21,13 +22,15 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
-    build_multi_wave_backward_graph,
-)
 from hyper_parallel.core.multicore.modules.mega_moe import (
     function as execution,
+)
+from hyper_parallel.core.multicore.modules.mega_moe import (
     plan,
     workspace,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
+    build_multi_wave_backward_graph,
 )
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
@@ -92,14 +95,14 @@ class TestReplicaGradientPrecision(unittest.TestCase):
         Description: fit FP32 matrices inside a BF16 activation buffer
         Expectation: only one W1 matrix fits and remaining matrices use the workspace tail
         """
-        plan = workspace._plan_weight_grad_scratch(
+        scratch = workspace._plan_weight_grad_scratch(
             local_experts=2, hidden_size=8, intermediate_size=4,
             element_size=4, activation_element_size=2, receive_capacity=16,
         )
 
-        self.assertEqual(plan.retained_w1_experts, 1)
-        self.assertEqual(plan.retained_w2_experts, 0)
-        self.assertEqual(plan.tail_bytes, 512)
+        self.assertEqual(scratch.retained_w1_experts, 1)
+        self.assertEqual(scratch.retained_w2_experts, 0)
+        self.assertEqual(scratch.tail_bytes, 512)
 
     def test_moe_autograd_reduces_unrounded_partials_before_home_dtype_cast(self) -> None:
         """
@@ -174,6 +177,74 @@ class TestReplicaGradientPrecision(unittest.TestCase):
         pending.manager.reduce_replica_gradients.assert_called_once()
         torch.testing.assert_close(weight1.grad, torch.full_like(weight1, 0.5), atol=0, rtol=0)
         torch.testing.assert_close(weight2.grad, torch.full_like(weight2, 0.5), atol=0, rtol=0)
+
+
+class TestForwardCycleProfiling(unittest.TestCase):
+    """Keep opt-in native arguments and default allocation behavior consistent."""
+
+    def test_forward_preparation_and_launch_use_the_same_profile_flag(self) -> None:
+        """
+        Feature: opt-in forward diagnostic ABI
+        Description: prepare buffers, then change the environment before launch
+        Expectation: the prepared flag and its buffer travel together at fixed input positions
+        """
+        spec = SimpleNamespace(
+            local_num_tokens=2, hidden_size=8, intermediate_size=4, rank_id=0, ep_size=2,
+            physical_num_experts=4, local_experts=2, forward_permute_fused=True, forward_unpermute_fused=True,
+        )
+        execution_runtime = SimpleNamespace(
+            spec=spec, up_proj_tiling=object(), swiglu_tiling=object(), down_proj_tiling=object(),
+            fwd_runtime_config=object(),
+        )
+        metadata = SimpleNamespace(
+            expert_capacity=4, retained_capacity=4, receive_capacity=4, wave_count=1,
+            **{name: object() for name in (
+                "group_list", "dispatch_src_off", "dispatch_target_off", "dispatch_size",
+                "combine_src_off", "combine_target_off", "combine_size",
+            )},
+        )
+        route = SimpleNamespace(permute_src_index=object(), unpermute_mapping=object())
+        hidden = torch.ones((2, 8))
+        weights = torch.ones((2, 8, 8))
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), patch.dict(os.environ):
+                scratch = workspace.MegaMoeWorkspace(
+                    symmetric_memory=Mock(),
+                    shared=False, expert_buffer=torch.empty((4, 8)), routed_buffer=torch.empty((4, 8)),
+                    gmm_workspace=torch.empty(16, dtype=torch.uint8),
+                )
+                os.environ[execution._CYCLE_PROFILE_ENV] = str(int(enabled))
+                with patch.object(scratch, "prepare_event_counters", return_value=object()):
+                    buffers = execution._prepare_forward_buffers(
+                        torch, execution_runtime, scratch, metadata, hidden, route,
+                    )
+                expected = scratch.forward_cycle_profile if enabled else scratch.gmm_workspace
+                self.assertIs(buffers.cycle_profile_workspace, expected)
+                self.assertIs(buffers.cycle_profile_enabled, enabled)
+                os.environ[execution._CYCLE_PROFILE_ENV] = str(int(not enabled))
+                with patch.object(execution.multicore_adapter, "mega_moe", autospec=True) as launch:
+                    execution._launch_forward(
+                        execution_runtime, metadata, hidden, hidden, weights, weights, route, weights, buffers,
+                    )
+                args = launch.call_args.args
+                kwargs = launch.call_args.kwargs
+                self.assertIs(kwargs["cycle_profile_workspace"], expected)
+                self.assertEqual(args[22:], (0, 2, 4, 8, 2))
+                self.assertEqual(kwargs["receive_capacity"], 4)
+                self.assertEqual(kwargs["wave_count"], 1)
+                self.assertEqual(kwargs["home_experts"], 0)
+                self.assertEqual(kwargs["cycle_profile"], int(enabled))
+                self.assertIs(args[20], execution_runtime.fwd_runtime_config)
+
+    def test_invalid_cycle_profile_flag_is_rejected(self) -> None:
+        """
+        Feature: diagnostic flag validation
+        Description: provide an unsupported environment value
+        Expectation: fail before selecting an unsupported native template key
+        """
+        with patch.dict(os.environ, {execution._CYCLE_PROFILE_ENV: "yes"}), \
+                self.assertRaisesRegex(ValueError, "must be 0 or 1"):
+            execution._cycle_profile_enabled()
 
 
 if __name__ == "__main__":

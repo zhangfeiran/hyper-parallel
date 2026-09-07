@@ -22,23 +22,23 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
 from hyper_parallel.core.multicore.modules.mega_moe.placement import (
     build_constrained_expert_placement,
     remap_logical_routes,
 )
-from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
-from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.route import (
     _build_route_indices,
     _compute_route_metadata,
+    _finish_static_count_gather,
     _permute_topk_input,
     _remap_topk_ids_to_physical,
     _resolve_counts,
-    _finish_static_count_gather,
     _validate_topk_inputs,
     prepare_topk_route,
     restore_topk_output,
 )
+from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 
 
 class TestMegaMoeRoute(unittest.TestCase):

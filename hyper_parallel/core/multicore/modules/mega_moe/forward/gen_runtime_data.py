@@ -33,10 +33,22 @@ Outputs (per rank):
 import argparse
 import os
 
+from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
+    build_forward_graph,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import (
+    get_down_proj_tiling_bytes,
+    get_swiglu_tiling_bytes,
+    get_up_proj_tiling_bytes,
+)
 from hyper_parallel.core.multicore.scheduler.config import (
-    RuntimeConfigC, QUEUE_CAPACITY,
-    TaskSplitValue, configure_ready_handshake, event_workspace_bytes,
-    init_task_split_value, serialize_runtime_config,
+    QUEUE_CAPACITY,
+    RuntimeConfigC,
+    TaskSplitValue,
+    configure_ready_handshake,
+    event_workspace_bytes,
+    init_task_split_value,
+    serialize_runtime_config,
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 from hyper_parallel.core.multicore.scheduler.scheduler import revise_task_queue
@@ -45,12 +57,6 @@ from hyper_parallel.core.multicore.tasks.utils import (
     add_terminate,
     add_terminate_on_event,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import (
-    get_up_proj_tiling_bytes,
-    get_down_proj_tiling_bytes,
-    get_swiglu_tiling_bytes,
-)
-from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 
 
 def parse_args() -> argparse.Namespace:

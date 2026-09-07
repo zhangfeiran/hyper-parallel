@@ -25,8 +25,8 @@ __all__ = [
     "RoutingMode",
 ]
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Any, Literal
 
 # This is a Torch-only executable example, not a platform-agnostic library module.
@@ -34,17 +34,19 @@ import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
-
-from hyper_parallel.auto_models.components.models.qwen3_moe_attention_common import (
-    run_qwen3_moe_flash_attention,
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeMLP,
+    Qwen3MoeRotaryEmbedding,
 )
+
+from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb
+from hyper_parallel.components.modules.rms_norm import RMSNorm
+from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.route import count_topk_experts
-from hyper_parallel.models.modules import (
-    RMSNorm,
-    RotaryEmbedding,
-    SwiGLUMLP,
-    apply_rotary_pos_emb,
+from hyper_parallel.models.qwen3_moe.adapter.attention import (
+    run_qwen3_moe_flash_attention,
 )
 
 RoutingMode = Literal["balanced", "topk", "dirichlet"]
@@ -190,10 +192,14 @@ class QwenAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = 0.0
         self.is_causal = True
-        self.rotary_emb = RotaryEmbedding(
-            self.head_dim,
-            config.max_seq_len,
-            config.rope_theta,
+        self.rotary_emb = Qwen3MoeRotaryEmbedding(
+            Qwen3MoeConfig(
+                hidden_size=config.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                max_position_embeddings=config.max_seq_len,
+                rope_theta=config.rope_theta,
+            )
         )
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.k_proj = nn.Linear(
@@ -449,9 +455,12 @@ class QwenMoeBlock(nn.Module):
             ep_group=ep_group,
         )
         self.shared_expert = SwiGLUMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.shared_expert_intermediate_size,
-            bias=False,
+            module=Qwen3MoeMLP(
+                Qwen3MoeConfig(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.shared_expert_intermediate_size,
+                )
+            )
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

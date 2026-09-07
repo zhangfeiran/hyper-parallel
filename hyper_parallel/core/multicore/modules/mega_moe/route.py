@@ -16,12 +16,11 @@
 
 from __future__ import annotations
 
-from importlib import import_module
-
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
+from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 import torch_npu
@@ -31,8 +30,8 @@ from hyper_parallel.core.multicore.modules.mega_moe.placement import (
     build_constrained_expert_placement,
 )
 
-from .spec import MegaMoeSpec
 from .plan import MegaMoePlan
+from .spec import MegaMoeSpec
 
 if TYPE_CHECKING:
     from .workspace import MegaMoeWorkspace

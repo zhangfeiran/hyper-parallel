@@ -233,6 +233,29 @@ def test_mega_moe_default_interface(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     card_mark="allcards",
     essential_mark="essential",
 )
+def test_mega_moe_kernel_cycle_profile(monkeypatch) -> None:
+    """
+    Feature: forward/backward diagnostic cycle counters
+    Description: compare on/off and checkpointed one/two-wave kernels with native
+    Expectation: independent nonzero counters, identical precision, zero default allocation
+    """
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
+    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run(
+            [TorchCase(_WORKER, "test_mega_moe_kernel_cycle_profile", num_proc=_PRECISION_WORLD_SIZE)],
+            global_num_proc=_PRECISION_WORLD_SIZE,
+        )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
 def test_mega_moe_receive_capacity_fallback(monkeypatch) -> None:
     """
     Feature: kernel-internal multi-wave overflow precision

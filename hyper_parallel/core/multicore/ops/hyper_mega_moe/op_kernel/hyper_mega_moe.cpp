@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 using namespace AscendC;
 
 template <int D_T_A, int D_T_B, int D_T_Y, int TRANS_A, int TRANS_B, int GROUP_LIST_TYPE, int IS_STATIC_TILING_API,
-          int A8W4_KERNEL_TEMPLATE, int A16W8_KERNEL_TEMPLATE, int AIV_AIC_RATIO>
+          int A8W4_KERNEL_TEMPLATE, int A16W8_KERNEL_TEMPLATE, int AIV_AIC_RATIO, int CYCLE_PROFILE>
 __global__ __aicore__ void hyper_mega_moe(
   GM_ADDR dispatch_target, GM_ADDR dispatch_target_off, GM_ADDR dispatch_src, GM_ADDR dispatch_src_off,
   GM_ADDR dispatch_size, GM_ADDR weight, GM_ADDR up_proj_glist, GM_ADDR y, GM_ADDR swiglu_out, GM_ADDR down_proj_weight,
@@ -27,6 +27,7 @@ __global__ __aicore__ void hyper_mega_moe(
   GM_ADDR combine_src_off, GM_ADDR combine_size, GM_ADDR gmm_workspace, GM_ADDR up_proj_tiling, GM_ADDR swiglu_tiling,
   GM_ADDR down_proj_tiling, GM_ADDR runtime_config, GM_ADDR all_event_counters, GM_ADDR original_x,
   GM_ADDR permute_src_index, GM_ADDR reduce_route_index, GM_ADDR topk_weights, GM_ADDR final_out,
+  GM_ADDR cycle_profile_workspace,
   GM_ADDR dispatch_target_ref, GM_ADDR y_ref, GM_ADDR swiglu_out_ref, GM_ADDR down_proj_y_ref,
   GM_ADDR combine_target_ref, GM_ADDR final_out_ref, GM_ADDR workspace, GM_ADDR tiling) {
   if (GROUP_LIST_TYPE != GROUPED_MATMUL_GROUP_LIST_TYPE_SPARSEM && IS_STATIC_TILING_API == 0 &&
@@ -61,9 +62,10 @@ __global__ __aicore__ void hyper_mega_moe(
                               final_out,
                               workspace,
                               tiling,
-                              all_event_counters};
+                              all_event_counters,
+                              cycle_profile_workspace};
       uint32_t idx = GetBlockIdx();
-      worker_kernel(idx, runtime_config, input_list);
+      worker_kernel<CYCLE_PROFILE != 0>(idx, runtime_config, input_list);
     } else if constexpr (TRANS_A == 0 && TRANS_B == 1 && AIV_AIC_RATIO == GROUPED_MATMUL_CUBE_ONLY) {
     } else if constexpr (TRANS_A == 1 && AIV_AIC_RATIO == GROUPED_MATMUL_AIV_AIC_RATIO_1) {
     }

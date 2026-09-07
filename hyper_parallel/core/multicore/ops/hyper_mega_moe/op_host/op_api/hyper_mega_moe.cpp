@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -37,15 +37,16 @@ const std::array<const aclTensor *, 6> HyperMegaMoe(
   const aclTensor *gmm_workspace, const aclTensor *up_proj_tiling, const aclTensor *swiglu_tiling,
   const aclTensor *down_proj_tiling, const aclTensor *runtime_config, const aclTensor *all_event_counters,
   const aclTensor *original_x, const aclTensor *permute_src_index, const aclTensor *reduce_route_index,
-  const aclTensor *topk_weights, const aclTensor *final_out, int64_t rankId, int64_t ep, int64_t expert_num,
+  const aclTensor *topk_weights, const aclTensor *final_out, const aclTensor *cycle_profile_workspace,
+  int64_t rankId, int64_t ep, int64_t expert_num,
   int64_t hidden_size, int64_t seq_size, int64_t receive_capacity,
-  int64_t wave_count, int64_t home_experts, aclOpExecutor *executor) {
+  int64_t wave_count, int64_t home_experts, int64_t cycle_profile, aclOpExecutor *executor) {
   L0_DFX(HyperMegaMoe, dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off, dispatch_size, weight,
          up_proj_glist, y, swiglu_out, down_proj_weight, down_proj_glist, down_proj_y, combine_target,
          combine_target_off, combine_src_off, combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling,
          down_proj_tiling, runtime_config, all_event_counters, original_x, permute_src_index, reduce_route_index,
-         topk_weights, final_out, rankId, ep, expert_num, hidden_size, seq_size,
-         receive_capacity, wave_count, home_experts);
+         topk_weights, final_out, cycle_profile_workspace, rankId, ep, expert_num, hidden_size, seq_size,
+         receive_capacity, wave_count, home_experts, cycle_profile);
   auto dispatch_target_out = const_cast<aclTensor *>(dispatch_target);
   auto y_out = const_cast<aclTensor *>(y);
   auto swiglu_out_out = const_cast<aclTensor *>(swiglu_out);
@@ -58,9 +59,9 @@ const std::array<const aclTensor *, 6> HyperMegaMoe(
              y, swiglu_out, down_proj_weight, down_proj_glist, down_proj_y, combine_target, combine_target_off,
              combine_src_off, combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
              runtime_config, all_event_counters, original_x, permute_src_index, reduce_route_index, topk_weights,
-             final_out),
+             final_out, cycle_profile_workspace),
     OP_OUTPUT(dispatch_target_out, y_out, swiglu_out_out, down_proj_y_out, combine_target_out, final_out_out),
-    OP_ATTR(rankId, ep, expert_num, hidden_size, seq_size, receive_capacity, wave_count, home_experts));
+    OP_ATTR(rankId, ep, expert_num, hidden_size, seq_size, receive_capacity, wave_count, home_experts, cycle_profile));
   if (ret != ACL_SUCCESS) {
     return {dispatch_target_out, y_out, swiglu_out_out, down_proj_y_out, combine_target_out, final_out_out};
   }

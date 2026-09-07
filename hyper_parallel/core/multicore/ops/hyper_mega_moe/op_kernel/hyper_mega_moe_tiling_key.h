@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -55,7 +55,8 @@
     ASCENDC_TPL_BOOL_SEL(IS_STATIC_TILING_API, 0),                                                                    \
     ASCENDC_TPL_UINT_SEL(A8W4_KERNEL_TEMPLATE, ASCENDC_TPL_UI_LIST, GROUPED_MATMUL_A8W4_KERNEL_TEMPLATE_NONE),        \
     ASCENDC_TPL_UINT_SEL(A16W8_KERNEL_TEMPLATE, ASCENDC_TPL_UI_LIST, GROUPED_MATMUL_A16W8_KERNEL_TEMPLATE_NONE),      \
-    ASCENDC_TPL_UINT_SEL(AIV_AIC_RATIO, ASCENDC_TPL_UI_LIST, aiv_aic_ratio)
+    ASCENDC_TPL_UINT_SEL(AIV_AIC_RATIO, ASCENDC_TPL_UI_LIST, aiv_aic_ratio),                                          \
+    ASCENDC_TPL_BOOL_SEL(CYCLE_PROFILE, 0, 1)
 
 ASCENDC_TPL_ARGS_DECL(
   HyperMegaMoe,
@@ -90,7 +91,8 @@ ASCENDC_TPL_ARGS_DECL(
                         GROUPED_MATMUL_A16W8_KERNEL_TEMPLATE_ANTIQUANT),  // A16W8 antiquant template
   // ratio of AIV:AIC
   ASCENDC_TPL_UINT_DECL(AIV_AIC_RATIO, ASCENDC_TPL_2_BW, ASCENDC_TPL_UI_LIST, GROUPED_MATMUL_CUBE_ONLY,
-                        GROUPED_MATMUL_AIV_AIC_RATIO_1, GROUPED_MATMUL_AIV_AIC_RATIO_2));
+                        GROUPED_MATMUL_AIV_AIC_RATIO_1, GROUPED_MATMUL_AIV_AIC_RATIO_2),
+  ASCENDC_TPL_BOOL_DECL(CYCLE_PROFILE, 0, 1));
 
 ASCENDC_TPL_SEL(ASCENDC_TPL_ARGS_SEL(SET_GMM_NO_QUANT_TPL_ARGS(ASCENDC_TPL_MIX_AIC_1_2, GMM_TPL_BF16, 0, 0,
                                                                GROUPED_MATMUL_CUBE_ONLY)),

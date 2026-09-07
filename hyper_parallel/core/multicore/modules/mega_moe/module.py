@@ -84,17 +84,17 @@ class _MegaMoeExecutionResources:
                 symmetric_memory=self.symmetric_memory,
                 shared=shared,
             )
+            self.replica_manager = (
+                ExpertReplicaManager(
+                    self.spec, pool_cache_size=pool_cache_size,
+                    compact_physical_weights=compact_physical_weights,
+                    compact_layout_strategy=compact_layout_strategy,
+                ) if self.spec.replica_slots_per_rank else None
+            )
         except Exception:
             self.symmetric_memory.close()
             raise
         self.shared_physical_weights = shared_physical_weights
-        self.replica_manager = (
-            ExpertReplicaManager(
-                self.spec, pool_cache_size=pool_cache_size,
-                compact_physical_weights=compact_physical_weights,
-                compact_layout_strategy=compact_layout_strategy,
-            ) if self.spec.replica_slots_per_rank else None
-        )
         self._closed = False
 
     def close(self) -> None:
@@ -106,6 +106,7 @@ class _MegaMoeExecutionResources:
             self.workspace.close()
         finally:
             self.symmetric_memory.close()
+
 
 _COMPACT_LAYOUT_STRATEGIES = frozenset(
     {"lazy_on_first_replica", "eager_on_first_forward"}

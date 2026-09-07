@@ -26,17 +26,17 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from hyper_parallel.core.multicore.modules.mega_moe.placement import (
-    build_constrained_expert_placement,
-)
 from hyper_parallel.core.multicore.modules.mega_moe import (
     replica as replica_module,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.spec import (
-    MegaMoeSpec,
+from hyper_parallel.core.multicore.modules.mega_moe.placement import (
+    build_constrained_expert_placement,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.replica import (
     ExpertReplicaManager,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.spec import (
+    MegaMoeSpec,
 )
 from hyper_parallel.core.multicore.scheduler.config import (
     RuntimeConfigC,

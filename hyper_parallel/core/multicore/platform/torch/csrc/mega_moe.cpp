@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  *
  * PyTorch TORCH_LIBRARY_IMPL for hyper_parallel::mega_moe.
  *
@@ -48,14 +48,16 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
   const at::Tensor &reduce_route_index,   // pos 24
   const at::Tensor &topk_weights,         // pos 25
   at::Tensor &final_out,                  // pos 26
+  at::Tensor &cycle_profile_workspace,    // pos 27 — diagnostic-only write
   int64_t rank_id, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size,
-  int64_t receive_capacity, int64_t wave_count, int64_t home_experts) {
+  int64_t receive_capacity, int64_t wave_count, int64_t home_experts, int64_t cycle_profile) {
   EXEC_NPU_CMD_EXT(aclnnHyperMegaMoe, dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off,
                    dispatch_size, up_proj_weight, up_proj_glist, up_proj_y, swiglu_out, down_proj_weight,
                    down_proj_glist, down_proj_y, combine_target, combine_target_off, combine_src_off, combine_size,
                    gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling, runtime_config, all_event_counters,
-                   original_x, permute_src_index, reduce_route_index, topk_weights, final_out, rank_id, ep, expert_num,
-                   hidden_size, seq_size, receive_capacity, wave_count, home_experts);
+                   original_x, permute_src_index, reduce_route_index, topk_weights, final_out, cycle_profile_workspace,
+                   rank_id, ep, expert_num, hidden_size, seq_size, receive_capacity, wave_count, home_experts,
+                   cycle_profile);
   return std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>(
     dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target, final_out);
 }
@@ -74,9 +76,10 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
   const at::Tensor & /*swiglu_tiling*/, const at::Tensor & /*down_proj_tiling*/, const at::Tensor & /*runtime_config*/,
   const at::Tensor & /*all_event_counters*/, const at::Tensor & /*original_x*/,
   const at::Tensor & /*permute_src_index*/, const at::Tensor & /*reduce_route_index*/,
-  const at::Tensor & /*topk_weights*/, at::Tensor &final_out, int64_t /*rank_id*/, int64_t /*ep*/,
+  const at::Tensor & /*topk_weights*/, at::Tensor &final_out, at::Tensor & /*cycle_profile_workspace*/,
+  int64_t /*rank_id*/, int64_t /*ep*/,
   int64_t /*expert_num*/, int64_t /*hidden_size*/, int64_t /*seq_size*/,
-  int64_t /*receive_capacity*/, int64_t /*wave_count*/, int64_t /*home_experts*/) {
+  int64_t /*receive_capacity*/, int64_t /*wave_count*/, int64_t /*home_experts*/, int64_t /*cycle_profile*/) {
   return std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>(
     dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target, final_out);
 }
