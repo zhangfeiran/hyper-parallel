@@ -18,17 +18,22 @@ import argparse
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from examples.torch.multicore.benchmark_mega_moe_layers import (
     ADAMW_OPTIONS,
     _configuration,
+    _execution_route_summary,
     _make_optimizer,
     _optimizer_state_ledger,
+    _parse_args,
     _python_source_identity,
     _route_pairs,
 )
+from examples.torch.multicore import mega_moe_layer_profile
 
 
 class TestBenchmarkMegaMoeLayers(unittest.TestCase):
@@ -79,6 +84,29 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         self.assertEqual(len(full), 55)
         self.assertEqual(_route_pairs(args), full[:4])
 
+    def test_one_wave_summary_matches_actual_home_bypass(self):
+        """Do not report hypothetical mean-target replicas when no planner runs."""
+        proposal = {
+            "replica_slots_per_rank": 1, "baseline_wave_count": 1, "expected_wave_count": 1,
+            "destination_loads": [5, 3], "realized_destination_skew": 1.25,
+            "physical_destination_loads": [4, 4], "physical_destination_skew": 1.0,
+            "receive_capacity": 6, "planner_target_capacity": 4, "replica_slots_used": 1,
+            "replica_slot_bindings": [[-1], [0]], "execution_mode": "replica-on-one-wave",
+        }
+        summary = _execution_route_summary(proposal)
+        self.assertEqual(summary["physical_destination_loads"], [5, 3])
+        self.assertEqual(summary["physical_destination_skew"], 1.25)
+        self.assertEqual(summary["replica_slot_bindings"], [[-1], [-1]])
+        self.assertEqual(summary["replica_slots_used"], 0)
+        self.assertEqual(summary["planner_target_capacity"], 6)
+        self.assertEqual(summary["execution_mode"], "home-only")
+        self.assertEqual(proposal["replica_slots_used"], 1)
+        proposal["baseline_wave_count"] = 2
+        self.assertIs(_execution_route_summary(proposal), proposal)
+        proposal["baseline_wave_count"] = 1
+        proposal["replica_slots_per_rank"] = 0
+        self.assertIs(_execution_route_summary(proposal), proposal)
+
     def test_source_identity_detects_dirty_runtime_changes(self):
         """Include uncommitted Python implementation edits in benchmark provenance."""
         with tempfile.TemporaryDirectory() as directory:
@@ -92,3 +120,66 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         self.assertEqual(first["file_count"], 1)
         self.assertEqual(second["file_count"], 1)
         self.assertNotEqual(first["sha256"], second["sha256"])
+
+    def test_profile_path_does_not_overwrite_benchmark(self):
+        """The optional diagnostic trace must not overwrite timing evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "timing.json")
+            with self.assertRaises(SystemExit):
+                _parse_args(["--variant", "b1", "--output", output, "--profile-output", output])
+            args = _parse_args(["--variant", "b1", "--output", output])
+        self.assertIsNone(args.profile_output)
+
+    def test_runtime_identity_excludes_generated_native_build_sources(self):
+        """A built checkout and a clean worktree should hash the same runtime code."""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            root = repo / "hyper_parallel/core/multicore"
+            root.mkdir(parents=True)
+            (root / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+            before = _python_source_identity(repo)
+            for name in ("build", "prebuild"):
+                (root / name).mkdir()
+                (root / name / "generated.py").write_text("BUILD = True\n", encoding="utf-8")
+            after = _python_source_identity(repo)
+        self.assertEqual(before, after)
+        self.assertEqual(after["file_count"], 1)
+        self.assertEqual(after["scope"], "torch_runtime_without_generated_build_trees_v2")
+
+    def test_profile_annotations_preserve_call_and_restore_after_error(self):
+        """Diagnostic wrappers must preserve arguments and never leak into timing."""
+        original = MagicMock(return_value=17)
+        target = SimpleNamespace(launch=original)
+        record = MagicMock()
+        with patch.dict(mega_moe_layer_profile._SPANS, {"execution": ("launch",)}, clear=True), \
+                patch.object(mega_moe_layer_profile.importlib, "import_module", return_value=target):
+            with self.assertRaisesRegex(RuntimeError, "diagnostic failed"):
+                with mega_moe_layer_profile._profile_spans(record):
+                    self.assertEqual(target.launch(3, value=4), 17)
+                    raise RuntimeError("diagnostic failed")
+        self.assertIs(target.launch, original)
+        original.assert_called_once_with(3, value=4)
+        record.assert_called_once_with("megamoe::execution.launch")
+
+    def test_profile_annotations_restore_after_partial_setup(self):
+        """An invalid later target must not leave earlier methods instrumented."""
+        original = MagicMock()
+        target = SimpleNamespace(launch=original)
+        with patch.dict(mega_moe_layer_profile._SPANS, {"execution": ("launch", "missing")}, clear=True), \
+                patch.object(mega_moe_layer_profile.importlib, "import_module", return_value=target):
+            with self.assertRaises(AttributeError):
+                with mega_moe_layer_profile._profile_spans(MagicMock()):
+                    self.fail("missing profiling target unexpectedly resolved")
+        self.assertIs(target.launch, original)
+
+    def test_non_recording_rank_trains_without_constructing_profiler(self):
+        """Every rank participates, but only rank zero may create profiler artifacts."""
+        sweep = MagicMock()
+        sweep.worker._RANK = 1
+        route = (object(), object(), object())
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(mega_moe_layer_profile.importlib, "import_module") as import_module:
+            mega_moe_layer_profile.profile_layer_step(sweep, route, Path(directory) / "trace.json")
+        import_module.assert_not_called()
+        self.assertEqual(sweep._train_step.call_count, 2)
+        self.assertEqual(sweep.optimizer.step.call_count, 2)

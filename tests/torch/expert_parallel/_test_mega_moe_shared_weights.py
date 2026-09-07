@@ -145,6 +145,36 @@ def _check_deferred(
     return len(outputs)
 
 
+def _check_control_stream(candidate, reference, shape, route) -> int:
+    """Replay on two compute streams, including an owner-only cache invalidation."""
+    hidden, grad_output = moe._make_data(shape)
+    caller = torch.npu.current_stream(moe._DEVICE)
+    previous = caller
+    manager = candidate._get_execution_resources(hidden).replica_manager
+    for iteration in range(2):
+        compute = torch.npu.Stream(device=moe._DEVICE)
+        compute.wait_stream(previous)
+        with torch.npu.stream(compute):
+            # Only the owner changes its version: all other ranks must still
+            # enter P2P when agreement observes this one-rank cache miss.
+            if iteration == 1 and moe._RANK == 0:
+                with torch.no_grad():
+                    for layer in (candidate, reference):
+                        layer.gate_up_weight.add_(0.00390625)
+            expected = moe._run_layer(reference, hidden, *route, grad_output)
+            actual = moe._run_checkpointed_layer(candidate, hidden, *route, grad_output, use_reentrant=True)
+            control = manager._shared_agreement_stream
+            assert control is not None and control != compute, (
+                f"agreement did not use an independent stream: control={control}, compute={compute}"
+            )
+            current = torch.npu.current_stream(moe._DEVICE)
+            assert current == compute, f"agreement changed the caller stream: {current} != {compute}"
+            moe._assert_results_close(expected, actual, weight_grad_wave_count=shape.ep_size)
+        previous = compute
+    caller.wait_stream(previous)
+    return 2
+
+
 def test_shared_weight_pool_lifecycle(*, checkpoint_modes: tuple[bool, ...] = (False, True)) -> None:
     """Validate mixed home/replica graphs, layer reuse, checkpoint and updates."""
     shape = _shape()
@@ -211,6 +241,7 @@ def test_shared_weight_pool_lifecycle(*, checkpoint_modes: tuple[bool, ...] = (F
     reference = moe._run_layer(references[0], hidden, *skewed, grad_output)
     actual = moe._run_layer(candidates[0], hidden, *skewed, grad_output)
     moe._assert_results_close(reference, actual, weight_grad_wave_count=shape.ep_size)
+    checks += _check_control_stream(candidates[0], references[0], shape, one_wave)
     manager = candidates[0]._get_execution_resources(hidden).replica_manager
     expected_pool_bytes = slots * shape.hidden_size * shape.intermediate_size * 3 * 2
     pool_bytes = sum(weight.untyped_storage().nbytes() for weight in manager._shared_weights)

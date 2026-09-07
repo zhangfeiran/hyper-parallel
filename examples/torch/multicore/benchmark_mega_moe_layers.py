@@ -36,6 +36,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from examples.torch.multicore.mega_moe_layer_profile import profile_layer_step
+
 ALPHAS = (10000, 3000, 1000, 300, 100, 30, 10, 3, 1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
 EXTRA_PAIRS = ((0.01, 1942), (0.01, 1708), (0.01, 0), (0.005, 943), (0.01, 2104),
                (0.01, 4050), (0.01, 2486), (0.01, 1164), (0.01, 29), (0.02, 1942))
@@ -63,6 +65,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pairs", help="Override the 55-route sweep, e.g. 10000:42,0.005:943.")
     parser.add_argument("--shuffle-seed", type=int, default=20260903)
     parser.add_argument("--limit", type=int, help="Only run this many routes from the shuffled sweep prefix.")
+    parser.add_argument("--profile-output", type=Path,
+                        help="After all measurements, trace one extra step of the first route on rank zero.")
     args = parser.parse_args(argv)
     if args.layers <= 0 or args.warmup < 0 or args.measured <= 0:
         parser.error("layers and measured must be positive; warmup must be nonnegative")
@@ -70,6 +74,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("limit must be positive")
     if args.output.exists():
         parser.error(f"refusing to overwrite {args.output}")
+    if args.profile_output is not None:
+        if args.profile_output.exists() or args.profile_output.resolve() == args.output.resolve():
+            parser.error("profile-output must be a new path distinct from output")
+        if args.profile_output.suffix != ".json":
+            parser.error("profile-output must have a .json suffix")
     return args
 
 
@@ -90,6 +99,23 @@ def _make_optimizer(torch: Any, parameters: Any) -> Any:
     return torch.optim.AdamW(parameters, **ADAMW_OPTIONS)
 
 
+def _execution_route_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Report the home bypass instead of the ST helper's mean-target proposal."""
+    slots = summary["replica_slots_per_rank"]
+    if not slots or summary["baseline_wave_count"] > 1:
+        return summary
+    return {
+        **summary,
+        "physical_destination_loads": list(summary["destination_loads"]),
+        "physical_destination_skew": summary["realized_destination_skew"],
+        "planner_target_capacity": summary["receive_capacity"],
+        "expected_wave_count": 1,
+        "replica_slots_used": 0,
+        "replica_slot_bindings": [[-1] * slots for _ in summary["destination_loads"]],
+        "execution_mode": "home-only",
+    }
+
+
 def _optimizer_state_ledger(torch: Any, optimizer: Any) -> dict[str, Any]:
     # These tensors already belong to the allocator peak, not an extra HBM term.
     by_device, by_dtype = {}, {}
@@ -108,12 +134,12 @@ def _optimizer_state_ledger(torch: Any, optimizer: Any) -> dict[str, Any]:
 
 
 def _python_source_identity(repo: Path) -> dict[str, Any]:
-    """Hash Torch MegaMoe Python sources, including dirty-tree changes."""
+    """Hash dirty runtime sources, excluding generated native build trees."""
     paths = sorted(
         path
         for relative_root in _PYTHON_SOURCE_ROOTS
         for path in (repo / relative_root).rglob("*.py")
-        if "mindspore" not in path.parts
+        if not {"mindspore", "build", "prebuild"}.intersection(path.relative_to(repo).parts)
     )
     digest = hashlib.sha256()
     for path in paths:
@@ -123,7 +149,8 @@ def _python_source_identity(repo: Path) -> dict[str, Any]:
         digest.update(relative)
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
-    return {"file_count": len(paths), "sha256": digest.hexdigest()}
+    return {"scope": "torch_runtime_without_generated_build_trees_v2",
+            "file_count": len(paths), "sha256": digest.hexdigest()}
 
 
 def _source_identity() -> dict[str, Any]:
@@ -141,6 +168,9 @@ def _source_identity() -> dict[str, Any]:
             (repo / "tests/torch/expert_parallel/_test_mega_moe.py").read_bytes()
         ).hexdigest(),
         "adapter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "profile_helper_sha256": hashlib.sha256(
+            Path(__file__).with_name("mega_moe_layer_profile.py").read_bytes()
+        ).hexdigest(),
         "python_implementation": _python_source_identity(repo),
         "native_artifacts": artifacts,
     }
@@ -248,10 +278,10 @@ class _LayerSweep:
         """Measure one route, validating before warmup and after all updates."""
         worker = self.worker
         route = worker._make_dirichlet_route(self.shape, alpha, seed)
-        summary = worker._summarize_performance_route(
+        summary = _execution_route_summary(worker._summarize_performance_route(
             self.shape, route[2], self.slots,
             {"profile": "dirichlet", "dirichlet_alpha": alpha, "dirichlet_seed": seed},
-        )
+        ))
         self._train_step(route, validate=True)
         self.optimizer.step()
         for _ in range(self.args.warmup):
@@ -324,11 +354,18 @@ def main() -> None:
             if worker._RANK == 0:
                 results.append(result)
                 print("LAYER_SWEEP_POINT=" + json.dumps(result, sort_keys=True), flush=True)
+        if args.profile_output is not None:
+            profile_layer_step(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]), args.profile_output)
         if source != _source_identity():
             raise RuntimeError("source or native artifacts changed during the sweep")
         if worker._RANK == 0:
             payload = {"variant": args.variant, "kind": "performance", "points": results,
                        "source": source, "configuration": _configuration(args)}
+            if args.profile_output is not None:
+                payload["diagnostic_trace"] = {
+                    "path": str(args.profile_output), "rank": 0, "alpha": points[0][0], "seed": points[0][1],
+                    "timing": "one extra post-update step after all performance and memory measurements",
+                }
             args.output.parent.mkdir(parents=True, exist_ok=True)
             with args.output.open("x", encoding="utf-8") as stream:
                 stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")

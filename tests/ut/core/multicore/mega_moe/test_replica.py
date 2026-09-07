@@ -21,7 +21,7 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -1047,6 +1047,57 @@ class TestExpertReplicaManager(unittest.TestCase):
             for gradient in gradients:
                 torch.testing.assert_close(gradient, torch.zeros_like(gradient))
             lease.release()
+
+    def test_shared_agreement_uses_one_independent_stream_and_restores_context(self):
+        """Keep scalar agreement independent while preserving the EP-wide result.
+
+        Feature: shared cache control stream
+        Description: perform two agreements on a mocked NPU and then inject an error
+        Expectation: one stream is reused and every call restores the caller's context
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        weight = SimpleNamespace(device=SimpleNamespace(type="npu"))
+        npu = MagicMock()
+        scope = npu.stream.return_value
+        with patch.object(replica_module, "torch", new=SimpleNamespace(npu=npu)), \
+                patch.object(manager, "_all_ranks_can_reuse", side_effect=[True, False, RuntimeError("agreement")]):
+            self.assertTrue(manager._shared_all_ranks_can_reuse(True, weight))
+            self.assertFalse(manager._shared_all_ranks_can_reuse(True, weight))
+            with self.assertRaisesRegex(RuntimeError, "agreement"):
+                manager._shared_all_ranks_can_reuse(False, weight)
+        npu.Stream.assert_called_once_with(device=weight.device)
+        self.assertEqual(npu.stream.call_args_list, [((npu.Stream.return_value,),)] * 3)
+        self.assertEqual(scope.__enter__.call_count, 3)
+        self.assertEqual(scope.__exit__.call_count, 3)
+        self.assertIs(scope.__exit__.call_args.args[0], RuntimeError)
+        npu.Stream.return_value.wait_stream.assert_not_called()
+        npu.Stream.return_value.wait_event.assert_not_called()
+
+    def test_cache_agreement_materializes_flag_without_host_tensor_copy(self):
+        """Create the scalar on device while retaining a collective on every rank.
+
+        Feature: cache agreement flag construction
+        Description: emulate local and remote misses through the real scalar path
+        Expectation: device fill replaces host tensor copying without changing MIN semantics
+        """
+        manager = ExpertReplicaManager(self._config(rank_id=1))
+        weight = torch.ones(2, device="cpu")
+        distributed = Mock()
+
+        def remote_miss(flag: Any, **kwargs: Any) -> None:
+            """Model another rank contributing a zero flag to the MIN reduction."""
+            self.assertEqual(flag.shape, torch.Size([]))
+            self.assertEqual(flag.dtype, torch.int32)
+            self.assertEqual(kwargs, {"op": distributed.ReduceOp.MIN, "group": "ep_group"})
+            flag.zero_()
+
+        with patch.object(replica_module, "dist", new=distributed), \
+                patch.object(torch, "tensor", side_effect=AssertionError("unexpected host tensor copy")):
+            self.assertTrue(manager._all_ranks_can_reuse(True, weight))
+            self.assertFalse(manager._all_ranks_can_reuse(False, weight))
+            distributed.all_reduce.side_effect = remote_miss
+            self.assertFalse(manager._all_ranks_can_reuse(True, weight))
+        self.assertEqual(distributed.all_reduce.call_count, 3)
 
     def test_shared_runtime_extension_has_stable_versioned_b_addresses(self):
         """Append the native pointer extension to a real compact plan image.

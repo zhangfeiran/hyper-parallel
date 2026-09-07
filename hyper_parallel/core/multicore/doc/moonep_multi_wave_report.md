@@ -12,7 +12,7 @@
 | 整理日期 | 2026-09-07 |
 | 代码分支 | `megamoe-perf-sun` |
 | 代码基线 | `megamoe-perf-sun`；以本文同提交代码为准 |
-| 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、`43aa7d6c`、`b255b821`、`40b6963b`、`9f75fd20`、`86f4b433`、`364af596` |
+| 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、`43aa7d6c`、`b255b821`、`40b6963b`、`9f75fd20`、`86f4b433`、`364af596`、`50a4e68c` |
 | 状态 | 已实现；multi-wave 保持 lossless；副本默认关闭；串行多层可显式启用 shared-B |
 
 代码是最终事实来源；本文中的性能数字只对应第 10 节写明的硬件、模型、路由和测量方法。
@@ -29,14 +29,17 @@
   已能在一个 receive window 内完成，会自动选择较小的 home runtime，跳过 placement、物理 ID remap
   和权重 P2P。非 shared-B 的 compact 路径仍默认在每层第一次 forward 前准备 suffix；显式 lazy 策略
   才会同时跳过未使用的 suffix backing。
-- 在 8 卡 16 层 checkpointed Qwen MoE、严重固定偏斜、每步 AdamW 的当前复测中，`B=1 + shared-B`
+- 在上一阶段 8 卡 16 层 checkpointed Qwen MoE、严重固定偏斜、每步 AdamW 的复测中，`B=1 + shared-B`
   相比 `B=0`，F+B 从 `1789.069 ms` 降到两次运行均值 `1247.859 ms`，降低 `30.251%`；full step 从
   `1920.229 ms` 降到 `1379.185 ms`，降低 `28.176%`。conservative peak 只增加 `77.888 MiB`，而
   allocator peak reserved 反而减少 `724 MiB`。
-- 本轮首先落地 shared-B 的同版本 cache hit：checkpoint recompute 紧接同层 backward 时复用 B-slot，
+- 上一阶段落地 shared-B 的同版本 cache hit：checkpoint recompute 紧接同层 backward 时复用 B-slot，
   只有 transfer 全部完成后才发布 cache key；层、placement、storage 或参数版本变化都会失效，且 EP
   group 用 `MIN` all-reduce 保证一致决策。两轮 A/B 的 F+B 均值降低 `1.321%`，full step 降低
   `1.182%`，HBM 逐字节不变。
+- 在 `50a4e68c` 上继续按 trace 优化 shared-B cache agreement：移到独立 control stream 后，两轮配对
+  运行的 F+B median 均值再降低 `1.688%`，含 AdamW 的 step 降低 `1.466%`。allocated/conservative peak
+  不变；启用副本后 reserved 增加 `2 MiB`。这些是第 10.2.1 节的后续增量，不应与前一轮噪声混算。
 - 旧的 8 层 compact 路径复测中，`B=1 + compact` 相比
   `B=0`，optimizer-step rank-max p50 从 `1156.840 ms` 降到 `671.199 ms`，降低 `41.980%`，
   等价吞吐提升 `1.724x`；该组数据用于比较 legacy per-layer storage，不是当前 shared-B 多层主结果。
@@ -274,6 +277,17 @@ cache hit 前仍在 EP group 上执行 INT32 `MIN` all-reduce。只要一个 ran
 初始 forward、16 次 recompute forward、16 次 backward。固定同一路由时，首个 reverse layer 的 recompute
 以及每层 recompute 后的 backward 共 17 次可命中，transfer phase 从 48 降到 31；跨 layer 的 pool overwrite
 仍然 miss。
+
+当前 shared-B 把该 agreement 放到 resource-group 独立 NPU control stream，并用 `torch.full((), ...)`
+直接生成 INT32 flag，避免 host tensor H2D copy。它只读取 Python 侧的 Parameter identity、version、
+placement 等元数据，不读取 weight 或 B pool 内容，所以 control stream 不必等待 compute event。
+`all_reduce` 的结果仍在 control stream 上通过 `.item()` 等待后才决定 hit/miss；退出上下文立即恢复
+调用者的 compute stream。原有 lease event、P2P transfer、handle wait 和 kernel consumer 顺序不变，
+控制流提前完成不能使 B pool 提前改写。
+
+这不是跳过 collective 或假设各 rank 的 version 一致：单 rank 参数更新仍会使全组刷新。只为 shared-B
+启用独立流，legacy compact/snapshot agreement 仍在调用者流上；两条路径都使用 device-side flag fill。
+当前仍只有一个串行 B pool，没有增加 weight/gradient 双 buffer。
 
 ### 5.3 compact layout 时机与首次交叠保护
 
@@ -639,7 +653,7 @@ control plane，不改 native ABI 或 kernel。四组 route、workspace、optimi
 | shared-B，cache-on run 2 | 1246.147 ms | 1377.382 ms |
 | **shared-B，cache-on 两次均值** | **1247.859 ms** | **1379.185 ms** |
 
-当前 shared-B + cache 相对 `B=0`：
+该 cache 阶段的 shared-B 相对 `B=0`：
 
 - F+B 降低 `541.210 ms / 30.251%`，等价吞吐 `1.434x`；
 - full step 降低 `541.044 ms / 28.176%`，等价吞吐 `1.392x`；
@@ -666,6 +680,76 @@ shared-B 的 weight + gradient pool 虽是 157.5 MiB，但 `B=1` 把 2-wave work
 同版本 cache 理论上消掉 48 次 shared claim 中的 17 次 transfer phase，但端到端只收益约 1.2%。这说明
 weight P2P 已能部分 overlap 且不是主瓶颈；继续做复杂 weight cache/double-buffer 前，应先量化 FP32 dW、
 GMM 尾部、replica-gradient return 和 host control plane。
+
+#### 10.2.1 下一阶段：独立 control-stream agreement
+
+本阶段先用可选 `--profile-output` 采集 rank-zero CPU/NPU trace，再修改 `replica.py`；不改 planner
+算法、weight/gradient payload、native ABI、kernel 或 AdamW。CPU 标注只在 example 的诊断上下文安装，
+正式 timing/HBM 完成后才启用，并在异常路径恢复原函数。最终诊断入口先完成一个 route warmup 与
+AdamW update，再捕获一个完整 step，确保包含 update 后的 replica refresh。
+
+探索 trace 给出的关键证据如下。CPU 数字为 inclusive launch/wait scope，device 数字为 kernel duration
+之和；不能相加，也不能把 CPU 等待缩短量直接解释为端到端收益。
+
+| 分段，16 层 | 调用数 | 原 agreement | 独立 control stream |
+| --- | ---: | ---: | ---: |
+| cache agreement，CPU | 48 | 268.761 ms | 23.029 ms |
+| physical ID remap，CPU | 32 | 33.894 ms | 30.779 ms |
+| replica-gradient return，CPU | 16 | 17.612 ms | 14.746 ms |
+| fused forward，NPU kernels | 32 | 478.325 ms | 476.924 ms |
+| fused backward，NPU kernels | 16 | 325.198 ms | 332.804 ms |
+
+原 agreement 内 `aten::copy_` 占 `240.951 ms`，而 49 次 device all-reduce（含诊断 barrier）合计
+`5.977 ms`。主要问题是 flag 的阻塞 H2D copy 排在 recompute/compute 尾部，不是标量传输量大。
+独立流上的 flag fill + collective 只依赖 host cache metadata，使 CPU 可以继续准备和提交 backward；
+compute 工作本身没有消失。这里没有证据支持立即增加 FP32 owner receive pool 或 B 双 buffer，暂不扩大
+这两类 persistent HBM。
+
+两份探索 trace 为 `shared_phase_trace_baseline_20260907.json` 和
+`shared_control_trace_optimized_20260907.json`，均在 `output/qwen_moe_optimizer/`。它们来自首版诊断
+入口，紧接未做 optimizer step 的 finite validation，因此有额外一次跨 step warm hit：30 次 weight
+refresh，而不是正常 post-update 的 31 次。上表用于定位 stream 等待，不作为更新后 transfer 次数或正式
+性能数据；修正后的入口单独采集 post-update smoke trace。
+
+`shared_control_trace_post_update_20260907.json` 已确认 48 次 agreement（CPU scope 共 `23.202 ms`）、
+31 次 weight refresh；同一 smoke 的 balanced 摘要为 `home-only / 0 replicas`。其 1 warmup + 1 measured
+只用于验证诊断入口，不加入下面的性能 aggregate。
+
+正式性能按 A/B/B/A 顺序运行，A 为已提交的 `50a4e68c`，B 只改变上述 Python control plane。每点仍为
+3 warmup + 7 measured，全部参数每步更新。A1/B1 是单点；B2/A2 使用完全相同的三点顺序
+`10000:42 -> 0.005:943 -> 0.1:42`，保留 route history 对 allocator 的影响。
+
+| `alpha=0.1, seed=42` | 原 agreement F+B | 独立流 F+B | 原 agreement full step | 独立流 full step |
+| --- | ---: | ---: | ---: | ---: |
+| 配对 1 | 1253.688 ms | 1233.034 ms | 1384.570 ms | 1364.339 ms |
+| 配对 2 | 1247.644 ms | 1226.085 ms | 1377.584 ms | 1357.314 ms |
+| 两个进程 median 的均值 | 1250.666 ms | 1229.560 ms | 1381.077 ms | 1360.826 ms |
+| 降幅 | — | **21.106 ms / 1.688%** | — | **20.251 ms / 1.466%** |
+
+三点配对中的其他两个点：
+
+| 路由 | 实际路径 | 原 full step | 独立流 full step | 解释 |
+| --- | --- | ---: | ---: | --- |
+| `10000:42` | home-only，W1 | 804.076 ms | 799.981 ms | 0.509% 差异视为噪声；未创建 B pool/control stream |
+| `0.005:943` | home W4，B1 后 W1 | 1419.168 ms | 1395.930 ms | 降低 1.637%，仍只是一个配对 |
+
+这三点未覆盖 B1 placement 后仍 residual multi-wave 的性能边界，也不是完整 55-route 曲线。
+原三点 JSON 的 balanced `replica_slot_bindings` 来自旧 ST helper 的 exact-mean proposal；该点实际
+`shared_pool_per_rank` 全为 0，backend 走 home bypass。当前 multi-layer adapter 已把 home 单 wave 摘要
+修正为 0 active replica、原始 destination loads 和 `home-only`，并补 CPU 回归；不改动历史原始 JSON。
+
+各配对的 stable allocated、peak allocated、conservative peak、SHMEM heap 和 B pool 字节数完全相同。
+只有使用 control stream 的点 peak reserved 增加 `2 MiB`；balanced 点连 reserved 也不变。没有增加
+FP32 dW、owner receive 或 weight 双 buffer，不能把 reserved 的小增量说成绝对零 HBM 代价。
+
+原始数据：`shared_phase_baseline_20260907.json`、`shared_control_optimized_20260907.json`、
+`shared_control_optimized_repeat_20260907.json`、`shared_control_baseline_repeat_20260907.json`。四份
+native artifact 和 ST worker hash 相同。A2 使用隔离 editable 环境的 detached worktree；共同的 51 个
+Python runtime source 中只有 `replica.py` 与 B 不同。旧 digest 还把主树生成目录下的 232 个 Python
+build/prebuild 文件算入，因此主树 file count 为 283、detached 为 51；不能把该总 digest 差异误判成
+232 处 runtime 改动。
+当前 source digest 已以显式 v2 scope 排除这些 generated build/prebuild 目录，同时继续记录 dirty
+runtime source 与实际加载的 native artifacts；对应 CPU 回归验证 clean/built checkout 的一致性。
 
 ### 10.3 Legacy per-layer compact 测量口径
 
@@ -805,20 +889,27 @@ pytest -q \
   tests/ut/examples/torch/multicore
 ```
 
-结果：`141 passed, 105 subtests passed in 11.73s`。新增回归覆盖 cache key 只在 transfer wait 后发布、
+结果：`149 passed, 105 subtests passed in 11.82s`。回归覆盖 cache key 只在 transfer wait 后发布、
 相同 layer/version/placement 命中、layer/版本/placement 失效，以及本 rank 命中但任一远端 rank miss 时
-全组重新进入 P2P。benchmark UT 同时验证 Python implementation digest 能发现 dirty-tree 变化。
+全组重新进入 P2P。本阶段新增独立 agreement stream 复用和异常后上下文恢复、device flag fill/MIN
+语义、profiling wrapper 异常恢复、非记录 rank 不创建 profiler、home bypass 摘要，以及排除 generated
+build/prebuild 后仍能发现 dirty runtime source 的 digest。
 
 目标文件 `pylint`、`git diff --check` 和本文 `markdownlint-cli2` 均通过。当前环境没有安装 Ruff 命令，
 因此不把 Ruff 计为已执行检查。
 
-完整 `pytest -q tests/ut` 也已尝试，但当前 Python 环境缺少 `transformers`、`toml`、`matplotlib` 和
+前一阶段尝试过完整 `pytest -q tests/ut`，但当时 Python 环境缺少 `transformers`、`toml`、`matplotlib` 和
 `pulp`，在 16 个无关测试模块的 collection 阶段终止；没有进入测试执行，因此不把它计作代码回归。
 
-当前 shared-B + reentrant checkpoint 两卡 fused-kernel ST 在系统 CANN 9.2.0 与新构建的
-Torch/Ascend910B payload 上结果为 `1 passed in 103.17s`。它使用 native MoE oracle 覆盖跨层 forward、
-reverse backward、checkpoint recompute、optimizer update、pool storage 稳定和 finite output/gradient。
-构建中的 multicore vendor、Torch adapter 与 Torch SHMEM 均成功；总 `build.sh` 最后只在无关的 MindSpore
+本阶段 shared-B + reentrant checkpoint 两卡 fused-kernel ST 结果为 `1 passed in 31.18s`。它使用
+native MoE oracle 覆盖跨层 forward、reverse backward、checkpoint recompute、参数 update、pool storage
+稳定和 finite output/gradient；新增两个非默认 compute stream 上的 checkpoint replay，并只更新 rank 0
+参数，验证远端局部 hit 时仍全组刷新且调用者 stream 不变。legacy hot-expert replication 两卡 ST 也通过
+（`1 passed in 33.72s`），覆盖共享 helper 的 device flag fill 不破坏 compact/snapshot 路径。
+
+本阶段仅改 Python，没有重建 native。沿用上一阶段系统 CANN 9.2.0 与 Torch/Ascend910B payload；当时
+shared-B ST 为 `1 passed in 103.17s`，multicore vendor、Torch adapter 与 Torch SHMEM 构建均成功。
+总 `build.sh` 最后只在无关的 MindSpore
 custom-ops 阶段失败，因为本机 MindSpore 2.9 不支持 CANN 9.2 headers，不影响上述 Torch payload/ST。
 
 此前两卡 fused-kernel eager/lazy 切换 ST 结果为 `2 passed in 126.20s`。两条用例分别验证 eager 首次
@@ -848,10 +939,11 @@ CANN 9.0 放在系统 9.2 之前。重新 source `/usr/local/Ascend/cann/set_env
 - peer-buffer reuse fence：CPU source harness 覆盖首个 Combine tile 选举 publisher；双卡小 shape 验证
   publisher 不依赖固定 worker 获得 Combine 任务，避免所有实际 worker 等待未发布 event。
 
-本轮重新执行 11.1 节 UT、重建并验证 Torch/Ascend910B payload，再完成第 10.2 节五组 8 卡进程：一组
+前一阶段重新执行 UT、重建并验证 Torch/Ascend910B payload，再完成第 10.2 节五组 8 卡进程：一组
 `B=0`、cache-off/on 各两组。所有 finite 检查和 AdamW state 检查通过，logical histogram 与 placement
 完全相同；`B=0` 为 2 wave，`B=1` 为 7 个 replica binding 后 1 wave。第 10.4--10.5 节的三组 8 层
 legacy compact 结果来自前一轮 `40b6963b` 复测，不能与当前 16 层数字混成同一 aggregate。
+本阶段另外完成第 10.2.1 节四组 A/B/B/A 及一组诊断 smoke；不宣称已重跑完整 55-route 曲线。
 
 ## 12. 已落地优化与被否决方案
 
@@ -925,8 +1017,8 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
    上游 MoonEP 式全局 `E+B` symmetric VMM 或 rank-level transport deduplication。
 3. optimizer 每步更新会使 shared/legacy pool version 失效；下一 step 的初始 forward 仍需刷新 replica。
    当前新增命中主要覆盖 checkpoint recompute 后的同层 backward，以及同版本 micro-batch/梯度累积。
-4. shared cache agreement 每次 claim 都有一个 device scalar `MIN` all-reduce 和 `.item()`；它保证协议安全，
-   但也是 cache hit 的固定控制面税，尚未与已有 count exchange 合并。
+4. shared cache agreement 每次 claim 都有一个 device scalar `MIN` all-reduce 和 `.item()`；当前已经移到
+   独立 control stream，避免排在 compute 尾部，但固定 collective/host 决策成本尚未与 count exchange 合并。
 5. eager compact 在每层第一次 forward 建图前重绑 Parameter storage；lazy 在首次无 live home lease 的
    replica route 重绑。跨该边界持有的 raw storage alias 不兼容；lazy 的首次交叠和后续 overlapping
    placement 可能临时退回 snapshot，瞬时 HBM 高于 steady state；shared-B 不走该 `set_` 路径。
@@ -938,19 +1030,20 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 
 ## 15. 下一步优先级
 
-1. **先补可归因 profile。** 在当前 16 层 shared-B benchmark 中分别记录 count gather、planner、remap、
-   cache agreement、weight P2P、forward GMM、backward dW 和 replica-gradient return；同时跑 55-route
-   sweep。cache 消掉 35.4% transfer phase 却只改善约 1.2%，不应继续凭 transfer 次数猜主瓶颈。
-2. **缩短 FP32 dW 与 owner receive 生命周期。** 用 allocator snapshot/trace 验证 call-local `[H, ...]`
+1. **扩展已有 profile，而不是继续猜 transfer 次数。** 当前已定位并移走 agreement 的 compute-stream
+   等待。接下来跑完整 55-route 与动态 skew，并用 device/cycle profile 区分 fused forward/backward 内部
+   GMM、dW accumulation 和通信等待。rank-zero CPU scope 不能替代各 rank 的关键路径。
+2. **继续压 control plane 的同步。** count gather 的 device-to-host capacity decision、physical ID remap
+   的数据相关 sizing、重复 metadata H2D，以及约 23 ms/step 的独立流 agreement 仍值得量化。合并
+   agreement 与 histogram exchange 时必须保留任一 rank miss 后全组一致的协议；不能把真实 producer
+   dependency 一并删掉。只移 planner 而保留 Python `P2POp(peer_rank=...)` 也不能消除全部同步。
+3. **按内存证据缩短 FP32 dW 与 owner receive 生命周期。** 用 allocator snapshot/trace 验证 `[H, ...]`
    FP32 dW、owner receive tensors 和 retained scratch 的真实峰值；只在确认 churn 后实现 event-ordered
    high-watermark/ring buffer，或在所有 replica contribution FP32 聚合完成后尽早 cast/release。不能提前
    BF16 累加，也不能为省临时 allocation 无条件增加更大的 persistent pool。
-3. **优化 replica-gradient return。** 评估复用 owner receive storage、按 peer 合批以及把通信/FP32
-   accumulation 与下一层 backward overlap；当前 weight prefetch 已不是首要瓶颈，gradient return 更接近
-   backward critical path。
-4. **合并 control-plane collective。** 把 cache agreement/version generation 与现有 histogram exchange
-   合并或异步 overlap，再把 placement、physical IDs/counts/group-list 和 transfer table 消费整体下沉到
-   NPU。只移动 planner 而保留 Python `P2POp(peer_rank=...)` 不能消除同步。
+4. **量化 replica-gradient return 的 device 路径。** 当前 CPU scope 约 15 ms/step，不能因此断言 HCCL
+   payload 或 FP32 reduction 便宜；需按 device timeline 评估 peer 合批和与下一层 backward overlap。
+   owner receive 的 CPU allocation 很小，尚不足以支持新增 persistent pool。
 5. **最后评估双 buffer 与预测 prefetch。** 若分段 profile 证明剩余 31 次 weight refresh 仍显著，再做
    shared-B ping-pong pool和跨层 backward prefetch；上一 histogram 预测必须带 generation 校验，不能静默
    使用错误 plan。
@@ -972,5 +1065,6 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 | shared device worker | `hyper_parallel/core/multicore/ops/runtime/worker_kernel.h` |
 | Qwen model/profile | `examples/torch/multicore/qwen_moe_mega_moe_model.py`、`qwen_moe_mega_moe_profile.py` |
 | checkpointed multi-layer benchmark | `examples/torch/multicore/benchmark_mega_moe_layers.py` |
+| opt-in rank-zero CPU/NPU trace | `examples/torch/multicore/mega_moe_layer_profile.py` |
 | planner/route/pool UT | `tests/ut/core/multicore/mega_moe/` |
 | real fused-kernel ST | `tests/torch/expert_parallel/test_mega_moe.py`、`_test_mega_moe_shared_weights.py` |

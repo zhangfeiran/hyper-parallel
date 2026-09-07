@@ -277,6 +277,7 @@ class ExpertReplicaManager:
         self._shared_lock = threading.Lock()
         self._shared_in_use = False
         self._shared_event: Any | None = None
+        self._shared_agreement_stream: Any | None = None
         self._shared_failed = False
 
     def start_shared_prefetch(
@@ -321,7 +322,7 @@ class ExpertReplicaManager:
             if self._shared_event is not None:
                 torch.npu.current_stream(weight1.device).wait_event(self._shared_event)
             locally_reusable = self._shared_key == key
-            if self._all_ranks_can_reuse(locally_reusable, weight1):
+            if self._shared_all_ranks_can_reuse(locally_reusable, weight1):
                 return SharedExpertWeightLease(
                     self,
                     plan,
@@ -360,6 +361,18 @@ class ExpertReplicaManager:
             if self._shared_failed or not self._shared_in_use:
                 raise RuntimeError("shared expert weight pool is not claimed.")
             self._shared_key = key
+
+    def _shared_all_ranks_can_reuse(self, locally_reusable: bool, weight: Any) -> bool:
+        """Agree on host-only cache metadata without draining the compute stream."""
+        if weight.device.type == "cpu" or self.spec.ep_size == 1:
+            return self._all_ranks_can_reuse(locally_reusable, weight)
+        if self._shared_agreement_stream is None:
+            self._shared_agreement_stream = torch.npu.Stream(device=weight.device)
+        # Identity, version and placement are host metadata, so this scalar has
+        # no compute dependency. B-slot transfers/consumers remain on the caller
+        # stream behind the lease event; only the agreement uses this stream.
+        with torch.npu.stream(self._shared_agreement_stream):
+            return self._all_ranks_can_reuse(locally_reusable, weight)
 
     def prepare_shared_gradients(self, *, multi_wave: bool) -> tuple[Any, Any]:
         """Return FP32 B-slot partials, cleared before multi-wave accumulation."""
@@ -510,7 +523,8 @@ class ExpertReplicaManager:
             return locally_reusable
         if not dist.is_available() or not dist.is_initialized():
             return locally_reusable
-        reuse_flag = torch.tensor(
+        reuse_flag = torch.full(
+            (),
             int(locally_reusable),
             dtype=torch.int32,
             device=weight.device,

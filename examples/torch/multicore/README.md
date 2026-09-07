@@ -57,6 +57,10 @@ artifact hashes. The tool rejects unmatched alpha/seed sets, different
 logical routes or shapes, incompatible settings, duplicate samples, and
 inconsistent memory accounting instead of silently joining unlike runs.
 
+The multi-layer worker's v2 Python digest excludes generated `build`/`prebuild`
+trees so a built checkout and a detached A/B worktree describe the same runtime
+source scope. Native payloads remain fingerprinted separately.
+
 The outputs are `dirichlet_skew_latency_hbm.png`, an SVG, a point-level CSV,
 and `dirichlet_skew_summary.json`. The upper panel shows median forward plus
 backward latency; the lower panel shows total peak HBM per rank. Both use the
@@ -124,6 +128,24 @@ The plotter rejects mixed layer counts, checkpoint modes, optimizer protocols,
 and workload scope, including whether latency includes the optimizer update.
 Latency is measured for the complete multi-layer step, not single-layer latency
 multiplied by the layer count.
+
+Add `--profile-output output/b1_trace.json` to capture an optional rank-zero
+CPU/NPU Chrome trace. After **all** timing and memory measurements, the worker
+warms the first selected route with an AdamW update and profiles one extra full
+step. This also covers replica refresh after the update. Diagnostic annotations
+cover count exchange, planning/remapping, cache agreement, weight P2P, fused
+forward/backward launches, backward allocation, replica-gradient return and AdamW.
+The wrappers are installed only inside the profiling context and always restored;
+disabled profiling adds no annotations or synchronization to library hot paths.
+CPU scopes are inclusive launch/wait times, not device compute times, and must not
+be added together. Use the NPU timeline for asynchronous attribution and independent
+profiler-free runs for final performance/HBM comparisons. The output path must be
+new and distinct from the benchmark JSON.
+
+The multi-layer adapter reports the actual home-runtime bypass for routes already
+inside one receive window: no active replica bindings and unchanged destination
+loads, even with a configured B budget. It does not report the ST helper's
+hypothetical exact-mean placement as if those replicas executed.
 
 The legacy single-layer fixed-route F+B workload excludes optimizer updates and activation
 checkpointing. In particular, B1 can reuse same-version physical weights
