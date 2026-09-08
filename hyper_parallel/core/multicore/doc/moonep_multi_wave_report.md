@@ -60,6 +60,12 @@ allocated 增加约 1 MiB、reserved 增加 36 MiB，B pool 不变。详见第 1
 仅一份 B pool。这是正确性接入，不是新的加速结论，见第 10.2.15 节及
 [完整模型报告](megamoe_qwen_shared_integration_20260908.md)。
 
+随后已消除基准的双模型/optimizer 常驻，原始宽度八层完成 fresh-process ABBA、每步 AdamW
+及首次全量精度比较。MegaMoe 的 peak allocated + SHMEM 最高约 42.059 GiB；每 rank 只驻留
+一套约 36.608 GiB 的训练状态。计时记录中存在其他设备进程，且多步 loss 自重复仍有分歧，
+因此先补数值重复性与计时窗口归因，再继续细粒度调度优化，见第 10.2.16 节及
+[单后端驻留报告](megamoe_qwen_isolated_benchmark_20260908.md)。
+
 ### 1.1 结论摘要
 
 - 当前组合不是把 MoonEP CUDA 实现直接移植到 Ascend，而是把其“按路由热度动态复制专家”的思想，
@@ -1299,6 +1305,29 @@ pool bytes 不是 allocator peak，短测 A/B 不是整模型优化 ABBA。下�
 73.216 GiB，不含激活和 workspace，不能在 64 GiB 卡上当作单模型基准。下一项优先拆分两侧
 fresh process，再补默认八层 matched ABBA，详见完整模型报告第 5 节；尚无整模型优化收益结论。
 
+#### 10.2.16 单后端驻留与原始八层基准
+
+默认 shell 改为无框架 parent，顺序启动 common A1、MegaMoe B1/B2、common A2；每组只持有
+一个模型与一套 FP32-master AdamW。A1 导出 rank-local CPU reference，后三组逐阶段全量
+比较输入、初始参数、loss/logits、梯度和更新后参数；原 `rtol=0.02 / atol=0.002` 不变。
+快照与 source/native fingerprint 均在稳态计时外，保留 `BENCHMARK_MODE=paired` 回归路径。
+
+EP8、原始八层 H5120/I1792/T4096/V32000、E48/K8、shared-B1、capacity=1.5、Dirichlet 0.1:42，
+四组各执行 3 warmup + 7 measured AdamW steps，均正常退出。83 个参数/梯度张量通过首次
+全量比较；最大梯度绝对误差 3.8147e-6，更新后最大归一化误差 0.982151。CPU 281 passed /
+259 subtests；新隔离模式和旧 paired 模式各三种路由八卡回归通过。
+
+每 rank 的单 backend 训练状态实测为 36.608 GiB。MegaMoe 八层共用的 B weight/gradient
+仍为 52.5/105 MiB，SHMEM heap 为 832 MiB；稳态 peak allocated + heap 最高 42.059 GiB，
+common 为 43.926 GiB。全组最大值降低约 1.867 GiB，但 rank 2/4/5 分别增加约
+0.936/0.486/0.479 GiB，不能说所有 rank 的 HBM 代价都消失。CPU references 占 99.575 GiB。
+
+进程 median 均值为 common 1207.770 ms、MegaMoe 713.717 ms，观测耗时差 40.906%。这不是
+本轮内核加速，也不与独立层 receive-only 收益叠加。完整采样发现 B1/A2 生存期内有额外设备
+PID；没有逐步绝对窗口标记，不能将本组称为严格独占 ABBA 或用于确认细小增量。后续 loss
+在 common/common、MegaMoe/MegaMoe 自重复中均有分歧，首次精度通过不等于多步/收敛验收。
+后续优先级据此调整，原始数据及限制见 [单后端驻留报告](megamoe_qwen_isolated_benchmark_20260908.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1606,11 +1635,14 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **优先消除完整 Qwen 基准的双模型常驻，再做 matched ABBA。**
+1. **先补整模型多步数值重复性和可审计计时窗口，再按 profile 选优化。**
    receive-only 解耦已经保留，独立 16 层 MoE 的偏斜 step 减少 4.086%，只增加约 1 MiB allocated
    和 36 MiB reserved（第 10.2.14 节）。整模型 shared-B 接入及三种路由的小形状训练验收已完成
-   （第 10.2.15 节），原宽度两层/四层也已通过。先分离两侧 fresh process，避免八层双套训练状态
-   的 73.216 GiB 下界淹没 shared-B 成本，再补完整模型 HBM/profile，不把独立层收益外推整网。
+   （第 10.2.15 节），单后端驻留及原始八层 ABBA/首次精度也已完成（第 10.2.16 节），不再受
+   双套训练状态 73.216 GiB 下界阻断。但后续 loss 在同 backend 自重复中已有分歧，先做
+   common/common、MegaMoe/MegaMoe 与交叉 backend 的逐步梯度/更新后参数对照，区分非确定性、
+   学习率敏感性及 backend 特有误差，不放宽精度门槛。计时补绝对窗口标记并与所有设备 PID
+   对齐，在稳定八卡窗口复测后采完整模型 HBM/profile，不把独立层收益外推整网。
    rank 1 的约 57.6 ms 晚邻居窗口及 rank 3 native 计算仍需归因。
    整专家合包已回退 1.806%，独立收尾也无确认收益（第 10.2.11--10.2.12 节），不再盲目叠加；
    含发送 batch 必须保留 native dW 的真实就绪依赖，不能泛化删除 caller wait。
@@ -1658,6 +1690,7 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 | multi-wave backward DAG | `hyper_parallel/core/multicore/modules/mega_moe/backward/graph.py` |
 | shared device worker | `hyper_parallel/core/multicore/ops/runtime/worker_kernel.h` |
 | Qwen model/optimizer benchmark | `examples/torch/multicore/mega_moe/qwen_moe_model.py`、`qwen_moe_benchmark.py` |
+| Qwen 单后端驻留 / CPU reference | `examples/torch/multicore/mega_moe/qwen_moe_isolated.py`、`qwen_moe_snapshots.py` |
 | checkpointed multi-layer benchmark | `examples/torch/multicore/benchmark_mega_moe_layers.py` |
 | opt-in rank-zero trace / all-rank forward/backward cycles | `examples/torch/multicore/mega_moe_layer_profile.py` |
 | opt-in all-rank P2P payload / readiness | `examples/torch/multicore/mega_moe_p2p_profile.py` |

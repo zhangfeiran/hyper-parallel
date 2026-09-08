@@ -18,12 +18,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import os
 import statistics
 import sys
 import time
 from dataclasses import asdict, dataclass
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +37,12 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 import torch_npu
-from examples.torch.multicore.mega_moe.qwen_moe_config import QwenMoeConfig, make_config, parse_args
+import hyper_parallel
+from examples.torch.multicore.mega_moe.qwen_moe_config import (
+    QwenMoeConfig, make_config, optimizer_contract, parse_args,
+)
 from examples.torch.multicore.mega_moe.qwen_moe_model import QwenMoeModel
+from examples.torch.multicore.mega_moe.qwen_moe_snapshots import compare_snapshot, save_snapshot
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.components.optim import (
@@ -46,6 +53,7 @@ from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.optimizer import get_hyper_optimizer
 from hyper_parallel.platform.torch.common import GroupedExperts
+from hyper_parallel.platform.torch.symmetric_memory import lifecycle
 
 # pylint: enable=wrong-import-position
 
@@ -54,6 +62,7 @@ _BATCH_SIZE = 1
 _DTYPE = torch.bfloat16
 _RTOL = 2e-2
 _ATOL = 2e-3
+_SNAPSHOT_PHASES = ("inputs", "initial_parameters", "forward", "gradients", "updated_parameters")
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,75 @@ class _Workload:
     labels: torch.Tensor
     world_size: int
     device: torch.device
+
+
+class _AccuracySnapshots:
+    """Coordinate rank-local CPU references without retaining a second device model."""
+
+    def __init__(self, args: argparse.Namespace, config: QwenMoeConfig, rank: int, world_size: int) -> None:
+        """Bind snapshot ownership to the complete workload and global rank."""
+        self.reference = args.reference_dir is not None
+        self.directory = Path(args.reference_dir or args.snapshot_dir) / f"rank{rank}"
+        self.contract = {
+            "configuration": asdict(config), "rank": rank, "world_size": world_size, "seed": args.seed,
+            "optimizer": optimizer_contract(args),
+        }
+        self.world_size = world_size
+        self.results: dict[str, Any] = {}
+
+    def phase(self, name: str, tensors: Iterator[tuple[str, torch.Tensor]]) -> None:
+        """Save or compare one phase, propagating local I/O errors to every rank."""
+        local = {}
+        try:
+            if name not in _SNAPSHOT_PHASES or name in self.results:
+                raise ValueError(f"unexpected or repeated Qwen snapshot phase: {name}")
+            contract = {**self.contract, "phase": name}
+            path = self.directory / f"{name}.pt"
+            if self.reference:
+                manifest = json.loads((self.directory / "complete.json").read_text(encoding="utf-8"))
+                if manifest != {"contract": self.contract, "phases": list(_SNAPSHOT_PHASES)}:
+                    raise ValueError("Qwen reference is incomplete or belongs to a different workload.")
+                exact = name in ("inputs", "initial_parameters")
+                local["result"] = compare_snapshot(path, contract, tensors,
+                                                   rtol=0.0 if exact else _RTOL, atol=0.0 if exact else _ATOL)
+            else:
+                local["result"] = save_snapshot(path, contract, tensors)
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+            local["error"] = f"{type(error).__name__}: {error}"
+        gathered = [None] * self.world_size
+        dist.all_gather_object(gathered, local)
+        errors = {rank: value["error"] for rank, value in enumerate(gathered) if "error" in value}
+        if errors:
+            raise RuntimeError(f"Qwen {name} snapshot errors by rank: {errors}")
+        results = [value["result"] for value in gathered]
+        result = dict(results[0])
+        if any(value["tensor_count"] != result["tensor_count"] for value in results):
+            raise RuntimeError(f"Qwen {name} tensor counts differ across ranks: {results}")
+        if self.reference:
+            result["passed"] = all(value["passed"] for value in results)
+            for metric in ("absolute", "normalized"):
+                worst = max(results, key=lambda value: value[f"max_{metric}_error"])
+                for key in (f"max_{metric}_error", f"max_{metric}_error_tensor"):
+                    result[key] = worst[key]
+            if not result["passed"]:
+                raise RuntimeError(f"Qwen isolated {name} comparison failed: {result}")
+        self.results[name] = result
+
+    def finish(self) -> None:
+        """Publish completion only after every snapshot and optimizer step succeeded."""
+        local_error = None
+        try:
+            if set(self.results) != set(_SNAPSHOT_PHASES):
+                raise ValueError(f"Qwen snapshot phases incomplete: {sorted(self.results)}")
+            if not self.reference:
+                with (self.directory / "complete.json").open("x", encoding="utf-8") as stream:
+                    json.dump({"contract": self.contract, "phases": list(_SNAPSHOT_PHASES)}, stream, sort_keys=True)
+        except (OSError, ValueError) as error:
+            local_error = str(error)
+        errors = [None] * self.world_size
+        dist.all_gather_object(errors, local_error)
+        if any(error is not None for error in errors):
+            raise RuntimeError(f"Qwen snapshot completion failed: {errors}")
 
 
 class _CommonExpertsAdapter(torch.nn.Module):
@@ -268,6 +346,7 @@ def _optimizer_step(
     workload: _Workload,
     *,
     capture_gradients: bool = False,
+    gradient_device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
     """Run one AdamW step and optionally retain first-step gradients."""
     with SkipDTensorDispatch():
@@ -284,11 +363,12 @@ def _optimizer_step(
     gradients = None
     if capture_gradients:
         gradients = {
-            name: tensor.detach().clone()
-            for name, tensor in _canonical_tensors(
+            name: tensor.detach().to(device=gradient_device, copy=True) if gradient_device is not None
+            else tensor.detach().clone()
+            for name, tensor in _iter_canonical_tensors(
                 workload.model,
                 gradients=True,
-            ).items()
+            )
         }
     with SkipDTensorDispatch():
         workload.optimizer.step()
@@ -311,7 +391,7 @@ def _all_gradients_finite(
     for gradient in gradients.values():
         finite = torch.minimum(
             finite,
-            torch.isfinite(gradient).all().to(torch.int32),
+            torch.isfinite(gradient).all().to(device=device, dtype=torch.int32),
         )
     dist.all_reduce(finite, op=dist.ReduceOp.MIN)
     return bool(finite.cpu().item())
@@ -366,6 +446,8 @@ def _expert_parameters_updated(
 
 def _validate_first_step(
     workload: _Workload,
+    *,
+    gradient_device: torch.device | None = None,
 ) -> tuple[
     dict[str, Any],
     float,
@@ -386,6 +468,7 @@ def _validate_first_step(
     loss, logits, gradients = _optimizer_step(
         workload,
         capture_gradients=True,
+        gradient_device=gradient_device,
     )
     torch.npu.synchronize(workload.device)
     if gradients is None:
@@ -428,18 +511,16 @@ def _parameter_value(
     return _local_tensor(value)
 
 
-def _canonical_tensors(
+def _iter_canonical_tensors(
     model: QwenMoeModel,
     *,
     gradients: bool,
-) -> dict[str, torch.Tensor]:
-    """Return dense and packed local-expert tensors under backend-neutral names."""
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield canonical tensors without retaining every layer's temporary packing."""
     expert_parameters = {id(parameter) for parameter in model.expert_parameters()}
-    tensors = {
-        f"dense.{name}": _parameter_value(parameter, gradients=gradients)
-        for name, parameter in model.named_parameters()
-        if id(parameter) not in expert_parameters
-    }
+    for name, parameter in model.named_parameters():
+        if id(parameter) not in expert_parameters:
+            yield f"dense.{name}", _parameter_value(parameter, gradients=gradients)
     for layer_index, layer in enumerate(model.layers):
         experts = layer.mlp.experts
         if isinstance(experts, MegaMoeExperts):
@@ -462,9 +543,13 @@ def _canonical_tensors(
             raise TypeError(
                 f"unsupported Qwen expert backend {type(experts).__name__}."
             )
-        tensors[f"experts.{layer_index}.gate_up_weight"] = gate_up
-        tensors[f"experts.{layer_index}.down_weight"] = down
-    return tensors
+        yield f"experts.{layer_index}.gate_up_weight", gate_up
+        yield f"experts.{layer_index}.down_weight", down
+
+
+def _canonical_tensors(model: QwenMoeModel, *, gradients: bool) -> dict[str, torch.Tensor]:
+    """Retain the original paired-backend oracle's canonical tensor interface."""
+    return dict(_iter_canonical_tensors(model, gradients=gradients))
 
 
 def _compare_tensor_maps(
@@ -535,22 +620,32 @@ def _compare_tensor_maps(
     return result
 
 
+def _symmetric_heap_bytes() -> int:
+    """Read the external SHMEM allocation, which Torch allocator statistics exclude."""
+    return lifecycle._PROCESS_STATE.heap_size or 0  # pylint: disable=protected-access
+
+
 def _measure_backend(
     workload: _Workload,
     validation: dict[str, Any],
     first_step_ms: float,
     args: argparse.Namespace,
+    *,
+    collect_memory: bool = False,
 ) -> dict[str, Any]:
     """Finish warmup and measure one backend after its compared first step."""
     for _ in range(args.warmup_steps - 1):
         _timed_step(workload)
+    if collect_memory:
+        torch.npu.synchronize(workload.device)
+        torch.npu.reset_peak_memory_stats(workload.device)
     latencies = []
     losses = []
     for _ in range(args.measured_steps):
         loss, latency = _timed_step(workload)
         latencies.append(latency)
         losses.append(float(loss.float().cpu().item()))
-    return {
+    result = {
         "validation": validation,
         "first_optimizer_step_ms": first_step_ms,
         "steady_state_optimizer_step_ms": {
@@ -561,6 +656,28 @@ def _measure_backend(
         },
         "measured_losses": losses,
     }
+    if collect_memory:
+        torch.npu.synchronize(workload.device)
+        free_bytes, total_bytes = torch.npu.mem_get_info(workload.device)
+        local_memory = {
+            "peak_allocated_bytes": torch.npu.max_memory_allocated(workload.device),
+            "peak_reserved_bytes": torch.npu.max_memory_reserved(workload.device),
+            "final_allocated_bytes": torch.npu.memory_allocated(workload.device),
+            "final_reserved_bytes": torch.npu.memory_reserved(workload.device),
+            "symmetric_heap_bytes": _symmetric_heap_bytes(),
+            "final_device_used_bytes": total_bytes - free_bytes,
+            "final_device_total_bytes": total_bytes,
+        }
+        # B pools are already in the allocator, and workspace views are already
+        # in SHMEM. Do not count either twice. This excludes opaque driver/HCCL
+        # allocations; the device-wide final sample is not a runtime peak.
+        local_memory["conservative_total_peak_bytes"] = (
+            local_memory["peak_allocated_bytes"] + local_memory["symmetric_heap_bytes"]
+        )
+        per_rank = [None] * workload.world_size
+        dist.all_gather_object(per_rank, local_memory)
+        result["steady_state_memory_per_rank"] = per_rank
+    return result
 
 
 def _shared_pool_ledger(model: QwenMoeModel) -> dict[str, int]:
@@ -715,6 +832,105 @@ def _compare_first_step_accuracy(
     return accuracy, first_steps
 
 
+def _runtime_identity() -> dict[str, Any]:
+    """Record local source/artifact identity outside every timing window."""
+    repo = Path(__file__).resolve().parents[4]
+    if Path(hyper_parallel.__file__).resolve() != repo / "hyper_parallel/__init__.py":
+        raise RuntimeError("Qwen worker must import hyper_parallel from this checkout; reinstall with pip -e .")
+    sources = list(Path(__file__).parent.glob("*.py"))
+    sources.extend((repo / "hyper_parallel").rglob("*.py"))
+    artifacts = [path for path in (repo / "build/native/payload/hyper_parallel").rglob("*")
+                 if path.is_file() and path.suffix in (".so", ".o")]
+    return {
+        "torch": str(torch.__version__), "torch_npu": str(torch_npu.__version__),
+        "transformers": importlib.metadata.version("transformers"),
+        "source_scope": "qwen-example-and-hyper_parallel-python-v1",
+        "native_scope": "build/native/payload/hyper_parallel/**/*.{so,o}",
+        "source_sha256": {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in sorted(sources)},
+        "native_sha256": {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in sorted(artifacts)},
+    }
+
+
+def _resident_training_ledger(workload: _Workload) -> dict[str, int]:
+    """Count the one resident backend's local model and optimizer tensors after timing."""
+    def tensor_bytes(tensor: torch.Tensor) -> int:
+        """Count local storage elements without allocating diagnostic tensors."""
+        value = _local_tensor(tensor)
+        return value.numel() * value.element_size()
+
+    parameters = list(workload.model.parameters())
+    main_parameters = [parameter for group in workload.optimizer.param_groups for parameter in group["params"]]
+    state = [value for optimizer in workload.optimizer.chained_optimizers
+             for values in optimizer.state.values() for value in values.values() if isinstance(value, torch.Tensor)]
+    return {
+        "resident_backend_count": 1,
+        "local_parameter_count": sum(_local_tensor(parameter).numel() for parameter in parameters),
+        "model_bytes": sum(map(tensor_bytes, parameters)),
+        "main_parameter_bytes": sum(map(tensor_bytes, main_parameters)),
+        "main_gradient_bytes": sum(tensor_bytes(parameter.grad) for parameter in main_parameters
+                                   if parameter.grad is not None),
+        "optimizer_state_bytes": sum(map(tensor_bytes, state)),
+    }
+
+
+def _run_single_backend(
+    args: argparse.Namespace, config: QwenMoeConfig, rank: int, world_size: int, device: torch.device,
+) -> int:
+    """Validate and time exactly one backend, keeping accuracy snapshots on CPU."""
+    identity = _runtime_identity()
+    snapshots = _AccuracySnapshots(args, config, rank, world_size)
+    input_ids, labels = _build_batch(config, rank, args.seed, device)
+    snapshots.phase("inputs", iter((("input_ids", input_ids), ("labels", labels))))
+    model = _build_backend_model(config, device, args.seed, args.backend)
+    try:
+        snapshots.phase("initial_parameters", _iter_canonical_tensors(model, gradients=False))
+        workload = _build_workload(model, args, input_ids, labels, world_size, device)
+        validation, first_ms, loss, logits, gradients = _validate_first_step(
+            workload, gradient_device=torch.device("cpu"),
+        )
+        snapshots.phase("forward", iter((("loss", loss), ("logits", logits))))
+        snapshots.phase("gradients", iter(gradients.items()))
+        snapshots.phase("updated_parameters", _iter_canonical_tensors(model, gradients=False))
+        del gradients, loss, logits
+        torch.npu.synchronize(device)
+        torch.npu.empty_cache()
+        measurement = _measure_backend(workload, validation, first_ms, args, collect_memory=True)
+        snapshots.finish()
+        ledger = [None] * world_size
+        dist.all_gather_object(ledger, _resident_training_ledger(workload))
+        pools = [None] * world_size
+        dist.all_gather_object(pools, _shared_pool_ledger(model) if args.backend == "mega_moe" else None)
+        if not _all_ranks_true(identity == _runtime_identity(), device):
+            raise RuntimeError("Qwen source/artifact identity changed during the run.")
+        identities = [None] * world_size
+        dist.all_gather_object(identities, identity)
+        if any(value != identity for value in identities):
+            raise RuntimeError("Qwen source/artifact identity differs across ranks.")
+        # Every node's framework-free parent validates its own local result file.
+        if int(os.environ.get("LOCAL_RANK", str(rank))) == 0:
+            result = {
+                "mode": "isolated_backend", "backend": args.backend, "configuration": asdict(config),
+                "initialization_seed": args.seed, "world_size": world_size,
+                "warmup_steps": args.warmup_steps, "measured_steps": args.measured_steps,
+                "optimizer": snapshots.contract["optimizer"],
+                "accuracy": {"mode": "compare" if snapshots.reference else "export",
+                             "phases": snapshots.results, "reference_dir": args.reference_dir,
+                             "snapshot_dir": args.snapshot_dir},
+                "measurement": measurement, "resident_training_per_rank": ledger,
+                "shared_pool_per_rank": pools, "runtime": identity,
+            }
+            path = Path(args.output)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            print(f"RESULT_JSON={path}", flush=True)
+        dist.barrier()
+        return 0
+    finally:
+        model.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Compare common and MegaMoe Qwen accuracy, then time A and B.
 
@@ -729,6 +945,8 @@ def main(argv: list[str] | None = None) -> int:
     config = make_config(args)
     models: dict[str, QwenMoeModel] = {}
     try:
+        if args.backend != "both":
+            return _run_single_backend(args, config, rank, world_size, device)
         input_ids, labels = _build_batch(config, rank, args.seed, device)
         for backend in ("common", "mega_moe"):
             models[backend] = _build_backend_model(

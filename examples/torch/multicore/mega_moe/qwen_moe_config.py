@@ -175,11 +175,12 @@ def _capacity_factor(value: str) -> float | None:
     return factor
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, *, parser: argparse.ArgumentParser | None = None,
+) -> argparse.Namespace:
     """Parse the minimal optimizer benchmark interface."""
-    parser = argparse.ArgumentParser(
-        description="Run an eight-NPU Qwen MoE optimizer-step benchmark.",
-    )
+    if parser is None:
+        parser = argparse.ArgumentParser(description="Run an eight-NPU Qwen MoE optimizer-step benchmark.")
     parser.add_argument("--warmup-steps", type=int, default=3)
     parser.add_argument("--measured-steps", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -202,12 +203,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="eager_on_first_forward",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--backend", choices=("both", "common", "mega_moe"), default="both")
+    snapshots = parser.add_mutually_exclusive_group()
+    snapshots.add_argument("--snapshot-dir", help="write CPU accuracy references for a single backend")
+    snapshots.add_argument("--reference-dir", help="compare a single backend against completed CPU references")
     parser.add_argument(
         "--output",
         default="output/qwen_moe_benchmark.json",
         help="rank-zero JSON result path",
     )
     args = parser.parse_args(argv)
+    has_snapshots = bool(args.snapshot_dir or args.reference_dir)
+    if (args.backend != "both") != has_snapshots:
+        raise ValueError("single-backend runs require --snapshot-dir or --reference-dir; paired runs exclude both.")
     if args.warmup_steps < 1:
         raise ValueError(f"warmup_steps must be positive, got {args.warmup_steps}.")
     if args.measured_steps <= 0:
@@ -243,3 +251,9 @@ def make_config(args: argparse.Namespace) -> QwenMoeConfig:
         router_load_alpha=args.router_load_alpha,
         router_load_seed=args.router_load_seed,
     )
+
+
+def optimizer_contract(args: argparse.Namespace) -> dict:
+    """Describe the fixed numerical optimizer contract shared by workers and parents."""
+    return {"name": "AdamW", "learning_rate": args.learning_rate, "weight_decay": args.weight_decay,
+            "betas": [0.9, 0.999], "eps": 1e-8, "model_dtype": "bfloat16", "main_dtype": "float32"}

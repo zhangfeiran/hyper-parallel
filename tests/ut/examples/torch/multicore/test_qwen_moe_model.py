@@ -15,14 +15,18 @@
 """CPU-only construction and input contracts for the optional full Qwen example."""
 
 import importlib
+import json
+import tempfile
 import unittest
 from dataclasses import replace
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from examples.torch.multicore.mega_moe.qwen_moe_config import QwenMoeConfig
+from examples.torch.multicore.mega_moe.qwen_moe_config import make_config, parse_args
 
 # Only this model integration file requires the example's optional packages;
 # configuration and namespace tests run without either dependency installed.
@@ -121,3 +125,147 @@ class TestExpertUpdateProbe(unittest.TestCase):
             )
         self.assertFalse(updated)
         rank_max.assert_called_once_with(0.0, torch.device('cpu'))
+
+
+class TestSingleBackendSnapshots(unittest.TestCase):
+    """Mock collectives while exercising real CPU snapshot coordination and ownership."""
+
+    @staticmethod
+    def _gather(destination, local) -> None:
+        """Emulate agreement with an identical peer, without distributed initialization."""
+        destination[:] = [local] * len(destination)
+
+    def test_incomplete_reference_fails_on_every_rank(self) -> None:
+        """A directory with no completion marker is not an accepted baseline."""
+        with tempfile.TemporaryDirectory() as directory:
+            args = parse_args(['--backend', 'mega_moe', '--reference-dir', directory])
+            snapshots = qwen_benchmark._AccuracySnapshots(args, make_config(args), 0, 2)
+            with patch.object(qwen_benchmark.dist, 'all_gather_object', side_effect=self._gather), \
+                    self.assertRaisesRegex(RuntimeError, 'snapshot errors by rank'):
+                snapshots.phase('inputs', iter([('input_ids', torch.ones(2, dtype=torch.int64))]))
+
+    def test_round_trip_checks_every_phase_before_completion(self) -> None:
+        """A complete CPU reference supports a fresh process without preserving device tensors."""
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(qwen_benchmark.dist, 'all_gather_object', side_effect=self._gather):
+            args = parse_args(['--backend', 'common', '--snapshot-dir', directory])
+            writer = qwen_benchmark._AccuracySnapshots(args, make_config(args), 0, 2)
+            for phase in qwen_benchmark._SNAPSHOT_PHASES:
+                writer.phase(phase, iter([('value', torch.ones(2))]))
+            self.assertFalse((Path(directory) / 'rank0/complete.json').exists())
+            writer.finish()
+            args = parse_args(['--backend', 'mega_moe', '--reference-dir', directory])
+            reader = qwen_benchmark._AccuracySnapshots(args, make_config(args), 0, 2)
+            for phase in qwen_benchmark._SNAPSHOT_PHASES:
+                reader.phase(phase, iter([('value', torch.ones(2))]))
+                self.assertTrue(reader.results[phase]['passed'])
+            reader.finish()
+
+    def test_peer_io_error_is_not_masked_by_local_success(self) -> None:
+        """A rank-local filesystem failure must not let the other ranks continue the model."""
+        def gather_with_error(destination: list, local: dict) -> None:
+            """Report that the peer could not write its snapshot."""
+            destination[:] = [local, {'error': 'disk full'}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            args = parse_args(['--backend', 'common', '--snapshot-dir', directory])
+            writer = qwen_benchmark._AccuracySnapshots(args, make_config(args), 0, 2)
+            with patch.object(qwen_benchmark.dist, 'all_gather_object', side_effect=gather_with_error), \
+                    self.assertRaisesRegex(RuntimeError, 'disk full'):
+                writer.phase('inputs', iter([('input_ids', torch.ones(2, dtype=torch.int64))]))
+            self.assertFalse((Path(directory) / 'rank0/complete.json').exists())
+
+    def test_cpu_gradient_finiteness_uses_only_scalar_collectives(self) -> None:
+        """CPU snapshots must still participate in the original all-rank finite-gradient gate."""
+        with patch.object(qwen_benchmark.dist, 'all_reduce') as reduce:
+            self.assertTrue(qwen_benchmark._all_gradients_finite({'weight': torch.ones(3)}, torch.device('cpu')))
+            self.assertFalse(qwen_benchmark._all_gradients_finite({'weight': torch.tensor([float('nan')])},
+                                                               torch.device('cpu')))
+        self.assertTrue(all(call.args[0].numel() == 1 for call in reduce.call_args_list))
+
+    def test_memory_window_excludes_warmup_and_counts_external_heap_once(self) -> None:
+        """Separate allocator peaks, the external heap, and a final device-wide sample."""
+        args = parse_args(['--warmup-steps', '2', '--measured-steps', '2'])
+        workload = MagicMock(device=torch.device('cpu'), world_size=8)
+        events = []
+
+        def timed_step(_workload: object) -> tuple[torch.Tensor, float]:
+            """Record each synthetic optimizer step without running a device operation."""
+            events.append('step')
+            return torch.ones(()), 3.0
+
+        with patch.object(qwen_benchmark, '_timed_step', side_effect=timed_step), \
+                patch.object(qwen_benchmark, '_symmetric_heap_bytes', return_value=50, create=True), \
+                patch.object(qwen_benchmark.torch.npu, 'synchronize'), \
+                patch.object(qwen_benchmark.torch.npu, 'reset_peak_memory_stats',
+                             side_effect=lambda _: events.append('reset')), \
+                patch.object(qwen_benchmark.torch.npu, 'max_memory_allocated', return_value=100), \
+                patch.object(qwen_benchmark.torch.npu, 'max_memory_reserved', return_value=120), \
+                patch.object(qwen_benchmark.torch.npu, 'memory_allocated', return_value=90), \
+                patch.object(qwen_benchmark.torch.npu, 'memory_reserved', return_value=110), \
+                patch.object(qwen_benchmark.torch.npu, 'mem_get_info', return_value=(300, 500)), \
+                patch.object(qwen_benchmark.dist, 'all_gather_object', side_effect=self._gather):
+            result = qwen_benchmark._measure_backend(workload, {}, 10.0, args, collect_memory=True)
+        self.assertEqual(events, ['step', 'reset', 'step', 'step'])
+        memory = result['steady_state_memory_per_rank']
+        self.assertEqual(len(memory), 8)
+        self.assertEqual(memory[0]['symmetric_heap_bytes'], 50)
+        self.assertEqual(memory[0]['conservative_total_peak_bytes'], 150)
+        self.assertEqual(memory[0]['final_device_used_bytes'], 200)
+        self.assertEqual(memory[0]['final_device_total_bytes'], 500)
+
+    def test_single_backend_builds_one_model_and_closes_it(self) -> None:
+        """The worker cannot retain the paired path's second model or device gradient snapshots."""
+        with tempfile.TemporaryDirectory() as directory:
+            args = parse_args(['--backend', 'mega_moe', '--snapshot-dir', directory,
+                               '--output', directory + '/run.json'])
+            config = make_config(args)
+            model, workload = MagicMock(), MagicMock()
+            snapshots = MagicMock(contract={'optimizer': {}}, results={}, reference=False)
+            cpu = torch.device('cpu')
+            first_step = ({'loss_finite': True}, 1.0, torch.ones(()), torch.ones((1, 2)), {'weight': torch.ones(2)})
+            with patch.object(qwen_benchmark, '_runtime_identity', return_value={}), \
+                    patch.object(qwen_benchmark, '_AccuracySnapshots', return_value=snapshots), \
+                    patch.object(qwen_benchmark, '_build_batch', return_value=(torch.ones(2), torch.ones(2))), \
+                    patch.object(qwen_benchmark, '_build_backend_model', return_value=model) as build, \
+                    patch.object(qwen_benchmark, '_build_workload', return_value=workload) as attach, \
+                    patch.object(qwen_benchmark, '_validate_first_step', return_value=first_step) as validate, \
+                    patch.object(qwen_benchmark, '_measure_backend', return_value={}), \
+                    patch.object(qwen_benchmark, '_resident_training_ledger',
+                                 return_value={'resident_backend_count': 1}), \
+                    patch.object(qwen_benchmark, '_shared_pool_ledger', return_value={}), \
+                    patch.object(qwen_benchmark, '_all_ranks_true', return_value=True), \
+                    patch.object(qwen_benchmark.dist, 'all_gather_object', side_effect=self._gather), \
+                    patch.object(qwen_benchmark.dist, 'barrier'), \
+                    patch.object(qwen_benchmark.torch.npu, 'synchronize'), \
+                    patch.object(qwen_benchmark.torch.npu, 'empty_cache'):
+                self.assertEqual(qwen_benchmark._run_single_backend(args, config, 0, 8, cpu), 0)
+            build.assert_called_once_with(config, cpu, args.seed, 'mega_moe')
+            attach.assert_called_once()
+            validate.assert_called_once_with(workload, gradient_device=cpu)
+            model.close.assert_called_once()
+            payload = json.loads(Path(args.output).read_text(encoding='utf-8'))
+            self.assertEqual(len(payload['resident_training_per_rank']), 8)
+
+    def test_runtime_identity_includes_kernel_objects_and_checks_editable(self) -> None:
+        """Native .o kernels must not disappear from the identity behind an unchanged adapter .so."""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            worker = repo / 'examples/torch/multicore/mega_moe/qwen_moe_benchmark.py'
+            package = repo / 'hyper_parallel/__init__.py'
+            native = repo / 'build/native/payload/hyper_parallel'
+            for path in (worker, package, native / 'adapter.so', native / 'kernel.o', native / 'ignored.txt'):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('identity fixture', encoding='utf-8')
+            with patch.object(qwen_benchmark, '__file__', str(worker)), \
+                    patch.object(qwen_benchmark.hyper_parallel, '__file__', str(package)):
+                identity = qwen_benchmark._runtime_identity()
+                self.assertEqual(set(identity['native_sha256']),
+                                 {'build/native/payload/hyper_parallel/adapter.so',
+                                  'build/native/payload/hyper_parallel/kernel.o'})
+                self.assertEqual(set(identity['source_sha256']),
+                                 {'examples/torch/multicore/mega_moe/qwen_moe_benchmark.py',
+                                  'hyper_parallel/__init__.py'})
+                with patch.object(qwen_benchmark.hyper_parallel, '__file__', str(repo / 'stale/__init__.py')), \
+                        self.assertRaisesRegex(RuntimeError, 'this checkout'):
+                    qwen_benchmark._runtime_identity()

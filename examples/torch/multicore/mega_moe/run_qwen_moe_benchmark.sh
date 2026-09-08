@@ -23,7 +23,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 if [[ "$PYTHON_BIN" != */* ]]; then
     PYTHON_BIN=$(command -v "$PYTHON_BIN") || die "Python is not executable: $PYTHON_BIN"
 fi
-TORCHRUN_BIN="${TORCHRUN_BIN:-$(dirname "$PYTHON_BIN")/torchrun}"
+BENCHMARK_MODE="${BENCHMARK_MODE:-isolated}"
 CANN_ENV_FILE="${CANN_ENV_FILE:-/usr/local/Ascend/cann/set_env.sh}"  # codespell:ignore cann
 NATIVE_ENV_FILE="${NATIVE_ENV_FILE:-$ROOT/build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash}"
 SHMEM_LIB_DIR="${SHMEM_LIB_DIR:-$ROOT/build/native/payload/hyper_parallel/core/symmetric_memory/lib/shmem}"
@@ -46,7 +46,14 @@ source_env() {
 }
 
 [[ -x "$PYTHON_BIN" ]] || die "Python is not executable: $PYTHON_BIN"
-[[ -x "$TORCHRUN_BIN" ]] || die "torchrun is not executable: $TORCHRUN_BIN"
+if [[ -n "${TORCHRUN_BIN:-}" ]]; then
+    [[ -x "$TORCHRUN_BIN" ]] || die "torchrun is not executable: $TORCHRUN_BIN"
+    TORCHRUN_COMMAND=("$TORCHRUN_BIN")
+else
+    TORCHRUN_COMMAND=("$PYTHON_BIN" -m torch.distributed.run)
+fi
+[[ "$BENCHMARK_MODE" == isolated || "$BENCHMARK_MODE" == paired ]] || \
+    die "BENCHMARK_MODE must be isolated or paired"
 [[ -f "$SCRIPT_DIR/qwen_moe_benchmark.py" ]] || \
     die "benchmark runner is missing under $ROOT"
 [[ -d "$SHMEM_LIB_DIR" ]] || die "SHMEM library directory is missing: $SHMEM_LIB_DIR"
@@ -77,8 +84,13 @@ case "$IMPORTED_PACKAGE" in
     *) die "hyper_parallel imports from $IMPORTED_PACKAGE instead of $ROOT; run $PYTHON_BIN -m pip install -e $ROOT" ;;
 esac
 
+if [[ "$BENCHMARK_MODE" == isolated ]]; then
+    exec timeout --kill-after=60s "$TIMEOUT_SECONDS" \
+        "$PYTHON_BIN" "$SCRIPT_DIR/qwen_moe_isolated.py" "$@"
+fi
+
 exec timeout --kill-after=60s "$TIMEOUT_SECONDS" \
-    "$TORCHRUN_BIN" \
+    "${TORCHRUN_COMMAND[@]}" \
     --nnodes="$NNODES_VALUE" \
     --nproc_per_node="$NPROC_PER_NODE_VALUE" \
     --node_rank="$NODE_RANK_VALUE" \
