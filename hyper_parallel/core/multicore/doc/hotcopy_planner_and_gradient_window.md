@@ -21,7 +21,9 @@ experts = MegaMoeExperts(
 ```
 
 这是容量配置示例；实际运行还需要底层通信和 kernel descriptor 支持对应的 EP 规模。
-当前 descriptor 的任务上限仍是 25600，本轮没有解除此前 EP64 配置触发的任务容量限制。
+本报告最初记录的 25600 task 固定容量限制，已由后续 [runtime descriptor v2](runtime_descriptor_v2.md)
+解除；当前按图分配 task/event 容量。EP16/32/64 meta 构图已通过，实际多机执行仍需独立验收，
+见[当前待办](megamoe_optimization_backlog.md)。
 修改 B 与接收窗口是两个独立的调优动作：前者影响负载均衡、权重复制量和剩余 wave 数，
 后者在既定 placement 上平衡梯度接收内存与通信并发。
 

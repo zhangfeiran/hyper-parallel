@@ -5,6 +5,9 @@
 MoonEP 风格有界热专家副本与 lossless multi-wave 的组合实现、内存模型和性能验证，见
 [MegaMoe MoonEP + multi-wave 技术报告](moonep_multi_wave_report.md)。
 
+合并后的开发优先级、已完成基线和逐项验收标准，统一维护在
+[MegaMoe 当前待办与验收清单](megamoe_optimization_backlog.md)。
+
 ## 1. 背景与融合思路
 
 ### 1.1 问题

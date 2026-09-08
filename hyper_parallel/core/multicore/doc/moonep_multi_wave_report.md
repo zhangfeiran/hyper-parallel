@@ -1740,6 +1740,9 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 
 ## 15. 下一步优先级
 
+本节保留 `megamoe-sun-260908` 合并前的规划与证据背景。合并后的当前待办、已完成事项和验收标准，
+以 [MegaMoe 当前待办与验收清单](megamoe_optimization_backlog.md) 为准，避免重复推进已落地功能。
+
 **重基复核后的前置项：** 串联 dX / shared-workspace alias 已修复并完成 ABBA，见第 10.2.8 节。
 Conda include 探测及新 reference 测试适配随后也已完成，常规完整构建和 12 项 NPU 回归通过，
 见第 10.2.9 节。随后完成第 10.2.10 节的 all-rank P2P payload / wait 归因，梯度回传累计暴露等待
