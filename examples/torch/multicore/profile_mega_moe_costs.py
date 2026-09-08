@@ -165,6 +165,29 @@ def main() -> None:
         worker.torch.npu.reset_peak_memory_stats()
         samples = [worker._timed_fwd_bwd(layer, hidden, *route, grad_output) for _ in range(args.measured)]
         memory = worker._collect_memory_result(layer, baseline)
+        results.append(
+            {
+                "pair": pair,
+                "shape": asdict(shape),
+                "counts": counts,
+                "route": route_summary,
+                "profile_off_median_ms": statistics.median(samples),
+                "profile_off_samples_ms": samples,
+                "memory": memory,
+                "precision": "native passed; detailed checkpoint checked when task profiling is enabled",
+            }
+        )
+        if worker._RANK == 0:
+            print(
+                f"COST_PROFILE_POINT={pair} median_ms={statistics.median(samples):.4f}",
+                flush=True,
+            )
+    # Task arenas grow lazily and persist with the workspace. Finish every
+    # profile-off route before allocating any diagnostic storage.
+    for result in results:
+        alpha, seed = result["pair"].split(":")
+        route = worker._make_dirichlet_route(shape, float(alpha), int(seed))
+        waves = result["route"]["expected_wave_count"]
         scoped, captures = [], {}
         if args.profile_scopes:
             context = ProfileContext(rank=worker._RANK, world_size=shape.ep_size, source=identity,
@@ -202,28 +225,15 @@ def main() -> None:
             }
             os.environ["HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"] = "0"
             os.environ["HP_MEGA_MOE_TASK_PROFILE"] = "0"
-        results.append(
+        result.update(
             {
-                "pair": pair,
-                "shape": asdict(shape),
-                "counts": counts,
-                "route": route_summary,
-                "profile_off_median_ms": statistics.median(samples),
-                "profile_off_samples_ms": samples,
-                "memory": memory,
                 "task_profiles": profiles,
                 "scoped_events": scoped,
                 "cycle_profiles": cycles,
                 "captures": captures,
                 "task_contexts": {direction: context.last_launch[(0, direction)] for direction in profiles},
-                "precision": "native passed; detailed checkpoint checked when task profiling is enabled",
             }
         )
-        if worker._RANK == 0:
-            print(
-                f"COST_PROFILE_POINT={pair} median_ms={statistics.median(samples):.4f}",
-                flush=True,
-            )
     if identity != _identity():
         raise RuntimeError("source or native artifacts changed during profiling")
     with output.open("x", encoding="utf-8") as stream:
@@ -231,6 +241,7 @@ def main() -> None:
             {
                 "rank": worker._RANK,
                 "profile_schema_version": 2,
+                "measurement_protocol": "all routes profile-off before any diagnostic arena allocation",
                 "identity": identity,
                 "arguments": vars(args) | {"output": str(args.output)},
                 "results": results,
