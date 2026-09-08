@@ -213,12 +213,14 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         original = MagicMock(return_value=17)
         target = SimpleNamespace(launch=original)
         record = MagicMock()
-        with patch.dict(mega_moe_layer_profile._SPANS, {"execution": ("launch",)}, clear=True), \
-                patch.object(mega_moe_layer_profile.importlib, "import_module", return_value=target):
-            with self.assertRaisesRegex(RuntimeError, "diagnostic failed"):
-                with mega_moe_layer_profile._profile_spans(record):
-                    self.assertEqual(target.launch(3, value=4), 17)
-                    raise RuntimeError("diagnostic failed")
+        with (
+            patch.dict(mega_moe_layer_profile._SPANS, {"execution": ("launch",)}, clear=True),
+            patch.object(mega_moe_layer_profile.importlib, "import_module", return_value=target),
+            self.assertRaisesRegex(RuntimeError, "diagnostic failed"),
+            mega_moe_layer_profile._profile_spans(record),
+        ):
+            self.assertEqual(target.launch(3, value=4), 17)
+            raise RuntimeError("diagnostic failed")
         self.assertIs(target.launch, original)
         original.assert_called_once_with(3, value=4)
         record.assert_called_once_with("megamoe::execution.launch")
@@ -227,11 +229,13 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         """An invalid later target must not leave earlier methods instrumented."""
         original = MagicMock()
         target = SimpleNamespace(launch=original)
-        with patch.dict(mega_moe_layer_profile._SPANS, {"execution": ("launch", "missing")}, clear=True), \
-                patch.object(mega_moe_layer_profile.importlib, "import_module", return_value=target):
-            with self.assertRaises(AttributeError):
-                with mega_moe_layer_profile._profile_spans(MagicMock()):
-                    self.fail("missing profiling target unexpectedly resolved")
+        with (
+            patch.dict(mega_moe_layer_profile._SPANS, {"execution": ("launch", "missing")}, clear=True),
+            patch.object(mega_moe_layer_profile.importlib, "import_module", return_value=target),
+            self.assertRaises(AttributeError),
+            mega_moe_layer_profile._profile_spans(MagicMock()),
+        ):
+            self.fail("missing profiling target unexpectedly resolved")
         self.assertIs(target.launch, original)
 
     def test_non_recording_rank_trains_without_constructing_profiler(self):
@@ -270,7 +274,7 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
                 observed = []
                 sweep = MagicMock()
                 sweep.worker._RANK = 1
-                sweep._train_step.side_effect = lambda route: observed.append(os.environ.get(name))
+                sweep._train_step.side_effect = lambda route, observed=observed: observed.append(os.environ.get(name))
                 counters = {"unit": "system_cycle", "per_rank": [{"rank": 0}, {"rank": 1}]}
                 forward_counters = {"unit": "system_cycle", "categories": ["up_proj", "down_proj"]}
                 sweep.worker._collect_kernel_cycle_profile.side_effect = [counters, forward_counters]
@@ -303,6 +307,8 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         events = []
         worker = MagicMock()
         worker._RANK = 0
+        worker.dist.get_rank.return_value = 0
+        worker.dist.get_world_size.return_value = 8
         worker.dist.is_initialized.return_value = False
         sweep = MagicMock()
         sweep.measure.side_effect = lambda alpha, seed: events.append("measure") or {"seed": seed}
@@ -318,7 +324,7 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
                     patch.object(benchmark, "profile_layer_p2p",
                                  side_effect=AssertionError("unexpected P2P capture")), \
                     patch.object(benchmark, "profile_layer_cycles",
-                                 side_effect=lambda *_args: events.append("cycles") or {"layer_index": 0}):
+                                 side_effect=lambda *_args, **_kwargs: events.append("cycles") or {"layer_index": 0}):
                 benchmark.main()
             payload = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual(events, ["measure", "measure", "cycles"])
@@ -340,6 +346,8 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         events = []
         worker = MagicMock()
         worker._RANK = 0
+        worker.dist.get_rank.return_value = 0
+        worker.dist.get_world_size.return_value = 8
         worker.dist.is_initialized.return_value = False
         sweep = MagicMock()
         sweep.measure.side_effect = lambda alpha, seed: events.append("measure") or {"seed": seed}
@@ -364,6 +372,8 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
         events = []
         worker = MagicMock()
         worker._RANK = 0
+        worker.dist.get_rank.return_value = 0
+        worker.dist.get_world_size.return_value = 8
         worker.dist.get_world_size.return_value = 8
         worker.dist.is_initialized.return_value = False
         sweep = MagicMock()
@@ -383,7 +393,8 @@ class TestBenchmarkMegaMoeLayers(unittest.TestCase):
                 benchmark.main()
             payload = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual(events, ["measure", "measure", "trace"])
-        self.assertEqual(capture.call_args.kwargs, {"all_ranks": True})
+        self.assertTrue(capture.call_args.kwargs["all_ranks"])
+        self.assertEqual(capture.call_args.kwargs["context"].base["world_size"], 8)
         self.assertEqual(payload["diagnostic_trace"]["per_rank"], [
             {"rank": rank, "path": str(trace.with_name(f"trace.rank{rank}.json"))} for rank in range(8)
         ])

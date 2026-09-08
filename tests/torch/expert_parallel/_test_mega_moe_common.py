@@ -234,6 +234,7 @@ def new_layers(
     compact_physical_weights: bool = False,
     compact_layout_strategy: str = "eager_on_first_forward",
     shared_physical_weights: bool = False,
+    replica_grad_receive_slots: int = 8,
     seed: int = 2026,
 ) -> tuple[MegaMoeExperts, torch.nn.Module]:
     """Construct parameter-aligned MegaMoe and common expert layers."""
@@ -249,6 +250,7 @@ def new_layers(
         compact_physical_weights=compact_physical_weights,
         compact_layout_strategy=compact_layout_strategy,
         shared_physical_weights=shared_physical_weights,
+        replica_grad_receive_slots=replica_grad_receive_slots,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(device=DEVICE, dtype=torch.bfloat16)

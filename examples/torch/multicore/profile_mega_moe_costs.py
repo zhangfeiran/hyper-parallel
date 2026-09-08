@@ -30,6 +30,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 from examples.torch.multicore.mega_moe_layer_profile import profile_scoped_events
+from examples.torch.multicore.mega_moe_profile_context import (
+    ProfileContext,
+    new_capture_id,
+)
 
 # Framework initialization belongs in the distributed worker, not its launcher.
 from tests.torch.expert_parallel import _test_mega_moe as worker
@@ -46,6 +50,8 @@ def _identity() -> dict:
     paths += list((root / "hyper_parallel/core/multicore/ops").rglob("*.hpp"))
     paths += list((root / "build/native/payload").rglob("*.so"))
     paths += list((root / "build/native/payload").rglob("*.o"))
+    paths += [Path(__file__), Path(__file__).with_name("mega_moe_layer_profile.py"),
+              Path(__file__).with_name("mega_moe_profile_context.py")]
     return {
         "root": str(root),
         "torch": worker.torch.__version__,
@@ -128,6 +134,8 @@ def main() -> None:
     )
     results = []
     os.environ["HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"] = "0"
+    os.environ["HP_MEGA_MOE_TASK_PROFILE"] = "0"
+    identity = _identity()
     for pair in args.pairs.split(","):
         alpha, seed = pair.split(":")
         route = worker._make_dirichlet_route(shape, float(alpha), int(seed))
@@ -157,18 +165,25 @@ def main() -> None:
         worker.torch.npu.reset_peak_memory_stats()
         samples = [worker._timed_fwd_bwd(layer, hidden, *route, grad_output) for _ in range(args.measured)]
         memory = worker._collect_memory_result(layer, baseline)
-        scoped = (
-            profile_scoped_events(
-                worker.torch, lambda route=route: worker._timed_fwd_bwd(layer, hidden, *route, grad_output)
-            )
-            if args.profile_scopes
-            else []
-        )
+        scoped, captures = [], {}
+        if args.profile_scopes:
+            context = ProfileContext(rank=worker._RANK, world_size=shape.ep_size, source=identity,
+                                     capture_id=new_capture_id(worker.dist, "scopes"))
+            with context.observe(worker.torch, [layer]):
+                scoped = profile_scoped_events(
+                    worker.torch, lambda route=route: worker._timed_fwd_bwd(layer, hidden, *route, grad_output),
+                    context=context,
+                )
+            captures["scopes"] = context.manifest()
         profiles, cycles = {}, {}
         if not args.skip_task_profile:
             os.environ["HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"] = "1"
             os.environ["HP_MEGA_MOE_TASK_PROFILE"] = "1"
-            actual = worker._run_checkpointed_layer(layer, hidden, *route, grad_output, use_reentrant=True)
+            context = ProfileContext(rank=worker._RANK, world_size=shape.ep_size, source=identity,
+                                     capture_id=new_capture_id(worker.dist, "tasks"))
+            with context.observe(worker.torch, [layer], checkpoint="reentrant"):
+                actual = worker._run_checkpointed_layer(layer, hidden, *route, grad_output, use_reentrant=True)
+            captures["tasks"] = context.manifest()
             reference = worker._run_layer(native, hidden, *route, grad_output)
             worker._assert_results_close(reference, actual, weight_grad_wave_count=waves)
             del reference, actual
@@ -199,6 +214,8 @@ def main() -> None:
                 "task_profiles": profiles,
                 "scoped_events": scoped,
                 "cycle_profiles": cycles,
+                "captures": captures,
+                "task_contexts": {direction: context.last_launch[(0, direction)] for direction in profiles},
                 "precision": "native passed; detailed checkpoint checked when task profiling is enabled",
             }
         )
@@ -207,11 +224,14 @@ def main() -> None:
                 f"COST_PROFILE_POINT={pair} median_ms={statistics.median(samples):.4f}",
                 flush=True,
             )
+    if identity != _identity():
+        raise RuntimeError("source or native artifacts changed during profiling")
     with output.open("x", encoding="utf-8") as stream:
         json.dump(
             {
                 "rank": worker._RANK,
-                "identity": _identity(),
+                "profile_schema_version": 2,
+                "identity": identity,
                 "arguments": vars(args) | {"output": str(args.output)},
                 "results": results,
             },

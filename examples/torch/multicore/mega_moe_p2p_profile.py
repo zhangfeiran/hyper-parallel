@@ -25,15 +25,22 @@ from contextlib import ExitStack, contextmanager
 from functools import wraps
 from typing import Any
 
+from examples.torch.multicore.mega_moe_profile_context import (
+    ProfileContext,
+    new_capture_id,
+    placement_metadata,
+)
+
 _PHASES = ("weight_refresh", "gradient_return")
 _METRICS = ("send_bytes", "receive_bytes", "prepare_cpu_ms", "launch_cpu_ms", "wait_cpu_ms",
             "launch_to_ready_ms", "pre_wait_ms", "exposed_wait_ms")
+_DEVICE_METRICS = ("launch_to_ready_ms", "pre_wait_ms", "exposed_wait_ms")
 
 
 class _P2PObserver:
     """Observe serial batches without retaining tensors or changing communication."""
 
-    def __init__(self, npu: Any, device: Any) -> None:
+    def __init__(self, npu: Any, device: Any, *, context: Any = None, device_timing: bool = True) -> None:
         """Keep only host metadata and three device events for each nonempty batch."""
         self.npu = npu
         self.device = device
@@ -41,6 +48,48 @@ class _P2PObserver:
         self.pending: dict[int, dict[str, Any]] = {}
         self.completed: list[dict[str, Any]] = []
         self.calls = dict.fromkeys(_PHASES, 0)
+        self.context = context
+        self.device_timing = device_timing
+        self.empty_batches: list[dict[str, Any]] = []
+
+    def _correlation(self, args: tuple, phase: str, metadata: list[dict], transfers: tuple) -> dict:
+        """Match logical expert descriptors to the actual two wire tensors."""
+        if self.context is None:
+            return {}
+        manager, description = args[:2]
+        identity = self.context.metadata()
+        if "layer" not in identity:
+            raise ValueError("P2P batch lacks its layer identity")
+        if phase == "weight_refresh":
+            descriptors = description.replica_transfers
+            identity.update(placement_metadata(manager, description))
+            identity["batch_index"] = self.context.next_index(
+                phase, identity["layer"], identity["direction"], identity["call_id"],
+            )
+        else:
+            descriptors = description
+        expected = []
+        for entry in descriptors:
+            if manager.spec.rank_id not in (entry.owner_rank, entry.target_rank):
+                continue
+            owner = manager.spec.rank_id == entry.owner_rank
+            send = owner if phase == "weight_refresh" else not owner
+            for tensor_role in ("gate_up", "down"):
+                expected.append({
+                    "operation": "send" if send else "receive",
+                    "peer_rank": entry.target_rank if owner else entry.owner_rank,
+                    "logical_expert": entry.logical_expert, "owner_slot": entry.owner_slot,
+                    "replica_slot": entry.target_slot, "tensor_role": tensor_role,
+                })
+        if len(expected) != len(metadata):
+            raise RuntimeError("P2P descriptor count does not match actual wire tensors")
+        for item, descriptor, transfer in zip(metadata, expected, transfers):
+            if any(item[name] != descriptor[name] for name in ("operation", "peer_rank")):
+                raise RuntimeError("P2P descriptor order does not match actual wire tensors")
+            item.update(descriptor)
+            item["storage_address"] = transfer.tensor.untyped_storage().data_ptr()
+            item["storage_offset_elements"] = transfer.tensor.storage_offset()
+        return identity
 
     def _builder(self, function: Any, phase: str) -> Any:
         @wraps(function)
@@ -52,19 +101,26 @@ class _P2PObserver:
             transfers = result[0] if phase == "gradient_return" else result
             call_index = self.calls[phase]
             self.calls[phase] += 1
-            if transfers:
-                metadata = [
+            metadata = [
                     {"operation": item.operation, "peer_rank": item.peer_rank,
                      "bytes": item.tensor.numel() * item.tensor.element_size(),
                      "dtype": str(item.tensor.dtype), "shape": list(item.tensor.shape)}
                     for item in transfers
-                ]
+            ]
+            correlation = self._correlation(args, phase, metadata, transfers)
+            if transfers:
                 self.prepared[id(transfers)] = {
+                    **correlation,
                     "phase": phase, "phase_call": call_index, "prepare_cpu_ms": elapsed,
                     "transfers": metadata,
                     "send_bytes": sum(item["bytes"] for item in metadata if item["operation"] == "send"),
                     "receive_bytes": sum(item["bytes"] for item in metadata if item["operation"] == "receive"),
                 }
+            else:
+                self.empty_batches.append({
+                    **correlation, "phase": phase, "phase_call": call_index,
+                    "prepare_cpu_ms": elapsed, "transfers": [], "send_bytes": 0, "receive_bytes": 0,
+                })
             return result
 
         return build
@@ -79,8 +135,9 @@ class _P2PObserver:
             if record is None:
                 raise RuntimeError("unclassified P2P batch in diagnostic step")
             record["stream"] = self.npu.current_stream(self.device)
-            record["events"] = [self.npu.Event(enable_timing=True) for _ in range(3)]
-            record["events"][0].record(record["stream"])
+            record["events"] = [self.npu.Event(enable_timing=True) for _ in range(3)] if self.device_timing else []
+            if record["events"]:
+                record["events"][0].record(record["stream"])
             started = time.perf_counter()
             handles = function(transfers, group)
             record["launch_cpu_ms"] = (time.perf_counter() - started) * 1000
@@ -103,11 +160,13 @@ class _P2PObserver:
                 raise RuntimeError("unclassified P2P wait in diagnostic step")
             if self.npu.current_stream(self.device) != record["stream"]:
                 raise RuntimeError("profiled P2P wait changed the caller stream")
-            record["events"][1].record(record["stream"])
+            if record["events"]:
+                record["events"][1].record(record["stream"])
             started = time.perf_counter()
             result = function(handles)
             record["wait_cpu_ms"] = (time.perf_counter() - started) * 1000
-            record["events"][2].record(record["stream"])
+            if record["events"]:
+                record["events"][2].record(record["stream"])
             del self.pending[id(handles)]
             self.completed.append(record)
             return result
@@ -137,19 +196,25 @@ class _P2PObserver:
             raise RuntimeError("unfinished P2P batches in diagnostic step")
         batches = []
         for record in self.completed:
-            start, wait, ready = record["events"]
-            durations = {"launch_to_ready_ms": start.elapsed_time(ready),
-                         "pre_wait_ms": start.elapsed_time(wait), "exposed_wait_ms": wait.elapsed_time(ready)}
-            if any(not math.isfinite(value) or value < 0 for value in durations.values()):
+            durations = dict.fromkeys(_DEVICE_METRICS)
+            if record["events"]:
+                start, wait, ready = record["events"]
+                durations = {"launch_to_ready_ms": start.elapsed_time(ready),
+                             "pre_wait_ms": start.elapsed_time(wait), "exposed_wait_ms": wait.elapsed_time(ready)}
+            if any(value is not None and (not math.isfinite(value) or value < 0) for value in durations.values()):
                 raise RuntimeError(f"invalid P2P device event durations: {durations}")
             batches.append({key: value for key, value in record.items() if key not in {"stream", "events"}} | durations)
         summary = {}
         for phase in _PHASES:
             selected = [batch for batch in batches if batch["phase"] == phase]
             summary[phase] = {"batches": len(selected), "builder_calls": self.calls[phase],
-                              **{name: sum(batch[name] for batch in selected) for name in _METRICS},
-                              "max_exposed_wait_ms": max((batch["exposed_wait_ms"] for batch in selected), default=0)}
-        return {"batches": batches, "summary": summary}
+                              **{name: sum(batch[name] for batch in selected if batch[name] is not None)
+                                 if self.device_timing or name not in _DEVICE_METRICS else None for name in _METRICS},
+                              "max_exposed_wait_ms": max(
+                                  (batch["exposed_wait_ms"] for batch in selected), default=0
+                              ) if self.device_timing else None}
+        return {"batches": batches, "empty_batches": self.empty_batches, "summary": summary,
+                "device_timing": self.device_timing}
 
 
 def _validate_payload_balance(ranks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -157,21 +222,57 @@ def _validate_payload_balance(ranks: list[dict[str, Any]]) -> dict[str, Any]:
     if sorted(rank["rank"] for rank in ranks) != list(range(len(ranks))):
         raise RuntimeError("P2P diagnostics must contain each EP rank exactly once")
     sent, received = Counter(), Counter()
+    totals = Counter()
+    contexts = [item.get("context") for item in ranks]
+    correlated = any(contexts)
+    if correlated:
+        if not all(contexts):
+            raise RuntimeError("P2P diagnostics mix correlated and legacy captures")
+        identities = {(ctx["capture_id"], ctx["step"], ctx["world_size"]) for ctx in contexts}
+        if len(identities) != 1 or contexts[0]["world_size"] != len(ranks):
+            raise RuntimeError("P2P diagnostics have incompatible capture identities")
     for rank in ranks:
+        seen_batches = set()
+        if correlated and rank["context"]["rank"] != rank["rank"]:
+            raise RuntimeError("P2P rank disagrees with its capture context")
+        for batch in [*rank["batches"], *rank.get("empty_batches", [])]:
+            if not correlated:
+                continue
+            for name in ("capture_id", "rank", "world_size", "step"):
+                if batch.get(name) != rank["context"][name]:
+                    raise RuntimeError(f"P2P batch has incompatible {name}")
+            key = tuple(batch.get(name) for name in (
+                "phase", "step", "layer", "resource_group", "direction", "call_id", "reduction_index", "batch_index",
+            ))
+            if key in seen_batches:
+                raise RuntimeError("Duplicate P2P batch identity")
+            seen_batches.add(key)
         for batch in rank["batches"]:
             for transfer in batch["transfers"]:
                 peer = transfer["peer_rank"]
                 if transfer["operation"] not in {"send", "receive"} or not 0 <= peer < len(ranks):
                     raise RuntimeError(f"invalid P2P transfer metadata: {transfer}")
                 source, target = (rank["rank"], peer) if transfer["operation"] == "send" else (peer, rank["rank"])
-                key = (batch["phase"], batch["phase_call"], source, target,
-                       transfer["dtype"], tuple(transfer["shape"]))
+                round_key = (batch["phase_call"],)
+                expert_key = ()
+                if correlated:
+                    round_key = tuple(batch.get(name) for name in (
+                        "step", "layer", "resource_group", "direction", "call_id", "reduction_index", "batch_index",
+                        "placement_id",
+                    ))
+                    expert_key = tuple(transfer[name] for name in (
+                        "logical_expert", "tensor_role", "owner_slot", "replica_slot",
+                    ))
+                key = (batch["phase"], round_key, source, target, expert_key,
+                       transfer["dtype"], tuple(transfer["shape"]), transfer["bytes"])
                 counts = sent if transfer["operation"] == "send" else received
-                counts[key] += transfer["bytes"]
+                counts[key] += 1
+                if transfer["operation"] == "send":
+                    totals[batch["phase"]] += transfer["bytes"]
     if sent != received:
         raise RuntimeError(f"P2P payload mismatch: unmatched sends={sent - received}, receives={received - sent}")
     return {"matching_peer_payloads": True,
-            "sent_bytes": {phase: sum(size for key, size in sent.items() if key[0] == phase) for phase in _PHASES}}
+            "sent_bytes": {phase: totals[phase] for phase in _PHASES}}
 
 
 def profile_layer_p2p(sweep: Any, route: tuple) -> dict[str, Any]:
@@ -201,12 +302,14 @@ def profile_layer_p2p(sweep: Any, route: tuple) -> dict[str, Any]:
     sweep.optimizer.step()
     worker.dist.barrier()
     worker.torch.npu.synchronize(worker._DEVICE)
-    observer = _P2PObserver(worker.torch.npu, worker._DEVICE)
+    context = ProfileContext(rank=worker._RANK, world_size=sweep.shape.ep_size,
+                             capture_id=new_capture_id(worker.dist, "p2p"), source=sweep.source)
+    observer = _P2PObserver(worker.torch.npu, worker._DEVICE, context=context)
     replica = importlib.import_module("hyper_parallel.core.multicore.modules.mega_moe.replica")
-    with observer.observe(replica):
+    with context.observe(worker.torch, sweep.layers, checkpoint="reentrant"), observer.observe(replica):
         sweep._train_step(route)
     worker.torch.npu.synchronize(worker._DEVICE)
-    local = {"rank": worker._RANK, **observer.collect()}
+    local = {"rank": worker._RANK, "context": context.manifest(), **observer.collect()}
     sweep.optimizer.step()
     worker.torch.npu.synchronize(worker._DEVICE)
     ranks = [None] * sweep.shape.ep_size

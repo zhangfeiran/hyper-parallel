@@ -107,3 +107,14 @@ class TestMegaMoeLayerProfile(unittest.TestCase):
             self.assertIs(target.launch, original)
             self.assertIs(profiler.profile.return_value.__exit__.call_args.args[0], RuntimeError)
             profiler.profile.return_value.export_chrome_trace.assert_not_called()
+
+    def test_export_rejects_truncated_json_even_when_vendor_does_not_raise(self) -> None:
+        """A CANN exporter failure must not turn a partial file into successful diagnostic evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "trace.json"
+            capture = MagicMock()
+            capture.export_chrome_trace.side_effect = (
+                lambda path: Path(path).write_text('[{"ph": "X"}', encoding="utf-8")
+            )
+            with self.assertRaisesRegex(RuntimeError, "Incomplete NPU trace export"):
+                profiling._export_trace(capture, output)

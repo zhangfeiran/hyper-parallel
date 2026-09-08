@@ -17,6 +17,7 @@
 import gc
 import unittest
 import weakref
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -151,9 +152,11 @@ class TestP2PObserver(unittest.TestCase):
                      self.replica.ExpertReplicaManager._prefetch_transfers,
                      self.replica.ExpertReplicaManager._gradient_transfers)
         observer = profiling._P2PObserver(self.npu, "npu:0")
-        with self.assertRaisesRegex(RuntimeError, "injected"):
-            with observer.observe(self.replica):
-                raise RuntimeError("injected")
+        with (
+            self.assertRaisesRegex(RuntimeError, "injected"),
+            observer.observe(self.replica),
+        ):
+            raise RuntimeError("injected")
         restored = (self.replica._launch_transfers, self.replica._wait_handles,
                     self.replica.ExpertReplicaManager._prefetch_transfers,
                     self.replica.ExpertReplicaManager._gradient_transfers)
@@ -185,6 +188,7 @@ class TestP2PObserver(unittest.TestCase):
         sweep = MagicMock()
         sweep.worker._RANK = 3
         sweep.shape.ep_size = 8
+        sweep.source = {}
         observer = MagicMock()
         events = []
         sweep._train_step.side_effect = lambda _route: events.append("train")
@@ -196,10 +200,13 @@ class TestP2PObserver(unittest.TestCase):
         def gather(ranks: list, local: dict) -> None:
             """Fill distinct EP-rank rows without a distributed process group."""
             events.append("gather")
-            ranks[:] = [{**local, "rank": rank} for rank in range(len(ranks))]
+            ranks[:] = [{**local, "rank": rank, "context": {**local["context"], "rank": rank}}
+                        for rank in range(len(ranks))]
 
         sweep.worker.dist.all_gather_object.side_effect = gather
-        with patch.object(profiling, "_P2PObserver", return_value=observer), \
+        with patch.object(profiling, "new_capture_id", return_value="p2p:fixture"), \
+                patch.object(profiling.ProfileContext, "observe", return_value=nullcontext()), \
+                patch.object(profiling, "_P2PObserver", return_value=observer), \
                 patch.object(profiling.importlib, "import_module", return_value=self.replica):
             result = profiling.profile_layer_p2p(sweep, (1, 2, 3))
         self.assertEqual(sweep._train_step.call_count, 2)
@@ -224,9 +231,12 @@ class TestP2PObserver(unittest.TestCase):
         result = profiling._validate_payload_balance(ranks)
         self.assertEqual(result["sent_bytes"], {"weight_refresh": 0, "gradient_return": 24})
         for field, value in (("peer_rank", 1), ("dtype", "torch.bfloat16"), ("bytes", 12), ("shape", [6])):
-            with self.subTest(field=field), patch.dict(receive, {field: value}):
-                with self.assertRaisesRegex(RuntimeError, "payload mismatch"):
-                    profiling._validate_payload_balance(ranks)
+            with (
+                self.subTest(field=field),
+                patch.dict(receive, {field: value}),
+                self.assertRaisesRegex(RuntimeError, "payload mismatch"),
+            ):
+                profiling._validate_payload_balance(ranks)
         with patch.dict(other, {"phase_call": 1}), self.assertRaisesRegex(RuntimeError, "payload mismatch"):
             profiling._validate_payload_balance(ranks)
 
@@ -239,10 +249,12 @@ class TestP2PObserver(unittest.TestCase):
         self.replica._wait_handles = MagicMock(side_effect=RuntimeError("wait failed"))
         original = self.replica._wait_handles
         observer = profiling._P2PObserver(self.npu, "npu:0")
-        with self.assertRaisesRegex(RuntimeError, "wait failed"):
-            with observer.observe(self.replica):
-                transfers = self.replica.ExpertReplicaManager._prefetch_transfers(self._transfers(torch.float32))
-                self.replica._wait_handles(self.replica._launch_transfers(transfers, None))
+        with (
+            self.assertRaisesRegex(RuntimeError, "wait failed"),
+            observer.observe(self.replica),
+        ):
+            transfers = self.replica.ExpertReplicaManager._prefetch_transfers(self._transfers(torch.float32))
+            self.replica._wait_handles(self.replica._launch_transfers(transfers, None))
         self.assertIs(self.replica._wait_handles, original)
         with self.assertRaisesRegex(RuntimeError, "unfinished"):
             observer.collect()
@@ -257,9 +269,8 @@ class TestP2PObserver(unittest.TestCase):
         original = manager._prefetch_transfers
         del manager._gradient_transfers
         observer = profiling._P2PObserver(self.npu, "npu:0")
-        with self.assertRaises(AttributeError):
-            with observer.observe(self.replica):
-                self.fail("profiling accepted a missing transfer builder")
+        with self.assertRaises(AttributeError), observer.observe(self.replica):
+            self.fail("profiling accepted a missing transfer builder")
         self.assertIs(manager._prefetch_transfers, original)
 
     def test_launch_failure_or_missing_handles_cannot_publish_complete_capture(self) -> None:
@@ -273,12 +284,14 @@ class TestP2PObserver(unittest.TestCase):
                 original = MagicMock(return_value=(), side_effect=error)
                 self.replica._launch_transfers = original
                 observer = profiling._P2PObserver(self.npu, "npu:0")
-                with self.assertRaisesRegex(RuntimeError, "launch failed|no completion handles"):
-                    with observer.observe(self.replica):
-                        transfers = self.replica.ExpertReplicaManager._prefetch_transfers(
-                            self._transfers(torch.float32),
-                        )
-                        self.replica._launch_transfers(transfers, None)
+                with (
+                    self.assertRaisesRegex(RuntimeError, "launch failed|no completion handles"),
+                    observer.observe(self.replica),
+                ):
+                    transfers = self.replica.ExpertReplicaManager._prefetch_transfers(
+                        self._transfers(torch.float32),
+                    )
+                    self.replica._launch_transfers(transfers, None)
                 self.assertIs(self.replica._launch_transfers, original)
                 with self.assertRaisesRegex(RuntimeError, "unfinished"):
                     observer.collect()
@@ -295,9 +308,11 @@ class TestP2PObserver(unittest.TestCase):
                 with observer.observe(self.replica):
                     transfers = self.replica.ExpertReplicaManager._prefetch_transfers(self._transfers(torch.float32))
                     self.replica._wait_handles(self.replica._launch_transfers(transfers, None))
-                with patch.object(_Event, "elapsed_time", return_value=duration):
-                    with self.assertRaisesRegex(RuntimeError, "invalid P2P device event durations"):
-                        observer.collect()
+                with (
+                    patch.object(_Event, "elapsed_time", return_value=duration),
+                    self.assertRaisesRegex(RuntimeError, "invalid P2P device event durations"),
+                ):
+                    observer.collect()
 
     def test_cross_stream_wait_is_not_reported_as_same_stream_overlap(self) -> None:
         """
@@ -314,3 +329,29 @@ class TestP2PObserver(unittest.TestCase):
                 self.replica._wait_handles(handles)
         with self.assertRaisesRegex(RuntimeError, "unfinished"):
             observer.collect()
+
+    def test_trace_payloads_keep_experts_and_empty_windows_without_timing_events(self) -> None:
+        """Match actual tensor views to expert descriptors without allocating NPU events."""
+        context = profiling.ProfileContext(rank=0, world_size=3, capture_id="trace:payload")
+        observer = profiling._P2PObserver(self.npu, "npu:0", context=context, device_timing=False)
+        self.npu.Event = MagicMock(side_effect=AssertionError("trace must not allocate timing events"))
+        manager = SimpleNamespace(spec=SimpleNamespace(rank_id=0))
+        descriptors = (SimpleNamespace(owner_rank=0, target_rank=1, logical_expert=7, owner_slot=2, target_slot=4),)
+        tensors = tuple(SimpleNamespace(operation="receive", peer_rank=1,
+                                        tensor=torch.ones(shape, dtype=torch.float32))
+                        for shape in ((2, 6), (3, 2)))
+        builder = observer._builder(lambda _manager, _batch, transfers: (transfers, ()), "gradient_return")
+        with context.span("call", layer=5, resource_group=1, direction="backward", call_id=0):
+            for index, (batch, transfers) in enumerate((((), ()), (descriptors, tensors))):
+                with context.span("batch", reduction_index=0, batch_index=index):
+                    built, _ = builder(manager, batch, transfers)
+                    handles = observer._launch(self.replica._launch_transfers)(built, None)
+                    observer._wait(self.replica._wait_handles)(handles)
+        result = observer.collect()
+        self.assertEqual(result["empty_batches"][0]["batch_index"], 0)
+        self.assertEqual(result["batches"][0]["batch_index"], 1)
+        self.assertEqual(result["batches"][0]["receive_bytes"], 72)
+        self.assertEqual({item["logical_expert"] for item in result["batches"][0]["transfers"]}, {7})
+        self.assertEqual(result["batches"][0]["transfers"][0]["shape"], [2, 6])
+        self.assertIsNone(result["batches"][0]["exposed_wait_ms"])
+        self.npu.Event.assert_not_called()

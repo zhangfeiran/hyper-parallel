@@ -42,6 +42,10 @@ from examples.torch.multicore.mega_moe_layer_profile import (
     profile_trace_paths,
 )
 from examples.torch.multicore.mega_moe_p2p_profile import profile_layer_p2p
+from examples.torch.multicore.mega_moe_profile_context import (
+    ProfileContext,
+    new_capture_id,
+)
 
 ALPHAS = (10000, 3000, 1000, 300, 100, 30, 10, 3, 1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
 EXTRA_PAIRS = ((0.01, 1942), (0.01, 1708), (0.01, 0), (0.005, 943), (0.01, 2104),
@@ -67,6 +71,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--variant", choices=("native", "b0", "b1"), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layers", type=int, default=16)
+    parser.add_argument("--tokens", type=int, default=4096)
+    parser.add_argument("--experts", type=int, default=48)
+    parser.add_argument("--hidden", type=int, default=5120)
+    parser.add_argument("--intermediate", type=int, default=1792)
+    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--resource-groups", type=int, default=1)
+    parser.add_argument("--gradient-receive-slots", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--measured", type=int, default=7)
     parser.add_argument("--pairs", help="Override the 55-route sweep, e.g. 10000:42,0.005:943.")
@@ -80,11 +91,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="After timing, gather last forward/backward cycles on all ranks (first route, MegaMoe).")
     parser.add_argument("--profile-p2p", action="store_true",
                         help="After timing, collect all-rank P2P payload and readiness events (first route, MegaMoe).")
+    parser.add_argument("--profile-tasks", action="store_true",
+                        help="With --profile-kernel-cycles, retain each resource group's last task queues.")
     args = parser.parse_args(argv)
     if args.layers <= 0 or args.warmup < 0 or args.measured <= 0:
         parser.error("layers and measured must be positive; warmup must be nonnegative")
     if args.limit is not None and args.limit <= 0:
         parser.error("limit must be positive")
+    if any(getattr(args, name) <= 0 for name in (
+        "tokens", "experts", "hidden", "intermediate", "top_k", "resource_groups", "gradient_receive_slots",
+    )) or args.resource_groups > args.layers or args.top_k > args.experts:
+        parser.error("shape/window/group dimensions must be positive; groups <= layers and top-k <= experts")
+    if args.experts % int(os.getenv("WORLD_SIZE", "8")):
+        parser.error("experts must be divisible by WORLD_SIZE")
+    if args.profile_tasks and not args.profile_kernel_cycles:
+        parser.error("profile-tasks requires profile-kernel-cycles")
+    if os.getenv("HP_MEGA_MOE_TASK_PROFILE", "0") == "1":
+        parser.error("unset HP_MEGA_MOE_TASK_PROFILE for timing; use --profile-tasks instead")
     if args.output.exists():
         parser.error(f"refusing to overwrite {args.output}")
     if args.profile_kernel_cycles and args.variant == "native":
@@ -212,6 +235,9 @@ def _source_identity() -> dict[str, Any]:
         "p2p_profile_helper_sha256": hashlib.sha256(
             Path(__file__).with_name("mega_moe_p2p_profile.py").read_bytes()
         ).hexdigest(),
+        "context_helper_sha256": hashlib.sha256(
+            Path(__file__).with_name("mega_moe_profile_context.py").read_bytes()
+        ).hexdigest(),
         "python_implementation": _python_source_identity(repo),
         "native_artifacts": artifacts,
     }
@@ -225,8 +251,9 @@ class _LayerSweep:
         self.worker = worker
         self.args = args
         self.checkpoint = importlib.import_module("torch.utils.checkpoint").checkpoint
-        self.shape = worker._MoeShape(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
-                                      num_experts=48, top_k=8, ep_size=8)
+        self.shape = worker._MoeShape(local_num_tokens=args.tokens, hidden_size=args.hidden,
+                                      intermediate_size=args.intermediate, num_experts=args.experts,
+                                      top_k=args.top_k, ep_size=worker.dist.get_world_size())
         self.slots = int(args.variant == "b1")
         self.layers = self._make_layers()
         hidden, self.grad_output = worker._make_data(self.shape)
@@ -241,14 +268,20 @@ class _LayerSweep:
             if self.args.variant == "native":
                 layer = worker.new_common_moe(shape, seed=seed)
             else:
+                options = {}
+                if getattr(self.args, "gradient_receive_slots", 8) != 8:
+                    options["replica_grad_receive_slots"] = self.args.gradient_receive_slots
                 layer, common = worker.new_common_layers(
                     shape, seed=seed, expert_capacity_factor=1.5,
                     replica_slots_per_rank=self.slots, shared_physical_weights=bool(self.slots),
+                    **options,
                 )
                 del common
             layers.append(layer)
         if self.args.variant != "native":
-            worker.MegaMoeExperts.share_execution_resources(layers)
+            groups = getattr(self.args, "resource_groups", 1)
+            for group in range(groups):
+                worker.MegaMoeExperts.share_execution_resources(layers[group::groups])
         return worker.torch.nn.ModuleList(layers)
 
     def _train_step(self, route: tuple, *, validate: bool = False) -> None:
@@ -279,16 +312,18 @@ class _LayerSweep:
     def _pool_ledger(self) -> dict[str, Any]:
         if not self.slots:
             return {"shared_weight_bytes": 0, "shared_gradient_bytes": 0}
-        resources = self.layers[0]._get_execution_resources(self.inputs[0])
-        if any(layer._get_execution_resources(self.inputs[0]) is not resources for layer in self.layers):
-            raise AssertionError("layers do not share one execution resource group")
-        manager = resources.replica_manager
-        ledger = {
-            "shared_weight_bytes": sum(tensor.numel() * tensor.element_size()
-                                       for tensor in (manager._shared_weights or ())),
-            "shared_gradient_bytes": sum(tensor.numel() * tensor.element_size()
-                                         for tensor in (manager._shared_gradients or ())),
-        }
+        groups = {id(layer._resource_group): layer for layer in self.layers}
+        ledger = {"resource_groups": len(groups), "shared_weight_bytes": 0, "shared_gradient_bytes": 0,
+                  "workspace_views_by_group": []}
+        for group, layer in enumerate(groups.values()):
+            resource = layer._get_execution_resources(self.inputs[0])
+            manager = resource.replica_manager
+            size, fields = self.worker._workspace_tensor_storage(layer)
+            ledger["workspace_views_by_group"].append({"resource_group": group, "storage_bytes": size,
+                                                      "by_field": fields})
+            for label, tensors in (("shared_weight_bytes", manager._shared_weights),
+                                   ("shared_gradient_bytes", manager._shared_gradients)):
+                ledger[label] += sum(tensor.numel() * tensor.element_size() for tensor in (tensors or ()))
         if any(parameter.untyped_storage().nbytes() != parameter.numel() * parameter.element_size()
                for parameter in self.layers.parameters()):
             raise AssertionError("shared B changed the home parameter storage size")
@@ -332,6 +367,10 @@ class _LayerSweep:
         worker.torch.npu.reset_peak_memory_stats(worker._DEVICE)
         latencies, step_latencies = self._measure_steps(route)
         memory = worker._collect_memory_result(self.layers[0], baseline)
+        memory["accounting"]["workspace_ledger"] += (
+            "; the legacy workspace field describes the first resource group; "
+            "shared_pool_per_rank.workspace_views_by_group lists all groups without adding them to HBM peaks"
+        )
         # Capture memory first: finite checks allocate untimed diagnostic tensors.
         self._train_step(route, validate=True)
         for parameter in self.layers.parameters():
@@ -364,13 +403,15 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
         "capacity_factor": 1.5, "replica_slots_per_rank": int(args.variant == "b1"),
         "compact_physical_weights": False, "shared_physical_weights": args.variant == "b1",
         "layers": args.layers, "checkpoint": "reentrant", "scope": SCOPE,
+        "resource_groups": getattr(args, "resource_groups", 1),
+        "gradient_receive_slots": getattr(args, "gradient_receive_slots", 8),
         "warmup_steps": args.warmup, "measured_steps": args.measured, "shuffle_seed": args.shuffle_seed,
         "optimizer_step": True, "optimizer": {"name": "AdamW", **ADAMW_OPTIONS},
         "latency_metric": "train_step",
         "optimizer_timing": "direct F+B and full AdamW-step wall timers; states/updates inside HBM peak window",
         "validation_protocol": "finite forward and gradients before warmup and after measurement; finite AdamW state",
         "weight_refresh": "parameters updated every iteration; replica refresh included in next F+B",
-        "workspace_lifetime": "one shared execution group across layers and routes; high-watermarks retained",
+        "workspace_lifetime": "configured shared execution groups across layers and routes; high-watermarks retained",
         "runtime_environment": {key: value for key, value in os.environ.items()
                                 if key.startswith(("HP_MEGA_MOE_", "HYPER_PARALLEL_MEGA_MOE_"))},
     }
@@ -381,11 +422,12 @@ def main() -> None:
     args = _parse_args()
     points = _route_pairs(args)
     os.environ["HP_MEGA_MOE_CAPACITY_FACTOR"] = "1.5"
-    os.environ["HP_MEGA_MOE_WORLD_SIZE"] = "8"
+    os.environ["HP_MEGA_MOE_WORLD_SIZE"] = os.getenv("WORLD_SIZE", "8")
     worker = importlib.import_module("tests.torch.expert_parallel._test_mega_moe")
     try:
         source = _source_identity()
         sweep = _LayerSweep(worker, args)
+        sweep.source = source
         results = []
         for alpha, seed in points:
             result = sweep.measure(alpha, seed)
@@ -393,14 +435,24 @@ def main() -> None:
                 results.append(result)
                 print("LAYER_SWEEP_POINT=" + json.dumps(result, sort_keys=True), flush=True)
         trace_paths = ()
+        trace_capture = {}
         if args.profile_output is not None:
             trace_paths = profile_trace_paths(args.profile_output, worker.dist.get_world_size(),
                                               all_ranks=args.profile_all_ranks)
-            profile_layer_step(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]), args.profile_output,
-                               all_ranks=args.profile_all_ranks)
+            context = None if args.variant == "native" else ProfileContext(
+                rank=worker._RANK, world_size=worker.dist.get_world_size(), source=source,
+                capture_id=new_capture_id(worker.dist, "trace"),
+            )
+            trace_capture = profile_layer_step(
+                sweep, worker._make_dirichlet_route(sweep.shape, *points[0]), args.profile_output,
+                all_ranks=args.profile_all_ranks, context=context,
+            )
         kernel_cycles = None
         if args.profile_kernel_cycles:
-            kernel_cycles = profile_layer_cycles(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]))
+            context = ProfileContext(rank=worker._RANK, world_size=worker.dist.get_world_size(), source=source,
+                                     capture_id=new_capture_id(worker.dist, "tasks"))
+            kernel_cycles = profile_layer_cycles(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]),
+                                                 context=context, tasks=getattr(args, "profile_tasks", False))
         p2p_profile = None
         if args.profile_p2p:
             p2p_profile = profile_layer_p2p(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]))
@@ -418,6 +470,8 @@ def main() -> None:
                     payload["diagnostic_trace"]["per_rank"] = [
                         {"rank": rank, "path": str(path)} for rank, path in enumerate(trace_paths)
                     ]
+                if trace_capture:
+                    payload["diagnostic_trace"]["capture"] = trace_capture
             if kernel_cycles is not None:
                 payload["diagnostic_kernel_cycles"] = {"alpha": points[0][0], "seed": points[0][1], **kernel_cycles}
             if p2p_profile is not None:
