@@ -148,7 +148,9 @@ def _route_pairs(args: argparse.Namespace) -> list[tuple[float, int]]:
 
 
 def _make_optimizer(torch: Any, parameters: Any) -> Any:
-    return torch.optim.AdamW(parameters, **ADAMW_OPTIONS)
+    # EP already produced complete local expert gradients. AdamW updates the
+    # original leaves without distributed layout inference for pointwise updates.
+    return torch.optim.AdamW([_local_tensor(parameter) for parameter in parameters], **ADAMW_OPTIONS)
 
 
 def _execution_route_summary(summary: dict[str, Any]) -> dict[str, Any]:
