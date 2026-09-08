@@ -1332,6 +1332,30 @@ PID；没有逐步绝对窗口标记，不能将本组称为严格独占 ABBA �
 benchmark 仅负责训练/比较/测量。CPU 287 passed / 307 subtests、两模式各三路由 EP8 回归及
 重构前后的 common references 对比通过；这是职责重构，没有新增性能结论，详见该报告第 7 节。
 
+#### 10.2.17 拉取新合并后的多步数值与计时诊断
+
+基于 `ee5a6965` 重新构建当前 descriptor ABI 的 native payload，CPU 回归 193 passed /
+202 subtests。原始八层、shared-B1、capacity=1.5、Dirichlet 0.1、FP32-main AdamW 合同不变。
+固定权重下两 backend 的全量 logits 逐位一致，梯度通过原阈值；但真实多步训练中，默认
+common/common 在第 2 步也出现 logits / 更新后参数超阈值，两 backend 自重复的 loss 均从
+第 5 步有 rank 超阈值，不能把该现象单独归因于新合并的 MegaMoe。
+
+独立复放定位了 attention backward 和 BF16 dense all-reduce 的非确定性，以及微小梯度符号
+变化被 AdamW 放大的机制。确定性模式下，两 backend 各自的八 rank × 十步 loss 和最终
+参数可以逐位重复，但跨 backend 的第 2 步 logits 仍失败、loss 从第 6 步有 rank 超阈值；
+loss 回升也仍存在。因此确定性开关不等于跨 backend 精度或收敛修复，原阈值未放宽。
+
+补充确定性首步对照进一步将残差收敛到 expert dW：67 个 dense 梯度及其更新后参数完全
+一致，只有 16 个 expert 张量（跨 rank 并集）有差异，梯度最大差 9.5367e-7、首步更新后
+最大参数差 1.2207e-4。优先核对 grouped dW 与 physical-copy/replica FP32 聚合和 cast，
+不把微小首步梯度通过直接外推为后续轨迹相同，也不提前降低 replica contribution 精度。
+
+计时已补绝对窗口与设备 PID 采样：默认组 common A1 的七个稳态窗口全部有外部 PID，
+B2/A2 未采到；不能将四组当作共同干净的 ABBA。单列确定性组的 28 个稳态窗口均未采到
+外部 PID，但执行模式不同，不能混入默认值或据此发布新合并的增量收益。
+完整证据、补充控制及下一步边界见
+[多步数值与计时诊断](megamoe_qwen_multistep_diagnosis_20260908.md)。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1639,14 +1663,19 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **先补整模型多步数值重复性和可审计计时窗口，再按 profile 选优化。**
+1. **先定位可重复的跨 backend 反向差异，再按 profile 选优化。**
    receive-only 解耦已经保留，独立 16 层 MoE 的偏斜 step 减少 4.086%，只增加约 1 MiB allocated
    和 36 MiB reserved（第 10.2.14 节）。整模型 shared-B 接入及三种路由的小形状训练验收已完成
    （第 10.2.15 节），单后端驻留及原始八层 ABBA/首次精度也已完成（第 10.2.16 节），不再受
-   双套训练状态 73.216 GiB 下界阻断。但后续 loss 在同 backend 自重复中已有分歧，先做
-   common/common、MegaMoe/MegaMoe 与交叉 backend 的逐步梯度/更新后参数对照，区分非确定性、
-   学习率敏感性及 backend 特有误差，不放宽精度门槛。计时补绝对窗口标记并与所有设备 PID
-   对齐，在稳定八卡窗口复测后采完整模型 HBM/profile，不把独立层收益外推整网。
+   双套训练状态 73.216 GiB 下界阻断。第 10.2.17 节已定位 attention backward / BF16 dense
+   collective 非确定性及 AdamW 放大，补齐默认/确定性自重复、跨 backend 第 2 步全量对照和
+   绝对计时窗口。确定性模式恢复自重复，却不能使跨 backend 多步精度通过；下一项固定相同
+   权重/输入，定位反向残差的首个来源，不能用低 LR 或放宽阈值替代原配置验收。
+   首步定位已将保存的差异收敛到 expert dW，先拆分原生 grouped dW、自定义 dW 和 B0/B1
+   copy 聚合/最终 cast，保持 FP32 replica 累加合同；不无依据重写已逐位一致的 dense 路径。
+   精度 gate 与性能 gate 应分开；任何 FP32 dense 归约候选要显式验证数值合同、HBM 和通信成本，
+   不能悄悄替换 baseline。默认组竞争记录仍不对称，需稳定八卡窗口复测后采完整模型 HBM/profile，
+   不把独立层收益或单列确定性模式的计时外推成默认整网增量。
    rank 1 的约 57.6 ms 晚邻居窗口及 rank 3 native 计算仍需归因。
    整专家合包已回退 1.806%，独立收尾也无确认收益（第 10.2.11--10.2.12 节），不再盲目叠加；
    含发送 batch 必须保留 native dW 的真实就绪依赖，不能泛化删除 caller wait。
