@@ -41,6 +41,10 @@ from examples.torch.multicore.mega_moe_layer_profile import (
     profile_layer_step,
     profile_trace_paths,
 )
+from examples.torch.multicore.mega_moe_measurement import (
+    RUN_ID_ENV,
+    measurement_identity,
+)
 from examples.torch.multicore.mega_moe_p2p_profile import profile_layer_p2p
 from examples.torch.multicore.mega_moe_profile_context import (
     ProfileContext,
@@ -240,6 +244,9 @@ def _source_identity() -> dict[str, Any]:
         "context_helper_sha256": hashlib.sha256(
             Path(__file__).with_name("mega_moe_profile_context.py").read_bytes()
         ).hexdigest(),
+        "measurement_helper_sha256": hashlib.sha256(
+            Path(__file__).with_name("mega_moe_measurement.py").read_bytes()
+        ).hexdigest(),
         "python_implementation": _python_source_identity(repo),
         "native_artifacts": artifacts,
     }
@@ -252,6 +259,8 @@ class _LayerSweep:
         """Construct fixed production-shape layers and independent inputs."""
         self.worker = worker
         self.args = args
+        self.measurement_run_id = os.getenv(RUN_ID_ENV) or new_capture_id(worker.dist, "measurement")
+        self.measurement_metadata = measurement_identity(worker._RANK, self.measurement_run_id)
         self.checkpoint = importlib.import_module("torch.utils.checkpoint").checkpoint
         self.shape = worker._MoeShape(local_num_tokens=args.tokens, hidden_size=args.hidden,
                                       intermediate_size=args.intermediate, num_experts=args.experts,
@@ -331,23 +340,26 @@ class _LayerSweep:
             raise AssertionError("shared B changed the home parameter storage size")
         return ledger
 
-    def _measure_steps(self, route: tuple) -> tuple[list[float], list[float]]:
+    def _measure_steps(self, route: tuple) -> tuple[list[float], list[float], dict]:
         worker = self.worker
         latencies, step_latencies = [], []
-        for _ in range(self.args.measured):
+        windows = {"identity": self.measurement_metadata, "samples": []}
+        for sample in range(self.args.measured):
             worker.dist.barrier()
             worker.torch.npu.synchronize(worker._DEVICE)
-            started = time.perf_counter()
+            started = time.monotonic_ns()
             self._train_step(route)
             worker.torch.npu.synchronize(worker._DEVICE)
-            elapsed = (time.perf_counter() - started) * 1000
+            forward_end = time.monotonic_ns()
             self.optimizer.step()
             worker.torch.npu.synchronize(worker._DEVICE)
-            step_elapsed = (time.perf_counter() - started) * 1000
+            ended = time.monotonic_ns()
             # Aggregate only after both timers stop: diagnostics are not training.
-            latencies.append(worker._rank_max_latency(elapsed))
-            step_latencies.append(worker._rank_max_latency(step_elapsed))
-        return latencies, step_latencies
+            latencies.append(worker._rank_max_latency((forward_end - started) / 1e6))
+            step_latencies.append(worker._rank_max_latency((ended - started) / 1e6))
+            windows["samples"].append({"sample": sample, "start_ns": started,
+                                       "fwd_bwd_end_ns": forward_end, "end_ns": ended})
+        return latencies, step_latencies, windows
 
     def measure(self, alpha: float, seed: int) -> dict[str, Any]:
         """Measure one route, validating before warmup and after all updates."""
@@ -367,7 +379,7 @@ class _LayerSweep:
         worker.torch.npu.synchronize(worker._DEVICE)
         baseline = worker._device_memory_snapshot()
         worker.torch.npu.reset_peak_memory_stats(worker._DEVICE)
-        latencies, step_latencies = self._measure_steps(route)
+        latencies, step_latencies, windows = self._measure_steps(route)
         memory = worker._collect_memory_result(self.layers[0], baseline)
         memory["accounting"]["workspace_ledger"] += (
             "; the legacy workspace field describes the first resource group; "
@@ -379,7 +391,8 @@ class _LayerSweep:
             if not bool(worker.torch.isfinite(_local_tensor(parameter)).all().item()):
                 raise AssertionError("nonfinite parameter after AdamW updates")
         local_ledger = {"shared_pool": self._pool_ledger(),
-                        "optimizer_state": _optimizer_state_ledger(worker.torch, self.optimizer)}
+                        "optimizer_state": _optimizer_state_ledger(worker.torch, self.optimizer),
+                        "measurement_windows": windows}
         ledgers = [None] * self.shape.ep_size
         worker.dist.all_gather_object(ledgers, local_ledger)
         result = worker._build_performance_result(
@@ -393,6 +406,7 @@ class _LayerSweep:
         }
         result["shared_pool_per_rank"] = [ledger["shared_pool"] for ledger in ledgers]
         result["optimizer_state_per_rank"] = [ledger["optimizer_state"] for ledger in ledgers]
+        result["measurement_windows"] = [ledger["measurement_windows"] for ledger in ledgers]
         result["validation"].update(post_measurement_finite=True, optimizer_states_finite=True)
         result["layers"] = self.args.layers
         result["checkpoint"] = "reentrant"
@@ -411,6 +425,7 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
         "optimizer_step": True, "optimizer": {"name": "AdamW", **ADAMW_OPTIONS},
         "latency_metric": "train_step",
         "optimizer_timing": "direct F+B and full AdamW-step wall timers; states/updates inside HBM peak window",
+        "measurement_clock": "per-rank host monotonic ns; PID/start ticks and boot identity; census audited offline",
         "validation_protocol": "finite forward and gradients before warmup and after measurement; finite AdamW state",
         "weight_refresh": "parameters updated every iteration; replica refresh included in next F+B",
         "workspace_lifetime": "configured shared execution groups across layers and routes; high-watermarks retained",

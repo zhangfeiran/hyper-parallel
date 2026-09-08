@@ -43,6 +43,31 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 class TestBenchmarkMegaMoeLayers(unittest.TestCase):
     """Keep AdamW execution, state accounting and reported metadata consistent."""
 
+    def test_recorded_windows_share_timers_and_exclude_rank_aggregation(self) -> None:
+        """A slow timing collective must not enter either phase or the recorded step."""
+        events = []
+        sweep = benchmark._LayerSweep.__new__(benchmark._LayerSweep)
+        sweep.worker = MagicMock()
+        sweep.args = argparse.Namespace(measured=1)
+        sweep.measurement_metadata = {"pid": 123}
+        sweep._train_step = lambda _route: events.append("train")
+        sweep.optimizer = MagicMock()
+        sweep.optimizer.step.side_effect = lambda: events.append("optimizer")
+        sweep.worker._rank_max_latency.side_effect = lambda value: events.append("aggregate") or value
+        times = iter((1000000, 4000000, 8000000))
+
+        def clock() -> int:
+            """Expose timer placement independently of mocked training and collectives."""
+            events.append("clock")
+            return next(times)
+
+        with patch.object(benchmark.time, "monotonic_ns", side_effect=clock):
+            forward, full, windows = sweep._measure_steps(())
+        self.assertEqual(events, ["clock", "train", "clock", "optimizer", "clock", "aggregate", "aggregate"])
+        self.assertEqual((forward, full), ([3.0], [7.0]))
+        self.assertEqual(windows["samples"], [{"sample": 0, "start_ns": 1000000,
+                                              "fwd_bwd_end_ns": 4000000, "end_ns": 8000000}])
+
     def test_optimizer_is_adamw_with_reported_options(self):
         """The benchmark must execute AdamW, not SGD or coupled-decay Adam."""
         parameter = torch.nn.Parameter(torch.ones(2, device="cpu"))

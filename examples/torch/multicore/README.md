@@ -90,8 +90,9 @@ same original route in a step, making the skew coordinate unambiguous.
 
 All variants start from the same seeded standard EP expert weights for each
 layer; MegaMoe copies the rank-local shard into its packed layout before timing.
-Native parameters and optimizer states are DTensors: validation and the HBM
-ledger inspect their local shards, not the global logical tensor size.
+Native parameters are DTensors. AdamW binds their original local leaves, sharing
+the same storage and gradient with the registered parameters. Pointwise updates
+and moment buffers stay local; validation and the HBM ledger use shard sizes.
 
 Both MegaMoe variants share execution resources before first forward. B1 uses
 `shared_physical_weights=True`, leaving home parameters intact and sharing only
@@ -135,6 +136,43 @@ The plotter rejects mixed layer counts, checkpoint modes, optimizer protocols,
 and workload scope, including whether latency includes the optimizer update.
 Latency is measured for the complete multi-layer step, not single-layer latency
 multiplied by the layer count.
+
+#### Measured-step process audit
+
+Every point now stores `measurement_windows` for all ranks: PID and process start
+ticks, run identity, host/boot/PID namespace, and integer `start_ns`,
+`fwd_bwd_end_ns`, `end_ns` for each measured step. The latency values use these
+same monotonic timestamps; rank aggregation runs after the full-step end.
+A separate realtime anchor supports approximate calendar dates. Ownership joins
+use monotonic time on the same host and boot, without relying on wall-clock stability.
+
+After the existing idle gate, wrap the launcher in the process sampler. Specify
+physical board/chip pairs in the order used by each worker's `LOCAL_RANK`:
+
+```bash
+python -m examples.torch.multicore.mega_moe_measurement run \
+  --output output/b1_a.census.jsonl --devices 0:0,1:0,2:0,3:0,4:0,5:0,6:0,7:0 -- \
+  python -m torch.distributed.run --nproc_per_node=8 --master_port=29500 \
+  -m examples.torch.multicore.benchmark_mega_moe_layers \
+  --variant b1 --layers 16 --warmup 3 --measured 7 --output output/b1_a.json
+
+python -m examples.torch.multicore.mega_moe_measurement audit \
+  output/b1_a.json output/b1_a.census.jsonl --output output/b1_a.audit.json
+```
+
+The sampler records raw `npu-smi` output and the start/end of each query, with a
+one-second pause between queries by default. The offline audit checks every
+rank/step against bracketing observations, verifies worker PID/start ticks and
+device mapping, and checks the reported rank-max latencies. Failed queries,
+unknown ownership, missing brackets or excessive gaps are `inconclusive`;
+observed interference is `contaminated`. Any foreign process observed during the
+run prevents whole-run comparison, even if it falls outside measured steps.
+The default maximum worst-case observation gap is five seconds; use the same
+sampling cadence and acceptance policy for all paired runs. `eligible` means
+accepted under that sampling policy. A short-lived job between observations can
+still be missed; this is not continuous proof of exclusive device use.
+Both commands reject existing output files; the audit returns nonzero when a
+result is ineligible. The offline audit imports no training framework.
 
 Add `--profile-output output/b1_trace.json` to capture an optional rank-zero
 CPU/NPU Chrome trace. After **all** timing and memory measurements, the worker

@@ -39,7 +39,7 @@ T03 建立合并后的测量基线，T04/T05 完善显存与时间模型，T06 �
 | --- | --- | --- | --- | --- |
 | P0 | T01 | 统一 profiler 语义并支持多窗口归因 | 已实现并完成工具验收 | 两组原有 profiler 均保留 |
 | P0 | T02 | Qwen 生产形状多步数值重复性 | 历史问题待当前版本复现 | 固定原始配置和输入 |
-| P0 | T03 | 合并后的性能、HBM 和计时窗口基线 | 尚未做匹配 ABBA | T01；Qwen 部分依赖 T02 |
+| P0 | T03 | 合并后的性能、HBM 和计时窗口基线 | 逐步占用审计已实现；独立 MoE 基线验证中 | T01；Qwen 部分依赖 T02 |
 | P1 | T04 | 补齐并校验峰值 HBM 生命周期 | 已有账本待核对扩展 | T01/T03 的内存证据 |
 | P1 | T05 | 增强关键路径模型并重新校准 | rank 阶段模型待细化 | T01/T03；HBM 结合 T04 |
 | P1 | T06 | EP16/32/64、E384 联合参数扫描 | 可重放，待更新排序和边界 | T04/T05 |
@@ -106,8 +106,10 @@ EP8/E48、T512/H1024/I1024、3 层、2 个资源组、接收窗口 1 的真机�
 
 ### T03 — 合并后匹配的性能与 HBM 基线
 
-- [ ] 给每个 measured step 添加可审计的绝对起止时间，与全部设备 PID census 对齐。
-  当前进程组级的占用记录不能自动证明每个性能窗口都没有竞争。
+- [x] 给每个 measured step 添加可审计的绝对起止时间，与全部设备 PID census 对齐。
+  独立 MoE worker 的各 rank 使用同一组整数 monotonic 时间戳生成耗时与审计窗口，
+  保留 PID/start ticks、host/boot/PID namespace 和 realtime anchor。
+  审计报告前后采样、最大采样间隔及干扰；采样缺口和未知进程均不能当作干净测量。
 - [ ] 在空闲门控、匹配源码/native/输入下，用 fresh-process A/B/B/A 分别建立独立 MoE 层和
   connected Qwen 基线；明确 common EP、B0、B1 的比较范围，保持优化器、checkpoint 和容量设置一致。
 - [ ] 补齐动态路由、参数更新、连续 generation、B1 residual 3+ waves，以及 native/B0/B1
@@ -118,7 +120,12 @@ EP8/E48、T512/H1024/I1024、3 层、2 个资源组、接收窗口 1 的真机�
 均可追溯。没有稳定收益时如实保留中性结论；旧分支的收益不作为合并后结果。
 
 入口：[多层 benchmark](../../../../examples/torch/multicore/benchmark_mega_moe_layers.py)、
+[逐步占用审计](../../../../examples/torch/multicore/mega_moe_measurement.py)、
 [isolated Qwen](../../../../examples/torch/multicore/mega_moe/qwen_moe_isolated.py)。
+
+本轮同时修复独立 MoE native benchmark 的 AdamW 适配：优化器绑定已完成 EP 梯度同步的
+原有本地 leaf，避开 DTensor 未注册的 `lerp_` 布局推导，保持参数存储及梯度别名。
+CPU 回归逐步核对三次 AdamW 更新、moment 和 zero-grad；不改变全局 DTensor 算子注册。
 
 ## P1：用模型驱动参数和实现迭代
 
