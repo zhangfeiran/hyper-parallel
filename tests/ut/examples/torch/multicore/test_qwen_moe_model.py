@@ -85,6 +85,63 @@ class TestQwenMoeModel(unittest.TestCase):
         model.close()
 
 
+class TestQwenBackendModel(unittest.TestCase):
+    """Protect backend initialization and default dtype restoration."""
+
+    @staticmethod
+    def _shard_grouped(module: torch.nn.Module, _mesh: object) -> None:
+        """Emulate rank-zero expert sharding without initializing a process group."""
+        for name in ('w1', 'w2', 'w3'):
+            parameter = getattr(module, name)
+            setattr(module, name, torch.nn.Parameter(parameter[:parameter.shape[0] // 8].detach().clone()))
+
+    def _common_model(self) -> torch.nn.Module:
+        config = TestQwenMoeModel._config()
+        with patch.object(qwen_model, 'init_device_mesh', return_value=object()), \
+                patch.object(qwen_model.ExpertParallel, 'apply', side_effect=self._shard_grouped):
+            model = qwen_model.build_qwen_moe_model(config, torch.device('cpu'), backend='common')
+        self.addCleanup(model.close)
+        return model
+
+    def test_factory_preserves_initial_weights_and_dtype(self) -> None:
+        """Conversion must happen after dense initialization, preserving the original RNG order."""
+        config = TestQwenMoeModel._config()
+        default_dtype = torch.get_default_dtype()
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(42)
+            mega = qwen_model.build_qwen_moe_model(config, torch.device('cpu'))
+            self.addCleanup(mega.close)
+            torch.manual_seed(42)
+            common = self._common_model()
+        self.assertEqual(torch.get_default_dtype(), default_dtype)
+        self.assertTrue(all(parameter.dtype == torch.bfloat16 for parameter in common.parameters()))
+        self.assertEqual(common.layers[0].self_attn.rotary_emb.inv_freq.dtype, torch.float32)
+        expected = dict(mega.named_canonical_tensors())
+        actual = dict(common.named_canonical_tensors())
+        self.assertEqual(list(actual), list(expected))
+        self.assertEqual(len(actual), 23)
+        for name, tensor in actual.items():
+            with self.subTest(name=name):
+                torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
+        self.assertTrue(all(isinstance(layer.mlp.experts, qwen_model.NativeMoeExperts) for layer in common.layers))
+        self.assertEqual(len(common.expert_parameters()), 6)
+        with patch.object(qwen_model.MegaMoeExperts, 'close') as close_mega:
+            common.close()
+            close_mega.assert_not_called()
+
+    def test_factory_rejects_backend_before_construction_and_restores_dtype_on_error(self) -> None:
+        """Invalid backends and failed model construction cannot leak a new default dtype."""
+        config = TestQwenMoeModel._config()
+        default_dtype = torch.get_default_dtype()
+        with patch.object(qwen_model, 'QwenMoeModel', side_effect=RuntimeError('construction failed')) as construct:
+            with self.assertRaisesRegex(ValueError, 'backend'):
+                qwen_model.build_qwen_moe_model(config, torch.device('cpu'), backend='invalid')
+            construct.assert_not_called()
+            with self.assertRaisesRegex(RuntimeError, 'construction failed'):
+                qwen_model.build_qwen_moe_model(config, torch.device('cpu'))
+        self.assertEqual(torch.get_default_dtype(), default_dtype)
+
+
 class TestExpertUpdateProbe(unittest.TestCase):
     """Keep optimizer validation meaningful when skew leaves an expert or owner cold."""
 

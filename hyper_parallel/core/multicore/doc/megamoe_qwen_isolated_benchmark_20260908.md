@@ -249,3 +249,71 @@ native_sha256 map
 99.575 GiB 原始 CPU references 和四组 child JSON/log 位于：
 `/tmp/megamoe-qwen-isolated.Ud8iJ4/full8/qwen_isolated_uzsa2kya/`。
 小形状证据位于同一临时根目录的 `st_initial/`、`st_remaining/`、`st_final/`、`paired/`。
+
+## 7. 后续模型定义分层重构
+
+本节记录 `ed03e671` 之后按用户要求做的职责迁移，不替换上述历史测量和源码指纹：
+
+- `NativeMoeExperts` 定义在 `qwen_moe_model.py`，native token permutation、standard EP /
+  GroupedExperts、unpermutation 全部属于模型定义。benchmark 不再导入或检查这些具体实现类型。
+- 新增模型侧 `build_qwen_moe_model(config, device, backend=..., ep_group=...)`，负责 BF16
+  初始化、保留 rotary buffer dtype，以及 common 的 EP 分片和本地权重复制。seed、optimizer、
+  精度门槛、snapshot、计时和 HBM 诊断仍由 benchmark 负责。
+- 保持先构造全部 decoder、再逐层转换 common experts 的顺序，不把 GroupedExperts 初始化
+  插到后续 dense 参数之前；没有改变随机数消耗顺序或参数/optimizer ownership。
+- 模型提供 `named_canonical_tensors(gradients=False)`，统一暴露 dense 参数及 packed gate/up、
+  down 布局；benchmark 仅消费该接口。canonical 名称、shape、dtype 和按层惰性拼接保持不变。
+- AST 对照确认 adapter 的构造/forward/close 与原实现一致（仅 dtype 常量名迁移），canonical
+  转换函数体仅将 `model` 换成 `self`。17 个 native artifact hashes 与第 6 节记录一致。
+
+初始重构提交 `15f707a6` 按 add-unit-test 先补 6 项回归并观察其在旧实现上失败，再搬迁代码。完整 CPU 验证为
+287 passed / 307 subtests，51.39 s；三个修改 Python 文件 pylint 通过。无 Transformers 主环境
+19 passed / 25 subtests，模型集成文件因缺少可选包 skip 1 项；有依赖环境真实执行全部模型测试。
+当时新增用例覆盖独立 model import、两 backend 精确初始参数、RoPE dtype、非法 backend、异常后
+default dtype 恢复、原路由 histogram/score 透传、canonical gradient 和 benchmark 薄委托。
+
+后续按覆盖收益将该轮新增 UT 从 6 项精简为 2 项，只保留两 backend 初始化参数/dtype 一致及
+构造异常后 default dtype 恢复的检查。删除独立导入、薄委托、mock forward 和全 1 梯度布局
+检查；真实训练行为继续由已有八卡回归覆盖。模型、benchmark 和 ST 用例均未修改。
+精简后 Qwen model/config/snapshots/isolated 四个文件的 CPU 回归为 33 passed / 50 subtests，
+2.72 s，修改后的测试文件 pylint 通过；日志为 `output/qwen_moe_optimizer/qwen_model_ut_trim_20260908.log`。
+本轮未重跑八卡，以下 ST 和快照数字仍是初始重构提交的验证记录。
+
+此前 EP8 完整 connected 模型小形状回归为 6 passed，519.31 s：paired 与 isolated 各覆盖 balanced、
+Dirichlet、learned TopK。配置为两层 H1024/I256/T1024/V2048、E48/K8、shared-B1，包含逐步
+AdamW；isolated 使用 fresh-process A/B。所有首次输入/初始化、forward、gradient、更新后
+参数检查通过（paired 不单独导出输入快照），继续使用原 `rtol=0.02 / atol=0.002`。
+
+额外逐 rank、逐阶段对比本次 common A1 与重构前保留的 common CPU references，三种路由的
+inputs 和 initial parameters 都精确一致；其余阶段通过原阈值，但不是 bitwise 一致：
+
+| 路由 | 每 rank 参数/梯度张量数 | 最大 forward 绝对误差 | 最大梯度绝对误差 | 更新后最大归一化误差 |
+| --- | --- | --- | --- | --- |
+| balanced | 23 | 1.43051e-6 | 1.52588e-5 | 0.982961 |
+| Dirichlet | 23 | 9.53674e-7 | 1.52588e-5 | 0.975253 |
+| learned TopK | 25 | 9.53674e-7 | 1.52588e-5 | 0.980974 |
+
+新六组结果、逐 rank CPU snapshots 和跨版本比较脚本保留在
+`/tmp/megamoe-qwen-model-refactor.BkjW7d/`（`paired/`、`st/`、`compare_references.py`）；
+旧小形状 references 仍在第 6 节的临时根目录。以下日志/汇总位于 `output/qwen_moe_optimizer/`，
+没有加入 git；SHA256：
+
+```text
+qwen_model_refactor_full_ut_20260908.log
+  5d680be5730d8294e34e8eff2696db9c844ae636cdc716ae44e6a8c43db203f5
+qwen_model_refactor_st_20260908.log
+  8a202a9f1e276cba84be00bf54c0f7ff243d9cabff778e440e7aabe55dec4d5c
+qwen_model_refactor_previous_balanced_20260908.json
+  8d57c7585f334d22c9f4062ea02058954a46840b6fc53bf3aaf3e4ef87917a87
+qwen_model_refactor_previous_dirichlet_20260908.json
+  61eba4a622a2980275de4be58b557305a70bd5de32cf7bb7d3b126551d607cd7
+qwen_model_refactor_previous_topk_20260908.json
+  8e2fab091a8704fa10f0e5bb22c229c7fcacc95670816f7467fb6ec537fa07f6
+```
+
+临时比较脚本 SHA256 为
+`0971da43bb74ecee28fa29e82a2fcaa432df168c608db7f45b51bcd775816dd3`。
+
+本次是结构性重构，不宣称性能/HBM 优化，不用上述历史八层计时充当本次复测；多步 loss
+重复性和计时窗口校准仍是后续待处理项。CPU UT/lint/参考比较与部分短 ST 同时执行，短测
+latency 仅作为测试产物，不作为性能证据。

@@ -2,10 +2,10 @@
 
 This directory contains a focused end-to-end training benchmark:
 
-- `qwen_moe_model.py` defines a random-weight Qwen MoE model with learned TopK
-  routing, routed experts, shared experts, attention, and a language-model loss.
-- `qwen_moe_benchmark.py` builds identically initialized common-MoE and
-  MegaMoe variants, checks their full-model accuracy, and runs `zero_grad`,
+- `qwen_moe_model.py` defines the complete random-weight Qwen model, including
+  both MegaMoe and common/native routed experts, EP assembly, and weight layouts.
+- `qwen_moe_benchmark.py` selects reproducible seeds, calls the model factory,
+  checks full-model accuracy, and runs `zero_grad`,
   forward, backward, dense-gradient synchronization, and an AdamW step.
 - `qwen_moe_config.py` provides backend-free shape, routing, and storage options.
 - `qwen_moe_isolated.py` launches fresh common/MegaMoe processes in A/B/B/A order.
@@ -18,6 +18,27 @@ It is a runnable integration example, not a profiler. Isolated runs record
 per-rank steady-state allocator peaks, external SHMEM heap bytes, actual shared-B
 pool bytes, training-state bytes, and source/native fingerprints outside timing.
 They do not collect traces.
+
+## Model and benchmark boundary
+
+`build_qwen_moe_model(config, device, backend="mega_moe", ep_group=...)` is the
+model-side BF16 construction entry point. `backend="common"` selects the native
+token-permute → standard EP/GroupedExperts → token-unpermute implementation.
+The `NativeMoeExperts` definition, EP weight sharding, and local gate/up/down
+weight mapping all live in `qwen_moe_model.py`, not in the benchmark. The common
+path uses the example's world EP mesh; it is not the original MoonEP baseline.
+
+Both backends first construct the same initialized model; common conversion runs
+only after all layers exist, preserving RNG consumption and dense parameters.
+Rotary buffers keep their native dtype, and original per-backend parameter names
+and optimizer ownership are unchanged. `QwenMoeModel(config, ep_group=...)`
+continues to construct the default MegaMoe structure directly.
+
+`model.named_canonical_tensors(gradients=False)` exposes stable comparison names
+and backend-neutral local layouts. Common gate/up packing remains per-layer and
+lazy. The benchmark consumes this interface without inspecting expert types; it
+still owns seeding, optimizer steps, precision thresholds, snapshots, timing, and
+memory diagnostics. Constructing or importing a model does not import the runner.
 
 ## MegaMoe integration
 

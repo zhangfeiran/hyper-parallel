@@ -41,25 +41,21 @@ import hyper_parallel
 from examples.torch.multicore.mega_moe.qwen_moe_config import (
     QwenMoeConfig, make_config, optimizer_contract, parse_args,
 )
-from examples.torch.multicore.mega_moe.qwen_moe_model import QwenMoeModel
+from examples.torch.multicore.mega_moe.qwen_moe_model import QwenMoeModel, build_qwen_moe_model
 from examples.torch.multicore.mega_moe.qwen_moe_snapshots import compare_snapshot, save_snapshot
 
-from hyper_parallel import SkipDTensorDispatch, init_device_mesh
+from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.components.optim import (
     Float16OptimizerWithFloat16Params,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
-from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.optimizer import get_hyper_optimizer
-from hyper_parallel.platform.torch.common import GroupedExperts
 from hyper_parallel.platform.torch.symmetric_memory import lifecycle
 
 # pylint: enable=wrong-import-position
 
 _WORLD_SIZE = 8
 _BATCH_SIZE = 1
-_DTYPE = torch.bfloat16
 _RTOL = 2e-2
 _ATOL = 2e-3
 _SNAPSHOT_PHASES = ("inputs", "initial_parameters", "forward", "gradients", "updated_parameters")
@@ -146,63 +142,6 @@ class _AccuracySnapshots:
             raise RuntimeError(f"Qwen snapshot completion failed: {errors}")
 
 
-class _CommonExpertsAdapter(torch.nn.Module):
-    """Expose standard EP routed experts through the Qwen expert interface."""
-
-    def __init__(
-        self,
-        config: QwenMoeConfig,
-        source: MegaMoeExperts,
-        ep_mesh: Any,
-        device: torch.device,
-    ) -> None:
-        """Shard common experts and copy one local MegaMoe expert shard."""
-        super().__init__()
-        self.module = GroupedExperts(
-            dim=config.hidden_size,
-            hidden_dim=config.intermediate_size,
-            num_experts=config.num_experts,
-            use_grouped_mm=True,
-        ).to(device=device, dtype=_DTYPE)
-        ExpertParallel().apply(self.module, ep_mesh)
-        gate_weight, up_weight = source.gate_up_weight.split(
-            config.intermediate_size,
-            dim=-1,
-        )
-        with torch.no_grad():
-            _local_tensor(self.module.w1).copy_(gate_weight.transpose(1, 2))
-            _local_tensor(self.module.w3).copy_(up_weight.transpose(1, 2))
-            _local_tensor(self.module.w2).copy_(
-                source.down_weight.transpose(1, 2)
-            )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        *,
-        tokens_per_expert: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run the common routed-expert implementation."""
-        if tokens_per_expert is None:
-            tokens_per_expert = torch.bincount(
-                topk_ids.reshape(-1).to(torch.int64), minlength=self.module.num_experts,
-            )
-        routed_input, mapping = torch_npu.npu_moe_token_permute(
-            hidden_states.reshape(-1, hidden_states.shape[-1]), topk_ids,
-        )
-        expert_output = self.module(routed_input, tokens_per_expert)
-        output = torch_npu.npu_moe_token_unpermute(
-            expert_output, mapping, probs=topk_weights.float().contiguous(),
-        )
-        return output.reshape(hidden_states.shape)
-
-    @staticmethod
-    def close() -> None:
-        """Match the managed expert lifecycle without owning SHMEM."""
-
-
 def _init_runtime() -> tuple[int, int, torch.device]:
     """Bind the local NPU and initialize the fixed EP world."""
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -216,17 +155,6 @@ def _init_runtime() -> tuple[int, int, torch.device]:
             f"Qwen benchmark requires {_WORLD_SIZE} ranks, got {world_size}."
         )
     return rank, world_size, torch.device("npu", local_rank)
-
-
-def _build_model(config: QwenMoeConfig, device: torch.device) -> QwenMoeModel:
-    """Build BF16 model weights and keep rotary buffers in their native dtype."""
-    default_dtype = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(_DTYPE)
-        model = QwenMoeModel(config, ep_group=dist.group.WORLD)
-    finally:
-        torch.set_default_dtype(default_dtype)
-    return model.to(device=device)
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -246,24 +174,9 @@ def _build_backend_model(
     seed: int,
     backend: str,
 ) -> QwenMoeModel:
-    """Build one deterministically initialized MegaMoe or common model."""
+    """Select reproducible initialization, leaving backend assembly to the model."""
     _reset_seed(seed)
-    model = _build_model(config, device)
-    if backend == "mega_moe":
-        return model
-    if backend != "common":
-        raise ValueError(f"unsupported Qwen expert backend {backend!r}.")
-    ep_mesh = init_device_mesh(
-        device_type="npu",
-        mesh_shape=(config.ep_size,),
-        mesh_dim_names=("ep",),
-    )
-    for layer in model.layers:
-        source = layer.mlp.experts
-        common = _CommonExpertsAdapter(config, source, ep_mesh, device)
-        source.close()
-        layer.mlp.experts = common
-    return model
+    return build_qwen_moe_model(config, device, backend=backend, ep_group=dist.group.WORLD)
 
 
 def _build_workload(
@@ -499,52 +412,13 @@ def _validate_first_step(
     return validation, first_step_ms, loss, logits, gradients
 
 
-def _parameter_value(
-    parameter: torch.Tensor,
-    *,
-    gradients: bool,
-) -> torch.Tensor:
-    """Return one local parameter or its required gradient."""
-    value = parameter.grad if gradients else parameter
-    if value is None:
-        raise RuntimeError("Qwen accuracy comparison found a missing gradient.")
-    return _local_tensor(value)
-
-
 def _iter_canonical_tensors(
     model: QwenMoeModel,
     *,
     gradients: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield canonical tensors without retaining every layer's temporary packing."""
-    expert_parameters = {id(parameter) for parameter in model.expert_parameters()}
-    for name, parameter in model.named_parameters():
-        if id(parameter) not in expert_parameters:
-            yield f"dense.{name}", _parameter_value(parameter, gradients=gradients)
-    for layer_index, layer in enumerate(model.layers):
-        experts = layer.mlp.experts
-        if isinstance(experts, MegaMoeExperts):
-            gate_up = _parameter_value(
-                experts.gate_up_weight,
-                gradients=gradients,
-            )
-            down = _parameter_value(experts.down_weight, gradients=gradients)
-        elif isinstance(experts, _CommonExpertsAdapter):
-            grouped = experts.module
-            gate = _parameter_value(grouped.w1, gradients=gradients)
-            up = _parameter_value(grouped.w3, gradients=gradients)
-            down = _parameter_value(grouped.w2, gradients=gradients)
-            gate_up = torch.cat(
-                (gate.transpose(1, 2), up.transpose(1, 2)),
-                dim=-1,
-            )
-            down = down.transpose(1, 2)
-        else:
-            raise TypeError(
-                f"unsupported Qwen expert backend {type(experts).__name__}."
-            )
-        yield f"experts.{layer_index}.gate_up_weight", gate_up
-        yield f"experts.{layer_index}.down_weight", down
+    """Read the model-owned canonical interface without knowing backend layouts."""
+    return model.named_canonical_tensors(gradients=gradients)
 
 
 def _canonical_tensors(model: QwenMoeModel, *, gradients: bool) -> dict[str, torch.Tensor]:

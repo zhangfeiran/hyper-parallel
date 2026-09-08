@@ -1328,6 +1328,10 @@ PID；没有逐步绝对窗口标记，不能将本组称为严格独占 ABBA �
 在 common/common、MegaMoe/MegaMoe 自重复中均有分歧，首次精度通过不等于多步/收敛验收。
 后续优先级据此调整，原始数据及限制见 [单后端驻留报告](megamoe_qwen_isolated_benchmark_20260908.md)。
 
+随后将 `NativeMoeExperts`、两 backend 构造和 canonical 权重布局统一移入 Qwen model，
+benchmark 仅负责训练/比较/测量。CPU 287 passed / 307 subtests、两模式各三路由 EP8 回归及
+重构前后的 common references 对比通过；这是职责重构，没有新增性能结论，详见该报告第 7 节。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
