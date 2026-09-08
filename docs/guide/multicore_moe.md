@@ -164,3 +164,6 @@ EP16/32/64 planner 优化、owner 梯度接收显存上限及 peer 并发调优�
 2. **单边通信**：基于内存语义的单边通信（Symmetric Memory）避免传统集合通信的同步开销
 3. **RATR 通信重排**：通过 Rank-Aware Tile Reordering 将 AllToAll 流量在时间轴上均匀分散，避免多源 Rank 同时涌向同一目标，降低尾延迟
 4. **O0 vs O1**：O0 通过 host CPU 调度，O1 调度下沉到 AICore，性能更高但实现难度更大
+
+离线耗时/HBM 预测、细粒度任务采样和校准方法见
+[MegaMoe 理论成本模型](../../hyper_parallel/core/multicore/doc/theoretical_cost_model.md)。
