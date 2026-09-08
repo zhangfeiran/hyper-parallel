@@ -622,6 +622,19 @@ class TestMegaMoeRoute(unittest.TestCase):
                     self.assertTrue(actual.is_contiguous())
                     torch.testing.assert_close(actual.reshape(-1), expected, rtol=0, atol=0)
 
+    def test_copy_runs_preserve_logical_then_physical_order(self):
+        """Bucket sparse quotas in the ordering required by expert-major permutation."""
+        counts = ((8, 0, 0, 0, 0, 0, 0, 0), (8, 0, 2, 0, 0, 0, 0, 0),
+                  (8, 1, 0, 0, 0, 0, 0, 0), (0, 0, 0, 0, 0, 0, 0, 0))
+        plan = build_constrained_expert_placement(counts, 2, receive_capacity=8)
+        for source, row in enumerate(plan.dispatch_counts):
+            with self.subTest(source=source):
+                expected = sorted((plan.physical_to_logical_expert[index], index, count)
+                                  for index, count in enumerate(row) if count)
+                ids, sizes = route_module._physical_copy_runs(plan, source)
+                self.assertEqual(list(zip(ids, sizes)), [(index, count) for _, index, count in expected])
+                self.assertEqual(sum(sizes), sum(counts[source]))
+
     def test_device_remap_rejects_wrong_total_before_device_expansion(self):
         """
         Feature: fixed-size expansion safety

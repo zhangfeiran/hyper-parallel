@@ -209,16 +209,19 @@ def _physical_copy_runs(
     source_rank: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Return physical IDs and row counts ordered by logical expert."""
+    runs_by_expert = [[] for _ in range(plan.logical_num_experts)]
+    # One pass retains ascending physical-slot order within each logical
+    # expert, which is the ordering used by the device permutation's quotas.
+    for physical_expert, (logical_expert, count) in enumerate(zip(
+            plan.physical_to_logical_expert, plan.dispatch_counts[source_rank])):
+        if count:
+            runs_by_expert[logical_expert].append((physical_expert, count))
     physical_ids = []
     copy_counts = []
-    physical_to_logical = plan.physical_to_logical_expert
-    source_counts = plan.dispatch_counts[source_rank]
-    for logical_expert in range(plan.logical_num_experts):
-        for physical_expert, mapped_expert in enumerate(physical_to_logical):
-            count = source_counts[physical_expert]
-            if mapped_expert == logical_expert and count:
-                physical_ids.append(physical_expert)
-                copy_counts.append(count)
+    for runs in runs_by_expert:
+        for physical_expert, count in runs:
+            physical_ids.append(physical_expert)
+            copy_counts.append(count)
     return tuple(physical_ids), tuple(copy_counts)
 
 
