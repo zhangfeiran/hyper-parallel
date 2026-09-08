@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import wraps
@@ -27,13 +28,32 @@ from typing import Any
 _PACKAGE = "hyper_parallel.core.multicore.modules.mega_moe"
 _CYCLE_PROFILE_ENV = "HP_MEGA_MOE_KERNEL_CYCLE_PROFILE"
 _SPANS = {
-    "route": ("_start_count_gather", "_finish_static_count_gather", "_build_replica_plan",
-              "_remap_topk_ids_to_physical", "_materialize_replica_counts", "_prepare_route_endpoints"),
-    "function": ("_prepare_forward_buffers", "_launch_forward", "_prepare_backward_route",
-                  "_allocate_backward_intermediates", "_launch_backward", "_finish_backward"),
+    "route": (
+        "_start_count_gather",
+        "_finish_static_count_gather",
+        "_build_replica_plan",
+        "_remap_topk_ids_to_physical",
+        "_physical_copy_runs",
+        "_materialize_replica_counts",
+        "_compute_route_metadata",
+        "_prepare_route_endpoints",
+    ),
+    "function": (
+        "_prepare_forward_buffers",
+        "_launch_forward",
+        "_prepare_backward_route",
+        "_allocate_backward_intermediates",
+        "_launch_backward",
+        "_finish_backward",
+    ),
     "replica": ("_launch_transfers", "_wait_handles"),
-    "replica.ExpertReplicaManager": ("start_shared_prefetch", "_all_ranks_can_reuse", "_prefetch_transfers",
-                                     "_gradient_transfers", "reduce_replica_gradients"),
+    "replica.ExpertReplicaManager": (
+        "start_shared_prefetch",
+        "_all_ranks_can_reuse",
+        "_prefetch_transfers",
+        "_gradient_transfers",
+        "reduce_replica_gradients",
+    ),
     "replica.SharedExpertWeightLease": ("wait", "prepare_backward"),
 }
 
@@ -99,19 +119,22 @@ def profile_layer_step(sweep: Any, route: tuple, output: Path) -> None:
         profiler = importlib.import_module("torch_npu.profiler")
         capture = profiler.profile(
             activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+            record_shapes=True,
+            profile_memory=True,
             on_trace_ready=profiler.tensorboard_trace_handler(
-                str(output.parent), worker_name=output.stem, analyse_flag=False,
+                str(output.parent),
+                worker_name=output.stem,
+                analyse_flag=False,
             ),
         )
-    with capture:
-        with _profile_spans(record) if enabled else nullcontext():
-            worker.dist.barrier()
-            with record("megamoe::fwd_bwd") if enabled else nullcontext():
-                sweep._train_step(route)  # pylint: disable=protected-access
-                worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
-            with record("megamoe::adamw") if enabled else nullcontext():
-                sweep.optimizer.step()
-                worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
+    with capture, _profile_spans(record) if enabled else nullcontext():
+        worker.dist.barrier()
+        with record("megamoe::fwd_bwd") if enabled else nullcontext():
+            sweep._train_step(route)  # pylint: disable=protected-access
+            worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
+        with record("megamoe::adamw") if enabled else nullcontext():
+            sweep.optimizer.step()
+            worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
     if enabled:
         capture.export_chrome_trace(str(output))
         if not output.is_file():
@@ -150,10 +173,21 @@ def profile_layer_cycles(sweep: Any, route: tuple) -> dict[str, Any]:
         worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
         counters = worker._collect_kernel_cycle_profile(sweep.layers[0])  # pylint: disable=protected-access
         forward_counters = worker._collect_kernel_cycle_profile(  # pylint: disable=protected-access
-            sweep.layers[0], forward=True,
+            sweep.layers[0],
+            forward=True,
         )
         if counters is None or forward_counters is None:
             raise RuntimeError("MegaMoe forward/backward cycle counters were not collected")
+        detailed = []
+        if os.getenv("HP_MEGA_MOE_TASK_PROFILE", "0") == "1":
+            resources = sweep.layers[0]._resource_group.resources  # pylint: disable=protected-access
+            local = {
+                "rank": worker._RANK,  # pylint: disable=protected-access
+                "forward": resources.workspace.collect_task_profile(resources.spec.num_cube_cores, forward=True),
+                "backward": resources.workspace.collect_task_profile(resources.spec.num_cube_cores),
+            }
+            detailed = [None] * worker.dist.get_world_size()
+            worker.dist.all_gather_object(detailed, local)
         sweep.optimizer.step()
         worker.torch.npu.synchronize(worker._DEVICE)  # pylint: disable=protected-access
     finally:
@@ -161,6 +195,87 @@ def profile_layer_cycles(sweep: Any, route: tuple) -> dict[str, Any]:
             os.environ.pop(_CYCLE_PROFILE_ENV, None)
         else:
             os.environ[_CYCLE_PROFILE_ENV] = previous
-    return {"layer_index": 0, "scope": "last forward recomputation and backward launch only; not all layers",
-            "timing": "extra post-update step after all performance and memory measurements",
-            "counters": counters, "forward_counters": forward_counters}
+    return {
+        "layer_index": 0,
+        "scope": "last forward recomputation and backward launch only; not all layers",
+        "timing": "extra post-update step after all performance and memory measurements",
+        "counters": counters,
+        "forward_counters": forward_counters,
+        "task_profiles": detailed,
+    }
+
+
+def profile_scoped_events(torch_module: Any, call: Any) -> list[dict[str, Any]]:
+    """Capture CPU launch scopes and current-stream intervals in an extra step.
+
+    Scopes are inclusive and may nest or overlap across streams. HCCL launch
+    wrappers are CPU-only; the enclosing gradient reduction's current-stream
+    interval includes its real Work.wait dependencies. This diagnostic is never
+    used as the profile-off throughput measurement.
+    """
+    records = []
+    scope_groups = {
+        "route": (
+            "_build_replica_plan",
+            "_physical_copy_runs",
+            "_remap_topk_ids_to_physical",
+            "_compute_route_metadata",
+            "_prepare_route_endpoints",
+        ),
+        "function": (
+            "_prepare_forward_buffers",
+            "_launch_forward",
+            "_prepare_backward_route",
+            "_allocate_backward_intermediates",
+            "_launch_backward",
+            "_finish_backward",
+        ),
+        "replica.ExpertReplicaManager": ("reduce_replica_gradients",),
+    }
+
+    def _wrap(original: Any, name: str, device: bool) -> Any:
+        @wraps(original)
+        def _measured(*args: Any, **kwargs: Any) -> Any:
+            events = (
+                (torch_module.npu.Event(enable_timing=True), torch_module.npu.Event(enable_timing=True))
+                if device
+                else ()
+            )
+            stream = torch_module.npu.current_stream() if device else None
+            if events:
+                events[0].record(stream)
+            start = time.perf_counter_ns()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                cpu_us = (time.perf_counter_ns() - start) / 1000
+                if events:
+                    events[1].record(stream)
+                records.append({"scope": name, "cpu_us": cpu_us, "events": events})
+
+        return _measured
+
+    with ExitStack() as stack:
+        for path, names in scope_groups.items():
+            module_name, _, class_name = path.partition(".")
+            target = importlib.import_module(f"{_PACKAGE}.{module_name}")
+            if class_name:
+                target = getattr(target, class_name)
+            for name in names:
+                original = getattr(target, name)
+                stack.callback(setattr, target, name, original)
+                setattr(
+                    target,
+                    name,
+                    _wrap(original, f"{path}.{name}", name not in {"_build_replica_plan", "_physical_copy_runs"}),
+                )
+        call()
+    torch_module.npu.synchronize()
+    return [
+        {
+            "scope": item["scope"],
+            "cpu_us": item["cpu_us"],
+            "stream_us": item["events"][0].elapsed_time(item["events"][1]) * 1000 if item["events"] else None,
+        }
+        for item in records
+    ]

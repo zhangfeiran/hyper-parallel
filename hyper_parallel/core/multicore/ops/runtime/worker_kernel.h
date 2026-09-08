@@ -79,6 +79,7 @@ class KernelWorkerBase {
     if (this->home_experts_ > 0) {
       getReplicaMatrixBases(this->runtimeConfigPtr, this->replica_matrix_bases_);
     }
+    InitTaskProfile();
   }
 
   __aicore__ inline void Process() {
@@ -146,6 +147,85 @@ class KernelWorkerBase {
     if constexpr (Derived::CYCLE_PROFILE_ENABLED) {
       this->cycle_profile_[static_cast<uint32_t>(category)] +=
         AscendC::GetSystemCycle() - start;
+    }
+  }
+
+  static constexpr uint32_t TASK_PROFILE_MARKER = 0x4D545001;
+  static constexpr uint32_t TASK_PROFILE_CAPACITY = 256;
+  static constexpr uint32_t TASK_PROFILE_VALUES = 16;
+
+  __aicore__ inline void InitTaskProfile() {
+    if constexpr (Derived::CYCLE_PROFILE_ENABLED) {
+      GM_ADDR base = input_list[Derived::CYCLE_PROFILE_WORKSPACE_IDX] + Derived::CYCLE_PROFILE_OFFSET_BYTES;
+      GlobalTensor<int64_t> marker;
+      marker.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(base + 3968), 1);
+      this->task_profile_enabled_ = marker.GetValue(0) == TASK_PROFILE_MARKER;
+      if (!this->task_profile_enabled_) {
+        return;
+      }
+      uint32_t slot = this->worker_id_;
+      uint32_t tasks = this->cube_task_num;
+#ifndef __DAV_C220_CUBE__
+      slot = NUM_WORKERS_CUBE + this->worker_id_ / 2;
+      tasks = this->vector_task_num;
+#endif
+      uint32_t per_core = (tasks + this->core_num - 1) / this->core_num;
+      uint32_t visits = per_core * this->wave_count_;
+      this->task_profile_stride_ = (visits + TASK_PROFILE_CAPACITY - 1) / TASK_PROFILE_CAPACITY;
+      if (this->task_profile_stride_ == 0) {
+        this->task_profile_stride_ = 1;
+      }
+      this->task_profile_output_.SetGlobalBuffer(
+        reinterpret_cast<__gm__ int64_t *>(base + 4096) +
+          slot * (TASK_PROFILE_CAPACITY + 1) * TASK_PROFILE_VALUES,
+        (TASK_PROFILE_CAPACITY + 1) * TASK_PROFILE_VALUES);
+      this->task_profile_start_ = ProfileStart();
+    }
+  }
+
+  __aicore__ inline void RecordTaskProfile(
+      TaskId task_id, const TaskDesc &desc, int64_t start, int64_t ready, int64_t compute_end, int64_t end) {
+    if constexpr (Derived::CYCLE_PROFILE_ENABLED) {
+      if (!this->task_profile_enabled_ || this->task_profile_recorded_ >= TASK_PROFILE_CAPACITY ||
+          (this->task_profile_seen_ - 1) % this->task_profile_stride_ != 0) {
+        return;
+      }
+      int64_t rows = -1;
+      if (desc.task_type == TASK_GROUPED_MATMUL) {
+        GlobalTensor<int64_t> groups;
+        groups.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(
+          input_list[desc.inputs[2].input_position] + desc.inputs[2].base_ptr_offset * desc.inputs[2].data_type));
+        int64_t begin = 0;
+        int64_t finish = 0;
+        GetWaveExpertRange(groups, desc.task_index / this->core_num, &begin, &finish);
+        rows = finish - begin;
+      }
+      const int64_t values[TASK_PROFILE_VALUES] = {
+        task_id, desc.task_type, desc.task_index, this->wave_index_, desc.tiling_data_position,
+        desc.dependent_event, desc.trigger_event, start, ready, compute_end, end, rows,
+        desc.outputs[0].input_position, desc.extra_value_3, this->task_profile_seen_ - 1, 0};
+      const uint32_t offset = (++this->task_profile_recorded_) * TASK_PROFILE_VALUES;
+      for (uint32_t i = 0; i < TASK_PROFILE_VALUES; ++i) {
+        this->task_profile_output_.SetValue(offset + i, values[i]);
+      }
+      for (uint32_t i = 0; i < TASK_PROFILE_VALUES; i += DATA_CACHE_LINE_SIZE / sizeof(int64_t)) {
+        DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+          this->task_profile_output_[offset + i]);
+      }
+    }
+  }
+
+  __aicore__ inline void FlushTaskProfile() {
+    if constexpr (Derived::CYCLE_PROFILE_ENABLED) {
+      if (this->task_profile_enabled_) {
+        this->task_profile_output_.SetValue(0, this->task_profile_seen_);
+        this->task_profile_output_.SetValue(1, this->task_profile_recorded_);
+        this->task_profile_output_.SetValue(2, this->task_profile_stride_);
+        this->task_profile_output_.SetValue(3, this->task_profile_start_);
+        this->task_profile_output_.SetValue(4, ProfileStart());
+        DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+          this->task_profile_output_[0]);
+      }
     }
   }
 
@@ -638,6 +718,10 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void ExecuteTask(TaskId task_id) {
+    const int64_t task_start = ProfileStart();
+    if constexpr (Derived::CYCLE_PROFILE_ENABLED) {
+      ++this->task_profile_seen_;
+    }
     TaskDesc task_desc;
     int64_t profile_start = ProfileStart();
     getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
@@ -666,6 +750,8 @@ class KernelWorkerBase {
       profile_start = ProfileStart();
       SynchronizePhase();
       ProfileRecord(CYCLE_PROFILE_SYNCHRONIZATION, profile_start);
+      const int64_t end = ProfileStart();
+      RecordTaskProfile(task_id, task_desc, task_start, end, end, end);
       return;
     }
     const bool route_tile_copy =
@@ -748,7 +834,9 @@ class KernelWorkerBase {
         ProfileRecord(CYCLE_PROFILE_SYNCHRONIZATION, profile_start);
       }
     }
+    const int64_t task_ready = ProfileStart();
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
+    const int64_t task_compute_end = ProfileStart();
     if (route_tile_copy) {
       profile_start = ProfileStart();
       PublishRouteCopyAck(task_desc);
@@ -762,6 +850,7 @@ class KernelWorkerBase {
     if (task_desc.task_type != TASK_SHMEM_PUT_MEM_SIGNAL && task_desc.trigger_event != EVENT_INVALID_ID) {
       TriggerEvent(task_desc.trigger_event);
     }
+    RecordTaskProfile(task_id, task_desc, task_start, task_ready, task_compute_end, ProfileStart());
   }
 
   __aicore__ inline void WaitForDependency(
@@ -916,6 +1005,7 @@ class KernelWorkerBase {
   __aicore__ inline void TriggerEvent(uint32_t event_index) { AtomicAddForAllEventCounters(event_index); }
 
   __aicore__ inline void FlushCycleProfile() {
+    FlushTaskProfile();
     if constexpr (Derived::CYCLE_PROFILE_ENABLED) {
       uint32_t worker_slot = this->worker_id_;
 #ifndef __DAV_C220_CUBE__
@@ -941,6 +1031,12 @@ class KernelWorkerBase {
     }
   }
 
+  bool task_profile_enabled_ = false;
+  uint32_t task_profile_seen_ = 0;
+  uint32_t task_profile_recorded_ = 0;
+  uint32_t task_profile_stride_ = 1;
+  int64_t task_profile_start_ = 0;
+  GlobalTensor<int64_t> task_profile_output_;
   uint32_t worker_id_ = 0;
   uint32_t task_num = 0;
   int32_t vector_task_num = 0;

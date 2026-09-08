@@ -35,6 +35,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
     ROUTE_ARRIVAL_STRIDE_BYTES as _ROUTE_ARRIVAL_STRIDE_BYTES,
 )
 
+from . import task_profile
 from .spec import (
     _COMMUNICATION_SPLIT,
     MegaMoeSpec,
@@ -375,31 +376,48 @@ class MegaMoeWorkspace:
             self._free_local_tensors()
             raise
 
+    def _prepare_profile_storage(self, *, forward: bool) -> Any:
+        """Grow diagnostic storage before launch, retaining the old 4 KiB ABI."""
+        detailed = task_profile.enabled()
+        offset = 0 if forward else _SWIGLU_GRAD_WORKSPACE_BYTES
+        required = offset + _CYCLE_PROFILE_STORAGE_BYTES + (task_profile.ARENA_BYTES if detailed else 0)
+        field_name = "forward_cycle_profile" if forward else "swiglu_grad_workspace"
+        workspace = getattr(self, field_name)
+        if workspace is None or workspace.numel() < required:
+            if workspace is not None:
+                torch.npu.synchronize()
+                workspace.untyped_storage().resize_(0)
+            workspace = torch.empty((required,), dtype=torch.uint8, device=self.gmm_workspace.device)
+            setattr(self, field_name, workspace)
+        workspace.narrow(0, offset, required - offset).zero_()
+        if detailed:
+            workspace.narrow(0, offset + task_profile.MARKER_OFFSET, 8).view(torch.int64).fill_(task_profile.MARKER)
+        return workspace
+
     def prepare_cycle_profile(self, *, enabled: bool) -> None:
-        """Clear the fixed diagnostic tail only for an instrumented launch."""
-        if not enabled:
-            return
-        workspace = self.swiglu_grad_workspace
-        if workspace is None:
-            raise RuntimeError("MegaMoe SwiGLU-grad workspace is not initialized.")
-        workspace.narrow(
-            0,
-            _SWIGLU_GRAD_WORKSPACE_BYTES,
-            _CYCLE_PROFILE_STORAGE_BYTES,
-        ).zero_()
+        """Clear backward diagnostics only for an instrumented launch."""
+        if enabled:
+            self._prepare_profile_storage(forward=False)
 
     def prepare_forward_cycle_profile(self, *, enabled: bool) -> Any:
-        """Return a diagnostic-only buffer, or the existing scratch as an unused input."""
+        """Return diagnostic storage, or existing scratch as an unused input."""
         if self.gmm_workspace is None:
             raise RuntimeError("MegaMoe GMM workspace is not initialized.")
-        if not enabled:
-            return self.gmm_workspace
-        if self.forward_cycle_profile is None:
-            self.forward_cycle_profile = torch.empty(
-                (_CYCLE_PROFILE_STORAGE_BYTES,), dtype=torch.uint8, device=self.gmm_workspace.device,
-            )
-        self.forward_cycle_profile.zero_()
-        return self.forward_cycle_profile
+        return self._prepare_profile_storage(forward=True) if enabled else self.gmm_workspace
+
+    def collect_task_profile(self, num_cube_cores: int, *, forward: bool = False) -> dict[str, Any]:
+        """Read bounded task samples after the profiled launch has completed."""
+        workspace = self.forward_cycle_profile if forward else self.swiglu_grad_workspace
+        offset = 0 if forward else _SWIGLU_GRAD_WORKSPACE_BYTES
+        if workspace is None or workspace.numel() < offset + task_profile.BASE_BYTES + task_profile.ARENA_BYTES:
+            raise RuntimeError("No detailed task profile storage; enable HP_MEGA_MOE_TASK_PROFILE=1.")
+        marker = workspace.narrow(0, offset + task_profile.MARKER_OFFSET, 8).view(torch.int64).item()
+        if marker != task_profile.MARKER:
+            raise RuntimeError("Last launch did not enable the task profile ABI.")
+        values = workspace.narrow(0, offset + task_profile.BASE_BYTES, task_profile.ARENA_BYTES).view(
+            torch.int64
+        ).reshape(task_profile.WORKERS, task_profile.CAPACITY + 1, task_profile.RECORD_VALUES).cpu().tolist()
+        return task_profile.decode(values, num_cube_cores)
 
     def collect_cycle_profile(self, num_cube_cores: int, *, forward: bool = False) -> dict[str, Any]:
         """Return counters from the last profiled launch in one direction.
