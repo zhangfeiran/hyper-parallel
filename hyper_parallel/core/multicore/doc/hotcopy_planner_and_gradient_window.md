@@ -124,8 +124,8 @@ CPU 规划成本下降会改变 B 的收益判断。例如按两层每步 2 次�
 
 显存紧张时先测接收上限 4，再根据吞吐与峰值取舍。不要把缩减 B 作为固定的 OOM 回退：
 减少副本可能增加最大接收 token 数和保留激活，抵消权重池的节省。
-后续优先减少冷缓存 planner 的关键路径，例如分开缓存全局负载平衡结果和 per-source 分配，
-以及在 NPU 上构建规划与 remap 元数据；完整 per-source counts 仍是正确路由所需的数据。
+后续 planner 与控制面工作的顺序、进入条件和验收标准统一见[当前待办](megamoe_optimization_backlog.md)。
+完整 per-source counts 仍是正确路由所需的数据。
 
 ## 验证与参考
 

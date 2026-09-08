@@ -38,7 +38,7 @@
 
 每个 GEMM 的基础服务时间为：
 
-```
+```text
 fixed_us + max(padded_flops / effective_flops_per_us,
                logical_matrix_bytes / effective_hbm_bytes_per_us)
 ```

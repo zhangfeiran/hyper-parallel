@@ -184,4 +184,4 @@ speedups.
 
 For the original-width eight-layer shared-B1/capacity-1.5/Dirichlet acceptance,
 per-rank memory costs, competing-process observations, and remaining multi-step
-numerical limits, see the [isolated benchmark report](../../../../hyper_parallel/core/multicore/doc/megamoe_qwen_isolated_benchmark_20260908.md).
+numerical limits, see the [isolated benchmark report](../../../../hyper_parallel/core/multicore/doc/history/qwen_validation.md#单后端驻留与首次精度).

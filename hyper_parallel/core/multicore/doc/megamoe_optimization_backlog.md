@@ -1,7 +1,7 @@
 # MegaMoe 当前待办与验收清单
 
 更新日期：2026-09-08。核对基线：`megamoe-sun@ee5a696554133d99c80aa9029e5cdd9ab039c1ac`。
-本文件统一记录合并 cost-model 系列与 `megamoe-sun-260908` 后的待办；旧报告的“下一步”保留为历史记录。
+本文件统一记录合并 cost-model 系列与 `megamoe-sun-260908` 后的待办；历史实验见 history/，当前优先级仅在本文件维护。
 本次只整理文档，以下未勾选项均未因此启动或完成。后续完成一轮时更新状态、提交和证据入口。
 
 目标是让一次匹配源码、硬件与训练契约的校准支撑后续离线预测，预测耗时与峰值 HBM，
@@ -81,7 +81,7 @@ T03 建立合并后的测量基线，T04/T05 完善显存与时间模型，T06 �
 “loss 有限”“首次快照通过”和小形状回归均不能关闭此项；有限步数对照也不代表长时收敛。
 数值前置项失败时，暂停对应形状的性能调优，先诊断。
 
-证据：[Qwen 单后端驻留报告，第 4.4/5 节](megamoe_qwen_isolated_benchmark_20260908.md)。
+证据：[Qwen 多步数值边界](history/qwen_validation.md#多步数值边界)。
 入口：[Qwen benchmark](../../../../examples/torch/multicore/mega_moe/qwen_moe_benchmark.py)、
 [CPU snapshots](../../../../examples/torch/multicore/mega_moe/qwen_moe_snapshots.py)。
 
@@ -180,8 +180,8 @@ shared-B/checkpoint/跨流生命周期及完整梯度/更新后参数，然后�
 保留真实发送 producer wait、owner 全量 FP32 累加、窗口复用和 SHMEM ACK/generation 约束。
 无稳定收益或峰值超预算的候选撤回到实验归档，不累积在默认路径。
 
-证据：[receive-only 报告](megamoe_receive_only_overlap_20260908.md)、
-[梯度就绪报告](megamoe_gradient_readiness_20260908.md)。
+证据：[receive-only 报告](history/communication_experiments.md#已保留的-receive-only-接收解耦)、
+[梯度就绪报告](history/communication_experiments.md#跨-rank-就绪时间线)。
 
 ## P2：环境与证据满足后再推进
 
@@ -226,6 +226,6 @@ shared-B/checkpoint/跨流生命周期及完整梯度/更新后参数，然后�
   `REPORT.md`、设备日志、源码/native 前后指纹与 12 个 EP64 重放结果。
 - `/home/feiran/doc/megamoe-commit-split-20260908-160900/`：六个主题提交的拆分与逐阶段验证。
 - `/home/feiran/doc/megamoe-consolidation-20260908/`：归档 manifest、退役记录、独立数据根与重放脚本。
-- [Qwen 单后端驻留报告](megamoe_qwen_isolated_benchmark_20260908.md)：生产形状多步数值问题及历史计时边界。
+- [Qwen 单后端驻留报告](history/qwen_validation.md#单后端驻留与首次精度)：生产形状多步数值问题及历史计时边界。
 - [Runtime descriptor v2](runtime_descriptor_v2.md)：动态容量、ABI、worker 拓扑与校准边界。
 - [MoonEP + multi-wave 报告](moonep_multi_wave_report.md)：实现合同、已撤回实验与历史性能。

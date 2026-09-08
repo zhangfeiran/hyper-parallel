@@ -1,12 +1,19 @@
 # MoE-FFN Multicore Operator
 
----
+本页维护通用 multicore 图、任务切分、调度器、构建及扩展方式。MegaMoe 文档按责任分为以下入口：
 
-MoonEP 风格有界热专家副本与 lossless multi-wave 的组合实现、内存模型和性能验证，见
-[MegaMoe MoonEP + multi-wave 技术报告](moonep_multi_wave_report.md)。
+| 长期维护文档 | 内容 |
+| --- | --- |
+| [本页](README.md) | 通用 multicore 架构、构建、底层 API 与新任务开发 |
+| [MegaMoe 技术设计](moonep_multi_wave_report.md) | 热专家副本、multi-wave、资源与梯度所有权 |
+| [Planner 与梯度窗口](hotcopy_planner_and_gradient_window.md) | B、接收窗口、peer 并发与 EP64 模型边界 |
+| [理论成本模型](theoretical_cost_model.md) | 离线耗时/HBM 预测、细粒度 profiler 与校准 |
+| [Runtime descriptor v2](runtime_descriptor_v2.md) | 动态 task/event 容量、wire format 与 decoder |
+| [当前待办](megamoe_optimization_backlog.md) | 唯一的当前优先级、已完成基线与逐项验收标准 |
 
-合并后的开发优先级、已完成基线和逐项验收标准，统一维护在
-[MegaMoe 当前待办与验收清单](megamoe_optimization_backlog.md)。
+历史结果按主题保存在 [运行时验证](history/runtime_validation.md)、
+[通信实验](history/communication_experiments.md)和 [Qwen 验证](history/qwen_validation.md)；
+每篇标明旧基线、测量边界、原始证据与 Git 恢复入口。新实验追加到对应主题，不再逐轮新增日期报告。
 
 ## 1. 背景与融合思路
 
