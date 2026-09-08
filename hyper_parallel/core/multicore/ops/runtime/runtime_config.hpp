@@ -33,6 +33,10 @@ constexpr uint32_t READY_HANDSHAKE_COPY_ACK_VERSION = 2;
 constexpr uint32_t READY_HANDSHAKE_DESTINATION_FENCE_VERSION = 3;
 constexpr uint32_t RUNTIME_TASK_CAPACITY_MAGIC = 0x80000000;
 constexpr uint32_t RUNTIME_TASK_CAPACITY_MASK = RUNTIME_TASK_CAPACITY_MAGIC - 1;
+constexpr uint32_t RUNTIME_EXTENDED_MAGIC = 0x40000000;
+constexpr uint32_t RUNTIME_EXTENDED_CAPACITY_MASK = RUNTIME_EXTENDED_MAGIC - 1;
+constexpr uint32_t RUNTIME_FORMAT_VERSION = 2;
+constexpr uint32_t COMPACT_TASK_DESC_SIZE = 128;
 
 constexpr uint32_t UB_32B_ALIGN = 32;
 constexpr uint32_t DATA_CACHE_LINE_SIZE = 64;
@@ -184,30 +188,112 @@ __aicore__ inline uint32_t getConfigExtraValue(__gm__ uint8_t *tiling) {
   return (*(__gm__ uint32_t *)(tiling + UINT32_T_SIZE * 3));
 }
 
+__aicore__ inline bool hasExtendedRuntime(__gm__ uint8_t *tiling) {
+  uint32_t encoded = (*(__gm__ uint32_t *)(tiling + UINT32_T_SIZE * 2));
+  return (encoded & (RUNTIME_TASK_CAPACITY_MAGIC | RUNTIME_EXTENDED_MAGIC)) ==
+    (RUNTIME_TASK_CAPACITY_MAGIC | RUNTIME_EXTENDED_MAGIC);
+}
+
 __aicore__ inline uint32_t getRuntimeTaskCapacity(__gm__ uint8_t *tiling) {
   uint32_t encoded = (*(__gm__ uint32_t *)(tiling + UINT32_T_SIZE * 2));
+  if (hasExtendedRuntime(tiling)) {
+    return encoded & RUNTIME_EXTENDED_CAPACITY_MASK;
+  }
   return (encoded & RUNTIME_TASK_CAPACITY_MAGIC) != 0 ? encoded & RUNTIME_TASK_CAPACITY_MASK : MAX_TASK_NUM;
 }
 
-__aicore__ inline uint32_t getAllEventNumTriggersOffset() { return UINT32_T_SIZE * 4; }
+__aicore__ inline uint32_t getRuntimeEventCapacity(__gm__ uint8_t *tiling) {
+  return hasExtendedRuntime(tiling) ? (*(__gm__ uint32_t *)(tiling + 16)) : MAX_EVENT_NUM;
+}
 
-__aicore__ inline uint32_t getAllTasksOffset() { return UINT32_T_SIZE * 4 + INT32_T_SIZE * MAX_EVENT_NUM; }
+__aicore__ inline uint32_t getRuntimeTensorCount(__gm__ uint8_t *tiling) {
+  return hasExtendedRuntime(tiling) ? (*(__gm__ uint32_t *)(tiling + 20)) : 0;
+}
+
+__aicore__ inline uint32_t getRuntimeTaskStride(__gm__ uint8_t *tiling) {
+  return hasExtendedRuntime(tiling) ? (*(__gm__ uint32_t *)(tiling + 24)) : sizeof(TaskDesc);
+}
+
+__aicore__ inline void validateRuntimeFormat(__gm__ uint8_t *tiling) {
+  if (!hasExtendedRuntime(tiling)) {
+    return;
+  }
+  uint32_t stride = getRuntimeTaskStride(tiling);
+  if ((*(__gm__ uint32_t *)(tiling + 28)) != RUNTIME_FORMAT_VERSION ||
+      (stride != sizeof(TaskDesc) && stride != COMPACT_TASK_DESC_SIZE) ||
+      getRuntimeEventCapacity(tiling) < MAX_EVENT_NUM || getRuntimeEventCapacity(tiling) % 16 != 0) {
+    AscendC::Trap();
+  }
+}
+
+__aicore__ inline uint32_t getAllEventNumTriggersOffset(__gm__ uint8_t *tiling) {
+  return hasExtendedRuntime(tiling) ? DATA_CACHE_LINE_SIZE : UINT32_T_SIZE * 4;
+}
+
+__aicore__ inline uint32_t getAllTasksOffset(__gm__ uint8_t *tiling) {
+  return getAllEventNumTriggersOffset(tiling) + INT32_T_SIZE * getRuntimeEventCapacity(tiling);
+}
 
 __aicore__ inline uint32_t getAllEventsOffset(__gm__ uint8_t *tiling) {
-  uint32_t start_size = getAllTasksOffset();
+  return getAllTasksOffset(tiling) + getRuntimeTaskStride(tiling) * getRuntimeTaskCapacity(tiling);
+}
 
-  uint32_t tensor_desc_size = UINT32_T_SIZE * 8 + UINT32_T_SIZE * MAX_TENSOR_DIMS * 2;
-  uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size +
-                            MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
+__aicore__ inline uint32_t getRuntimeTensorTableOffset(__gm__ uint8_t *tiling);
 
-  return start_size + task_desc_size * getRuntimeTaskCapacity(tiling);
+__aicore__ inline void getTensorTemplate(__gm__ uint32_t *source, TensorDesc *tensor) {
+  tensor->tensor_type = source[0];
+  tensor->num_dims = source[1];
+  for (uint32_t dimension = 0; dimension < MAX_TENSOR_DIMS; ++dimension) {
+    tensor->dim[dimension] = source[2 + dimension];
+    tensor->stride[dimension] = source[6 + dimension];
+  }
+  tensor->data_type = source[10];
+  tensor->input_position = source[11];
+  tensor->base_ptr_offset = source[12];
+  tensor->transpose_flag = source[13];
+  tensor->dynamic_shape = source[14];
+  tensor->dynamic_dim = source[15];
+}
+
+__aicore__ inline void getCompactTaskDesc(__gm__ uint8_t *tiling, TaskDesc *task, uint32_t index) {
+  __gm__ uint32_t *record = reinterpret_cast<__gm__ uint32_t *>(
+    tiling + getAllTasksOffset(tiling) + index * COMPACT_TASK_DESC_SIZE);
+  task->task_type = static_cast<TaskType>(record[0]);
+  task->task_aicore_type = static_cast<TaskAiCoreType>(record[1]);
+  task->num_inputs = record[2];
+  task->num_outputs = record[3];
+  task->trigger_event = record[4];
+  task->dependent_event = record[5];
+  __gm__ uint8_t *table = tiling + getRuntimeTensorTableOffset(tiling);
+  for (uint32_t tensor_index = 0; tensor_index < MAX_INPUTS_PER_TASK + MAX_OUTPUTS_PER_TASK; ++tensor_index) {
+    TensorDesc *tensor = tensor_index < MAX_INPUTS_PER_TASK ?
+      &task->inputs[tensor_index] : &task->outputs[tensor_index - MAX_INPUTS_PER_TASK];
+    const uint32_t template_id = record[6 + tensor_index * 2];
+    __gm__ uint32_t *source = reinterpret_cast<__gm__ uint32_t *>(table + template_id * sizeof(TensorDesc));
+    getTensorTemplate(source, tensor);
+    tensor->base_ptr_offset = record[7 + tensor_index * 2];
+  }
+  task->tiling_data_position = record[22];
+  task->tiling_data_offset = record[23];
+  task->task_index = record[24];
+  task->task_split_num = record[25];
+  task->task_split_value = record[26];
+  task->extra_value_0 = record[27];
+  task->extra_value_1 = record[28];
+  task->extra_value_2 = record[29];
+  task->extra_value_3 = record[30];
+  task->extra_value_4 = record[31];
 }
 
 __aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData, uint32_t index_size) {
   uint32_t tensor_desc_size = UINT32_T_SIZE * 8 + UINT32_T_SIZE * MAX_TENSOR_DIMS * 2;
   uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size +
                             MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
-  uint32_t size = getAllTasksOffset() + index_size * task_desc_size;
+  if (getRuntimeTaskStride(tiling) == COMPACT_TASK_DESC_SIZE) {
+    getCompactTaskDesc(tiling, tilingData, index_size);
+    return;
+  }
+  uint32_t size = getAllTasksOffset(tiling) + index_size * task_desc_size;
 
   tilingData->task_type = (*(__gm__ TaskType *)(tiling + size));
   tilingData->task_aicore_type = (*(__gm__ TaskAiCoreType *)(tiling + size + UINT32_T_SIZE));
@@ -299,7 +385,7 @@ __aicore__ inline void getEventDesc(__gm__ uint8_t *tiling, EventDesc *tilingDat
 }
 
 __aicore__ inline uint32_t getTaskIndexNumOffset(__gm__ uint8_t *tiling) {
-  return getAllEventsOffset(tiling) + MAX_EVENT_NUM * 4 * UINT32_T_SIZE;
+  return getAllEventsOffset(tiling) + getRuntimeEventCapacity(tiling) * 4 * UINT32_T_SIZE;
 }
 
 __aicore__ inline int32_t getTaskIndexNumByTaskType(__gm__ uint8_t *tiling, TaskAiCoreType task_aicore_type) {
@@ -360,11 +446,18 @@ __aicore__ inline void getReadyHandshakeMeta(__gm__ uint8_t *tiling, ReadyHandsh
   meta->ready_event = (*(__gm__ uint32_t *)(base + UINT32_T_SIZE * 2));
 }
 
+// Tensor templates start on a cache line. Legacy descriptors retain their
+// original 8-byte-aligned tail so persisted offline blobs remain readable.
+__aicore__ inline uint32_t getRuntimeTensorTableOffset(__gm__ uint8_t *tiling) {
+  uint32_t alignment = hasExtendedRuntime(tiling) ? DATA_CACHE_LINE_SIZE : INT64_T_SIZE;
+  return (getReadyHandshakeMetaOffset(tiling) + 3 * UINT32_T_SIZE + alignment - 1) & ~(alignment - 1);
+}
+
 // Optional split-weight ABI v1, after the compact RuntimeConfig's 8-byte
 // aligned end. Home tensors remain operator inputs; only group-owned B-slot
 // weights and gradients are addressed here. Never read this for dense weights.
 __aicore__ inline void getReplicaMatrixBases(__gm__ uint8_t *tiling, GM_ADDR *bases) {
-  const uint32_t offset = (getReadyHandshakeMetaOffset(tiling) + 3 * UINT32_T_SIZE + 7U) & ~7U;
+  const uint32_t offset = getRuntimeTensorTableOffset(tiling) + getRuntimeTensorCount(tiling) * sizeof(TensorDesc);
   __gm__ uint8_t *base = tiling + offset;
   const uint32_t magic = *reinterpret_cast<__gm__ uint32_t *>(base);
   const uint32_t version = *reinterpret_cast<__gm__ uint32_t *>(base + UINT32_T_SIZE);

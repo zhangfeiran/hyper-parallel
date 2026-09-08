@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import statistics
 from collections import defaultdict
@@ -182,6 +184,64 @@ def calibrate(samples: list[dict], hardware: Hardware, *, identity: dict) -> Har
                 for key, buckets in curve_buckets.items()
             },
         },
+    )
+
+
+def calibrate_descriptor_service(documents: list[dict], hardware: Hardware, *, train_pairs: set[str]) -> Hardware:
+    """Fit decode service using all-task counters, independently of sampled spans.
+
+    Args:
+        documents: Raw per-rank results from ``profile_mega_moe_costs``.
+        hardware: Existing hardware rates; GEMM and transfer fits are preserved.
+        train_pairs: Explicit route alpha/seed identifiers allowed into this fit.
+
+    Returns:
+        Hardware with measured active-vector-worker count and per-task decode
+        service. Dependency wait and holdout routes never enter the fit.
+    """
+    observations, identities, worker_counts = [], set(), set()
+    for document in documents:
+        identity = document["identity"]
+        mode = identity.get("runtime_environment", {}).get("HP_MEGA_MOE_COMPACT_RUNTIME")
+        sources = identity.get("sources_and_payload", {})
+        reader_hash = sources.get("hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp")
+        worker_hash = sources.get("hyper_parallel/core/multicore/ops/runtime/worker_kernel.h")
+        native = {name: value for name, value in sources.items() if name.endswith((".so", ".o"))}
+        if mode not in {"0", "1"} or not reader_hash or not worker_hash or not native:
+            raise ValueError("descriptor calibration requires explicit runtime format and native source identity")
+        native_hash = hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest()
+        identities.add((mode, reader_hash, worker_hash, native_hash))
+        for result in document["results"]:
+            if result["pair"] not in train_pairs:
+                continue
+            for direction, profile in result["task_profiles"].items():
+                cycles = result["cycle_profiles"][direction]
+                if profile["unit"] != "system_cycle" or cycles["unit"] != "system_cycle":
+                    raise ValueError("descriptor calibration requires system-cycle counters")
+                vectors = [worker for worker in profile["workers"] if worker["kind"] == "vector"]
+                per_core = cycles["vector"]["per_core"]
+                if not vectors or len(per_core) != len(vectors):
+                    raise ValueError("descriptor calibration requires complete active vector counters")
+                seen = sum(worker["seen"] for worker in vectors)
+                decode_cycles = sum(row[cycles["categories"].index("descriptor_decode")] for row in per_core)
+                if seen <= 0 or decode_cycles <= 0:
+                    raise ValueError("descriptor calibration requires positive task counts and decode duration")
+                worker_counts.add(len(vectors))
+                observations.append(decode_cycles / (50.0 * seen))
+    if not observations or len(identities) != 1 or len(worker_counts) != 1:
+        raise ValueError("descriptor calibration requires training samples from one runtime format and worker topology")
+    mode, reader_hash, worker_hash, native_hash = identities.pop()
+    workers = worker_counts.pop()
+    return replace(
+        hardware, descriptor_us=statistics.median(observations), vector_workers=workers,
+        provenance=hardware.provenance | {"descriptor": {
+            "format": "compact" if mode == "1" else "dense",
+            "reader_sha256": reader_hash, "worker_sha256": worker_hash,
+            "native_payload_sha256": native_hash,
+            "vector_workers": workers, "train_pairs": sorted(train_pairs),
+            "observations": len(observations), "min_us": min(observations), "max_us": max(observations),
+            "accounting": "median rank/direction all-task decode averages; excludes dependency waits; not wall time",
+        }},
     )
 
 

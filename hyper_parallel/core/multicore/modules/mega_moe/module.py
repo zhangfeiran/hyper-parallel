@@ -78,7 +78,10 @@ class _MegaMoeExecutionResources:
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
             self.home_runtime = (
-                build_mega_moe_plan(replace(self.spec, replica_slots_per_rank=0), tensor.device)
+                build_mega_moe_plan(
+                    replace(self.spec, replica_slots_per_rank=0), tensor.device,
+                    event_capacity=self.plan.event_capacity,
+                )
                 if self.spec.replica_slots_per_rank else self.plan
             )
             self.workspace = MegaMoeWorkspace(

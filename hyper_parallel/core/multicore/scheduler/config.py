@@ -20,8 +20,11 @@ Combines:
 - ctypes.Structure mirrors of runtime_head.hpp — passed as binary blobs to C++ kernels
 """
 import ctypes
+import os
+import struct
 from dataclasses import dataclass
 from enum import IntEnum
+from functools import lru_cache
 
 # ── Constants (match runtime_head.hpp exactly) ────────────────────────────────
 MAX_TENSOR_DIMS      = 4
@@ -53,6 +56,19 @@ ATOMIC_DW_ACCUMULATION_FLAG = 1 << 29
 RUNTIME_TASK_CAPACITY_MAGIC = 0x80000000
 RUNTIME_TASK_CAPACITY_MASK = RUNTIME_TASK_CAPACITY_MAGIC - 1
 RUNTIME_TASK_CAPACITY_ALIGNMENT = 16
+RUNTIME_EXTENDED_MAGIC = 0x40000000
+RUNTIME_EXTENDED_CAPACITY_MASK = RUNTIME_EXTENDED_MAGIC - 1
+RUNTIME_FORMAT_VERSION = 2
+COMPACT_TASK_DESC_SIZE = 128
+
+
+def compact_runtime_enabled() -> bool:
+    """Select the validated tensor-table format for managed online plans."""
+    name = "HP_MEGA_MOE_COMPACT_RUNTIME"
+    value = os.getenv(name, "1")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}.")
+    return value == "1"
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
@@ -200,6 +216,49 @@ RUNTIME_CONFIG_BYTES_PER_TASK_CAPACITY = (
 )
 
 
+def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
+    """Reserve all backward replay events and a separate barrier cache line.
+
+    The largest graph uses ``2 * E + 9 * local_E + 5`` ordinary events,
+    followed by readiness/route events up to that value plus five. Phase and
+    wave barriers occupy the final cache line, isolated from op atomics.
+    ``num_experts`` includes physical replica slots.
+    """
+    if ep_size < 1 or num_experts < 1 or num_experts % ep_size:
+        raise ValueError("expert count must be positive and divisible by EP size")
+    ordinary = 2 * num_experts + 9 * (num_experts // ep_size) + 11
+    return max(MAX_EVENT_NUM, (ordinary + 15) // 16 * 16 + 16)
+
+
+@lru_cache(maxsize=16)
+def _runtime_config_type(task_capacity: int, event_capacity: int) -> type:
+    """Keep the legacy host mirror for small graphs; grow only when needed."""
+    if task_capacity <= MAX_TASK_NUM and event_capacity == MAX_EVENT_NUM:
+        return RuntimeConfigC
+    replacements = {
+        "all_event_num_triggers": ctypes.c_int32 * event_capacity,
+        "all_tasks": TaskDescC * task_capacity,
+        "all_events": EventDescC * event_capacity,
+        "cube_task_indices": ctypes.c_int32 * task_capacity,
+        "vector_task_indices": ctypes.c_int32 * task_capacity,
+        "mix_task_indices": ctypes.c_int32 * task_capacity,
+    }
+    return type(
+        "SizedRuntimeConfigC", (ctypes.Structure,),
+        {"_fields_": [(name, replacements.get(name, kind)) for name, kind in RuntimeConfigC._fields_]},
+    )
+
+
+def allocate_runtime_config(task_capacity: int, event_capacity: int = MAX_EVENT_NUM) -> RuntimeConfigC:
+    """Allocate a host graph image with sufficient task, queue and event slots."""
+    if task_capacity < 0 or event_capacity < MAX_EVENT_NUM or event_capacity % 16:
+        raise ValueError("invalid runtime allocation capacity")
+    capacity = (task_capacity + 15) // 16 * 16
+    # Device byte offsets are uint32, even for the expanded dense reference ABI.
+    runtime_config_serialized_size(capacity, event_capacity=event_capacity)
+    return _runtime_config_type(capacity, event_capacity)()
+
+
 def runtime_config_task_capacity(cfg: RuntimeConfigC) -> int:
     """Return the aligned wire capacity required by populated task queues.
 
@@ -210,96 +269,154 @@ def runtime_config_task_capacity(cfg: RuntimeConfigC) -> int:
         Aligned number of serialized task slots.
     """
     counts = [int(cfg.task_index_num[index]) for index in range(3)]
-    for count in counts:
-        if count < 0 or count > TASK_TYPE_INDEX_NUM:
+    queues = (cfg.cube_task_indices, cfg.vector_task_indices, cfg.mix_task_indices)
+    for count, indices in zip(counts, queues):
+        if count < 0 or count > len(indices):
             raise ValueError(f"invalid runtime task-index count {count}")
 
     maximum_task_id = -1
     for indices, count in zip(
-        (cfg.cube_task_indices, cfg.vector_task_indices, cfg.mix_task_indices),
+        queues,
         counts,
     ):
         for index in range(count):
             task_id = int(indices[index])
-            if task_id < 0 or task_id >= MAX_TASK_NUM:
+            if task_id < 0 or task_id >= len(cfg.all_tasks):
                 raise ValueError(f"invalid runtime task id {task_id}")
             maximum_task_id = max(maximum_task_id, task_id)
 
     required = max(int(cfg.task_num), *counts, maximum_task_id + 1)
-    if required > MAX_TASK_NUM:
+    if required > len(cfg.all_tasks):
         raise ValueError(
-            f"runtime requires {required} task slots, maximum is {MAX_TASK_NUM}"
+            f"runtime requires {required} task slots, allocated {len(cfg.all_tasks)}"
         )
     alignment = RUNTIME_TASK_CAPACITY_ALIGNMENT
     return (required + alignment - 1) // alignment * alignment
 
 
-def runtime_config_serialized_size(task_capacity: int) -> int:
+def runtime_config_serialized_size(
+    task_capacity: int, *, event_capacity: int = MAX_EVENT_NUM,
+    compact: bool = False, tensor_count: int = 0,
+) -> int:
     """Return the dynamic wire size for an aligned full task capacity.
 
     Args:
         task_capacity: Aligned number of serialized task slots.
+        event_capacity: Cache-line-aligned event slots, shared by all plans.
+        compact: Whether tasks reference an interned tensor table.
+        tensor_count: Number of 64-byte tensor templates in the table.
 
     Returns:
         Runtime descriptor size in bytes.
     """
     if (
         task_capacity < 0
-        or task_capacity > MAX_TASK_NUM
+        or task_capacity > RUNTIME_EXTENDED_CAPACITY_MASK
         or task_capacity % RUNTIME_TASK_CAPACITY_ALIGNMENT
+        or event_capacity < MAX_EVENT_NUM or event_capacity % 16
+        or tensor_count < 0 or (tensor_count and not compact)
     ):
         raise ValueError(f"invalid runtime task capacity {task_capacity}")
-    return (
+    extended = compact or event_capacity != MAX_EVENT_NUM or task_capacity > MAX_TASK_NUM
+    size = (
         RUNTIME_CONFIG_FIXED_BYTES
-        + task_capacity * RUNTIME_CONFIG_BYTES_PER_TASK_CAPACITY
+        + (event_capacity - MAX_EVENT_NUM) * 20
+        + (48 if extended else 0)
+        + task_capacity * ((COMPACT_TASK_DESC_SIZE if compact else TASK_DESC_SIZE) + 12)
     )
+    if extended:
+        size = (size + 63) // 64 * 64
+    size += tensor_count * TENSOR_DESC_SIZE
+    if size >= 1 << 32:
+        raise ValueError("runtime descriptor exceeds uint32 device byte offsets")
+    return size
 
 
-def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
+def _compact_tasks(raw: bytes, capacity: int) -> tuple[bytes, bytes]:
+    """Intern tensors without their per-tile base offset; retain every field."""
+    tasks = bytearray(capacity * COMPACT_TASK_DESC_SIZE)
+    templates = {}
+    for index in range(capacity):
+        source = index * TASK_DESC_SIZE
+        target = index * COMPACT_TASK_DESC_SIZE
+        tasks[target:target + 24] = raw[source:source + 24]
+        tasks[target + 88:target + 128] = raw[source + 536:source + 576]
+        for tensor_index in range(8):
+            tensor_start = source + 24 + tensor_index * TENSOR_DESC_SIZE
+            tensor = raw[tensor_start:tensor_start + TENSOR_DESC_SIZE]
+            normalized = tensor[:48] + bytes(4) + tensor[52:]
+            template_id = templates.setdefault(normalized, len(templates))
+            offset = struct.unpack_from("<I", tensor, 48)[0]
+            struct.pack_into("<II", tasks, target + 24 + tensor_index * 8, template_id, offset)
+    return bytes(tasks), b"".join(templates)
+
+
+def serialize_runtime_config(cfg: RuntimeConfigC, *, compact: bool = False) -> bytes:
     """Serialize only populated task and task-index prefixes.
 
-    The high bit in the legacy ``queue_capacity`` header word marks a dynamic
-    image. Unmarked offline descriptors retain the fixed-capacity ABI.
+    Bit 31 marks dynamic task capacity; bit 30 extends the header to 64 bytes
+    with event capacity, tensor count, task stride and format version. Small dense
+    images retain the previous wire ABI. Compact records reference a tensor
+    table after the aligned metadata tail; split-weight pointers follow it.
 
     Args:
         cfg: Populated runtime configuration.
+        compact: Share tensor templates between 128-byte task records.
 
     Returns:
         Compact runtime descriptor bytes.
     """
     capacity = runtime_config_task_capacity(cfg)
     raw = bytes(cfg)
-    prefix = bytearray(raw[:RuntimeConfigC.all_tasks.offset])
+    layout = type(cfg)
+    event_capacity = len(cfg.all_event_num_triggers)
+    extended = compact or event_capacity != MAX_EVENT_NUM or capacity > MAX_TASK_NUM
+    task_bytes = raw[layout.all_tasks.offset:layout.all_tasks.offset + capacity * TASK_DESC_SIZE]
+    templates = b""
+    if compact:
+        task_bytes, templates = _compact_tasks(task_bytes, capacity)
+    tensor_count = len(templates) // TENSOR_DESC_SIZE
+    prefix = bytearray(raw[:16])
     encoded_capacity = RUNTIME_TASK_CAPACITY_MAGIC | capacity
-    queue_offset = RuntimeConfigC.queue_capacity.offset
+    if extended:
+        encoded_capacity |= RUNTIME_EXTENDED_MAGIC
+    queue_offset = layout.queue_capacity.offset
     prefix[queue_offset:queue_offset + 4] = encoded_capacity.to_bytes(4, "little")
+    if extended:
+        prefix.extend(struct.pack(
+            "<4I", event_capacity, tensor_count,
+            COMPACT_TASK_DESC_SIZE if compact else TASK_DESC_SIZE, RUNTIME_FORMAT_VERSION,
+        ))
+        prefix.extend(bytes(32))
+    prefix.extend(raw[layout.all_event_num_triggers.offset:layout.all_tasks.offset])
 
     int32_size = ctypes.sizeof(ctypes.c_int32)
     data = b"".join(
         (
             bytes(prefix),
+            task_bytes,
+            raw[layout.all_events.offset:layout.task_index_num.offset],
+            raw[layout.task_index_num.offset:layout.cube_task_indices.offset],
             raw[
-                RuntimeConfigC.all_tasks.offset:
-                RuntimeConfigC.all_tasks.offset + capacity * TASK_DESC_SIZE
-            ],
-            raw[RuntimeConfigC.all_events.offset:RuntimeConfigC.task_index_num.offset],
-            raw[RuntimeConfigC.task_index_num.offset:RuntimeConfigC.cube_task_indices.offset],
-            raw[
-                RuntimeConfigC.cube_task_indices.offset:
-                RuntimeConfigC.cube_task_indices.offset + capacity * int32_size
+                layout.cube_task_indices.offset:
+                layout.cube_task_indices.offset + capacity * int32_size
             ],
             raw[
-                RuntimeConfigC.vector_task_indices.offset:
-                RuntimeConfigC.vector_task_indices.offset + capacity * int32_size
+                layout.vector_task_indices.offset:
+                layout.vector_task_indices.offset + capacity * int32_size
             ],
             raw[
-                RuntimeConfigC.mix_task_indices.offset:
-                RuntimeConfigC.mix_task_indices.offset + capacity * int32_size
+                layout.mix_task_indices.offset:
+                layout.mix_task_indices.offset + capacity * int32_size
             ],
-            raw[RuntimeConfigC.dynamic_data.offset:],
+            raw[layout.dynamic_data.offset:],
         )
     )
-    expected = runtime_config_serialized_size(capacity)
+    if extended:
+        data += bytes((-len(data)) % 64) + templates
+    expected = runtime_config_serialized_size(
+        capacity, event_capacity=event_capacity, compact=compact, tensor_count=tensor_count,
+    )
     if len(data) != expected:
         raise RuntimeError(
             f"runtime config serialization produced {len(data)} bytes, expected {expected}"
@@ -358,6 +475,12 @@ class TaskSplitValue:
     all_expert_num: int = 32
     top_k:          int = 8
     extra_event_num: int = 0
+    event_capacity: int = 0
+
+    @property
+    def runtime_event_capacity(self) -> int:
+        """Return the common event layout for forward and both backward graphs."""
+        return max(self.event_capacity, mega_moe_event_capacity(self.all_expert_num, self.ep))
 
     # ── Derived properties ────────────────────────────────────────────────────
     @property
@@ -431,8 +554,8 @@ def configure_ready_handshake(
     if tsv.ep == 1:
         return
     ready_event = tsv.all_event_num + 3
-    if ready_event >= MAX_EVENT_NUM:
-        raise ValueError("ready handshake event exceeds MAX_EVENT_NUM.")
+    if ready_event + 2 >= len(cfg.all_event_num_triggers) - 16:
+        raise ValueError("ready/route events overlap the reserved barrier cache line.")
     cfg.ready_handshake_meta.magic = READY_HANDSHAKE_MAGIC
     if version not in {
         READY_HANDSHAKE_VERSION,
@@ -446,15 +569,16 @@ def configure_ready_handshake(
     cfg.config_extra_value = READY_HANDSHAKE_MAGIC
 
 
-def event_workspace_bytes(ep_size: int) -> int:
+def event_workspace_bytes(ep_size: int, event_capacity: int = MAX_EVENT_NUM) -> int:
     """Return event-counter plus persistent ready-state storage.
 
     Args:
         ep_size: Number of ranks in the expert-parallel group.
+        event_capacity: Number of event counters in the runtime descriptor.
 
     Returns:
         Required event workspace size in bytes.
     """
     if ep_size <= 1:
-        return EVENT_COUNTER_BYTES
-    return EVENT_COUNTER_BYTES + (ep_size + 1) * READY_CACHE_LINE_BYTES
+        return event_capacity * 4
+    return event_capacity * 4 + (ep_size + 1) * READY_CACHE_LINE_BYTES

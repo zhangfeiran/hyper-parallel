@@ -29,6 +29,7 @@ import numpy as np
 
 REPOSITORY = Path(__file__).resolve().parents[4]
 PLANNER_PATH = REPOSITORY / "hyper_parallel/core/multicore/modules/mega_moe/placement.py"
+RUNTIME_CONFIG_PATH = REPOSITORY / "hyper_parallel/core/multicore/scheduler/config.py"
 Counts = tuple[tuple[int, ...], ...]
 
 
@@ -40,10 +41,20 @@ def placement_module() -> Any:
     this framework-independent source directly keeps offline runs NPU-free;
     the source path and digest are included in every report.
     """
-    name = "_megamoe_simulator_production_placement"
-    spec = importlib.util.spec_from_file_location(name, PLANNER_PATH)
+    return _load_source("_megamoe_simulator_production_placement", PLANNER_PATH)
+
+
+@lru_cache(maxsize=1)
+def runtime_config_module() -> Any:
+    """Read production layout formulas without initializing a framework."""
+    return _load_source("_megamoe_simulator_runtime_config", RUNTIME_CONFIG_PATH)
+
+
+def _load_source(name: str, path: Path) -> Any:
+    """Load a framework-independent production module from this checkout."""
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load the production planner from {PLANNER_PATH}.")
+        raise RuntimeError(f"Cannot load production source from {path}.")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)

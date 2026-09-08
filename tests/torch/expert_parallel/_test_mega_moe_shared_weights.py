@@ -35,7 +35,7 @@ def _shape() -> moe._MoeShape:
         local_num_tokens=int(os.getenv("HP_MEGA_MOE_SHARED_TOKENS", "128")),
         hidden_size=int(os.getenv("HP_MEGA_MOE_SHARED_HIDDEN", "512")),
         intermediate_size=int(os.getenv("HP_MEGA_MOE_SHARED_INTERMEDIATE", "128")),
-        num_experts=48 if moe.dist.get_world_size() == 8 else 8,
+        num_experts=int(os.getenv("HP_MEGA_MOE_SHARED_EXPERTS", "48" if moe.dist.get_world_size() == 8 else "8")),
         top_k=8 if moe.dist.get_world_size() == 8 else 4,
         ep_size=moe.dist.get_world_size(),
     )

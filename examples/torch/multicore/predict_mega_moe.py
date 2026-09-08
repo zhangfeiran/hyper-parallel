@@ -27,6 +27,7 @@ from examples.torch.multicore.megamoe_simulator.model import Training
 from examples.torch.multicore.megamoe_simulator.network import Fabric
 from examples.torch.multicore.megamoe_simulator.profile import (
     calibrate,
+    calibrate_descriptor_service,
     calibrate_transfer_windows,
     hardware_dict,
     summarize_tasks,
@@ -68,6 +69,10 @@ def main() -> None:
     )
     parser.add_argument("--task-profile", type=Path, help="Summarize one collected task profile")
     parser.add_argument(
+        "--descriptor-profiles", type=Path, nargs="+", help="Fit decoder service from raw rank profiles",
+    )
+    parser.add_argument("--train-pairs", default="10000:42", help="Route identifiers admitted into the descriptor fit")
+    parser.add_argument(
         "--trace",
         type=Path,
         help="Summarize a Chrome trace without adding nested scopes",
@@ -86,6 +91,11 @@ def main() -> None:
                 calibration["transfer_samples"], fitted, identity=calibration["transfer_identity"]
             )
         output = hardware_dict(fitted)
+    elif args.descriptor_profiles:
+        output = hardware_dict(calibrate_descriptor_service(
+            [json.loads(path.read_text()) for path in args.descriptor_profiles], hardware,
+            train_pairs=set(args.train_pairs.split(",")),
+        ))
     elif args.task_profile:
         output = summarize_tasks(json.loads(args.task_profile.read_text()))
     elif args.trace:
@@ -117,6 +127,7 @@ def main() -> None:
                     row
                     for row in audits
                     if row["ranks"] == args.ranks
+                    and row.get("num_cube_cores", 24) == hardware.vector_workers
                     and row["slots"] == slots
                     and row["shape"] == vars(selected_shape)
                     and all(row["options"][key] == getattr(options, key) for key in ("inplace_backward", "atomic_dw"))
@@ -124,7 +135,9 @@ def main() -> None:
                 if args.schedule_audit and len(matches) != 1:
                     raise ValueError("schedule audit must contain exactly one entry matching each shape and option set")
                 selected_options = (
-                    replace(options, plan_storage_bytes=matches[0].get("total_plan_tensor_bytes", 0))
+                    replace(options, plan_storage_bytes=matches[0].get(
+                        "total_warmed_plan_upper_bound_bytes", matches[0].get("total_plan_tensor_bytes", 0),
+                    ))
                     if matches
                     else options
                 )

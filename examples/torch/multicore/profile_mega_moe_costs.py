@@ -40,13 +40,18 @@ from tests.torch.expert_parallel import _test_mega_moe as worker
 
 def _identity() -> dict:
     root = Path(__file__).resolve().parents[3]
+    layout = importlib.import_module("hyper_parallel.core.multicore.scheduler.config")
     paths = list((root / "hyper_parallel/core/multicore").rglob("*.py"))
     paths += list((root / "hyper_parallel/core/multicore/ops").rglob("*.h"))
+    paths += list((root / "hyper_parallel/core/multicore/ops").rglob("*.hpp"))
     paths += list((root / "build/native/payload").rglob("*.so"))
     paths += list((root / "build/native/payload").rglob("*.o"))
     return {
         "root": str(root),
         "torch": worker.torch.__version__,
+        "runtime_environment": {
+            name: value for name, value in sorted(os.environ.items()) if name.startswith("HP_MEGA_MOE_")
+        } | {"HP_MEGA_MOE_COMPACT_RUNTIME": str(int(layout.compact_runtime_enabled()))},
         "sources_and_payload": {
             str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(paths)
         },

@@ -42,10 +42,12 @@ from .model import Costs, Training, TrainingGraph
 from .network import Fabric
 from .workload import (
     REPOSITORY,
+    RUNTIME_CONFIG_PATH,
     Shape,
     build_plan,
     count_digest,
     placement_module,
+    runtime_config_module,
     validate_counts,
 )
 
@@ -213,7 +215,7 @@ class CostGraph(TrainingGraph):
                 wave_label,
                 "descriptor_service",
                 tails,
-                descriptors / 24 * self.hardware.descriptor_us,
+                descriptors / self.hardware.vector_workers * self.hardware.descriptor_us,
             )
             if backward and (len(matrices) > 1 or self.options.inplace_backward):
                 incoming, sent = self._token_transfers(wave_label, "backward_hidden_dispatch", matrix, tails)
@@ -290,6 +292,7 @@ def source_identity() -> dict[str, str]:
         REPOSITORY / "hyper_parallel/core/multicore/modules/mega_moe" / f"{name}.py"
         for name in ("placement", "replica", "route", "function", "workspace", "plan", "spec")
     ]
+    paths.append(RUNTIME_CONFIG_PATH)
     paths += [
         REPOSITORY / "hyper_parallel/core/multicore/ops/runtime" / name
         for name in ("worker_kernel.h", "runtime_config.hpp")
@@ -378,9 +381,15 @@ def predict(
         "memory": memory_ledger(shape, plan, training, options, configured_slots=slots),
         "descriptor_audit": {
             "forward_task_lower_bound": fwd_descriptors,
-            "current_limit": 25600,
-            "forward_fits": fwd_descriptors <= 25600,
-            "note": "backward grids also require validation; dynamic wire format retains this limit",
+            "legacy_task_limit": 25600,
+            "allocation": "graph-sized task and queue arrays; uint32 byte offsets",
+            "event_capacity": runtime_config_module().mega_moe_event_capacity(
+                shape.experts + len(counts) * slots, len(counts),
+            ),
+            "note": (
+                "run the meta plan audit for exact buildability and static HBM; "
+                "latency needs ABI-matched calibration"
+            ),
         },
         "limitations": [
             "rank-stage model omits expert-tile overlap and detailed FIFO head blocking",

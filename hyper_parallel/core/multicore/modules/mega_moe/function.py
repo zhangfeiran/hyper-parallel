@@ -788,6 +788,7 @@ def _get_mega_moe_function() -> Any:
                 spec,
                 hidden_states.dtype,
                 hidden_states.device,
+                event_capacity=plan.event_capacity,
             )
             workspace.claim()
             try:

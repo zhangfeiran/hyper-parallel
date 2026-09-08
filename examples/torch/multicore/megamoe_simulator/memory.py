@@ -26,7 +26,7 @@ from typing import Any
 
 from .cost import Options, aligned
 from .model import Training
-from .workload import Shape
+from .workload import Shape, runtime_config_module
 
 MIB = 2**20
 GIB = 2**30
@@ -98,11 +98,11 @@ def memory_ledger(
     home_elements = home * elements
     grad_bytes = 4 if slots else shape.element_bytes
     replicas = layers if training.pool == "per-layer" else 1
-    event_bytes = (
-        4096
-        + (ranks + 1) * 64
-        + 2 * (shape.experts + ranks * configured_slots) * aligned(shape.tokens_per_rank, 128) // 128 * 64
-    )
+    physical_experts = shape.experts + ranks * configured_slots
+    runtime_layout = runtime_config_module()
+    event_capacity = runtime_layout.mega_moe_event_capacity(physical_experts, ranks)
+    event_bytes = runtime_layout.event_workspace_bytes(ranks, event_capacity)
+    event_bytes += 2 * physical_experts * aligned(shape.tokens_per_rank, 128) // 128 * 64
     heap = aligned((shape.capacity + rows) * shape.row_bytes + 2 * event_bytes + 4 * 511, 64 * MIB)
     scratch = (home + slots) * elements * grad_bytes if multi and not options.atomic_dw else 0
     scratch = max(scratch, options.previous_scratch_bytes)

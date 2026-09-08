@@ -30,6 +30,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
     NUM_WORKERS_CUBE,
     READY_CACHE_LINE_BYTES,
     event_workspace_bytes,
+    mega_moe_event_capacity,
 )
 from hyper_parallel.core.multicore.scheduler.config import (
     ROUTE_ARRIVAL_STRIDE_BYTES as _ROUTE_ARRIVAL_STRIDE_BYTES,
@@ -145,9 +146,12 @@ def _event_workspace_bytes(
     num_experts: int,
     dispatch_split: int,
     fusion_mode: str,
+    event_capacity: int | None = None,
 ) -> int:
     """Return event storage including isolated route-dispatch arrivals."""
-    standard_bytes = event_workspace_bytes(ep_size)
+    if event_capacity is None:
+        event_capacity = mega_moe_event_capacity(num_experts, ep_size)
+    standard_bytes = event_workspace_bytes(ep_size, event_capacity)
     if fusion_mode not in {"permute", "both"}:
         return standard_bytes
     tasks_per_expert = (
@@ -281,27 +285,37 @@ class MegaMoeWorkspace:
     forward_route_arrivals_enabled: bool = False
     backward_route_arrivals_enabled: bool = False
     route_arrival_offset_bytes: int = 0
+    event_counter_bytes: int = _EVENT_COUNTER_BYTES
     lock: Any = field(default_factory=threading.Lock, repr=False)
 
-    def ensure(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
+    def ensure(
+        self, spec: MegaMoeSpec, dtype: Any, device: Any, *, event_capacity: int | None = None,
+    ) -> None:
         """Allocate the fixed configured route capacity once.
 
         Args:
             spec: First-forward-bound shape and capacity specification.
             dtype: Element dtype for symmetric data buffers.
             device: Device that owns local and symmetric buffers.
+            event_capacity: Shared layout of configured and home-only schedules.
         """
         requested_capacity = spec.receive_capacity
+        minimum_events = mega_moe_event_capacity(spec.physical_num_experts, spec.ep_size)
+        if event_capacity is None:
+            event_capacity = minimum_events
+        if event_capacity < minimum_events or event_capacity % 16:
+            raise ValueError("workspace event capacity is insufficient or unaligned")
         if self.expert_buffer is not None:
             compatible = (
                 self.dtype == dtype
                 and self.device == device
                 and self.routed_slots == spec.routed_slots
                 and self.expert_capacity == requested_capacity
+                and self.event_counter_bytes == event_capacity * 4
             )
             if not compatible:
                 raise ValueError(
-                    "MegaMoe workspace cannot change device, dtype, routed shape, or capacity."
+                    "MegaMoe workspace cannot change device, dtype, routed shape, or capacity (including events)."
                 )
             return
 
@@ -309,12 +323,13 @@ class MegaMoeWorkspace:
         self.device = device
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
+        self.event_counter_bytes = event_capacity * 4
         self.forward_route_arrivals_enabled = spec.forward_permute_fused
         self.backward_route_arrivals_enabled = (
             spec.forward_permute_fused or spec.backward_permute_fused
         )
         self.route_arrival_offset_bytes = (
-            event_workspace_bytes(spec.ep_size)
+            event_workspace_bytes(spec.ep_size, event_capacity)
             if (
                 self.forward_route_arrivals_enabled
                 or self.backward_route_arrivals_enabled
@@ -327,6 +342,7 @@ class MegaMoeWorkspace:
             num_experts=spec.physical_num_experts,
             dispatch_split=spec.dispatch_split,
             fusion_mode=spec.forward_fusion_mode,
+            event_capacity=event_capacity,
         )
         backward_event_bytes = _event_workspace_bytes(
             ep_size=spec.ep_size,
@@ -338,6 +354,7 @@ class MegaMoeWorkspace:
                 if self.backward_route_arrivals_enabled
                 else spec.backward_fusion_mode
             ),
+            event_capacity=event_capacity,
         )
         try:
             self.expert_buffer = self.symmetric_memory.aligned_empty(
@@ -496,14 +513,14 @@ class MegaMoeWorkspace:
             route_arrivals_enabled = self.backward_route_arrivals_enabled
         if events is None:
             raise RuntimeError(f"MegaMoe workspace {field_name} is not initialized.")
-        events[:_EVENT_COUNTER_BYTES].zero_()
+        events[:self.event_counter_bytes].zero_()
         if route_arrivals_enabled:
             events[self.route_arrival_offset_bytes:].zero_()
-        if events.numel() == _EVENT_COUNTER_BYTES or ready_initialized:
+        if events.numel() == self.event_counter_bytes or ready_initialized:
             return events
 
         # Initialize the persistent generation before any peer can signal it.
-        events[_EVENT_COUNTER_BYTES:].zero_()
+        events[self.event_counter_bytes:].zero_()
         self.symmetric_memory.barrier()
         if forward:
             self.forward_ready_initialized = True
@@ -650,6 +667,7 @@ class MegaMoeWorkspace:
         self.forward_route_arrivals_enabled = False
         self.backward_route_arrivals_enabled = False
         self.route_arrival_offset_bytes = 0
+        self.event_counter_bytes = _EVENT_COUNTER_BYTES
 
     def _free_local_tensors(self) -> None:
         """Release local-only workspaces after all queued kernels complete."""

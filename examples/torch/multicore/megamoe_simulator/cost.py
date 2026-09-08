@@ -42,6 +42,7 @@ class Hardware:
     hbm_gbps: float = 800.0
     launch_us: float = 5.0
     descriptor_us: float = 0.1
+    vector_workers: int = 24
     route_us: float = 30.0
     planner_us: float = 0.0
     copy_pair_us: float = 0.0
@@ -53,6 +54,8 @@ class Hardware:
     provenance: dict[str, Any] = field(default_factory=lambda: {"status": "assumed; no calibration"})
 
     def __post_init__(self) -> None:
+        if not isinstance(self.vector_workers, int) or isinstance(self.vector_workers, bool) or self.vector_workers < 1:
+            raise ValueError("vector_workers must be a positive integer")
         for name, value in asdict(self).items():
             if isinstance(value, dict):
                 continue

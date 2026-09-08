@@ -25,8 +25,9 @@ import argparse
 import importlib
 import json
 import os
+import time
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +35,10 @@ from examples.torch.multicore.megamoe_simulator.cost import Options
 from examples.torch.multicore.megamoe_simulator.workload import Shape
 
 
-def audit(shape: Shape, ranks: int, slots: int, options: Options) -> dict[str, Any]:
+def audit(shape: Shape, ranks: int, slots: int, options: Options, num_cube_cores: int = 24) -> dict[str, Any]:
     """Build the current implementation's static schedules in one host process."""
+    if num_cube_cores < 1:
+        raise ValueError("num_cube_cores must be positive")
     # The framework is an optional dependency of this diagnostic command. The
     # ordinary predictor never initializes HyperParallel or either framework.
     os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
@@ -51,8 +54,12 @@ def audit(shape: Shape, ranks: int, slots: int, options: Options) -> dict[str, A
     previous = {name: os.environ.get(name) for name in switches}
     for name, value in switches.items():
         os.environ[name] = str(value)
-    result = {"shape": asdict(shape), "ranks": ranks, "slots": slots, "options": asdict(options)}
+    result = {
+        "shape": asdict(shape), "ranks": ranks, "slots": slots,
+        "options": asdict(options), "num_cube_cores": num_cube_cores,
+    }
     try:
+        started = time.perf_counter()
         spec = spec_module.MegaMoeSpec(
             expert_capacity_factor=shape.capacity_factor,
             local_num_tokens=shape.tokens_per_rank,
@@ -64,7 +71,7 @@ def audit(shape: Shape, ranks: int, slots: int, options: Options) -> dict[str, A
             ep_size=ranks,
             ep_group=None,
             rank_id=0,
-            num_cube_cores=24,
+            num_cube_cores=num_cube_cores,
             replica_slots_per_rank=slots,
             forward_fusion_mode="permute",
             backward_fusion_mode="both",
@@ -73,10 +80,32 @@ def audit(shape: Shape, ranks: int, slots: int, options: Options) -> dict[str, A
         tensors = {
             name: value.numel() * value.element_size() for name, value in vars(plan).items() if hasattr(value, "numel")
         }
+        home_tensors = {}
+        if slots:
+            home = plan_module.build_mega_moe_plan(
+                replace(spec, replica_slots_per_rank=0), "meta", event_capacity=plan.event_capacity,
+            )
+            home_tensors = {
+                name: value.numel() * value.element_size()
+                for name, value in vars(home).items() if hasattr(value, "numel")
+            }
+        # SharedExpertWeightManager caches torch.cat(base, pointer metadata).
+        # Both backward variants can remain cached after routes change. Count
+        # that warmed upper bound separately from the eagerly allocated plans.
+        split_runtime_upper_bound = (
+            sum(size + 40 for name, size in tensors.items() if "runtime_config" in name) if slots else 0
+        )
+        eager_bytes = sum(tensors.values()) + sum(home_tensors.values())
         result.update(
             buildable=True,
             plan_tensor_bytes=tensors,
-            total_plan_tensor_bytes=sum(tensors.values()),
+            home_plan_tensor_bytes=home_tensors,
+            total_plan_tensor_bytes=eager_bytes,
+            warmed_split_runtime_upper_bound_bytes=split_runtime_upper_bound,
+            total_warmed_plan_upper_bound_bytes=eager_bytes + split_runtime_upper_bound,
+            event_capacity=plan.event_capacity,
+            compact_runtime=plan_module.compact_runtime_enabled(),
+            build_seconds=time.perf_counter() - started,
             scope="rank-zero graph construction only; numerical kernels and other ranks are not executed",
         )
     except (IndexError, ValueError) as error:
@@ -102,6 +131,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ranks", default="16,32,64")
     parser.add_argument("--slots", default="0,1,2,3")
+    parser.add_argument("--cube-cores", type=int, default=24, help="Target Cube/active Vector workers per rank")
     parser.add_argument("--shape", type=Path, help="Shape JSON; defaults to E384/T4096/H5120/I1792/K8")
     parser.add_argument("--options", type=Path)
     args = parser.parse_args()
@@ -110,7 +140,7 @@ def main() -> None:
     shape = Shape(**json.loads(args.shape.read_text())) if args.shape else Shape()
     options = Options(**json.loads(args.options.read_text())) if args.options else Options()
     results = [
-        audit(shape, ranks, slots, options)
+        audit(shape, ranks, slots, options, args.cube_cores)
         for ranks in map(int, args.ranks.split(","))
         for slots in map(int, args.slots.split(","))
     ]

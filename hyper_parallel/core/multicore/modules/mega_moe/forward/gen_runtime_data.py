@@ -41,6 +41,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
+from hyper_parallel.core.multicore.scheduler.builder import allocate_graph_config
 from hyper_parallel.core.multicore.scheduler.config import (
     QUEUE_CAPACITY,
     RuntimeConfigC,
@@ -83,7 +84,7 @@ def parse_args() -> argparse.Namespace:
 def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
                           num_cube_cores: int = 24) -> RuntimeConfigC:
     """Build RuntimeConfig for a single rank."""
-    cfg = RuntimeConfigC()
+    cfg = allocate_graph_config(graph, tsv)
     cfg.num_workers    = 2 * num_cube_cores   # NUM_WORKERS_VECTOR = 2 × NUM_WORKERS_CUBE
     cfg.queue_capacity = QUEUE_CAPACITY
 
@@ -196,7 +197,7 @@ def main() -> None:
     # ── Event counters + workspace (rank-independent) ─────────────────────────
     # The persistent tail stores the per-rank ready generation.
     write_bin(os.path.join(out, 'all_event_counters.bin'),
-              bytes(event_workspace_bytes(args.ep)))
+              bytes(event_workspace_bytes(args.ep, tsv.runtime_event_capacity)))
     # gmm_workspace: 256 MiB zeros — kernel-internal scratch buffer
     write_bin(os.path.join(out, 'gmm_workspace.bin'),
               bytes(256 * 1024 * 1024))

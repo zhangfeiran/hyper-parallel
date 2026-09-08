@@ -134,6 +134,7 @@ class TestReplicaGradientPrecision(unittest.TestCase):
         )
         execution_runtime = SimpleNamespace(
             spec=spec, inplace_wave_backward=False, reuse_retained_dw_scratch=False, atomic_dw_accumulation=False,
+            event_capacity=1024,
         )
         metadata = SimpleNamespace(
             wave_count=1, expert_capacity=4, receive_capacity=4,

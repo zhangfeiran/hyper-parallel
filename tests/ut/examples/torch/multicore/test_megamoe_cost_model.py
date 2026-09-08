@@ -14,6 +14,7 @@
 # ============================================================================
 """Independent arithmetic, lifetime, calibration and conservation contracts."""
 
+import copy
 import random
 import unittest
 from dataclasses import replace
@@ -39,6 +40,7 @@ from examples.torch.multicore.megamoe_simulator.network import (
 )
 from examples.torch.multicore.megamoe_simulator.profile import (
     calibrate,
+    calibrate_descriptor_service,
     calibrate_transfer_windows,
     evaluate,
     union_us,
@@ -57,6 +59,50 @@ class TestCostModel(unittest.TestCase):
         """Create a hardware-free shape with exact tile boundaries."""
         self.shape = Shape(experts=8, tokens_per_rank=64, top_k=2, hidden=16, intermediate=16)
         self.hardware = Hardware()
+
+    def test_descriptor_fit_uses_full_counts_and_isolates_runtime_formats(self) -> None:
+        """
+        Feature: descriptor service calibration
+        Description: fit known all-task cycle totals with sampled records and an extreme holdout
+        Expectation: recover 4/3 us and two workers, preserve GEMM rates, reject mixed ABIs
+        """
+        point = {
+            "pair": "train", "task_profiles": {"forward": {
+                "unit": "system_cycle", "workers": [
+                    {"kind": "vector", "seen": 10, "recorded": 1, "stride": 10},
+                    {"kind": "vector", "seen": 20, "recorded": 1, "stride": 20},
+                ],
+            }}, "cycle_profiles": {"forward": {
+                "unit": "system_cycle", "categories": ["descriptor_decode", "dependency_wait"],
+                "vector": {"per_core": [[500, 1000000], [1500, 1000000]]},
+            }},
+        }
+        holdout = copy.deepcopy(point)
+        holdout["pair"] = "holdout"
+        holdout["cycle_profiles"]["forward"]["vector"]["per_core"][0][0] = 999999
+        document = {"identity": {
+            "runtime_environment": {"HP_MEGA_MOE_COMPACT_RUNTIME": "1"},
+            "sources_and_payload": {
+                "hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp": "reader",
+                "hyper_parallel/core/multicore/ops/runtime/worker_kernel.h": "worker",
+                "payload/kernel.o": "native",
+            },
+        }, "results": [point, holdout]}
+        hardware = replace(self.hardware, phase_scales={"up_proj": 3.0})
+        fitted = calibrate_descriptor_service([document], hardware, train_pairs={"train"})
+        self.assertAlmostEqual(fitted.descriptor_us, 4 / 3)
+        self.assertEqual(fitted.vector_workers, 2)
+        self.assertEqual(fitted.phase_scales, hardware.phase_scales)
+        self.assertEqual(fitted.provenance["descriptor"]["observations"], 1)
+        other = copy.deepcopy(document)
+        other["identity"]["runtime_environment"]["HP_MEGA_MOE_COMPACT_RUNTIME"] = "0"
+        with self.assertRaisesRegex(ValueError, "one runtime format"):
+            calibrate_descriptor_service([document, other], hardware, train_pairs={"train"})
+        with self.assertRaises(ValueError):
+            calibrate_descriptor_service([document], hardware, train_pairs={"missing"})
+        for workers in (0, -1, 2.5, True):
+            with self.subTest(workers=workers), self.assertRaises(ValueError):
+                replace(hardware, vector_workers=workers)
 
     def test_forward_backward_flops(self) -> None:
         """All six GEMMs equal the independent gated-MLP FLOP identity."""

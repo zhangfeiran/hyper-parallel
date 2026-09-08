@@ -37,14 +37,17 @@ class KernelWorkerBase {
   __aicore__ inline void Init(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr, GM_ADDR *input_list) {
     this->worker_id_ = worker_id;
     this->runtimeConfigPtr = runtimeConfigPtr;
+    validateRuntimeFormat(runtimeConfigPtr);
+    this->event_capacity_ = getRuntimeEventCapacity(runtimeConfigPtr);
 
     this->tpipe_.InitBuffer(tBuf, DISPATCH_TOKEN_UB_SIZE);
     tpipe_.Destroy();
 
-    all_event_counters.SetGlobalBuffer((__gm__ int32_t *)(input_list[Derived::EVENT_IDX]), MAX_EVENT_NUM);
+    all_event_counters.SetGlobalBuffer((__gm__ int32_t *)(input_list[Derived::EVENT_IDX]), this->event_capacity_);
 
-    all_event_num_triggers.SetGlobalBuffer((__gm__ int32_t *)(this->runtimeConfigPtr + getAllEventNumTriggersOffset()),
-                                           MAX_EVENT_NUM);
+    all_event_num_triggers.SetGlobalBuffer(
+      (__gm__ int32_t *)(this->runtimeConfigPtr + getAllEventNumTriggersOffset(this->runtimeConfigPtr)),
+      this->event_capacity_);
 
     uint32_t runtime_task_capacity = getRuntimeTaskCapacity(this->runtimeConfigPtr);
     vector_task_indexs.SetGlobalBuffer(
@@ -330,7 +333,7 @@ class KernelWorkerBase {
     int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
     int64_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
     constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
-    __gm__ int32_t *ready = (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + MAX_EVENT_NUM;
+    __gm__ int32_t *ready = (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + this->event_capacity_;
 
     GlobalTensor<int32_t> ready_state;
     ready_state.SetGlobalBuffer(ready, static_cast<uint32_t>((ep + 1) * ready_stride));
@@ -358,7 +361,7 @@ class KernelWorkerBase {
     int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
     constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
     __gm__ int32_t *ready =
-      (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + MAX_EVENT_NUM;
+      (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + this->event_capacity_;
     GlobalTensor<int32_t> ready_state;
     ready_state.SetGlobalBuffer(
       ready, static_cast<uint32_t>((ep + 1) * ready_stride));
@@ -379,7 +382,7 @@ class KernelWorkerBase {
       getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
     constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
     __gm__ int32_t *ready =
-      (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + MAX_EVENT_NUM;
+      (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + this->event_capacity_;
     GlobalTensor<int32_t> ready_state;
     ready_state.SetGlobalBuffer(
       ready, static_cast<uint32_t>((ep + 1) * ready_stride));
@@ -425,7 +428,7 @@ class KernelWorkerBase {
     }
     constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
     __gm__ int32_t *ready =
-      (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + MAX_EVENT_NUM;
+      (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + this->event_capacity_;
     __gm__ int32_t *destination_ready =
       ready + static_cast<uint32_t>(target) * ready_stride;
     aclshmem_signal_wait_until(
@@ -486,7 +489,7 @@ class KernelWorkerBase {
   __aicore__ inline int64_t GetRouteArrivalOffset() const {
     int64_t ep = getExtraValueFromTiling(
       input_list[Derived::TILING_IDX], 1);
-    return MAX_EVENT_NUM * INT32_T_SIZE +
+    return this->event_capacity_ * INT32_T_SIZE +
       (ep + 1) * DATA_CACHE_LINE_SIZE;
   }
 
@@ -658,7 +661,7 @@ class KernelWorkerBase {
     int64_t local_expert = expert_index % local_experts;
     int64_t tile = task_index % tasks_per_expert;
     int64_t slot = (local_expert * ep + source_pe) * tasks_per_expert + tile;
-    int64_t route_arrival_offset = MAX_EVENT_NUM * INT32_T_SIZE + (ep + 1) * DATA_CACHE_LINE_SIZE;
+    int64_t route_arrival_offset = this->event_capacity_ * INT32_T_SIZE + (ep + 1) * DATA_CACHE_LINE_SIZE;
     __gm__ int32_t *arrival = reinterpret_cast<__gm__ int32_t *>(input_list[Derived::EVENT_IDX] + route_arrival_offset +
                                                                  slot * ROUTE_ARRIVAL_STRIDE_BYTES);
     const int32_t generation = static_cast<int32_t>(
@@ -689,7 +692,7 @@ class KernelWorkerBase {
     }
     int64_t tasks_per_source = static_cast<int64_t>(needed) / ep;
     int64_t local_expert = (static_cast<int64_t>(event_index) - 1) % local_experts;
-    int64_t route_arrival_offset = MAX_EVENT_NUM * INT32_T_SIZE + (ep + 1) * DATA_CACHE_LINE_SIZE;
+    int64_t route_arrival_offset = this->event_capacity_ * INT32_T_SIZE + (ep + 1) * DATA_CACHE_LINE_SIZE;
     constexpr uint32_t stride = ROUTE_ARRIVAL_STRIDE_BYTES / INT32_T_SIZE;
     GlobalTensor<int32_t> arrivals;
     arrivals.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(input_list[Derived::EVENT_IDX] + route_arrival_offset),
@@ -916,11 +919,11 @@ class KernelWorkerBase {
 
   __aicore__ inline void SynchronizeWave(
       const ReadyHandshakeMeta &meta, bool has_ready_handshake) {
-    TriggerEvent(WAVE_BARRIER_EVENT);
+    TriggerEvent(this->event_capacity_ - 1);
     const int32_t active_workers = static_cast<int32_t>(this->core_num * 2);
     const int32_t local_generation =
       active_workers * static_cast<int32_t>(this->wave_index_ + 1);
-    WaitForEventCount(WAVE_BARRIER_EVENT, local_generation);
+    WaitForEventCount(this->event_capacity_ - 1, local_generation);
     if (!has_ready_handshake) {
       return;
     }
@@ -947,11 +950,11 @@ class KernelWorkerBase {
 
   __aicore__ inline void SynchronizePhase() {
     PipeBarrier<PIPE_ALL>();
-    TriggerEvent(PHASE_BARRIER_EVENT);
+    TriggerEvent(this->event_capacity_ - 2);
     const int32_t active_workers = static_cast<int32_t>(this->core_num * 2);
     const int32_t generation =
       active_workers * static_cast<int32_t>(this->wave_index_ + 1);
-    WaitForEventCount(PHASE_BARRIER_EVENT, generation);
+    WaitForEventCount(this->event_capacity_ - 2, generation);
     PipeBarrier<PIPE_ALL>();
   }
 
@@ -1037,6 +1040,7 @@ class KernelWorkerBase {
   uint32_t task_profile_stride_ = 1;
   int64_t task_profile_start_ = 0;
   GlobalTensor<int64_t> task_profile_output_;
+  uint32_t event_capacity_ = MAX_EVENT_NUM;
   uint32_t worker_id_ = 0;
   uint32_t task_num = 0;
   int32_t vector_task_num = 0;

@@ -21,9 +21,22 @@ graph-specific post-processing (add_terminate, revise_task_queue, etc.) — call
 build_config_for_rank() from a model's gen_runtime_data.py for full generation.
 """
 from hyper_parallel.core.multicore.scheduler.config import (
-    TaskSplitValue, init_task_split_value, RuntimeConfigC, QUEUE_CAPACITY,
+    NUM_WORKERS_CUBE,
+    QUEUE_CAPACITY,
+    RuntimeConfigC,
+    TaskSplitValue,
+    allocate_runtime_config,
+    init_task_split_value,
 )
-from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
+from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OpType
+
+
+def allocate_graph_config(graph: ComputeGraph, tsv: TaskSplitValue) -> RuntimeConfigC:
+    """Size host arrays for graph tasks, repeated barriers and termination."""
+    operators = graph.topological_sort()
+    required = 1 + sum(op.task_num for op in operators)
+    required += sum(op.op_type == OpType.PHASE_BARRIER for op in operators) * (NUM_WORKERS_CUBE - 1)
+    return allocate_runtime_config(required, tsv.runtime_event_capacity)
 
 
 def build_runtime_config(graph: ComputeGraph, tsv: TaskSplitValue,
@@ -41,7 +54,7 @@ def build_runtime_config(graph: ComputeGraph, tsv: TaskSplitValue,
     Returns:
         RuntimeConfigC ready to be serialized with bytes(cfg).
     """
-    cfg = RuntimeConfigC()
+    cfg = allocate_graph_config(graph, tsv)
     cfg.num_workers    = 2 * num_cube_cores
     cfg.queue_capacity = QUEUE_CAPACITY
 

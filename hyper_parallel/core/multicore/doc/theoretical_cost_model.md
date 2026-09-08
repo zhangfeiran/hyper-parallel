@@ -172,6 +172,8 @@ worker 在 profile-off 测量之前检查 native 输出、输入/路由权重/�
 
 18 个 EP16/32/64 配置的所有 672 个 rank 配额逐项相同。新进程、profile-off 的 8 NPU A/B/B/A 验证中，EP8/E192、T512、H512、I128、B1 的强热点单层 F+B 从 9.761 ms 降到 8.127 ms，降低 16.7%，两组方向一致；全程通过 native 精度检查，峰值 HBM 相同。无副本路由为 6.027 → 6.043 ms，方向不稳定，视为无可确认变化。该收益不能外推成 EP64 实测收益。
 
-E384/T4096 的 EP16/32/64 构图审计还发现当前 descriptor 上限 25600 无法容纳相关静态图；部分较小 token 的 E384 图会先触及 event 上限 1024。离线 EP64 成本结果因此是待实现配置的比较依据，不能标注为当前 kernel 已经跑通。
+首轮 E384/T4096 的 EP16/32/64 构图审计发现，原来的 25600 个 task、1024 个 event 固定数组无法容纳这些图。后续 [runtime descriptor v2](runtime_descriptor_v2.md) 已改成按图分配容量，并加入 128 字节 task + 共享 tensor 模板格式。EP16/32/64、B0–B3 的默认与优化配置现已通过 meta 构图审计。实际多机内核仍需独立验证，不能把构图成功或 EP64 模型结果标成多机实测。
 
-后续迭代应分别处理：按 tile/专家事件重放队列、独立校准 HCCL 权重/梯度传输、减少静态 descriptor 扩张并保留 ACK/generation 语义、再评估长 K 的 dW tiling。每个候选先看模型的关键路径与显存峰值，再用独立精度及 profile-off A/B/B/A 验证；不能通过删除必要等待来“降低模型成本”。
+当前计划审计还计入 B 配置的 home fallback 计划，以及 `torch.cat(base_config, pointer_metadata)` 缓存的三种扩展 runtime 暖态上界。预测器使用这个上界补齐常驻 HBM；事件区与生产代码共用容量公式。压缩后的 descriptor 服务耗时通过 `--descriptor-profiles` 单独校准，不能按字节缩减比例直接宣称加速。拟合使用全量 seen 计数而非采样条数，并隔离格式、native payload、worker 数和留出路由。`Hardware.vector_workers` 已替代固定的 24；本机 910B3 校准值为 20，meta 审计也应传入 `--cube-cores 20`。
+
+后续迭代应分别处理：按 tile/专家事件重放队列、独立校准 HCCL 权重/梯度传输、缓存 tensor 模板解码并保留 ACK/generation 语义、再评估长 K 的 dW tiling。每个候选先看模型的关键路径与显存峰值，再用独立精度及 profile-off A/B/B/A 验证；不能通过删除必要等待来“降低模型成本”。

@@ -22,6 +22,7 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import workspace as workspace_module
 from hyper_parallel.core.multicore.modules.mega_moe.spec import (
+    MegaMoeSpec,
     _resolve_receive_capacity,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
@@ -446,6 +447,40 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "active workspace lease"):
             workspace.mark_routed_buffer_write()
+
+    def test_expanded_events_preserve_ready_generation_and_home_layout(self):
+        """
+        Feature: expanded event workspace lifecycle
+        Description: clear E384 EP8 B1 events and reuse the workspace for the home fast path
+        Expectation: preserve ready generations, clear route arrivals, reject mismatched event offsets
+        """
+        home = MegaMoeSpec(
+            local_num_tokens=128, hidden_size=16, intermediate_size=16,
+            num_experts=384, top_k=8, ep_size=8, ep_group=None, rank_id=0,
+            num_cube_cores=24, receive_capacity=1536, expert_capacity_factor=1.5,
+            forward_fusion_mode="permute", backward_fusion_mode="both",
+        )
+        counter_bytes, ready_bytes = 1264 * 4, 9 * 64
+        counters = torch.full((counter_bytes + ready_bytes + 128,), 7, dtype=torch.uint8)
+        symmetric = Mock()
+        workspace = MegaMoeWorkspace(
+            symmetric_memory=symmetric, shared=True, device=torch.device("cpu"), dtype=torch.bfloat16,
+            expert_buffer=object(), expert_capacity=home.receive_capacity, routed_slots=home.routed_slots,
+            forward_event_counters=counters, event_counter_bytes=counter_bytes,
+            forward_route_arrivals_enabled=True, route_arrival_offset_bytes=counter_bytes + ready_bytes,
+        )
+        workspace.prepare_event_counters(forward=True)
+        self.assertEqual(torch.count_nonzero(counters).item(), 0)
+        symmetric.barrier.assert_called_once()
+        counters.fill_(11)
+        workspace.prepare_event_counters(forward=True)
+        self.assertEqual(torch.count_nonzero(counters[:counter_bytes]).item(), 0)
+        self.assertTrue(torch.all(counters[counter_bytes:counter_bytes + ready_bytes] == 11).item())
+        self.assertEqual(torch.count_nonzero(counters[counter_bytes + ready_bytes:]).item(), 0)
+        symmetric.barrier.assert_called_once()
+        workspace.ensure(home, torch.bfloat16, torch.device("cpu"), event_capacity=1264)
+        with self.assertRaisesRegex(ValueError, "including events"):
+            workspace.ensure(home, torch.bfloat16, torch.device("cpu"))
 
     def test_cycle_profile_uses_fixed_workspace_tail(self):
         """

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build legacy-ABI plan descriptors for managed MegaMoe execution."""
+"""Build sized plan descriptors for managed MegaMoe execution."""
 
 from __future__ import annotations
 
@@ -51,8 +51,10 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_up_proj_tiling_bytes,
 )
 from hyper_parallel.core.multicore.scheduler.config import (
+    MAX_EVENT_NUM,
     SwiGluTilingDataC,
     TaskSplitValue,
+    compact_runtime_enabled,
     serialize_runtime_config,
 )
 from hyper_parallel.core.multicore.scheduler.graph import OpType
@@ -90,6 +92,7 @@ class MegaMoePlan:
     reuse_retained_dw_scratch: bool
     atomic_dw_accumulation: bool
     destination_wave_fence: bool
+    event_capacity: int = MAX_EVENT_NUM
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,11 @@ def _tensor_from_bytes(data: bytes, device: Any) -> Any:
 
     array = np.frombuffer(bytearray(data), dtype=np.uint8).copy()
     return torch.from_numpy(array).to(device=device, dtype=torch.uint8)
+
+
+def _serialize_schedule(config: Any) -> bytes:
+    """Select the tensor-table ABI for controlled dense/compact comparisons."""
+    return serialize_runtime_config(config, compact=compact_runtime_enabled())
 
 
 def _resize_swiglu_tiling(
@@ -250,7 +258,7 @@ def _build_forward_schedule(
         spec.rank_id,
         spec.num_cube_cores,
     )
-    return graph, _tensor_from_bytes(serialize_runtime_config(data), device)
+    return graph, _tensor_from_bytes(_serialize_schedule(data), device)
 
 
 def _build_backward_schedule(
@@ -354,8 +362,8 @@ def _build_backward_schedule(
     )
     return (
         graph,
-        _tensor_from_bytes(serialize_runtime_config(data), device),
-        _tensor_from_bytes(serialize_runtime_config(multi_wave_data), device),
+        _tensor_from_bytes(_serialize_schedule(data), device),
+        _tensor_from_bytes(_serialize_schedule(multi_wave_data), device),
     )
 
 
@@ -444,17 +452,24 @@ def _build_route_slots(spec: MegaMoeSpec, device: Any) -> Any | None:
     ).reshape(-1, 1)
 
 
-def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
+def build_mega_moe_plan(
+    spec: MegaMoeSpec, device: Any, *, event_capacity: int | None = None,
+) -> MegaMoePlan:
     """Build the selected forward/backward route endpoint schedules.
 
     Args:
         spec: Validated local-token and expert topology configuration.
         device: NPU device receiving serialized descriptors and tiling tensors.
+        event_capacity: Shared event layout for a configured plan and its home fallback.
 
     Returns:
         Rank-local forward and backward plan resources.
     """
     task_values = _build_task_values(spec)
+    if event_capacity is not None:
+        if event_capacity < task_values.runtime_event_capacity or event_capacity % 16:
+            raise ValueError("shared event capacity is insufficient or unaligned")
+        task_values.event_capacity = event_capacity
     inplace_wave_backward = _inplace_wave_backward_enabled()
     tile_phase_ack = _tile_phase_ack_enabled()
     reuse_retained_dw_scratch = _reuse_retained_dw_scratch_enabled()
@@ -507,4 +522,5 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         reuse_retained_dw_scratch=reuse_retained_dw_scratch,
         atomic_dw_accumulation=atomic_dw_accumulation,
         destination_wave_fence=destination_wave_fence,
+        event_capacity=task_values.runtime_event_capacity,
     )

@@ -413,8 +413,8 @@ class ExpertReplicaManager:
         key = (id(base_config), backward)
         if key not in self._shared_runtime_configs:
             gradients = self._shared_gradients if backward else None
-            # The compact RuntimeConfig wire image is 8-byte aligned. The
-            # native reader locates this extension after ReadyHandshakeMeta.
+            # The runtime image ends on at least an 8-byte boundary. The
+            # native reader skips its optional tensor table before this extension.
             if (
                 base_config.dtype != torch.uint8 or base_config.ndim != 1
                 or not base_config.is_contiguous() or base_config.numel() % 8
