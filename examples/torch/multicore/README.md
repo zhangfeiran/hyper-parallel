@@ -180,22 +180,50 @@ ordinary pre-diagnostic measurements and independent profiler-free runs.
 For receive-only shared-B ranks, submission and `Work.wait()` run on the control
 stream. Their event interval measures that stream's wait; the compute stream's
 exposed wait ends at its later join. `analyze_mega_moe_gradient_timeline.py`
-correlates these joins for its fixed EP8, sixteen-layer, single-batch workload.
-It rejects multi-window reductions. Use the per-batch `diagnostic_p2p` payload
-and raw trace for those reductions; summing control-stream waits does not measure
-training latency.
+uses the same-execution payloads stored in `diagnostic_trace.capture` with
+`--profile-all-ranks`. It supports arbitrary rank/layer counts, empty batches,
+multiple receive windows and multiple execution resource groups. It separates
+control-stream waits, compute-stream joins, owner adds and window reuse fences.
+Missing flows, mismatched capture identities and uncalibrated cross-host clocks
+are rejected. Legacy EP8/16-layer traces retain their existing reader.
+
+For a small diagnostic workload, keep tokens divisible by 128 and select shape,
+window and sharing explicitly (default shape and sharing are unchanged):
+
+```bash
+python -m torch.distributed.run --nproc_per_node=8 \
+  -m examples.torch.multicore.benchmark_mega_moe_layers \
+  --variant b1 --layers 3 --resource-groups 2 --gradient-receive-slots 1 \
+  --tokens 512 --hidden 1024 --intermediate 1024 --experts 48 \
+  --pairs 0.005:943 --warmup 0 --measured 1 --output output/windows.json \
+  --profile-output output/windows-trace.json --profile-all-ranks --profile-p2p \
+  --profile-kernel-cycles --profile-tasks
+
+python -m examples.torch.multicore.analyze_mega_moe_gradient_timeline output/windows.json
+```
+
+The trace collector also reads the profiler's existing allocator records and
+correlates them to CPU scopes. Unattributed events remain explicit; external
+SHMEM/HCCL memory and profile-off peaks are separate. A partial JSON left by a
+failed vendor exporter is rejected on all participating ranks.
 
 For MegaMoe variants, `--profile-kernel-cycles` runs a separate extra post-update
 step after all measurements and writes `diagnostic_kernel_cycles` into the JSON.
 It gathers per-core counters from every EP rank. The shared workspace retains
 only the **last launch in each direction**: layer zero's forward checkpoint
-recomputation and backward, not all layers. The existing `counters` field remains
+recomputation and backward for the default sharing configuration, not all layers.
+With multiple groups, `captures` identifies the last launch of every group and
+direction. Add `--profile-tasks` to retain detailed queues in the same extra step.
+The existing `counters` field remains
 backward-only; `forward_counters` separates up/down GMM, hidden dispatch, combine,
 local compute (SwiGLU/epilogue), dependency waits and synchronization. Counters use
 system cycles; per-category worker maxima are not additive wall time.
 The option temporarily enables native instrumentation and restores its environment
 even on failure. An inherited `HP_MEGA_MOE_KERNEL_CYCLE_PROFILE=1` is rejected by
-this timed benchmark: unset it and use the diagnostic option instead.
+this timed benchmark, as is inherited `HP_MEGA_MOE_TASK_PROFILE=1`: unset them
+and use the diagnostic options instead. The unified offline import entry and
+clock/coverage contracts are documented in the
+[cost-model guide](../../../hyper_parallel/core/multicore/doc/theoretical_cost_model.md#关联采集与多窗口归因).
 
 Forward diagnostics lazily allocate a separate 4 KiB per shared resource group,
 so subsequent backward launches cannot overwrite them. This buffer is reused;

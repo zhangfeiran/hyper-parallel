@@ -25,6 +25,7 @@ from dataclasses import asdict, replace
 from typing import Any
 
 from .cost import Hardware, gemm, gemm_curve_key
+from .profile_import import cube_services, import_profiles
 from .workload import Shape
 
 CYCLE_SOURCE = (
@@ -299,14 +300,8 @@ def task_service_samples(documents: list[dict], train_pairs: set[str]) -> list[d
     no dependency wait enters the fit. All Cube queues must have stride one.
     Vector samples remain diagnostic because communication contains protocol waits.
     """
-    phases = {
-        17: "up_proj",
-        19: "down_proj",
-        20: "act_grad",
-        21: "gate_dx",
-        22: "w1_grad",
-        23: "w2_grad",
-    }
+    if any(document.get("profile_schema_version") == 2 for document in documents):
+        import_profiles(documents, expected_identity=documents[0]["identity"], read_traces=False)
     samples = []
     for document in documents:
         for result in document["results"]:
@@ -323,40 +318,15 @@ def task_service_samples(documents: list[dict], train_pairs: set[str]) -> list[d
             # writes BF16 dW; using the configured B would mislabel calibration.
             gradient_bytes = 4 if document["arguments"]["slots"] and result["route"]["baseline_wave_count"] > 1 else 2
             for direction, profile in result["task_profiles"].items():
-                cubes = [worker for worker in profile["workers"] if worker["kind"] == "cube"]
-                if not cubes or any(worker["stride"] != 1 for worker in cubes):
-                    raise ValueError("GEMM calibration requires unsampled Cube queues")
-                groups: dict[tuple, list[float]] = defaultdict(list)
-                for worker in cubes:
-                    for record in worker["records"]:
-                        if record["task_type"] != 104 or record["expert_rows"] <= 0:
-                            continue
-                        key = (
-                            record["tiling_position"],
-                            record["wave"],
-                            record["task_index"] // len(cubes),
-                            record["expert_rows"],
-                        )
-                        groups[key].append((record["compute_end_cycle"] - record["ready_cycle"]) / 50.0)
-                for (position, wave, expert, rows), spans in groups.items():
-                    if len(spans) != len(cubes):
-                        raise ValueError("GEMM calibration needs all workers for each expert")
-                    samples.append(
-                        {
-                            "phase": phases[position],
-                            "expert_rows": rows,
-                            "compute_us": max(spans),
-                            "shape": shape,
-                            "gradient_bytes": gradient_bytes,
-                            "pair": result["pair"],
-                            "rank": document["rank"],
-                            "ranks": source_shape["ep_size"],
-                            "direction": direction,
-                            "wave": wave,
-                            "expert": expert,
-                            "split": "train" if result["pair"] in train_pairs else "holdout",
-                        }
-                    )
+                context = result.get("task_contexts", {}).get(direction, {})
+                cores = context.get("num_cube_cores", sum(worker["kind"] == "cube" for worker in profile["workers"]))
+                for service in cube_services(profile, expected_cores=cores):
+                    samples.append({
+                        **service, "shape": shape, "gradient_bytes": gradient_bytes,
+                        "pair": result["pair"], "rank": document["rank"], "ranks": source_shape["ep_size"],
+                        "direction": direction, "context": context or None,
+                        "split": "train" if result["pair"] in train_pairs else "holdout",
+                    })
     return samples
 
 

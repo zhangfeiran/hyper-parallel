@@ -13,7 +13,9 @@
 | `megamoe_simulator/estimate.py` | 前向、重计算、反向、热拷贝和优化器的依赖图 |
 | `megamoe_simulator/network.py`、`accelerated.py` | 共享节点出口/入口带宽、竞争和传播延迟 |
 | `megamoe_simulator/memory.py` | 唯一 storage 的分配/释放区间、别名、SHMEM 和历史池容量 |
-| `megamoe_simulator/profile.py` | 任务记录、Chrome trace、训练集校准和预留集误差 |
+| `megamoe_simulator/profile.py` | 任务记录、训练集校准和预留集误差 |
+| `megamoe_simulator/profile_import.py` | 统一导入 layer/cost worker 的关联诊断，核对 source/native 身份 |
+| `examples/torch/multicore/analyze_mega_moe_gradient_timeline.py` | 同一次全 rank trace 的梯度窗口与就绪依赖归因 |
 | `examples/torch/multicore/audit_mega_moe_plan.py` | 可选的 Torch meta 构图审计，不启动通信和 kernel |
 | `examples/torch/multicore/profile_mega_moe_costs.py` | 单独采集真实耗时、显存、精度及诊断数据的分布式 worker |
 
@@ -99,7 +101,69 @@ H=5120、I=1792 时，一个专家的 BF16 权重为 52.5 MiB，FP32 梯度为 1
 
 计时使用 `GetSystemCycle`。文档规定其系统计数器为 50 MHz，转换为微秒应除以 50，不能使用 Cube 主频。该 API 本身不替代其他流水线的完成同步：[Ascend C API](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/ascendcopapi/atlasascendc_api_07_0282.html)。GMM 校准取同一专家所有 Cube worker 的最大 compute 区间，并要求完整、stride=1 的 Cube 队列；不把依赖等待纳入算力倍率。
 
-另提供 CPU scope 和当前 stream NPU event 的额外诊断步骤，以及 Chrome trace 导入。scope 保留嵌套关系，trace 汇总按时间区间并集计算。所有诊断均在 profile-off 性能测量之后执行，不能使用诊断步骤的耗时宣称性能收益。诊断 arena 扩容后可能继续保留到资源释放，严谨显存 A/B 应使用新进程。
+另提供 CPU scope 和当前 stream NPU event 的额外诊断步骤，以及 Chrome trace 导入。scope 保留嵌套关系，trace 汇总按时间区间并集计算。所有诊断均在 profile-off 性能测量之后执行，不能使用诊断步骤的耗时宣称性能收益。
+两个 worker 均先测完所有路由，再统一执行诊断，避免先前路由扩容后的 task arena 混入后续测量。
+诊断 arena 可能继续保留到资源释放，严谨显存 A/B 应使用新进程。
+
+### 关联采集与多窗口归因
+
+Layer worker 的原有 trace、P2P event 和 kernel cycle 入口均保留。`ProfileContext` 只在额外诊断步骤中
+临时安装包装器，给每次执行分配跨 rank 一致的 `capture_id`。`step`、layer、rank、resource group、
+forward/recompute/backward 和 call id 共同标识一次调用；placement 的映射摘要和 generation 来自实际 plan。
+Host 的一次 kernel launch 记录 `wave_count`；具体 wave、物理专家和 GEMM readiness 来自该 launch 的 task 记录。
+准备 plan 之前尚未确定的 placement 不猜填。原来的 `megamoe::...` scope 名称继续输出。
+
+`--profile-output ... --profile-all-ranks` 现在在 **同一次 trace 执行内**读取真实 P2P descriptor，
+不增加 P2P 计时事件。`diagnostic_trace.capture` 包含每个 rank 的调用标识、非空和空 batch、
+实际 peer/shape/dtype/bytes、逻辑专家、gate/up 或 down 权重角色，以及接收 tensor 的 storage 地址和偏移。
+全局 batch 编号包含本 rank 没有收发任务的窗口，避免后续窗口错位。
+`--profile-p2p` 仍是另一次带 NPU event 的诊断，两次执行使用不同的 capture id。
+
+分析器通过 CPU pid/tid、scope 和精确 device flow 关联调用，不再从列表位置反推层号。
+新格式支持任意 EP rank 数、层数、多个 resource group、多窗口、receive-only 和 mixed send/receive；
+每个窗口独立报告以下字段，不能把它们相加当作 step 耗时：
+
+| 字段 | 含义 |
+| --- | --- |
+| `control_stream_wait_duration_ns` | 独立接收控制流上的等待区间并集 |
+| `compute_stream_join_duration_ns` | 本地计算流加入通信依赖的区间并集 |
+| `owner_accumulation_duration_ns` | owner 的 `aten::add_` 所启动的设备累加 kernel 区间并集 |
+| `window_reuse_duration_ns` | 下一次覆盖接收窗口前的控制流等待 |
+| `late_neighbor_ns` | 同一次执行中，等待开始后才到达的最晚 peer 就绪时间 |
+
+分析器核对 peer 的消息条数、字节、shape/dtype、窗口和专家身份，并验证生产、通信完成、owner 累加、
+窗口复用的先后关系。缺失或不唯一的关键 flow、缺少 scope、身份不匹配都拒绝分析。
+目前只在同一 host 的 CANN 校准时钟下比较跨 rank 时间；跨 host 尚无时钟校准协议，明确拒绝比较。
+旧 EP8/16 层格式仍由原来的 reader 处理，保留原字段；它不能替代新格式的同次执行证据。
+
+Torch-NPU 的 Chrome 导出不一定包含 allocator 事件。采集器使用已安装 Torch-NPU 的 reader 解码
+**同一 profiler 已采集的 framework memory records**，保留纳秒、pid/tid、地址、分配字节和 allocator 总量，
+再归到同线程的最内层关联 scope。无匹配 scope 的事件显式计入 `unattributed`，不按临近时间猜测所属层。
+这是诊断执行中的 allocator 记录，不覆盖外部 SHMEM/HCCL 分配，也不替代 profile-off HBM 峰值。
+每个资源组的 workspace view 列账单独保存，不能再加到 allocator/SHMEM 总量上。
+
+`--profile-kernel-cycles --profile-tasks` 在另一额外步骤中采集所有资源组。每组每个方向的 arena
+只保留最后一次 launch，输出具体 layer/call/placement；旧 `counters`、`forward_counters` 和
+`task_profiles` 字段继续描述首个资源组。六类 GEMM 归到 forward/recompute、dX、dW，保留本地 wave、
+逻辑专家的 ready/complete cycle 和 compute 服务时间。task cycle 没有 trace 或跨 rank 的绝对原点。
+存在 stride>1 时仍可保存诊断，但不给出 GEMM 标定样本；缺失/重复 Cube queue 或同一专家的 worker 记录
+也拒绝标定。stride=1 表示该次 launch 的队列未抽样，不代表采到了整个 checkpoint step。
+
+统一离线导入不导入 Torch，也不启动设备：
+
+```bash
+python -m examples.torch.multicore.megamoe_simulator.profile_import \
+  output/layers.json --identity-from output/layers.json --output output/profile-bundle.json
+
+python -m examples.torch.multicore.megamoe_simulator.profile_import \
+  output/fresh-calibration/rank*.json --identity-from output/fresh-calibration/rank0.json \
+  --output output/cost-profile-bundle.json
+```
+
+`measurements` 只接收原 profile-off 数据；`executions` 按 capture id 分开，`timelines` 保存关联分析。
+每个结果携带 source/native 摘要、时间单位、时钟域、stride 和覆盖范围。输入必须与显式参考身份一致，
+并含 native 文件哈希。`--skip-traces` 可只导入 payload/task；这不表示已有时间线验收。
+旧 cost JSON 可继续通过旧校准入口读取，不能伪造新格式的 capture 身份。
 
 ## 复现与使用
 

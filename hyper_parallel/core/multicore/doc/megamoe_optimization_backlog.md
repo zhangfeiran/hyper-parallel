@@ -2,7 +2,7 @@
 
 更新日期：2026-09-08。核对基线：`megamoe-sun@ee5a696554133d99c80aa9029e5cdd9ab039c1ac`。
 本文件统一记录合并 cost-model 系列与 `megamoe-sun-260908` 后的待办；历史实验见 history/，当前优先级仅在本文件维护。
-本次只整理文档，以下未勾选项均未因此启动或完成。后续完成一轮时更新状态、提交和证据入口。
+以下状态随实施更新，未勾选项仍待完成；每轮保留提交和证据入口。
 
 目标是让一次匹配源码、硬件与训练契约的校准支撑后续离线预测，预测耗时与峰值 HBM，
 再据此筛选 EP16/32/64、E384 的热专家拷贝和整体 MegaMoe 优化。
@@ -19,7 +19,7 @@
 | 梯度接收 | 默认 8 槽的 peer-balanced 有界窗口与 receive-only control-stream 重叠已结合；消费、复用依赖及 FP32 累加保留 |
 | Runtime descriptor | 按图分配 task/event 容量、128 字节 compact task、tensor templates 已实现；EP16/32/64 meta 构图通过不等于设备执行通过 |
 | Cost-model | 六类 GEMM 服务、rank 阶段依赖、网络竞争、storage 生命周期、train/holdout 校准和构图筛选已实现；仍是近似模型 |
-| Profiler | task/cycle、CPU scope、NPU event、shape/memory capture、全 rank trace、P2P 诊断已保留；尚未形成统一的多窗口归因与重校准流程 |
+| Profiler | 两组采集器均保留，T01 已统一关联与多窗口归因；重校准仍在 T03/T05 待办 |
 | Qwen 集成 | shared-B、单 backend 驻留、CPU 精度快照、model/config/backend 分层已完成；完整生产形状的多步数值重复性仍需核查 |
 | 工程收束 | 六个主题提交与 260908 九个提交均保留，通过双亲 merge 收束；本轮临时 worktree 及数据已归档，阶段快照不重复合入 |
 
@@ -37,7 +37,7 @@ T03 建立合并后的测量基线，T04/T05 完善显存与时间模型，T06 �
 
 | 优先级 | ID | 待办 | 当前状态 | 主要依赖 |
 | --- | --- | --- | --- | --- |
-| P0 | T01 | 统一 profiler 语义并支持多窗口归因 | 采集已有，整合未完成 | 当前两组 profiler |
+| P0 | T01 | 统一 profiler 语义并支持多窗口归因 | 已实现并完成工具验收 | 两组原有 profiler 均保留 |
 | P0 | T02 | Qwen 生产形状多步数值重复性 | 历史问题待当前版本复现 | 固定原始配置和输入 |
 | P0 | T03 | 合并后的性能、HBM 和计时窗口基线 | 尚未做匹配 ABBA | T01；Qwen 部分依赖 T02 |
 | P1 | T04 | 补齐并校验峰值 HBM 生命周期 | 已有账本待核对扩展 | T01/T03 的内存证据 |
@@ -51,13 +51,13 @@ T03 建立合并后的测量基线，T04/T05 完善显存与时间模型，T06 �
 
 ### T01 — Profiler 整合与多窗口归因
 
-- [ ] 为 host scope、kernel task、P2P batch 和内存事件建立可关联的 step/layer/rank/wave/专家及
+- [x] 为 host scope、kernel task、P2P batch 和内存事件建立可关联的 step/layer/rank/wave/专家及
   placement generation 标识；扩展现有入口，不再建立一套重复采集器。
-- [ ] 扩展时间线分析器，解除 EP8、16 层、每层单个非空梯度 batch 的硬编码。
+- [x] 扩展时间线分析器，解除 EP8、16 层、每层单个非空梯度 batch 的硬编码。
   覆盖空 batch、多接收窗口、receive-only、mixed send/receive 和多个 resource group。
-- [ ] 分别报告 control-stream 等待、compute-stream join、owner 累加及窗口复用依赖；
+- [x] 分别报告 control-stream 等待、compute-stream join、owner 累加及窗口复用依赖；
   将已有六类 GEMM/task 标记接入 dX、dW、recompute 汇总，关联具体 expert 的 readiness。
-- [ ] 为 cost-model 提供统一导入结果，明确时间单位、时钟域、采样 stride、覆盖范围和源码/native 身份。
+- [x] 为 cost-model 提供统一导入结果，明确时间单位、时钟域、采样 stride、覆盖范围和源码/native 身份。
   task 的本地 system cycle 不直接作为跨 rank 时钟；不同诊断步骤不假装是同一次执行。
 
 验收：旧 trace 的已有字段与历史分析一致；多窗口的 peer/shape/dtype/字节数与真实 transfer 描述匹配；
@@ -67,7 +67,26 @@ T03 建立合并后的测量基线，T04/T05 完善显存与时间模型，T06 �
 入口：[layer profiler](../../../../examples/torch/multicore/mega_moe_layer_profile.py)、
 [P2P profiler](../../../../examples/torch/multicore/mega_moe_p2p_profile.py)、
 [时间线分析器](../../../../examples/torch/multicore/analyze_mega_moe_gradient_timeline.py)、
-[task ABI](../modules/mega_moe/task_profile.py)。
+[task ABI](../modules/mega_moe/task_profile.py)、
+[统一导入](../../../../examples/torch/multicore/megamoe_simulator/profile_import.py)。
+使用方式与时钟/覆盖边界见 [成本模型文档](theoretical_cost_model.md#关联采集与多窗口归因)。
+
+验收记录（2026-09-08）：multicore 示例目录 139 项 UT、164 个子测试通过；覆盖 EP16/32/64、多窗口、空 batch、
+mixed send/receive、多个资源组和坏数据拒绝。旧 EP8×16 层 fixture 与 `7dfd4ee0` reader 的全部输出字段一致；
+旧真实 trace 原件未在当前工作区找到，这项是格式回归测试，不是重新采集历史性能。
+EP8/E48、T512/H1024/I1024、3 层、2 个资源组、接收窗口 1 的真机采集通过：每层 5 个全局梯度窗口，
+包含 receive-only 和本地空窗口；30 个非空窗口与 90 个空窗口均完成归因与 payload 核对。
+32 份最后一次 launch 的 task 记录通过完整 Cube/stride=1 检查，共提取 144 条专家 GEMM 服务记录。
+9,978 条 allocator 事件中 7,284 条关联到 scope，其余显式保留为未归因。
+另一个 EP8/E48、T128/H512/I128、B1 的 cost worker 在均匀与强热点两条路由上
+通过 native 与 checkpoint 精度检查和统一导入。两条路由均先完成 profile-off 测量，再采集诊断，
+防止已扩容的 task arena 污染后续 HBM；相应回归测试先复现污染再验证修复。
+最终两轮的进程占用检查通过，均是小尺寸工具验收，没有重做生产性能 ABBA 或重新拟合模型。
+
+原始结果、trace、脚本及检查日志在
+`/home/feiran/doc/megamoe-profiler-integration-20260908/`，有效设备结果分别为 `smoke-final-2/` 与
+`cost-smoke-2/`。早期 CANN 导出权限失败、缺少关键 flow 的小尺寸 trace，以及外部作业污染的运行均保留，
+不能拿来替代有效验收或做性能标定。CANN 工具只在该目录复制并收紧权限，共享安装未修改。
 
 ### T02 — Qwen 多步数值重复性
 

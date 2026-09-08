@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Analyze gradient waits in sixteen-layer EP8 Torch-NPU traces through exact device flows."""
+"""Analyze correlated gradient windows, retaining the legacy EP8 trace reader."""
 
 from __future__ import annotations
 
@@ -23,8 +23,16 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any
 
+from examples.torch.multicore.mega_moe_gradient_windows import analyze_windows
+from examples.torch.multicore.mega_moe_trace import (
+    communication_events as _trace_communication_events,
+)
+from examples.torch.multicore.mega_moe_trace import (
+    validate_stream_order as _validate_stream_order,
+)
 
-def _nanoseconds(value: str | int | float) -> int:
+
+def _nanoseconds(value: str | float) -> int:
     """Preserve decimal microsecond timestamps without epoch-sized floating point."""
     return int(Decimal(str(value)) * 1000)
 
@@ -36,43 +44,11 @@ def _contains(scope: dict[str, Any], host: dict[str, Any]) -> bool:
 
 
 def _communication_events(
-    joined: list[tuple[dict[str, Any], dict[str, Any]]],
-    native: dict[str, Any],
-    scopes: dict[str, dict[str, Any]],
-    *,
-    receive_only: bool,
+    joined: list[tuple[dict[str, Any], dict[str, Any]]], native: dict[str, Any],
+    scopes: dict[str, dict[str, Any]], *, receive_only: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Separate a P2P wait from its eventual compute-stream join through exact scopes."""
-    barriers = [device for device, host in joined if _contains(scopes['wait'], host)
-                and device['name'] == 'EVENT_WAIT']
-    streams = {(event['pid'], event['tid']) for event in barriers}
-    if len(streams) != 1:
-        raise ValueError('Non-unique P2P wait stream')
-    stream = next(iter(streams))
-    caller = (native['pid'], native['tid'])
-    independent = stream != caller
-    if independent and not receive_only:
-        raise ValueError('Gradient send lost its native producer dependency')
-    records = [device for device, host in joined if _contains(scopes['launch'], host)
-               and (device['pid'], device['tid']) == stream and device['name'] == 'EVENT_RECORD']
-    caller_barriers = ([device for device, host in joined
-                        if _contains(scopes['reduction'], host) and not _contains(scopes['wait'], host)
-                        and (device['pid'], device['tid']) == caller and device['name'] == 'EVENT_WAIT']
-                       if independent else barriers)
-    if not records or not caller_barriers:
-        raise ValueError('Missing P2P ready record or caller-stream join')
-    return records, barriers, caller_barriers
-
-
-def _validate_stream_order(row: dict[str, Any]) -> None:
-    """Require native production and P2P completion before owner consumption."""
-    if ((not row['independent_receive'] and row['ready_ns'] < row['native_end_ns'])
-            or row['p2p_wait_start_ns'] < row['ready_ns']
-            or row['wait_start_ns'] < row['native_end_ns']
-            or row['wait_end_ns'] < row['p2p_wait_end_ns']):
-        raise ValueError('Invalid producer/communication/consumer stream order')
-    if row['owner_start_ns'] is not None and row['owner_start_ns'] < row['wait_end_ns']:
-        raise ValueError('Owner starts before P2P completion')
+    """Keep the original inclusive scope boundary when replaying legacy traces."""
+    return _trace_communication_events(joined, native, scopes, receive_only=receive_only, include_scope_end=True)
 
 
 def _rank_timeline(path: Path, rank: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -171,6 +147,9 @@ def main() -> None:
     parser.add_argument('result', type=Path)
     args = parser.parse_args()
     run = json.loads(args.result.read_text())
+    if run['diagnostic_trace'].get('capture', {}).get('schema_version') == 2:
+        print(json.dumps(analyze_windows(run), indent=2))
+        return
     traces = run['diagnostic_trace']['per_rank']
     if run['configuration']['layers'] != 16 or [item['rank'] for item in traces] != list(range(8)):
         raise ValueError('analysis requires sixteen layers and all eight ranks in order')
