@@ -44,6 +44,21 @@ _PERFORMANCE_WORLD_SIZE = 4
     card_mark="allcards",
     essential_mark="essential",
 )
+def test_mega_moe_replica_gradient_receive_windows() -> None:
+    """Check bounded owner receives with real HCCL and eight distinct NPUs."""
+    worker = str(Path(__file__).resolve().parent / "_test_mega_moe_replica_reduce.py")
+    with without_inherited_rank_environment():
+        parallel_run([
+            TorchCase(worker, "test_replica_gradient_receive_windows", master_port=allocate_port(), num_proc=8),
+        ])
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
 def test_mega_moe_shared_weight_pool_lifecycle(monkeypatch) -> None:
     """Compare shared staging with native across layers and backward replay.
 

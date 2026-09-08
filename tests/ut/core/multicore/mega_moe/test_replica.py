@@ -30,6 +30,7 @@ from hyper_parallel.core.multicore.modules.mega_moe import (
     replica as replica_module,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.placement import (
+    ExpertPlacementPlan,
     build_constrained_expert_placement,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.replica import (
@@ -198,7 +199,9 @@ class TestExpertReplicaManager(unittest.TestCase):
 
     def test_multiple_replica_gradients_round_only_after_owner_reduction(self) -> None:
         """Preserve small contributions when low-precision replica sums cancel."""
-        manager = ExpertReplicaManager(replace(self._config(rank_id=0), ep_size=3, num_experts=6))
+        manager = ExpertReplicaManager(
+            replace(self._config(rank_id=0), ep_size=3, num_experts=6), gradient_receive_slots=1
+        )
         plan = build_constrained_expert_placement(((9, 0, 0, 0, 0, 0),) * 3, 1, receive_capacity=9)
 
         for dtype, large in ((torch.bfloat16, 256), (torch.float16, 2048)):
@@ -228,6 +231,94 @@ class TestExpertReplicaManager(unittest.TestCase):
                 self.assertEqual(home2.data_ptr(), grad_weight2.data_ptr())
                 torch.testing.assert_close(home1[1], torch.full_like(home1[1], 7.0), atol=0, rtol=0)
                 torch.testing.assert_close(home2[1], torch.full_like(home2[1], 7.0), atol=0, rtol=0)
+
+    def test_gradient_window_reuses_receive_storage_after_wait_and_accumulate(self) -> None:
+        """Sum many replicas through a fixed window with completion ordering."""
+        plan = build_constrained_expert_placement(((9,) + (0,) * 15,) * 8, 1, receive_capacity=9)
+        manager = ExpertReplicaManager(
+            replace(self._config(rank_id=0), ep_size=8, num_experts=16), gradient_receive_slots=2
+        )
+        gradients = (torch.ones(3, 2, 2), torch.ones(3, 1, 2))
+        pointers = [set(), set()]
+        completed_peers = []
+        batches = []
+
+        def launch(transfers: tuple[Any, ...], _group: Any) -> tuple[Any, ...]:
+            """Complete receives only on wait; check earlier slots were consumed."""
+            for home in gradients:
+                torch.testing.assert_close(home[0], torch.full_like(home[0], 1 + sum(completed_peers)))
+            peers = [transfer.peer_rank for transfer in transfers[::2]]
+            self.assertLessEqual(len(peers), 2)
+            batches.append(peers)
+            for index, transfer in enumerate(transfers):
+                self.assertEqual(transfer.operation, "receive")
+                pointers[index % 2].add(transfer.tensor.data_ptr())
+
+            def wait() -> None:
+                """Make this batch's receive payloads visible to the consumer."""
+                for transfer in transfers:
+                    transfer.tensor.fill_(transfer.peer_rank)
+                completed_peers.extend(peers)
+
+            return (SimpleNamespace(wait=wait),)
+
+        with patch.object(replica_module, "_launch_transfers", side_effect=launch):
+            homes = manager.reduce_replica_gradients(plan, *gradients)
+
+        self.assertEqual(batches, [[1, 2], [3, 4], [5, 6], [7]])
+        self.assertEqual([len(values) for values in pointers], [2, 2])
+        for home, physical in zip(homes, gradients):
+            self.assertEqual(home.data_ptr(), physical.data_ptr())
+            torch.testing.assert_close(home[0], torch.full_like(home[0], 29))
+            torch.testing.assert_close(home[1], torch.ones_like(home[1]))
+
+    def test_gradient_batches_preserve_transfers_with_asymmetric_owners(self) -> None:
+        """Keep each replica exactly once and bound every owner's receive count."""
+        counts = ((8, 3, 0, 1, 0, 0, 0, 0),) * 4
+        plan = build_constrained_expert_placement(counts, 2, receive_capacity=12)
+        for window in (1, 2, 4):
+            for group_by_slot in (False, True):
+                with self.subTest(window=window, group_by_slot=group_by_slot):
+                    groups = replica_module._gradient_transfer_groups(
+                        plan, window, group_by_slot=group_by_slot
+                    )
+                    flattened = []
+                    for owner_slot, batches in groups:
+                        for batch in batches:
+                            flattened.extend(batch)
+                            for rank in range(4):
+                                self.assertLessEqual(sum(item.owner_rank == rank for item in batch), window)
+                            if group_by_slot:
+                                self.assertTrue(all(item.owner_slot == owner_slot for item in batch))
+                    self.assertCountEqual(flattened, plan.replica_transfers)
+                    for expert in range(8):
+                        self.assertEqual(
+                            [item for item in flattened if item.logical_expert == expert],
+                            [item for item in plan.replica_transfers if item.logical_expert == expert],
+                        )
+
+    def test_gradient_window_rejects_invalid_capacity(self) -> None:
+        """Reject an invalid receive limit before any P2P is launched."""
+        for slots in (0, -1, True, 1.5, "4"):
+            with self.subTest(slots=slots), self.assertRaisesRegex(ValueError, "gradient_receive_slots"):
+                ExpertReplicaManager(self._config(rank_id=0), gradient_receive_slots=slots)
+
+    def test_gradient_window_spreads_one_experts_copies_across_peers(self) -> None:
+        """Avoid serializing each sender's complete remote home group."""
+        counts = ((4, 4, 0, 0, 0, 0, 0, 0),) * 4
+        slots = ((0, 1, -1, -1), (2, 3, 0, 1), (4, 5, 0, 1), (6, 7, 0, 1))
+        dispatch = ((1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1),) * 4
+        plan = ExpertPlacementPlan(counts, 2, slots, dispatch)
+
+        groups = replica_module._gradient_transfer_groups(plan, 4)
+
+        self.assertEqual(len(groups), 1)
+        self.assertIsNone(groups[0][0])
+        batches = groups[0][1]
+        self.assertEqual(len(batches), 2)
+        for slot, batch in enumerate(batches):
+            self.assertEqual([transfer.target_rank for transfer in batch], [1, 2, 3])
+            self.assertEqual([transfer.owner_slot for transfer in batch], [slot] * 3)
 
     def test_ready_pool_reuses_storage_until_a_parameter_changes(self):
         """
@@ -509,7 +600,14 @@ class TestExpertReplicaManager(unittest.TestCase):
         )
         home_loss = home_weight1.square().sum() + home_weight2.square().sum()
 
-        with patch.object(replica_module, "_launch_transfers", return_value=()):
+        def _zero_receives(transfers: tuple, _group: object) -> tuple:
+            """Complete the mock peer's unused-expert zero gradients deterministically."""
+            for transfer in transfers:
+                if transfer.operation == "receive":
+                    transfer.tensor.zero_()
+            return ()
+
+        with patch.object(replica_module, "_launch_transfers", side_effect=_zero_receives):
             physical_weight1, physical_weight2 = manager.start_prefetch(
                 weight1,
                 weight2,
@@ -1032,7 +1130,9 @@ class TestExpertReplicaManager(unittest.TestCase):
                 self.assertEqual(gradient.dtype, torch.float32)
                 self.assertEqual(gradient.untyped_storage().nbytes(), weight[0].numel() * 4)
                 gradient.fill_(7)
-            transfers, received = manager._gradient_transfers(plan, *home_partials, replica_gradients=gradients)
+            transfers, received = manager._gradient_transfers(
+                plan.replica_transfers, *home_partials, receive_buffers=None, replica_gradients=gradients
+            )
             self.assertEqual(received, ())
             self.assertEqual([transfer.operation for transfer in transfers], ["send", "send"])
             self.assertEqual([transfer.tensor.data_ptr() for transfer in transfers],

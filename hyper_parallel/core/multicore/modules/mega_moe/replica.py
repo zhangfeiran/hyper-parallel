@@ -26,6 +26,8 @@ from typing import Any, Literal
 
 from hyper_parallel.core.multicore.modules.mega_moe.placement import (
     ExpertPlacementPlan,
+    ExpertReplicaTransfer,
+    _gradient_transfer_groups,
 )
 
 from .spec import MegaMoeSpec
@@ -232,6 +234,7 @@ class ExpertReplicaManager:
         *,
         compact_physical_weights: bool = False,
         compact_layout_strategy: str = _DEFAULT_COMPACT_LAYOUT_STRATEGY,
+        gradient_receive_slots: int = 8,
     ) -> None:
         """Initialize empty placement-generation state."""
         if spec.replica_slots_per_rank <= 0:
@@ -250,6 +253,12 @@ class ExpertReplicaManager:
                 f"{compact_physical_weights!r}."
             )
         if (
+            not isinstance(gradient_receive_slots, int)
+            or isinstance(gradient_receive_slots, bool)
+            or gradient_receive_slots <= 0
+        ):
+            raise ValueError("gradient_receive_slots must be a positive integer.")
+        if (
             not isinstance(compact_layout_strategy, str)
             or compact_layout_strategy not in _COMPACT_LAYOUT_STRATEGIES
         ):
@@ -264,6 +273,7 @@ class ExpertReplicaManager:
         self._pool_cache_size = pool_cache_size
         self._compact_physical_weights = compact_physical_weights
         self._compact_layout_strategy = compact_layout_strategy
+        self._gradient_receive_slots = gradient_receive_slots
         self._physical_pools: OrderedDict[
             tuple[int, int], _PhysicalWeightPool
         ] = OrderedDict()
@@ -1014,13 +1024,14 @@ class ExpertReplicaManager:
 
     def _gradient_transfers(
         self,
-        plan: ExpertPlacementPlan,
+        batch: tuple[ExpertReplicaTransfer, ...],
         grad_weight1: Any,
         grad_weight2: Any,
         *,
+        receive_buffers: tuple[Any, Any] | None,
         replica_gradients: tuple[Any, Any] | None = None,
     ) -> tuple[tuple[_P2PTransfer, ...], tuple[tuple[int, Any, Any], ...]]:
-        """Build replica-gradient transfers and owner accumulation records."""
+        """Bind one batch to send views and reusable owner receive storage."""
         rank_id = self.spec.rank_id
         transfers = []
         received = []
@@ -1028,7 +1039,7 @@ class ExpertReplicaManager:
             (grad_weight1, grad_weight2) if replica_gradients is None else replica_gradients
         )
         pool_start = 0 if replica_gradients is None else self.spec.local_experts
-        for transfer in plan.replica_transfers:
+        for transfer in batch:
             if transfer.target_rank == rank_id:
                 tensors = (
                     source_grad1[transfer.target_slot - pool_start].contiguous(),
@@ -1039,16 +1050,10 @@ class ExpertReplicaManager:
                     for tensor in tensors
                 )
             elif transfer.owner_rank == rank_id:
-                received_weight1 = torch.empty(
-                    tuple(grad_weight1.shape[1:]),
-                    dtype=grad_weight1.dtype,
-                    device=grad_weight1.device,
-                )
-                received_weight2 = torch.empty(
-                    tuple(grad_weight2.shape[1:]),
-                    dtype=grad_weight2.dtype,
-                    device=grad_weight2.device,
-                )
+                if receive_buffers is None:
+                    raise RuntimeError("replica gradient batch requires owner receive storage.")
+                received_weight1 = receive_buffers[0][len(received)]
+                received_weight2 = receive_buffers[1][len(received)]
                 transfers.extend(
                     (
                         _P2PTransfer(
@@ -1072,6 +1077,45 @@ class ExpertReplicaManager:
                 )
         return tuple(transfers), tuple(received)
 
+    def _reduce_gradient_group(
+        self,
+        owner_slot: int | None,
+        batches: tuple[tuple[ExpertReplicaTransfer, ...], ...],
+        home_gradients: tuple[Any, Any],
+        physical_gradients: tuple[Any, Any],
+        receive_buffers: tuple[Any, Any] | None,
+        replica_gradients: tuple[Any, Any] | None,
+    ) -> None:
+        """Accumulate replicas, retaining one FP32 scratch expert if needed."""
+        owns_copies = owner_slot is not None and any(
+            transfer.owner_rank == self.spec.rank_id
+            for batch in batches for transfer in batch
+        )
+        accumulators = tuple(
+            home[owner_slot].float() if home.dtype in (torch.bfloat16, torch.float16) else home[owner_slot]
+            for home in home_gradients
+        ) if owns_copies else ()
+        for batch in batches:
+            transfers, received = self._gradient_transfers(
+                batch,
+                *physical_gradients,
+                receive_buffers=receive_buffers,
+                replica_gradients=replica_gradients,
+            )
+            _wait_handles(_launch_transfers(transfers, self.spec.ep_group))
+            for received_slot, received_weight1, received_weight2 in received:
+                destinations = accumulators if owner_slot is not None else tuple(
+                    home[received_slot] for home in home_gradients
+                )
+                for accumulator, contribution in zip(destinations, (received_weight1, received_weight2)):
+                    accumulator.add_(contribution)
+            # Work.wait orders communication before these adds. The next P2P
+            # launch inherits the current stream, so it cannot overwrite a
+            # receive slot until its previous contribution has been consumed.
+        for home, accumulator in zip(home_gradients, accumulators):
+            if home.dtype in (torch.bfloat16, torch.float16):
+                home[owner_slot].copy_(accumulator)
+
     def reduce_replica_gradients(
         self,
         plan: ExpertPlacementPlan,
@@ -1080,7 +1124,12 @@ class ExpertReplicaManager:
         *,
         replica_gradients: tuple[Any, Any] | None = None,
     ) -> tuple[Any, Any]:
-        """Return gradients for only the optimizer-owned home parameters.
+        """Return home gradients using a bounded, reusable receive window.
+
+        All ranks must configure the same ``gradient_receive_slots`` and use
+        the same plan. Home slots and batches are ordered globally, including
+        batches in which a rank only sends or has no work. Low-precision inputs
+        accumulate in FP32 until every replica of that home slot has arrived.
 
         Args:
             plan: Placement that produced the physical expert gradients.
@@ -1122,32 +1171,32 @@ class ExpertReplicaManager:
         # before the owner receives are accumulated in place.
         home_grad_weight1 = grad_weight1[:local_experts].contiguous()
         home_grad_weight2 = grad_weight2[:local_experts].contiguous()
-        transfers, received = self._gradient_transfers(
+        groups = _gradient_transfer_groups(
             plan,
-            grad_weight1,
-            grad_weight2,
-            replica_gradients=replica_gradients,
+            self._gradient_receive_slots,
+            group_by_slot=any(gradient.dtype in (torch.bfloat16, torch.float16)
+                              for gradient in (grad_weight1, grad_weight2)),
         )
-        _wait_handles(_launch_transfers(transfers, self.spec.ep_group))
-        received_by_owner: dict[int, list[tuple[Any, Any]]] = {}
-        for owner_slot, received_weight1, received_weight2 in received:
-            received_by_owner.setdefault(owner_slot, []).append(
-                (received_weight1, received_weight2)
+        receive_count = max(
+            (sum(transfer.owner_rank == self.spec.rank_id for transfer in batch)
+             for _, batches in groups for batch in batches),
+            default=0,
+        )
+        # Allocate once per reduction, independently of total replica fan-in.
+        # The buffers remain alive through all current-stream accumulation.
+        receive_buffers = tuple(
+            torch.empty((receive_count, *gradient.shape[1:]), dtype=gradient.dtype, device=gradient.device)
+            for gradient in (grad_weight1, grad_weight2)
+        ) if receive_count else None
+        for owner_slot, batches in groups:
+            self._reduce_gradient_group(
+                owner_slot,
+                batches,
+                (home_grad_weight1, home_grad_weight2),
+                (grad_weight1, grad_weight2),
+                receive_buffers,
+                replica_gradients,
             )
-        for owner_slot, contributions in received_by_owner.items():
-            # Round only after all copies have contributed. Repeated BF16/FP16
-            # in-place adds lose small gradients when replica sums cancel.
-            # Process one owner at a time to bound the FP32 scratch footprint.
-            for weight_index, home_grad in enumerate((home_grad_weight1, home_grad_weight2)):
-                home = home_grad[owner_slot]
-                accumulator = (
-                    home.float()
-                    if home.dtype in (torch.bfloat16, torch.float16)
-                    else home
-                )
-                for contribution in contributions:
-                    accumulator.add_(contribution[weight_index])
-                home.copy_(accumulator)
         return home_grad_weight1, home_grad_weight2
 
 

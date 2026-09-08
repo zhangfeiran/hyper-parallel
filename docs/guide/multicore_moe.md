@@ -152,6 +152,10 @@ MoonEP 风格有界热专家副本与 lossless multi-wave 的实现细节和性�
 
 [MegaMoe MoonEP + multi-wave 技术报告](../../hyper_parallel/core/multicore/doc/moonep_multi_wave_report.md)
 
+EP16/32/64 planner 优化、owner 梯度接收显存上限及 peer 并发调优：
+
+[热专家 planner 与梯度接收窗口](../../hyper_parallel/core/multicore/doc/hotcopy_planner_and_gradient_window.md)
+
 ---
 
 ## 性能建议

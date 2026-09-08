@@ -30,6 +30,9 @@ from examples.torch.multicore.megamoe_simulator.workload import (
     build_plan,
     make_counts,
 )
+from hyper_parallel.core.multicore.modules.mega_moe.placement import (
+    _gradient_transfer_groups,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.replica import ExpertReplicaManager
 
 
@@ -62,8 +65,14 @@ class TestProductionReplicaPayloads(unittest.TestCase):
                     self._count_sends(real_weights, transfers, rank)
                     gradients = tuple(weight.to(torch.float32) for weight in home)
                     replica_gradients = tuple(weight.to(torch.float32) for weight in suffix)
-                    transfers, _ = manager._gradient_transfers(plan, *gradients, replica_gradients=replica_gradients)
-                    self._count_sends(real_gradients, transfers, rank)
+                    receive_buffers = tuple(torch.empty((8, *weight.shape[1:]), dtype=torch.float32, device="meta")
+                                            for weight in home)
+                    for _, batches in _gradient_transfer_groups(plan, 8):
+                        for batch in batches:
+                            transfers, _ = manager._gradient_transfers(
+                                batch, *gradients, receive_buffers=receive_buffers, replica_gradients=replica_gradients,
+                            )
+                            self._count_sends(real_gradients, transfers, rank)
                 graph = TrainingGraph(shape, [plan], Costs(), Training(layers=1, steps=1))
                 tasks = graph.build()
                 for phase, real in (("weight_prefetch", real_weights), ("replica_gradient", real_gradients)):

@@ -105,6 +105,7 @@ print(json.dumps({
                     "top_k": 2,
                     "expert_capacity_factor": None,
                     "replica_slots_per_rank": 0,
+                    "replica_grad_receive_slots": 8,
                     "compact_physical_weights": False,
                     "shared_physical_weights": False,
                     "compact_layout_strategy": "eager_on_first_forward",
@@ -141,6 +142,25 @@ print(json.dumps({
                 )
 
         mock_create_parameters.assert_not_called()
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_gradient_window_validates_and_participates_in_resource_compatibility(
+        self, mock_create_parameters: Mock,
+    ) -> None:
+        """Keep communication batching identical within an execution group."""
+        shape = {"local_num_tokens": 128, "hidden_size": 16, "intermediate_size": 8,
+                 "num_experts": 4, "top_k": 2, "ep_size": 2, "replica_slots_per_rank": 1}
+        for slots in (0, -1, True, 1.5, "4"):
+            with self.subTest(slots=slots), self.assertRaisesRegex(ValueError, "replica_grad_receive_slots"):
+                MegaMoeExperts(**shape, replica_grad_receive_slots=slots)
+        mock_create_parameters.assert_not_called()
+        mock_create_parameters.return_value = (object(), object())
+        first = MegaMoeExperts(**shape, replica_grad_receive_slots=2)
+        second = MegaMoeExperts(**shape, replica_grad_receive_slots=4)
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        with self.assertRaisesRegex(ValueError, "identical configuration"):
+            MegaMoeExperts.share_execution_resources((first, second))
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_shared_physical_weights_validate_storage_contract(self, mock_create_parameters):

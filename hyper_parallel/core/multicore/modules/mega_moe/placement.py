@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import zip_longest
 
 
 def _validate_nonnegative_integer(value: object, name: str) -> int:
@@ -416,42 +417,46 @@ def _select_replica_move(
     best_score: tuple[int, int, int, int, int, int, int, int] | None = None
     best_move: tuple[int, int, int, int, bool] | None = None
     exact_balance = sum(rank_loads) == len(rank_loads) * load_ceiling
+    # A move cannot originate at an empty copy or an underfull rank. Build
+    # this ordered list once instead of rediscovering it for every receiver.
+    active_copies = [
+        (expert, loads_by_rank, source, expert_load, rank_loads[source] - load_ceiling)
+        for expert, loads_by_rank in enumerate(copy_loads)
+        for source, expert_load in loads_by_rank.items()
+        if expert_load > 0 and rank_loads[source] > load_ceiling
+    ]
     for target, available in enumerate(remaining_slots):
         target_room = load_ceiling - rank_loads[target]
         if target_room <= 0:
             continue
-        for expert, loads_by_rank in enumerate(copy_loads):
+        for expert, loads_by_rank, source, expert_load, source_surplus in active_copies:
             new_copy = target not in loads_by_rank
             if new_copy and available == 0:
                 continue
-            for source, expert_load in loads_by_rank.items():
-                source_surplus = rank_loads[source] - load_ceiling
-                if expert_load == 0 or source_surplus <= 0:
-                    continue
-                # Fill the cold rank in one shot when this copy permits it.
-                # The sender may become temporarily underfull and receive a
-                # different home group later. This chained transfer is what
-                # keeps MoonEP's training bound at one remote home group (at
-                # most ``local_home_experts`` distinct copies) per rank.
-                rows = min(expert_load, target_room)
-                if not exact_balance:
-                    # Capacity headroom does not need a transfer chain. Move
-                    # only the overflow so prefetch and communication stay
-                    # proportional to the imbalance being removed.
-                    rows = min(rows, source_surplus)
-                score = (
-                    rows,
-                    int(not new_copy),
-                    source_surplus,
-                    target_room,
-                    rank_loads[source],
-                    expert_load,
-                    -target,
-                    -expert,
-                )
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_move = (expert, source, target, rows, new_copy)
+            # Fill the cold rank in one shot when this copy permits it.
+            # The sender may become temporarily underfull and receive a
+            # different home group later. This chained transfer is what
+            # keeps MoonEP's training bound at one remote home group (at
+            # most ``local_home_experts`` distinct copies) per rank.
+            rows = min(expert_load, target_room)
+            if not exact_balance:
+                # Capacity headroom does not need a transfer chain. Move
+                # only the overflow so prefetch and communication stay
+                # proportional to the imbalance being removed.
+                rows = min(rows, source_surplus)
+            score = (
+                rows,
+                int(not new_copy),
+                source_surplus,
+                target_room,
+                rank_loads[source],
+                expert_load,
+                -target,
+                -expert,
+            )
+            if best_score is None or score > best_score:
+                best_score = score
+                best_move = (expert, source, target, rows, new_copy)
     return best_move
 
 
@@ -743,3 +748,41 @@ def remap_logical_routes(
             f"source rank {source_rank}."
         )
     return tuple(physical_routes)
+
+
+def _gradient_transfer_groups(
+    plan: ExpertPlacementPlan,
+    receive_slots: int,
+    *,
+    group_by_slot: bool = False,
+) -> tuple[tuple[int | None, tuple[tuple[ExpertReplicaTransfer, ...], ...]], ...]:
+    """Bound owner fan-in, optionally isolating low-precision accumulators."""
+    by_slot: dict[int | None, dict[int, list[ExpertReplicaTransfer]]] = {}
+    for transfer in plan.replica_transfers:
+        owner_slot = transfer.owner_slot if group_by_slot else None
+        owners = by_slot.setdefault(owner_slot, {})
+        owners.setdefault(transfer.owner_rank, []).append(transfer)
+    groups = []
+    for owner_slot, owners in sorted(by_slot.items()):
+        # Spread a window across replica peers instead of filling it with one
+        # peer's different experts. Stable sorting preserves each expert's
+        # original contribution order, including floating-point cancellation.
+        for transfers in owners.values():
+            transfers.sort(key=lambda transfer: transfer.owner_slot)
+        owner_batches = []
+        for transfers in owners.values():
+            peer_count = len({transfer.target_rank for transfer in transfers})
+            # A partial extra round of peers makes its few repeated senders
+            # bottlenecks. Leave that tail unused when a full peer round fits.
+            width = receive_slots
+            if peer_count <= width:
+                width -= width % peer_count
+            owner_batches.append(tuple(
+                tuple(transfers[start:start + width]) for start in range(0, len(transfers), width)
+            ))
+        batches = tuple(
+            tuple(transfer for batch in owner_round for transfer in batch)
+            for owner_round in zip_longest(*owner_batches, fillvalue=())
+        )
+        groups.append((owner_slot, batches))
+    return tuple(groups)

@@ -69,6 +69,7 @@ class _MegaMoeExecutionResources:
         compact_physical_weights: bool = False,
         shared_physical_weights: bool = False,
         compact_layout_strategy: str = "eager_on_first_forward",
+        replica_grad_receive_slots: int = 8,
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
@@ -89,6 +90,7 @@ class _MegaMoeExecutionResources:
                     self.spec, pool_cache_size=pool_cache_size,
                     compact_physical_weights=compact_physical_weights,
                     compact_layout_strategy=compact_layout_strategy,
+                    gradient_receive_slots=replica_grad_receive_slots,
                 ) if self.spec.replica_slots_per_rank else None
             )
         except Exception:
@@ -134,6 +136,7 @@ class MegaMoeExperts(MulticoreModule):
         compact_physical_weights: bool = False,
         shared_physical_weights: bool = False,
         compact_layout_strategy: str = "eager_on_first_forward",
+        replica_grad_receive_slots: int = 8,
         ep_size: int = 1,
         ep_group: Any | None = None,
     ) -> None:
@@ -151,6 +154,11 @@ class MegaMoeExperts(MulticoreModule):
                 and executes larger routes losslessly in fixed-capacity waves.
             replica_slots_per_rank: Bounded temporary expert-weight slots on
                 each EP rank. Zero preserves static home-expert execution.
+            replica_grad_receive_slots: Maximum incoming replica gradients
+                buffered simultaneously per owner rank. Must be a positive
+                integer identical on all EP ranks. The default of eight bounds
+                receive storage independently of B and total replica fan-in;
+                batches may use fewer slots to balance traffic across peers.
             compact_physical_weights: Store replica suffixes in spare storage
                 attached to home parameters instead of snapshotting home rows.
                 This reduces HBM under the standard contract that parameters
@@ -178,6 +186,7 @@ class MegaMoeExperts(MulticoreModule):
             top_k=top_k,
             expert_capacity_factor=expert_capacity_factor,
             replica_slots_per_rank=replica_slots_per_rank,
+            replica_grad_receive_slots=replica_grad_receive_slots,
             compact_physical_weights=compact_physical_weights,
             shared_physical_weights=shared_physical_weights,
             compact_layout_strategy=compact_layout_strategy,
@@ -193,6 +202,7 @@ class MegaMoeExperts(MulticoreModule):
             "top_k": top_k,
             "expert_capacity_factor": expert_capacity_factor,
             "replica_slots_per_rank": replica_slots_per_rank,
+            "replica_grad_receive_slots": replica_grad_receive_slots,
             "compact_physical_weights": compact_physical_weights,
             "shared_physical_weights": shared_physical_weights,
             "compact_layout_strategy": compact_layout_strategy,
@@ -207,6 +217,7 @@ class MegaMoeExperts(MulticoreModule):
             top_k,
             expert_capacity_factor,
             replica_slots_per_rank,
+            replica_grad_receive_slots,
             compact_physical_weights,
             shared_physical_weights,
             compact_layout_strategy,
@@ -225,6 +236,7 @@ class MegaMoeExperts(MulticoreModule):
         self.top_k = top_k
         self.expert_capacity_factor = expert_capacity_factor
         self.replica_slots_per_rank = replica_slots_per_rank
+        self.replica_grad_receive_slots = replica_grad_receive_slots
         self.compact_physical_weights = compact_physical_weights
         self.shared_physical_weights = shared_physical_weights
         self.compact_layout_strategy = compact_layout_strategy
@@ -240,11 +252,18 @@ class MegaMoeExperts(MulticoreModule):
     @staticmethod
     def _validate_replica_options(
         replica_slots_per_rank: int,
+        replica_grad_receive_slots: int,
         compact_physical_weights: bool,
         shared_physical_weights: bool,
         compact_layout_strategy: str,
     ) -> None:
         """Validate public physical-weight storage controls."""
+        if (
+            not isinstance(replica_grad_receive_slots, int)
+            or isinstance(replica_grad_receive_slots, bool)
+            or replica_grad_receive_slots <= 0
+        ):
+            raise ValueError("replica_grad_receive_slots must be a positive integer.")
         if (
             not isinstance(replica_slots_per_rank, int)
             or isinstance(replica_slots_per_rank, bool)
@@ -285,6 +304,7 @@ class MegaMoeExperts(MulticoreModule):
         top_k: int,
         expert_capacity_factor: float | None,
         replica_slots_per_rank: int,
+        replica_grad_receive_slots: int,
         compact_physical_weights: bool,
         shared_physical_weights: bool,
         compact_layout_strategy: str,
@@ -312,6 +332,7 @@ class MegaMoeExperts(MulticoreModule):
             )
         MegaMoeExperts._validate_replica_options(
             replica_slots_per_rank,
+            replica_grad_receive_slots,
             compact_physical_weights,
             shared_physical_weights,
             compact_layout_strategy,
@@ -523,4 +544,5 @@ class MegaMoeExperts(MulticoreModule):
             compact_physical_weights=self.compact_physical_weights,
             shared_physical_weights=self.shared_physical_weights,
             compact_layout_strategy=self.compact_layout_strategy,
+            replica_grad_receive_slots=self.replica_grad_receive_slots,
         )
