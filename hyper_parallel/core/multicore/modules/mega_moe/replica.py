@@ -20,6 +20,7 @@ import struct
 import threading
 import weakref
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Literal
@@ -371,16 +372,21 @@ class ExpertReplicaManager:
                 raise RuntimeError("shared expert weight pool is not claimed.")
             self._shared_key = key
 
+    def _shared_control_stream(self, weight: Any) -> Any:
+        """Reuse one stream for shared-pool work without native output dependencies."""
+        if self._shared_agreement_stream is None:
+            self._shared_agreement_stream = torch.npu.Stream(device=weight.device)
+        return self._shared_agreement_stream
+
     def _shared_all_ranks_can_reuse(self, locally_reusable: bool, weight: Any) -> bool:
         """Agree on host-only cache metadata without draining the compute stream."""
         if weight.device.type == "cpu" or self.spec.ep_size == 1:
             return self._all_ranks_can_reuse(locally_reusable, weight)
-        if self._shared_agreement_stream is None:
-            self._shared_agreement_stream = torch.npu.Stream(device=weight.device)
         # Identity, version and placement are host metadata, so this scalar has
-        # no compute dependency. B-slot transfers/consumers remain on the caller
-        # stream behind the lease event; only the agreement uses this stream.
-        with torch.npu.stream(self._shared_agreement_stream):
+        # no compute dependency. Weight transfers and all gradient sends keep
+        # their caller-stream dependencies; receive-only gradients may share
+        # this stream because their destination storage is independent.
+        with torch.npu.stream(self._shared_control_stream(weight)):
             return self._all_ranks_can_reuse(locally_reusable, weight)
 
     def prepare_shared_gradients(self, *, multi_wave: bool) -> tuple[Any, Any]:
@@ -1077,6 +1083,59 @@ class ExpertReplicaManager:
                 )
         return tuple(transfers), tuple(received)
 
+    def _gradient_receive_control(
+        self, plan: ExpertPlacementPlan, weight: Any, replica_gradients: tuple[Any, Any] | None,
+    ) -> Any:
+        """Use independent receives only when the complete plan has no local sends."""
+        rank_id = self.spec.rank_id
+        receive_only = (
+            replica_gradients is not None
+            and weight.device.type == "npu"
+            and any(transfer.owner_rank == rank_id for transfer in plan.replica_transfers)
+            and not any(transfer.target_rank == rank_id for transfer in plan.replica_transfers)
+        )
+        return self._shared_control_stream(weight) if receive_only else None
+
+    def _complete_gradient_transfers(
+        self,
+        batch: tuple[ExpertReplicaTransfer, ...],
+        grad_weight1: Any,
+        grad_weight2: Any,
+        *,
+        receive_buffers: tuple[Any, Any] | None,
+        replica_gradients: tuple[Any, Any] | None = None,
+        receive_control: Any = None,
+    ) -> tuple[tuple[int, Any, Any], ...]:
+        """Join one bounded batch before owner accumulation, preserving send readiness."""
+        if receive_control is None:
+            transfers, received = self._gradient_transfers(
+                batch, grad_weight1, grad_weight2, receive_buffers=receive_buffers,
+                replica_gradients=replica_gradients,
+            )
+            _wait_handles(_launch_transfers(transfers, self.spec.ep_group))
+            return received
+
+        consumer = torch.npu.current_stream(grad_weight1.device)
+        try:
+            try:
+                with torch.npu.stream(receive_control):
+                    transfers, received = self._gradient_transfers(
+                        batch, grad_weight1, grad_weight2, receive_buffers=receive_buffers,
+                        replica_gradients=replica_gradients,
+                    )
+                    for _, weight1, weight2 in received:
+                        weight1.record_stream(consumer)
+                        weight2.record_stream(consumer)
+                    _wait_handles(_launch_transfers(transfers, self.spec.ep_group))
+            finally:
+                consumer.wait_stream(receive_control)
+        except Exception:
+            with self._shared_lock:
+                self._shared_failed = True
+                self._shared_key = None
+            raise
+        return received
+
     def _reduce_gradient_group(
         self,
         owner_slot: int | None,
@@ -1085,6 +1144,7 @@ class ExpertReplicaManager:
         physical_gradients: tuple[Any, Any],
         receive_buffers: tuple[Any, Any] | None,
         replica_gradients: tuple[Any, Any] | None,
+        receive_control: Any = None,
     ) -> None:
         """Accumulate replicas, retaining one FP32 scratch expert if needed."""
         owns_copies = owner_slot is not None and any(
@@ -1096,22 +1156,28 @@ class ExpertReplicaManager:
             for home in home_gradients
         ) if owns_copies else ()
         for batch in batches:
-            transfers, received = self._gradient_transfers(
+            # Empty local batches must not make the first useful receive wait
+            # for native backward through an unnecessary control-stream join.
+            control = receive_control if any(
+                transfer.owner_rank == self.spec.rank_id for transfer in batch
+            ) else None
+            received = self._complete_gradient_transfers(
                 batch,
                 *physical_gradients,
                 receive_buffers=receive_buffers,
                 replica_gradients=replica_gradients,
+                receive_control=control,
             )
-            _wait_handles(_launch_transfers(transfers, self.spec.ep_group))
             for received_slot, received_weight1, received_weight2 in received:
                 destinations = accumulators if owner_slot is not None else tuple(
                     home[received_slot] for home in home_gradients
                 )
                 for accumulator, contribution in zip(destinations, (received_weight1, received_weight2)):
                     accumulator.add_(contribution)
-            # Work.wait orders communication before these adds. The next P2P
-            # launch inherits the current stream, so it cannot overwrite a
-            # receive slot until its previous contribution has been consumed.
+            if control is not None:
+                # The bounded window is reused. Its next DMA must follow these
+                # caller-stream adds, even though the first receive was early.
+                control.wait_stream(torch.npu.current_stream(physical_gradients[0].device))
         for home, accumulator in zip(home_gradients, accumulators):
             if home.dtype in (torch.bfloat16, torch.float16):
                 home[owner_slot].copy_(accumulator)
@@ -1182,21 +1248,33 @@ class ExpertReplicaManager:
              for _, batches in groups for batch in batches),
             default=0,
         )
-        # Allocate once per reduction, independently of total replica fan-in.
-        # The buffers remain alive through all current-stream accumulation.
-        receive_buffers = tuple(
-            torch.empty((receive_count, *gradient.shape[1:]), dtype=gradient.dtype, device=gradient.device)
-            for gradient in (grad_weight1, grad_weight2)
-        ) if receive_count else None
-        for owner_slot, batches in groups:
-            self._reduce_gradient_group(
-                owner_slot,
-                batches,
-                (home_grad_weight1, home_grad_weight2),
-                (grad_weight1, grad_weight2),
-                receive_buffers,
-                replica_gradients,
-            )
+        control = self._gradient_receive_control(plan, grad_weight1, replica_gradients)
+        try:
+            # Control-stream allocation avoids recycling caller storage whose
+            # old consumer is still live. Fan-in never enlarges this window.
+            with torch.npu.stream(control) if control is not None else nullcontext():
+                receive_buffers = tuple(
+                    torch.empty((receive_count, *gradient.shape[1:]), dtype=gradient.dtype, device=gradient.device)
+                    for gradient in (grad_weight1, grad_weight2)
+                ) if receive_count else None
+            for owner_slot, batches in groups:
+                self._reduce_gradient_group(
+                    owner_slot,
+                    batches,
+                    (home_grad_weight1, home_grad_weight2),
+                    (grad_weight1, grad_weight2),
+                    receive_buffers,
+                    replica_gradients,
+                    control,
+                )
+        except Exception:
+            # A failed accumulation/reuse join must also prevent another lease
+            # from overwriting storage that may still be used by communication.
+            if control is not None:
+                with self._shared_lock:
+                    self._shared_failed = True
+                    self._shared_key = None
+            raise
         return home_grad_weight1, home_grad_weight2
 
 

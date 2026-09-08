@@ -12,16 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Public high-performance module interfaces."""
+"""Public high-performance modules, resolved without loading unrelated optional kernels."""
 
-from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
-from hyper_parallel.components.modules.gqa_attention import GatedGQAAttention, GQAAttention
-from hyper_parallel.components.modules.grouped_experts import GroupedExperts
-from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPostProcessModule, MhcPreModule
-from hyper_parallel.components.modules.mla_attention import MLAAttention
-from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
-from hyper_parallel.components.modules.shared_expert import SharedExpert
-from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
+import importlib
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
+    from hyper_parallel.components.modules.gqa_attention import GatedGQAAttention, GQAAttention
+    from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+    from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPostProcessModule, MhcPreModule
+    from hyper_parallel.components.modules.mla_attention import MLAAttention
+    from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
+    from hyper_parallel.components.modules.shared_expert import SharedExpert
+    from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
+
+_EXPORT_TO_MODULE = {
+    "DeepseekV32DSAAttention": "dsa_attention",
+    "DSAAttention": "dsa_attention",
+    "GQAAttention": "gqa_attention",
+    "GatedGQAAttention": "gqa_attention",
+    "GroupedExperts": "grouped_experts",
+    "MhcPostModule": "mhc",
+    "MhcPostProcessModule": "mhc",
+    "MhcPreModule": "mhc",
+    "MLAAttention": "mla_attention",
+    "OffsetRMSNorm": "rms_norm",
+    "RMSNorm": "rms_norm",
+    "SharedExpert": "shared_expert",
+    "SwiGLUMLP": "swiglu_mlp",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load only the requested module, preserving explicit optional-dependency errors."""
+    submodule = _EXPORT_TO_MODULE.get(name)
+    if submodule is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(f"{__name__}.{submodule}")
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose the unchanged public names before their optional imports occur."""
+    return sorted(set(globals()) | set(_EXPORT_TO_MODULE))
+
 
 __all__ = [
     "DeepseekV32DSAAttention",

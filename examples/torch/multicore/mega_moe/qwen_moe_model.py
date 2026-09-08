@@ -19,165 +19,116 @@ from __future__ import annotations
 
 __all__ = [
     "CompactLayoutStrategy",
+    "NativeMoeExperts",
     "QwenMoeBlock",
     "QwenMoeConfig",
     "QwenMoeModel",
     "RoutingMode",
+    "build_qwen_moe_model",
 ]
 
-import math
-from dataclasses import dataclass
-from typing import Any, Literal
+from collections.abc import Iterator
+from typing import Any
 
 # This is a Torch-only executable example, not a platform-agnostic library module.
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
+import torch_npu
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeMLP,
     Qwen3MoeRotaryEmbedding,
 )
 
+from examples.torch.multicore.mega_moe.qwen_moe_config import (
+    CompactLayoutStrategy,
+    QwenMoeConfig,
+    RoutingMode,
+)
+from hyper_parallel import init_device_mesh
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb
 from hyper_parallel.components.modules.rms_norm import RMSNorm
 from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.route import count_topk_experts
 from hyper_parallel.models.qwen3_moe.adapter.attention import (
     run_qwen3_moe_flash_attention,
 )
+from hyper_parallel.platform.torch.common import GroupedExperts
 
-RoutingMode = Literal["balanced", "topk", "dirichlet"]
-CompactLayoutStrategy = Literal[
-    "lazy_on_first_replica",
-    "eager_on_first_forward",
-]
+_MODEL_DTYPE = torch.bfloat16
 
 
-@dataclass(frozen=True)
-class QwenMoeConfig:
-    """Fixed-shape synthetic Qwen model configuration.
+def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the local value of a plain tensor or DTensor."""
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
-    The example intentionally models one TP1/EP8 optimizer-step workload. Its
-    deterministic balanced default gives every destination the same load;
-    optional Dirichlet routing reproduces load-skew and multi-wave behavior.
-    """
 
-    vocab_size: int = 32000
-    hidden_size: int = 5120
-    num_layers: int = 8
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 2
-    max_seq_len: int = 4096
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 10_000_000.0
-    num_experts: int = 48
-    top_k: int = 8
-    intermediate_size: int = 1792
-    shared_expert_intermediate_size: int = 512
-    routed_scaling_factor: float = 1.0
-    routing: RoutingMode = "balanced"
-    router_load_alpha: float = 1.0
-    router_load_seed: int = 42
-    local_num_tokens: int = 4096
-    expert_capacity_factor: float | None = None
-    replica_slots_per_rank: int = 0
-    compact_physical_weights: bool = False
-    compact_layout_strategy: CompactLayoutStrategy = "eager_on_first_forward"
-    ep_size: int = 8
+def _parameter_value(parameter: torch.Tensor, *, gradients: bool) -> torch.Tensor:
+    """Return one local parameter or its required gradient in canonical layouts."""
+    value = parameter.grad if gradients else parameter
+    if value is None:
+        raise RuntimeError("Qwen accuracy comparison found a missing gradient.")
+    return _local_tensor(value)
 
-    def __post_init__(self) -> None:
-        """Validate the fixed optimizer-step topology."""
-        positive = {
-            "vocab_size": self.vocab_size,
-            "hidden_size": self.hidden_size,
-            "num_layers": self.num_layers,
-            "num_attention_heads": self.num_attention_heads,
-            "num_key_value_heads": self.num_key_value_heads,
-            "max_seq_len": self.max_seq_len,
-            "num_experts": self.num_experts,
-            "top_k": self.top_k,
-            "intermediate_size": self.intermediate_size,
-            "shared_expert_intermediate_size": self.shared_expert_intermediate_size,
-            "local_num_tokens": self.local_num_tokens,
-            "ep_size": self.ep_size,
-        }
-        for name, value in positive.items():
-            if value <= 0:
-                raise ValueError(f"{name} must be positive, got {value}.")
-        if self.hidden_size % self.num_attention_heads:
-            raise ValueError(
-                f"hidden_size ({self.hidden_size}) must be divisible by "
-                f"num_attention_heads ({self.num_attention_heads})."
-            )
-        if self.num_attention_heads % self.num_key_value_heads:
-            raise ValueError(
-                f"num_attention_heads ({self.num_attention_heads}) must be divisible by "
-                f"num_key_value_heads ({self.num_key_value_heads})."
-            )
-        if self.num_experts % self.ep_size:
-            raise ValueError(
-                f"num_experts ({self.num_experts}) must be divisible by ep_size ({self.ep_size})."
-            )
-        if self.top_k > self.num_experts:
-            raise ValueError(
-                f"top_k ({self.top_k}) cannot exceed num_experts ({self.num_experts})."
-            )
-        if (
-            not isinstance(self.replica_slots_per_rank, int)
-            or isinstance(self.replica_slots_per_rank, bool)
-            or self.replica_slots_per_rank < 0
-        ):
-            raise ValueError(
-                "replica_slots_per_rank must be a nonnegative integer, "
-                f"got {self.replica_slots_per_rank!r}."
-            )
-        if not isinstance(self.compact_physical_weights, bool):
-            raise ValueError(
-                "compact_physical_weights must be a bool, got "
-                f"{self.compact_physical_weights!r}."
-            )
-        if self.compact_layout_strategy not in (
-            "lazy_on_first_replica",
-            "eager_on_first_forward",
-        ):
-            raise ValueError(
-                "compact_layout_strategy must be 'lazy_on_first_replica' or "
-                f"'eager_on_first_forward', got {self.compact_layout_strategy!r}."
-            )
-        if self.local_num_tokens % 128:
-            raise ValueError(
-                f"local_num_tokens ({self.local_num_tokens}) must be divisible by 128."
-            )
-        if self.max_seq_len > self.local_num_tokens:
-            raise ValueError(
-                f"max_seq_len ({self.max_seq_len}) cannot exceed local_num_tokens "
-                f"({self.local_num_tokens}) in the fixed batch-one workload."
-            )
-        self._validate_routing()
 
-    def _validate_routing(self) -> None:
-        """Validate learned and synthetic router parameters."""
-        if self.routing not in ("balanced", "topk", "dirichlet"):
-            raise ValueError(f"unsupported routing mode: {self.routing!r}.")
-        if self.routing == "balanced" and self.top_k != self.ep_size:
-            raise ValueError(
-                "balanced routing requires top_k to equal ep_size so every token "
-                f"selects one expert per destination, got top_k={self.top_k} and "
-                f"ep_size={self.ep_size}."
+class NativeMoeExperts(nn.Module):
+    """Standard EP routed experts using native token permutation and grouped GEMMs."""
+
+    def __init__(
+        self,
+        config: QwenMoeConfig,
+        source: MegaMoeExperts,
+        ep_mesh: Any,
+        device: torch.device,
+    ) -> None:
+        """Shard common experts and copy one local MegaMoe expert shard."""
+        super().__init__()
+        self.module = GroupedExperts(
+            dim=config.hidden_size,
+            hidden_dim=config.intermediate_size,
+            num_experts=config.num_experts,
+            use_grouped_mm=True,
+        ).to(device=device, dtype=_MODEL_DTYPE)
+        ExpertParallel().apply(self.module, ep_mesh)
+        gate_weight, up_weight = source.gate_up_weight.split(
+            config.intermediate_size,
+            dim=-1,
+        )
+        with torch.no_grad():
+            _local_tensor(self.module.w1).copy_(gate_weight.transpose(1, 2))
+            _local_tensor(self.module.w3).copy_(up_weight.transpose(1, 2))
+            _local_tensor(self.module.w2).copy_(source.down_weight.transpose(1, 2))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        tokens_per_expert: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the common routed-expert implementation."""
+        if tokens_per_expert is None:
+            tokens_per_expert = torch.bincount(
+                topk_ids.reshape(-1).to(torch.int64), minlength=self.module.num_experts,
             )
-        if not math.isfinite(self.router_load_alpha) or self.router_load_alpha < 0.01:
-            raise ValueError(
-                "router_load_alpha must be finite and at least 0.01, got "
-                f"{self.router_load_alpha}."
-            )
-        if not math.isfinite(self.routed_scaling_factor) or self.routed_scaling_factor <= 0:
-            raise ValueError(
-                "routed_scaling_factor must be finite and positive, got "
-                f"{self.routed_scaling_factor}."
-            )
+        routed_input, mapping = torch_npu.npu_moe_token_permute(
+            hidden_states.reshape(-1, hidden_states.shape[-1]), topk_ids,
+        )
+        expert_output = self.module(routed_input, tokens_per_expert)
+        output = torch_npu.npu_moe_token_unpermute(
+            expert_output, mapping, probs=topk_weights.float().contiguous(),
+        )
+        return output.reshape(hidden_states.shape)
+
+    @staticmethod
+    def close() -> None:
+        """Match the managed expert lifecycle without owning SHMEM."""
 
 
 class QwenAttention(nn.Module):
@@ -193,13 +144,13 @@ class QwenAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = True
         self.rotary_emb = Qwen3MoeRotaryEmbedding(
-            Qwen3MoeConfig(
-                hidden_size=config.hidden_size,
-                num_attention_heads=config.num_attention_heads,
-                num_key_value_heads=config.num_key_value_heads,
-                max_position_embeddings=config.max_seq_len,
-                rope_theta=config.rope_theta,
-            )
+            Qwen3MoeConfig.from_dict({
+                "hidden_size": config.hidden_size,
+                "num_attention_heads": config.num_attention_heads,
+                "num_key_value_heads": config.num_key_value_heads,
+                "max_position_embeddings": config.max_seq_len,
+                "rope_theta": config.rope_theta,
+            })
         )
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.k_proj = nn.Linear(
@@ -450,16 +401,17 @@ class QwenMoeBlock(nn.Module):
             expert_capacity_factor=config.expert_capacity_factor,
             replica_slots_per_rank=config.replica_slots_per_rank,
             compact_physical_weights=config.compact_physical_weights,
+            shared_physical_weights=config.shared_physical_weights,
             compact_layout_strategy=config.compact_layout_strategy,
             ep_size=config.ep_size,
             ep_group=ep_group,
         )
         self.shared_expert = SwiGLUMLP(
             module=Qwen3MoeMLP(
-                Qwen3MoeConfig(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.shared_expert_intermediate_size,
-                )
+                Qwen3MoeConfig.from_dict({
+                    "hidden_size": config.hidden_size,
+                    "intermediate_size": config.shared_expert_intermediate_size,
+                })
             )
         )
 
@@ -602,7 +554,7 @@ class QwenMoeModel(nn.Module):
             hidden_states.shape[1],
             dtype=torch.int64,
             device=hidden_states.device,
-        )
+        ).unsqueeze(0).expand(hidden_states.shape[0], -1)
         for layer in self.layers:
             hidden_states = layer(hidden_states, position_ids)
         logits = self.lm_head(self.norm(hidden_states))
@@ -629,7 +581,90 @@ class QwenMoeModel(nn.Module):
             parameters.extend(layer.mlp.experts.parameters())
         return tuple(parameters)
 
+    def named_canonical_tensors(self, *, gradients: bool = False) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield local tensors in a common layout for either expert backend.
+
+        Args:
+            gradients: Yield parameter gradients instead of parameter values.
+
+        Yields:
+            Stable names and local tensors. Expert gate/up packing is temporary
+            and produced one layer at a time; callers must not assume ownership.
+
+        Raises:
+            RuntimeError: A requested gradient is missing.
+            TypeError: A decoder has an unsupported expert implementation.
+        """
+        expert_parameters = {id(parameter) for parameter in self.expert_parameters()}
+        for name, parameter in self.named_parameters():
+            if id(parameter) not in expert_parameters:
+                yield f"dense.{name}", _parameter_value(parameter, gradients=gradients)
+        for layer_index, layer in enumerate(self.layers):
+            experts = layer.mlp.experts
+            if isinstance(experts, MegaMoeExperts):
+                gate_up = _parameter_value(experts.gate_up_weight, gradients=gradients)
+                down = _parameter_value(experts.down_weight, gradients=gradients)
+            elif isinstance(experts, NativeMoeExperts):
+                grouped = experts.module
+                gate = _parameter_value(grouped.w1, gradients=gradients)
+                up = _parameter_value(grouped.w3, gradients=gradients)
+                down = _parameter_value(grouped.w2, gradients=gradients)
+                gate_up = torch.cat((gate.transpose(1, 2), up.transpose(1, 2)), dim=-1)
+                down = down.transpose(1, 2)
+            else:
+                raise TypeError(f"unsupported Qwen expert backend {type(experts).__name__}.")
+            yield f"experts.{layer_index}.gate_up_weight", gate_up
+            yield f"experts.{layer_index}.down_weight", down
+
     def close(self) -> None:
         """Release the shared MegaMoe runtime after all queued work finishes."""
         for layer in self.layers:
             layer.mlp.experts.close()
+
+
+def build_qwen_moe_model(
+    config: QwenMoeConfig,
+    device: torch.device,
+    *,
+    backend: str = "mega_moe",
+    ep_group: Any | None = None,
+) -> QwenMoeModel:
+    """Build a BF16 Qwen model with MegaMoe or standard EP routed experts.
+
+    Args:
+        config: Shared model and expert-parallel configuration.
+        device: Destination device for model parameters and buffers.
+        backend: ``mega_moe`` or ``common`` (GroupedExperts with standard EP).
+        ep_group: Process group for MegaMoe; common uses the example's world EP mesh.
+
+    Returns:
+        One model, preserving rotary buffer dtypes and independent expert parameters.
+        Seed selection and optimizer construction remain the caller's responsibility.
+
+    Raises:
+        ValueError: The expert backend is unsupported.
+    """
+    if backend not in ("mega_moe", "common"):
+        raise ValueError(f"unsupported Qwen expert backend {backend!r}.")
+    default_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(_MODEL_DTYPE)
+        model = QwenMoeModel(config, ep_group=ep_group)
+    finally:
+        torch.set_default_dtype(default_dtype)
+    model = model.to(device=device)
+    if backend == "mega_moe":
+        return model
+    ep_mesh = init_device_mesh(
+        device_type=device.type,
+        mesh_shape=(config.ep_size,),
+        mesh_dim_names=("ep",),
+    )
+    # Construct every layer before conversion: interleaving GroupedExperts
+    # initialization would consume RNG state needed by later dense parameters.
+    for layer in model.layers:
+        source = layer.mlp.experts
+        common = NativeMoeExperts(config, source, ep_mesh, device)
+        source.close()
+        layer.mlp.experts = common
+    return model

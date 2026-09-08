@@ -272,6 +272,80 @@ class TestExpertReplicaManager(unittest.TestCase):
             torch.testing.assert_close(home[0], torch.full_like(home[0], 29))
             torch.testing.assert_close(home[1], torch.ones_like(home[1]))
 
+    def test_receive_control_window_waits_for_consumption_before_reuse(self) -> None:
+        """Keep a single receive slot independent initially and ordered on reuse."""
+        plan = build_constrained_expert_placement(((3, 0, 0, 0, 0, 0),) * 3, 1, receive_capacity=3)
+        manager = ExpertReplicaManager(
+            replace(self._config(rank_id=0), ep_size=3, num_experts=6), gradient_receive_slots=1,
+        )
+        gradients = (torch.ones(2, 2, 2), torch.ones(2, 1, 2))
+        replicas = (torch.zeros(1, 2, 2), torch.zeros(1, 1, 2))
+        npu = MagicMock()
+        control = Mock()
+        consumer = npu.current_stream.return_value
+        pointers = []
+        completed = []
+        reused = []
+        allocated = []
+        active = []
+        npu.stream.return_value.__enter__.side_effect = lambda: active.append(control)
+        npu.stream.return_value.__exit__.side_effect = lambda *_args: active.pop() and False
+
+        def allocate(*args: Any, **kwargs: Any) -> Any:
+            """Never source an independent receive from the caller allocator."""
+            self.assertEqual(active, [control])
+            result = torch.empty(*args, **kwargs)
+            allocated.append(result.shape)
+            return result
+
+        def launch(transfers: tuple[Any, ...], _group: Any) -> tuple[Any, ...]:
+            """A second DMA requires a reuse dependency after the preceding add."""
+            self.assertEqual(active, [control])
+            self.assertEqual(reused, completed)
+            self.assertEqual(len(transfers), 2)
+            pointers.append(tuple(transfer.tensor.data_ptr() for transfer in transfers))
+            for transfer in transfers:
+                transfer.tensor.fill_(transfer.peer_rank)
+            completed.append(transfers[0].peer_rank)
+            return (Mock(),)
+
+        def reuse(stream: Any) -> None:
+            """Check the owner has consumed each contribution before its slot is reused."""
+            self.assertIs(stream, consumer)
+            self.assertFalse(active)
+            for gradient in gradients:
+                torch.testing.assert_close(gradient[0], torch.full_like(gradient[0], 1 + sum(completed)))
+            reused[:] = completed
+
+        control.wait_stream.side_effect = reuse
+        framework = SimpleNamespace(npu=npu, empty=allocate, bfloat16=torch.bfloat16, float16=torch.float16)
+        with patch.object(manager, "_gradient_receive_control", return_value=control), \
+                patch.object(replica_module, "torch", new=framework), \
+                patch.object(torch.Tensor, "record_stream") as record, \
+                patch.object(replica_module, "_launch_transfers", side_effect=launch):
+            manager.reduce_replica_gradients(plan, *gradients, replica_gradients=replicas)
+        self.assertEqual(completed, [1, 2])
+        self.assertEqual(pointers[0], pointers[1])
+        self.assertEqual(allocated, [(1, 2, 2), (1, 1, 2)])
+        self.assertEqual(record.call_count, 4)
+        self.assertEqual(consumer.wait_stream.call_count, 2)
+
+    def test_receive_window_reuse_failure_disables_shared_pool(self) -> None:
+        """Do not release a failed cross-stream reuse dependency as a valid pool."""
+        manager = ExpertReplicaManager(self._config(rank_id=0))
+        manager._shared_key = object()
+        gradients = (torch.ones(2, 2, 2), torch.ones(2, 1, 2))
+        replicas = (torch.zeros(1, 2, 2), torch.zeros(1, 1, 2))
+        npu = MagicMock()
+        framework = SimpleNamespace(npu=npu, empty=torch.empty, bfloat16=torch.bfloat16, float16=torch.float16)
+        with patch.object(manager, "_gradient_receive_control", return_value=Mock()), \
+                patch.object(replica_module, "torch", new=framework), \
+                patch.object(manager, "_reduce_gradient_group", side_effect=RuntimeError("reuse join")), \
+                self.assertRaisesRegex(RuntimeError, "reuse join"):
+            manager.reduce_replica_gradients(self._hot_expert_zero_plan(), *gradients, replica_gradients=replicas)
+        self.assertTrue(manager._shared_failed)
+        self.assertIsNone(manager._shared_key)
+
     def test_gradient_batches_preserve_transfers_with_asymmetric_owners(self) -> None:
         """Keep each replica exactly once and bound every owner's receive count."""
         counts = ((8, 3, 0, 1, 0, 0, 0, 0),) * 4
@@ -1147,6 +1221,126 @@ class TestExpertReplicaManager(unittest.TestCase):
             for gradient in gradients:
                 torch.testing.assert_close(gradient, torch.zeros_like(gradient))
             lease.release()
+
+    def test_receive_only_gradients_use_control_stream_and_protect_consumer_storage(self) -> None:
+        """Post receives without waiting for home computation, then join before owner consumption."""
+        manager = ExpertReplicaManager(self._config(rank_id=0))
+        plan = self._hot_expert_zero_plan()
+        gradient = SimpleNamespace(device=SimpleNamespace(type="npu"))
+        events = []
+        npu = MagicMock()
+        consumer = npu.current_stream.return_value
+        control = manager._shared_agreement_stream = Mock()
+        scope = npu.stream.return_value
+        scope.__enter__.side_effect = lambda: events.append("control_enter")
+        scope.__exit__.side_effect = lambda *_args: events.append("control_exit")
+        consumer.wait_stream.side_effect = lambda _stream: events.append("consumer_wait")
+        received = ((0, Mock(), Mock()),)
+        for index, tensor in enumerate(received[0][1:]):
+            tensor.record_stream.side_effect = lambda _stream, number=index: events.append(f"record_{number}")
+        transfers = (object(), object())
+        handle = Mock(wait=Mock(side_effect=lambda: events.append("handle_wait")))
+
+        def build(*_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+            """Allocate mocked receive storage inside the independent stream context."""
+            events.append("allocate")
+            return transfers, received
+
+        def launch(*_args: Any) -> tuple[Any, ...]:
+            """Enqueue one unchanged batch after its receive tensors are registered."""
+            events.append("launch")
+            return (handle,)
+
+        with patch.object(replica_module, "torch", new=SimpleNamespace(npu=npu)), \
+                patch.object(manager, "_gradient_transfers", side_effect=build), \
+                patch.object(replica_module, "_launch_transfers", side_effect=launch):
+            selected = manager._gradient_receive_control(plan, gradient, (gradient, gradient))
+            self.assertIs(selected, control)
+            result = manager._complete_gradient_transfers(
+                plan.replica_transfers, gradient, gradient, receive_buffers=(Mock(), Mock()),
+                replica_gradients=(gradient, gradient), receive_control=selected,
+            )
+
+        self.assertIs(result, received)
+        self.assertEqual(events, ["control_enter", "allocate", "record_0", "record_1", "launch",
+                                  "handle_wait", "control_exit", "consumer_wait"])
+        npu.Stream.assert_not_called()
+        npu.stream.assert_called_once_with(control)
+        consumer.wait_stream.assert_called_once_with(control)
+        control.wait_stream.assert_not_called()
+        for tensor in received[0][1:]:
+            tensor.record_stream.assert_called_once_with(consumer)
+
+    def test_gradient_send_mixed_legacy_cpu_and_empty_batches_keep_caller_stream(self) -> None:
+        """Never remove the native producer dependency when this rank sends a gradient."""
+        receives = (SimpleNamespace(owner_rank=0, target_rank=1),)
+        sends = (SimpleNamespace(owner_rank=1, target_rank=0),)
+        for name, entries, device, shared in (
+            ("send", sends, "npu", True), ("mixed", receives + sends, "npu", True),
+            ("legacy", receives, "npu", False), ("cpu", receives, "cpu", True),
+            ("empty", (), "npu", True),
+        ):
+            with self.subTest(name=name):
+                manager = ExpertReplicaManager(self._config(rank_id=0))
+                plan = SimpleNamespace(replica_transfers=entries)
+                gradient = SimpleNamespace(device=SimpleNamespace(type=device))
+                npu = MagicMock()
+                received = ()
+                transfers = ()
+                handle = Mock()
+                with patch.object(replica_module, "torch", new=SimpleNamespace(npu=npu)), \
+                        patch.object(manager, "_gradient_transfers", return_value=(transfers, received)) as build, \
+                        patch.object(replica_module, "_launch_transfers", return_value=(handle,)) as launch:
+                    replicas = (gradient, gradient) if shared else None
+                    control = manager._gradient_receive_control(plan, gradient, replicas)
+                    self.assertIsNone(control)
+                    result = manager._complete_gradient_transfers(
+                        entries, gradient, gradient, receive_buffers=None,
+                        replica_gradients=replicas, receive_control=control,
+                    )
+                self.assertIs(result, received)
+                build.assert_called_once()
+                launch.assert_called_once_with(transfers, manager.spec.ep_group)
+                handle.wait.assert_called_once_with()
+                npu.current_stream.assert_not_called()
+                npu.Stream.assert_not_called()
+                npu.stream.assert_not_called()
+
+    def test_receive_only_failure_joins_control_stream_and_disables_pool_reuse(self) -> None:
+        """Unwind control scope and preserve its dependency even if preparation or communication fails."""
+        for stage in ("build", "record", "launch", "wait", "join"):
+            with self.subTest(stage=stage):
+                manager = ExpertReplicaManager(self._config(rank_id=0))
+                manager._shared_key = object()
+                gradient = SimpleNamespace(device=SimpleNamespace(type="npu"))
+                npu = MagicMock()
+                consumer = npu.current_stream.return_value
+                received = ((0, Mock(), Mock()),)
+                error = RuntimeError(f"{stage} failure")
+                handle = Mock()
+                if stage == "record":
+                    received[0][1].record_stream.side_effect = error
+                if stage == "wait":
+                    handle.wait.side_effect = error
+                if stage == "join":
+                    consumer.wait_stream.side_effect = error
+                with patch.object(replica_module, "torch", new=SimpleNamespace(npu=npu)), \
+                        patch.object(manager, "_gradient_transfers", return_value=((object(),), received),
+                                     side_effect=error if stage == "build" else None), \
+                        patch.object(replica_module, "_launch_transfers", return_value=(handle,),
+                                     side_effect=error if stage == "launch" else None), \
+                        self.assertRaisesRegex(RuntimeError, f"{stage} failure"):
+                    plan = self._hot_expert_zero_plan()
+                    control = manager._gradient_receive_control(plan, gradient, (gradient, gradient))
+                    manager._complete_gradient_transfers(
+                        plan.replica_transfers, gradient, gradient, receive_buffers=(Mock(), Mock()),
+                        replica_gradients=(gradient, gradient), receive_control=control,
+                    )
+                consumer.wait_stream.assert_called_once_with(npu.Stream.return_value)
+                self.assertIs(npu.stream.return_value.__exit__.call_args.args[0],
+                              None if stage == "join" else RuntimeError)
+                self.assertTrue(manager._shared_failed)
+                self.assertIsNone(manager._shared_key)
 
     def test_shared_agreement_uses_one_independent_stream_and_restores_context(self):
         """Keep scalar agreement independent while preserving the EP-wide result.

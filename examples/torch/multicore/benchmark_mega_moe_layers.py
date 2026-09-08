@@ -39,7 +39,9 @@ from typing import Any
 from examples.torch.multicore.mega_moe_layer_profile import (
     profile_layer_cycles,
     profile_layer_step,
+    profile_trace_paths,
 )
+from examples.torch.multicore.mega_moe_p2p_profile import profile_layer_p2p
 
 ALPHAS = (10000, 3000, 1000, 300, 100, 30, 10, 3, 1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
 EXTRA_PAIRS = ((0.01, 1942), (0.01, 1708), (0.01, 0), (0.005, 943), (0.01, 2104),
@@ -72,8 +74,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, help="Only run this many routes from the shuffled sweep prefix.")
     parser.add_argument("--profile-output", type=Path,
                         help="After all measurements, trace one extra step of the first route on rank zero.")
+    parser.add_argument("--profile-all-ranks", action="store_true",
+                        help="With --profile-output, write one .rankN.json trace per rank instead of rank zero only.")
     parser.add_argument("--profile-kernel-cycles", action="store_true",
                         help="After timing, gather last forward/backward cycles on all ranks (first route, MegaMoe).")
+    parser.add_argument("--profile-p2p", action="store_true",
+                        help="After timing, collect all-rank P2P payload and readiness events (first route, MegaMoe).")
     args = parser.parse_args(argv)
     if args.layers <= 0 or args.warmup < 0 or args.measured <= 0:
         parser.error("layers and measured must be positive; warmup must be nonnegative")
@@ -83,13 +89,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"refusing to overwrite {args.output}")
     if args.profile_kernel_cycles and args.variant == "native":
         parser.error("profile-kernel-cycles requires a MegaMoe variant")
+    if args.profile_p2p and args.variant == "native":
+        parser.error("profile-p2p requires a MegaMoe variant")
     if os.getenv("HP_MEGA_MOE_KERNEL_CYCLE_PROFILE", "0") == "1":
         parser.error("unset HP_MEGA_MOE_KERNEL_CYCLE_PROFILE for timing; use --profile-kernel-cycles instead")
+    if args.profile_all_ranks and args.profile_output is None:
+        parser.error("profile-all-ranks requires profile-output")
     if args.profile_output is not None:
         if args.profile_output.exists() or args.profile_output.resolve() == args.output.resolve():
             parser.error("profile-output must be a new path distinct from output")
         if args.profile_output.suffix != ".json":
             parser.error("profile-output must have a .json suffix")
+        try:
+            paths = profile_trace_paths(args.profile_output, int(os.getenv("WORLD_SIZE", "8")),
+                                        all_ranks=args.profile_all_ranks)
+        except ValueError as exc:
+            parser.error(str(exc))
+        for path in paths:
+            if path.exists() or path.resolve() == args.output.resolve():
+                parser.error(f"trace destination must be new and distinct from output: {path}")
     return args
 
 
@@ -190,6 +208,9 @@ def _source_identity() -> dict[str, Any]:
         "adapter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "profile_helper_sha256": hashlib.sha256(
             Path(__file__).with_name("mega_moe_layer_profile.py").read_bytes()
+        ).hexdigest(),
+        "p2p_profile_helper_sha256": hashlib.sha256(
+            Path(__file__).with_name("mega_moe_p2p_profile.py").read_bytes()
         ).hexdigest(),
         "python_implementation": _python_source_identity(repo),
         "native_artifacts": artifacts,
@@ -371,11 +392,18 @@ def main() -> None:
             if worker._RANK == 0:
                 results.append(result)
                 print("LAYER_SWEEP_POINT=" + json.dumps(result, sort_keys=True), flush=True)
+        trace_paths = ()
         if args.profile_output is not None:
-            profile_layer_step(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]), args.profile_output)
+            trace_paths = profile_trace_paths(args.profile_output, worker.dist.get_world_size(),
+                                              all_ranks=args.profile_all_ranks)
+            profile_layer_step(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]), args.profile_output,
+                               all_ranks=args.profile_all_ranks)
         kernel_cycles = None
         if args.profile_kernel_cycles:
             kernel_cycles = profile_layer_cycles(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]))
+        p2p_profile = None
+        if args.profile_p2p:
+            p2p_profile = profile_layer_p2p(sweep, worker._make_dirichlet_route(sweep.shape, *points[0]))
         if source != _source_identity():
             raise RuntimeError("source or native artifacts changed during the sweep")
         if worker._RANK == 0:
@@ -383,11 +411,17 @@ def main() -> None:
                        "source": source, "configuration": _configuration(args)}
             if args.profile_output is not None:
                 payload["diagnostic_trace"] = {
-                    "path": str(args.profile_output), "rank": 0, "alpha": points[0][0], "seed": points[0][1],
+                    "path": str(trace_paths[0]), "rank": 0, "alpha": points[0][0], "seed": points[0][1],
                     "timing": "one extra post-update step after all performance and memory measurements",
                 }
+                if args.profile_all_ranks:
+                    payload["diagnostic_trace"]["per_rank"] = [
+                        {"rank": rank, "path": str(path)} for rank, path in enumerate(trace_paths)
+                    ]
             if kernel_cycles is not None:
                 payload["diagnostic_kernel_cycles"] = {"alpha": points[0][0], "seed": points[0][1], **kernel_cycles}
+            if p2p_profile is not None:
+                payload["diagnostic_p2p"] = {"alpha": points[0][0], "seed": points[0][1], **p2p_profile}
             args.output.parent.mkdir(parents=True, exist_ok=True)
             with args.output.open("x", encoding="utf-8") as stream:
                 stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")

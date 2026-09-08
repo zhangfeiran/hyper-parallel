@@ -86,13 +86,34 @@ def _profile_spans(record_function: Any) -> Iterator[None]:
         yield
 
 
-def profile_layer_step(sweep: Any, route: tuple, output: Path) -> None:
+def profile_trace_paths(output: Path, world_size: int, *, all_ranks: bool = False) -> tuple[Path, ...]:
+    """Resolve trace destinations without creating files or importing a profiler.
+
+    Args:
+        output: Base JSON path; retained verbatim for default rank-zero capture.
+        world_size: Number of ranks in the benchmark group.
+        all_ranks: Give every rank a distinct ``.rankN.json`` filename.
+
+    Returns:
+        Paths ordered by rank, or only rank zero's path for default capture.
+    """
+    if world_size <= 0:
+        raise ValueError("trace world size must be positive")
+    if output.suffix != ".json":
+        raise ValueError("trace output must have a .json suffix")
+    if not all_ranks:
+        return (output,)
+    return tuple(output.with_name(f"{output.stem}.rank{rank}.json") for rank in range(world_size))
+
+
+def profile_layer_step(sweep: Any, route: tuple, output: Path, *, all_ranks: bool = False) -> None:
     """Capture one extra AdamW step after all benchmark timing has finished.
 
     Args:
         sweep: Initialized layer benchmark; all EP ranks must call this function.
         route: Already sampled route for the diagnostic step.
-        output: New rank-zero Chrome trace path. Existing files are rejected.
+        output: New Chrome trace path, or filename base for all-rank capture.
+        all_ranks: Capture every rank with distinct files; default records rank zero.
 
     Note:
         CPU annotations are inclusive launch scopes, not device durations. The
@@ -100,9 +121,14 @@ def profile_layer_step(sweep: Any, route: tuple, output: Path) -> None:
         Profiling perturbs execution and is excluded from performance results.
     """
     worker = sweep.worker
-    enabled = worker._RANK == 0  # pylint: disable=protected-access
-    if output.exists():
-        raise FileExistsError(f"refusing to overwrite {output}")
+    enabled = all_ranks or worker._RANK == 0  # pylint: disable=protected-access
+    paths = profile_trace_paths(output, worker.dist.get_world_size() if all_ranks else 1, all_ranks=all_ranks)
+    # All workers share the example's output filesystem. Preflight every rank
+    # before any collective so one existing artifact cannot strand its peers.
+    for path in (output, *paths):
+        if path.exists():
+            raise FileExistsError(f"refusing to overwrite {path}")
+    output = paths[worker._RANK] if all_ranks else paths[0]  # pylint: disable=protected-access
     if enabled:
         output.parent.mkdir(parents=True, exist_ok=True)
     # Return to the selected route and finish a real update before capture;
@@ -114,8 +140,8 @@ def profile_layer_step(sweep: Any, route: tuple, output: Path) -> None:
     record = worker.torch.autograd.profiler.record_function
     capture = nullcontext()
     if enabled:
-        # Only rank zero owns a profiler; raw artifacts stay beside the trace,
-        # rather than being created by inactive profiler destructors in cwd.
+        # Selected ranks own separate profilers and raw-artifact prefixes;
+        # inactive ranks must not create artifacts through profiler destructors.
         profiler = importlib.import_module("torch_npu.profiler")
         capture = profiler.profile(
             activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],

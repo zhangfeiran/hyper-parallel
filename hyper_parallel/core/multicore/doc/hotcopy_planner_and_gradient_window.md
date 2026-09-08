@@ -74,6 +74,12 @@ FP32 梯度直接累加到 home 梯度。BF16/FP16 输入按 home slot 分组，
 BF16/FP16 兼容路径还需一个专家的 FP32 累加存储。
 这项上限不包含 home/replica 梯度本体、optimizer、激活、SHMEM、其他 kernel scratch 或通信库内存。
 
+合入 receive-only 优化后，整个 placement 中只有接收、没有发送的 NPU shared-B rank 会在
+control stream 上分配这一份有界窗口并提前接收。消费端先 join，再累加；control stream 随后
+等待消费端完成累加，才允许下一批覆盖同一窗口。含发送的 rank 保留 native dW producer 依赖。
+这不扩大接收窗口，也不新增常驻 B pool；跨流 allocator reserve 和通信库开销仍需实测。
+下文历史测量及 cost-model 的通信阶段预测没有重新标定这一重叠，不能直接作为合并后的性能结果。
+
 ## 单机 NPU 实测与 EP64 模型
 
 Ascend 910B3 ×8、Torch 2.9.1、CANN 9.0.0 的独立梯度归并测试，固定 H=5120、I=1792、FP32。

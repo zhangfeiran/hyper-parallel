@@ -9,7 +9,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 整理日期 | 2026-09-07 |
+| 整理日期 | 2026-09-08 |
 | 代码分支 | `megamoe-sun`；历史性能数据来自重基前的 `megamoe-perf-sun` |
 | 代码基线 | 重基于 `megamoe-minimal-api@c24cfe7a`；以本文同提交代码为准 |
 | 主功能提交 | `0157ed63`、`eadec971`、`d51ec884`、`43aa7d6c`、`b255b821`、`40b6963b`、`9f75fd20`、`86f4b433`、`364af596`、`50a4e68c`、`5d2a3e38`、`ce089b10` |
@@ -32,6 +32,39 @@ owned-SHMEM 生命周期、`expert_capacity_factor=None` 默认值及按绑定�
 同配置 ABBA 的偏斜 / 平衡 step 差为 +0.068% / +0.173%，偏斜 conservative peak 增加 39.001 MiB。
 Conda 构建探测与 reference 适配随后也已修复，常规完整构建及 12 项 NPU 回归通过。
 详见第 10.2.8--10.2.9 节及 [修复报告](megamoe_sun_fix_report_20260907.md)。
+
+随后完成当前正式产物的 all-rank P2P 归因：两轮偏斜诊断中，16 层累计梯度回传暴露等待
+约 85--192 ms/rank，权重刷新约 34--55 ms/rank。下一项优先研究梯度回传，权重双缓冲仍后置；
+这不是已实现的加速或可直接兑现的等待节省，详见第 10.2.10 节及
+[P2P 归因报告](megamoe_p2p_attribution_20260907.md)。
+
+2026-09-08 随后验证并否决 B1 梯度整专家合包：虽保持 312 个张量逐位一致，偏斜训练 ABBA
+仍回退 1.806%，候选已完整撤回。下一项验证不新增池的梯度通信/收尾重叠，见第 10.2.11 节及
+[梯度 P2P 实验报告](megamoe_gradient_p2p_optimization_20260908.md)。
+
+同日完成独立收尾重叠实验：312/312 张量仍逐位一致，但偏斜 F+B 几乎不变，等待前窗口仅
+0.68--1.33 ms/rank/step，未确认端到端收益，候选亦已撤回。下一项转向高等待 rank 的共同时间线，
+见第 10.2.12 节及 [收尾重叠报告](megamoe_gradient_epilogue_overlap_20260908.md)。
+
+随后两轮八卡共同时间线确认 receive-only rank 5 每层最晚 ready，平均 ready spread 约 5.5 ms；
+rank 4/7 的约 88/82 ms 累计等待窗口与较晚邻居重合。下一候选收敛为仅接收路径的独立接收，
+尚非已兑现收益，见第 10.2.13 节及 [梯度就绪报告](megamoe_gradient_readiness_20260908.md)。
+
+receive-only 解耦随后已完成并保留：排查启动阶段进程竞争后重跑 A/B/B/A，偏斜完整 step
+减少 4.086%、F+B 减少 4.490%，平衡点基本不变。312 个张量逐位一致；只有 rank 5 的峰值
+allocated 增加约 1 MiB、reserved 增加 36 MiB，B pool 不变。详见第 10.2.14 节和
+[独立接收报告](megamoe_receive_only_overlap_20260908.md)。这仍不是整模型 Qwen 训练的性能结论。
+
+完整 Qwen example 已显式接入 shared-B，并修复 RoPE batch 维度、可选依赖导入和冷专家更新探针。
+两层 connected model 的平衡/倾斜/learned TopK 八卡回归全部通过，原精度阈值不变；倾斜组跨层
+仅一份 B pool。这是正确性接入，不是新的加速结论，见第 10.2.15 节及
+[完整模型报告](megamoe_qwen_shared_integration_20260908.md)。
+
+随后已消除基准的双模型/optimizer 常驻，原始宽度八层完成 fresh-process ABBA、每步 AdamW
+及首次全量精度比较。MegaMoe 的 peak allocated + SHMEM 最高约 42.059 GiB；每 rank 只驻留
+一套约 36.608 GiB 的训练状态。计时记录中存在其他设备进程，且多步 loss 自重复仍有分歧，
+因此先补数值重复性与计时窗口归因，再继续细粒度调度优化，见第 10.2.16 节及
+[单后端驻留报告](megamoe_qwen_isolated_benchmark_20260908.md)。
 
 ### 1.1 结论摘要
 
@@ -1156,6 +1189,149 @@ adapters 恢复相对 RUNPATH，不再使用诊断构建的绝对路径和额外
 这不代表整网长期收敛、所有 shape、其他平台或完整 wheel 分发已验证。复现命令及证据见
 [修复报告](megamoe_sun_fix_report_20260907.md)。
 
+#### 10.2.10 完成 P2P payload / wait 归因
+
+example 新增默认关闭的 `--profile-p2p`，在所有性能/HBM 测量结束后采一轮额外的已更新权重
+F+B。八卡分别记录真实 transfer bytes、CPU builder/launch/wait 和三个 caller-stream 时间戳，
+逐 phase-call、peer、shape、dtype 验证发送/接收匹配；不改原通信，不在 F+B 内加全设备同步。
+observer 不保留 tensor，异常时恢复原函数，默认路径不创建 observer/events 或额外持久池。
+
+当前正式 native payload 上的两轮 Qwen-shape 16 层 B1、每步 AdamW 偏斜诊断一致确认：31 次
+weight refresh 总发送 `11392.5 MiB`，16 次 FP32 gradient return 总发送 `11760 MiB`。
+前者累计暴露等待 `33.947--54.704 ms/rank`，后者 `85.038--191.673 ms/rank`；梯度累计 pre-wait
+只有 `0.003--0.005 ms/rank`，与立即 wait 结构一致。平衡 home-only 路由八卡均为零 batch/payload。
+
+新采 rank-zero trace 通过 host/device flow 唯一归因 47/47 个 AICPU batch；`SDMA_SQE` 区间并集
+为 `169.333 ms`，但无有效 connection ID 可逐条归入 phase。事件包含 enqueue/诊断空隙，pre-wait
+不是有效计算重叠；局部等待或 SDMA 并集均不是可预测的 step 收益。本轮只落地诊断和优先级依据，
+没有推广新的 runtime 调度。详细 per-rank 结果、计时/HBM 隔离验收、复现命令和局限见
+[P2P 归因报告](megamoe_p2p_attribution_20260907.md)。
+
+#### 10.2.11 否决 B1 梯度整专家合包
+
+在 `5a2ae4b0` 上尝试将 gate/up + down 的两个 FP32 梯度存成一块 flat pool 的不重叠 view，
+B1 每个 expert 以一个 105 MiB payload 发回 owner。真实 NPU 确认发送 view 零拷贝；owner 仍先
+wait 再按原次序 FP32 聚合。207 项 CPU、五项 NPU launcher、八卡 B1/B2 生命周期及跨版本
+312/312 张量逐位对照通过，未放宽精度。
+
+隔离 16-batch 传输的 ABBA 降低 3.663%，但同配置完整 16 层 Qwen-shape 训练的偏斜 full step
+均值 `1365.100 → 1389.760 ms`，回退 **1.806%**；平衡 `804.293 → 803.246 ms`，基本不变。
+梯度字节数相同、描述符减半，但 rank 4/5/7 的暴露等待反而增大。池的逻辑字节不变，实际偏斜
+allocated 增加约 1 MiB，后续平衡 reserved 增加 240 MiB，不能用逻辑池账本代替完整 HBM 验收。
+
+候选生产代码及测试改动已撤回，仅保留实验补丁与反证。下一轮先验证独立 backward 收尾与梯度
+通信的重叠；若窗口不足，再补高等待 rank 的共同时间线，不继续盲目放大消息或重排 peer。
+完整方法、补丁及原始 hashes 见 [实验报告](megamoe_gradient_p2p_optimization_20260908.md)。
+
+#### 10.2.12 独立 backward 收尾重叠未带来可确认收益
+
+在 `59d4736f` 上保持两段 FP32 梯度协议，将 dX owned clone / route 收尾调度在 P2P launch 与
+wait 之间。callback 异常也先等待通信，再释放 shared-B/workspace；owner FP32 聚合顺序未改。
+207 项 CPU / 171 subtests、五项 NPU launcher、八卡 B1/B2 各 21 组及跨版本 312/312 张量逐位
+对照通过，未降低精度或删掉 dX ownership 修复。
+
+完整训练 ABBA：偏斜 F+B `1230.282 → 1230.270 ms`，full step `1361.513 → 1361.009 ms`
+（−0.037%，未确认收益）；平衡 full step `800.617 → 805.759 ms`（+0.642%）。各 rank 等待前
+窗口从约 0.003--0.005 ms 增至 0.68--1.33 ms/step，但没有普遍改善 owner/fan-in 等待；这段
+事件时间也不能全部等同于有效 wire overlap。偏斜 peak allocated 增加约 1 MiB，两点 peak
+reserved 增加 6 MiB，虽然 shared pool/SHMEM 的逻辑字节不变。
+
+候选 runtime/test 改动已完整撤回并通过恢复回归，只保留实验补丁与反证。下一优先项是
+rank 4/5/7 与 peer 的共同时间线，而非继续扩大消息、叠加 callback 或增加双 buffer。
+详细数值和证据见 [收尾重叠报告](megamoe_gradient_epilogue_overlap_20260908.md)。
+
+#### 10.2.13 全 rank 时间线收敛到 receive-only 依赖
+
+新增默认关闭的 `--profile-all-ranks` 和固定 16 层 EP8 的精确 flow 分析器。两轮各导出八份 trace，
+分别有 406692/407843 个 events，128/128 个梯度调用均能关联 native、input-ready、caller wait
+和 owner kernel。使用 CANN 标定恢复同机 monotonic 坐标，不把 AICPU control 的提前启动当作
+payload 就绪；无有效 peer/size 的 SDMA 明细不作逐链路因果解释。
+
+两轮全部 32 次逐层比较中，只接收梯度的 rank 5 始终最晚 ready；ready spread 均值为
+5.541/5.522 ms。rank 4/7 的暴露等待分别约 190--193/184--187 ms，其中晚邻居窗口约 88/82 ms。
+rank 5 的 native backward 累计约 417 ms，rank 4/7 约 332/334 ms；其 receive-only 批次仍依赖
+本地 caller-ready。下一项优先验证独立接收、计算流消费前等待和跨流 storage 保护。
+
+生产代码及 HBM 账本未改变，本轮没有新的加速结论。S1 启动与 UT 收尾有短暂重合，S2 已在设备
+无进程后重采并复现同一模式。剩余就绪后等待仍明显，不能将重合窗口或各 rank 累计值当作可
+节省的 step。详细方法、验收和复现见 [梯度就绪报告](megamoe_gradient_readiness_20260908.md)。
+
+#### 10.2.14 receive-only 梯度接收与本地 backward 重叠
+
+只对 NPU shared-B 且本 rank 无发送的梯度 batch，复用已有 control stream 分配 receive buffer、
+launch/wait，再由 native caller stream join 后进行原 FP32 owner 聚合。发送路径、CPU、legacy、
+kernel、planner、通信 payload 和 dX owned-storage clone 均不改变。跨流 buffer 使用
+`record_stream(consumer)`，异常使 pool 失效，防止后续 lease 继续复用。
+
+最终 fresh-process A/B/B/A 的每轮中位数均值：
+
+| 场景 | 旧 F+B → 新 F+B | 旧 full step → 新 full step | full step 变化 |
+| --- | ---: | ---: | ---: |
+| 偏斜 `0.1:42` | 1234.996 → 1179.547 ms | 1366.232 → 1310.406 ms | -4.086% |
+| 平衡 `10000:42` | 673.108 → 672.506 ms | 804.569 → 803.669 ms | -0.112% |
+
+首轮 B1 启动遇到额外 `akg_benchmark`，其数据保留但不作最终验收；表格来自随后重跑，四轮
+census 均只有各自八个 worker。配置、参数初始化、route、helper、17 个正式 native artifacts、
+P2P 描述符、optimizer 和 shared pool 一致。离散 census 不是排除所有瞬时竞争的独占保证。
+
+rank 5 的 trace caller wait 从前一轮 S2 的累计 105.269 ms 降到 39.812 ms；独立 control-stream
+wait 为 650.287 ms，二者不能混用。分析器已支持显式 caller join，原 S2 的全部已有字段重解析
+不变。312 个张量与旧代码逐位一致，5 项 ST、实际 EP8 B1/B2 各 21 组通过，最终 CPU
+217 passed / 196 subtests。
+
+偏斜 peak allocated/conservative peak 增加 1048064 bytes（约 1 MiB），平衡 allocated 不变；
+rank 5 reserved 增加 37748736 bytes（36 MiB），其他 rank 不变，final allocated 和 B pool 不变。
+先偏斜后平衡导致后者保留 reserve，不外推为纯平衡路径的固定成本。详细证据及后续优先级见
+[独立接收报告](megamoe_receive_only_overlap_20260908.md)。
+
+#### 10.2.15 完整 Qwen shared-B 接入与 optimizer 验收
+
+为真实 `examples/torch/multicore/mega_moe/qwen_moe_model.py` 增加显式 shared-B 配置和小形状
+CLI，保留原默认形状；各 decoder 共享资源而不共享 home 参数。修复现有 RoPE `[sequence]`
+输入缺少 batch 维度、Qwen 导入被 DeepSeek-only custom ops 阻断，以及倾斜时只采样第一个冷
+专家导致的 optimizer-update 假失败。更新探针要求 active owner 更新、全局至少一次更新，
+完整梯度和更新后参数比较不变，不放宽 `rtol=0.02 / atol=0.002`。
+
+EP8、两层 H1024/I256/T1024/V2048、B1、capacity=1.5，平衡/Dirichlet 0.1:42/learned TopK 三组
+完整模型各执行每步 FP32-master AdamW。三组 ST 通过；最终 CPU 259 passed / 242 subtests。
+初始参数逐位一致；最大梯度绝对误差 1.5259e-5，更新后最大归一化误差均小于 1。倾斜组每 rank
+只持有一份 1572864-byte BF16 B weight 和 3145728-byte FP32 B gradient，其他两组未激活 replica。
+pool bytes 不是 allocator peak，短测 A/B 不是整模型优化 ABBA。下一项先扩展原宽度正确性再
+建立完整模型性能/HBM 基准，详见 [完整模型报告](megamoe_qwen_shared_integration_20260908.md)。
+
+随后在 `51d87203` 上补齐原 H5120/I1792/T4096/V32000 的两层、四层倾斜训练复验，均通过；
+每 rank 的 B weight/gradient 仍只有 52.5/105 MiB。发现现有 benchmark 同时常驻两个 backend
+及其 FP32 AdamW；按参数/dtype 下界，八层仅两套参数、master、moments 和 main grad 即需
+73.216 GiB，不含激活和 workspace，不能在 64 GiB 卡上当作单模型基准。下一项优先拆分两侧
+fresh process，再补默认八层 matched ABBA，详见完整模型报告第 5 节；尚无整模型优化收益结论。
+
+#### 10.2.16 单后端驻留与原始八层基准
+
+默认 shell 改为无框架 parent，顺序启动 common A1、MegaMoe B1/B2、common A2；每组只持有
+一个模型与一套 FP32-master AdamW。A1 导出 rank-local CPU reference，后三组逐阶段全量
+比较输入、初始参数、loss/logits、梯度和更新后参数；原 `rtol=0.02 / atol=0.002` 不变。
+快照与 source/native fingerprint 均在稳态计时外，保留 `BENCHMARK_MODE=paired` 回归路径。
+
+EP8、原始八层 H5120/I1792/T4096/V32000、E48/K8、shared-B1、capacity=1.5、Dirichlet 0.1:42，
+四组各执行 3 warmup + 7 measured AdamW steps，均正常退出。83 个参数/梯度张量通过首次
+全量比较；最大梯度绝对误差 3.8147e-6，更新后最大归一化误差 0.982151。CPU 281 passed /
+259 subtests；新隔离模式和旧 paired 模式各三种路由八卡回归通过。
+
+每 rank 的单 backend 训练状态实测为 36.608 GiB。MegaMoe 八层共用的 B weight/gradient
+仍为 52.5/105 MiB，SHMEM heap 为 832 MiB；稳态 peak allocated + heap 最高 42.059 GiB，
+common 为 43.926 GiB。全组最大值降低约 1.867 GiB，但 rank 2/4/5 分别增加约
+0.936/0.486/0.479 GiB，不能说所有 rank 的 HBM 代价都消失。CPU references 占 99.575 GiB。
+
+进程 median 均值为 common 1207.770 ms、MegaMoe 713.717 ms，观测耗时差 40.906%。这不是
+本轮内核加速，也不与独立层 receive-only 收益叠加。完整采样发现 B1/A2 生存期内有额外设备
+PID；没有逐步绝对窗口标记，不能将本组称为严格独占 ABBA 或用于确认细小增量。后续 loss
+在 common/common、MegaMoe/MegaMoe 自重复中均有分歧，首次精度通过不等于多步/收敛验收。
+后续优先级据此调整，原始数据及限制见 [单后端驻留报告](megamoe_qwen_isolated_benchmark_20260908.md)。
+
+随后将 `NativeMoeExperts`、两 backend 构造和 canonical 权重布局统一移入 Qwen model，
+benchmark 仅负责训练/比较/测量。CPU 287 passed / 307 subtests、两模式各三路由 EP8 回归及
+重构前后的 common references 对比通过；这是职责重构，没有新增性能结论，详见该报告第 7 节。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1285,9 +1461,9 @@ optimizer step，代表相同权重版本、pool 可直接命中的 micro-batch/
 
 ### 11.1 分阶段验证记录
 
-2026-09-07 重基复核与修复后的新证据分别见第 10.2.7--10.2.9 节及
-[修复报告](megamoe_sun_fix_report_20260907.md)。下列“本轮 / 本阶段”数字保留重基前各优化周期
-的历史记录，不替代当前分支的验收结果。
+2026-09-07 重基复核、修复和新诊断证据分别见第 10.2.7--10.2.10 节、
+[修复报告](megamoe_sun_fix_report_20260907.md)及 [P2P 归因报告](megamoe_p2p_attribution_20260907.md)。
+下列“本轮 / 本阶段”数字保留重基前各优化周期的历史记录，不替代当前分支的验收结果。
 
 执行：
 
@@ -1455,17 +1631,29 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 
 **重基复核后的前置项：** 串联 dX / shared-workspace alias 已修复并完成 ABBA，见第 10.2.8 节。
 Conda include 探测及新 reference 测试适配随后也已完成，常规完整构建和 12 项 NPU 回归通过，
-见第 10.2.9 节。复审后恢复下面的性能优化顺序；dX 小幅复制暂不优先于 P2P 传输 / 等待归因，
-不能为省去该复制重新暴露已修复的 alias。
+见第 10.2.9 节。随后完成第 10.2.10 节的 all-rank P2P payload / wait 归因，梯度回传累计暴露等待
+明显大于权重刷新，故下一项优先收敛 gradient return。dX 小幅复制暂不优先于它，也不能为省去
+该复制重新暴露已修复的 alias。
 
 本轮按“扫测 → backward 诊断 → sizing 小改动 → A/B/B/A → forward 诊断 → 否决两种 peer 轮转”
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **把 P2P 数据面归因提升到第一位。** rank-zero 的 SDMA 区间并集约 `169 ms`，CPU launch scope 和
-   profiler 的 `Communication` 汇总都不足以代表 payload。先区分 31 次 weight refresh 与 16 次 gradient
-   return 的传输、等待和 overlap，再选择 peer 合批或调度改动。owner receive contribution 必须完成
-   FP32 聚合后才能 cast；不能直接把区间并集当成预计可节省的 wall time。
+1. **先补整模型多步数值重复性和可审计计时窗口，再按 profile 选优化。**
+   receive-only 解耦已经保留，独立 16 层 MoE 的偏斜 step 减少 4.086%，只增加约 1 MiB allocated
+   和 36 MiB reserved（第 10.2.14 节）。整模型 shared-B 接入及三种路由的小形状训练验收已完成
+   （第 10.2.15 节），单后端驻留及原始八层 ABBA/首次精度也已完成（第 10.2.16 节），不再受
+   双套训练状态 73.216 GiB 下界阻断。但后续 loss 在同 backend 自重复中已有分歧，先做
+   common/common、MegaMoe/MegaMoe 与交叉 backend 的逐步梯度/更新后参数对照，区分非确定性、
+   学习率敏感性及 backend 特有误差，不放宽精度门槛。计时补绝对窗口标记并与所有设备 PID
+   对齐，在稳定八卡窗口复测后采完整模型 HBM/profile，不把独立层收益外推整网。
+   rank 1 的约 57.6 ms 晚邻居窗口及 rank 3 native 计算仍需归因。
+   整专家合包已回退 1.806%，独立收尾也无确认收益（第 10.2.11--10.2.12 节），不再盲目叠加；
+   含发送 batch 必须保留 native dW 的真实就绪依赖，不能泛化删除 caller wait。
+   owner receive contribution 必须全部完成 FP32
+   聚合后才能 cast；shared-B dW 发送完成前不能复用 storage，不能只移走 wait 破坏消费/复用依赖。
+   默认 HBM 不增加优先；若合批需要额外复制或池，必须单独核算并经匹配 ABBA 才保留。局部事件
+   和 rank-zero 约 `169 ms` 的 SDMA 并集均不是预计可节省的 wall time。
 2. **前向调度先补 expert 就绪证据，不继续盲目轮转。** 两种 peer 重排虽保持通信字节数与 HBM，
    偏斜 full step 分别回退 `2.609%` / `3.746%`，均已撤回。接收 rank 或 worker 的 payload 均衡不能
    替代 GMM readiness 和跨 rank 进度；下一步关联具体 expert 的 dependency/event、非空 transfer 完成
@@ -1486,9 +1674,9 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
    后续补 native/B0/B1 全曲线配对、逐 step 动态 skew、`B=0/1/2/4/6`、capacity、active expert、更新频率、
    频繁换绑和连续 generation。重点验证 B1 residual 3+ waves 及 connected model；不得用当前扫测作为
    取消 multi-wave 的依据。
-6. **最后评估双 buffer 与预测 prefetch。** 若分段 profile 证明 31 次 weight refresh 的未重叠部分显著，
-   且更低内存代价的调度仍不足，再做
-   shared-B ping-pong pool和跨层 backward prefetch；上一 histogram 预测必须带 generation 校验，不能静默
+6. **最后评估双 buffer 与预测 prefetch。** 新诊断已显示 31 次 weight refresh 的暴露等待小于梯度回传，
+   暂不增加权重双缓冲。只有其剩余等待在后续成为主要限制，且更低内存代价的调度仍不足，再做
+   shared-B ping-pong pool 和跨层 backward prefetch；上一 histogram 预测必须带 generation 校验，不能静默
    使用错误 plan。保持“性能收益足以覆盖新增 HBM 与生命周期复杂度”的进入条件。
 
 ## 16. 代码与测试索引
@@ -1506,7 +1694,9 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 | multi-wave backward DAG | `hyper_parallel/core/multicore/modules/mega_moe/backward/graph.py` |
 | shared device worker | `hyper_parallel/core/multicore/ops/runtime/worker_kernel.h` |
 | Qwen model/optimizer benchmark | `examples/torch/multicore/mega_moe/qwen_moe_model.py`、`qwen_moe_benchmark.py` |
+| Qwen 单后端驻留 / CPU reference | `examples/torch/multicore/mega_moe/qwen_moe_isolated.py`、`qwen_moe_snapshots.py` |
 | checkpointed multi-layer benchmark | `examples/torch/multicore/benchmark_mega_moe_layers.py` |
 | opt-in rank-zero trace / all-rank forward/backward cycles | `examples/torch/multicore/mega_moe_layer_profile.py` |
+| opt-in all-rank P2P payload / readiness | `examples/torch/multicore/mega_moe_p2p_profile.py` |
 | planner/route/pool UT | `tests/ut/core/multicore/mega_moe/` |
 | real fused-kernel ST | `tests/torch/expert_parallel/test_mega_moe.py`、`_test_mega_moe_shared_weights.py` |
