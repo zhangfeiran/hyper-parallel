@@ -313,6 +313,12 @@ snapshot step；`loss_only_no_tensor_references` 仅满足临时 worker 复用�
 
 ## 6. 本轮后的优先级
 
+后续已完成实际第 8 层的固定输入 / dY 复放，见
+[expert dW 切分与舍入诊断](megamoe_qwen_expert_dw_diagnosis_20260908.md)：B0 单波与 native
+逐位一致，B1 residual 只在复制过的 expert；实际 owner FP32 聚合和最终 cast 与 CPU 重算
+一致。该后续报告已将下一优先级调整为 AdamW FP32 更新与 BF16 参数写回的放大定位。
+以下保留本轮结束时的原始优先级，不能将完成的单层定位外推为完整模型多步精度已通过。
+
 1. **先拆 expert dW 的可重复残差。** 固定相同权重、路由和实际层输入/输出梯度，逐段比较
    原生 grouped dW、自定义 dW、physical copy 部分和 owner 聚合结果；用 B0/B1 对照区分
    kernel 累加顺序与 replica 切分/最终 cast。必要时用受控的小块高精度计算判定舍入误差，

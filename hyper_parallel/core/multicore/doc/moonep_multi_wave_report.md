@@ -1356,6 +1356,93 @@ B2/A2 未采到；不能将四组当作共同干净的 ABBA。单列确定性组
 完整证据、补充控制及下一步边界见
 [多步数值与计时诊断](megamoe_qwen_multistep_diagnosis_20260908.md)。
 
+#### 10.2.18 实际 Qwen 层的 expert dW 切分定位
+
+捕获原八层确定性首步的第 8 层真实 hidden / route / dY / weights，随后分别做 native、B0
+单波、B0 多波和 shared-B1 的独立层 EP8 复放。原输出及 routed-only dX 全量逐位一致；
+B0 单波的 dW 也与 native 逐位一致。B0 两波只有被 wave 边界切开的 expert 35 / 39 有差异；
+B1 降为一波，差异只在复制的 expert 10 / 29 / 32 / 36，两者最大 dW 差均为 4.7684e-7，
+远低于原梯度阈值，但不能据此宣称多步精度通过。
+
+B1 的全部 home / replica FP32 partial 按真实通信贡献顺序在 CPU 重算，与设备 owner
+聚合和最终 BF16 leaf gradient 全量逐位一致。1917 个 FP64 点积诊断位置中，B1 与 native
+不同的 256 个位置分别有 134 / 122 个更接近 FP64，支持切分累加的不同舍入结果，而不是
+本次 owner 聚合错误。保留已有 FP32 contribution 合同，下一项拆 AdamW FP32 更新与 BF16
+模型参数写回；本次不改 runtime、不测性能。完整边界见
+[expert dW 诊断](megamoe_qwen_expert_dw_diagnosis_20260908.md)，原始张量/JSON 只保留本地。
+
+#### 10.2.19 AdamW 更新与 BF16 参数写回的放大
+
+保留原 dW 路径，对捕获的真实第 8 层权重/梯度运行原 fused AdamW。native layout + native
+梯度、MegaMoe layout + 同一 native 梯度、MegaMoe layout + B1 梯度三组，各在 EP8 上做
+三次固定梯度更新，不运行新的 F+B。等梯度的两种布局在三步的 main、两个 moments、BF16
+model 全部逐位一致；梯度转换、group step、main 跨步延续和最终 cast 均符合原合同。
+
+B1 首步 main 最大差为 6.4932e-6，BF16 model 有 738 个不同元素，最大差 1.2207e-4。
+小梯度区域的 AdamW 更新敏感度和 BF16 舍入边界共同解释本次参数差异；首步两侧写回都与
+之前完整模型的第 8 层参数逐位一致，没有发现本次 optimizer 实现错误。FP64 理想公式复核
+的首步 main 最大差仅约 2.291e-9。main 没有被 BF16 写回覆盖；三次固定梯度更新不等于
+完整模型三步训练，下一项用参数干预验证其对下一次 logits/loss 的因果贡献。
+详见 [AdamW 诊断](megamoe_qwen_adamw_diagnosis_20260908.md)；原始 JSON/张量只留本地。
+
+#### 10.2.20 首步 expert 参数到第二次 forward 的因果干预
+
+在原八层配置下重放真实首步 AdamW，全部参数复现历史记录。八层 routed expert 合计
+11227 个 BF16 参数不同，dense 完全相同。固定首步状态，仅恢复这些 expert 参数后，
+MegaMoe 第二次 logits/loss 与历史 native 逐位一致；重新注入则复现原分歧。反向在实际
+native 注入相同参数差异，reference、仅末层、全层三个同权重状态的八层输出、norm、
+logits/loss 均与 MegaMoe 逐位一致，没有发现本组同权重的额外 forward backend 差异。
+
+末层 738 个差异参数单独注入，前七层输出仍相同，最终 logits 有 32 个元素超原阈值，
+最大归一化误差 1.544；全层注入则有 111605047 个 logits 超限，最大归一化误差 10.2398。
+两者 logits 最大绝对差均为 0.0625，不能只看最大值衡量贡献；本次 loss 差仍通过原阈值。
+逐层单独干预均恰好从被注入层出现输出差异，各层影响不能线性相加。
+
+干预仅修改 BF16 model；不再执行 optimizer 更新，FP32 main/moments 保持首步状态。
+这完成首步参数到第二次 forward 的因果验证，不是整网多步精度修复，也不是性能测量。
+下一优先级调整为显式 eps 稳定性控制，保留原 baseline，不重写未发现错误的 AdamW。
+详见 [参数干预报告](megamoe_qwen_parameter_intervention_20260908.md)；原始 JSON/张量不入 git。
+
+#### 10.2.21 eps 稳定性控制与 trainer AdamW 用法对照
+
+对真实第八层梯度做四档 eps 的原 fused AdamW 首步复放。等梯度的 native/MegaMoe 布局在
+main/moments/model 上仍全部逐位一致；增大 eps 降低 main 最大差，但 BF16 的最大差、
+不同元素数和 RMSE 没有同时改善。eps=1e-7 的末层 main 最大差从 6.4932e-6 降到 1.9316e-6，
+BF16 不同元素反而从 738 增到 826；同时它也改变了大量正常更新，不能称为无代价精度修复。
+
+显式 eps=1e-7 的完整八层十步对照仍在第二步 logits、第六步 loss 超原阈值，两侧 loss
+回升也未消除。原 eps、LR、容差及 runtime 均未修改，本轮不发布性能/HBM 数字。
+
+其他 trainer 与 benchmark 共享同一 core fused AdamW 和可选 FP32-main wrapper，但
+Qwen3 recipe 为 Muon/fallback AdamW、较低 LR、warmup/裁剪/no-decay 分组；纯 AdamW
+FSDP 精度用例则为 LR=1e-4、WD=0、FP32 reduce/main_grad。benchmark 的 BF16 dense
+归约后再转 FP32，与该 trainer 梯度路径不同。裁剪也不能直接照搬：MegaMoe 本地 packed
+expert 缺少 helper 用于跨 rank norm 归约的 DTensor placements。
+
+下一项优先单变量 LR=1e-4 的两个 backend 多步控制；梯度归一化/norm、FP32 dense 归约、
+裁剪与调度分别验证，不一次搬入整套 recipe。详见
+[eps 与 trainer 对照报告](megamoe_qwen_eps_stability_20260908.md)；JSON/张量仍只保留本地。
+
+#### 10.2.22 单变量 LR=1e-4 多步训练控制
+
+保持 eps=1e-8、WD=0.01、原 BF16 dense 归约及 FP32-main AdamW 不变，只通过已有
+benchmark 参数将 LR 显式设为 1e-4。八层原宽度模型的确定性控制中，两个 backend
+每 rank 的十步 loss 均持续下降，十步跨 backend loss 全部通过原阈值；末步平均 loss
+为 0.683569 / 0.683580，整个轨迹的最大 loss 归一化误差为 0.0127054。首步 forward
+及各自梯度复现历史指纹，比较对象为同模式 LR=1e-3，而非此前非确定性 native-only 低 LR。
+
+第 1、2、10 步全部 83 个 canonical 梯度/参数也通过原 tensor 阈值。但第 2--10 步
+logits 仍失败，首步 BF16 参数最大差仍为 1.220703e-4；这不是 expert 舍入或原 LR 合同
+的精度修复。未改默认 LR、eps、容差或生产代码，不发布本轮性能/HBM 数字。
+
+四组 A/B/B/A 正常完成 320 次 rank-local 更新；两 backend 各自的十步 forward、采集步
+梯度/参数和末步完整 model/main/moments 指纹均逐位自重复。末步 FP32 状态全量有限，
+208 份快照的 4304 个张量另经独立字节审计；末步 main/moments 未做跨 backend 数值 oracle。
+
+下一项转向全局目标下的梯度归一化和 norm 独立参考，先验证 dense 副本/home expert
+分片的统计域，再尝试裁剪；FP32 dense 归约及成本另做单变量控制，不继续盲目扫描 LR/eps。
+详见 [低 LR 多步对照](megamoe_qwen_lr_stability_20260908.md)，原始 JSON/张量只保留本地。
+
 ### 10.3 Legacy per-layer compact 测量口径
 
 以下历史对照使用固定 workload：
@@ -1663,16 +1750,29 @@ Conda include 探测及新 reference 测试适配随后也已完成，常规完�
 逐步复审，结果见第 10.2.2--10.2.6 节。当前顺序如下；每项落地后先验证正确性、wall time 和 HBM，
 直接本地 commit，再决定下一项。
 
-1. **先定位可重复的跨 backend 反向差异，再按 profile 选优化。**
+1. **先核验全局梯度归一化/norm 与 trainer 合同，性能优化独立验收。**
    receive-only 解耦已经保留，独立 16 层 MoE 的偏斜 step 减少 4.086%，只增加约 1 MiB allocated
    和 36 MiB reserved（第 10.2.14 节）。整模型 shared-B 接入及三种路由的小形状训练验收已完成
    （第 10.2.15 节），单后端驻留及原始八层 ABBA/首次精度也已完成（第 10.2.16 节），不再受
    双套训练状态 73.216 GiB 下界阻断。第 10.2.17 节已定位 attention backward / BF16 dense
    collective 非确定性及 AdamW 放大，补齐默认/确定性自重复、跨 backend 第 2 步全量对照和
-   绝对计时窗口。确定性模式恢复自重复，却不能使跨 backend 多步精度通过；下一项固定相同
-   权重/输入，定位反向残差的首个来源，不能用低 LR 或放宽阈值替代原配置验收。
-   首步定位已将保存的差异收敛到 expert dW，先拆分原生 grouped dW、自定义 dW 和 B0/B1
-   copy 聚合/最终 cast，保持 FP32 replica 累加合同；不无依据重写已逐位一致的 dense 路径。
+   绝对计时窗口。确定性模式恢复自重复，却不能使跨 backend 多步精度通过。第 10.2.18 节
+   已完成真实第 8 层固定权重/输入/dY 的 dW 拆分：B0 单波与 native 逐位一致，B1 residual
+   仅在复制的 expert，owner FP32 聚合及最终 cast 与 CPU 重算一致。第 10.2.19 节进一步
+   完成原 fused AdamW 的固定梯度复放，等梯度的两种布局完全一致，定位小梯度更新敏感度与
+   BF16 写回边界；首步两侧参数都复现原完整模型该层结果。第 10.2.20 节已完成八层 BF16
+   参数干预：全量恢复消除第二步 logits/loss 分歧，native 反向注入同一差异也复现 MegaMoe
+   的全部层输出。第 10.2.21 节进一步完成 eps 扫描和显式 1e-7 十步控制：较小的 main
+   最大差未换来 BF16/完整训练 gate 通过，故不提高默认 eps。其他 trainer 使用同一 fused
+   AdamW，但 LR、分组、调度、裁剪及 FP32 reduce/main_grad 合同不同。第 10.2.22 节的
+   单变量 LR=1e-4 控制已使两侧十步 loss 持续下降且跨 backend loss 全部通过，第 1、2、10
+   步全量梯度/参数也通过，但 logits 仍从第二步失败，不改变默认 LR 或原合同结论。
+   下一项先以全局参考核验梯度归一化及 norm，区分 dense 副本和 home expert 分片；尚无
+   此参考结果，不提前断言缩放 bug。先验证 norm，再考虑实际裁剪，不直接给 packed
+   expert 套用 DTensor 裁剪。FP32 dense 归约及其精度、通信/HBM 成本独立控制。
+   不继续无依据重写 AdamW。同权重的 forward 一致不等于原配置的跨 backend 多步精度已通过。
+   保持当前 FP32 replica/AdamW 合同，不实施高代价逐位 dW 对齐，不用低 LR 或放宽阈值替代原配置验收，
+   也不无依据重写已逐位一致的 dense 路径。
    精度 gate 与性能 gate 应分开；任何 FP32 dense 归约候选要显式验证数值合同、HBM 和通信成本，
    不能悄悄替换 baseline。默认组竞争记录仍不对称，需稳定八卡窗口复测后采完整模型 HBM/profile，
    不把独立层收益或单列确定性模式的计时外推成默认整网增量。
