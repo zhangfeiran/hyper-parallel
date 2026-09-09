@@ -603,7 +603,7 @@ bash examples/torch/multicore/benchmark_qwen_moe_mega_moe.sh \
 | 重基和 dX ownership 修复是否退化 | [运行时验证](history/runtime_validation.md) | 同权重独立层 ABBA；诊断构建与正式构建分开 |
 | P2P 字节、等待、rank readiness 与 receive-only 收益 | [通信实验](history/communication_experiments.md) | 历史单机 EP8；局部等待不相加，合并后的有界窗口尚未重测 ABBA |
 | 合包、收尾和前向 peer 轮转是否保留 | [实验取舍](history/communication_experiments.md#早期-shared-b-与前向调度记录) | 否决结论和补丁恢复入口保留 |
-| connected Qwen 的精度、计时与 HBM | [Qwen 验证](history/qwen_validation.md) | 首次精度通过；原宽度多步重复性与竞争窗口未完成验收 |
+| connected Qwen 的精度、计时与 HBM | [Qwen 数值诊断](history/qwen_validation.md#数值诊断汇总) | 舍入/AdamW/层间放大已定位；全局训练契约、跨 backend 多步 logits 和干净计时窗口仍分项验收 |
 | EP64/E384 如何选择 B 与接收窗口 | [planner 与梯度窗口](hotcopy_planner_and_gradient_window.md) | 区分单机归并微测量、CPU 模拟和实际多机 |
 | 不实际运行如何估算时间和 HBM | [理论成本模型](theoretical_cost_model.md) | 公式/校准预测，当前不是 tile FIFO 关键路径或物理显存上界 |
 
@@ -682,8 +682,9 @@ MoonEP 的 symmetric VMM、fused zero-copy dispatch/combine 及 rank-level dedup
 6. shared workspace/shared-B pool 只支持串行 layer/call；真正并发的 MoE 调用必须使用独立 resource
    group，当前没有双 buffer 跨层预取。
 7. 当前 Torch backend 要求 NPU BF16、固定 token shape、`E % R == 0`，route-fused `top_k <= 16`。
-8. 独立层与 connected Qwen 已有不同范围的历史测量，但原宽度 Qwen 多步数值重复性和干净计时窗口
-   仍待验收。B1 的历史 55-route sweep 不替代 native/B0/B1 全曲线、逐 step 动态 skew、
+8. 原宽度 Qwen 已定位 expert 舍入、AdamW/BF16 写回及层间传播；确定性模式恢复同 backend 自重复。
+   低 LR 十步 loss 通过仍不代表多步 logits、全局训练契约或长期收敛通过，干净计时窗口也未关闭。
+   B1 的历史 55-route sweep 不替代 native/B0/B1 全曲线、逐 step 动态 skew、
    residual waves 性能或长时收敛；具体缺口见当前待办。
 
 ## 15. 下一步优先级
