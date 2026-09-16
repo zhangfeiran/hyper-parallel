@@ -27,7 +27,6 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.multicore import shmem
-from hyper_parallel.core.multicore.scheduler.config import MAX_EXPERT_NUM_PER_RANK
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
@@ -286,11 +285,6 @@ class MegaMoeExperts(MulticoreModule):
         if num_experts % ep_size:
             raise ValueError(
                 f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})."
-            )
-        if num_experts // ep_size > MAX_EXPERT_NUM_PER_RANK:
-            raise ValueError(
-                "local expert count cannot exceed the device scratch capacity "
-                f"({MAX_EXPERT_NUM_PER_RANK}), got {num_experts // ep_size}."
             )
         if local_num_tokens % _COMMUNICATION_SPLIT:
             raise ValueError(
