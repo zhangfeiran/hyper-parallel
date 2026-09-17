@@ -311,8 +311,8 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         self.assertEqual(layout.buffer_size, 53760)
         self.assertLess(layout.buffer_size, MAX_PROFILE_BUFFER_BYTES)
 
-    def test_layout_caps_each_worker_at_256_records(self):
-        """Bound Device memory when a long schedule needs more records."""
+    def test_layout_preserves_more_than_256_records(self):
+        """Retain a complete worker trace when the schedule exceeds 256 records."""
         runtime_config = _runtime_config(2048)
         runtime_config.num_workers = 48
         runtime_config.all_tasks[0] = _three_record_task()
@@ -321,7 +321,7 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         layout = _calculate_profile_layout(runtime_config)
 
         self.assertEqual(layout.aic_required_records, 258)
-        self.assertEqual(layout.aic_record_capacity, 256)
+        self.assertEqual(layout.aic_record_capacity, 272)
 
     def test_prepared_runtime_serializes_disabled_config_and_lazily_profiles(self):
         """Keep the normal tensor disabled and create the enabled tensor on demand."""

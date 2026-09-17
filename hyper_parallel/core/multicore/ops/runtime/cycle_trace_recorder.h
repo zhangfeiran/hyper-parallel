@@ -45,7 +45,7 @@ static_assert(sizeof(CycleTraceRecord) == 32, "Unexpected cycle trace record siz
 
 class CycleTraceRecorder {
  public:
-  static constexpr uint32_t MAX_RECORDS_PER_CORE = 256;
+  static constexpr uint32_t MAX_RECORDS_PER_CORE = 16384;
 
   __aicore__ inline void Init(uint32_t worker_id, GM_ADDR profile_buffer, uint32_t aic_record_capacity,
                              uint32_t aiv_record_capacity) {

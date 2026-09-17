@@ -239,14 +239,14 @@ kernel 的输入列表都显式传递它，但 Python 公共 `mega_moe()`、`meg
 Host 根据完整调度表复现每个 worker 可能执行的任务，分别计算最忙 AIC 和 AIV 的记录数：
 
 ```text
-capacity = min(round_up(required_records, 16), 256)
+capacity = min(round_up(required_records, 16), 16384)
 ```
 
 每个有依赖的普通 task 最多记录 WaitDependency、Compute 和 TriggerEvent 三段；SHMEM put 不重复记录公共
-trigger 区间。达到 256 条上限后停止写入新 record 并累计 dropped count，不覆盖既有数据。
+trigger 区间。达到 16384 条上限后停止写入新 record 并累计 dropped count，不覆盖既有数据。
 
 profile buffer 总容量为 `24 * AIC_stride + 48 * AIV_stride`，最大值为
-`72 * (64 + 256 * 32) = 594432` Byte；不包含调度 event workspace。
+`72 * (64 + 16384 * 32) = 37753344` Byte；不包含调度 event workspace。
 `max_pending_calls` 控制 Host session 的 buffer drain 频率，与这里的每核 record 容量无关。
 
 ### 4.4 Cycle 与时间换算
@@ -745,7 +745,7 @@ pytest -v tests/torch/multicore/test_mega_moe_profiling.py
 | trace 为空 | active step 内是否真的执行 MegaKernel；是否只有 warmup 数据 |
 | timeline 零散 | shape 是否过小；是否完成真实 warmup、NPU synchronize 和 rank barrier |
 | 未知 SoC | 当前 device name 是否在 system counter 频率映射中 |
-| dropped record | 每核 slot 是否达到 256 上限；不能用 `max_pending_calls` 修复 |
+| dropped record | 每核 slot 是否达到 16384 上限；不能用 `max_pending_calls` 修复 |
 | merge 无匹配 | 原生 trace 是否含 Device kernel；检查 pattern、index 和 pid |
 | fallback warning | 复核 duration 降级选择的外层 kernel 是否正确 |
 | Host wrapper warning | 仅在明确设置 `allow_host_wrapper=True` 时接受近似结果 |

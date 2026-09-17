@@ -45,7 +45,7 @@ CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
 VECTOR_SLOT_COUNT = NUM_WORKERS_VECTOR
 CORE_SLOT_COUNT = CUBE_SLOT_COUNT + VECTOR_SLOT_COUNT
 RECORD_CAPACITY_ALIGNMENT = 16
-MAX_RECORDS_PER_CORE = 256
+MAX_RECORDS_PER_CORE = 16384
 CORE_HEADER = struct.Struct("<QIIIIII32x")
 PROFILE_RECORD = struct.Struct("<QQIIII")
 MAX_CORE_STRIDE_BYTES = CORE_HEADER.size + MAX_RECORDS_PER_CORE * PROFILE_RECORD.size
@@ -159,7 +159,7 @@ def _profile_buffer_bytes_for_capacities(aic_record_capacity: int, aiv_record_ca
 
 
 def _round_up_record_capacity(required_records: int) -> int:
-    """Round a per-worker requirement up to 16 records and enforce the 256-record limit."""
+    """Round a per-worker requirement up to 16 records and enforce the per-core capacity limit."""
     aligned_capacity = (
         (required_records + RECORD_CAPACITY_ALIGNMENT - 1) // RECORD_CAPACITY_ALIGNMENT * RECORD_CAPACITY_ALIGNMENT
     )
