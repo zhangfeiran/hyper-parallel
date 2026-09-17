@@ -30,6 +30,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Spars
 
 from examples.training_demo.cropped_deepseek_v41 import build_deepseek_v41_validation_config
 from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_accuracy import fp32_accuracy
 from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_oracle import evaluate_fp32_moe
 from hyper_parallel.models.deepseek_v41.adapter.activation import configure_deepseek_v41_swiglu
 from hyper_parallel.models.deepseek_v41.adapter.megamoe import DeepseekV41MegaMoe
@@ -365,3 +366,44 @@ class TestDeepseekV41LimitOverride(unittest.TestCase):
                         expected = shared.down_proj(F.silu(bound) * bound)
                         torch.testing.assert_close(shared(inputs), expected)
             self.assertEqual(config_path.read_text(encoding="utf-8"), source_bytes)
+
+
+class TestDeepseekV41Accuracy(unittest.TestCase):
+    """Reject invalid evidence and preserve both independent error budgets."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fp32_contract_rejects_invalid_evidence(self):
+        """
+        Feature: Per-tensor FP32 acceptance.
+        Description: Exercise missing gradients, broadcasting, nonfinite and zero references.
+        Expectation: Only matching absence and exact zero candidates pass these cases.
+        """
+        cases = [(None, None, True), (None, torch.zeros(1), False),
+                 (torch.zeros(1), None, False), (torch.zeros(2), torch.zeros(1), False),
+                 (torch.tensor([float("nan")]), torch.ones(1), False),
+                 (torch.ones(1), torch.tensor([float("inf")]), False),
+                 (torch.zeros(2), torch.zeros(2), True),
+                 (torch.tensor([1e-20]), torch.zeros(1), False)]
+        for actual, expected, passed in cases:
+            with self.subTest(actual=actual, expected=expected):
+                self.assertEqual(fp32_accuracy(actual, expected)["passed"], passed,
+                                 "Expected the shape, presence, finite and zero-reference contract")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fp32_contract_requires_both_error_budgets(self):
+        """
+        Feature: Per-tensor FP32 acceptance.
+        Description: Separate widespread error from a sparse outlier and check scale invariance.
+        Expectation: Relative L2 above 1% or peak-normalized error above 2% fails independently.
+        """
+        reference = torch.ones(10000)
+        spike = reference.clone()
+        spike[0] += 0.03
+        cases = [(reference * 1.005, True), (reference * 1.015, False), (spike, False)]
+        for actual, passed in cases:
+            for scale in (1.0, 1e-6, 1e6):
+                with self.subTest(passed=passed, scale=scale):
+                    self.assertEqual(fp32_accuracy(actual * scale, reference * scale)["passed"], passed,
+                                     "Expected each tensor to satisfy both scale-independent error budgets")

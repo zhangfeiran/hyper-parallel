@@ -35,6 +35,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4SparseMoeBlock
 
 from hyper_parallel.core.multicore._loader import get_multicore_paths
+from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_accuracy import fp32_accuracy
 from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_oracle import evaluate_fp32_moe
 from hyper_parallel.models.deepseek_v41.adapter.activation import configure_deepseek_v41_swiglu
 from hyper_parallel.models.deepseek_v41.adapter.megamoe import DeepseekV41MegaMoe
@@ -57,8 +58,10 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
     parser.add_argument("--route", choices=("learned", "hotspot"), default="learned")
     parser.add_argument("--vision", action="store_true")
+    parser.add_argument("--acceptance", choices=("fp32", "hf_bf16"), default="fp32",
+                        help="FP32 acceptance synchronizes step weights; hf_bf16 retains the legacy gate")
     parser.add_argument("--fp32-oracle", action="store_true",
-                        help="Record independent CPU FP32 comparisons without changing the BF16 acceptance gate")
+                        help="Record independent CPU FP32 comparisons, including with the legacy HF BF16 gate")
     parser.add_argument(
         "--synchronize-step-weights", action="store_true",
         help="Copy the HF path's current weights before each step, after validating the previous update",
@@ -67,6 +70,9 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=2e-3)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.acceptance == "fp32":
+        args.fp32_oracle = True
+        args.synchronize_step_weights = True
     for name in ("tokens", "hidden_size", "intermediate_size", "num_experts", "top_k", "steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -102,6 +108,8 @@ def _compare(name: str, actual: torch.Tensor | None, expected: torch.Tensor | No
              args: argparse.Namespace) -> dict[str, Any]:
     if actual is None or expected is None:
         return {"name": name, "passed": actual is None and expected is None, "gradient_absent": True}
+    if actual.shape != expected.shape:
+        return {"name": name, "passed": False, "shape_matches": False}
     actual = actual.detach().float()
     expected = expected.detach().float()
     difference = (actual - expected).abs()
@@ -110,7 +118,8 @@ def _compare(name: str, actual: torch.Tensor | None, expected: torch.Tensor | No
     violation = difference > tolerance
     worst = int((difference / tolerance.clamp_min(1e-12)).reshape(-1).argmax())
     return {
-        "name": name, "passed": finite and torch.allclose(actual, expected, rtol=args.rtol, atol=args.atol),
+        "name": name, "finite": finite, "shape_matches": True,
+        "passed": finite and torch.allclose(actual, expected, rtol=args.rtol, atol=args.atol),
         "max_abs_error": float(difference.max()), "reference_max_abs": float(expected.abs().max()),
         "relative_l2": float(difference.norm() / expected.norm().clamp_min(1e-12)),
         "elements_outside_tolerance": int(violation.sum()), "elements": actual.numel(),
@@ -118,6 +127,13 @@ def _compare(name: str, actual: torch.Tensor | None, expected: torch.Tensor | No
         "worst_expected": float(expected.reshape(-1)[worst]),
         "worst_tolerance_ratio": float((difference / tolerance.clamp_min(1e-12)).max()),
     }
+
+
+def _compare_fp32(name, actual, expected, args):
+    comparison = _compare(name, actual, expected, args)
+    comparison["elementwise_passed"] = comparison["passed"]
+    comparison.update(fp32_accuracy(actual, expected))
+    return comparison
 
 
 def _reference_parameter(name: str, parameter: torch.Tensor | None, rank: int, local_experts: int):
@@ -196,10 +212,10 @@ def _fp32_evidence(module, parameters, inputs, output, dy, route, args, ep_group
         dist.all_reduce(gradient, group=ep_group)
         oracle["gradients"][name] = gradient.cpu()
     checks = [
-        _compare("output", output.cpu(), oracle["output"], args),
-        _compare("input_grad", inputs.grad.cpu(), oracle["input_grad"], args),
-        _compare("route_weights", route["weights"].cpu(), oracle["route_weights"], args),
-        _compare("route_weight_grad", route["weights"].grad.cpu(), oracle["route_weight_grad"], args),
+        _compare_fp32("output", output.cpu(), oracle["output"], args),
+        _compare_fp32("input_grad", inputs.grad.cpu(), oracle["input_grad"], args),
+        _compare_fp32("route_weights", route["weights"].cpu(), oracle["route_weights"], args),
+        _compare_fp32("route_weight_grad", route["weights"].grad.cpu(), oracle["route_weight_grad"], args),
     ]
     checks.extend(_fp32_parameter_checks(module, oracle, args, ep_group, gradients=True))
     return oracle, checks
@@ -216,7 +232,7 @@ def _fp32_parameter_checks(module, oracle, args, ep_group, *, gradients):
         if source_name != name:
             expected = _reference_parameter(name, expected, dist.get_rank(ep_group), module.experts.local_experts)
         actual = parameter.grad if gradients else parameter
-        checks.append(_compare(f"{'grad' if gradients else 'weight'}/{name}",
+        checks.append(_compare_fp32(f"{'grad' if gradients else 'weight'}/{name}",
                                None if actual is None else actual.cpu(), expected, args))
     return checks
 
@@ -294,9 +310,26 @@ def _run_steps(source, candidate, args, device, ep_group):
             fp32_checks["megamoe"].extend(_fp32_parameter_checks(
                 candidate, native_oracle, args, ep_group, gradients=False))
         results.append({"step": step, "checks": comparisons, "fp32_checks": fp32_checks})
-    return {"rank": dist.get_rank(), "ep_rank": ep_rank, "ep_ranks": dist.get_process_group_ranks(ep_group),
+    return _rank_result(results, args, ep_group)
+
+
+def _requires_exact_check(check):
+    return (check["name"].startswith("initial_weight/") or check["name"] == "route/indices"
+            or check.get("gradient_absent") or check.get("shape_matches") is False)
+
+
+def _rank_result(results, args, ep_group):
+    legacy_passed = all(check["passed"] for result in results for check in result["checks"])
+    structural_passed = all(check["passed"] for result in results for check in result["checks"]
+                            if _requires_exact_check(check))
+    fp32_passed = args.fp32_oracle and all(
+        check["passed"] for result in results for checks in result["fp32_checks"].values() for check in checks
+    )
+    return {"rank": dist.get_rank(), "ep_rank": dist.get_rank(ep_group),
+            "ep_ranks": dist.get_process_group_ranks(ep_group),
             "steps": results,
-            "passed": all(check["passed"] for result in results for check in result["checks"])}
+            "hf_bf16_passed": legacy_passed, "structural_passed": structural_passed,
+            "passed": structural_passed and fp32_passed if args.acceptance == "fp32" else legacy_passed}
 
 
 def _ep_group(ep_size):
@@ -334,6 +367,12 @@ def _environment() -> dict[str, Any]:
     }
 
 
+def _fp32_passes(results):
+    return {backend: all(check["passed"] for rank in results for step in rank["steps"]
+                         for check in step["fp32_checks"][backend])
+            for backend in ("hf_bf16", "megamoe")}
+
+
 def main(argv: list[str] | None = None) -> None:
     """Compare per-rank evidence and fail the torchrun job on any mismatch.
 
@@ -365,18 +404,17 @@ def main(argv: list[str] | None = None) -> None:
                       "config": {key: str(value) if isinstance(value, Path) else value
                                  for key, value in vars(args).items()},
                       "environment": _environment(), "ranks": results}
+            report["hf_bf16_passed"] = all(item["hf_bf16_passed"] for item in results)
             report["step_state"] = ("identical weights before each step; previous optimizer updates checked first"
                                     if args.synchronize_step_weights else "independent optimizer trajectories")
             if args.fp32_oracle:
-                report["fp32_passed"] = {
-                    backend: all(check["passed"] for rank in results for step in rank["steps"]
-                                 for check in step["fp32_checks"][backend])
-                    for backend in ("hf_bf16", "megamoe")
-                }
+                report["fp32_passed"] = _fp32_passes(results)
                 report["fp32_contract"] = (
                     "CPU FP32 math with fixed selected IDs and each path's current weights; "
                     "expert gradients reduced in FP32 within the actual EP group; "
-                    "per-step SGD update checked from that same state; HF BF16 acceptance gate unchanged"
+                    "per-step SGD update checked from that same state; "
+                    "each tensor must be finite with matching shape/presence, "
+                    "relative L2 <= 1% and peak-normalized error <= 2%; zero reference requires exact zero"
                 )
             args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
             print(f"DeepSeek-V4.1 MegaMoe precision passed={passed}: {args.output}", flush=True)

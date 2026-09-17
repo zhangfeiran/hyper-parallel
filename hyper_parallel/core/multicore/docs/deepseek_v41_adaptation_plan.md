@@ -8,7 +8,7 @@
 
 已完成分支准备、提交迁移、独立依赖环境、limit override、无 clamp 激活分支、
 独立 MoE adapter、native 重编译及 block 精度入口。独立 CPU FP32 oracle 已补齐，
-两轮各 16 组 NPU 矩阵已完成。P1 的数值验收仍待确认；P2 Trainer/FSDP/checkpoint
+两轮各 16 组 NPU 矩阵已完成。P1 已确认采用同状态 FP32 数值判据；P2 Trainer/FSDP/checkpoint
 和 P3 拓扑/性能扩展尚未实施，不能将 block 验证外推为完整模型支持。
 
 ## 分支与提交来源
@@ -217,8 +217,13 @@ HF text / V4.1 text / V4.1 visual router；原有 limit=10 和 Multicore 回归�
 同状态的 16 组均满足初始参数/路由 IDs/梯度存在性精确匹配。
 MegaMoe 对 FP32 的最坏相对 L2 为 0.5177%，峰值归一化误差为 1.0054%；
 HF BF16 对 FP32 分别为 0.5482% 和 1.1716%。原 BF16 逐元素硬门槛通过 5/16 组。
-在 P2 前需要确认 FP32 数值验收口径，并保留原 BF16 差异报告。
+用户已确认同状态 FP32 判据：每 tensor 相对 L2 <= 1%、峰值归一化误差 <= 2%，
+精确检查形状、梯度存在性、初始权重和路由 IDs，双方 baseline 使用相同标准。
+默认入口及 ST 已切换到此判据，原 BF16 差异报告和显式旧门槛模式保留。
 本阶段不更改通用 optimizer，也不恢复已删除的参数回拷测试。
 
 FP32 数值结果、独立训练轨迹的路由分歧，以及同状态验证协议见
 [block 精度实施记录](deepseek_v41_block_precision_report.md)。
+
+算子偏差追踪入口及数值证据见 [算子精度定位报告](deepseek_v41_operator_precision_report.md)。
+本轮只改变验收入口和诊断工具；融合 SwiGLU、归约边界的替换只用于诊断副本。

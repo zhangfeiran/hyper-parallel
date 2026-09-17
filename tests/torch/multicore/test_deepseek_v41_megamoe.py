@@ -48,7 +48,7 @@ def test_deepseek_v41_megamoe(
     if not multicore_adapter_is_available():
         raise RuntimeError("DeepSeek-V4.1 MegaMoe ST requires an activated Torch multicore payload")
     result_path = tmp_path / "deepseek_v41_megamoe.json"
-    arguments = ["--dispatch-mode", dispatch_mode, "--route", route, "--ep-size", str(ep_size),
+    arguments = ["--acceptance", "fp32", "--dispatch-mode", dispatch_mode, "--route", route, "--ep-size", str(ep_size),
                  "--output", str(result_path)]
     if vision:
         arguments.append("--vision")
@@ -58,4 +58,6 @@ def test_deepseek_v41_megamoe(
     with without_inherited_rank_environment():
         torchrun_case(_WORKER, "test_deepseek_v41_megamoe", num_proc=2)
     report = json.loads(result_path.read_text(encoding="utf-8"))
+    assert report["config"]["synchronize_step_weights"], "Expected identical weights before each step"
+    assert all(report["fp32_passed"].values()), "Expected both HF BF16 and MegaMoe to satisfy FP32 bounds"
     assert report["passed"], f"Expected precision pass, got report={report}"

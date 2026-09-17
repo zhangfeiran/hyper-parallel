@@ -30,7 +30,7 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1
 export HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT=tcp://127.0.0.1:29571
 python -m torch.distributed.run --standalone --nproc-per-node=2 --module \
   hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_precision \
-  --dispatch-mode push --route learned --fp32-oracle --synchronize-step-weights \
+  --dispatch-mode push --route learned --acceptance fp32 \
   --output output/deepseek_v41_megamoe.json
 ```
 
@@ -52,9 +52,10 @@ Useful variations:
 - `--top-k 1` or `--top-k 8`: selection boundary cases with E=8.
 - `--tokens`: positive multiple of 128; capacity remains lossless.
 - `--synchronize-step-weights`: start each step from identical current HF weights.
-  The previous native optimizer update is compared before the next copy. Omit
-  this flag to observe independent optimizer trajectories, which may cross
-  different TopK boundaries after small BF16 gradient differences.
+  This is automatic with the default `--acceptance fp32`. The previous native
+  optimizer update is compared before the next copy. Use `--acceptance hf_bf16
+  --fp32-oracle` without this flag to observe independent trajectories, which may
+  cross different TopK boundaries after small BF16 gradient differences.
 
 ## Reference and evidence
 
@@ -71,7 +72,7 @@ The full-expert HF oracle sees only local inputs, so its expert gradients are
 summed within the EP group before comparison with native local expert gradients.
 Router and shared gradients remain local on both paths.
 
-`--fp32-oracle` additionally evaluates independent CPU FP32 matrix operations,
+The default `--acceptance fp32` evaluates independent CPU FP32 matrix operations,
 SiLU, score functions and autodiff. It calls neither HF experts nor MegaMoe.
 For each backend and each step it copies that backend's **current** weights and
 inputs, fixes the actual discrete expert IDs, and recomputes differentiable
@@ -81,14 +82,18 @@ native layout. It checks the one-step SGD update from this same state. This is
 not a separate three-step FP32 training trajectory and does not independently
 validate discrete TopK selection; the HF comparison checks selected IDs exactly.
 
-JSON contains separate BF16 and FP32 comparisons, finite-value checks, relative
-L2 error, maximum absolute error, failing-element counts and the worst ratio to
-`atol + rtol * abs(reference)`. The default remains `rtol=0.02, atol=0.002`.
-`passed` and the process exit status use the existing HF BF16 gate;
-`fp32_passed` reports each backend against FP32 independently. Adding the oracle
-does not relax acceptance. BF16 rounding can cause isolated element failures,
-including in the unchanged shared-expert baseline. Inspect the full report
-before interpreting an aggregate pass/fail as an integration defect.
+Acceptance checks **every tensor on every rank and step** independently against
+FP32: relative L2 <= 1% and max absolute error / reference max absolute value <=
+2%. Shapes, gradient presence, initial weights and selected IDs must match;
+values must be finite. A zero reference requires an exactly zero candidate.
+Both HF BF16 and MegaMoe must meet these same bounds. This approved block
+criterion is an engineering regression budget, not a convergence guarantee.
+
+JSON retains original `rtol=0.02, atol=0.002` elementwise comparisons and counts.
+`hf_bf16_passed` reports the original cross-backend gate, `elementwise_passed`
+retains each FP32 comparison's old elementwise outcome, and `fp32_passed` gives
+the new per-backend result. `passed` and exit status use the selected acceptance
+mode. `--acceptance hf_bf16` explicitly restores the original hard gate.
 
 The report records source file hashes (including uncommitted files), git HEAD,
 diff hash, native artifact hashes, framework versions, dependency path, CANN,
@@ -103,7 +108,27 @@ python -m pytest -q tests/torch/multicore/test_deepseek_v41_megamoe.py
 ```
 
 The system-test launcher imports no framework. It requires two visible NPUs,
-activates the native payload, and launches a separate worker. It retains the
-strict BF16 gate, including hotspot cases; failures are not skipped or hidden.
+activates the native payload, and launches a separate worker. It selects the
+approved FP32 gate with synchronized state and retains all BF16 diagnostics.
 See the [adaptation plan](../../docs/deepseek_v41_adaptation_plan.md) for the
 current validation status and the remaining Trainer/FSDP work.
+
+## Operator diagnosis
+
+With the same activated environment, run `deepseek_v41_operator_trace` instead
+of `deepseek_v41_precision` using `--nproc-per-node=1`. It supports `--route
+hotspot|learned` and `--dispatch-mode push|pull` with the same shape arguments.
+It copies actual native scratch before reuse, compares each operator against
+CPU FP32 using that operator's actual inputs, and replays the chain with
+ordinary NPU matmuls plus either HF SiLU/multiply or fused `npu_swiglu`.
+The output JSON and `.stepN.pt` snapshots are diagnostic artifacts, not timing
+results. The full-block intervention changes only a temporary reference copy.
+
+For EP2/EP4 run `deepseek_v41_reduction_trace` with that many processes. This
+probe requires WORLD=EP and text routing. It compares original HF BF16,
+fused-SwiGLU HF with BF16 gradient reduction, and FP32 partial dW reduction
+rounded once at the end. These partials use actual BF16 intermediate inputs;
+they are **operator-local references**, not the end-to-end FP32 oracle.
+
+See the [operator diagnosis](../../docs/deepseek_v41_operator_precision_report.md)
+for source evidence, causal interventions and the remaining precision boundary.

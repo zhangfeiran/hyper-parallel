@@ -93,9 +93,9 @@ HF BF16 对 FP32 分别为 **0.5482%** 和 **1.1716%**。
 | ep4-push-hotspot-aligned | 失败 | 0.5221% | 0.4896% | 0.8029% | 0.7616% |
 | ep4-push-learned-aligned | 失败 | 0.5309% | 0.5177% | 0.9724% | 0.9724% |
 
-## 待确认的工程验收口径
+## 已确认的工程验收口径（2026-09-17）
 
-建议将**同状态** FP32 oracle 用于数值验收，同时保留 HF BF16 逐元素对比及独立轨迹诊断。
+经用户确认，将**同状态** FP32 oracle 用于数值验收，同时保留 HF BF16 逐元素对比及独立轨迹诊断。
 对每个 rank、step、tensor 单独检查，不能跨张量平均后掩盖失败：
 
 1. 所有值有限，参数初始映射、同状态路由 IDs、梯度存在性及张量形状精确匹配。
@@ -103,8 +103,9 @@ HF BF16 对 FP32 分别为 **0.5482%** 和 **1.1716%**。
 3. 对 FP32 的峰值归一化最大绝对误差不超过 2%；全零 reference 要求 actual 也全零。
 4. 对 HF BF16 baseline 施加相同 FP32 标准；保留原逐元素超界明细。
 
-这是针对 BF16 block 的工程回归建议，不是理论误差上界，也不是完整模型收敛标准。
-**目前未改动默认硬门槛**，不能把上述建议直接写成已验收通过。
+这是针对 BF16 block 的工程回归判据，不是理论误差上界，也不是完整模型收敛标准。
+默认 `--acceptance fp32` 自动开启 oracle 和每步权重同步；`--acceptance hf_bf16` 保留原硬门槛。
+JSON 分别记录新判据、旧逐元素门槛和精确匹配项，历史日志不回写。
 完整四层 crop 的 logits/loss、多步训练和 checkpoint 属于下一阶段。
 
 ## CPU 与静态检查
@@ -123,3 +124,9 @@ HYPER_PARALLEL_PLATFORM=torch python -m pytest -q \
 代码未修改通用 optimizer，也未恢复已删除的 `test_parameter_copy.py`。
 
 后续工作见 [适配计划](deepseek_v41_adaptation_plan.md)。
+
+## 算子级追踪
+
+后续以 `c126ee4c` 加诊断改动为源码基线，native 二进制保持上述 SHA256。
+实际 scratch、相同输入的单算子 FP32 对照、融合激活替换及 EP 梯度归约对照见
+[算子精度定位报告](deepseek_v41_operator_precision_report.md)。
