@@ -181,6 +181,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--expert-capacity-factor", type=_capacity_factor, default=None)
+    parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--output",
@@ -659,6 +660,7 @@ def _write_result(
                 "num_experts": config.num_experts,
                 "top_k": config.top_k,
                 "expert_capacity_factor": config.expert_capacity_factor,
+                "dispatch_mode": config.dispatch_mode,
                 "dtype": "bfloat16",
             },
             "optimizer": {
@@ -774,6 +776,7 @@ def _prepare_benchmark(argv: list[str] | None) -> _BenchmarkContext:
     config = replace(
         QwenMoeConfig(),
         expert_capacity_factor=args.expert_capacity_factor,
+        dispatch_mode=args.dispatch_mode,
     )
     return _BenchmarkContext(args, rank, world_size, device, config, initialized_here)
 

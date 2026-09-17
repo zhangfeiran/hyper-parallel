@@ -23,12 +23,13 @@ constexpr uint32_t NUM_WORKERS_CUBE = 24;
 constexpr uint32_t MAX_GROUP_LIST = 512;
 constexpr uint32_t MAX_EXPERT_NUM_PER_RANK = 16;
 constexpr uint32_t ATOMIC_ADD_VALUE_LEN = 8;
+constexpr uint32_t RUNTIME_PROTOCOL_VERSION = 1;
 
 constexpr uint32_t GROUP_LIST_CACHE_LINE_BYTES = 128;
 static_assert(MAX_EXPERT_NUM_PER_RANK * sizeof(int64_t) % GROUP_LIST_CACHE_LINE_BYTES == 0,
               "Grouped-list worker stride must preserve cache-line alignment.");
-static_assert((GROUP_LIST_CACHE_LINE_BYTES - 1) +
-                  NUM_WORKERS_CUBE * MAX_EXPERT_NUM_PER_RANK * sizeof(int64_t) <= MAX_GROUP_LIST * sizeof(int64_t),
+static_assert((GROUP_LIST_CACHE_LINE_BYTES - 1) + NUM_WORKERS_CUBE * MAX_EXPERT_NUM_PER_RANK * sizeof(int64_t) <=
+                MAX_GROUP_LIST * sizeof(int64_t),
               "Grouped-list scratch slots exceed the runtime-config buffer.");
 
 constexpr uint32_t UB_32B_ALIGN = 32;
@@ -65,6 +66,7 @@ enum class TaskType : uint32_t {
   TASK_GROUPED_MATMUL = 104,
   TASK_SHMEM_PUT_MEM_SIGNAL = 105,
   TASK_SWI_GLU_GRAD = 106,
+  TASK_SHMEM_GET_MEM = 107,
 };
 
 enum class EventType : uint32_t {
@@ -134,6 +136,7 @@ struct TaskDesc {
 
 struct ReadyHandshakeMeta {
   uint32_t ready_event;
+  uint32_t completion_event;
 };
 
 struct RuntimeHeader {
@@ -145,7 +148,9 @@ struct RuntimeHeader {
   uint32_t cycle_profiling_enabled;
   uint32_t aic_profile_record_capacity;
   uint32_t aiv_profile_record_capacity;
-  uint32_t padding[8];
+  uint32_t completion_event;
+  uint32_t protocol_version;
+  uint32_t padding[6];
 };
 
 static_assert(sizeof(RuntimeHeader) == 64);
@@ -164,6 +169,7 @@ __aicore__ inline uint32_t getRuntimeEventCapacity(__gm__ uint8_t *tiling) {
 
 __aicore__ inline void getReadyHandshakeMeta(__gm__ uint8_t *tiling, ReadyHandshakeMeta *meta) {
   meta->ready_event = (*(__gm__ uint32_t *)(tiling + 4 * UINT32_T_SIZE));
+  meta->completion_event = (*(__gm__ uint32_t *)(tiling + 8 * UINT32_T_SIZE));
 }
 
 __aicore__ inline uint32_t getAllEventNumTriggersOffset() { return sizeof(RuntimeHeader); }
@@ -339,7 +345,7 @@ __aicore__ inline uint32_t getGroupedMatmulGroupListOffset(__gm__ uint8_t *tilin
 __aicore__ inline uint32_t getGroupedMatmulGroupListOffsetById(__gm__ uint8_t *tiling, uint32_t worker_id) {
   // Each worker must own complete cache lines when publishing its group list.
   const uint32_t aligned_offset = (getGroupedMatmulGroupListOffset(tiling) + GROUP_LIST_CACHE_LINE_BYTES - 1) /
-                                 GROUP_LIST_CACHE_LINE_BYTES * GROUP_LIST_CACHE_LINE_BYTES;
+                                  GROUP_LIST_CACHE_LINE_BYTES * GROUP_LIST_CACHE_LINE_BYTES;
   return aligned_offset + MAX_EXPERT_NUM_PER_RANK * INT64_T_SIZE * worker_id;
 }
 
@@ -374,9 +380,11 @@ __aicore__ inline bool isReadyHandshakeStorageValid(__gm__ uint8_t *tiling, uint
                                                     uint32_t ep_size) {
   ReadyHandshakeMeta meta;
   getReadyHandshakeMeta(tiling, &meta);
-  return meta.ready_event == 0 ||
-         (ep_size > 1 && static_cast<uint64_t>(meta.ready_event) + ATOMIC_ADD_VALUE_LEN <= events &&
-          event_bytes >= events * INT32_T_SIZE + (static_cast<uint64_t>(ep_size) + 1) * DATA_CACHE_LINE_SIZE);
+  return (meta.ready_event == 0 ||
+          (ep_size > 1 && static_cast<uint64_t>(meta.ready_event) + ATOMIC_ADD_VALUE_LEN <= events &&
+           event_bytes >= events * INT32_T_SIZE + 2 * (static_cast<uint64_t>(ep_size) + 1) * DATA_CACHE_LINE_SIZE)) &&
+         (meta.completion_event == 0 ||
+          static_cast<uint64_t>(meta.completion_event) + ATOMIC_ADD_VALUE_LEN <= events);
 }
 
 __aicore__ inline bool areTaskIndexCountsValid(__gm__ uint8_t *tiling, uint64_t capacity) {
@@ -393,6 +401,9 @@ __aicore__ inline bool areTaskIndexCountsValid(__gm__ uint8_t *tiling, uint64_t 
 __aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t runtime_bytes,
                                              uint64_t event_bytes, uint32_t ep_size = 1) {
   if (runtime_bytes < sizeof(RuntimeHeader) || runtime_bytes >= RUNTIME_ADDRESS_SPACE_BYTES) {
+    return false;
+  }
+  if (*(__gm__ uint32_t *)(tiling + 9 * UINT32_T_SIZE) > RUNTIME_PROTOCOL_VERSION) {
     return false;
   }
   uint64_t capacity = getRuntimeTaskCapacity(tiling);

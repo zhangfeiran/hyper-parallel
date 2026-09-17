@@ -75,3 +75,13 @@ extern "C" void read_layout(uint8_t *image, uint32_t *result) {
   result[10] = Runtime::getRuntimeTaskCapacity(image);
   result[11] = Runtime::getRuntimeEventCapacity(image);
 }
+
+extern "C" void read_protocol_profile(uint8_t *image, uint32_t *result) {
+  Runtime::ReadyHandshakeMeta meta;
+  getRuntime::ReadyHandshakeMeta(image, &meta);
+  result[0] = meta.ready_event;
+  result[1] = meta.completion_event;
+  result[2] = Runtime::isCycleProfileEnabled(image);
+  result[3] = Runtime::getAicProfileRecordCapacity(image);
+  result[4] = Runtime::getAivProfileRecordCapacity(image);
+}

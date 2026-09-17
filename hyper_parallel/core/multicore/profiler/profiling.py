@@ -73,6 +73,7 @@ TASK_TYPE_NAMES = {
     104: "GroupedMatMul",
     105: "ShmemPutMemSignal",
     106: "SwiGLUGrad",
+    107: "ShmemGetMem",
 }
 CORE_TYPE_NAMES = {
     1: "AIC",

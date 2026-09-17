@@ -59,6 +59,8 @@ def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -
         routed_slots,
         specification["ep_size"],
     )
+    if specification.get("dispatch_mode", "push") == "pull":
+        capacity = routed_slots
     tensor_bytes = (
         (capacity + routed_slots) * specification["hidden_size"] * element_size
     )
@@ -121,6 +123,8 @@ class MegaMoeWorkspace:
     device: Any | None = None
     expert_capacity: int = 0
     routed_slots: int = 0
+    dispatch_mode: str = "push"
+    source_buffer: Any | None = None
     expert_buffer: Any | None = None
     routed_buffer: Any | None = None
     forward_event_counters: Any | None = None
@@ -168,9 +172,10 @@ class MegaMoeWorkspace:
         if self.closing:
             raise RuntimeError("cannot allocate a closing MegaMoe workspace.")
         requested_capacity = spec.receive_capacity
-        if self.expert_buffer is not None:
+        if self.expert_buffer is not None or self.source_buffer is not None:
             compatible = (
-                self.dtype == dtype
+                self.dispatch_mode == spec.dispatch_mode
+                and self.dtype == dtype
                 and self.device == device
                 and self.routed_slots == spec.routed_slots
                 and self.expert_capacity == requested_capacity
@@ -179,6 +184,7 @@ class MegaMoeWorkspace:
                 raise ValueError("MegaMoe workspace cannot change device, dtype, routed shape, or capacity.")
             return
 
+        self.dispatch_mode = spec.dispatch_mode
         self.dtype = dtype
         self.device = device
         self.expert_capacity = requested_capacity
@@ -186,11 +192,11 @@ class MegaMoeWorkspace:
         self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
         event_bytes = event_workspace_bytes(spec.ep_size, spec.num_experts)
         try:
-            self.expert_buffer = shmem.empty(
-                (requested_capacity, spec.hidden_size),
-                dtype=dtype,
-                alignment=_WORKSPACE_ALIGNMENT,
-            )
+            field_name = "source_buffer" if self.dispatch_mode == "pull" else "expert_buffer"
+            rows = spec.routed_slots if self.dispatch_mode == "pull" else requested_capacity
+            setattr(self, field_name, shmem.empty(
+                (rows, spec.hidden_size), dtype=dtype, alignment=_WORKSPACE_ALIGNMENT,
+            ))
             self.routed_buffer = shmem.empty(
                 (spec.routed_slots, spec.hidden_size),
                 dtype=dtype,
@@ -277,10 +283,12 @@ class MegaMoeWorkspace:
         """Free each unique SHMEM allocation and invalidate its tensor view."""
         if self.closing:
             remaining = tuple(tensor is not None for tensor in (
-                self.expert_buffer, self.routed_buffer, self.forward_event_counters, self.backward_event_counters))
+                self.source_buffer, self.expert_buffer, self.routed_buffer,
+                self.forward_event_counters, self.backward_event_counters))
             if any(peer != remaining for peer in _automatic.exchange(remaining)):
                 raise RuntimeError("partial symmetric teardown differs across ranks; restart the process")
         for field_name in (
+            "source_buffer",
             "expert_buffer",
             "routed_buffer",
             "forward_event_counters",
@@ -313,6 +321,7 @@ class MegaMoeWorkspace:
             if not self.can_close():
                 raise RuntimeError("cannot close MegaMoe workspace while backward graphs still need its buffers.")
             empty = all(tensor is None for tensor in (
+                self.source_buffer,
                 self.expert_buffer,
                 self.routed_buffer,
                 self.forward_event_counters,
