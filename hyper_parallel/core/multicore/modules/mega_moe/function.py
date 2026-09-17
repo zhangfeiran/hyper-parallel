@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch_npu
 
 from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
@@ -238,8 +237,8 @@ def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any
     spec = ctx.plan.spec
     # Consume the shared gradient before release records completion.
     # The permutation gradient owns its reduced [T, H] output.
-    return torch_npu.npu_moe_token_permute_grad_v2(
-        grad_x, unpermute_mapping, spec.local_num_tokens, grad_x.dtype, spec.top_k
+    return multicore_ops.moe_token_permute_grad(
+        grad_x, unpermute_mapping, spec.local_num_tokens, spec.top_k
     )
 
 
