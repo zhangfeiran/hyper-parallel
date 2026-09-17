@@ -61,3 +61,32 @@ def test_deepseek_v41_megamoe(
     assert report["config"]["synchronize_step_weights"], "Expected identical weights before each step"
     assert all(report["fp32_passed"].values()), "Expected both HF BF16 and MegaMoe to satisfy FP32 bounds"
     assert report["passed"], f"Expected precision pass, got report={report}"
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="unessential")
+@pytest.mark.parametrize("world_size,dispatch_mode,init_dtype",
+                         [(2, "push", "float32"), (4, "pull", "bfloat16")])
+def test_deepseek_v41_megamoe_training(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, world_size: int, dispatch_mode: str, init_dtype: str,
+) -> None:
+    """
+    Feature: DeepSeek-V4.1 MegaMoe Trainer integration.
+    Description: Run real EP/FSDP Trainer steps, gradient accumulation and checkpoint restore.
+    Expectation: Expert updates and exact checkpoint restoration pass with EDP-only reductions.
+    """
+    prepare_multicore_test_environment()
+    if not multicore_adapter_is_available():
+        raise RuntimeError("DSV4.1 Trainer ST requires an activated Torch multicore payload")
+    monkeypatch.setenv("HP_DSV41_TRAINING_OUTPUT", str(tmp_path))
+    monkeypatch.setenv("HP_DSV41_TRAINING_EP", "2")
+    monkeypatch.setenv("HP_DSV41_TRAINING_MODE", dispatch_mode)
+    monkeypatch.setenv("HP_DSV41_MODEL_INIT_DTYPE", init_dtype)
+    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
+    monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
+    worker = str(Path(__file__).with_name("_test_deepseek_v41_megamoe_training.py"))
+    with without_inherited_rank_environment():
+        torchrun_case(worker, "test_deepseek_v41_megamoe_training", num_proc=world_size)
+    for rank in range(world_size):
+        report = json.loads((tmp_path / f"rank{rank}" / "result.json").read_text(encoding="utf-8"))
+        assert report["passed"] and report["model_checkpoint_exact"], f"Rank {rank} did not pass Trainer checks"

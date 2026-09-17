@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import subprocess
 from types import MethodType
+from unittest.mock import patch
 from typing import Any
 
 import torch
@@ -35,6 +36,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4SparseMoeBlock
 
 from hyper_parallel.core.multicore._loader import get_multicore_paths
+from hyper_parallel.models.deepseek_v41.adapter.expert_parallel import deepseek_v41_ep_compute_fn
 from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_accuracy import fp32_accuracy
 from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_oracle import evaluate_fp32_moe
 from hyper_parallel.models.deepseek_v41.adapter.activation import configure_deepseek_v41_swiglu
@@ -56,6 +58,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--ep-size", type=int, default=None,
                         help="EP group size; smaller than WORLD creates strided disjoint subgroups")
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
+    parser.add_argument("--reference", choices=("owner_ep", "hf_replicated"), default="owner_ep")
     parser.add_argument("--route", choices=("learned", "hotspot"), default="learned")
     parser.add_argument("--vision", action="store_true")
     parser.add_argument("--acceptance", choices=("fp32", "hf_bf16"), default="fp32",
@@ -104,6 +107,61 @@ def _source_block(args: argparse.Namespace, device: torch.device) -> torch.nn.Mo
     return source.to(device=device, dtype=torch.bfloat16)
 
 
+class _GroupMesh:
+    """Expose the existing group through the EP factory's mesh contract."""
+
+    def __init__(self, group: Any) -> None:
+        """Keep an already-created EP process group."""
+        self.group = group
+
+    def __getitem__(self, _axis: str) -> _GroupMesh:
+        """Expose the single EP axis."""
+        return self
+
+    def size(self) -> int:
+        """Return the group-local EP degree."""
+        return dist.get_world_size(self.group)
+
+    def get_group(self, _axis: str) -> Any:
+        """Return the explicit EP collective group.
+
+        Args:
+            _axis: EP axis name supplied by the factory.
+        """
+        return self.group
+
+
+def _configure_owner_reference(source, ep_group):
+    compute = deepseek_v41_ep_compute_fn(
+        module=source, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=_GroupMesh(ep_group))
+    count = source.experts.num_experts // dist.get_world_size(ep_group)
+    start = dist.get_rank(ep_group) * count
+    for name, parameter in tuple(source.experts.named_parameters()):
+        setattr(source.experts, name, torch.nn.Parameter(parameter[start:start + count].detach().clone(),
+                                                       requires_grad=parameter.requires_grad))
+    source.forward = MethodType(compute, source)
+    source._dsv41_owner_ep = True
+
+
+def _mapped_reference(source, name, parameter, ep_rank, local_experts):
+    if getattr(source, "_dsv41_owner_ep", False) and name.startswith("experts."):
+        return None if parameter is None else parameter.transpose(1, 2)
+    return _reference_parameter(name, parameter, ep_rank, local_experts)
+
+
+def _full_source_parameters(source, ep_group):
+    if not getattr(source, "_dsv41_owner_ep", False):
+        return dict(source.named_parameters())
+    parameters = {}
+    for name, parameter in source.named_parameters():
+        if name.startswith("experts."):
+            shards = [torch.empty_like(parameter) for _ in range(dist.get_world_size(ep_group))]
+            dist.all_gather(shards, parameter, group=ep_group)
+            parameter = torch.cat(shards)
+        parameters[name] = parameter
+    return parameters
+
+
 def _compare(name: str, actual: torch.Tensor | None, expected: torch.Tensor | None,
              args: argparse.Namespace) -> dict[str, Any]:
     if actual is None or expected is None:
@@ -149,7 +207,7 @@ def _parameter_comparisons(source, candidate, args, ep_rank, *, gradients: bool)
         source_name = name.replace("gate_up_weight", "gate_up_proj").replace("down_weight", "down_proj")
         expected = reference_parameters[source_name]
         expected = expected.grad if gradients else expected
-        expected = _reference_parameter(name, expected, ep_rank, candidate.experts.local_experts)
+        expected = _mapped_reference(source, name, expected, ep_rank, candidate.experts.local_experts)
         actual = parameter.grad if gradients else parameter
         comparisons.append(_compare(f"{'grad' if gradients else 'weight'}/{name}", actual, expected, args))
     return comparisons
@@ -169,8 +227,12 @@ def _forward_pair(source, candidate, inputs, other_inputs, args, image_mask):
         weights = torch.full((args.tokens, args.top_k), 1.7 / args.top_k,
                              device=inputs.device, dtype=torch.float32, requires_grad=True)
         other_weights = weights.detach().clone().requires_grad_()
-        expected = source.experts(inputs.reshape(-1, args.hidden_size), indices, weights).reshape_as(inputs)
-        expected = expected + source.shared_experts(inputs)
+        if getattr(source, "_dsv41_owner_ep", False):
+            with patch.object(source.gate, "forward", return_value=(None, weights, indices)):
+                expected = source(inputs)
+        else:
+            expected = source.experts(inputs.reshape(-1, args.hidden_size), indices, weights).reshape_as(inputs)
+            expected = expected + source.shared_experts(inputs)
         actual = candidate.experts(other_inputs, indices, other_weights) + candidate.shared_experts(other_inputs)
         return (expected, actual, {"weights": weights, "indices": indices},
                 {"weights": other_weights, "indices": indices})
@@ -229,6 +291,10 @@ def _fp32_parameter_checks(module, oracle, args, ep_group, *, gradients):
         if not gradients:
             before = oracle["parameters"][source_name]
             expected = before if expected is None else before - 0.01 * expected
+        if getattr(module, "_dsv41_owner_ep", False) and name.startswith("experts."):
+            count = module.experts.local_expert_count
+            start = dist.get_rank(ep_group) * count
+            expected = None if expected is None else expected[start:start + count]
         if source_name != name:
             expected = _reference_parameter(name, expected, dist.get_rank(ep_group), module.experts.local_experts)
         actual = parameter.grad if gradients else parameter
@@ -242,7 +308,7 @@ def _synchronize_parameters(source, candidate, ep_rank):
     with torch.no_grad():
         for name, parameter in candidate.named_parameters():
             source_name = name.replace("gate_up_weight", "gate_up_proj").replace("down_weight", "down_proj")
-            expected = _reference_parameter(name, reference[source_name], ep_rank, candidate.experts.local_experts)
+            expected = _mapped_reference(source, name, reference[source_name], ep_rank, candidate.experts.local_experts)
             parameter.copy_(expected)
 
 
@@ -251,7 +317,7 @@ def _initial_parameter_checks(source, candidate, ep_rank):
     checks = []
     for name, parameter in candidate.named_parameters():
         source_name = name.replace("gate_up_weight", "gate_up_proj").replace("down_weight", "down_proj")
-        expected = _reference_parameter(name, reference[source_name], ep_rank, candidate.experts.local_experts)
+        expected = _mapped_reference(source, name, reference[source_name], ep_rank, candidate.experts.local_experts)
         checks.append({"name": f"initial_weight/{name}", "passed": torch.equal(parameter, expected)})
     return checks
 
@@ -284,8 +350,9 @@ def _run_steps(source, candidate, args, device, ep_group):
         (actual.float() * output_grad).sum().backward()
         # The full-expert oracle saw only this rank's tokens. Native local dW
         # includes tokens dispatched from every rank, so sum before slicing.
-        for parameter in source.experts.parameters():
-            dist.all_reduce(parameter.grad, group=ep_group)
+        if not getattr(source, "_dsv41_owner_ep", False):
+            for parameter in source.experts.parameters():
+                dist.all_reduce(parameter.grad, group=ep_group)
         comparisons.extend((
             _compare("input_grad", other_inputs.grad, inputs.grad, args),
             _compare("route_weight_grad", actual_route["weights"].grad, expected_route["weights"].grad, args),
@@ -294,7 +361,7 @@ def _run_steps(source, candidate, args, device, ep_group):
         fp32_checks = {}
         if args.fp32_oracle:
             source_oracle, fp32_checks["hf_bf16"] = _fp32_evidence(
-                source, dict(source.named_parameters()), inputs, expected, output_grad,
+                source, _full_source_parameters(source, ep_group), inputs, expected, output_grad,
                 expected_route, args, ep_group,
             )
             native_oracle, fp32_checks["megamoe"] = _fp32_evidence(
@@ -392,6 +459,8 @@ def main(argv: list[str] | None = None) -> None:
         copy.deepcopy(source), local_num_tokens=args.tokens,
         ep_group=ep_group, dispatch_mode=args.dispatch_mode,
     )
+    if args.reference == "owner_ep":
+        _configure_owner_reference(source, ep_group)
     try:
         result = _run_steps(source, candidate, args, device, ep_group)
         results = [None] * dist.get_world_size()

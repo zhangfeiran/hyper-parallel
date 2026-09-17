@@ -8,8 +8,9 @@
 
 已完成分支准备、提交迁移、独立依赖环境、limit override、无 clamp 激活分支、
 独立 MoE adapter、native 重编译及 block 精度入口。独立 CPU FP32 oracle 已补齐，
-两轮各 16 组 NPU 矩阵已完成。P1 已确认采用同状态 FP32 数值判据；P2 Trainer/FSDP/checkpoint
-和 P3 拓扑/性能扩展尚未实施，不能将 block 验证外推为完整模型支持。
+两轮各 16 组 NPU 矩阵已完成。P1 已确认采用同状态 FP32 数值判据，并补充真实 owner EP 对照。
+P2 已新增 Trainer replacement、训练配方及多层 EP/FSDP 验证入口；具体通过范围与未完成项见
+[训练接入报告](deepseek_v41_training_report.md)。P3 拓扑/性能扩展尚未完成。
 
 ## 分支与提交来源
 
@@ -128,8 +129,8 @@ optimizer 更新后的参数比较。路由离散索引不要求梯度；correct
   保留普通 EP baseline。不得将 MegaMoe 挂进已经完成 EP dispatch 的本地 expert 回调。
 - 使用现有 module replacement 与 `make_transforms()`/weight conversion 机制处理
   `gate_up_proj/down_proj` 到 native 参数布局的转换，并实现初始化、加载和保存闭环。
-- 显式声明新参数名的 expert-axis `Shard(0)` 和 source-shard metadata；
-  planner 当前的 fused expert 名称识别不能直接套用 `gate_up_weight/down_weight`。
+- Trainer replacement 保留 `gate_up_proj/down_proj` 名称，沿用 expert-axis `Shard(0)`
+  和 source-shard metadata；独立 block 的 `gate_up_weight/down_weight` 不进入 planner。
   先保证每 rank 持有完整本地 experts，不引入 expert 内 TP。
 - 验证替换发生在参数分片和 optimizer 构造之前，meta materialization 后 BF16、连续性和形状正确；
   FSDP 每次 unshard 的当前参数供执行使用，不缓存过期 storage/view。
@@ -195,7 +196,7 @@ optimizer 文件和已删除测试相对 DSV4.1 基线无 diff，Multicore 源�
   runtime 改回原始 OPP 路径后通过启动；未修改系统安装或其他用户的 vendor。
 - [block adapter](../../../models/deepseek_v41/adapter/megamoe.py) 保留原 router/shared 模块，
   按 group-local rank 转换一次完整 expert 权重；拒绝非零 limit、hash routing 和错误布局。
-  参数名称发生变化，因此当前明确限于独立 block，不提供未经验证的 Trainer/checkpoint 替换。
+  参数名称发生变化，因此该 adapter 限于独立 block；后续 Trainer 接入使用独立的、保留 HF 参数名的 replacement。
 - [精度入口](../examples/mega_moe/deepseek_v41_precision.md) 覆盖真实 learned routing、
   hotspot/空 expert、push/pull、EP1/EP2/EP4、两个 strided EP2 subgroup、视觉路由、TopK=1/8。
   每组连续三步 SGD，保留原 BF16 门槛和完整逐 tensor 诊断。
@@ -212,7 +213,7 @@ CPU 最终全量范围为 `tests/ut/auto_models/models/deepseek_v41` 与
 `tests/ut/core/multicore`，结果 `156 passed, 610 subtests passed`。
 其中新增文件聚焦测试为 `10 passed, 13 subtests passed`，包含独立 FP32 oracle 和
 HF text / V4.1 text / V4.1 visual router；原有 limit=10 和 Multicore 回归同时通过。
-四层模型配置/构造在 CPU 测试覆盖，完整四层 NPU 训练仍属于 P2。
+该阶段四层模型配置/构造只在 CPU 测试覆盖；后续 P2 进展见训练接入报告。
 
 同状态的 16 组均满足初始参数/路由 IDs/梯度存在性精确匹配。
 MegaMoe 对 FP32 的最坏相对 L2 为 0.5177%，峰值归一化误差为 1.0054%；
@@ -227,3 +228,14 @@ FP32 数值结果、独立训练轨迹的路由分歧，以及同状态验证协
 
 算子偏差追踪入口及数值证据见 [算子精度定位报告](deepseek_v41_operator_precision_report.md)。
 本轮只改变验收入口和诊断工具；融合 SwiGLU、归约边界的替换只用于诊断副本。
+
+## Trainer 接入进展（2026-09-17）
+
+新增 [Trainer expert replacement](../../../models/deepseek_v41/adapter/megamoe_training.py)
+与 [可选训练配方](../../../../examples/training_demo/train_deepseek_v41_megamoe.yaml)。
+所有层在首轮 forward 前登记执行规格，使固定 SHMEM heap 一次覆盖完整模型。
+专家参数只由原 `mlp.experts` FSDP 单元持有，每次 forward 使用当轮 unshard 的参数。
+专家梯度按已有框架的 EDP mesh 归约，未新增 EP dW all-reduce，未修改通用 optimizer。
+
+[训练接入报告](deepseek_v41_training_report.md) 区分 owner EP 数值验收、完整 Trainer 冒烟、
+模型权重 checkpoint，以及尚未验证的融合注意力/mHC 与 optimizer checkpoint 恢复。

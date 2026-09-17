@@ -2,8 +2,9 @@
 
 This example compares a standalone DeepSeek-V4.1 MoE block with
 `DeepseekV41MegaMoe`. It retains the V4.1 learned router and shared experts;
-only routed expert execution changes to `MegaMoeExperts`. It does not install
-Trainer replacements or claim FSDP/checkpoint compatibility.
+only routed expert execution changes to `MegaMoeExperts`. This standalone entrypoint
+does not install Trainer replacements. The separate Trainer path and its validation
+boundaries are described in the [integration report](../../docs/deepseek_v41_training_report.md).
 
 ## Activation and dependencies
 
@@ -44,6 +45,9 @@ The crop's complete attention, mHC and Engram layers are not executed here.
 
 Useful variations:
 
+- `--reference owner_ep` (default): the actual DSV4.1 token A2A/owner-compute EP path.
+- `--reference hf_replicated`: the earlier full-HF-experts-per-rank diagnostic,
+  with a manual BF16 expert-gradient all-reduce.
 - `--dispatch-mode pull`: integrated pull transport.
 - `--route hotspot`: every token selects experts `0..TopK-1`; the remaining
   experts are empty. Gate parameters have no gradient in this diagnostic case.
@@ -59,7 +63,7 @@ Useful variations:
 
 ## Reference and evidence
 
-The HF BF16 path uses the original expert container with the unclamped activation
+The BF16 reference uses the original expert container with the unclamped activation
 and the actual `DeepseekV41TopKRouter`. Shared experts are unchanged apart from
 the explicit zero-limit convention. Both paths start from identical global
 weights. MegaMoe takes a contiguous expert slice in **group-local** rank order
@@ -68,9 +72,17 @@ and transposes `[E,2I,H]` / `[E,H,I]` to `[E_local,H,2I]` / `[E_local,I,H]` once
 The comparison checks exact initial parameter mapping (and exact state alignment
 every step when synchronization is enabled). It includes output, selected IDs, input gradient, routing-weight
 gradient, every parameter gradient, and every parameter after each SGD step.
-The full-expert HF oracle sees only local inputs, so its expert gradients are
-summed within the EP group before comparison with native local expert gradients.
-Router and shared gradients remain local on both paths.
+The default reference calls `deepseek_v41_ep_compute_fn`: tokens are sent to
+the owning rank before local expert compute, and outputs return through A2A.
+Its local expert gradients already include incoming tokens from all EP ranks;
+there is no additional EP expert-gradient reduction. Only `hf_replicated` uses
+the historical BF16 expert-gradient all-reduce. Router and shared gradients
+remain local in this standalone block test. FP32 oracle partial gradients are
+separately summed in FP32 to construct the mathematical reference.
+
+For compatibility, JSON keys named `hf` and `hf_bf16_passed` identify the selected
+BF16 reference; `config.reference` records which implementation actually ran.
+The operator/reduction trace tools intentionally retain `hf_replicated`.
 
 The default `--acceptance fp32` evaluates independent CPU FP32 matrix operations,
 SiLU, score functions and autodiff. It calls neither HF experts nor MegaMoe.
@@ -107,8 +119,9 @@ HYPER_PARALLEL_PLATFORM=torch python -m pytest -q \
 python -m pytest -q tests/torch/multicore/test_deepseek_v41_megamoe.py
 ```
 
-The system-test launcher imports no framework. It requires two visible NPUs,
-activates the native payload, and launches a separate worker. It selects the
+The system-test launcher imports no framework. The block matrix requires two
+visible NPUs; the Trainer EP2/EDP2 case requires four. The launcher activates
+the native payload and launches a separate worker. It selects the
 approved FP32 gate with synchronized state and retains all BF16 diagnostics.
 See the [adaptation plan](../../docs/deepseek_v41_adaptation_plan.md) for the
 current validation status and the remaining Trainer/FSDP work.

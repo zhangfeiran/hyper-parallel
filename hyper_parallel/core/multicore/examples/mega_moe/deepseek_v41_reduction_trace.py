@@ -118,6 +118,7 @@ def _step(source, candidate, args, generator, device, step):
 def main() -> None:
     """Compare synchronized WORLD=EP expert gradients across reduction boundaries."""
     args = precision._arguments(None)
+    args.reference = "hf_replicated"
     if args.vision:
         raise ValueError("Reduction diagnosis currently uses text routing only")
     torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))

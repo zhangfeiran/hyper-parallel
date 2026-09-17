@@ -228,6 +228,7 @@ def _step(source, candidate, args, generator, device, step):
 def main() -> None:
     """Run a synchronized EP1 push/pull diagnostic and write stage evidence."""
     args = precision._arguments(None)
+    args.reference = "hf_replicated"
     if args.vision:
         raise ValueError("This EP1 operator probe currently uses text routing only")
     torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
