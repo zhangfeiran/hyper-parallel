@@ -245,6 +245,141 @@ Dirichlet 为 rank 5 / step 5。选择规则是先按上式得到 5 个最大值
 python3 /home/ma-user/zfr/shared-profiler-results-20260917/analyze_shared_bound.py
 ```
 
+## AIV 奇偶与前后半分工的补充验证
+
+**本次前后半分工没有获得正收益，保留现有奇偶分工。**
+在同一实验二进制内，均衡路由耗时增加 26.29%，Dirichlet(alpha=10) 增加 0.63%，
+两种负载的 p95 都更差。这里比较的两侧都已融合 shared experts，衡量的是 AIV 分组方式的增量影响，
+不与前文独立共享专家基线的历史耗时拼接计算总收益。
+
+### 实验控制与正确性
+
+实验工作树为 `/home/ma-user/zfr/hyper-aiv-halves-20260917`，
+分支 `experiment/megamoe-aiv-halves-20260917`，实现提交 `15b5c57e`。
+通过实验 runner 的 `--aiv-partition interleaved|halves` 选择模式，主模块公共接口未增加配置。
+实验 native 使用共享 ABI 版本 3，避免旧二进制忽略新增模式标志；当前主工作树仍使用原有实现。
+
+| 模式 | 路由 AIV | 共享 AIV | 组内任务索引 |
+| --- | --- | --- | --- |
+| A：奇偶分工 | 1、3、…、47 | 0、2、…、46 | `worker_id / 2` |
+| B：前后半分工 | 0–23 | 24–47 | `worker_id % 24` |
+
+两侧都固定 `--fused --placement idle`，Cube 任务不变，每组 AIV 数量、逻辑任务队列、插入位置、
+事件和完成计数均保持一致。前后半模式同时调整 fast/profiled 两条路径、终止任务归属，
+以及 Pull ready/completion 握手的 worker 判定和组内 leader。
+本次只验证“前半路由、后半共享”，没有测试前后角色互换。
+
+验证结果：
+
+- Multicore UT 通过 129 项、643 个 subtest。
+- 前后半模式的 2 卡 Push/Pull 数值检查通过；均衡、Dirichlet 两种模式的 16 卡目标负载检查通过。
+  所有 rank 的输出、dX、router 梯度及四组权重梯度最大绝对误差均为 0。
+- 12 份真机 trace 的实际 worker 分组检查通过。目标负载每份 trace 均为 355182 条记录、零丢失。
+  将物理 worker 换算回逻辑 lane 后，两种分组的逐任务、逐事件记录计数完全相同。
+- 正式八轮使用同一源码、runner、运行时及 15 个 native 二进制哈希。
+  七组签名在所有 rank 上相同，并与此前独立共享专家基线一致；起止 NPU 健康检查均通过，外部 worker 为零。
+
+### 关闭 profiler 的 ABBA 结果
+
+验收形状和计时范围沿用前文的 505B、4K、MBS2、TP1/EP16 单层 MoE 前反向。
+每轮独立重启，预热 5 步、计时 50 步，每步取 16 个 rank 的最大耗时；
+A1/B1/B2/A2 合并后每种模式各 100 个样本，不开启 `--check` 或 profiler。
+下表变化按 `(T_B / T_A - 1) × 100%` 计算，正数表示变慢。
+
+| 路由 | 奇偶中位数 | 前后半中位数 | 耗时增加 | 奇偶 p95 | 前后半 p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 均衡 | 60.138 ms | 75.949 ms | **26.29%** | 62.005 ms | 81.187 ms |
+| Dirichlet(alpha=10) | 62.752 ms | 63.148 ms | **0.63%** | 64.003 ms | 72.144 ms |
+
+均衡路由的两组配对分别变慢 26.60% / 25.91%；Dirichlet 分别变慢 1.04% / 0.37%。
+均衡 A1/A2 为 60.180 / 60.048 ms，B1/B2 为 76.186 / 75.607 ms，
+回到奇偶分工后耗时恢复，回退在两次独立重启中重复出现。
+
+两种分组的峰值显存完全相同：均衡 allocated/reserved 为 5.7857 / 6.7383 GiB，
+Dirichlet 为 5.9913 / 6.9453 GiB。显存口径仍为 Torch NPU allocator，不包含完整外部 SHMEM 占用。
+
+### 内部 profiler 的观察
+
+下表先对每个 rank 的同阶段计算记录求每个 worker 的累计时间均值，再对 rank 0、15 取平均。
+单位为 ms；该值是阶段的 worker 时间统计，不能作为整个 kernel 的关键路径耗时。
+
+| 路由 | 指标 | 奇偶 | 前后半 |
+| --- | --- | ---: | ---: |
+| 均衡 | 共享 SwiGLU 计算 | 0.0900 | 0.0870 |
+| 均衡 | 共享 SwiGLUGrad 计算 | 0.2255 | 0.2281 |
+| 均衡 | shared down 前 Cube 等待 | 0.2265 | 0.3058 |
+| Dirichlet | 共享 SwiGLU 计算 | 0.0900 | 0.0911 |
+| Dirichlet | 共享 SwiGLUGrad 计算 | 0.2173 | 0.2214 |
+| Dirichlet | shared down 前 Cube 等待 | 0.2573 | 0.2355 |
+
+共享向量计算没有表现出稳定收益，等待时间变化也未在两种路由间呈现一致改善。
+诊断 trace 的前向入口等待存在波动，而且内部 profiler 使用 `ProcessProfiled`，
+正式计时使用 `ProcessFast`；因此不能用单次内部 kernel 总跨度直接解释正式 ABBA 的全部回退。
+
+### Fast path 的 CANN 算子级补采
+
+为观察实际 `ProcessFast`，另在相同 16 卡均衡负载上采集 CANN Level1，仅开启 NPU 活动，
+关闭 Torch 的调用栈和 shape 记录，且不启用 MegaMoE 内部 profiler。
+每种分组先预热 5 步、普通执行 3 步，再进行 1 步 profiler 预热、5 步正式采集。
+补采的 native 哈希、源码、运行时和七组签名均与正式实验一致；起止设备健康检查通过、无外部 worker。
+
+NPU-only 的 `kernel_details.csv` 没有 Step 列。
+每个 rank 均恰有 5 次 `HyperMegaMoe` 和 5 次 `HyperMegaMoeGrad`，
+按本 rank 的开始时间排序，将第 j 次前向与第 j 次反向配对；采集序号是分析脚本定义的索引，
+不冒充原始 Step 字段，也不使用不同设备的绝对时间戳做对齐。
+下表每个采集序号先取 rank 最大设备 Duration，再对 5 个值取中位数：
+
+| CANN 设备耗时指标 | 奇偶 | 前后半 |
+| --- | ---: | ---: |
+| 前向 megakernel | 22.675 ms | 19.947 ms |
+| 反向 megakernel | **28.447 ms** | **36.877 ms** |
+| 同一 rank 内前向与反向之和，再取 rank 最大值 | 50.921 ms | 56.860 ms |
+
+三个统计量分别聚合，不能把前两行的中位数相加来替代第三行。
+本表来自开启 CANN profiler 的 5 次采集，只用于定位现象，不能替代前文关闭 profiler 的 100 样本 ABBA，
+也不能用它精确分摊正式实验的全部 15.811 ms 回退。
+
+反向的 5 个逐次 rank 最大值为：
+
+- 奇偶：28.489、28.447、28.467、28.431、28.383 ms。
+- 前后半：39.061、35.300、28.574、38.726、36.877 ms，
+  对应最慢 rank 为 11、4、8、14、4。
+
+这说明本轮前后半分工出现了**部分 rank 的反向 megakernel 长尾**。
+其全部 80 个 rank/采集样本的反向中位数仍为 28.321 ms，与奇偶的 28.207 ms 接近，
+只看平均或常见 rank 会掩盖长尾。此前内部 trace 只采 rank 0/15，
+且走不同的 profiling 路径，因此不足以单独解释正式性能回退。
+
+目前证据将问题定位到 fast path 的反向 megakernel 长尾；具体是哪条内部依赖等待或硬件资源冲突，
+本次没有进一步确证。AIV 分组的默认选择依据正式 ABBA，继续保留奇偶分工。
+
+### 复现与产物
+
+本轮产物根目录为 `/home/ma-user/zfr/aiv-halves-results-20260917/`：
+
+- `validate.sh`、`validation.log`：设备空闲锁下的实际实验编排及退出状态。
+- `balanced/abba_summary.json`、`dirichlet/abba_summary.json`：正式结果。
+- `<route>/<A1|B1|B2|A2>/`：逐 rank 样本、签名、命令、源码、二进制哈希及 NPU 健康快照。
+- `profile-<route>-<partition>/`、`small-<push|pull>-halves/`：正确性结果及完整内部 trace。
+- `profile-audit.json`、`profile-stage-comparison.json`：实际 worker 分配与阶段统计。
+- `validate_results.py`、`acceptance.json`、`ACCEPTANCE_PASSED`：完整验收审计。
+- `build-source-audit.json`、`build.log`、`ut-multicore.log`：构建来源和单测证据。
+- `cann-<partition>/`、`cann-facts-<partition>-rank<N>/`：fast path 的 CANN 原始记录和事实包。
+- `fast_path_profile.py`、`profile_fast_path.sh`、`cann-launch.log`：补采脚本、实际启动及退出记录。
+- `analyze_fast_path.py`、`fast-path-summary.json`：逐 rank/采集序号耗时、原始 CSV 行号、哈希及聚合结果。
+  CANN 事实包由 `pangu-perf` 提取，rank 聚合和上述分析由独立脚本完成。
+
+在上述实验工作树构建并激活 native 后，使用相同入口，A/B 仅切换 `--aiv-partition`：
+
+```bash
+python -m torch.distributed.run --nproc-per-node=16 --master-port=63018 \
+  examples/torch/multicore/shared_expert_profile.py \
+  --output /path/to/result --route balanced --fused --placement idle \
+  --aiv-partition halves --warmup 5 --steps 50
+```
+
+实验代码和二进制留在独立工作树；主分支不切换 AIV 分组方式。
+
 ## 尚不支持：共享权重梯度直接 FP32 累加
 
 探索性的 FP32 累加检查最初因独立 PanGu 基线无法加载 `libatb.so` 而中止。
