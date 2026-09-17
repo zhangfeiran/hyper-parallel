@@ -6,8 +6,10 @@
 先验证关闭 SwiGLU clamp 后的 routed-expert 前后向精度，再接入完整训练链路。
 首轮验证约定 `swiglu_limit=0.0`；baseline 和 MegaMoe 使用相同的配置、权重和路由。
 
-本轮完成分支准备、已有提交迁移和源码梳理。模型适配、limit 覆盖入口、native 重编译及
-NPU 精度验证尚未执行。此文件中的后续阶段是实施计划，不代表已经支持 DSV4.1。
+已完成分支准备、提交迁移、独立依赖环境、limit override、无 clamp 激活分支、
+独立 MoE adapter、native 重编译及 block 精度入口。独立 CPU FP32 oracle 已补齐，
+两轮各 16 组 NPU 矩阵已完成。P1 的数值验收仍待确认；P2 Trainer/FSDP/checkpoint
+和 P3 拓扑/性能扩展尚未实施，不能将 block 验证外推为完整模型支持。
 
 ## 分支与提交来源
 
@@ -53,7 +55,7 @@ NPU 精度验证尚未执行。此文件中的后续阶段是实施计划，不�
 | [DSV4.1 router/model](../../../models/deepseek_v41/modeling_deepseek_v41.py) | router 返回 logits、weights、indices；支持文本/图像 correction bias | 保留 router 原语义及 `image_mask`，只替换 routed experts 执行 |
 | [DSV4.1 EP adapter](../../../models/deepseek_v41/adapter/expert_parallel.py) | 通用 EP dispatch/combine 后执行本地 experts，再加 shared experts | MegaMoe 自带 dispatch/combine；新路径必须在完整 routed 分支入口切换，避免重复通信 |
 | [MegaMoeExperts](../modules/mega_moe/module.py) | 接收 hidden states、全局 expert IDs 和 weights；持有本地 expert 参数 | 绑定正确 EP subgroup，保留 weights 梯度；shared experts 先沿用模型实现 |
-| [配置构造](../../../../examples/training_demo/cropped_deepseek_v41.py) | 从源 `text_config["swiglu_limit"]` 传入 HF config | 在构造模型前显式覆盖验证配置；当前入口还没有 limit override 参数 |
+| [配置构造](../../../../examples/training_demo/cropped_deepseek_v41.py) | 从源 `text_config["swiglu_limit"]` 传入 HF config | 已支持构造前显式覆盖，并保留源值；普通 baseline 默认仍沿用源值 |
 | [参数布局与通用 EP](../../../distributed/expert_parallel/experts.py) | fused `gate_up_proj [E,2I,H]`、`down_proj [E,H,I]` | MegaMoe 参数为 `[E_local,H,2I]`、`[E_local,I,H]`；需要显式转换 |
 | [模块替换](../../../models/replacement.py) | 默认要求参数身份、注册名和 state dict 不变；支持 `make_transforms()` | 参数改名、转置必须提供 weight conversion，不能直接赋值后声称兼容 checkpoint |
 | [DSV4.1 注册](../../../models/deepseek_v41/adapter/registration.py) | 声明 Engram、视觉及 decoder 的 FSDP 包装/执行顺序 | 保留声明；新 experts FQN、EP 参数元数据和嵌套 FSDP 单元必须一致 |
@@ -83,8 +85,9 @@ TopK 大于 1 时归一化，再乘 `routed_scaling_factor`。
 4. MegaMoe adapter 对非零 limit 明确拒绝。保留普通 DSV4.1 baseline 的 limit=10 回归；
    不能以本轮结果宣称已经验证原始 clamp 模型精度。
 
-当前主机未安装带 `deepseek_v4` 的 Transformers，因此尚未实测 HF 的零值分支；
-此项是开始 NPU 比较前的必验条件。
+已在隔离环境实测 Transformers 5.13.0：HF 的零值仍会执行 clamp，并将 up 截断为零。
+当前实现仅对 limit=0 的实例绑定无 clamp 方法，同时覆盖 routed/shared 分支；
+limit=10 保留 HF 方法及参数身份。CPU 测试包含大幅值输出/梯度、配置透传和真实模型构造。
 
 ## 分阶段实施
 
@@ -180,6 +183,42 @@ optimizer 和测试回退后，在新分支重跑
 optimizer 文件和已删除测试相对 DSV4.1 基线无 diff，Multicore 源码/测试相对来源分支无 diff。
 `git diff --check`、文档本地链接检查通过。
 
-DSV4.1 CPU UT 在 collection 阶段报
+分支准备阶段，旧环境的 DSV4.1 CPU UT 曾在 collection 阶段报
 `ModuleNotFoundError: No module named 'transformers.models.deepseek_v4'`。
-这是当前依赖不满足的证据；DSV4.1 精度、native build 和 NPU 测试仍未验证。
+实施阶段已使用独立 Transformers 5.13.0 环境解决，旧环境未修改。
+
+## 实施记录（2026-09-17）
+
+- 隔离环境使用 Transformers 5.13.0、Torch/torch-npu 2.9.1、torchdata 0.11.0。
+  当前 checkout 的 editable import 已确认；CANN 9.1.0 的 910B native payload 已重编译。
+- 本机 CANN 的第三方 vendor 配置不可读，编译使用仅链接同版本内置文件的独立 OPP 视图。
+  runtime 改回原始 OPP 路径后通过启动；未修改系统安装或其他用户的 vendor。
+- [block adapter](../../../models/deepseek_v41/adapter/megamoe.py) 保留原 router/shared 模块，
+  按 group-local rank 转换一次完整 expert 权重；拒绝非零 limit、hash routing 和错误布局。
+  参数名称发生变化，因此当前明确限于独立 block，不提供未经验证的 Trainer/checkpoint 替换。
+- [精度入口](../examples/mega_moe/deepseek_v41_precision.md) 覆盖真实 learned routing、
+  hotspot/空 expert、push/pull、EP1/EP2/EP4、两个 strided EP2 subgroup、视觉路由、TopK=1/8。
+  每组连续三步 SGD，保留原 BF16 门槛和完整逐 tensor 诊断。
+- [独立 FP32 oracle](../examples/mega_moe/deepseek_v41_oracle.py) 使用 CPU FP32 原语和 autograd，
+  不调用 HF expert 或 native 实现；固定实际离散路由，使用每条路径当前权重重算连续函数。
+  expert 梯度在实际 EP group 内以 FP32 归约；同时比较一次 SGD 更新。
+  该 oracle 不是独立连续三步的 FP32 训练轨迹，TopK 离散选择仍由 BF16 baseline 精确对比覆盖。
+- 按用户指示允许 busy NPU，继续记录进程占用。当前运行仅作精度验证，没有性能结论。
+- 原 BF16 `rtol=0.02, atol=0.002` 判据保留：热点和部分多卡用例有少量 expert dW 超阈值。
+  FP32 复核还发现未改动的 shared expert BF16 梯度也会触发同一逐元素门槛。
+  因而必须分别报告数值误差与集成语义检查，不能通过放宽阈值直接宣称验收完成。
+
+CPU 最终全量范围为 `tests/ut/auto_models/models/deepseek_v41` 与
+`tests/ut/core/multicore`，结果 `156 passed, 610 subtests passed`。
+其中新增文件聚焦测试为 `10 passed, 13 subtests passed`，包含独立 FP32 oracle 和
+HF text / V4.1 text / V4.1 visual router；原有 limit=10 和 Multicore 回归同时通过。
+四层模型配置/构造在 CPU 测试覆盖，完整四层 NPU 训练仍属于 P2。
+
+同状态的 16 组均满足初始参数/路由 IDs/梯度存在性精确匹配。
+MegaMoe 对 FP32 的最坏相对 L2 为 0.5177%，峰值归一化误差为 1.0054%；
+HF BF16 对 FP32 分别为 0.5482% 和 1.1716%。原 BF16 逐元素硬门槛通过 5/16 组。
+在 P2 前需要确认 FP32 数值验收口径，并保留原 BF16 差异报告。
+本阶段不更改通用 optimizer，也不恢复已删除的参数回拷测试。
+
+FP32 数值结果、独立训练轨迹的路由分歧，以及同状态验证协议见
+[block 精度实施记录](deepseek_v41_block_precision_report.md)。

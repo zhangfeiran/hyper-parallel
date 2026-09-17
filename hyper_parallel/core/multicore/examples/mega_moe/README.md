@@ -112,3 +112,9 @@ not affect steady-state timing. Timing is plain A/B, not A/B/B/A, and uses the
 rank-maximum complete optimizer-step latency after independent warmup. This
 random-weight benchmark validates integration; it does not establish checkpoint
 convergence.
+
+## DeepSeek-V4.1 block validation
+
+See [the DSV4.1 precision example](deepseek_v41_precision.md) for the unclamped
+MoE adapter, HF BF16 comparisons and an independent CPU FP32 oracle. This is a
+standalone block validator; Trainer/FSDP integration remains a separate stage.
