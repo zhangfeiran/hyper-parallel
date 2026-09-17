@@ -63,7 +63,10 @@ def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -
     tensor_bytes = (
         (capacity + routed_slots) * specification["hidden_size"] * element_size
     )
-    event_bytes = event_workspace_bytes(specification["ep_size"], specification["num_experts"])
+    event_bytes = event_workspace_bytes(
+        specification["ep_size"], specification["num_experts"],
+        shared_expert=bool(specification.get("shared_intermediate_size", 0)),
+    )
     return tensor_bytes + 2 * event_bytes + 4 * (_WORKSPACE_ALIGNMENT - 1)
 
 
@@ -164,8 +167,12 @@ class MegaMoeWorkspace:
         self.device = device
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
-        event_bytes = event_workspace_bytes(spec.ep_size, spec.num_experts)
+        self.event_counter_bytes = mega_moe_event_capacity(
+            spec.num_experts, spec.ep_size, shared_expert=bool(spec.shared_intermediate_size),
+        ) * 4
+        event_bytes = event_workspace_bytes(
+            spec.ep_size, spec.num_experts, shared_expert=bool(spec.shared_intermediate_size),
+        )
         try:
             field_name = "source_buffer" if self.dispatch_mode == "pull" else "expert_buffer"
             rows = spec.routed_slots if self.dispatch_mode == "pull" else requested_capacity

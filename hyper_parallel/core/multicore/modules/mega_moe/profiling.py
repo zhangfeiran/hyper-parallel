@@ -55,10 +55,12 @@ def _resolve_expert_owner(
     operator: OperatorNode,
     task_desc: TaskDescC,
     raw_context: Any,
-) -> int:
+) -> int | None:
     """Resolve the global expert ID from a graph operator and its concrete task."""
     context = _require_profile_context(raw_context)
     topology = context.topology
+    if operator.name.startswith("shared_"):
+        return None
     rank_owner_base = topology.rank_id * topology.single_rank_expert_num
 
     if operator.op_type == OpType.GMM:

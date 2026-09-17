@@ -133,6 +133,16 @@ class HyperMegaMoe : public OpDef {
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Input("shared_ptrs")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_UINT8, ge::DT_UINT8})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Input("shared_runtime")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_UINT8, ge::DT_UINT8})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
         this->Output("dispatch_target")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})

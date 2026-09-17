@@ -45,6 +45,8 @@ mega_moe_npu(
     const at::Tensor& runtime_config,      // pos 20
     const at::Tensor& all_event_counters,  // pos 21
     const at::Tensor& profile_buffer,      // pos 22
+    const at::Tensor& shared_ptrs,
+    const at::Tensor& shared_runtime,
     int64_t rank_id,
     int64_t ep,
     int64_t expert_num,
@@ -58,7 +60,7 @@ mega_moe_npu(
         down_proj_weight, down_proj_glist, down_proj_y,
         combine_target, combine_target_off, combine_src_off, combine_size,
         gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
-        runtime_config, all_event_counters, profile_buffer,
+        runtime_config, all_event_counters, profile_buffer, shared_ptrs, shared_runtime,
         rank_id, ep, expert_num, hidden_size, seq_size);
     return std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&>(
         dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target);
@@ -93,6 +95,8 @@ mega_moe_meta(
     const at::Tensor& /*runtime_config*/,
     const at::Tensor& /*all_event_counters*/,
     const at::Tensor& /*profile_buffer*/,
+    const at::Tensor& /*shared_ptrs*/,
+    const at::Tensor& /*shared_runtime*/,
     int64_t /*rank_id*/,
     int64_t /*ep*/,
     int64_t /*expert_num*/,

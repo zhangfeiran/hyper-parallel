@@ -150,6 +150,7 @@ class MegaMoeExperts(MulticoreModule):
         ep_size: int = 1,
         ep_group: Any | None = None,
         dispatch_mode: str = "push",
+        shared_intermediate_size: int = 0,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -165,12 +166,17 @@ class MegaMoeExperts(MulticoreModule):
                 and raises a clear error if a route exceeds it.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
+            shared_intermediate_size: Optional local shared SwiGLU width. Zero disables
+                fusion. The caller supplies contiguous BF16 dense weights to forward.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
             ep_group: Torch expert-parallel process group, possibly a subgroup of
                 WORLD. Expert ownership follows group-local rank order. Disjoint
                 PP/DP groups bootstrap independently; one process can have only
                 one ordered EP membership active in SHMEM at a time.
         """
+        if (isinstance(shared_intermediate_size, bool) or not isinstance(shared_intermediate_size, int)
+                or shared_intermediate_size < 0):
+            raise ValueError("shared_intermediate_size must be a nonnegative integer")
         if dispatch_mode not in ("push", "pull"):
             raise ValueError("dispatch_mode must be push or pull")
         self._validate_topology(
@@ -195,6 +201,8 @@ class MegaMoeExperts(MulticoreModule):
             "ep_group": ep_group,
             "dispatch_mode": dispatch_mode,
         }
+        if shared_intermediate_size:
+            specification["shared_intermediate_size"] = shared_intermediate_size
         compatibility_key = (
             local_num_tokens,
             hidden_size,
@@ -205,6 +213,7 @@ class MegaMoeExperts(MulticoreModule):
             ep_size,
             id(ep_group),
             dispatch_mode,
+            shared_intermediate_size,
         )
         super().__init__(
             resource_specification=specification,
@@ -218,6 +227,7 @@ class MegaMoeExperts(MulticoreModule):
         self.top_k = top_k
         self.expert_capacity_factor = expert_capacity_factor
         self.dispatch_mode = dispatch_mode
+        self.shared_intermediate_size = shared_intermediate_size
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
@@ -361,6 +371,8 @@ class MegaMoeExperts(MulticoreModule):
         topk_weights: torch.Tensor,
         *,
         tokens_per_expert: torch.Tensor | None = None,
+        shared_gate_up_weight: torch.Tensor | None = None,
+        shared_down_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Route token states through the configured experts.
 
@@ -370,6 +382,8 @@ class MegaMoeExperts(MulticoreModule):
             topk_weights: Router weights with the same shape as ``topk_ids``.
             tokens_per_expert: Optional trusted exact global-expert histogram.
                 Supplying Router-produced counts skips histogram recomputation.
+            shared_gate_up_weight: Local shared weight with shape [2 * shared width, hidden size].
+            shared_down_weight: Local shared weight with shape [hidden size, shared width].
 
         Returns:
             Tensor matching the shape and dtype of ``hidden_states``.
@@ -385,6 +399,18 @@ class MegaMoeExperts(MulticoreModule):
             topk_weights,
             tokens_per_expert,
         )
+        shared_weights = (shared_gate_up_weight, shared_down_weight)
+        if self.shared_intermediate_size:
+            expected_shapes = ((2 * self.shared_intermediate_size, self.hidden_size),
+                               (self.hidden_size, self.shared_intermediate_size))
+            for weight, expected in zip(shared_weights, expected_shapes):
+                if weight is None or tuple(weight.shape) != expected:
+                    raise ValueError(f"Shared weight must have shape {expected}")
+                if (weight.device != hidden_flat.device or weight.dtype != hidden_flat.dtype
+                        or not weight.is_contiguous()):
+                    raise ValueError("Shared weights must be contiguous and match the input device and dtype")
+        elif any(weight is not None for weight in shared_weights):
+            raise ValueError("Shared weights require shared_intermediate_size at construction")
         resources = self._get_execution_resources(hidden_flat)
         # The expert autograd bridge consumes permutation gradients before the
         # workspace can be reused, so route preparation needs no separate node.
@@ -406,14 +432,22 @@ class MegaMoeExperts(MulticoreModule):
             _select_plan(resources, route),
             resources.workspace,
             topk_weights=topk_weights if self.dispatch_mode == "pull" else None,
+            **({"shared_weight1": shared_gate_up_weight, "shared_weight2": shared_down_weight}
+               if self.shared_intermediate_size else {}),
         )
+        shared_output = None
+        if self.shared_intermediate_size:
+            expert_output, shared_output = expert_output
         if self.dispatch_mode == "pull":
-            return expert_output.reshape_as(hidden_states)
-        output = restore_topk_output(
-            expert_output,
-            route.unpermute_mapping,
-            topk_weights,
-        )
+            output = expert_output
+        else:
+            output = restore_topk_output(
+                expert_output,
+                route.unpermute_mapping,
+                topk_weights,
+            )
+        if shared_output is not None:
+            output = output + shared_output
         return output.reshape(hidden_states.shape)
 
     def _create_execution_resources(

@@ -14,6 +14,7 @@
 # ============================================================================
 """MoE-FFN backward compute graph."""
 
+from hyper_parallel.core.multicore.modules.mega_moe.shared_schedule import add_shared_graph
 from hyper_parallel.core.multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
 )
@@ -221,7 +222,8 @@ def build_backward_graph(tsv, *,
                          hidden_size:       int = 7168,
                          intermediate_size: int = 2048,
                          dtype_size:        int = 2,
-                         num_cube_cores:    int = 24) -> ComputeGraph:
+                         num_cube_cores:    int = 24,
+                         shared_intermediate_size: int = 0) -> ComputeGraph:
     """Build the MoE-FFN backward DAG.
 
     Execution order:
@@ -270,4 +272,7 @@ def build_backward_graph(tsv, *,
           .add_edge(swiglu_grad, gate_grad)
           .add_edge(gate_grad,   combine)
           .add_edge(gate_grad,   w1_grad))
+    if shared_intermediate_size:
+        add_shared_graph(graph, tsv, hidden_size, shared_intermediate_size, num_cube_cores,
+                         backward=True)
     return graph

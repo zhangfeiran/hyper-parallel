@@ -55,6 +55,7 @@ from hyper_parallel.core.multicore.profiler.profiler import _enable_runtime_conf
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
 from .spec import MegaMoeSpec
+from .shared import shared_tiling_bytes
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,8 @@ class MegaMoePlan:
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
+    shared_forward_runtime: Any = None
+    shared_backward_runtime: Any = None
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -129,6 +132,7 @@ def _build_runtime_configs(spec: MegaMoeSpec, task_values: TaskSplitValue) -> tu
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
+        shared_intermediate_size=spec.shared_intermediate_size,
     )
     forward_graph.propagate_splits(task_values)
     forward_data = build_forward_config(
@@ -136,6 +140,7 @@ def _build_runtime_configs(spec: MegaMoeSpec, task_values: TaskSplitValue) -> tu
         task_values,
         spec.rank_id,
         spec.num_cube_cores,
+        shared_placement=spec.shared_placement,
     )
     backward_graph = build_backward_graph(
         task_values,
@@ -145,6 +150,7 @@ def _build_runtime_configs(spec: MegaMoeSpec, task_values: TaskSplitValue) -> tu
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
+        shared_intermediate_size=spec.shared_intermediate_size,
     )
     backward_graph.propagate_splits(task_values)
     backward_data = build_backward_config(
@@ -152,12 +158,13 @@ def _build_runtime_configs(spec: MegaMoeSpec, task_values: TaskSplitValue) -> tu
         task_values,
         spec.rank_id,
         spec.num_cube_cores,
+        shared_placement=spec.shared_placement,
     )
     return forward_graph, forward_data, backward_graph, backward_data
 
 
 def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
-    """Build trimmed dense forward/backward runtime images without fusion slots.
+    """Build routed and optional shared forward/backward runtime images.
 
     Args:
         spec: Validated local-token and expert topology specification.
@@ -206,6 +213,10 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     )
     return MegaMoePlan(
         spec=spec,
+        shared_forward_runtime=(_tensor_from_bytes(shared_tiling_bytes(spec, backward=False), device)
+                                if spec.shared_intermediate_size else None),
+        shared_backward_runtime=(_tensor_from_bytes(shared_tiling_bytes(spec, backward=True), device)
+                                 if spec.shared_intermediate_size else None),
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_data, spec.local_experts, spec.num_cube_cores,
         ),

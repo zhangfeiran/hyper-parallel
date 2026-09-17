@@ -48,6 +48,8 @@ class MegaMoeSpec:
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
+    shared_intermediate_size: int = 0
+    shared_placement: str = "idle"
 
     @property
     def local_experts(self) -> int:
@@ -170,4 +172,5 @@ def bind_mega_moe_spec(
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
         dispatch_mode=specification.get("dispatch_mode", "push"),
+        shared_intermediate_size=specification.get("shared_intermediate_size", 0),
     )

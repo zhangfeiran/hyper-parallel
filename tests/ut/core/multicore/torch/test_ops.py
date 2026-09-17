@@ -65,6 +65,7 @@ class TestTorchOps(unittest.TestCase):
             patch.object(ops, "preload_vendor_library") as preload,
             patch.object(ops.torch.ops, "load_library") as load,
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version", return_value=1, create=True),
+            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_shared_version", return_value=2, create=True),
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_grad", self._backward_op(), create=True),
         ):
             ops._load_native()
@@ -85,6 +86,7 @@ class TestTorchOps(unittest.TestCase):
             patch.object(ops, "preload_vendor_library"),
             patch.object(ops.torch.ops, "load_library"),
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version", return_value=1, create=True),
+            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_shared_version", return_value=2, create=True),
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_grad", self._backward_op("e"), create=True),
             self.assertRaisesRegex(NativeComponentUnavailableError, "backward dispatch storage reuse"),
         ):
@@ -104,5 +106,17 @@ class TestTorchOps(unittest.TestCase):
             patch.object(ops.torch.ops, "load_library"),
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version", return_value=0, create=True),
             self.assertRaisesRegex(NativeComponentUnavailableError, "transport ABI mismatch"),
+        ):
+            ops._load_native()
+
+    def test_adapter_rejects_incompatible_shared_protocol(self) -> None:
+        """Reject stale native argument layouts before passing indirect shared tensors."""
+        with (
+            patch.object(ops, "get_multicore_paths", return_value=(Path("vendor"), Path("old.so"))),
+            patch.object(ops, "preload_vendor_library"),
+            patch.object(ops.torch.ops, "load_library"),
+            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version", return_value=1, create=True),
+            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_shared_version", return_value=0, create=True),
+            self.assertRaisesRegex(NativeComponentUnavailableError, "shared-expert ABI mismatch"),
         ):
             ops._load_native()

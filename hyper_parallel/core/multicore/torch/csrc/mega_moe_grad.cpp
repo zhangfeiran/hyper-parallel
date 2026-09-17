@@ -51,6 +51,8 @@ BwdReturn mega_moe_grad_npu(
     const at::Tensor& runtime_config,         // pos 27
     const at::Tensor& all_event_counters,     // pos 28
     const at::Tensor& profile_buffer,          // pos 29
+    const at::Tensor& shared_ptrs,
+    const at::Tensor& shared_runtime,
     int64_t rank_id,
     int64_t ep,
     int64_t expert_num,
@@ -63,7 +65,7 @@ BwdReturn mega_moe_grad_npu(
         permute_out, gate_dw, group_list,
         act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
         swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
-        runtime_config, all_event_counters, profile_buffer,
+        runtime_config, all_event_counters, profile_buffer, shared_ptrs, shared_runtime,
         rank_id, ep, expert_num, hidden_size, seq_size);
     return BwdReturn(dispatch_target, hidden_dw, act_grad_y, grad_gate,
                      gate_dx, grad_x, permute_out, gate_dw);
@@ -103,6 +105,8 @@ BwdReturn mega_moe_grad_meta(
     const at::Tensor& /*runtime_config*/,
     const at::Tensor& /*all_event_counters*/,
     const at::Tensor& /*profile_buffer*/,
+    const at::Tensor& /*shared_ptrs*/,
+    const at::Tensor& /*shared_runtime*/,
     int64_t /*rank_id*/,
     int64_t /*ep*/,
     int64_t /*expert_num*/,

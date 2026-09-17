@@ -35,6 +35,7 @@ Outputs (per rank):
 import argparse
 import os
 
+from hyper_parallel.core.multicore.modules.mega_moe.shared_schedule import reorder_shared_tasks
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
@@ -88,7 +89,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
-                          num_cube_cores: int = 24) -> RuntimeConfigC:
+                          num_cube_cores: int = 24, *, shared_placement: str = "tail") -> RuntimeConfigC:
     """Build RuntimeConfig for a single rank.
 
     Args:
@@ -124,8 +125,12 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     add_terminate(cfg, tsv,
                   w2_grad_op.task_num + w1_grad_op.task_num
                   + combine_op.task_num // tsv.ep * tsv.ep)
-    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num, combine_op.task_num)
-    revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
+    if any(op.name.startswith("shared_") for op in graph.topological_sort()):
+        reorder_shared_tasks(cfg, graph, tsv, num_cube_cores,
+                             backward=True, placement=shared_placement)
+    else:
+        revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num, combine_op.task_num)
+        revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
     add_dynamic_data(cfg, tsv, dynamic_input_position=19)
 
     cfg.task_num = task_num_all

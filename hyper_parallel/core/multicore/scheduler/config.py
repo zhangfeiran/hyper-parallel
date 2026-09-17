@@ -42,7 +42,7 @@ EVENT_INVALID_ID         = 0xFFFFFFFF
 RUNTIME_PROTOCOL_VERSION = 1
 
 
-def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
+def mega_moe_event_capacity(num_experts: int, ep_size: int, *, shared_expert: bool = False) -> int:
     """Reserve graph events and the complete atomic write at the last trigger.
 
     Args:
@@ -56,7 +56,7 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
         raise ValueError("num_experts must be positive and divisible by ep_size")
     # Ready and worker completion follow termination with separate atomic lanes.
     final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
-    required = final_event + ATOMIC_ADD_VALUE_LEN
+    required = final_event + ATOMIC_ADD_VALUE_LEN + (32 if shared_expert else 0)
     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
 
 
@@ -306,6 +306,7 @@ class TaskSplitValue:
         return 1 + self.all_expert_num + e + e + e
 
     # ── Runtime counters (reset by init_task_split_value per rank) ────────────
+    shared_expert:        bool = False
     rank_id:              int = 0
     pre_pre_event_num:    int = 0
     pre_event_num:        int = 0
@@ -440,9 +441,10 @@ def validate_runtime_config(
         _validate_task_bounds(task, descriptor_index)
 
         if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
-            _validate_swiglu_task(task, descriptor_index, group_size)
+            _validate_swiglu_task(task, descriptor_index, 1 if task.inputs[0].tensor_type == 2 else group_size)
         elif task_type == TaskType.TASK_GROUPED_MATMUL:
-            _validate_gmm_task(task, descriptor_index, num_cube_cores * local_experts)
+            groups = 1 if task.inputs[0].tensor_type == 2 else local_experts
+            _validate_gmm_task(task, descriptor_index, num_cube_cores * groups)
         else:
             _validate_shmem_task(task, descriptor_index, tsv)
 
@@ -465,7 +467,7 @@ def configure_ready_handshake(cfg: RuntimeConfigC, tsv: TaskSplitValue) -> None:
     cfg.all_event_num_triggers[completion_event] = cfg.num_workers
 
 
-def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
+def event_workspace_bytes(ep_size: int, num_experts: int, *, shared_expert: bool = False) -> int:
     """Return graph counters plus separate ready and completion generations.
 
     Args:
@@ -475,7 +477,7 @@ def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
     Returns:
         Required byte count for one direction's event workspace.
     """
-    counter_bytes = mega_moe_event_capacity(num_experts, ep_size) * ctypes.sizeof(ctypes.c_int32)
+    counter_bytes = mega_moe_event_capacity(num_experts, ep_size, shared_expert=shared_expert) * 4
     if ep_size <= 1:
         return counter_bytes
     return counter_bytes + 2 * (ep_size + 1) * READY_CACHE_LINE_BYTES

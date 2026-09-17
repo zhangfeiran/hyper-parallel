@@ -99,6 +99,22 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         mock_create_parameters.assert_not_called()
 
+    def test_shared_weights_are_validated_before_resource_initialization(self) -> None:
+        """Reject incomplete shared branches and incompatible dense weight storage."""
+        experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                                 num_experts=4, top_k=2, ep_size=2, shared_intermediate_size=16).to(torch.bfloat16)
+        self.addCleanup(experts.close)
+        x = torch.zeros(128, 16, dtype=torch.bfloat16)
+        ids = torch.zeros(128, 2, dtype=torch.int32)
+        probs = torch.ones(128, 2)
+        w1 = torch.ones(32, 16, dtype=torch.bfloat16)
+        w2 = torch.ones(16, 16, dtype=torch.bfloat16)
+        with patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True):
+            for first, second in ((None, w2), (w1, None), (w1[:16], w2), (w1.float(), w2), (w1, w2.t())):
+                with self.subTest(first=first is None, second=second is None), self.assertRaises(ValueError):
+                    experts(x, ids, probs, shared_gate_up_weight=first, shared_down_weight=second)
+        self.assertIsNone(experts._resource_group.resources)
+
     def test_constructor_accepts_more_than_sixteen_local_experts(self) -> None:
         """Create all expert parameters without a fixed scratch-derived limit."""
         for local_experts in (17, 33, 128):

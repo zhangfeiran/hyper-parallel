@@ -132,7 +132,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         Expectation: Retain expanded event storage when allocating through the SHMEM API.
         """
         spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
-                               ep_size=64, num_experts=1024, dispatch_mode="push")
+                               ep_size=64, num_experts=1024, dispatch_mode="push", shared_intermediate_size=0)
         workspace = MegaMoeWorkspace(shared=True)
         with (
             patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(

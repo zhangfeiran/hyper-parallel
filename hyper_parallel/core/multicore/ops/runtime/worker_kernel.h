@@ -76,6 +76,11 @@ class KernelWorkerBase {
     this->cube_task_num = getTaskIndexNumByTaskType(this->runtimeConfigPtr, TaskAiCoreType::TASK_AICORE_CUBE);
     this->core_num = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 5);
     this->vector_num = this->core_num * 2;
+    // A disabled shared branch passes event storage as its pointer-table placeholder.
+    if (input_list[Derived::SHARED_PTRS_IDX] != input_list[Derived::EVENT_IDX] &&
+        reinterpret_cast<__gm__ uint64_t *>(input_list[Derived::SHARED_PTRS_IDX])[0] == 1) {
+      shared_vector_count_ = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 4) / 128;
+    }
   }
 
   __aicore__ inline void Process() {
@@ -97,6 +102,14 @@ class KernelWorkerBase {
   }
 
  protected:
+  __aicore__ inline GM_ADDR SharedTensorAddress(const TensorDesc &desc) {
+    GM_ADDR address = input_list[desc.input_position];
+    if (desc.tensor_type == 2) {
+      address = reinterpret_cast<GM_ADDR>(reinterpret_cast<__gm__ uint64_t *>(address)[desc.dynamic_dim + 1]);
+    }
+    return address + desc.base_ptr_offset * desc.data_type;
+  }
+
   __aicore__ inline void ProcessFast() {
 #ifdef __DAV_C220_CUBE__
     uint32_t block_idx = this->worker_id_;
@@ -109,19 +122,27 @@ class KernelWorkerBase {
       block_idx = block_idx + this->core_num;
     } while (1);
 #else
-    if (this->worker_id_ % 2 == 0) {
+    bool shared_worker = this->worker_id_ % 2 == 0;
+    if (shared_worker && shared_vector_count_ == 0) {
       return;
     }
     uint32_t block_idx = this->worker_id_ / 2;
-    do {
-      if (block_idx >= this->vector_task_num) {
-        return;
+    uint32_t end = this->vector_task_num;
+    if (shared_vector_count_ != 0) {
+      uint32_t shared_begin = this->vector_task_num - shared_vector_count_ - 1;
+      end = shared_worker ? this->vector_task_num - 1 : shared_begin;
+      if (shared_worker) {
+        block_idx += shared_begin;
       }
+    }
+    for (; block_idx < end; block_idx += this->core_num) {
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskFast(task_index);
-      uint32_t half_num = this->vector_num / 2;
-      block_idx = block_idx + half_num;
-    } while (1);
+    }
+    if (shared_vector_count_ != 0 && !shared_worker &&
+        this->worker_id_ / 2 == (this->vector_task_num - 1) % this->core_num) {
+      ExecuteTaskFast(GetTaskIndex(this->vector_task_num - 1));
+    }
 #endif
   }
 
@@ -141,19 +162,27 @@ class KernelWorkerBase {
       block_idx = block_idx + this->core_num;
     } while (1);
 #else
-    if (this->worker_id_ % 2 == 0) {
+    bool shared_worker = this->worker_id_ % 2 == 0;
+    if (shared_worker && shared_vector_count_ == 0) {
       return;
     }
     uint32_t block_idx = this->worker_id_ / 2;
-    do {
-      if (block_idx >= this->vector_task_num) {
-        return;
+    uint32_t end = this->vector_task_num;
+    if (shared_vector_count_ != 0) {
+      uint32_t shared_begin = this->vector_task_num - shared_vector_count_ - 1;
+      end = shared_worker ? this->vector_task_num - 1 : shared_begin;
+      if (shared_worker) {
+        block_idx += shared_begin;
       }
+    }
+    for (; block_idx < end; block_idx += this->core_num) {
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskProfiled(task_index, cycle_trace_recorder);
-      uint32_t half_num = this->vector_num / 2;
-      block_idx = block_idx + half_num;
-    } while (1);
+    }
+    if (shared_vector_count_ != 0 && !shared_worker &&
+        this->worker_id_ / 2 == (this->vector_task_num - 1) % this->core_num) {
+      ExecuteTaskProfiled(GetTaskIndex(this->vector_task_num - 1), cycle_trace_recorder);
+    }
 #endif
   }
 
@@ -379,6 +408,7 @@ class KernelWorkerBase {
 
   __aicore__ inline void TriggerEvent(uint32_t event_index) { AtomicAddForAllEventCounters(event_index); }
 
+  uint32_t shared_vector_count_ = 0;
   bool pull_protocol_ = false;
   uint32_t worker_id_ = 0;
   uint32_t grouped_matmul_group_list_offset_ = 0;
