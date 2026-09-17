@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -124,6 +124,7 @@ def _allocate_backward_intermediates(
     grad_output: Any,
     weight1: Any,
     weight2: Any,
+    reusable_dispatch: Any | None = None,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
     grad_weight2 = torch.zeros_like(weight2)
@@ -137,7 +138,7 @@ def _allocate_backward_intermediates(
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
-    gate_dx = torch.empty(
+    gate_dx = reusable_dispatch if reusable_dispatch is not None else torch.empty(
         (capacity, spec.hidden_size),
         dtype=grad_output.dtype,
         device=grad_output.device,
@@ -219,6 +220,7 @@ def _prepare_backward_execution(
                 grad_output,
                 saved.weight1,
                 saved.weight2,
+                dispatch[:saved.dispatch.shape[0]] if plan.reuse_backward_dispatch else None,
             ),
         )
     except Exception:
@@ -490,6 +492,13 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution,
             )
             execution.profile_call.complete()
+            # Release ordinary scratch before allocating the owned token gradient;
+            # SHMEM remains leased until the current-stream work is recorded.
+            execution = replace(execution, intermediates=_BackwardIntermediates(
+                execution.intermediates.grad_weight1,
+                execution.intermediates.grad_weight2,
+                None, None, None,
+            ))
             grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
             _release_completed_graph(ctx, workspace)
             return (
