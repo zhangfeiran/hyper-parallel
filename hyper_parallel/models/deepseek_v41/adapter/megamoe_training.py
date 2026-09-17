@@ -119,6 +119,19 @@ class DeepseekV41TrainingExperts(nn.Module):
                         for parameter in (self.gate_up_proj, self.down_proj))
         return self._kernel(hidden_states, top_k_index, top_k_weights, expert_weights=weights)
 
+    @staticmethod
+    def share_execution_resources(experts: list[DeepseekV41TrainingExperts]) -> None:
+        """Share transient storage across configured, serial decoder layers.
+
+        Args:
+            experts: Experts with compatible shapes and the same EP process group.
+        """
+        if not experts:
+            return
+        if any(module._kernel is None for module in experts):
+            raise RuntimeError("Configure every expert before sharing execution resources")
+        MegaMoeExperts.share_execution_resources(module._kernel for module in experts)
+
     def close(self) -> None:
         """Release native resources after the final backward has completed."""
         if self._kernel is not None:

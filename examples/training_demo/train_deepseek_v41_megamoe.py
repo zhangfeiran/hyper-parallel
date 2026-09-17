@@ -15,12 +15,26 @@
 """Run DSV4.1 MegaMoe text training with ordered native-resource shutdown."""
 
 from hyper_parallel.models.deepseek_v41.adapter.megamoe_training import DeepseekV41TrainingExperts
+from hyper_parallel.trainer.config import TrainerConfig
 from hyper_parallel.trainer.config.manager import parse_training_args
 from hyper_parallel.trainer.text_trainer import TextTrainer
 
 
 class MegaMoeTextTrainer(TextTrainer):
     """Release SHMEM while the Trainer's EP process groups are still alive."""
+
+    def __init__(self, config: TrainerConfig, *, share_workspace: bool = True) -> None:
+        """Build the Trainer and bind compatible serial layers to one workspace.
+
+        Args:
+            config: Resolved text-training recipe.
+            share_workspace: Share transient native storage before the first forward.
+        """
+        super().__init__(config)
+        if share_workspace:
+            experts = [module for module in self.base.model.modules()
+                       if isinstance(module, DeepseekV41TrainingExperts)]
+            DeepseekV41TrainingExperts.share_execution_resources(experts)
 
     def on_train_end(self) -> None:
         """Finish callbacks, then close all expert executors in model order."""

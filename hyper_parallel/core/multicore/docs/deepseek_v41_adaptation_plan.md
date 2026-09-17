@@ -147,7 +147,7 @@ optimizer 更新后的参数比较。路由离散索引不要求梯度；correct
   activation checkpoint 重入、close/recreate 和多 EP subgroup。
   在 PP 存在并发或重叠执行时，先证明资源生命周期和互斥关系再启用共享。
 - 精度通过后做同配置、同 native payload 的 fresh-process ABBA，分别统计编译/初始化和稳态。
-  NPU 作业经过空闲队列与最终占用复查，记录期间的设备使用者；混入其他进程的性能块重跑。
+  用户已授权直接使用 busy NPU；记录期间的设备使用者，混入其他进程的性能块完整重跑。
 - 报告 peak allocated/reserved、SHMEM heap 和 workspace，区分参数/activation 与通信常驻空间。
   limit=10 的 native forward/backward 支持另立后续阶段。
 
@@ -238,4 +238,20 @@ FP32 数值结果、独立训练轨迹的路由分歧，以及同状态验证协
 专家梯度按已有框架的 EDP mesh 归约，未新增 EP dW all-reduce，未修改通用 optimizer。
 
 [训练接入报告](deepseek_v41_training_report.md) 区分 owner EP 数值验收、完整 Trainer 冒烟、
-模型权重 checkpoint，以及尚未验证的融合注意力/mHC 与 optimizer checkpoint 恢复。
+模型权重 checkpoint，以及该阶段尚未验证的融合注意力/mHC 与 optimizer checkpoint 恢复。
+
+## 原始宽度与性能接入进展（2026-09-17）
+
+`MegaMoeTextTrainer` 默认为兼容串行层共享 workspace。真实四层 Trainer 已在
+H=5120、I=2304、TopK=6、head_dim=512、RoPE dim=64、mHC mult=4 下
+运行生产 attention/Sinkhorn/mHC-post 融合路径，mHC pre 沿用分阶段实现，
+未使用小模型 ST 的 portable attention/mHC-post 替代。
+8 卡 EP8、128 experts、每卡 4K tokens 已完成多步训练；192 experts 的稳定运行
+受本机 64GB/卡显存限制，不能以只完成一两步替代完整验收。
+原始宽度的独立 FP32 block 检查通过，保持既定 1%/2% 判据。
+
+完整 Trainer 与大尺寸单层 MoE 的独立进程 ABBA、原始配置裁剪细节、
+权重一致性和设备占用证据见 [单机性能报告](deepseek_v41_performance.md)。
+干净 ABBA 中完整训练按全部样本均值吞吐增加 5.47%；单层 EP4/E192
+前反向加速 15.24×，保持原 E384/EP8 的每卡 48 experts。两者范围不同。
+TP/CP/PP、VLM Trainer、全量 optimizer checkpoint 和 limit=10 native 支持仍未完成。

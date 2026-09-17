@@ -16,7 +16,8 @@ DSV4.1 text 配方，增加 expert replacement 和整个 MoE 边界的 local com
 原 `mlp.experts` 是唯一参数持有者，仍是嵌套 FSDP 单元。
 无参数 MegaMoe executor 每次读取当前 unshard 后的 expert 参数，不保存参数副本或旧 view。
 所有层在 forward 前登记静态执行规格，首次 native 调用才分配资源并按全部层计算 SHMEM heap。
-当前各层拥有独立 workspace；串行层共享 workspace 留待后续。
+默认通过 `MegaMoeTextTrainer` 将兼容的串行层绑定到同一 workspace，
+各层仍保留独立参数与反向保存值。`share_workspace=False` 可保留独立资源用于对照。
 
 归约契约沿用框架：MegaMoe 完成 token dispatch、owner expert compute 和 token combine；
 expert dW 不额外做 EP all-reduce。同一 expert 的副本由 EDP/FSDP mesh 归约，
@@ -68,15 +69,37 @@ BF16 参数存储/FP32 主参数的四卡专项覆盖同样通过。
 小模型的融合 attention/mHC post 调用仍失败。配方保留原 fused 路径，运行需匹配的依赖和形状。
 不能把本 ST 通过表述为所有融合算子或原始大模型已验证。
 
+## 原始宽度与 4K 训练推进
+
+后续使用原始 H=5120、expert I=2304、TopK=6、head_dim=512、RoPE dim=64、
+mHC mult=4，四层、E128、EP8、每卡 4096 tokens 运行真实 Trainer。
+生产融合 attention/Sinkhorn/mHC-post 前反向已跑通，mHC pre 保留原配方的分阶段实现。
+这轮没有小模型 ST 的 portable attention/mHC-post monkeypatch。
+串行层共享 workspace，多步 Muon/AdamW 更新和正常 SHMEM 关闭通过。
+共享 workspace 默认启用后，追加四卡 EP2/EDP2、pull、BF16 + FP32 主参数回归通过：
+三步训练、每步两次梯度累积、模型权重 checkpoint 精确恢复，以及有序 SHMEM 关闭。
+该小模型回归保留 portable attention/mHC；4K 性能运行另行覆盖生产融合路径。
+
+原始 H/I/TopK 的 EP2/E8/T128 独立 FP32 MoE 验收通过，最坏相对 L2
+owner EP 0.5422%、MegaMoe 0.5132%；两者峰值归一化误差均不超过 0.9303%。
+E192/EP4/T4096 补充 BF16 后端对照覆盖 output、dX 和全部参数梯度，36 项通过，
+最坏相对 L2 0.4910%、峰值归一化误差 1.1364%。它不替代全模型 FP32 验收。
+完整训练干净 ABBA 全部计时样本均值为 6887.83 → 6530.71 ms，吞吐增加 5.47%。
+MegaMoe 的计时窗口仍有一次缓存回收/分配重试；慢样本保留在均值内，未改通用 allocator。
+
+规模选择、失败的显存边界、干净 ABBA 和原始记录见
+[单机裁剪性能报告](deepseek_v41_performance.md)。
+
 ## 当前未覆盖及发现的问题
 
-- 完整模型 logits/所有梯度对独立 FP32 参考、长期训练轨迹、真实 4K 配方尚未验收。
+- 完整模型 logits/所有梯度对独立 FP32 参考、长期训练轨迹、未裁剪的 384-expert 训练配方尚未验收。
 - 全量 optimizer checkpoint 恢复未通过：尝试保存 model+optimizer 后，恢复
   `model.layers.0.attn_hc.scale` 的 Adam `exp_avg/exp_avg_sq` 出现 `[2]` 与 `[1]` shard shape mismatch。
   该参数不属于 MegaMoe。本轮只验证模型权重 checkpoint，没有修补通用 DCP/optimizer，
   不能据此宣称完整训练状态断点续训通过。
-- TP/CP/PP 组合、完整 VLM Trainer、跨拓扑 checkpoint、共享 workspace、性能仍待验证。
-- 用户已允许 busy NPU；本轮保留占用记录，只作正确性验证，不报告性能收益。
+- TP/CP/PP 组合、完整 VLM Trainer、跨拓扑 checkpoint 与共享 workspace 的重算/PP 重入仍待验证。
+- 用户已允许 busy NPU；此前小模型阶段只作正确性验证。后续性能轮次单独保留占用记录，
+  受干扰的整组不用于性能结论。
 
 ## 复现
 
