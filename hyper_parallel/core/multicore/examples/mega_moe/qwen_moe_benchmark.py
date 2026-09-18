@@ -28,8 +28,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
-
 # The launcher activates CANN and the native payload before framework import.
 # pylint: disable=wrong-import-position
 import torch  # pylint: disable=forbidden-backend-import
@@ -45,7 +43,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.optimizer import get_hyper_optimizer
-from hyper_parallel.platform.torch.common import GroupedExperts
+from hyper_parallel.components.modules.moe import GroupedExperts
 
 # pylint: enable=wrong-import-position
 
