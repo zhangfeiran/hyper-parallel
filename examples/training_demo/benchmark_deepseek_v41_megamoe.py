@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader, Dataset  # pylint: disable=forbidden-ba
 import yaml
 
 from examples.training_demo.train_deepseek_v41_megamoe import MegaMoeTextTrainer
+from examples.training_demo.deepseek_v41_diagnostics import MoeTrainingDiagnostics
 from hyper_parallel.trainer.config.manager import parse_training_args
 from hyper_parallel.trainer.text_trainer import TextTrainer
 
@@ -71,7 +72,7 @@ def _recipe(args, work, world):
     recipe["model"].update(config_path=args.model_dir, engram_assets_path=args.engram_assets,
                            num_routed_experts=args.experts)
     recipe["model_init_dtype"] = "bfloat16"
-    recipe["training"].update(train_iters=args.warmup + args.steps, global_batch_size=world)
+    recipe["training"].update(train_iters=args.schedule_steps or args.warmup + args.steps, global_batch_size=world)
     recipe["accelerator"]["ep_size"] = world
     recipe["fsdp_config"].update(dp_shard_size=world, edp_shard_size=1)
     if args.backend == "owner_ep":
@@ -140,9 +141,11 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument("--schedule-steps", type=int, help="Keep the LR schedule horizon fixed in shorter diagnostics")
     parser.add_argument("--weights", help="Shared canonical rank-local BF16 weights directory")
     parser.add_argument("--write-weights", action="store_true")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--diagnostics", choices=("none", "moe"), default="none")
     args = parser.parse_args()
     if args.steps < 1 or args.warmup < 0 or args.tokens < 128 or args.tokens % 128:
         parser.error("steps must be positive, warmup nonnegative, and tokens a positive multiple of 128")
@@ -151,6 +154,8 @@ def _arguments() -> argparse.Namespace:
         parser.error("requires EP >= 2 and experts >= TopK=6 divisible by EP")
     if args.write_weights and not args.weights:
         parser.error("--write-weights requires --weights")
+    if args.schedule_steps is not None and args.schedule_steps < args.warmup + args.steps:
+        parser.error("schedule-steps must cover all warmup and measured steps")
     return args
 
 
@@ -167,8 +172,13 @@ def main() -> None:
     trainer.on_train_begin()
     iterator = iter(trainer.base.train_dataloader)
     rows = []
+    diagnostics = None
     torch.npu.reset_peak_memory_stats()
     for step in range(args.warmup + args.steps):
+        if step == args.warmup and args.diagnostics != "none":
+            diagnostics = MoeTrainingDiagnostics(trainer)
+        if diagnostics is not None:
+            diagnostics.step = step
         dist.barrier()
         torch.npu.synchronize()
         start = time.perf_counter()
@@ -191,6 +201,10 @@ def main() -> None:
               "peak_reserved_bytes": torch.npu.max_memory_reserved(),
               "attention_mhc": "production_fused", "optimizer": "Muon_fp32_main_params",
               "canonical_weights": bool(args.weights), "workspace_shared": args.backend == "megamoe"}
+    if diagnostics is not None:
+        result["phase_timings"] = diagnostics.rows
+        result["throughput_valid"] = False
+        diagnostics.close()
     trainer.on_train_end()
     (work / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     dist.barrier()

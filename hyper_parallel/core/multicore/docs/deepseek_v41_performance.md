@@ -145,6 +145,10 @@ Torch peak allocated 减少约 1.37 GiB；该指标不包含所有外部 allocat
 尚未通过 profiler 拆分各部分开销；不能声称只是预热，也不能删除这些样本。
 本轮没有修改通用 allocator 或 optimizer。后续可针对该分配重试单独定位和优化。
 
+另按 EP8、全局 E48（每卡 6 experts）复测四层整网，完整 step 吞吐增加 3.57%；
+整网内四层 MoE 前反向为 509.43 → 315.86 ms，即 1.61x。配置、计时口径和
+原始证据见 [EP8/E48 整网内 MoE 计时](deepseek_v41_ep8_e48_attribution.md)。
+
 ## 大尺寸 MoE 单层 ABBA
 
 初次 EP8/E384 及后续 EP4/E192 试跑有外来或无法归属的 NPU 进程，完整计时组
