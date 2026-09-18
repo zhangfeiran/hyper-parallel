@@ -205,20 +205,17 @@ dataset:
 dataloader:
   _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
   min_buffered_samples: 16
+  # One model adapter owns physical token cost, per-item compression padding,
+  # resumable state identity, and compact forward metadata.
+  batch_adapter:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.packed_sequence.DeepseekV41BatchAdapter
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
-    # Encoder CSA2 uses ratio=2. Per-sample alignment prevents one compressed
-    # group from mixing the tail of one packed sample with the next sample.
-    sample_alignment: 2
   get_batch:
     _target_: hyper_parallel.data.batching.ParallelBatch
     source_type: online
     attention_mode: compressed
     cp_algorithm: colossal
-    # Nested targets let the model adapter supply its compact CSA2 metadata
-    # contract while the framework continues to own the generic batch flow.
-    attention_runtime_adapter:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.packed_sequence.DeepseekV41AttentionRuntimeAdapter
   dataloader_type: cyclic
   data_rearrange_map: null
   data_sharding: false

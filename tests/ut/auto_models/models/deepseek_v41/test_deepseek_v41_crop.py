@@ -670,24 +670,26 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_online_recipe_declares_one_model_owned_batch_adapter(self):
         """One configured adapter owns packing and forward runtime extensions."""
-        recipe_path = Path(__file__).resolve().parents[5] / (
-            "examples/training_demo/train_deepseek_v41_online.yaml"
-        )
+        examples_dir = Path(__file__).resolve().parents[5] / "examples/training_demo"
+        for recipe_name in (
+                "train_deepseek_v41_online.yaml",
+                "train_deepseek_v41_megamoe.yaml",
+        ):
+            with self.subTest(recipe=recipe_name):
+                recipe = parse_training_args([str(examples_dir / recipe_name)])
+                get_batch_target = recipe.dataloader.get_batch
+                batch_adapter_target = recipe.dataloader.batch_adapter
 
-        recipe = parse_training_args([str(recipe_path)])
-        get_batch_target = recipe.dataloader.get_batch
-        batch_adapter_target = recipe.dataloader.batch_adapter
-
-        self.assertIs(get_batch_target._target_, ParallelBatch)  # pylint: disable=protected-access
-        self.assertIsNone(get_batch_target.runtime_input_adapter)
-        self.assertIsInstance(batch_adapter_target, Target)
-        self.assertIs(  # pylint: disable=protected-access
-            batch_adapter_target._target_,
-            DeepseekV41BatchAdapter,
-        )
+                self.assertIs(get_batch_target._target_, ParallelBatch)  # pylint: disable=protected-access
+                self.assertIsNone(get_batch_target.runtime_input_adapter)
+                self.assertIsInstance(batch_adapter_target, Target)
+                self.assertIs(  # pylint: disable=protected-access
+                    batch_adapter_target._target_,
+                    DeepseekV41BatchAdapter,
+                )
 
         vlm_recipe = parse_training_args([
-            str(recipe_path.with_name("train_deepseek_v41_vlm_online.yaml"))
+            str(examples_dir / "train_deepseek_v41_vlm_online.yaml")
         ])
         self.assertIs(  # pylint: disable=protected-access
             vlm_recipe.dataset.data_transform._target_,

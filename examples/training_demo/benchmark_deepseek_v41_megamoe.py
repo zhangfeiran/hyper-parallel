@@ -88,6 +88,7 @@ def _recipe(args, work, world):
         "create_attention_mask_in_dataloader": True, "labels_are_shifted": True,
     }}
     recipe["dataloader"] = {"_target_": _TARGET + "build_loader",
+                            "batch_adapter": recipe["dataloader"]["batch_adapter"],
                             "collate_fn": recipe["dataloader"]["collate_fn"],
                             "get_batch": recipe["dataloader"]["get_batch"], "dataloader_type": "single"}
     recipe["checkpoint"]["checkpoint_dir"] = str(work / "unused-checkpoint")
