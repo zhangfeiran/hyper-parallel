@@ -30,6 +30,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
+    get_clipped_swiglu_grad_tiling_bytes,
     get_gate_grad_tiling_bytes,
     get_swiglu_grad_tiling_bytes,
     get_w1_grad_tiling_bytes,
@@ -42,6 +43,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
     build_forward_graph,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import (
+    get_clipped_swiglu_tiling_bytes,
     get_down_proj_tiling_bytes,
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
@@ -127,6 +129,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
+        swiglu_limit=spec.swiglu_limit,
     )
     forward_graph.propagate_splits(task_values)
     forward_data = build_forward_config(
@@ -143,6 +146,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
+        swiglu_limit=spec.swiglu_limit,
     )
     backward_graph.propagate_splits(task_values)
     backward_data = build_backward_config(
@@ -212,9 +216,17 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         ),
         swiglu_tiling=_tensor_from_bytes(
             _resize_swiglu_tiling(
-                get_swiglu_tiling_bytes(
-                    forward_graph.get_op("swiglu").split_value,
-                    intermediate_size=spec.intermediate_size,
+                (
+                    get_clipped_swiglu_tiling_bytes(
+                        forward_graph.get_op("swiglu").split_value,
+                        intermediate_size=spec.intermediate_size,
+                        clamp_limit=spec.swiglu_limit,
+                    )
+                    if spec.swiglu_limit is not None
+                    else get_swiglu_tiling_bytes(
+                        forward_graph.get_op("swiglu").split_value,
+                        intermediate_size=spec.intermediate_size,
+                    )
                 ),
                 spec.num_cube_cores,
             ),
@@ -243,9 +255,17 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         ),
         swiglu_grad_tiling=_tensor_from_bytes(
             _resize_swiglu_tiling(
-                get_swiglu_grad_tiling_bytes(
-                    backward_graph.get_op("swiglu_grad").split_value,
-                    intermediate_size=spec.intermediate_size,
+                (
+                    get_clipped_swiglu_grad_tiling_bytes(
+                        backward_graph.get_op("swiglu_grad").split_value,
+                        intermediate_size=spec.intermediate_size,
+                        clamp_limit=spec.swiglu_limit,
+                    )
+                    if spec.swiglu_limit is not None
+                    else get_swiglu_grad_tiling_bytes(
+                        backward_graph.get_op("swiglu_grad").split_value,
+                        intermediate_size=spec.intermediate_size,
+                    )
                 ),
                 spec.num_cube_cores,
             ),
