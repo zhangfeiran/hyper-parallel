@@ -3,7 +3,7 @@
 ## 变更范围
 
 本分支以 `upstream/trainer_dev` (`162aa8e1`) 为实际基线，适配 DSV4.1 的
-learned routing MoE 到现有 Torch MegaMoe。代码适配提交截至 `f4ae1a7a`；
+learned routing MoE 到现有 Torch MegaMoe。代码适配和验证工具以本提交为准；
 本文件只汇总实现契约和验收方法。四层训练 crop 用于验证完整训练链路，不能
 等同于官方 40 层模型。
 
@@ -54,6 +54,11 @@ branch 仍由 DSV4.1 adapter 执行。所有兼容层在首次 native forward �
 规格，串行层可以共享一个 execution workspace；关闭必须在所有 backward 完成
 后按层有序调用 `close()`。
 
+MegaMoe recipe 与 `trainer_dev` 的数据接口保持一致：`DeepseekV41BatchAdapter`
+统一负责 physical token cost、压缩对齐和 compact attention runtime metadata；
+collate 和 `ParallelBatch` 不再接收旧的 `sample_alignment` 或嵌套 runtime adapter。
+性能 benchmark 重建 dataloader 配置时也保留同一个 model-owned batch adapter。
+
 ### SwiGLU limit
 
 DSV4.1 使用 released `swiglu_limit=10`。当前 adapter 对 routed/shared 两支都
@@ -97,9 +102,9 @@ Trainer 入口为
 
 已归档的 NPU limit=10 复测结果：
 
-- `/home/feiran/doc/dsv41-megamoe-swiglu-limit-20260918-retry2.json`：EP2、
+- `dsv41-megamoe-swiglu-limit-20260918-retry2.json`：EP2、
   learned route、FP32 oracle，`passed=true`，HF 和 MegaMoe 均通过 FP32 判据。
-- `/home/feiran/doc/dsv41-megamoe-swiglu-clamp-probe-final-20260918.json`：
+- `dsv41-megamoe-swiglu-clamp-probe-final-20260918.json`：
   真实超限/未超限输入的 clipped SwiGLU probe，`passed=true`。该 probe 使用
   `limit=1` 验证算子边界，不代表模型配置；模型配置仍为 10。
 
@@ -114,6 +119,13 @@ CPU 回归覆盖 DSV4.1 model adapter、Multicore、replacement 和 oracle；历
 源码文件 hash、Torch/torch-npu/Transformers、CANN、active OPP 和 native
 payload hash；旧 payload 或旧 branch 的 JSON 不能直接作为当前验收。
 
+本轮 `limit=10` EP8/E48 四层整网使用当前代码重新生成 canonical rank-local
+BF16 权重。clean 的 owner A1/A2 和 push P2 均完成 18 步且 loss/grad norm 全部
+finite。push P2 相对 owner A1 的 144 个 rank-step 比较中，134 个 loss 完全相同；
+最大 loss 绝对差为 `0.125`（两个 BF16 ULP，相对 `1.117%`），全局 grad norm 最大
+相对差为 `0.0379%`。这些数值用于整网训练轨迹检查，不替代上面的逐 tensor FP32
+oracle，也不表示 bitwise 等价。pull 的整网 clean 复测仍在排队。
+
 ## 性能与 HBM 测试方法
 
 性能比较只使用 fresh-process、同一 canonical rank-local BF16 权重和确定性
@@ -126,21 +138,24 @@ payload hash；旧 payload 或旧 branch 的 JSON 不能直接作为当前验收
 torchrun。稳定测试建议 `warmup=8`、`steps=10`、`schedule_steps=18`：
 
 ```bash
-python -m torch.distributed.run --standalone --nproc-per-node=8 \
-  -m examples.training_demo.benchmark_deepseek_v41_megamoe \
-  --model-dir /path/to/DeepSeek-V4.1-Flash \
-  --engram-assets /path/to/engram.json \
-  --backend owner_ep --experts 48 --tokens 4096 \
-  --warmup 8 --steps 10 --schedule-steps 18 \
-  --weights /path/to/canonical-weights --output /path/to/owner
+MODEL_DIR=...
+ENGRAM_ASSETS=...
+WEIGHTS_DIR=...
+RESULT_DIR=...
 
 python -m torch.distributed.run --standalone --nproc-per-node=8 \
   -m examples.training_demo.benchmark_deepseek_v41_megamoe \
-  --model-dir /path/to/DeepSeek-V4.1-Flash \
-  --engram-assets /path/to/engram.json \
+  --model-dir "$MODEL_DIR" --engram-assets "$ENGRAM_ASSETS" \
+  --backend owner_ep --experts 48 --tokens 4096 \
+  --warmup 8 --steps 10 --schedule-steps 18 \
+  --weights "$WEIGHTS_DIR" --output "$RESULT_DIR/owner"
+
+python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  -m examples.training_demo.benchmark_deepseek_v41_megamoe \
+  --model-dir "$MODEL_DIR" --engram-assets "$ENGRAM_ASSETS" \
   --backend megamoe --dispatch-mode push --experts 48 --tokens 4096 \
   --warmup 8 --steps 10 --schedule-steps 18 \
-  --weights /path/to/canonical-weights --output /path/to/megamoe-push
+  --weights "$WEIGHTS_DIR" --output "$RESULT_DIR/megamoe-push"
 
 # pull 只需将 dispatch-mode 改为 pull，并使用独立 SHMEM endpoint/output。
 ```
@@ -160,11 +175,31 @@ MoE 加速比用相同输入和权重的模块边界诊断或
 
 ### 当前性能边界
 
-历史归档中有 `limit=0` 的 EP8/E48 四层整网和单层 MoE 结果；这些数字用于解释
-实现收益，不能当作当前 `limit=10` 的性能验收。当前分支本次尝试的 EP8/E48
-push/pull 整网复测因设备持续被其他训练进程占用，在 benchmark 启动前取消，
-没有新增性能或 HBM 结论。重新验收时必须按上述流程在 limit=10、同一 native
-payload 下分别完成 owner、push、pull。
+本轮使用 `limit=10`、EP8/E48、四层、`H=5120`、`I=2304`、`TopK=6` 和每卡
+4096 tokens。owner A1/A2、push P2 以及三组 MoE 模块边界诊断满足 exit 0、
+`foreign=[]`、`unresolved=[]`。push P1 和 pull L1/L2 在运行中观察到外来进程，
+对应整网性能/HBM 数据作废并排队重跑。
+
+当前 clean 的 provisional 整网结果如下。owner 取 A1/A2 mean 的平均；push 暂时
+只有 P2，待 P1 clean 重跑后再形成最终成对结论。
+
+| 后端 | 整网 mean | 相对 owner | Torch peak allocated | 物理 HBM 峰值 |
+| --- | ---: | ---: | ---: | ---: |
+| owner EP | `5568.462 ms` | `1.000x` | `40.786 GiB` | `48.524 GiB` |
+| MegaMoe push P2 | `5381.243 ms` | `1.035x` | `38.506 GiB` | `46.907 GiB` |
+
+MoE 诊断在四个 `*.mlp` 模块边界同步计时，只用于拆分 MoE 关键路径。三组均为
+clean 的独立进程，`warmup=8`、`steps=3`：
+
+| 后端 | MoE forward | forward 加速 | MoE backward | backward 加速 | MoE 合计 | 合计加速 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| owner EP | `264.189 ms` | `1.000x` | `206.565 ms` | `1.000x` | `470.754 ms` | `1.000x` |
+| MegaMoe push | `198.231 ms` | `1.333x` | `90.062 ms` | `2.294x` | `288.294 ms` | `1.633x` |
+| MegaMoe pull | `177.642 ms` | `1.487x` | `93.291 ms` | `2.214x` | `270.933 ms` | `1.738x` |
+
+诊断同步本身会改变整网 step time，因此只报告 MoE 加速比；整网加速和 HBM 以
+不启用诊断的 ABCCBA fresh-process 结果为准。历史 `limit=0` 数据不参与本轮
+`limit=10` 验收。
 
 ## 验收命令
 
