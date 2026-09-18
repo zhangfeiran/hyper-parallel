@@ -62,8 +62,7 @@ def build_deepseek_v41_validation_config(
             native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient. The released
             report does not disclose its production value.
-        swiglu_limit: Validation override; zero disables clipping in routed and
-            shared experts. ``None`` preserves the source model configuration.
+        swiglu_limit: Validation override; zero disables activation clipping.
 
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
@@ -88,16 +87,16 @@ def build_deepseek_v41_validation_config(
         raise ValueError("Engram assets and model crop use different layer counts")
 
     text = source["text_config"]
+    source_swiglu_limit = validate_swiglu_limit(text["swiglu_limit"])
+    effective_swiglu_limit = validate_swiglu_limit(
+        source_swiglu_limit if swiglu_limit is None else swiglu_limit
+    )
     released_hidden_layers = int(text["num_hidden_layers"])
     if not 4 <= num_hidden_layers <= released_hidden_layers:
         raise ValueError(
             "DeepSeek-V4.1 validation crop depth must be in [4, "
             f"{released_hidden_layers}], got {num_hidden_layers}"
         )
-    source_swiglu_limit = validate_swiglu_limit(text["swiglu_limit"])
-    effective_swiglu_limit = validate_swiglu_limit(
-        source_swiglu_limit if swiglu_limit is None else swiglu_limit
-    )
     released_routed_experts = int(text["n_routed_experts"])
     resolved_routed_experts = (
         released_routed_experts if num_routed_experts is None else int(num_routed_experts)

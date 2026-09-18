@@ -22,19 +22,11 @@ from typing import Iterable
 
 
 def validate_swiglu_limit(value: float) -> float:
-    """Validate a finite SwiGLU limit, with zero disabling activation clipping.
-
-    Args:
-        value: Source configuration value or an explicit validation override.
-
-    Returns:
-        The non-negative finite limit as a float.
-
-    Raises:
-        ValueError: If the value is negative, non-finite, boolean or non-numeric.
-    """
+    """Validate a finite non-negative SwiGLU activation limit."""
     if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value < 0:
-        raise ValueError("swiglu_limit must be a finite non-negative number; use 0 to disable clipping")
+        raise ValueError(
+            "swiglu_limit must be a finite non-negative number; use 0 to disable clipping"
+        )
     return float(value)
 
 
