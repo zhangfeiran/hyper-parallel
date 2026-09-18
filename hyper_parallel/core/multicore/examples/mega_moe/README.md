@@ -115,6 +115,7 @@ convergence.
 
 ## DeepSeek-V4.1 block validation
 
-See [the DSV4.1 precision example](deepseek_v41_precision.md) for the configured
-SwiGLU-limit MoE adapter, HF BF16 comparisons and an independent CPU FP32 oracle. This is a
-standalone block validator; Trainer/FSDP integration remains a separate stage.
+The DSV4.1 precision entrypoint remains available as
+`deepseek_v41_precision.py`. The adapter, Trainer/FSDP integration, FP32 oracle,
+and reproducible precision/performance procedures are described in the
+[DSV4.1 MegaMoe PR notes](../../docs/deepseek_v41_megamoe_pr.md).
