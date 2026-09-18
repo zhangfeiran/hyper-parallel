@@ -82,6 +82,8 @@ EP rank 必须一致，且不同模式不共享同一 workspace。
 - `push`：按 lossless 最大接收容量分配对称 SHMEM receive 区，使用 PUT dispatch。
 - `pull`：SHMEM 保存本地 source，接收 rows 使用普通 HBM，dispatch 使用 GET；
   combine 仍走 PUT。
+- push 和 pull 的 dispatch/combine 通信任务均固定为 128 行，不根据接收负载
+  构建或切换其他 plan。
 - 每次独立 torchrun 使用新的
   `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT`，进程组销毁前显式关闭所有
   MegaMoe executor。
@@ -176,7 +178,7 @@ MoE 加速比用相同输入和权重的模块边界诊断或
 ### 当前性能边界
 
 本轮使用 `limit=10`、EP8/E48、四层、`H=5120`、`I=2304`、`TopK=6` 和每卡
-4096 tokens。owner A1/A2、push P2 以及三组 MoE 模块边界诊断满足 exit 0、
+4096 tokens。owner A1/A2、push P2 以及 owner/push MoE 模块边界诊断满足 exit 0、
 `foreign=[]`、`unresolved=[]`。push P1 和 pull L1/L2 在运行中观察到外来进程，
 对应整网性能/HBM 数据作废并排队重跑。
 
@@ -188,18 +190,18 @@ MoE 加速比用相同输入和权重的模块边界诊断或
 | owner EP | `5568.462 ms` | `1.000x` | `40.786 GiB` | `48.524 GiB` |
 | MegaMoe push P2 | `5381.243 ms` | `1.035x` | `38.506 GiB` | `46.907 GiB` |
 
-MoE 诊断在四个 `*.mlp` 模块边界同步计时，只用于拆分 MoE 关键路径。三组均为
-clean 的独立进程，`warmup=8`、`steps=3`：
+MoE 诊断在四个 `*.mlp` 模块边界同步计时，只用于拆分 MoE 关键路径。下表是
+固定 128 策略仍适用的 clean 独立进程结果，`warmup=8`、`steps=3`：
 
 | 后端 | MoE forward | forward 加速 | MoE backward | backward 加速 | MoE 合计 | 合计加速 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | owner EP | `264.189 ms` | `1.000x` | `206.565 ms` | `1.000x` | `470.754 ms` | `1.000x` |
 | MegaMoe push | `198.231 ms` | `1.333x` | `90.062 ms` | `2.294x` | `288.294 ms` | `1.633x` |
-| MegaMoe pull | `177.642 ms` | `1.487x` | `93.291 ms` | `2.214x` | `270.933 ms` | `1.738x` |
 
 诊断同步本身会改变整网 step time，因此只报告 MoE 加速比；整网加速和 HBM 以
 不启用诊断的 ABCCBA fresh-process 结果为准。历史 `limit=0` 数据不参与本轮
-`limit=10` 验收。
+`limit=10` 验收。旧 pull 诊断使用过动态通信分块，固定为 128 后不再作为当前
+性能结论，需与 pull 整网一起重测。
 
 ## 验收命令
 
