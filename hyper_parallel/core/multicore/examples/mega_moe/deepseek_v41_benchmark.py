@@ -31,7 +31,6 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4SparseMoeBlock
 
 from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_accuracy import fp32_accuracy
-from hyper_parallel.models.deepseek_v41.adapter.activation import configure_deepseek_v41_swiglu
 from hyper_parallel.models.deepseek_v41.adapter.expert_parallel import deepseek_v41_ep_compute_fn
 from hyper_parallel.models.deepseek_v41.adapter.megamoe_training import (
     DeepseekV41TrainingExperts,
@@ -66,7 +65,7 @@ def _build(args):
     config = DeepseekV4Config(  # pylint: disable=unexpected-keyword-arg
         hidden_size=5120, moe_intermediate_size=2304, n_routed_experts=args.experts,
         n_shared_experts=1, num_experts_per_tok=6, num_hidden_layers=1,
-        mlp_layer_types=["moe"], swiglu_limit=0.0, scoring_func="sqrtsoftplus", routed_scaling_factor=1.5,
+        mlp_layer_types=["moe"], swiglu_limit=10.0, scoring_func="sqrtsoftplus", routed_scaling_factor=1.5,
     )
     with torch.device("meta"):
         model = DeepseekV4SparseMoeBlock(config, 0)
@@ -88,7 +87,6 @@ def _build(args):
     for name, value in model.state_dict().items():
         checksum.update(name.encode())
         checksum.update(value.view(torch.uint8).numpy().tobytes())
-    configure_deepseek_v41_swiglu(model)
     if args.backend == "megamoe":
         model.experts = DeepseekV41TrainingExperts(module=model.experts)
         compute = deepseek_v41_megamoe_compute_fn(
@@ -198,7 +196,7 @@ def main() -> None:
         measured = [row["max_rank_seconds"] for row in rows if not row["warmup"]]
         result = {**vars(args), "output": str(args.output), "rank": dist.get_rank(), "world_size": world,
                   "scope": "moe_forward_backward_no_optimizer_no_dense_dp_reduction",
-                  "hidden_size": 5120, "intermediate_size": 2304, "top_k": 6, "swiglu_limit": 0,
+                  "hidden_size": 5120, "intermediate_size": 2304, "top_k": 6, "swiglu_limit": 10,
                   "initial_weight_sha256": checksum, "route_sha256": route_hash,
                   "owner_received_tokens": owner_counts, "finite": True, "steps_detail": rows,
                   "median_seconds": statistics.median(measured),

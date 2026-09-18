@@ -24,8 +24,8 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 from transformers.activations import ACT2FN
 
 from hyper_parallel.core.multicore import MegaMoeExperts
-from hyper_parallel.models.deepseek_v41.adapter.activation import configure_deepseek_v41_swiglu
 from hyper_parallel.models.deepseek_v41.adapter.expert_parallel import _router
+from hyper_parallel.models.deepseek_v41.configuration import validate_swiglu_limit
 
 
 class DeepseekV41MegaMoe(nn.Module):
@@ -45,10 +45,11 @@ class DeepseekV41MegaMoe(nn.Module):
         ep_group: Any | None = None,
         dispatch_mode: str = "push",
     ) -> None:
-        """Convert an unclamped, learned-routing source block to MegaMoe.
+        """Convert a learned-routing source block to MegaMoe.
 
         Args:
-            module: Source block with complete routed weights and limit zero.
+            module: Source block with complete routed weights and a supported
+                routed/shared SwiGLU limit.
             local_num_tokens: Fixed token count received by this rank.
             ep_group: Explicit expert-parallel process group. ``None`` is for a single-process run.
             dispatch_mode: MegaMoe transport, either ``push`` or ``pull``.
@@ -59,10 +60,12 @@ class DeepseekV41MegaMoe(nn.Module):
         super().__init__()
         if module.is_hash:
             raise ValueError("DeepSeek-V4.1 MegaMoe requires learned routing")
-        if module.experts.limit != 0 or module.shared_experts.limit != 0:
-            raise ValueError("DeepSeek-V4.1 MegaMoe requires swiglu_limit=0 on routed and shared experts")
         if not isinstance(module.experts.act_fn, (nn.SiLU, type(ACT2FN["silu"]))):
             raise ValueError("DeepSeek-V4.1 MegaMoe requires the SiLU activation")
+        source_limit = validate_swiglu_limit(module.experts.limit)
+        shared_limit = validate_swiglu_limit(module.shared_experts.limit)
+        if source_limit != shared_limit:
+            raise ValueError("DeepSeek-V4.1 requires routed and shared experts to use the same swiglu_limit")
         source_up = module.experts.gate_up_proj
         source_down = module.experts.down_proj
         num_experts = module.experts.num_experts
@@ -75,7 +78,6 @@ class DeepseekV41MegaMoe(nn.Module):
         ep_rank = 0 if ep_group is None else dist.get_rank(ep_group)
         if not 0 <= ep_rank < ep_size:
             raise ValueError("The current rank must belong to ep_group")
-        configure_deepseek_v41_swiglu(module)
         self.gate = module.gate
         self.shared_experts = module.shared_experts
         self.is_hash = False
@@ -88,6 +90,7 @@ class DeepseekV41MegaMoe(nn.Module):
             ep_size=ep_size,
             ep_group=ep_group,
             dispatch_mode=dispatch_mode,
+            swiglu_limit=source_limit,
         ).to(device=source_up.device, dtype=source_up.dtype)
         start = ep_rank * self.experts.local_experts
         end = start + self.experts.local_experts

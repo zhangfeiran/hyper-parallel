@@ -43,6 +43,7 @@ class _WeightProbe(nn.Module):
         super().__init__()
         if kwargs["create_parameters"]:
             raise AssertionError("Trainer must own the only expert parameters")
+        self.swiglu_limit = kwargs["swiglu_limit"]
         self.calls = []
 
     def forward(self, hidden: torch.Tensor, _indices: torch.Tensor, _weights: torch.Tensor,
@@ -63,13 +64,15 @@ class TestMegaMoeTraining(unittest.TestCase):
         Description: Replace parameters between forwards as FSDP unshard can do.
         Expectation: New parameters receive gradients with no duplicate executor weights.
         """
-        experts = DeepseekV41TrainingExperts(module=_make_source().experts)
+        experts = DeepseekV41TrainingExperts(module=_make_source(10.0).experts)
         hidden = torch.ones(128, 8)
         indices, weights = torch.zeros(128, 2, dtype=torch.int64), torch.ones(128, 2)
         hooks = []
         experts.register_forward_pre_hook(lambda *_args: hooks.append(True))
         with patch("hyper_parallel.models.deepseek_v41.adapter.megamoe_training.MegaMoeExperts", _WeightProbe):
             experts.configure(None, 1, 128, "push", 2)
+            self.assertEqual(experts.swiglu_limit, 10.0)
+            self.assertEqual(experts._kernel.swiglu_limit, 10.0)
             experts(hidden, indices, weights).sum().backward()
             old = experts.gate_up_proj
             experts.gate_up_proj = nn.Parameter(torch.ones_like(old))
@@ -92,7 +95,7 @@ class TestMegaMoeTraining(unittest.TestCase):
         rules = entries_to_module_replacements(recipe.plan_overrides)
         with tempfile.TemporaryDirectory() as directory:
             config = _tiny_config(_write_engram_assets(directory))
-            config.swiglu_limit = 0.0
+            config.swiglu_limit = 10.0
             model = DeepseekV41CroppedForCausalLM(config)
             original = {name: value.clone() for name, value in model.state_dict().items()
                         if ".mlp.experts." in name}

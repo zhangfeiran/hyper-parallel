@@ -55,7 +55,6 @@ from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
 )
-from hyper_parallel.models.deepseek_v41.adapter.activation import configure_deepseek_v41_swiglu
 
 
 def _initialize_embedding_shard_safe(module: nn.Embedding, std: float) -> None:
@@ -406,7 +405,6 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
         for layer_idx in range(config.num_hidden_layers):
             layer = self.layers[layer_idx]
             layer.self_attn = DeepseekV41AttentionPlaceholder(config, layer_idx)
-            configure_deepseek_v41_swiglu(layer.mlp)
             layer.forward = MethodType(_v41_decoder_layer_forward, layer)
             if bool(getattr(config, "v41_vision_enabled", False)):
                 layer.mlp.gate = DeepseekV41TopKRouter(config)

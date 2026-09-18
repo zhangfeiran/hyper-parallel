@@ -29,6 +29,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.distributed.recipe_spec import local_compute
 from hyper_parallel.models.deepseek_v41.adapter.expert_parallel import _router
+from hyper_parallel.models.deepseek_v41.configuration import validate_swiglu_limit
 from hyper_parallel.models.replacement import module_replacement
 
 
@@ -41,15 +42,14 @@ class DeepseekV41TrainingExperts(nn.Module):
         """Convert a full HF holder before EP partitioning and FSDP construction.
 
         Args:
-            module: Unclamped HF DeepSeek routed experts.
+            module: HF DeepSeek routed experts with a supported SwiGLU limit.
             module_fqn: Checkpoint scope assigned by the replacement executor.
             context: Replacement context; model-parallel binding occurs later.
             initializer_range: Standard deviation used for meta-model random initialization.
         """
         super().__init__()
         del module_fqn, context
-        if module.limit != 0:
-            raise ValueError("MegaMoe Trainer replacement requires swiglu_limit=0")
+        source_limit = validate_swiglu_limit(module.limit)
         if not isinstance(module.act_fn, (nn.SiLU, type(ACT2FN["silu"]))):
             raise ValueError("MegaMoe Trainer replacement requires SiLU")
         self.global_experts = self.num_experts = module.num_experts
@@ -57,6 +57,7 @@ class DeepseekV41TrainingExperts(nn.Module):
         self.intermediate_size = module.intermediate_dim
         self.is_transposed = True
         self.initializer_range = initializer_range
+        self.swiglu_limit = source_limit
         self.gate_up_proj = nn.Parameter(module.gate_up_proj.detach().transpose(1, 2).contiguous(),
                                          requires_grad=module.gate_up_proj.requires_grad)
         self.down_proj = nn.Parameter(module.down_proj.detach().transpose(1, 2).contiguous(),
@@ -99,6 +100,7 @@ class DeepseekV41TrainingExperts(nn.Module):
             intermediate_size=self.intermediate_size, num_experts=self.global_experts,
             top_k=top_k, ep_group=ep_group, ep_size=ep_size,
             dispatch_mode=dispatch_mode, create_parameters=False,
+            swiglu_limit=self.swiglu_limit,
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
@@ -161,10 +163,13 @@ def deepseek_v41_megamoe_compute_fn(
     del mesh
     if any(axis is not None and axis.size() > 1 for axis in (tp_mesh, cp_mesh)):
         raise ValueError("DSV4.1 MegaMoe Trainer currently requires TP=CP=1")
-    if module.is_hash or module.shared_experts.limit != 0:
-        raise ValueError("DSV4.1 MegaMoe requires learned routing and unclamped shared experts")
+    if module.is_hash:
+        raise ValueError("DSV4.1 MegaMoe requires learned routing")
     if not isinstance(module.experts, DeepseekV41TrainingExperts):
         raise TypeError("Apply DeepseekV41TrainingExperts replacement before the MegaMoe EP factory")
+    shared_limit = validate_swiglu_limit(module.shared_experts.limit)
+    if shared_limit != module.experts.swiglu_limit:
+        raise ValueError("DSV4.1 MegaMoe requires the routed and shared experts to use the same swiglu_limit")
     group = None if ep_mesh is None else ep_mesh.get_group("ep")
     size = 1 if ep_mesh is None else ep_mesh["ep"].size()
     module.experts.configure(group, size, local_num_tokens, dispatch_mode, module.gate.top_k)

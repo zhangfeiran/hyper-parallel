@@ -1,5 +1,5 @@
 # Four-layer DeepSeek-V4.1 MegaMoe validation crop: Online 4K, TP1/CP1/EP16.
-# Validation uses unclamped SwiGLU in routed AND shared experts.
+# The crop preserves the released SwiGLU limit in routed and shared experts.
 # Activate the Torch multicore payload before launching this recipe.
 
 model:
@@ -15,8 +15,6 @@ model:
   indexer_loss_coeff: 0.001
   torch_dtype: bfloat16
   validate_placement: false
-  swiglu_limit: 0.0
-
 model_init_dtype: float32
 
 training:

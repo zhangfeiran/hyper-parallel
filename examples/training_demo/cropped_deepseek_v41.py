@@ -28,7 +28,6 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models._transformers import HyperAutoModelForCausalLM
 from hyper_parallel.models.build_options import CompileConfig
-from hyper_parallel.models.deepseek_v41.configuration import validate_swiglu_limit
 
 
 def build_deepseek_v41_validation_config(
@@ -40,7 +39,6 @@ def build_deepseek_v41_validation_config(
         num_routed_experts: int | None = None,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
-        swiglu_limit: float | None = None,
 ) -> DeepseekV4Config:
     """Translate the nested V4.1 text config into its validation config.
 
@@ -62,8 +60,6 @@ def build_deepseek_v41_validation_config(
             native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient. The released
             report does not disclose its production value.
-        swiglu_limit: Validation override; zero disables activation clipping.
-
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
 
@@ -87,10 +83,6 @@ def build_deepseek_v41_validation_config(
         raise ValueError("Engram assets and model crop use different layer counts")
 
     text = source["text_config"]
-    source_swiglu_limit = validate_swiglu_limit(text["swiglu_limit"])
-    effective_swiglu_limit = validate_swiglu_limit(
-        source_swiglu_limit if swiglu_limit is None else swiglu_limit
-    )
     released_hidden_layers = int(text["num_hidden_layers"])
     if not 4 <= num_hidden_layers <= released_hidden_layers:
         raise ValueError(
@@ -133,7 +125,7 @@ def build_deepseek_v41_validation_config(
         hc_mult=text["hc_mult"],
         hc_sinkhorn_iters=text["hc_sinkhorn_iters"],
         hc_eps=text["hc_eps"],
-        swiglu_limit=effective_swiglu_limit,
+        swiglu_limit=text["swiglu_limit"],
         sliding_window=text["sliding_window"],
         o_groups=text["o_groups"],
         o_lora_rank=text["o_lora_rank"],
@@ -153,7 +145,6 @@ def build_deepseek_v41_validation_config(
         attention_dropout=text["attention_dropout"],
     )
     config.architectures = ["DeepseekV41ForCausalLM"]
-    config.v41_source_swiglu_limit = source_swiglu_limit
     config.v41_compress_ratios = list(text["compress_ratios"][:num_hidden_layers])
     config.v41_kv_source_layer_ids = [
         layer_id for layer_id in text["kv_source_layer_ids"]
@@ -243,7 +234,6 @@ def build_cropped_deepseek_v41(
         activation_checkpoint: str | None = None,
         activation_swap: str = "none",
         model_init_dtype: str = "float32",
-        swiglu_limit: float | None = None,
 ) -> PreTrainedModel:
     """Build and parallelize the scaled-Engram V4.1 validation crop.
 
@@ -266,8 +256,6 @@ def build_cropped_deepseek_v41(
         activation_checkpoint: Activation-checkpoint mode.
         activation_swap: Activation-swap mode.
         model_init_dtype: Final parameter initialization dtype.
-        swiglu_limit: Optional activation limit override; zero disables clipping.
-
     Returns:
         Parallelized, randomly initialized V4.1 validation model.
     """
@@ -279,7 +267,6 @@ def build_cropped_deepseek_v41(
         num_routed_experts=num_routed_experts,
         exercise_post_training_indexer=exercise_post_training_indexer,
         indexer_loss_coeff=indexer_loss_coeff,
-        swiglu_limit=swiglu_limit,
     )
     return HyperAutoModelForCausalLM.from_config(
         config,

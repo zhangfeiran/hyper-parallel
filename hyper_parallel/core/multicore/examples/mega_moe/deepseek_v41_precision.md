@@ -13,12 +13,10 @@ build/activate its Torch multicore payload against the active CANN installation.
 The example uses BF16 on Ascend 910B. The CPU tests also need the repository's
 Trainer dependencies, including `torchdata`.
 
-The example explicitly uses `swiglu_limit=0`. HF 5.13 clamps unconditionally:
-zero would otherwise zero the up projection. The model adapter binds unclamped
-methods to **both** routed and shared experts while retaining their parameters.
-Positive limits keep the HF implementation; the MegaMoe adapter rejects them.
-The crop builder accepts `swiglu_limit=0.0` and records the original value as
-`v41_source_swiglu_limit`, without editing the source model assets.
+The example uses the released `swiglu_limit=10`. HF 5.13 clips the gate at the
+positive limit and the up projection symmetrically; the model adapter passes the
+same value to MegaMoe for both routed and shared experts. The validation crop
+preserves the source model's limit without a separate zero-limit override.
 
 ## Run
 
@@ -55,6 +53,9 @@ Useful variations:
 - `--ep-size 2` with four processes: disjoint strided groups `[0,2]` and `[1,3]`.
 - `--top-k 1` or `--top-k 8`: selection boundary cases with E=8.
 - `--tokens`: positive multiple of 128; capacity remains lossless.
+- `--swiglu-limit`: positive clamp limit; the default is the released value 10.
+- `--clamp-probe`: use exact projection values beyond and within the limit to
+  validate clipped forward/backward math without BF16 threshold-mask ambiguity.
 - `--synchronize-step-weights`: start each step from identical current HF weights.
   This is automatic with the default `--acceptance fp32`. The previous native
   optimizer update is compared before the next copy. Use `--acceptance hf_bf16
@@ -63,10 +64,9 @@ Useful variations:
 
 ## Reference and evidence
 
-The BF16 reference uses the original expert container with the unclamped activation
-and the actual `DeepseekV41TopKRouter`. Shared experts are unchanged apart from
-the explicit zero-limit convention. Both paths start from identical global
-weights. MegaMoe takes a contiguous expert slice in **group-local** rank order
+The BF16 reference uses the original expert container with the configured
+SwiGLU limit and the actual `DeepseekV41TopKRouter`. Both paths start from
+identical global weights. MegaMoe takes a contiguous expert slice in **group-local** rank order
 and transposes `[E,2I,H]` / `[E,H,I]` to `[E_local,H,2I]` / `[E_local,I,H]` once.
 
 The comparison checks exact initial parameter mapping (and exact state alignment

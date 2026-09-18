@@ -22,11 +22,19 @@ from typing import Iterable
 
 
 def validate_swiglu_limit(value: float) -> float:
-    """Validate a finite non-negative SwiGLU activation limit."""
-    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value < 0:
-        raise ValueError(
-            "swiglu_limit must be a finite non-negative number; use 0 to disable clipping"
-        )
+    """Validate a finite positive DeepSeek-V4.1 SwiGLU activation limit.
+
+    Args:
+        value: Source-model SwiGLU clamp limit.
+
+    Returns:
+        The validated limit as a float.
+
+    Raises:
+        ValueError: If the limit is not a finite positive real number.
+    """
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value <= 0:
+        raise ValueError("DeepSeek-V4.1 swiglu_limit must be a finite positive number")
     return float(value)
 
 

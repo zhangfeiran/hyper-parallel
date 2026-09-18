@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU contracts for unclamped DeepSeek-V4.1 and its MegaMoe block adapter."""
+"""CPU contracts for DeepSeek-V4.1 and its MegaMoe block adapter."""
 
 import copy
 import json
@@ -32,7 +32,6 @@ from examples.training_demo.cropped_deepseek_v41 import build_deepseek_v41_valid
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_accuracy import fp32_accuracy
 from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_oracle import evaluate_fp32_moe
-from hyper_parallel.models.deepseek_v41.adapter.activation import configure_deepseek_v41_swiglu
 from hyper_parallel.models.deepseek_v41.adapter.megamoe import DeepseekV41MegaMoe
 from hyper_parallel.models.deepseek_v41.configuration import validate_swiglu_limit
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
@@ -44,7 +43,7 @@ from tests.common.mark_utils import arg_mark
 from tests.ut.auto_models.models.deepseek_v41.test_deepseek_v41_crop import _tiny_config, _write_engram_assets
 
 
-def _make_source(limit=0.0, use_v41_router=True):
+def _make_source(limit=10.0, use_v41_router=True):
     """Build the actual HF expert modules and V4.1 multimodal learned router."""
     config = DeepseekV4Config(  # pylint: disable=unexpected-keyword-arg
         hidden_size=8, moe_intermediate_size=4, n_routed_experts=4,
@@ -71,13 +70,15 @@ def _cpu_experts(module, hidden, indices, weights):
     for expert_id in range(module.num_experts):
         rows, slots = torch.where(indices == expert_id)
         gate, up = (flat[rows] @ module.gate_up_weight[expert_id]).chunk(2, dim=-1)
+        gate = gate.clamp(max=module.swiglu_limit)
+        up = up.clamp(min=-module.swiglu_limit, max=module.swiglu_limit)
         values = (F.silu(gate) * up) @ module.down_weight[expert_id]
         output = output.index_add(0, rows, values * weights[rows, slots, None])
     return output.reshape_as(hidden)
 
 
 class TestDeepseekV41SwiGLU(unittest.TestCase):
-    """A zero validation limit disables clipping, with positive limits unchanged."""
+    """DeepSeek-V4.1 requires a positive clipped SwiGLU limit."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -87,86 +88,9 @@ class TestDeepseekV41SwiGLU(unittest.TestCase):
         Description: Reject invalid values instead of silently selecting a different activation.
         Expectation: Invalid limits raise ValueError.
         """
-        for value in (-1, float("inf"), float("nan"), True, "0", None):
+        for value in (-1, 0, float("inf"), float("nan"), True, "0", None):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_swiglu_limit(value)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_zero_limit_routed_outputs_and_gradients_are_unclamped(self):
-        """
-        Feature: DeepSeek-V4.1 MegaMoe validation.
-        Description: Large gate/up values preserve the ordinary SwiGLU derivative at limit zero.
-        Expectation: Large-value outputs and derivatives equal ordinary SwiGLU.
-        """
-        source = _make_source()
-        inputs = torch.tensor([[20.0, -20.0, 11.0, -11.0, -30.0, 30.0, 12.0, -12.0]], requires_grad=True)
-        # HF 5.13 treats zero as a clipping bound, not as a disabled clamp.
-        self.assertEqual(torch.count_nonzero(source.experts._apply_gate(inputs)).item(), 0)
-        configure_deepseek_v41_swiglu(source)
-        actual = source.experts._apply_gate(inputs)
-        gate, up = inputs.chunk(2, dim=-1)
-        expected = F.silu(gate) * up
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        actual_grad = torch.autograd.grad(actual.sum(), inputs, retain_graph=True)[0]
-        expected_grad = torch.autograd.grad(expected.sum(), inputs)[0]
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
-        self.assertGreater(actual.abs().max().item(), 100)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_shared_experts_disable_clamp_and_preserve_parameters(self):
-        """
-        Feature: DeepSeek-V4.1 MegaMoe validation.
-        Description: Zero applies to shared experts and preserves checkpoint/optimizer identities.
-        Expectation: Shared outputs and gradients match without replacing parameters.
-        """
-        source = _make_source()
-        identities = dict(source.named_parameters())
-        configure_deepseek_v41_swiglu(source)
-        for name, parameter in source.named_parameters():
-            self.assertIs(parameter, identities[name])
-        inputs = (torch.randn(2, 4, 8) * 100).requires_grad_()
-        shared = source.shared_experts
-        actual = shared(inputs)
-        expected = (F.silu(inputs @ shared.gate_proj.weight.T)
-                    * (inputs @ shared.up_proj.weight.T)) @ shared.down_proj.weight.T
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        actual_grads = torch.autograd.grad(actual.sum(), (inputs, *shared.parameters()), retain_graph=True)
-        expected_grads = torch.autograd.grad(expected.sum(), (inputs, *shared.parameters()))
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_positive_limit_keeps_both_hf_methods(self):
-        """
-        Feature: DeepSeek-V4.1 MegaMoe validation.
-        Description: Retain the existing HF clamp path when the source requests limit ten.
-        Expectation: Limit ten preserves the HF methods and clipped results.
-        """
-        source = _make_source(10.0)
-        gate_fn = source.experts._apply_gate.__func__
-        shared_fn = source.shared_experts.forward.__func__
-        inputs = torch.randn(3, 8) * 100
-        expected = source.experts._apply_gate(inputs)
-        configure_deepseek_v41_swiglu(source)
-        self.assertIs(source.experts._apply_gate.__func__, gate_fn)
-        self.assertIs(source.shared_experts.forward.__func__, shared_fn)
-        torch.testing.assert_close(source.experts._apply_gate(inputs), expected, rtol=0, atol=0)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_mismatched_branch_limits_are_rejected(self):
-        """
-        Feature: DeepSeek-V4.1 MegaMoe validation.
-        Description: Routed/shared semantics cannot diverge during configuration.
-        Expectation: Different routed and shared limits raise ValueError.
-        """
-        source = _make_source()
-        source.shared_experts.limit = 10
-        with self.assertRaisesRegex(ValueError, "same swiglu_limit"):
-            configure_deepseek_v41_swiglu(source)
 
 
 class TestDeepseekV41FP32Oracle(unittest.TestCase):
@@ -180,37 +104,40 @@ class TestDeepseekV41FP32Oracle(unittest.TestCase):
         Description: Fixed selected IDs preserve routing gradients and leave correction biases unused.
         Expectation: Independent FP32 math matches the real FP32 block and all gradients.
         """
-        for learned in (True, False):
-            with self.subTest(learned=learned):
-                source = _make_source()
-                configure_deepseek_v41_swiglu(source)
-                inputs = torch.randn(2, 4, 8, requires_grad=True)
-                dy = torch.randn_like(inputs)
-                if learned:
-                    _, weights, indices = source.gate(inputs)
-                    weights.retain_grad()
-                else:
-                    indices = torch.arange(2).expand(8, -1)
-                    weights = torch.full((8, 2), 0.85, requires_grad=True)
-                output = (source.experts(inputs.reshape(-1, 8), indices, weights).reshape_as(inputs)
-                          + source.shared_experts(inputs))
-                (output * dy).sum().backward()
-                oracle = evaluate_fp32_moe(
-                    inputs, dy, dict(source.named_parameters()), indices, weights,
-                    learned_routing=learned, scaling_factor=1.7,
-                )
-                torch.testing.assert_close(oracle["output"], output)
-                torch.testing.assert_close(oracle["input_grad"], inputs.grad)
-                torch.testing.assert_close(oracle["route_weights"], weights)
-                torch.testing.assert_close(oracle["route_weight_grad"], weights.grad)
-                for name, parameter in source.named_parameters():
-                    expected = oracle["gradients"][name]
-                    if parameter.grad is None:
-                        self.assertIsNone(expected)
+        for limit in (0.1, 10.0):
+            for learned in (True, False):
+                with self.subTest(limit=limit, learned=learned):
+                    source = _make_source(limit)
+                    inputs = torch.randn(2, 4, 8, requires_grad=True)
+                    dy = torch.randn_like(inputs)
+                    if learned:
+                        _, weights, indices = source.gate(inputs)
+                        weights.retain_grad()
                     else:
-                        self.assertEqual(expected.dtype, torch.float32)
-                        self.assertEqual(expected.device.type, "cpu")
-                        torch.testing.assert_close(expected, parameter.grad)
+                        indices = torch.arange(2).expand(8, -1)
+                        weights = torch.full((8, 2), 0.85, requires_grad=True)
+                    output = (source.experts(inputs.reshape(-1, 8), indices, weights).reshape_as(inputs)
+                              + source.shared_experts(inputs))
+                    (output * dy).sum().backward()
+                    oracle = evaluate_fp32_moe(
+                        inputs, dy, dict(source.named_parameters()), indices, weights,
+                        learned_routing=learned, scaling_factor=1.7,
+                        swiglu_limit=limit,
+                    )
+                    if limit == 0.1:
+                        self.assertGreater(sum(oracle["clamp_activity"].values()), 0)
+                    torch.testing.assert_close(oracle["output"], output)
+                    torch.testing.assert_close(oracle["input_grad"], inputs.grad)
+                    torch.testing.assert_close(oracle["route_weights"], weights)
+                    torch.testing.assert_close(oracle["route_weight_grad"], weights.grad)
+                    for name, parameter in source.named_parameters():
+                        expected = oracle["gradients"][name]
+                        if parameter.grad is None:
+                            self.assertIsNone(expected)
+                        else:
+                            self.assertEqual(expected.dtype, torch.float32)
+                            self.assertEqual(expected.device.type, "cpu")
+                            torch.testing.assert_close(expected, parameter.grad)
 
 
 class TestDeepseekV41MegaMoe(unittest.TestCase):
@@ -218,15 +145,25 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_rejects_clamp_and_hash_routing_before_allocation(self):
+    def test_accepts_clamp_and_rejects_hash_routing_before_allocation(self):
         """
         Feature: DeepSeek-V4.1 MegaMoe validation.
-        Description: Unsupported semantics must fail before creating a native execution owner.
-        Expectation: Unsupported source semantics fail before execution resources exist.
+        Description: Positive clipping is passed to MegaMoe while unsupported routing fails early.
+        Expectation: The adapter records the source limit and rejects hash routing.
         """
         source = _make_source(10.0)
-        with self.assertRaisesRegex(ValueError, "swiglu_limit=0"):
-            DeepseekV41MegaMoe(source, local_num_tokens=128)
+        adapter = DeepseekV41MegaMoe(source, local_num_tokens=128)
+        try:
+            self.assertEqual(adapter.experts.swiglu_limit, 10.0)
+        finally:
+            adapter.close()
+        zero_limit = _make_source(0.0)
+        with self.assertRaisesRegex(ValueError, "finite positive"):
+            DeepseekV41MegaMoe(zero_limit, local_num_tokens=128)
+        mismatched = _make_source()
+        mismatched.shared_experts.limit = 1.0
+        with self.assertRaisesRegex(ValueError, "same swiglu_limit"):
+            DeepseekV41MegaMoe(mismatched, local_num_tokens=128)
         source = _make_source()
         source.is_hash = True
         with self.assertRaisesRegex(ValueError, "learned routing"):
@@ -267,7 +204,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         for use_v41_router, visual in ((False, False), (True, False), (True, True)):
             with self.subTest(v41_router=use_v41_router, visual=visual):
                 source = _make_source(use_v41_router=use_v41_router)
-                configure_deepseek_v41_swiglu(source)
                 adapter = DeepseekV41MegaMoe(copy.deepcopy(source), local_num_tokens=128)
                 source_optimizer = torch.optim.SGD(source.parameters(), lr=0.01)
                 adapter_optimizer = torch.optim.SGD(adapter.parameters(), lr=0.01)
@@ -307,16 +243,16 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                     adapter.close()
 
 
-class TestDeepseekV41LimitOverride(unittest.TestCase):
-    """The validation override reaches every constructed MoE branch."""
+class TestDeepseekV41LimitPropagation(unittest.TestCase):
+    """The validation crop preserves the source model's activation limit."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_limit_override_keeps_source_and_configures_the_model(self):
+    def test_source_limit_configures_the_model(self):
         """
         Feature: DeepSeek-V4.1 MegaMoe validation.
-        Description: Preserve source limit ten while explicitly disabling both expert clamps.
-        Expectation: All layers honor the explicit override and retain the source asset.
+        Description: Build the crop directly from a source with the released limit.
+        Expectation: All layers retain the source limit and clipped HF behavior.
         """
         with tempfile.TemporaryDirectory() as directory:
             assets_path = _write_engram_assets(directory)
@@ -338,33 +274,20 @@ class TestDeepseekV41LimitOverride(unittest.TestCase):
             config_path = Path(directory) / "config.json"
             source_bytes = json.dumps(source)
             config_path.write_text(source_bytes, encoding="utf-8")
-            default = build_deepseek_v41_validation_config(directory, str(assets_path))
-            self.assertEqual(default.swiglu_limit, 10.0)
-            for limit in (0.0, 10.0):
-                with self.subTest(limit=limit):
-                    config = build_deepseek_v41_validation_config(
-                        directory, str(assets_path), swiglu_limit=limit)
-                    self.assertEqual(config.swiglu_limit, limit)
-                    self.assertEqual(config.v41_source_swiglu_limit, 10.0)
-                    with no_init_weights():
-                        model = DeepseekV41CroppedForCausalLM(config)
-                    for layer in model.model.layers:
-                        block = layer.mlp
-                        self.assertEqual(block.experts.limit, limit)
-                        self.assertEqual(block.shared_experts.limit, limit)
-                        gate_up = torch.full((1, 32), 20.0)
-                        value = block.experts._apply_gate(gate_up)
-                        expected_gate = torch.full((1, 16), 20.0 if limit == 0 else 10.0)
-                        torch.testing.assert_close(value, F.silu(expected_gate) * expected_gate)
-                        shared = block.shared_experts
-                        with torch.no_grad():
-                            for parameter in shared.parameters():
-                                parameter.fill_(0.25)
-                        inputs = torch.full((1, 32), 20.0)
-                        projected = shared.gate_proj(inputs)
-                        bound = projected if limit == 0 else projected.clamp(max=limit)
-                        expected = shared.down_proj(F.silu(bound) * bound)
-                        torch.testing.assert_close(shared(inputs), expected)
+            config = build_deepseek_v41_validation_config(directory, str(assets_path))
+            self.assertEqual(config.swiglu_limit, 10.0)
+            self.assertFalse(hasattr(config, "v41_source_swiglu_limit"))
+            with no_init_weights():
+                model = DeepseekV41CroppedForCausalLM(config)
+            for layer in model.model.layers:
+                block = layer.mlp
+                self.assertEqual(block.experts.limit, 10.0)
+                self.assertEqual(block.shared_experts.limit, 10.0)
+                gate_up = torch.full((1, 32), 20.0)
+                expected_gate = torch.full((1, 16), 10.0)
+                torch.testing.assert_close(
+                    block.experts._apply_gate(gate_up), F.silu(expected_gate) * expected_gate
+                )
             self.assertEqual(config_path.read_text(encoding="utf-8"), source_bytes)
 
 

@@ -39,7 +39,6 @@ from hyper_parallel.core.multicore._loader import get_multicore_paths
 from hyper_parallel.models.deepseek_v41.adapter.expert_parallel import deepseek_v41_ep_compute_fn
 from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_accuracy import fp32_accuracy
 from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_oracle import evaluate_fp32_moe
-from hyper_parallel.models.deepseek_v41.adapter.activation import configure_deepseek_v41_swiglu
 from hyper_parallel.models.deepseek_v41.adapter.megamoe import DeepseekV41MegaMoe
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
@@ -54,12 +53,15 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--intermediate-size", type=int, default=128)
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
+    parser.add_argument("--swiglu-limit", type=float, default=10.0)
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--ep-size", type=int, default=None,
                         help="EP group size; smaller than WORLD creates strided disjoint subgroups")
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
     parser.add_argument("--reference", choices=("owner_ep", "hf_replicated"), default="owner_ep")
     parser.add_argument("--route", choices=("learned", "hotspot"), default="learned")
+    parser.add_argument("--clamp-probe", action="store_true",
+                        help="Use exact projection values on both sides of the clamp boundary")
     parser.add_argument("--vision", action="store_true")
     parser.add_argument("--acceptance", choices=("fp32", "hf_bf16"), default="fp32",
                         help="FP32 acceptance synchronizes step weights; hf_bf16 retains the legacy gate")
@@ -83,6 +85,8 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
         parser.error("tokens must be divisible by 128 and top-k cannot exceed num-experts")
     if any(not math.isfinite(value) or value < 0 for value in (args.rtol, args.atol)):
         parser.error("rtol and atol must be finite and non-negative")
+    if not math.isfinite(args.swiglu_limit) or args.swiglu_limit <= 0:
+        parser.error("swiglu-limit must be finite and positive")
     if args.ep_size is not None and args.ep_size <= 0:
         parser.error("ep-size must be positive")
     return args
@@ -92,7 +96,7 @@ def _source_block(args: argparse.Namespace, device: torch.device) -> torch.nn.Mo
     config = DeepseekV4Config(  # pylint: disable=unexpected-keyword-arg
         hidden_size=args.hidden_size, moe_intermediate_size=args.intermediate_size,
         n_routed_experts=args.num_experts, n_shared_experts=1, num_experts_per_tok=args.top_k,
-        num_hidden_layers=1, mlp_layer_types=["moe"], swiglu_limit=0.0,
+        num_hidden_layers=1, mlp_layer_types=["moe"], swiglu_limit=args.swiglu_limit,
         scoring_func="sqrtsoftplus", routed_scaling_factor=1.7,
     )
     config.v41_vision_enabled = args.vision
@@ -103,7 +107,16 @@ def _source_block(args: argparse.Namespace, device: torch.device) -> torch.nn.Mo
     with torch.no_grad():
         for parameter in source.parameters():
             parameter.normal_(std=0.02, generator=generator)
-    configure_deepseek_v41_swiglu(source)
+        if args.clamp_probe:
+            values = torch.tensor((-2.0, -0.5, 0.5, 2.0)) * args.swiglu_limit
+            gate = values.repeat(math.ceil(args.intermediate_size / values.numel()))[:args.intermediate_size]
+            up = values.roll(1).repeat(math.ceil(args.intermediate_size / values.numel()))[:args.intermediate_size]
+            source.experts.gate_up_proj.zero_()
+            source.experts.gate_up_proj[:, :, 0] = torch.cat((gate, up))
+            source.shared_experts.gate_proj.weight.zero_()
+            source.shared_experts.up_proj.weight.zero_()
+            source.shared_experts.gate_proj.weight[:, 0] = gate
+            source.shared_experts.up_proj.weight[:, 0] = up
     return source.to(device=device, dtype=torch.bfloat16)
 
 
@@ -263,9 +276,13 @@ def _full_native_parameters(candidate, ep_group):
 
 
 def _fp32_evidence(module, parameters, inputs, output, dy, route, args, ep_group):
+    source_limit = getattr(module.experts, "swiglu_limit", getattr(module.experts, "limit", None))
+    if source_limit == 0:
+        source_limit = None
     oracle = evaluate_fp32_moe(
         inputs, dy, parameters, route["indices"], route["weights"],
         learned_routing=args.route == "learned", scaling_factor=1.7,
+        swiglu_limit=source_limit,
     )
     # Sum the FP32 per-rank oracle before comparing local expert dW. Reducing
     # already rounded BF16 gradients would add a second reference error.
@@ -334,7 +351,11 @@ def _run_steps(source, candidate, args, device, ep_group):
             _synchronize_parameters(source, candidate, ep_rank)
         initial_checks = (_initial_parameter_checks(source, candidate, ep_rank)
                           if step == 0 or args.synchronize_step_weights else [])
-        inputs = torch.randn(1, args.tokens, args.hidden_size, generator=generator).to(device, torch.bfloat16)
+        if args.clamp_probe:
+            inputs = torch.zeros(1, args.tokens, args.hidden_size, device=device, dtype=torch.bfloat16)
+            inputs[..., 0] = 1
+        else:
+            inputs = torch.randn(1, args.tokens, args.hidden_size, generator=generator).to(device, torch.bfloat16)
         inputs.requires_grad_()
         other_inputs = inputs.detach().clone().requires_grad_()
         output_grad = torch.randn(inputs.shape, generator=generator).to(device) / math.sqrt(args.tokens)
@@ -376,7 +397,13 @@ def _run_steps(source, candidate, args, device, ep_group):
                 source, source_oracle, args, ep_group, gradients=False))
             fp32_checks["megamoe"].extend(_fp32_parameter_checks(
                 candidate, native_oracle, args, ep_group, gradients=False))
-        results.append({"step": step, "checks": comparisons, "fp32_checks": fp32_checks})
+        step_result = {"step": step, "checks": comparisons, "fp32_checks": fp32_checks}
+        if args.fp32_oracle:
+            step_result["clamp_activity"] = {
+                "hf_bf16": source_oracle["clamp_activity"],
+                "megamoe": native_oracle["clamp_activity"],
+            }
+        results.append(step_result)
     return _rank_result(results, args, ep_group)
 
 
@@ -468,7 +495,7 @@ def main(argv: list[str] | None = None) -> None:
         passed = all(item["passed"] for item in results)
         if dist.get_rank() == 0:
             args.output.parent.mkdir(parents=True, exist_ok=True)
-            report = {"passed": passed, "swiglu_limit": 0.0, "ep_size": args.ep_size,
+            report = {"passed": passed, "swiglu_limit": args.swiglu_limit, "ep_size": args.ep_size,
                       "world_size": dist.get_world_size(),
                       "config": {key: str(value) if isinstance(value, Path) else value
                                  for key, value in vars(args).items()},

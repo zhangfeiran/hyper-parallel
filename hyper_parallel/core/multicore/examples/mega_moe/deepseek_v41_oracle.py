@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Independent CPU FP32 math oracle for unclamped DSV4.1 MoE validation."""
+"""Independent CPU FP32 math oracle for DSV4.1 MoE validation."""
 
 from __future__ import annotations
 
@@ -29,6 +29,15 @@ def _linear(hidden: torch.Tensor, parameters: dict[str, torch.Tensor], prefix: s
     return output if bias is None else output + bias
 
 
+def _swiglu(gate_up: torch.Tensor, limit: float | None) -> torch.Tensor:
+    """Apply the HF V4.1 gate/up clamp followed by SwiGLU."""
+    gate, up = gate_up.chunk(2, dim=-1)
+    if limit is not None and limit > 0:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    return functional.silu(gate) * up
+
+
 def evaluate_fp32_moe(
     hidden_states: torch.Tensor,
     output_gradient: torch.Tensor,
@@ -39,6 +48,7 @@ def evaluate_fp32_moe(
     learned_routing: bool,
     scaling_factor: float,
     scoring_func: str = "sqrtsoftplus",
+    swiglu_limit: float | None = None,
 ) -> dict[str, Any]:
     """Differentiate a CPU FP32 MoE without calling HF or native expert code.
 
@@ -51,6 +61,8 @@ def evaluate_fp32_moe(
         learned_routing: Recompute differentiable scores for the selected IDs.
         scaling_factor: Scaling applied once after TopK normalization.
         scoring_func: V4.1 score function for learned routing.
+        swiglu_limit: Positive V4.1 clamp limit, or ``None`` for the legacy
+            unclamped path.
 
     Returns:
         CPU output, input/route gradients, parameter gradients, route values,
@@ -80,14 +92,28 @@ def evaluate_fp32_moe(
         route_weights = weights.detach().to(device="cpu", dtype=torch.float32).clone().requires_grad_()
     route_weights.retain_grad()
     routed = torch.zeros_like(flat)
+    clamp_activity = {
+        "routed_gate_above_limit": 0,
+        "routed_up_outside_limit": 0,
+        "shared_gate_above_limit": 0,
+        "shared_up_outside_limit": 0,
+    }
     for expert_id in range(params["experts.gate_up_proj"].shape[0]):
         rows, slots = torch.where(selected == expert_id)
-        gate, up = (flat[rows] @ params["experts.gate_up_proj"][expert_id].T).chunk(2, dim=-1)
-        expert_output = (functional.silu(gate) * up) @ params["experts.down_proj"][expert_id].T
+        gate_up = flat[rows] @ params["experts.gate_up_proj"][expert_id].T
+        if swiglu_limit is not None:
+            gate, up = gate_up.chunk(2, dim=-1)
+            clamp_activity["routed_gate_above_limit"] += int((gate > swiglu_limit).sum())
+            clamp_activity["routed_up_outside_limit"] += int((up.abs() > swiglu_limit).sum())
+        expert_output = _swiglu(gate_up, swiglu_limit) @ params["experts.down_proj"][expert_id].T
         routed = routed.index_add(0, rows, expert_output * route_weights[rows, slots, None])
     shared_gate = _linear(flat, params, "shared_experts.gate_proj")
     shared_up = _linear(flat, params, "shared_experts.up_proj")
-    shared = _linear(functional.silu(shared_gate) * shared_up, params, "shared_experts.down_proj")
+    if swiglu_limit is not None:
+        clamp_activity["shared_gate_above_limit"] = int((shared_gate > swiglu_limit).sum())
+        clamp_activity["shared_up_outside_limit"] = int((shared_up.abs() > swiglu_limit).sum())
+    shared = _linear(_swiglu(torch.cat((shared_gate, shared_up), dim=-1), swiglu_limit),
+                     params, "shared_experts.down_proj")
     output = (routed + shared).reshape_as(hidden)
     (output * output_gradient.detach().to(device="cpu", dtype=torch.float32)).sum().backward()
     return {
@@ -95,4 +121,5 @@ def evaluate_fp32_moe(
         "route_weights": route_weights.detach(), "route_weight_grad": route_weights.grad,
         "parameters": {name: value.detach() for name, value in params.items()},
         "gradients": {name: value.grad for name, value in params.items()},
+        "clamp_activity": clamp_activity,
     }

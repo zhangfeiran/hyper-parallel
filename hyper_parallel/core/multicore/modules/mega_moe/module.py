@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import replace
+import struct
 from typing import Any
 
 import torch
@@ -34,6 +35,52 @@ from .spec import _COMMUNICATION_SPLIT, _balanced_communication_split, bind_mega
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
 
 __all__ = ["MegaMoeExperts"]
+
+
+def _validate_expert_capacity_factor(expert_capacity_factor: float | None) -> None:
+    """Validate the optional bounded receive-capacity multiplier."""
+    if expert_capacity_factor is None:
+        return
+    valid_type = isinstance(expert_capacity_factor, (int, float)) and not isinstance(
+        expert_capacity_factor, bool
+    )
+    try:
+        valid_value = valid_type and math.isfinite(expert_capacity_factor)
+    except OverflowError:
+        valid_value = False
+    if not valid_value or expert_capacity_factor < 1.0:
+        raise ValueError(
+            "expert_capacity_factor must be None or a finite number at least 1.0, "
+            f"got {expert_capacity_factor!r}."
+        )
+
+
+def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
+    """Validate a positive clamp value that survives float32 serialization."""
+    if swiglu_limit is None:
+        return
+    valid_type = isinstance(swiglu_limit, (int, float)) and not isinstance(
+        swiglu_limit, bool
+    )
+    try:
+        encoded_limit = (
+            struct.unpack("<f", struct.pack("<f", float(swiglu_limit)))[0]
+            if valid_type
+            else 0.0
+        )
+        valid_value = (
+            valid_type
+            and math.isfinite(swiglu_limit)
+            and math.isfinite(encoded_limit)
+            and encoded_limit > 0
+        )
+    except (OverflowError, TypeError, ValueError, struct.error):
+        valid_value = False
+    if not valid_value:
+        raise ValueError(
+            "swiglu_limit must be None or a finite positive float32-representable number, "
+            f"got {swiglu_limit!r}."
+        )
 
 
 def _create_mega_moe_parameters(
@@ -147,6 +194,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         expert_capacity_factor: float | None = None,
+        swiglu_limit: float | None = None,
         ep_size: int = 1,
         ep_group: Any | None = None,
         create_parameters: bool = True,
@@ -172,6 +220,10 @@ class MegaMoeExperts(MulticoreModule):
                 WORLD. Expert ownership follows group-local rank order. Disjoint
                 PP/DP groups bootstrap independently; one process can have only
                 one ordered EP membership active in SHMEM at a time.
+            swiglu_limit: Optional positive, finite float32-representable clamp
+                limit for SwiGLU. The gate branch is clipped at the positive
+                limit and the up branch symmetrically. ``None`` preserves the
+                legacy unclamped path.
         """
         if dispatch_mode not in ("push", "pull"):
             raise ValueError("dispatch_mode must be push or pull")
@@ -182,10 +234,13 @@ class MegaMoeExperts(MulticoreModule):
             num_experts=num_experts,
             top_k=top_k,
             expert_capacity_factor=expert_capacity_factor,
+            swiglu_limit=swiglu_limit,
             ep_size=ep_size,
         )
         if expert_capacity_factor is not None:
             expert_capacity_factor = float(expert_capacity_factor)
+        if swiglu_limit is not None:
+            swiglu_limit = float(swiglu_limit)
         specification = {
             "local_num_tokens": local_num_tokens,
             "hidden_size": hidden_size,
@@ -193,6 +248,7 @@ class MegaMoeExperts(MulticoreModule):
             "num_experts": num_experts,
             "top_k": top_k,
             "expert_capacity_factor": expert_capacity_factor,
+            "swiglu_limit": swiglu_limit,
             "ep_size": ep_size,
             "ep_group": ep_group,
             "dispatch_mode": dispatch_mode,
@@ -204,6 +260,7 @@ class MegaMoeExperts(MulticoreModule):
             num_experts,
             top_k,
             expert_capacity_factor,
+            swiglu_limit,
             ep_size,
             id(ep_group),
             dispatch_mode,
@@ -220,6 +277,7 @@ class MegaMoeExperts(MulticoreModule):
         self.top_k = top_k
         self.expert_capacity_factor = expert_capacity_factor
         self.dispatch_mode = dispatch_mode
+        self.swiglu_limit = swiglu_limit
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
@@ -240,6 +298,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         expert_capacity_factor: float | None,
+        swiglu_limit: float | None,
         ep_size: int,
     ) -> None:
         """Validate static shape and topology values before allocation."""
@@ -267,23 +326,8 @@ class MegaMoeExperts(MulticoreModule):
                 "local_num_tokens must be divisible by the fixed communication "
                 f"split {_COMMUNICATION_SPLIT}, got {local_num_tokens}."
             )
-        if expert_capacity_factor is None:
-            return
-        valid_factor_type = isinstance(
-            expert_capacity_factor,
-            (int, float),
-        ) and not isinstance(expert_capacity_factor, bool)
-        try:
-            valid_factor_value = valid_factor_type and math.isfinite(
-                expert_capacity_factor
-            )
-        except OverflowError:
-            valid_factor_value = False
-        if not valid_factor_value or expert_capacity_factor < 1.0:
-            raise ValueError(
-                "expert_capacity_factor must be None or a finite number at least 1.0, "
-                f"got {expert_capacity_factor!r}."
-            )
+        _validate_expert_capacity_factor(expert_capacity_factor)
+        _validate_swiglu_limit(swiglu_limit)
 
     def _validate_tensors(self, hidden_states: torch.Tensor, expert_weights: tuple) -> None:
         """Validate activation and parameter metadata before acquiring resources."""

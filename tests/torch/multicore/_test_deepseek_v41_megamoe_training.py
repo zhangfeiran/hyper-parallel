@@ -52,8 +52,7 @@ def build_model(assets_directory: str, distributed_setup: Any = None,
     config = _tiny_config(_write_engram_assets(assets_directory))
     config.hidden_size = 512
     config.moe_intermediate_size = config.intermediate_size = 128
-    config.swiglu_limit = 0.0
-    config.v41_source_swiglu_limit = 10.0
+    config.swiglu_limit = 10.0
     return HyperAutoModelForCausalLM.from_config(
         config, distributed_setup=distributed_setup, torch_dtype="bfloat16",
         attn_implementation="eager", model_init_dtype=model_init_dtype,
