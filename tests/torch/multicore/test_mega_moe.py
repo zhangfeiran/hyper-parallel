@@ -338,6 +338,26 @@ def test_moe_token_permute_grad(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     )
 
 
+@arg_mark(
+    plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential",
+)
+@pytest.mark.parametrize("task_queue_enable", ["1", "2"])
+def test_moe_token_unpermute_grad_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task_queue_enable: str,
+) -> None:
+    """Feature: Cached unpermute-gradient out bridge in both task queues.
+
+    Description: Exercise changing inputs, reused outputs and default/non-default streams.
+    Expectation: Gradients match the native operator exactly and overlapping outputs are rejected.
+    """
+    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue_enable)
+    evidence_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / f"queue_{task_queue_enable}"
+    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(evidence_dir))
+    _run_acceptance_worker(
+        monkeypatch, tmp_path, "test_moe_token_unpermute_grad_out", 2, "_test_moe_token_unpermute_grad.py",
+    )
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
           essential_mark="unessential")
 def test_mega_moe_transport_coexistence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
