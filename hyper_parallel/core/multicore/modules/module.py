@@ -46,6 +46,7 @@ class _ExecutionResourceGroup:
         self.binding = None
         self.shared = False
         self.binding_id = None
+        self.owner = None
         self.closing = False
         self.closed = False
 
@@ -59,7 +60,7 @@ class _MulticoreResourceManager:
         self._next_member_token = itertools.count()
         self._next_binding_id = itertools.count()
         self._groups: dict[int, _ExecutionResourceGroup] = {}
-        self._runtime_release = None
+        self.owner = None
 
     def create_group(
         self,
@@ -77,6 +78,7 @@ class _MulticoreResourceManager:
             compatibility_key,
             scope_key,
         )
+        group.owner = self.owner
         self._groups[group_id] = group
         return group, member_token
 
@@ -128,96 +130,27 @@ class _MulticoreResourceManager:
         dist.all_gather_object(values, value)
         return values
 
-    def reclaim(self, *, operation: str, stop_signal: int = 0) -> tuple[int, int]:
-        """Collectively close matching idle groups at a caller-established safe point.
-
-        Args:
-            operation: Matching collect, checkpoint, or shutdown operation on every rank.
-            stop_signal: Locally requested termination signal, or zero.
-
-        Returns:
-            Number of closed groups and the agreed termination signal.
-
-        Raises:
-            RuntimeError: Ranks disagree, backward is pending, or teardown fails.
-        """
-        if operation not in ("collect", "checkpoint", "shutdown"):
-            raise ValueError(f"unknown multicore lifecycle operation: {operation}")
-        groups = sorted(
-            (group for group in self._groups.values() if group.resources is not None),
+    def close_groups(self, *, owner: object | None = None) -> None:
+        """Close one task's groups, or all groups, at a collective idle boundary."""
+        groups = [group for group in self._groups.values() if owner is None or group.owner is owner]
+        bound = sorted(
+            (group for group in groups if group.resources is not None),
             key=lambda group: group.binding_id,
         )
-        selected, agreed_signal = self._agree_reclamation(groups, operation, stop_signal)
-        if operation != "shutdown" and selected and len(selected) == len(groups):
-            self._retain_runtime_collectively(selected[0])
-        for group in selected:
-            self._close_group_collectively(group)
-        if operation == "shutdown":
-            self._release_runtime_collectively()
-            self._close_unbound_groups()
-        return len(selected), agreed_signal
-
-    def _agree_reclamation(
-        self, groups: list[_ExecutionResourceGroup], operation: str, stop_signal: int,
-    ) -> tuple[list[_ExecutionResourceGroup], int]:
-        """Validate manifests and select groups before entering any native teardown."""
-        manifest = (
-            self._runtime_release is not None,
-            tuple((group.binding_id, group.resources.lifecycle_signature()) for group in groups),
-        )
-        readiness = tuple((not group.members, group.resources.can_close()) for group in groups)
-        peers = self._exchange((operation, manifest, readiness, stop_signal))
-        if any(peer[:2] != peers[0][:2] for peer in peers):
-            raise RuntimeError("multicore lifecycle operations or bound resource manifests differ across ranks")
-        agreed_signal = max(peer[3] for peer in peers)
-        if operation == "shutdown" and any(not ready for peer in peers for _, ready in peer[2]):
+        manifest = tuple((group.binding_id, group.resources.lifecycle_signature()) for group in bound)
+        ready = all(group.resources.can_close() for group in bound)
+        peers = self._exchange((manifest, ready))
+        if any(peer[0] != manifest for peer in peers):
+            raise RuntimeError("multicore resource manifests differ across ranks")
+        if not all(peer[1] for peer in peers):
             raise RuntimeError("multicore shutdown requires idle workspaces and no pending backward graphs")
-        selected = [
-            group for index, group in enumerate(groups)
-            if self._ready_on_all_ranks([peer[2][index] for peer in peers], operation)
-        ]
-        return selected, agreed_signal
-
-    @staticmethod
-    def _ready_on_all_ranks(readiness: list[tuple[bool, bool]], operation: str) -> bool:
-        """Require global idleness and, for collection, global absence of module owners."""
-        return all(ready and (orphaned or operation == "shutdown") for orphaned, ready in readiness)
-
-    def _close_unbound_groups(self) -> None:
-        """Invalidate never-executed modules without involving native resources."""
-        for group in tuple(self._groups.values()):
+        for group in bound:
+            self._close_group_collectively(group)
+        for group in groups:
             if group.resources is None:
                 group.closed = True
                 group.members.clear()
                 self._groups.pop(group.identifier, None)
-
-    def _retain_runtime_collectively(self, group: _ExecutionResourceGroup) -> None:
-        """Keep the runtime alive between model generations without retaining workspaces."""
-        if self._runtime_release is not None:
-            return
-        failure = None
-        try:
-            self._runtime_release = group.resources.retain_runtime()
-        except Exception as error:
-            failure = f"{type(error).__name__}: {error}"
-        failures = self._exchange(failure)
-        if any(error is not None for error in failures):
-            raise RuntimeError(f"multicore runtime retention failed: {failures}")
-
-    def _release_runtime_collectively(self) -> None:
-        """Release the manager's runtime reference only at final shutdown."""
-        if self._runtime_release is None:
-            return
-        failure = None
-        try:
-            self._runtime_release()
-        except Exception as error:
-            failure = f"{type(error).__name__}: {error}"
-        else:
-            self._runtime_release = None
-        failures = self._exchange(failure)
-        if any(error is not None for error in failures):
-            raise RuntimeError(f"multicore runtime shutdown failed: {failures}")
 
     def _close_group_collectively(self, group: _ExecutionResourceGroup) -> None:
         """Keep a failed group reachable and prevent peers from advancing past it."""
@@ -339,6 +272,8 @@ class MulticoreModule(torch.nn.Module):
         """Require compatible, single-member groups before merging them."""
         for member in members:
             group = member._resource_group  # pylint: disable=protected-access
+            if group.owner is not first_group.owner:
+                raise ValueError("execution resources cannot be shared across managed scopes.")
             if group.compatibility_key != first_group.compatibility_key:
                 raise ValueError(
                     "shared multicore modules must have identical configuration and scope."

@@ -15,7 +15,7 @@
 """Torch-only Multicore APIs, separate from the HyperParallel root exports."""
 
 from hyper_parallel.core.multicore import profiler
-from hyper_parallel.core.multicore.lifecycle import collect_resources, lifecycle_checkpoint, managed_run, shutdown
+from hyper_parallel.core.multicore.lifecycle import managed_run, shutdown
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 
-__all__ = ["MegaMoeExperts", "collect_resources", "lifecycle_checkpoint", "managed_run", "profiler", "shutdown"]
+__all__ = ["MegaMoeExperts", "managed_run", "profiler", "shutdown"]

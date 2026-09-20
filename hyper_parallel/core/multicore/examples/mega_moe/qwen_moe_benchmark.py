@@ -375,7 +375,6 @@ def _rank_max(value: float, device: torch.device) -> float:
 
 def _timed_step(workload: _Workload) -> tuple[torch.Tensor, float]:
     """Run one optimizer step from a synchronized, untimed boundary."""
-    multicore.lifecycle_checkpoint()
     dist.barrier()
     torch.npu.synchronize(workload.device)
     start = time.perf_counter()
@@ -395,7 +394,6 @@ def _validate_first_step(
     dict[str, torch.Tensor],
 ]:
     """Validate finite work and dense/expert updates on the first step."""
-    multicore.lifecycle_checkpoint()
     dense_parameter = workload.model.lm_head.weight
     expert_parameter = _local_tensor(workload.model.expert_parameters()[0])
     dense_before = dense_parameter.detach().reshape(-1)[:4096].clone()
@@ -714,7 +712,6 @@ def _compare_first_step_accuracy(
     return accuracy, first_steps
 
 
-@multicore.managed_run
 def main(argv: list[str] | None = None) -> int:
     """Compare common and MegaMoe Qwen accuracy, then time A and B.
 
@@ -782,7 +779,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         if sys.exc_info()[0] is None:
-            multicore.shutdown(destroy_process_group=True)
+            multicore.shutdown()
+            if dist.is_initialized():
+                dist.destroy_process_group()
 
 
 if __name__ == "__main__":

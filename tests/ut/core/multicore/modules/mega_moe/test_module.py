@@ -297,28 +297,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         mock_acquire.assert_called_once_with(root_group)
         mock_release.assert_called_once_with()
 
-    def test_runtime_owner_keeps_an_independent_shmem_reference(self) -> None:
-        """Keep the session reference independent of the closed workspace owner."""
-        resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access
-            mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
-        )
-        resources.spec = SimpleNamespace(ep_group=object())
-        resources.workspace = Mock()
-        resources._closed = False  # pylint: disable=protected-access
-        resources._workspace_closed = False  # pylint: disable=protected-access
-        with (
-            patch.object(mega_moe_module.shmem, "acquire") as acquire,
-            patch.object(mega_moe_module.shmem, "release") as release,
-        ):
-            release_runtime = resources.retain_runtime()
-            acquire.assert_called_once_with(resources.spec.ep_group)
-            release.assert_not_called()
-            resources.close()
-            release.assert_called_once_with()
-            release_runtime()
-            self.assertEqual(release.call_count, 2)
-        resources.workspace.close.assert_called_once_with()
-
     def test_workspace_close_failure_keeps_shmem_user(self) -> None:
         """Do not leave SHMEM when a workspace cannot release its resources."""
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access

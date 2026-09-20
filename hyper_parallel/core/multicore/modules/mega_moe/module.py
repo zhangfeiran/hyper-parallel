@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -88,11 +87,6 @@ class _MegaMoeExecutionResources:
     def can_close(self) -> bool:
         """Report whether neither an active call nor a backward graph needs buffers."""
         return self._workspace_closed or self.workspace.can_close()
-
-    def retain_runtime(self) -> Callable[[], None]:
-        """Acquire a process-owner reference and return its final release operation."""
-        shmem.acquire(self.spec.ep_group)
-        return shmem.release
 
     def close(self) -> None:
         """Release the workspace and leave the shared SHMEM lifecycle."""
