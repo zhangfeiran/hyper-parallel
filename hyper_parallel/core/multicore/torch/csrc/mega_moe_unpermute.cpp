@@ -15,109 +15,12 @@
 #include <ATen/MemoryOverlap.h>
 #include <torch/library.h>
 #include <tuple>
-#include "op_plugin/include/npu_cpp_extension.h"
+#include "cached_op_api.h"
 
 namespace {
 
 using UnpermuteOutputs = std::tuple<at::Tensor &, at::Tensor &>;
 
-constexpr const char *kUnpermuteGradApi = "aclnnMoeTokenUnpermuteGrad";
-
-struct UnpermuteGradApi {
-  using InitMemory = int (*)(void *, bool);
-  using MemoryCallback = void (*)(void *, bool);
-  using CacheCallback = void (*)();
-
-  UnpermuteGradApi() {
-    GetApiFunc(kUnpermuteGradApi, "aclnnMoeTokenUnpermuteGradGetWorkspaceSize", execute, workspace);
-  }
-
-  void init_context() const {
-    if (init_memory != nullptr) {
-      init_memory(nullptr, false);
-    }
-  }
-
-  void release_context() const {
-    if (release_memory != nullptr) {
-      release_memory(nullptr, false);
-    }
-  }
-
-  void uninit_context() const {
-    if (uninit_memory != nullptr) {
-      uninit_memory(nullptr, false);
-    }
-    if (uninit_cache != nullptr) {
-      uninit_cache();
-    }
-  }
-
-  void *execute = nullptr;
-  void *workspace = nullptr;
-  InitMemory init_memory = reinterpret_cast<InitMemory>(GetOpApiFuncAddr("InitHugeMemThreadLocal"));
-  MemoryCallback release_memory = reinterpret_cast<MemoryCallback>(GetOpApiFuncAddr("ReleaseHugeMem"));
-  MemoryCallback uninit_memory = reinterpret_cast<MemoryCallback>(GetOpApiFuncAddr("UnInitHugeMemThreadLocal"));
-  CacheCallback uninit_cache = reinterpret_cast<CacheCallback>(GetOpApiFuncAddr("UnInitPTACacheThreadLocal"));
-};
-
-template <typename... Args>
-void execute_unpermute_grad(Args &...args) {
-  // Cache only process-lifetime symbols, using the same resolver as the extension bridge.
-  // Workspace, executor, converted parameters and contexts remain invocation/thread-local.
-  static const UnpermuteGradApi api;
-  static const auto task_queue_enable = OpApiGetTaskQueueEnable();
-  auto stream = GetAclStream();
-  if (task_queue_enable == 2) {
-    auto copied_params = CopyTypesV2(args...);
-    auto cache_params = GetCacheParams();
-    auto acl_call = [copied_params, stream, cache_params]() -> int {
-      InitExecSubTheadCtx(stream);
-      int status = 0;
-      if (hit_cache_v2_ext(stream, kUnpermuteGradApi, api.execute, copied_params, &status, cache_params)) {
-        return status;
-      }
-      SetExecConfigV2(cache_params);
-      api.init_context();
-      uint64_t workspace_size = 0;
-      aclOpExecutor *executor = nullptr;
-      auto converted_params = ConvertTypesV2(copied_params, &workspace_size, &executor);
-      auto workspace_func = ConvertToOpApiFunc(converted_params, api.workspace);
-      auto workspace_status = call(workspace_func, converted_params);
-      TORCH_CHECK(workspace_status == 0, "unpermute gradient workspace query failed: ", workspace_status);
-      status = ExecuteApiFuncV2(api.execute, stream, workspace_size, executor);
-      ReleaseConvertTypes(converted_params);
-      api.release_context();
-      api.uninit_context();
-      return status;
-    };
-    RunAclCall(kUnpermuteGradApi, acl_call);
-    return;
-  }
-  if (hit_cache_ext(stream, kUnpermuteGradApi, api.execute, args...)) {
-    return;
-  }
-  SetExecConfig();
-  api.init_context();
-  uint64_t workspace_size = 0;
-  aclOpExecutor *executor = nullptr;
-  auto *workspace_size_addr = &workspace_size;
-  auto **executor_addr = &executor;
-  auto converted_params = ConvertTypes(args..., workspace_size_addr, executor_addr);
-  auto workspace_func = ConvertToOpApiFunc(converted_params, api.workspace);
-  auto workspace_status = call(workspace_func, converted_params);
-  TORCH_CHECK(workspace_status == 0, "unpermute gradient workspace query failed: ", workspace_status);
-  void *workspace_addr = GetWorkSpaceAddr(workspace_size);
-  auto acl_call = [converted_params, workspace_addr, workspace_size, stream, executor]() -> int {
-    InitExecSubTheadCtx(stream);
-    auto status = ExecuteApiFunc(api.execute, stream, workspace_addr, workspace_size, executor);
-    ReleaseConvertTypes(converted_params);
-    api.release_context();
-    return status;
-  };
-  RunAclCall(kUnpermuteGradApi, acl_call);
-  api.uninit_context();
-}
 
 void check_unpermute_shapes(const at::Tensor &tokens, const at::Tensor &grad, const at::Tensor &indices,
                             const at::Tensor &probs, const at::Tensor &grad_tokens, const at::Tensor &grad_probs) {
@@ -156,7 +59,10 @@ UnpermuteOutputs unpermute_grad_npu(const at::Tensor &tokens, const at::Tensor &
   auto contiguous_grad = grad.contiguous();
   const c10::optional<at::IntArrayRef> restore_shape = c10::nullopt;
   bool padded_mode = false;
-  execute_unpermute_grad(tokens, contiguous_grad, indices, probs, padded_mode, restore_shape, grad_tokens, grad_probs);
+  static const hyper_parallel::multicore::CachedOpApi api(
+      "aclnnMoeTokenUnpermuteGrad", "aclnnMoeTokenUnpermuteGradGetWorkspaceSize");
+  hyper_parallel::multicore::execute_cached_op(
+      api, tokens, contiguous_grad, indices, probs, padded_mode, restore_shape, grad_tokens, grad_probs);
   return {grad_tokens, grad_probs};
 }
 
