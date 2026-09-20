@@ -79,7 +79,7 @@ def _recipe(args, work, world):
         recipe["plan_overrides"].pop(0)
         recipe["plan_overrides"][-1]["local_compute_fn"] = {
             "_target_": "hyper_parallel.models.deepseek_v41.adapter.expert_parallel.deepseek_v41_ep_compute_fn",
-            "use_grouped_gemm": False,
+            "use_grouped_gemm": True,
         }
     else:
         recipe["plan_overrides"][-1]["local_compute_fn"].update(
@@ -201,7 +201,8 @@ def main() -> None:
               "peak_allocated_bytes": torch.npu.max_memory_allocated(),
               "peak_reserved_bytes": torch.npu.max_memory_reserved(),
               "attention_mhc": "production_fused", "optimizer": "Muon_fp32_main_params",
-              "canonical_weights": bool(args.weights), "workspace_shared": args.backend == "megamoe"}
+              "canonical_weights": bool(args.weights), "workspace_shared": args.backend == "megamoe",
+              "owner_use_grouped_gemm": args.backend == "owner_ep"}
     if diagnostics is not None:
         result["phase_timings"] = diagnostics.rows
         result["throughput_valid"] = False

@@ -79,12 +79,11 @@ def deepseek_v41_ep_compute_fn(
         raise ValueError("DeepSeek-V4.1 EP forward requires an active ep_mesh")
     if module.is_hash:
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
-    if use_grouped_gemm:
-        raise ValueError("DeepSeek-V4.1 clamp semantics currently require use_grouped_gemm=false")
     ep_group = ep_mesh.get_group("ep")
     bind_local_expert_forward(
         module,
         ep_mesh["ep"].size(),
+        use_grouped_gemm=use_grouped_gemm,
         apply_gate=module.experts._apply_gate,  # pylint: disable=protected-access
     )
 

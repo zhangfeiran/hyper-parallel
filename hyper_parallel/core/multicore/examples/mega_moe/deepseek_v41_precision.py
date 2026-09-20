@@ -146,7 +146,13 @@ class _GroupMesh:
 
 def _configure_owner_reference(source, ep_group):
     compute = deepseek_v41_ep_compute_fn(
-        module=source, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=_GroupMesh(ep_group))
+        module=source,
+        mesh=None,
+        tp_mesh=None,
+        cp_mesh=None,
+        ep_mesh=_GroupMesh(ep_group),
+        use_grouped_gemm=True,
+    )
     count = source.experts.num_experts // dist.get_world_size(ep_group)
     start = dist.get_rank(ep_group) * count
     for name, parameter in tuple(source.experts.named_parameters()):
@@ -496,6 +502,7 @@ def main(argv: list[str] | None = None) -> None:
         if dist.get_rank() == 0:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             report = {"passed": passed, "swiglu_limit": args.swiglu_limit, "ep_size": args.ep_size,
+                      "owner_use_grouped_gemm": args.reference == "owner_ep",
                       "world_size": dist.get_world_size(),
                       "config": {key: str(value) if isinstance(value, Path) else value
                                  for key, value in vars(args).items()},

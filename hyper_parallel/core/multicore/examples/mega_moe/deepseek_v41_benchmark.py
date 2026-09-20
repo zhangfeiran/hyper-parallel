@@ -94,7 +94,7 @@ def _build(args):
             local_num_tokens=args.tokens, dispatch_mode=args.dispatch_mode)
     else:
         compute = deepseek_v41_ep_compute_fn(module=model, mesh=None, tp_mesh=None,
-                                           cp_mesh=None, ep_mesh=_EpMesh())
+                                           cp_mesh=None, ep_mesh=_EpMesh(), use_grouped_gemm=True)
     model.forward = MethodType(compute, model)
     return model.to(device="npu"), checksum.hexdigest()
 
@@ -196,6 +196,7 @@ def main() -> None:
         measured = [row["max_rank_seconds"] for row in rows if not row["warmup"]]
         result = {**vars(args), "output": str(args.output), "rank": dist.get_rank(), "world_size": world,
                   "scope": "moe_forward_backward_no_optimizer_no_dense_dp_reduction",
+                  "owner_use_grouped_gemm": args.backend == "owner_ep",
                   "hidden_size": 5120, "intermediate_size": 2304, "top_k": 6, "swiglu_limit": 10,
                   "initial_weight_sha256": checksum, "route_sha256": route_hash,
                   "owner_received_tokens": owner_counts, "finite": True, "steps_detail": rows,

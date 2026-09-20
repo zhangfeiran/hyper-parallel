@@ -24,6 +24,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
@@ -1368,6 +1369,63 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
                         owner="DeepSeek-V4.1 EP signature test",
                     )
                 )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_ep_factory_enables_grouped_gemm_with_model_specific_gate(self):
+        """The V4.1 factory preserves its clamp hook in grouped-GEMM mode."""
+        module, ep_mesh = self._build_signature_fixture(multimodal=False)
+        deepseek_v41_ep_compute_fn(
+            module=module,
+            mesh=None,
+            tp_mesh=None,
+            cp_mesh=None,
+            ep_mesh=ep_mesh,
+            use_grouped_gemm=True,
+        )
+        self.assertTrue(module.experts._ep_use_grouped_gemm)  # pylint: disable=protected-access
+        self.assertIs(module.experts._ep_apply_gate, module.experts._apply_gate)  # pylint: disable=protected-access
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    @patch("hyper_parallel.distributed.expert_parallel.experts.npu_grouped_swiglu")
+    def test_grouped_expert_uses_model_specific_gate(self, grouped_swiglu):
+        """The grouped local expert forwards the V4 clamp hook to its kernel helper."""
+        class _Experts(nn.Module):
+            def __init__(self) -> None:
+                """Create a two-expert packed-weight holder."""
+                super().__init__()
+                self.num_experts = 2
+                self.act_fn = F.silu
+                self.gate_up_proj = nn.Parameter(torch.ones(2, 2, 1))
+                self.down_proj = nn.Parameter(torch.ones(2, 1, 1))
+
+        class _Moe(nn.Module):
+            def __init__(self) -> None:
+                """Wrap the expert holder for the EP binder."""
+                super().__init__()
+                self.experts = _Experts()
+
+        def apply_clamped_gate(gate_up: torch.Tensor) -> torch.Tensor:
+            """Stand in for DeepSeek-V4.1's model-specific clamp."""
+            return gate_up[..., :1]
+
+        module = _Moe()
+        grouped_swiglu.return_value = torch.tensor([[11.0], [22.0]])
+        bind_local_expert_forward(
+            module,
+            ep_size=1,
+            use_grouped_gemm=True,
+            apply_gate=apply_clamped_gate,
+        )
+        hidden_states = torch.tensor([[3.0], [4.0]])
+        expert_indices = torch.tensor([1, 0])
+        output = module.experts(hidden_states, expert_indices)
+
+        grouped_swiglu.assert_called_once()
+        call = grouped_swiglu.call_args
+        self.assertIs(call.kwargs["apply_gate"], apply_clamped_gate)
+        torch.testing.assert_close(output, torch.tensor([[22.0], [11.0]]))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

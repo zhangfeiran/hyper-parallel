@@ -97,8 +97,9 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
         minlength=experts.local_expert_count,
     )
     if getattr(experts, "_ep_use_grouped_gemm", False):
+        apply_gate = getattr(experts, "_ep_apply_gate", None)
         grouped_forward = getattr(experts, "forward_expert_major", None)
-        if callable(grouped_forward):
+        if callable(grouped_forward) and apply_gate is None:
             sorted_output = grouped_forward(sorted_states, local_expert_counts)
         else:
             gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
@@ -111,6 +112,7 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
                 gate_weight,
                 down_weight,
                 local_expert_counts,
+                apply_gate=apply_gate,
             )
         output = torch.empty_like(sorted_output)
         output[token_order] = sorted_output
@@ -207,8 +209,6 @@ def bind_local_expert_forward(
                 f"{type(module).__name__}: unsupported expert activation {hidden_act!r}; "
                 "provide experts.act_fn or extend the EP activation registry"
             )
-    if apply_gate is not None and use_grouped_gemm:
-        raise ValueError("custom expert gate activation is not supported by grouped GEMM")
     module.experts._ep_act_fn = activation
     module.experts._ep_apply_gate = apply_gate
     module.experts._ep_use_grouped_gemm = use_grouped_gemm
