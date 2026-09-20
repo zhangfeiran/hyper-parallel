@@ -171,14 +171,6 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         "num_groups": spec.local_experts,
         "num_cube_cores": spec.num_cube_cores,
     }
-    up_proj = forward_graph.get_op("up_proj")
-    swiglu = forward_graph.get_op("swiglu")
-    down_proj = forward_graph.get_op("down_proj")
-    act_grad = backward_graph.get_op("act_grad")
-    gate_grad = backward_graph.get_op("gate_grad")
-    w1_grad = backward_graph.get_op("w1_grad")
-    w2_grad = backward_graph.get_op("w2_grad")
-    swiglu_grad = backward_graph.get_op("swiglu_grad")
     device_id = device.index
     if device_id is None:
         device_id = torch.npu.current_device()
@@ -205,12 +197,12 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         spec=spec,
         fwd_runtime=fwd_runtime,
         up_proj_tiling=_tensor_from_bytes(
-            get_up_proj_tiling_bytes(up_proj.split_value, **gmm_options), device
+            get_up_proj_tiling_bytes(forward_graph.get_op("up_proj").split_value, **gmm_options), device
         ),
         swiglu_tiling=_tensor_from_bytes(
             _resize_swiglu_tiling(
                 get_swiglu_tiling_bytes(
-                    swiglu.split_value,
+                    forward_graph.get_op("swiglu").split_value,
                     intermediate_size=spec.intermediate_size,
                 ),
                 spec.num_cube_cores,
@@ -218,25 +210,25 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
             device,
         ),
         down_proj_tiling=_tensor_from_bytes(
-            get_down_proj_tiling_bytes(down_proj.split_value, **gmm_options), device
+            get_down_proj_tiling_bytes(forward_graph.get_op("down_proj").split_value, **gmm_options), device
         ),
         bwd_runtime=bwd_runtime,
         act_grad_tiling=_tensor_from_bytes(
-            get_act_grad_tiling_bytes(act_grad.split_value, **gmm_options), device
+            get_act_grad_tiling_bytes(backward_graph.get_op("act_grad").split_value, **gmm_options), device
         ),
         gate_grad_tiling=_tensor_from_bytes(
-            get_gate_grad_tiling_bytes(gate_grad.split_value, **gmm_options), device
+            get_gate_grad_tiling_bytes(backward_graph.get_op("gate_grad").split_value, **gmm_options), device
         ),
         w1_grad_tiling=_tensor_from_bytes(
-            get_w1_grad_tiling_bytes(w1_grad.split_value, **gmm_options), device
+            get_w1_grad_tiling_bytes(backward_graph.get_op("w1_grad").split_value, **gmm_options), device
         ),
         w2_grad_tiling=_tensor_from_bytes(
-            get_w2_grad_tiling_bytes(w2_grad.split_value, **gmm_options), device
+            get_w2_grad_tiling_bytes(backward_graph.get_op("w2_grad").split_value, **gmm_options), device
         ),
         swiglu_grad_tiling=_tensor_from_bytes(
             _resize_swiglu_tiling(
                 get_swiglu_grad_tiling_bytes(
-                    swiglu_grad.split_value,
+                    backward_graph.get_op("swiglu_grad").split_value,
                     intermediate_size=spec.intermediate_size,
                 ),
                 spec.num_cube_cores,

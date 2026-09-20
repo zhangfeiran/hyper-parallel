@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import statistics
@@ -28,26 +29,23 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-# The launcher activates CANN and the native payload before framework import.
-# pylint: disable=wrong-import-position
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 import torch_npu
 from qwen_moe_model import QwenMoeConfig, QwenMoeModel
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
-from hyper_parallel.core import multicore
+from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.components.optim import (
     Float16OptimizerWithFloat16Params,
 )
+from hyper_parallel.core import multicore
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.optimizer import get_hyper_optimizer
-from hyper_parallel.components.modules.moe import GroupedExperts
 
-# pylint: enable=wrong-import-position
-
+_LOGGER = logging.getLogger(__name__)
 _WORLD_SIZE = 8
 _BATCH_SIZE = 1
 _SEQUENCE_LENGTH = 1024
@@ -335,13 +333,8 @@ def _optimizer_step(
     _synchronize_dense_gradients(workload.model, workload.world_size)
     gradients = None
     if capture_gradients:
-        gradients = {
-            name: tensor.detach().clone()
-            for name, tensor in _canonical_tensors(
-                workload.model,
-                gradients=True,
-            ).items()
-        }
+        tensors = _canonical_tensors(workload.model, gradients=True)
+        gradients = {name: tensor.detach().clone() for name, tensor in tensors.items()}
     with SkipDTensorDispatch():
         workload.optimizer.step()
     return loss.detach(), logits.detach(), gradients
@@ -489,6 +482,43 @@ def _canonical_tensors(
     return tensors
 
 
+def _tensor_errors(
+    common: torch.Tensor, mega: torch.Tensor, rtol: float, atol: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute device-side pass status and absolute/normalized error."""
+    common = common.detach().float()
+    mega = mega.detach().float()
+    difference = (mega - common).abs()
+    tolerance = (atol + rtol * common.abs()).clamp_min(torch.finfo(torch.float32).tiny)
+    passed = torch.isclose(mega, common, rtol=rtol, atol=atol).all().to(torch.int32)
+    return passed, difference.max(), (difference / tolerance).max()
+
+
+def _summarize_tensor_errors(
+    errors: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    names: list[str], rtol: float, atol: float, device: torch.device,
+) -> dict[str, Any]:
+    """Reduce the same three diagnostics across ranks and format their maxima."""
+    passed = torch.stack([error[0] for error in errors]).amin().to(device=device)
+    absolute = torch.stack([error[1] for error in errors])
+    normalized = torch.stack([error[2] for error in errors])
+    dist.all_reduce(passed, op=dist.ReduceOp.MIN)
+    dist.all_reduce(absolute, op=dist.ReduceOp.MAX)
+    dist.all_reduce(normalized, op=dist.ReduceOp.MAX)
+    max_absolute, absolute_index = absolute.max(dim=0)
+    max_normalized, normalized_index = normalized.max(dim=0)
+    return {
+        "passed": bool(passed.cpu().item()),
+        "tensor_count": len(names),
+        "rtol": rtol,
+        "atol": atol,
+        "max_absolute_error": float(max_absolute.cpu().item()),
+        "max_absolute_error_tensor": names[int(absolute_index.cpu().item())],
+        "max_normalized_error": float(max_normalized.cpu().item()),
+        "max_normalized_error_tensor": names[int(normalized_index.cpu().item())],
+    }
+
+
 def _compare_tensor_maps(
     name: str,
     common_tensors: dict[str, torch.Tensor],
@@ -504,54 +534,16 @@ def _compare_tensor_maps(
             f"{name} tensor names differ: common={sorted(common_tensors)}, "
             f"mega={sorted(mega_tensors)}."
         )
-    passed = torch.ones((), dtype=torch.int32, device=device)
-    tensor_names = []
-    absolute_errors = []
-    normalized_errors = []
+    errors = []
     for tensor_name, common_tensor in common_tensors.items():
-        tensor_names.append(tensor_name)
         mega_tensor = mega_tensors[tensor_name]
         if mega_tensor.shape != common_tensor.shape:
             raise RuntimeError(
                 f"{name}.{tensor_name} shape differs: common={tuple(common_tensor.shape)}, "
                 f"mega={tuple(mega_tensor.shape)}."
             )
-        common_float = common_tensor.detach().float()
-        mega_float = mega_tensor.detach().float()
-        difference = (mega_float - common_float).abs()
-        passed = torch.minimum(
-            passed,
-            torch.isclose(
-                mega_float,
-                common_float,
-                rtol=rtol,
-                atol=atol,
-            )
-            .all()
-            .to(torch.int32),
-        )
-        absolute_errors.append(difference.max())
-        tolerance = atol + rtol * common_float.abs()
-        normalized_errors.append(
-            (difference / tolerance.clamp_min(torch.finfo(torch.float32).tiny)).max()
-        )
-    absolute_by_tensor = torch.stack(absolute_errors)
-    normalized_by_tensor = torch.stack(normalized_errors)
-    dist.all_reduce(passed, op=dist.ReduceOp.MIN)
-    dist.all_reduce(absolute_by_tensor, op=dist.ReduceOp.MAX)
-    dist.all_reduce(normalized_by_tensor, op=dist.ReduceOp.MAX)
-    maximum_absolute, absolute_index = absolute_by_tensor.max(dim=0)
-    maximum_normalized, normalized_index = normalized_by_tensor.max(dim=0)
-    result = {
-        "passed": bool(passed.cpu().item()),
-        "tensor_count": len(common_tensors),
-        "rtol": rtol,
-        "atol": atol,
-        "max_absolute_error": float(maximum_absolute.cpu().item()),
-        "max_absolute_error_tensor": tensor_names[int(absolute_index.cpu().item())],
-        "max_normalized_error": float(maximum_normalized.cpu().item()),
-        "max_normalized_error_tensor": tensor_names[int(normalized_index.cpu().item())],
-    }
+        errors.append(_tensor_errors(common_tensor, mega_tensor, rtol, atol))
+    result = _summarize_tensor_errors(errors, list(common_tensors), rtol, atol, device)
     if not result["passed"]:
         raise RuntimeError(f"Qwen common/MegaMoe {name} comparison failed: {result}.")
     return result
@@ -565,7 +557,7 @@ def _measure_backend(
 ) -> dict[str, Any]:
     """Finish warmup and measure one backend after its compared first step."""
     for _ in range(args.warmup_steps - 1):
-        _timed_step(workload)
+        _ = _timed_step(workload)  # Warmup results are intentionally excluded from reported measurements.
     latencies = []
     losses = []
     for _ in range(args.measured_steps):
@@ -642,8 +634,8 @@ def _write_result(
             json.dumps(result, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        print(f"RESULT_JSON={path}")
-        print(json.dumps(result, sort_keys=True))
+        _LOGGER.info("RESULT_JSON=%s", path)
+        _LOGGER.info("%s", json.dumps(result, sort_keys=True))
     dist.barrier()
 
 
@@ -756,22 +748,9 @@ def main(argv: list[str] | None = None) -> int:
             workloads,
             device,
         )
-        common_validation, common_first_ms = first_steps["common"]
-        mega_validation, mega_first_ms = first_steps["mega_moe"]
-        backends = {
-            "common": _measure_backend(
-                workloads["common"],
-                common_validation,
-                common_first_ms,
-                args,
-            ),
-            "mega_moe": _measure_backend(
-                workloads["mega_moe"],
-                mega_validation,
-                mega_first_ms,
-                args,
-            ),
-        }
+        backends = {}
+        for backend in ("common", "mega_moe"):
+            backends[backend] = _measure_backend(workloads[backend], *first_steps[backend], args)
         _write_result(
             args,
             config,
@@ -788,4 +767,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     sys.exit(main())

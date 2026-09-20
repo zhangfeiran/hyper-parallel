@@ -176,12 +176,11 @@ class _MulticoreResourceManager:
 
     def active_specifications(self, scope_key: Any) -> tuple[Any, ...]:
         """Return one specification per live or native-bound resource group."""
-        return tuple(
-            group.specification
-            for group in self._groups.values()
-            if group.scope_key == scope_key
-            and (group.members or group.resources is not None)
-        )
+        specifications = []
+        for group in self._groups.values():
+            if group.scope_key == scope_key and (group.members or group.resources is not None):
+                specifications.append(group.specification)
+        return tuple(specifications)
 
 
 _RESOURCE_MANAGER = _MulticoreResourceManager()
