@@ -77,7 +77,8 @@ class DeepseekV41TrainingExperts(nn.Module):
                 for name in ("gate_up_proj", "down_proj")]
 
     def configure(self, ep_group: Any, ep_size: int, local_num_tokens: int,
-                  dispatch_mode: str, top_k: int) -> None:
+                  dispatch_mode: str, top_k: int,
+                  expert_capacity_factor: float | None = None) -> None:
         """Bind the actual EP group before any native resources are acquired.
 
         Args:
@@ -86,6 +87,7 @@ class DeepseekV41TrainingExperts(nn.Module):
             local_num_tokens: Fixed number of tokens at this MoE boundary.
             dispatch_mode: Native push or pull transport.
             top_k: Number of global experts selected per token.
+            expert_capacity_factor: Optional bounded receive-capacity multiplier.
         """
         if self._kernel is not None:
             raise RuntimeError("Cannot reconfigure an active MegaMoe expert executor")
@@ -100,7 +102,7 @@ class DeepseekV41TrainingExperts(nn.Module):
             intermediate_size=self.intermediate_size, num_experts=self.global_experts,
             top_k=top_k, ep_group=ep_group, ep_size=ep_size,
             dispatch_mode=dispatch_mode, create_parameters=False,
-            swiglu_limit=self.swiglu_limit,
+            expert_capacity_factor=expert_capacity_factor, swiglu_limit=self.swiglu_limit,
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
@@ -145,6 +147,7 @@ class DeepseekV41TrainingExperts(nn.Module):
 def deepseek_v41_megamoe_compute_fn(
         *, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any,
         local_num_tokens: int = 128, dispatch_mode: str = "push",
+        expert_capacity_factor: float | None = None,
 ) -> Callable:
     """Replace the entire routed branch while preserving its nested FSDP call.
 
@@ -156,6 +159,7 @@ def deepseek_v41_megamoe_compute_fn(
         ep_mesh: Derived expert mesh, with group-local ownership.
         local_num_tokens: Fixed local token count after boundary transformations.
         dispatch_mode: Native push or pull transport.
+        expert_capacity_factor: Optional bounded receive-capacity multiplier.
 
     Returns:
         A text/multimodal-compatible routed-plus-shared compute function.
@@ -172,7 +176,10 @@ def deepseek_v41_megamoe_compute_fn(
         raise ValueError("DSV4.1 MegaMoe requires the routed and shared experts to use the same swiglu_limit")
     group = None if ep_mesh is None else ep_mesh.get_group("ep")
     size = 1 if ep_mesh is None else ep_mesh["ep"].size()
-    module.experts.configure(group, size, local_num_tokens, dispatch_mode, module.gate.top_k)
+    module.experts.configure(
+        group, size, local_num_tokens, dispatch_mode, module.gate.top_k,
+        expert_capacity_factor,
+    )
 
     if "image_mask" not in inspect.signature(module.forward).parameters:
         def text_compute_fn(module: Any, hidden_states: torch.Tensor,

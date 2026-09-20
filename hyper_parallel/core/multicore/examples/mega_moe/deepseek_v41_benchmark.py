@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -91,7 +92,8 @@ def _build(args):
         model.experts = DeepseekV41TrainingExperts(module=model.experts)
         compute = deepseek_v41_megamoe_compute_fn(
             module=model, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=_EpMesh(),
-            local_num_tokens=args.tokens, dispatch_mode=args.dispatch_mode)
+            local_num_tokens=args.tokens, dispatch_mode=args.dispatch_mode,
+            expert_capacity_factor=args.expert_capacity_factor)
     else:
         compute = deepseek_v41_ep_compute_fn(module=model, mesh=None, tp_mesh=None,
                                            cp_mesh=None, ep_mesh=_EpMesh(), use_grouped_gemm=True)
@@ -136,12 +138,30 @@ def _check_finite(model, hidden, output):
         raise RuntimeError("Nonfinite MoE output or gradients")
 
 
+def _capacity_factor(value: str) -> float | None:
+    """Parse ``none`` or a finite factor of at least one."""
+    if value.lower() == "none":
+        return None
+    try:
+        factor = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"capacity factor must be 'none' or a number, got {value!r}."
+        ) from error
+    if not math.isfinite(factor) or factor < 1.0:
+        raise argparse.ArgumentTypeError(
+            f"capacity factor must be finite and at least 1.0, got {value!r}."
+        )
+    return factor
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("owner_ep", "megamoe"), required=True)
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
+    parser.add_argument("--expert-capacity-factor", type=_capacity_factor, default=None)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--evidence-dir", help="Optional canonical BF16 output/gradient evidence directory")
