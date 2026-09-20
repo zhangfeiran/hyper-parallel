@@ -125,6 +125,56 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         mock_synchronize.assert_not_called()
 
 
+class TestMegaMoeWorkspaceClose(unittest.TestCase):
+    """Retain partially released buffers until their cleanup succeeds."""
+
+    def test_partial_symmetric_free_does_not_repeat_successful_free(self) -> None:
+        """Keep the remaining allocation handles after a local free failure."""
+        first = torch.empty(1)
+        second = torch.empty(1)
+        workspace = MegaMoeWorkspace(shared=False, expert_buffer=first, routed_buffer=second)
+        with (
+            patch.object(workspace_module.torch.npu, "synchronize"),
+            patch.object(workspace_module.shmem, "host_barrier"),
+            patch.object(workspace_module.shmem, "free", side_effect=[None, RuntimeError("free failed")]) as free,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "free failed"):
+                workspace.close()
+            self.assertIsNone(workspace.expert_buffer)
+            self.assertIs(workspace.routed_buffer, second)
+            free.side_effect = None
+            workspace.close()
+            workspace.close()
+
+        self.assertEqual([id(args.args[0]) for args in free.call_args_list], [id(first), id(second), id(second)])
+        self.assertIsNone(workspace.routed_buffer)
+
+    def test_partial_local_free_retries_remaining_buffer(self) -> None:
+        """Do not mistake a missing GMM buffer for a fully closed workspace."""
+        gmm = Mock()
+        swiglu = Mock()
+        swiglu.untyped_storage.return_value.resize_.side_effect = RuntimeError("local free failed")
+        workspace = MegaMoeWorkspace(
+            shared=False, gmm_workspace=gmm, swiglu_grad_workspace=swiglu, completion_event=Mock(),
+        )
+        with (
+            patch.object(workspace_module.torch.npu, "synchronize"),
+            patch.object(workspace_module.shmem, "host_barrier"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "local free failed"):
+                workspace.close()
+            self.assertIsNone(workspace.gmm_workspace)
+            self.assertIs(workspace.swiglu_grad_workspace, swiglu)
+            swiglu.untyped_storage.return_value.resize_.side_effect = None
+            workspace.close()
+            workspace.close()
+
+        gmm.untyped_storage.return_value.resize_.assert_called_once_with(0)
+        self.assertEqual(swiglu.untyped_storage.return_value.resize_.call_count, 2)
+        self.assertIsNone(workspace.swiglu_grad_workspace)
+        self.assertIsNone(workspace.completion_event)
+
+
 class TestReadyEventWorkspace(unittest.TestCase):
     """Keep each direction's peer generations alive across per-call clears."""
 

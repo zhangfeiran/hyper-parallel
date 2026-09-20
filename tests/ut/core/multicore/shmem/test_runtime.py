@@ -230,6 +230,9 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertTrue(_lifecycle._shutdown_failed)  # pylint: disable=protected-access
         with self.assertRaisesRegex(RuntimeError, "Native shutdown failure"):
             _lifecycle.acquire()
+        with self.assertRaisesRegex(RuntimeError, "Native shutdown failure"):
+            _lifecycle.release()
+        self.native._shutdown.assert_called_once_with()
 
     def test_release_without_reference_is_rejected(self) -> None:
         """Expose an unmatched release instead of silently underflowing the user count."""

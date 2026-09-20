@@ -305,6 +305,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         resources.workspace = Mock()
         resources.workspace.close.side_effect = RuntimeError("workspace busy")
         resources._closed = False  # pylint: disable=protected-access
+        resources._workspace_closed = False  # pylint: disable=protected-access
 
         with (
             patch.object(mega_moe_module.shmem, "release") as mock_release,
@@ -314,6 +315,13 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         mock_release.assert_not_called()
         self.assertFalse(resources._closed)  # pylint: disable=protected-access
+        resources.workspace.close.side_effect = None
+        with patch.object(mega_moe_module.shmem, "release") as retry_release:
+            resources.close()
+            resources.close()
+        self.assertEqual(resources.workspace.close.call_count, 2)
+        retry_release.assert_called_once_with()
+        self.assertTrue(resources._closed)  # pylint: disable=protected-access
 
     def test_shmem_release_failure_keeps_execution_resource_open(self) -> None:
         """Keep the resource open when its SHMEM reference cannot be released."""
@@ -322,6 +330,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         )
         resources.workspace = Mock()
         resources._closed = False  # pylint: disable=protected-access
+        resources._workspace_closed = False  # pylint: disable=protected-access
 
         with (
             patch.object(
@@ -335,6 +344,12 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         resources.workspace.close.assert_called_once_with()
         self.assertFalse(resources._closed)  # pylint: disable=protected-access
+        with patch.object(mega_moe_module.shmem, "release") as retry_release:
+            resources.close()
+            resources.close()
+        resources.workspace.close.assert_called_once_with()
+        retry_release.assert_called_once_with()
+        self.assertTrue(resources._closed)  # pylint: disable=protected-access
 
 
 if __name__ == "__main__":

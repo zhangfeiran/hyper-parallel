@@ -274,7 +274,15 @@ class MegaMoeWorkspace:
         with self.lock:
             if self.in_use:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
-            if self.expert_buffer is None and self.gmm_workspace is None:
+            if all(tensor is None for tensor in (
+                self.expert_buffer,
+                self.routed_buffer,
+                self.forward_event_counters,
+                self.backward_event_counters,
+                self.gmm_workspace,
+                self.swiglu_grad_workspace,
+                self.completion_event,
+            )):
                 return
         torch.npu.synchronize(self.device)
         # Workspace teardown requires each collective barrier to complete before

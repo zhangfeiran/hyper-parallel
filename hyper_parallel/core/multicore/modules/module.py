@@ -24,7 +24,6 @@ from typing import Any
 import torch
 
 
-
 class _ExecutionResourceGroup:
     """Process-owned runtime resources shared by compatible modules."""
 
@@ -88,23 +87,29 @@ class _MulticoreResourceManager:
         *,
         close_resources: bool,
     ) -> None:
-        """Retire one member and optionally close the last native owner."""
+        """Retire one member and optionally close the last native owner.
+
+        Args:
+            group_id: Resource group whose membership is being released.
+            member_token: Membership token to retire after successful teardown.
+            close_resources: Whether the last member should close native resources.
+        """
         group = self._groups.get(group_id)
         if group is None:
             return
-        group.members.discard(member_token)
-        if group.members:
+        if group.members - {member_token}:
+            group.members.discard(member_token)
             return
         resources = group.resources
-        if resources is None:
-            self._groups.pop(group_id, None)
-            return
-        if not close_resources:
+        if resources is not None and close_resources:
+            # Keep the last owner's handles until fallible native teardown succeeds.
+            resources.close()
+        group.members.discard(member_token)
+        if resources is not None and not close_resources:
             return
         group.resources = None
         group.binding = None
         self._groups.pop(group_id, None)
-        resources.close()
 
     def active_specifications(self, scope_key: Any) -> tuple[Any, ...]:
         """Return one specification per live or native-bound resource group."""
@@ -139,6 +144,7 @@ class MulticoreModule(torch.nn.Module):
         self._resource_group = group
         self._resource_member_token = member_token
         self._resource_closed = False
+        self._resource_closing = False
         self._resource_finalizer = weakref.finalize(
             self,
             _RESOURCE_MANAGER.retire,
@@ -186,6 +192,8 @@ class MulticoreModule(torch.nn.Module):
             )
         if any(member._resource_closed for member in members):  # pylint: disable=protected-access
             raise RuntimeError("closed multicore modules cannot share execution resources.")
+        if any(member._resource_closing for member in members):  # pylint: disable=protected-access
+            raise RuntimeError("closing multicore modules cannot share execution resources.")
         concrete_types = {type(member) for member in members}
         if len(concrete_types) != 1:
             raise TypeError("shared multicore execution requires one concrete module type.")
@@ -233,6 +241,8 @@ class MulticoreModule(torch.nn.Module):
         """Create or return resources bound to ``tensor`` device and dtype."""
         if self._resource_closed:
             raise RuntimeError("cannot execute a closed multicore module.")
+        if self._resource_closing:
+            raise RuntimeError("cannot execute a closing multicore module; retry close() to finish teardown.")
         group = self._resource_group
         binding = self._execution_binding(tensor)
         if group.resources is None:
@@ -269,13 +279,21 @@ class MulticoreModule(torch.nn.Module):
         raise NotImplementedError
 
     def close(self) -> None:
-        """Release this module's membership and last-owned native resources."""
+        """Release this module's membership and last-owned native resources.
+
+        A failed close retains ownership for a coordinated retry, but disables
+        further execution and resource sharing. Retry only after the cause is
+        resolved and all ranks can resume teardown in the same collective order;
+        a failed native runtime shutdown requires restarting the process.
+        """
         if self._resource_closed:
             return
-        self._resource_closed = True
-        self._resource_finalizer.detach()
+        self._resource_closing = True
         _RESOURCE_MANAGER.retire(
             self._resource_group.identifier,
             self._resource_member_token,
             close_resources=True,
         )
+        self._resource_closed = True
+        self._resource_closing = False
+        self._resource_finalizer.detach()

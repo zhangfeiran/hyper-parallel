@@ -133,6 +133,8 @@ def release() -> None:
     global _users, _shutdown_failed, _root_group, _root_uses_distributed, _root_size  # pylint: disable=global-statement
 
     with _lock:
+        if _shutdown_failed:
+            raise RuntimeError("SHMEM Runtime cannot be released after a Native shutdown failure; restart the process")
         if _users <= 0:
             raise RuntimeError("SHMEM Runtime has no active reference to release")
         if _users > 1:

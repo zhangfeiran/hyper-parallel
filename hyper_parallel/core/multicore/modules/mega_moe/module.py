@@ -74,12 +74,15 @@ class _MegaMoeExecutionResources:
             shmem.release()
             raise
         self._closed = False
+        self._workspace_closed = False
 
     def close(self) -> None:
         """Release the workspace and leave the shared SHMEM lifecycle."""
         if self._closed:
             return
-        self.workspace.close()
+        if not self._workspace_closed:
+            self.workspace.close()
+            self._workspace_closed = True
         shmem.release()
         self._closed = True
 
