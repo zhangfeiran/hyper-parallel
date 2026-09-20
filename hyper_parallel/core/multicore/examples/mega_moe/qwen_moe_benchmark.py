@@ -174,19 +174,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _init_runtime() -> tuple[int, int, torch.device]:
-    """Bind the local NPU and initialize the fixed EP world."""
+def _init_runtime() -> tuple[int, int, torch.device, bool]:
+    """Bind the NPU and return rank, world size, device, and group ownership."""
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.npu.set_device(local_rank)
-    if not dist.is_initialized():
+    initialized_here = not dist.is_initialized()
+    if initialized_here:
         dist.init_process_group(backend="hccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if world_size != _WORLD_SIZE:
+        if initialized_here:
+            dist.destroy_process_group()
         raise ValueError(
             f"Qwen benchmark requires {_WORLD_SIZE} ranks, got {world_size}."
         )
-    return rank, world_size, torch.device("npu", local_rank)
+    return rank, world_size, torch.device("npu", local_rank), initialized_here
 
 
 def _build_model(config: QwenMoeConfig, device: torch.device) -> QwenMoeModel:
@@ -722,7 +725,7 @@ def main(argv: list[str] | None = None) -> int:
         Zero after the distributed comparison completes successfully.
     """
     args = parse_args(argv)
-    rank, world_size, device = _init_runtime()
+    rank, world_size, device, initialized_here = _init_runtime()
     config = replace(
         QwenMoeConfig(),
         expert_capacity_factor=args.expert_capacity_factor,
@@ -780,7 +783,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if sys.exc_info()[0] is None:
             multicore.shutdown()
-            if dist.is_initialized():
+            if initialized_here and dist.is_initialized():
                 dist.destroy_process_group()
 
 
