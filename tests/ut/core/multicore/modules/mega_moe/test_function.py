@@ -129,7 +129,7 @@ class TestMegaMoeFunction(unittest.TestCase):
                 side_effect=backward_kernel,
             ),
             patch.object(function_module.torch_npu, "npu_moe_token_permute_grad_v2",
-                         side_effect=permutation_gradient) as mock_permutation,
+                         side_effect=permutation_gradient, create=True) as mock_permutation,
         ):
             for tag, capacity in enumerate(capacities, start=1):
                 source = torch.full((2 if permuted else 4, 4), float(tag), requires_grad=input_grad)

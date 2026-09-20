@@ -115,13 +115,63 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.la
 ```
 
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
-checkpoint/recompute 和 `retain_graph=True` 暂未验证。所有 backward 完成后，各 rank 按相同顺序调用
-每层的幂等 `close()`，并在销毁进程组前完成关闭。
+checkpoint/recompute 和 `retain_graph=True` 的完整算子正确性暂未验证。
+
+资源在首次执行时自动登记。普通 worker 入口可增加 `@managed_run`，在完整迭代边界增加
+`lifecycle_checkpoint()`，无需逐层调用 `close()`，也无需用 `with` 包裹训练主体：
+
+```python
+from hyper_parallel.core.multicore import managed_run, lifecycle_checkpoint
+
+@managed_run
+def main():
+    initialize_distributed()
+    model = build_model()
+    for batch in batches:
+        train_step(model, batch)
+        lifecycle_checkpoint()
+```
+
+装饰器在正常返回时先统一关闭资源，再销毁默认进程组。若现有入口已经调用
+`dist.destroy_process_group()`，将该行替换为
+`multicore.shutdown(destroy_process_group=True)`，且只在正常收尾或已协调的停止路径执行。
+不能先销毁进程组再交给装饰器清理。已有框架可直接在模型卸载回调调用 `collect_resources()`，
+在任务正常结束回调调用 `shutdown()`，无需接管原入口或信号处理器。
+
+`collect_resources()` 仅释放所有 rank 上都没有模块成员、且没有未完成 backward 的组；
+`shutdown()` 则关闭全部组，并使仍存活的模块不可再次执行。GC finalizer 只更新本地成员关系，
+不执行 NPU 操作。图通过弱引用跟踪，成功的非保留 backward 结束后解除使用权；保留图或未执行
+backward 的图继续阻止释放。旧版本引擎若没有图保留标志查询接口，则保守等待 context 被 GC。
+生命周期检查不会访问 saved tensors，因此不会触发 activation offload 的恢复钩子。
+
+当回收最后一组 workspace 时，manager 保留一份 SHMEM runtime 引用，使后续模型复用已有 bootstrap
+和固定 heap；已回收的对称分配不再占用 heap 内的分配额度。最终 `shutdown()` 才释放这份引用。
+因此 checkpoint 后固定 heap 仍可能占用设备显存，但资源组和活跃分配不会随反复建模累积。
+新模型超过现有固定 heap 容量时仍会报错，需要结束当前生命周期并重新配置 heap。
+
+这三个生命周期入口都必须由完整 WORLD 的各 rank 在相同安全点、以相同顺序调用，包含本地没有
+待回收资源的 rank。按首次绑定顺序和资源配置核对各 rank 的资源清单，只有全体同意后才释放。
+关闭失败保留尚未释放的句柄；跨 rank 部分关闭或通信失败不能盲目重试，应终止并重启该作业。
+checkpoint 会交换 Host 元数据，应放在计时区间之外；模型层的稳态 forward/backward 不新增
+生命周期 collective。仍可使用原有幂等 `close()`，但所有 rank 必须保持同样的关闭顺序。
+
+### 中断与异常退出
+
+`managed_run` 显式接管默认 SIGINT/SIGTERM 处理器，退出时恢复；遇到框架已安装的自定义处理器会
+拒绝覆盖，应改用框架回调。信号处理器只记录请求，各 rank 在下一个 `lifecycle_checkpoint()`
+共同决定停止，然后关闭资源并以 `128 + signal` 退出。没有 checkpoint 的长任务不会立即响应
+合作式停止；进入清理后再次收到信号也不会在处理器中重入 native teardown。
+
+未知训练异常、失联 rank、卡住的设备调用不走自动 collective 清理；原异常向外传播，由进程外
+launcher/watchdog 终止其余 worker。回收通信使用现有进程组及其 timeout，本组件不提供能中断
+native 调用的进程内定时器。必须为作业配置进程外超时终止策略。
+SIGKILL/OOM kill 无法捕获，也不能执行 Python 清理；不能承诺对称内存 finalize 或设备立即恢复。
+本实现不在 `atexit`、`__del__` 或信号回调里发起 collective。
 
 SHMEM Python层以进程级引用计数统一管理Runtime生命周期。每个MegaMoe执行资源组建立时配对调用一次
 内部`shmem.acquire()`，关闭时在workspace释放全部对称Tensor后调用一次`shmem.release()`；
 `share_execution_resources`的相同配置层共享同一组及workspace，因此只形成一个SHMEM引用。非最后一个
-`release()`只减少本地计数，进程内最后一个引用才执行跨rank关闭（仅丢弃模块对象不会触发释放）。未来
+`release()`只减少本地计数，进程内最后一个引用才执行跨rank关闭（仅丢弃模块对象会等待后续安全点回收）。未来
 MegaMHC、MegaDSA等Multicore特性复用同一SHMEM Runtime时，也通过同一配对接口共享这套进程级计数，
 不在各消费者内重复实现生命周期协调。
 重新开启生命周期时，所有 rank 完成关闭后使用新的 `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT`，

@@ -21,10 +21,14 @@ The Qwen Router computes `topk_ids`, `topk_weights`, and
 
 Each decoder layer keeps independent expert parameters and optimizer state.
 All serial MegaMoe layers call `share_execution_resources()` before first
-forward and therefore reuse one SHMEM runtime/workspace. The benchmark calls
-`QwenMoeModel.close()` before destroying the process group. Execution resources
-acquire and release their SHMEM references internally; model code only closes
-`MegaMoeExperts` (through `QwenMoeModel.close()`) and never calls SHMEM directly.
+forward and therefore reuse one SHMEM runtime/workspace. The benchmark uses
+`@multicore.managed_run` and `multicore.shutdown(destroy_process_group=True)`
+instead of closing every layer. Lifecycle checkpoints run before timed steps
+and propagate cooperative SIGINT/SIGTERM requests across ranks. The checkpoints
+add untimed control communication; they are not included in reported step latency.
+Unexpected worker failures and SIGKILL require the external launcher to terminate
+the job; no collective cleanup is attempted from a signal handler or arbitrary
+exception path. Execution resources acquire and release SHMEM references internally.
 
 The public `MegaMoeExperts` API and this benchmark default
 `expert_capacity_factor` to `None`, which reserves the maximum lossless receive

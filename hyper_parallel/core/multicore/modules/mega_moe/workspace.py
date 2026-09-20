@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import threading
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -129,6 +130,27 @@ class MegaMoeWorkspace:
     forward_ready_initialized: bool = False
     backward_ready_initialized: bool = False
     lock: Any = field(default_factory=threading.Lock, repr=False)
+    graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
+
+    def track_graph(self, context: Any) -> None:
+        """Retain a weak lease while an autograd context can still run backward.
+
+        Args:
+            context: Autograd context holding this workspace and saved tensors.
+        """
+        self.graphs.add(context)
+
+    def can_close(self) -> bool:
+        """Check active calls and weak graph leases without unpacking saved tensors."""
+        return not self.in_use and not self.graphs
+
+    def release_graph(self, context: Any) -> None:
+        """Retire a graph lease after successful non-retained backward.
+
+        Args:
+            context: Completed autograd context that cannot execute again.
+        """
+        self.graphs.discard(context)
 
     def ensure(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
         """Allocate the fixed configured route capacity once.
@@ -274,6 +296,8 @@ class MegaMoeWorkspace:
         with self.lock:
             if self.in_use:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
+            if not self.can_close():
+                raise RuntimeError("cannot close MegaMoe workspace while backward graphs still need its buffers.")
             if all(tensor is None for tensor in (
                 self.expert_buffer,
                 self.routed_buffer,

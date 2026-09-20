@@ -14,13 +14,16 @@
 # ============================================================================
 """Unit tests for MegaMoe workspace sizing and stream ordering."""
 
+import gc
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import workspace as workspace_module
+from hyper_parallel.core.multicore.modules.mega_moe.function import _release_completed_graph
 from hyper_parallel.core.multicore.modules.mega_moe.spec import (
     _resolve_receive_capacity,
 )
@@ -30,6 +33,83 @@ from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
     _spec_workspace_bytes,
 )
 from hyper_parallel.core.multicore.scheduler.config import event_workspace_bytes
+
+
+class _WorkspaceLeaseFunction(torch.autograd.Function):
+    """Exercise real autograd retention while all tensors remain on the CPU."""
+
+    @staticmethod
+    def forward(ctx: Any, tensor: torch.Tensor, workspace: MegaMoeWorkspace) -> torch.Tensor:
+        """Register the context after saving a tensor needed for backward."""
+        ctx.save_for_backward(tensor)
+        ctx.workspace = workspace
+        workspace.track_graph(ctx)
+        return tensor.square()
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Release only graphs the engine will not retain for another backward."""
+        (tensor,) = ctx.saved_tensors
+        _release_completed_graph(ctx, ctx.workspace)
+        return gradient * 2 * tensor, None
+
+
+class TestWorkspaceGraphLease(unittest.TestCase):
+    """Prevent lifecycle cleanup from invalidating pending or retained backward."""
+
+    def test_completed_backward_releases_lease_with_output_still_alive(self) -> None:
+        """Do not require users to delete completed losses before shutdown."""
+        workspace = MegaMoeWorkspace(shared=False)
+        tensor = torch.ones(2, requires_grad=True)
+        output = _WorkspaceLeaseFunction.apply(tensor, workspace)
+        self.assertFalse(workspace.can_close())
+        with self.assertRaisesRegex(RuntimeError, "backward graphs"):
+            workspace.close()
+        output.sum().backward()
+        self.assertTrue(workspace.can_close())
+        self.assertTrue(torch.equal(tensor.grad, torch.full_like(tensor, 2)))
+
+    def test_retained_graph_keeps_lease_until_final_backward(self) -> None:
+        """Keep buffers usable for a retained graph's subsequent backward."""
+        workspace = MegaMoeWorkspace(shared=False)
+        tensor = torch.ones(2, requires_grad=True)
+        output = _WorkspaceLeaseFunction.apply(tensor, workspace)
+        output.sum().backward(retain_graph=True)
+        self.assertFalse(workspace.can_close())
+        output.sum().backward()
+        self.assertTrue(workspace.can_close())
+
+    def test_discarded_graph_releases_weak_lease(self) -> None:
+        """Abandoning a graph must not require executing backward to release resources."""
+        workspace = MegaMoeWorkspace(shared=False)
+        output = _WorkspaceLeaseFunction.apply(torch.ones(2, requires_grad=True), workspace)
+        self.assertFalse(workspace.can_close())
+        del output
+        gc.collect()
+        self.assertTrue(workspace.can_close())
+
+    def test_readiness_does_not_unpack_saved_tensors(self) -> None:
+        """Checking lifetime must not trigger activation restore hooks."""
+        workspace = MegaMoeWorkspace(shared=False)
+        unpack = Mock(side_effect=lambda value: value)
+        with torch.autograd.graph.saved_tensors_hooks(lambda value: value, unpack):
+            output = _WorkspaceLeaseFunction.apply(torch.ones(2, requires_grad=True), workspace)
+        self.assertFalse(workspace.can_close())
+        unpack.assert_not_called()
+        del output
+        gc.collect()
+        self.assertTrue(workspace.can_close())
+
+    def test_engine_without_retention_query_waits_for_context_gc(self) -> None:
+        """Keep a conservative lease when the engine cannot report graph retention."""
+        workspace = MegaMoeWorkspace(shared=False)
+        output = _WorkspaceLeaseFunction.apply(torch.ones(2, requires_grad=True), workspace)
+        with patch.object(torch._C._autograd, "_get_current_graph_task_keep_graph", None):  # pylint: disable=protected-access
+            output.sum().backward()
+        self.assertFalse(workspace.can_close())
+        del output
+        gc.collect()
+        self.assertTrue(workspace.can_close())
 
 
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):

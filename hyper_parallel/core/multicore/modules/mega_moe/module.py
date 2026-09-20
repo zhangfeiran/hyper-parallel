@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -75,6 +76,23 @@ class _MegaMoeExecutionResources:
             raise
         self._closed = False
         self._workspace_closed = False
+
+    def lifecycle_signature(self) -> tuple[Any, ...]:
+        """Identify allocations independently of process-local group addresses."""
+        return (
+            "mega_moe", self.spec.local_num_tokens, self.spec.hidden_size,
+            self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
+            self.spec.receive_capacity, self.spec.ep_size,
+        )
+
+    def can_close(self) -> bool:
+        """Report whether neither an active call nor a backward graph needs buffers."""
+        return self._workspace_closed or self.workspace.can_close()
+
+    def retain_runtime(self) -> Callable[[], None]:
+        """Acquire a process-owner reference and return its final release operation."""
+        shmem.acquire(self.spec.ep_group)
+        return shmem.release
 
     def close(self) -> None:
         """Release the workspace and leave the shared SHMEM lifecycle."""
