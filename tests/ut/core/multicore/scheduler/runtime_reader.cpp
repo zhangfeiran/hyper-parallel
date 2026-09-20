@@ -34,6 +34,9 @@ inline void WaitFlag(uint32_t) {}
 using AscendC::GetTPipePtr;
 #include "hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp"
 
+namespace hyper_parallel {
+namespace multicore {
+
 static_assert(sizeof(TensorDesc) == 64);
 static_assert(sizeof(TaskDesc) == 576);
 
@@ -73,3 +76,6 @@ extern "C" void read_layout(uint8_t *image, uint32_t *result) {
   result[10] = getRuntimeTaskCapacity(image);
   result[11] = getRuntimeEventCapacity(image);
 }
+
+}  // namespace multicore
+}  // namespace hyper_parallel

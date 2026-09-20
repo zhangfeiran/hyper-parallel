@@ -11,6 +11,9 @@
 #ifndef MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP
 #define MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP
 
+namespace hyper_parallel {
+namespace multicore {
+
 constexpr uint32_t MAX_TENSOR_DIMS = 4;
 constexpr uint32_t MAX_INPUTS_PER_TASK = 4;
 constexpr uint32_t MAX_OUTPUTS_PER_TASK = 4;
@@ -394,5 +397,8 @@ __aicore__ inline void SyncFunc() {
   AscendC::SetFlag<event>(eventID);
   AscendC::WaitFlag<event>(eventID);
 }
+
+}  // namespace multicore
+}  // namespace hyper_parallel
 
 #endif  // MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP

@@ -12,6 +12,9 @@
  * @file hyper_mega_moe_grad_tiling.cpp
  */
 #include "hyper_mega_moe_grad_tiling.h"
+#include <cstdint>
+#include <limits>
+
 #include "register/op_def_registry.h"
 #include "graph/utils/type_utils.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -23,6 +26,10 @@ namespace optiling {
 const uint64_t BLOCK_SIZE = 32;
 const uint64_t BUFFER_NUM = 2;
 constexpr int64_t MAX_EXPERT_NUM_PER_RANK = 16;
+constexpr int64_t RUNTIME_HEADER_BYTES = 64;
+constexpr int64_t RUNTIME_BYTE_LIMIT = static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) + 1;
+constexpr int64_t MIN_EVENT_CAPACITY = 1024;
+constexpr int64_t MIN_EVENT_COUNTER_BYTES = MIN_EVENT_CAPACITY * static_cast<int64_t>(sizeof(int32_t));
 static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   OP_CHECK_NULL_WITH_CONTEXT(context, context);
   auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
@@ -93,7 +100,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   OP_CHECK_NULL_WITH_CONTEXT(context, eventShape);
   int64_t runtimeBytes = runtimeShape->GetStorageShape().GetShapeSize();
   int64_t eventBytes = eventShape->GetStorageShape().GetShapeSize();
-  if (runtimeBytes < 64 || runtimeBytes >= (1LL << 32) || eventBytes < 4096) {
+  if (runtimeBytes < RUNTIME_HEADER_BYTES || runtimeBytes >= RUNTIME_BYTE_LIMIT ||
+      eventBytes < MIN_EVENT_COUNTER_BYTES) {
     OP_LOGE(context->GetNodeName(), "Invalid runtime/event byte lengths: %ld/%ld.", runtimeBytes, eventBytes);
     return ge::GRAPH_FAILED;
   }

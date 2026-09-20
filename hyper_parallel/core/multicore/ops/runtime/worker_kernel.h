@@ -29,12 +29,18 @@
 #include "runtime_config.hpp"
 #include "cycle_trace_recorder.h"
 
+namespace hyper_parallel {
+namespace multicore {
+
 using namespace AscendC;  // NOLINT(build/namespaces)
 
 template <typename Derived>
 class KernelWorkerBase {
  public:
   __aicore__ inline KernelWorkerBase() {}
+
+  static constexpr int64_t READY_DISTANCE_GROWTH_FACTOR = 2;
+  static constexpr uint32_t VECTOR_WORKERS_PER_CUBE = 2;
 
   static constexpr uint32_t PROFILE_DESC_WAIT_DEPENDENCY = 0x10000;
   static constexpr uint32_t PROFILE_DESC_TRIGGER_EVENT = 0x10007;
@@ -97,7 +103,7 @@ class KernelWorkerBase {
       block_idx = block_idx + this->core_num;
     } while (1);
 #else
-    if (this->worker_id_ % 2 == 0) {
+    if (this->worker_id_ % VECTOR_WORKERS_PER_CUBE == 0) {
       return;
     }
     uint32_t block_idx = this->worker_id_ / 2;
@@ -170,7 +176,7 @@ class KernelWorkerBase {
     PipeBarrier<PIPE_ALL>();
 
     uint32_t round = 0;
-    for (int64_t distance = 1; distance < ep; distance *= 2, ++round) {
+    for (int64_t distance = 1; distance < ep; distance *= READY_DISTANCE_GROWTH_FACTOR, ++round) {
       int64_t target = (rank + distance) % ep;
       __gm__ int32_t *round_ready = ready + round * ready_stride;
       aclshmemx_signal_op(round_ready, generation, ACLSHMEM_SIGNAL_SET, static_cast<int>(target));
@@ -358,5 +364,8 @@ class KernelWorkerBase {
   int64_t core_num = 0;
   int64_t vector_num = 0;
 };
+
+}  // namespace multicore
+}  // namespace hyper_parallel
 
 #endif  // MULTICORE_SCHEDULER_WORKER_KERNEL_H

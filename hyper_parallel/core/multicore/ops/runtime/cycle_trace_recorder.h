@@ -19,6 +19,9 @@
 #include "kernel_operator.h"
 #include "runtime_config.hpp"
 
+namespace hyper_parallel {
+namespace multicore {
+
 using namespace AscendC;  // NOLINT(build/namespaces)
 
 struct CycleTraceCoreHeader {
@@ -111,5 +114,8 @@ class CycleTraceRecorder {
   uint32_t record_count_ = 0;
   uint32_t record_capacity_ = 0;
 };
+
+}  // namespace multicore
+}  // namespace hyper_parallel
 
 #endif  // MULTICORE_SCHEDULER_CYCLE_TRACE_RECORDER_H

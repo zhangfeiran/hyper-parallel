@@ -22,6 +22,9 @@
 
 using namespace AscendC;
 
+namespace hyper_parallel {
+namespace multicore {
+
 class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
   // input_list layout for hyper_mega_moe_grad (backward):
@@ -271,9 +274,12 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 };
 
+}  // namespace multicore
+}  // namespace hyper_parallel
+
 extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr,
                                                 GM_ADDR *input_list) {
-  KernelWorker worker;
+  hyper_parallel::multicore::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
   worker.Process();
 }
