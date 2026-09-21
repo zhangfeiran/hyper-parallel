@@ -18,6 +18,8 @@ from __future__ import annotations
 
 __all__ = ["MegaMoeExperts"]
 
+import math
+import struct
 from typing import Any
 
 import torch
@@ -34,6 +36,35 @@ from .spec import (
     _resolve_receive_capacity, bind_mega_moe_spec,
 )
 from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
+
+
+def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
+    """Validate a positive clamp value that survives float32 serialization."""
+    if swiglu_limit is None:
+        return
+    valid_type = isinstance(swiglu_limit, (int, float)) and not isinstance(
+        swiglu_limit, bool
+    )
+    try:
+        encoded_limit = (
+            struct.unpack("<f", struct.pack("<f", float(swiglu_limit)))[0]
+            if valid_type
+            else 0.0
+        )
+        valid_value = (
+            valid_type
+            and math.isfinite(swiglu_limit)
+            and math.isfinite(encoded_limit)
+            and encoded_limit > 0
+        )
+    except (OverflowError, TypeError, ValueError, struct.error):
+        valid_value = False
+    if not valid_value:
+        raise ValueError(
+            "swiglu_limit must be None or a finite positive float32-representable number, "
+            f"got {swiglu_limit!r}."
+        )
+
 
 def _create_mega_moe_parameters(
     local_experts: int,
@@ -192,6 +223,7 @@ class MegaMoeExperts(MulticoreModule):
         intermediate_size: int,
         num_experts: int,
         top_k: int,
+        swiglu_limit: float | None = None,
         ep_size: int = 1,
         ep_group: Any | None = None,
         create_parameters: bool = True,
@@ -209,6 +241,8 @@ class MegaMoeExperts(MulticoreModule):
             intermediate_size: SwiGLU intermediate dimension per expert.
             num_experts: Global routed-expert count.
             top_k: Experts selected for every token.
+            swiglu_limit: Optional positive float32 clamp; gate uses min(gate, limit)
+                and up uses clamp(up, -limit, limit). None preserves the unclamped path.
             initial_capacity_factor: Push initial receive rows as a multiple of local routed rows.
                 Defaults to 1.25 for push; omitted for pull. Must be finite and at least 1.0.
             capacity_growth_factor: Push capacity multiplier on overflow, defaulting to 1.25.
@@ -239,12 +273,16 @@ class MegaMoeExperts(MulticoreModule):
             dispatch_split=dispatch_split,
             combine_split=combine_split,
         )
+        _validate_swiglu_limit(swiglu_limit)
+        if swiglu_limit is not None:
+            swiglu_limit = float(swiglu_limit)
         specification = {
             "local_num_tokens": local_num_tokens,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
             "top_k": top_k,
+            "swiglu_limit": swiglu_limit,
             "initial_capacity_factor": initial_capacity_factor,
             "ep_size": ep_size,
             "ep_group": ep_group,
@@ -265,6 +303,7 @@ class MegaMoeExperts(MulticoreModule):
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.top_k = top_k
+        self.swiglu_limit = swiglu_limit
         self.initial_capacity_factor = initial_capacity_factor
         self.capacity_growth_factor = capacity_growth_factor
         self.dispatch_mode = dispatch_mode

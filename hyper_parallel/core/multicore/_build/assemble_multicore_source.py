@@ -141,9 +141,16 @@ def _apply_locked_adapters(source_root: Path, dependency_lock: dict[str, Any]) -
             raise ValueError(
                 f"Adapter hash mismatch for {adapter_path}: expected={adapter['sha256']}, actual={actual_hash}"
             )
-        _run_git_apply(source_root, adapter_path, check_only=True)
-        _run_git_apply(source_root, adapter_path, check_only=False)
-        _run_git_apply(source_root, adapter_path, check_only=True, reverse=True)
+        allow_zero_context = adapter.get("allow_zero_context", False)
+        _run_git_apply(source_root, adapter_path, check_only=True, allow_zero_context=allow_zero_context)
+        _run_git_apply(source_root, adapter_path, check_only=False, allow_zero_context=allow_zero_context)
+        _run_git_apply(
+            source_root,
+            adapter_path,
+            check_only=True,
+            reverse=True,
+            allow_zero_context=allow_zero_context,
+        )
 
 
 def _run_git_apply(
@@ -151,9 +158,12 @@ def _run_git_apply(
     adapter_path: Path,
     check_only: bool,
     reverse: bool = False,
+    allow_zero_context: bool = False,
 ) -> None:
     """Run Git's patch parser against one isolated source copy."""
     command = ["git", "apply", "--ignore-space-change"]
+    if allow_zero_context:
+        command.append("--unidiff-zero")
     if reverse:
         command.append("--reverse")
     if check_only:
