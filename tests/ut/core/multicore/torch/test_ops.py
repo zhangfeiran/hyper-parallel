@@ -18,7 +18,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
 from hyper_parallel.core.multicore.torch import ops
@@ -32,6 +32,18 @@ class TestTorchOps(unittest.TestCase):
     def tearDown(self) -> None:
         """Never retain a mocked native-registration cache between tests."""
         ops._load_native.cache_clear()
+
+    def test_permute_out_loads_native_before_using_caller_outputs(self) -> None:
+        """Forward every caller-owned tensor without allocating a replacement."""
+        tensors = tuple(object() for _ in range(4))
+        calls = Mock()
+        with (
+            patch.object(ops, "_load_native", calls.load),
+            patch.object(ops.torch.ops.hyper_parallel, "moe_token_permute_out", calls.permute, create=True),
+        ):
+            self.assertIsNone(ops.moe_token_permute_out(*tensors))
+        self.assertEqual([item[0] for item in calls.mock_calls], ["load", "permute"])
+        calls.permute.assert_called_once_with(*tensors)
 
     @staticmethod
     def _backward_op(alias: str = "a") -> SimpleNamespace:

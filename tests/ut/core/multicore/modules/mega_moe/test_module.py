@@ -16,6 +16,7 @@
 
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
 
 import torch
@@ -274,10 +275,87 @@ class TestMegaMoeExperts(unittest.TestCase):
             resources.plan,
             resources.workspace,
             topk_weights=None,
+            workspace_claimed=False,
         )
         mock_restore.assert_called_once_with(
             expert_output, route.unpermute_mapping, topk_weights
         )
+
+    def test_pull_forward_owns_route_lease_and_releases_on_errors(self) -> None:
+        """Cover direct-output preparation, execution failures and failed lease acquisition."""
+        experts = MegaMoeExperts(
+            local_num_tokens=128, hidden_size=16, intermediate_size=8,
+            num_experts=4, top_k=2, ep_size=2, dispatch_mode="pull",
+        ).to(dtype=torch.bfloat16)
+        self.addCleanup(experts.close)
+        hidden = torch.ones(2, 64, 16, dtype=torch.bfloat16)
+        ids = torch.zeros(128, 2, dtype=torch.int32)
+        probs = torch.full((128, 2), 0.5)
+        for failure in (None, "ensure", "claim", "prepare", "execute"):
+            with self.subTest(failure=failure):
+                events = []
+                workspace = Mock(in_use=False)
+                resources = SimpleNamespace(spec=object(), plan=object(), workspace=workspace)
+                route = object()
+
+                def step(name: str) -> None:
+                    """Record the lease boundary and inject a requested failure."""
+                    events.append(name)
+                    if name == failure:
+                        raise RuntimeError(f"injected {name} failure")
+
+                def claim() -> None:
+                    """Own the workspace only after successful acquisition."""
+                    step("claim")
+                    workspace.in_use = True
+
+                def release() -> None:
+                    """Reject double release and record the end of the lease."""
+                    self.assertTrue(workspace.in_use)
+                    step("release")
+                    workspace.in_use = False
+
+                def prepare(*_args: Any, **kwargs: Any) -> object:
+                    """Require routing to run without autograd inside the lease."""
+                    self.assertFalse(torch.is_grad_enabled())
+                    self.assertIs(kwargs["workspace"], workspace)
+                    self.assertTrue(workspace.in_use)
+                    step("prepare")
+                    return route
+
+                def execute(*args: Any, **kwargs: Any) -> torch.Tensor:
+                    """Check that forward borrows the original workspace."""
+                    self.assertIs(args[4], route)
+                    self.assertIs(args[6], workspace)
+                    self.assertTrue(kwargs["workspace_claimed"])
+                    self.assertIs(kwargs["topk_weights"], probs)
+                    self.assertTrue(workspace.in_use)
+                    step("execute")
+                    return hidden.reshape(128, 16) + 1
+
+                workspace.ensure.side_effect = lambda *_args: step("ensure")
+                workspace.claim.side_effect = claim
+                workspace.release.side_effect = release
+                with (
+                    patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+                    patch.object(experts, "_get_execution_resources", return_value=resources),
+                    patch.object(mega_moe_module, "prepare_topk_route", side_effect=prepare),
+                    patch.object(mega_moe_module, "execute_mega_moe_with_permutation", side_effect=execute),
+                    patch.object(mega_moe_module, "restore_topk_output") as restore,
+                ):
+                    if failure is None:
+                        torch.testing.assert_close(experts(hidden, ids, probs), hidden + 1)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, f"injected {failure} failure"):
+                            experts(hidden, ids, probs)
+                restore.assert_not_called()
+                expected = ["ensure", "claim", "prepare", "execute"]
+                if failure is not None:
+                    expected = expected[:expected.index(failure) + 1]
+                if failure not in ("ensure", "claim"):
+                    expected.append("release")
+                self.assertEqual(events, expected)
+                self.assertFalse(workspace.in_use)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")

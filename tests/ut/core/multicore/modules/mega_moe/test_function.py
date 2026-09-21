@@ -44,10 +44,33 @@ class TestMegaMoeFunction(unittest.TestCase):
         """Compute expert weight gradients without an unused token reduction."""
         self._check_deferred_backward(permuted=True, input_grad=False, reuse=True)
 
-    def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True, reuse: bool = False) -> None:
+    def test_pull_borrows_forward_lease_and_owns_deferred_backward_storage(self) -> None:
+        """Keep route-specific activations and gradients after the shared source is overwritten."""
+        for reuse in (False, True):
+            with self.subTest(reuse=reuse):
+                self._check_deferred_backward(permuted=True, reuse=reuse, pull=True)
+
+    def test_pull_dispatch_skips_only_the_exact_source_self_copy(self) -> None:
+        """Use pre-permuted SHMEM directly while preserving ordinary-source staging."""
+        spec = SimpleNamespace(dispatch_mode="pull", hidden_size=4)
+        source = torch.empty(4, 4)
+        workspace = SimpleNamespace(source_buffer=source)
+        with patch.object(torch.Tensor, "copy_", autospec=True) as copy:
+            dispatch, actual_source = function_module._dispatch_and_source(spec, workspace, source, 3)
+            copy.assert_not_called()
+        self.assertIs(actual_source, source)
+        self.assertEqual(tuple(dispatch.shape), (3, 4))
+        rows = torch.ones(4, 4)
+        function_module._dispatch_and_source(spec, workspace, rows, 3)
+        torch.testing.assert_close(source, rows)
+
+    def _check_deferred_backward(
+        self, *, permuted: bool, input_grad: bool = True, reuse: bool = False, pull: bool = False,
+    ) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
-                               ep_size=2, num_experts=4, local_num_tokens=2, top_k=2)
+                               ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
+                               dispatch_mode="pull" if pull else "push")
         plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=reuse)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
@@ -56,7 +79,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         plan.fwd_runtime = runtime
         plan.bwd_runtime = runtime
         workspace = Mock(
+            in_use=False,
             expert_capacity=128,
+            source_buffer=torch.empty(4, 4),
             expert_buffer=torch.empty(128, 4),
             routed_buffer=torch.empty(4, 4),
             forward_event_counters=torch.empty(16),
@@ -67,6 +92,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         weight1 = torch.ones(2, 4, 4, requires_grad=True)
         weight2 = torch.ones(2, 2, 4, requires_grad=True)
         down_pointers = []
+        dispatch_pointers = []
         backward_capacities = []
         scratch_references = []
         restore_gradient = function_module._restore_input_gradient  # pylint: disable=protected-access
@@ -79,9 +105,18 @@ class TestMegaMoeFunction(unittest.TestCase):
 
         def release_workspace() -> None:
             """Make accidental reads after the lease immediately observable."""
+            self.assertTrue(workspace.in_use)
+            workspace.in_use = False
+            workspace.source_buffer.fill_(float("nan"))
             workspace.expert_buffer.fill_(float("nan"))
             workspace.routed_buffer.fill_(float("nan"))
 
+        def claim_workspace() -> None:
+            """Reject nested claims while exercising the real autograd bridge."""
+            self.assertFalse(workspace.in_use)
+            workspace.in_use = True
+
+        workspace.claim.side_effect = claim_workspace
         workspace.release.side_effect = release_workspace
 
         def permutation_gradient(grad: Any, mapping: Any, token_rows: int, top_k: int) -> Any:
@@ -100,13 +135,14 @@ class TestMegaMoeFunction(unittest.TestCase):
             capacity = up_proj.shape[0]
             self.assertEqual(tuple(down_proj.shape), (capacity, 4))
             self.assertEqual(tuple(activation.shape), (capacity, 2))
-            self.assertEqual(tuple(dispatch.shape), (128, 4))
+            self.assertEqual(tuple(dispatch.shape), (capacity if pull else 128, 4))
             dispatch.fill_(tag)
             up_proj.fill_(tag + 10)
             activation.fill_(tag + 20)
             down_proj.fill_(tag + 30)
             combine.fill_(tag + 40)
             down_pointers.append(down_proj.data_ptr())
+            dispatch_pointers.append(dispatch.data_ptr())
 
         def backward_kernel(*args: Any) -> None:
             """Check saved values before emulating the in-place gradient outputs."""
@@ -160,16 +196,23 @@ class TestMegaMoeFunction(unittest.TestCase):
                         metadata=route,
                         unpermute_mapping=torch.tensor([0, 2, 1, 3], dtype=torch.int32),
                     )
+                    if pull:
+                        workspace.claim()
+                        workspace.source_buffer.copy_(prepared.routed_tokens)
+                        prepared.routed_tokens = workspace.source_buffer
                     output = function_module.execute_mega_moe_with_permutation(
-                        source, ids, weight1, weight2, prepared, plan, workspace
+                        source, ids, weight1, weight2, prepared, plan, workspace, workspace_claimed=pull,
                     )
+                    if pull:
+                        self.assertTrue(workspace.in_use)
+                        workspace.release()
                 else:
                     output = function_module.execute_mega_moe(source, weight1, weight2, route, plan, workspace)
                 saved = output.grad_fn.saved_tensors
                 self.assertEqual(len(saved), 13 if permuted and input_grad else 12)
                 self.assertTrue(all(t.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
                                     for t in saved))
-                self.assertEqual(saved[0].data_ptr(), down_pointers[-1])
+                self.assertEqual(saved[0].data_ptr(), (dispatch_pointers if pull else down_pointers)[-1])
                 self.assertNotEqual(saved[0].data_ptr(), workspace.expert_buffer.data_ptr())
                 self.assertEqual(saved[0].untyped_storage().nbytes(), capacity * 4 * source.element_size())
                 self.assertEqual(tuple(output.shape), (4, 4))

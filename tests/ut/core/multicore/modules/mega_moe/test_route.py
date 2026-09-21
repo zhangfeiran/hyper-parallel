@@ -103,6 +103,71 @@ class TestMegaMoeRoute(unittest.TestCase):
         ):
             _validate_bounded_capacity(8, bounded_spec)
 
+    def test_pull_permutation_writes_leased_source_with_owned_mapping(self) -> None:
+        """Preserve gather overlap while bypassing the allocating permutation."""
+        spec = replace(self._spec(ep_size=2), dispatch_mode="pull")
+        hidden = torch.ones(2, 4)
+        ids = torch.tensor([[0, 2], [1, 3]], dtype=torch.int64).T
+        counts = torch.ones(4, dtype=torch.int32)
+        source = torch.empty(4, 4)
+        workspace = Mock(in_use=True, source_buffer=source)
+        events = []
+        work = Mock()
+        work.wait.side_effect = lambda: events.append("wait")
+
+        def gather(output: torch.Tensor, _counts: torch.Tensor, **_kwargs: Any) -> Mock:
+            """Record collective launch and provide a deterministic count matrix."""
+            events.append("gather")
+            output.fill_(1)
+            return work
+
+        def permute(
+            tokens: torch.Tensor, indices: torch.Tensor, output: torch.Tensor, mapping: torch.Tensor,
+        ) -> None:
+            """Write mocked permutation results directly into the supplied outputs."""
+            events.append("permute-out")
+            self.assertIs(tokens, hidden)
+            self.assertIs(output, source)
+            self.assertTrue(indices.is_contiguous())
+            torch.testing.assert_close(indices, ids)
+            self.assertEqual(mapping.dtype, torch.int32)
+            self.assertEqual(tuple(mapping.shape), (4,))
+            output.fill_(3)
+            mapping.copy_(torch.arange(4, dtype=torch.int32))
+
+        with (
+            patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather),
+            patch.object(route_module.multicore_ops, "moe_token_permute_out", side_effect=permute),
+            patch.object(route_module, "_permute_topk_input") as allocating,
+        ):
+            first = prepare_topk_route(hidden, ids, torch.ones(2, 2), spec, counts, workspace)
+            second = prepare_topk_route(hidden, ids, torch.ones(2, 2), spec, counts, workspace)
+        allocating.assert_not_called()
+        workspace.wait_for_reuse.assert_not_called()
+        self.assertEqual(events, ["gather", "permute-out", "wait"] * 2)
+        self.assertIs(first.routed_tokens, source)
+        self.assertIs(second.routed_tokens, source)
+        self.assertNotEqual(first.unpermute_mapping.data_ptr(), second.unpermute_mapping.data_ptr())
+        torch.testing.assert_close(first.unpermute_mapping, torch.arange(4, dtype=torch.int32))
+        self.assertEqual(first.metadata.expert_capacity, 4)
+
+    def test_pull_permutation_rejects_unowned_or_uninitialized_workspace(self) -> None:
+        """Reject an invalid lease before starting a collective or modifying SHMEM."""
+        spec = replace(self._spec(ep_size=2), dispatch_mode="pull")
+        for active, source in ((False, torch.empty(4, 4)), (True, None)):
+            with (
+                self.subTest(active=active),
+                patch.object(route_module.dist, "all_gather_into_tensor") as gather,
+                patch.object(route_module.multicore_ops, "moe_token_permute_out") as permute,
+                self.assertRaisesRegex(RuntimeError, "initialized, claimed workspace"),
+            ):
+                prepare_topk_route(
+                    torch.ones(2, 4), torch.zeros(2, 2, dtype=torch.int32), torch.ones(2, 2),
+                    spec, torch.ones(4, dtype=torch.int32), Mock(in_use=active, source_buffer=source),
+                )
+            gather.assert_not_called()
+            permute.assert_not_called()
+
     def test_async_count_gather_overlaps_permute_and_builds_metadata(self) -> None:
         """Wait after permutation and derive every native offset from counts."""
         spec = self._spec(ep_size=2, rank_id=1)
