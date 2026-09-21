@@ -53,6 +53,8 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedPackedSequence,
     SharedCompressedDSAAttention,
     SharedCompressedDSAIndexer,
+    _gather_compressed_keys,
+    _sort_compressed_indices,
     compressed_candidate_topk,
     compressed_causal_topk,
     select_candidate_block_indices,
@@ -1049,6 +1051,38 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_compressed_key_gather_preserves_batches_and_repeated_positions(self):
+        """Row gathering preserves BF16 values for strided keys and repeated IDs."""
+        for batch_size in (1, 2):
+            with self.subTest(batch_size=batch_size):
+                key = torch.arange(batch_size * 5 * 8, dtype=torch.bfloat16).reshape(batch_size, 5, 8)
+                key = key[..., ::2]
+                indices = torch.tensor([[[4, 0, 4], [1, 3, 0]]]).expand(batch_size, -1, -1)
+                batch_indices = torch.arange(batch_size).view(-1, 1, 1)
+                expected = key[batch_indices, indices]
+                actual = _gather_compressed_keys(key, indices)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                empty_indices = indices[..., :0]
+                torch.testing.assert_close(
+                    _gather_compressed_keys(key, empty_indices), key[batch_indices, empty_indices],
+                    rtol=0, atol=0,
+                )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_compressed_index_sort_preserves_padding_and_large_adjacent_ids(self):
+        """Sorting retains duplicates and padding, including IDs beyond FP32 precision."""
+        for length in (2048, 2**24, 2**24 + 2):
+            for dtype in (torch.int32, torch.int64):
+                with self.subTest(length=length, dtype=dtype):
+                    indices = torch.tensor([[[length, length - 1, 0, length - 2, 0, length]]], dtype=dtype)
+                    torch.testing.assert_close(
+                        _sort_compressed_indices(indices, length), indices.sort(dim=-1).values,
+                        rtol=0, atol=0,
+                    )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_compressed_indexer_uses_ratio_aware_causal_boundary(self):
         """A compressed key becomes visible only after its source group closes."""
         query = torch.ones(1, 6, 2, 4)
@@ -1166,15 +1200,18 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
         """Precomputed PanGu-style gradients match a direct sparse KL graph."""
         torch.manual_seed(29)
         source_tensors = (
-            torch.randn(1, 4, 2, 3),
-            torch.randn(1, 4, 3),
-            torch.randn(1, 4, 2),
+            torch.randn(2, 4, 2, 3),
+            torch.randn(2, 4, 3),
+            torch.randn(2, 4, 2),
         )
         custom_inputs = [tensor.clone().requires_grad_() for tensor in source_tensors]
         reference_inputs = [tensor.clone().requires_grad_() for tensor in source_tensors]
-        attention_query = torch.randn(1, 2, 4, 5)
-        compressed_key = torch.randn(1, 4, 5)
-        topk_indices = torch.tensor([[[-1, -1], [0, -1], [0, 1], [1, 2]]])
+        attention_query = torch.randn(2, 2, 4, 5)
+        compressed_key = torch.randn(2, 4, 5)
+        topk_indices = torch.tensor([
+            [[-1, -1], [0, -1], [0, 1], [1, 2]],
+            [[-1, -1], [1, 1], [0, -1], [2, 3]],
+        ])
         sinks = torch.randn(2)
         scale = 5**-0.5
         coefficient = 0.13
@@ -1205,7 +1242,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
             selected_attention_key,
         ) * scale
         attention_scores = attention_scores.masked_fill(~valid.unsqueeze(1), -1.0e9)
-        sink_logits = sinks.view(1, -1, 1, 1).expand(1, -1, index_query.shape[1], -1)
+        sink_logits = sinks.view(1, -1, 1, 1).expand(index_query.shape[0], -1, index_query.shape[1], -1)
         target = torch.cat((attention_scores, sink_logits), dim=-1).softmax(dim=-1)
         target = target[..., :-1].masked_fill(~valid.unsqueeze(1), 0.0).sum(dim=1)
         target = target / target.sum(dim=-1, keepdim=True).clamp_min(

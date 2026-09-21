@@ -74,6 +74,18 @@ owner EP 的 dispatch 将 token 发到 expert owner，owner 对收到的全局 t
 `reduce_dtype` 控制。MegaMoe 负责 dispatch、owner compute、combine，不改变
 通用 optimizer 或 dense DP 梯度归约。
 
+### Indexer 索引与排序
+
+Reindex 候选 key gather 和 Indexer KL 中的两处 key gather 改为展平 batch 后的
+`index_select`，避免广播多维高级索引。三处 Top-K ID 排序在压缩长度不超过
+`2**24` 时转为 FP32 排序，再恢复整数 dtype；该范围内有效 ID 和 padding sentinel
+均可精确表示，更长序列保留整数排序。候选池、因果 mask、teacher 分布和 KL
+梯度公式保持不变。
+
+910B 单卡 profiler 已确认 gather 从 `IndexAiCpu` 切到 `GatherV3AiCore`，排序从
+`SortAiCpu` 切到 `SortAiCore`（包含必要的 Cast）。这项优化使用现有 Torch 接口，
+不依赖新增的 LightningIndexer 融合算子绑定。
+
 ### Push / pull
 
 `MegaMoeExperts(..., dispatch_mode="push" | "pull")` 在构造时选定模式，所有
@@ -128,6 +140,11 @@ finite。push P2 相对 owner A1 的 144 个 rank-step 比较中，134 个 loss 
 相对差为 `0.0379%`。这些数值用于整网训练轨迹检查，不替代上面的逐 tensor FP32
 oracle，也不表示 bitwise 等价。pull 的整网 clean 复测仍在排队。
 
+Indexer 替换的专项回归：CPU crop 测试 `36 passed, 14 subtests passed`，覆盖
+多 batch、非连续 key、重复 ID、空 gather 和 FP32 精确整数边界；KL 梯度与独立
+直接 autograd 公式对齐。910B 上对替换前后模块比较，Full/Reindex Top-K ID、
+KL loss 和 `dQ/dK/dWeight` 均逐元素完全一致（`rtol=0, atol=0`）。本次未重跑整网。
+
 ## 性能与 HBM 测试方法
 
 性能比较只使用 fresh-process、同一 canonical rank-local BF16 权重和确定性
@@ -175,14 +192,15 @@ MoE 加速比用相同输入和权重的模块边界诊断或
 按秒采样每张卡的 HBM used/total 和进程归属，报告两类数值：Torch allocator
 峰值，以及卡侧物理 HBM 峰值。两者必须注明采样边界和是否含 SHMEM heap。
 
-### 当前性能边界
+### Indexer 优化前的整网性能
 
-本轮使用 `limit=10`、EP8/E48、四层、`H=5120`、`I=2304`、`TopK=6` 和每卡
+以下整网和 MoE 结果测于本次 Indexer 索引与排序替换之前，不能作为替换后的
+整网性能结论。测试使用 `limit=10`、EP8/E48、四层、`H=5120`、`I=2304`、`TopK=6` 和每卡
 4096 tokens。owner A1/A2、push P2 以及 owner/push MoE 模块边界诊断满足 exit 0、
 `foreign=[]`、`unresolved=[]`。push P1 和 pull L1/L2 在运行中观察到外来进程，
 对应整网性能/HBM 数据作废并排队重跑。
 
-当前 clean 的 provisional 整网结果如下。owner 取 A1/A2 mean 的平均；push 暂时
+当时 clean 的 provisional 整网结果如下。owner 取 A1/A2 mean 的平均；push 暂时
 只有 P2，待 P1 clean 重跑后再形成最终成对结论。
 
 | 后端 | 整网 mean | 相对 owner | Torch peak allocated | 物理 HBM 峰值 |
@@ -202,6 +220,16 @@ MoE 诊断在四个 `*.mlp` 模块边界同步计时，只用于拆分 MoE 关�
 不启用诊断的 ABCCBA fresh-process 结果为准。历史 `limit=0` 数据不参与本轮
 `limit=10` 验收。旧 pull 诊断使用过动态通信分块，固定为 128 后不再作为当前
 性能结论，需与 pull 整网一起重测。
+
+### Indexer 替换的单卡诊断
+
+同一进程内同步 ABBA 测量的 KL 前后向中位数从 `1336.383 ms` 降至
+`103.947 ms`，约 `12.86x`。输入为 B1、Q4096、压缩 K2048、TopK512、query
+chunk256，Indexer 为 32 heads/D128，teacher 为 64 heads/D512；计时包含两端
+相同的输入准备。运行期间 18 次进程采样均只观察到本次测试进程。
+
+该结果用于确认局部瓶颈消除，样本较少且不是 fresh-process 整网 ABBA；不得
+据此外推整网加速、MoE 加速比或峰值 HBM。替换后的整网性能仍需按上面流程重测。
 
 ## 验收命令
 
