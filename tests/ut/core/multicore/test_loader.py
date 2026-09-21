@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for unified multicore payload lookup and OPP diagnostics."""
 
+import ctypes
 import os
 import shutil
 import tempfile
@@ -48,6 +49,25 @@ class TestMulticoreNative(unittest.TestCase):
         adapter.write_bytes(b"adapter")
         self.shmem_root = self.native_root.parent / "shmem" / "lib"
         (self.shmem_root / "shmem").mkdir(parents=True)
+
+    def test_vendor_preload_keeps_dependency_symbols_local(self) -> None:
+        """Load the exact vendor without exposing dependency globals to later libraries."""
+        library = self.vendor_root / "op_api" / "lib" / "libcust_opapi.so"
+        with patch.object(_loader.ctypes, "CDLL") as load:
+            _loader.preload_vendor_library(self.vendor_root)
+        load.assert_called_once_with(str(library), mode=ctypes.RTLD_LOCAL)
+
+    def test_vendor_preload_preserves_library_failure_and_cause(self) -> None:
+        """Report the exact failed vendor and preserve the original loader error."""
+        library = self.vendor_root / "op_api" / "lib" / "libcust_opapi.so"
+        error = OSError("missing dependency")
+        with patch.object(_loader.ctypes, "CDLL", side_effect=error) as load:
+            with self.assertRaisesRegex(NativeComponentUnavailableError, "HP-NATIVE-VENDOR-LOAD-FAILED") as raised:
+                _loader.preload_vendor_library(self.vendor_root)
+        load.assert_called_once_with(str(library), mode=ctypes.RTLD_LOCAL)
+        self.assertIn(str(library), str(raised.exception))
+        self.assertIn(str(error), str(raised.exception))
+        self.assertIs(raised.exception.__cause__, error)
 
     def test_component_paths_accept_sourced_environment_without_modifying_it(self):
         """Lookup accepts the sourced vendor paths without changing the process environment."""
