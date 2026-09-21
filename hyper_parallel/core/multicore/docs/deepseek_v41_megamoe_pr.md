@@ -86,6 +86,11 @@ Reindex 候选 key gather 和 Indexer KL 中的两处 key gather 改为展平 ba
 `SortAiCpu` 切到 `SortAiCore`（包含必要的 Cast）。这项优化使用现有 Torch 接口，
 不依赖新增的 LightningIndexer 融合算子绑定。
 
+KL 在非空 key 路径上也不再逐 chunk 将 `valid_rows.any()` 读取到 Python；无效
+行通过固定形状的 `masked_fill` 后归约，不再使用动态布尔索引。全无效行的 loss
+和梯度仍为零，空 key 保留原有跳过 gather 的行为。teacher 分布、梯度公式和
+默认 query chunk256 均保持不变。
+
 ### Push / pull
 
 `MegaMoeExperts(..., dispatch_mode="push" | "pull")` 在构造时选定模式，所有
@@ -138,12 +143,17 @@ BF16 权重。clean 的 owner A1/A2 和 push P2 均完成 18 步且 loss/grad no
 finite。push P2 相对 owner A1 的 144 个 rank-step 比较中，134 个 loss 完全相同；
 最大 loss 绝对差为 `0.125`（两个 BF16 ULP，相对 `1.117%`），全局 grad norm 最大
 相对差为 `0.0379%`。这些数值用于整网训练轨迹检查，不替代上面的逐 tensor FP32
-oracle，也不表示 bitwise 等价。pull 的整网 clean 复测仍在排队。
+oracle，也不表示 bitwise 等价。这组结果测于 Indexer 索引替换前。
 
 Indexer 替换的专项回归：CPU crop 测试 `36 passed, 14 subtests passed`，覆盖
 多 batch、非连续 key、重复 ID、空 gather 和 FP32 精确整数边界；KL 梯度与独立
 直接 autograd 公式对齐。910B 上对替换前后模块比较，Full/Reindex Top-K ID、
-KL loss 和 `dQ/dK/dWeight` 均逐元素完全一致（`rtol=0, atol=0`）。本次未重跑整网。
+KL loss 和 `dQ/dK/dWeight` 均逐元素完全一致（`rtol=0, atol=0`）。整网训练轨迹的
+单独复测见下方，不能替代逐 tensor FP32 oracle。
+
+KL 去同步的追加回归：CPU crop 测试 `37 passed, 16 subtests passed`，并单独复测
+包含全无效 chunk 的直接 autograd 对照。910B 上 loss、`dQ/dK/dWeight` 与去同步
+前逐元素一致；空 key、全无效 chunk 和不满 chunk 的尾段均得到零 loss/梯度。
 
 ## 性能与 HBM 测试方法
 
@@ -157,6 +167,7 @@ KL loss 和 `dQ/dK/dWeight` 均逐元素完全一致（`rtol=0, atol=0`）。本
 torchrun。稳定测试建议 `warmup=8`、`steps=10`、`schedule_steps=18`：
 
 ```bash
+export TASK_QUEUE_ENABLE=0
 MODEL_DIR=...
 ENGRAM_ASSETS=...
 WEIGHTS_DIR=...
@@ -229,7 +240,40 @@ chunk256，Indexer 为 32 heads/D128，teacher 为 64 heads/D512；计时包含�
 相同的输入准备。运行期间 18 次进程采样均只观察到本次测试进程。
 
 该结果用于确认局部瓶颈消除，样本较少且不是 fresh-process 整网 ABBA；不得
-据此外推整网加速、MoE 加速比或峰值 HBM。替换后的整网性能仍需按上面流程重测。
+据此外推整网加速、MoE 加速比或峰值 HBM。
+
+在上述 gather/sort 替换基础上，KL 去同步的同进程单卡 ABBA 诊断从
+`102.774 ms` 降至 `91.156 ms`（约 `1.127x`，10 个样本/实现），进程采样未发现
+其他 NPU 使用者。chunk512 的探索性计时略快，但显存增加，默认仍为 `256`。
+这些数据同样不是整网性能结论。
+
+KL 改动的整网对照固定 EP8/E48、limit10、四层、相同 canonical 权重和 18 步
+学习率计划，对比原版、KL 改版、KL 改版加 `TASK_QUEUE_ENABLE=1`，按
+A-B-C-C-B-A 独立启动。六轮均正常退出，所有 rank-step 的 loss、grad norm 与
+原版完全一致；六轮均检测到外来进程，因此整组性能数据作废。任务队列仍保持
+原测试配置 `0`，不能将受干扰的计时作为默认开启队列的依据。
+
+MegaMoe push 也分别完成了队列0/1的18步兼容性检查：144 个 rank-step 的 loss、
+grad norm 完全一致，且队列0的 KL 改版与此前 push 基线的训练轨迹一致。两轮
+均有外来进程，因此只确认本配置的运行兼容性，不报告队列开启的性能收益。
+
+### Gather/sort 替换后的整网复测
+
+`e8761676` 的 EP8/E48、limit10、四层复测中，owner A1、push P1、pull L2 未发现
+外来进程。下表仅是各一轮的暂定结果；owner A2、push P2、pull L1 受干扰，不能
+据此认定完整 ABCCBA 验收通过。此时尚未加入上面的 KL 去同步改动。
+
+| 后端 | 整网 mean | 相对 owner | Torch peak allocated | 物理 HBM 峰值 |
+| --- | ---: | ---: | ---: | ---: |
+| owner A1 | `2282.140 ms` | `1.000x` | `40.786 GiB` | `46.989 GiB` |
+| push P1 | `2145.131 ms` | `1.064x` | `38.506 GiB` | `46.786 GiB` |
+| pull L2 | `2139.455 ms` | `1.067x` | `38.506 GiB` | `45.163 GiB` |
+
+无干扰的 MoE 边界诊断中，owner/push 前后向合计为 `342.556/211.378 ms`，
+加速 `1.621x`；前向 `1.553x`，反向 `1.710x`。pull MoE 诊断受干扰，作废。
+push P1 与 pull L2 的 loss/grad norm 完全一致；相对 owner A1，144 个 rank-step
+中 134 个 loss 相同，最大 loss 绝对差 `0.125`，grad norm 最大相对差 `0.0379%`。
+loss 完全相等这一严格诊断未通过，不能将进程正常退出解释为所有精度判据通过。
 
 ## 验收命令
 

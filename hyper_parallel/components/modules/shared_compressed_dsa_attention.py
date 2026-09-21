@@ -661,6 +661,7 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
         grad_index_query = torch.zeros_like(index_query, dtype=torch.float32)
         grad_index_key = torch.zeros_like(index_key, dtype=torch.float32)
         grad_merge_weight = torch.zeros_like(merge_weight, dtype=torch.float32)
+        empty_keys = index_key.shape[1] == 0 or compressed_key.shape[1] == 0
 
         with torch.no_grad():
             for start in range(0, sequence_length, query_chunk_size):
@@ -668,7 +669,9 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 selected = topk_indices[:, start:end]
                 valid = selected >= 0
                 valid_rows = valid.any(dim=-1)
-                if not torch.any(valid_rows):
+                # Only empty key tensors require skipping the gather. For nonempty keys,
+                # masked rows contribute zero without synchronizing a device bool to Python.
+                if empty_keys and not torch.any(valid_rows):
                     continue
                 safe_indices = selected.clamp_min(0).long()
 
@@ -705,7 +708,7 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 log_prediction = index_scores.log_softmax(dim=-1)
                 target_log = target.clamp_min(torch.finfo(torch.float32).tiny).log()
                 row_loss = (target * (target_log - log_prediction)).sum(dim=-1)
-                total_loss.add_(row_loss[valid_rows].sum() * (loss_coeff / denominator))
+                total_loss.add_(row_loss.masked_fill(~valid_rows, 0.0).sum() * (loss_coeff / denominator))
 
                 grad_scores = (log_prediction.exp() - target) * (loss_coeff / denominator)
                 grad_scores.masked_fill_(~valid, 0.0)

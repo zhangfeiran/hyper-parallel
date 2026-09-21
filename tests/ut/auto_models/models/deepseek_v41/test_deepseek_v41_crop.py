@@ -1224,7 +1224,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
             sinks,
             attention_scale=scale,
             loss_coeff=coefficient,
-            query_chunk_size=2,
+            query_chunk_size=1,
         )
 
         index_query, index_key, merge_weight = reference_inputs
@@ -1262,6 +1262,33 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
         torch.testing.assert_close(custom_loss, reference_loss, rtol=1.0e-5, atol=1.0e-6)
         for custom, reference in zip(custom_inputs, reference_inputs):
             torch.testing.assert_close(custom.grad, reference.grad, rtol=1.0e-5, atol=1.0e-6)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_compressed_indexer_kl_fully_masked_chunks_have_zero_gradients(self):
+        """Masked chunks, including empty keys and a partial tail, contribute zero."""
+        for key_length in (0, 3):
+            with self.subTest(key_length=key_length):
+                index_query = torch.randn(2, 5, 2, 3, requires_grad=True)
+                index_key = torch.randn(2, key_length, 3, requires_grad=True)
+                merge_weight = torch.randn(2, 5, 2, requires_grad=True)
+                loss = shared_compressed_indexer_kl_loss(
+                    index_query,
+                    index_key,
+                    merge_weight,
+                    torch.randn(2, 2, 5, 4),
+                    torch.randn(2, key_length, 4),
+                    torch.full((2, 5, 2), -1, dtype=torch.long),
+                    torch.randn(2),
+                    attention_scale=0.5,
+                    loss_coeff=0.13,
+                    query_chunk_size=2,
+                )
+                loss.backward()
+                torch.testing.assert_close(loss, torch.zeros_like(loss), rtol=0, atol=0)
+                for value in (index_query, index_key, merge_weight):
+                    self.assertIsNotNone(value.grad)
+                    torch.testing.assert_close(value.grad, torch.zeros_like(value), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
