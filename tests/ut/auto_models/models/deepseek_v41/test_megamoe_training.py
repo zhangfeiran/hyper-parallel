@@ -44,7 +44,7 @@ class _WeightProbe(nn.Module):
         if kwargs["create_parameters"]:
             raise AssertionError("Trainer must own the only expert parameters")
         self.swiglu_limit = kwargs["swiglu_limit"]
-        self.expert_capacity_factor = kwargs["expert_capacity_factor"]
+        self.initial_capacity_factor = kwargs["initial_capacity_factor"]
         self.calls = []
 
     def forward(self, hidden: torch.Tensor, _indices: torch.Tensor, _weights: torch.Tensor,
@@ -74,7 +74,7 @@ class TestMegaMoeTraining(unittest.TestCase):
             experts.configure(None, 1, 128, "push", 2, 1.5)
             self.assertEqual(experts.swiglu_limit, 10.0)
             self.assertEqual(experts._kernel.swiglu_limit, 10.0)
-            self.assertEqual(experts._kernel.expert_capacity_factor, 1.5)
+            self.assertEqual(experts._kernel.initial_capacity_factor, 1.5)
             experts(hidden, indices, weights).sum().backward()
             old = experts.gate_up_proj
             experts.gate_up_proj = nn.Parameter(torch.ones_like(old))

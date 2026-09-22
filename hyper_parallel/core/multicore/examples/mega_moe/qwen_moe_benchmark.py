@@ -43,7 +43,8 @@ from hyper_parallel.components.optim import (
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
-from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore import MegaMoeExperts, shmem
+from hyper_parallel.core.multicore.modules.mega_moe.spec import _resolve_capacity_factors
 from hyper_parallel.core.optimizer import get_hyper_optimizer
 from hyper_parallel.platform.torch.common import GroupedExperts
 
@@ -126,23 +127,6 @@ class _CommonExpertsAdapter(torch.nn.Module):
         """Match the managed expert lifecycle without owning SHMEM."""
 
 
-def _capacity_factor(value: str) -> float | None:
-    """Parse ``none`` or a finite factor of at least one."""
-    if value.lower() == "none":
-        return None
-    try:
-        factor = float(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            f"capacity factor must be 'none' or a number, got {value!r}."
-        ) from error
-    if not math.isfinite(factor) or factor < 1.0:
-        raise argparse.ArgumentTypeError(
-            f"capacity factor must be finite and at least 1.0, got {value!r}."
-        )
-    return factor
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the minimal optimizer benchmark interface.
 
@@ -159,8 +143,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--measured-steps", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--expert-capacity-factor", type=_capacity_factor, default=None)
+    parser.add_argument("--initial-capacity-factor", type=float, default=None,
+                        help="push only: initial receive factor (default: 1.25)")
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
+    parser.add_argument("--capacity-growth-factor", type=float, default=None,
+                        help="push only: growth multiplier (default: 1.25; 1.0 fits actual demand)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--output",
@@ -168,6 +155,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="rank-zero JSON result path",
     )
     args = parser.parse_args(argv)
+    args.initial_capacity_factor, args.capacity_growth_factor = _resolve_capacity_factors(
+        args.dispatch_mode, args.initial_capacity_factor, args.capacity_growth_factor)
     if args.warmup_steps < 1:
         raise ValueError(f"warmup_steps must be positive, got {args.warmup_steps}.")
     if args.measured_steps <= 0:
@@ -578,7 +567,15 @@ def _measure_backend(
         loss, latency = _timed_step(workload)
         latencies.append(latency)
         losses.append(float(loss.float().cpu().item()))
+    managers = {}
+    for layer in workload.model.layers:
+        if isinstance(layer.mlp.experts, MegaMoeExperts):
+            manager = layer.mlp.experts._resource_group.resources.heap_manager
+            managers[id(manager)] = manager
+    state = shmem.debug_state() if managers else {}
     return {
+        "shmem_heap_bytes": state.get("config", {}).get("heap_size_bytes", 0),
+        "heap_growth": [record for manager in managers.values() for record in manager.growth_records],
         "validation": validation,
         "first_optimizer_step_ms": first_step_ms,
         "steady_state_optimizer_step_ms": {
@@ -612,8 +609,9 @@ def _write_result(
                 "num_layers": config.num_layers,
                 "num_experts": config.num_experts,
                 "top_k": config.top_k,
-                "expert_capacity_factor": config.expert_capacity_factor,
+                "initial_capacity_factor": config.initial_capacity_factor,
                 "dispatch_mode": config.dispatch_mode,
+                "capacity_growth_factor": config.capacity_growth_factor,
                 "dtype": "bfloat16",
             },
             "optimizer": {
@@ -735,8 +733,9 @@ def main(argv: list[str] | None = None) -> int:
     rank, world_size, device = _init_runtime()
     config = replace(
         QwenMoeConfig(),
-        expert_capacity_factor=args.expert_capacity_factor,
+        initial_capacity_factor=args.initial_capacity_factor,
         dispatch_mode=args.dispatch_mode,
+        capacity_growth_factor=args.capacity_growth_factor,
     )
     models: dict[str, QwenMoeModel] = {}
     try:

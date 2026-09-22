@@ -79,7 +79,7 @@ def test_mega_moe_push_memory_reuse() -> None:
     """Check alias/fallback, tails, empty ranks, retained graphs and trainable/frozen managed input."""
     shape = baseline.MoeShape()
     start_shmem_lifetime()
-    mega, common = baseline.new_layers(shape, expert_capacity_factor=None)
+    mega, common = baseline.new_layers(shape, initial_capacity_factor=shape.ep_size)
     reference_input, _ = baseline.make_data(shape)
     resources = mega._get_execution_resources(reference_input)  # pylint: disable=protected-access
     assert resources.plan.reuse_backward_dispatch, "managed push plan must enable checked storage reuse"

@@ -78,7 +78,8 @@ class DeepseekV41TrainingExperts(nn.Module):
 
     def configure(self, ep_group: Any, ep_size: int, local_num_tokens: int,
                   dispatch_mode: str, top_k: int,
-                  expert_capacity_factor: float | None = None) -> None:
+                  initial_capacity_factor: float | None = None,
+                  capacity_growth_factor: float | None = None) -> None:
         """Bind the actual EP group before any native resources are acquired.
 
         Args:
@@ -87,7 +88,8 @@ class DeepseekV41TrainingExperts(nn.Module):
             local_num_tokens: Fixed number of tokens at this MoE boundary.
             dispatch_mode: Native push or pull transport.
             top_k: Number of global experts selected per token.
-            expert_capacity_factor: Optional bounded receive-capacity multiplier.
+            initial_capacity_factor: Push initial receive-capacity multiplier, default 1.25.
+            capacity_growth_factor: Push overflow growth multiplier, default 1.25.
         """
         if self._kernel is not None:
             raise RuntimeError("Cannot reconfigure an active MegaMoe expert executor")
@@ -95,14 +97,15 @@ class DeepseekV41TrainingExperts(nn.Module):
             raise ValueError("Expert count must be divisible by EP size")
         if dispatch_mode not in ("push", "pull"):
             raise ValueError("dispatch_mode must be push or pull")
-        # Register every layer before the first forward sizes the fixed SHMEM heap.
+        # Register every layer before the first forward sizes the managed SHMEM heap.
         # Native allocation remains lazy and no FSDP parameter is retained here.
         self._kernel = MegaMoeExperts(
             local_num_tokens=local_num_tokens, hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size, num_experts=self.global_experts,
             top_k=top_k, ep_group=ep_group, ep_size=ep_size,
             dispatch_mode=dispatch_mode, create_parameters=False,
-            expert_capacity_factor=expert_capacity_factor, swiglu_limit=self.swiglu_limit,
+            initial_capacity_factor=initial_capacity_factor, capacity_growth_factor=capacity_growth_factor,
+            swiglu_limit=self.swiglu_limit,
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
@@ -147,7 +150,8 @@ class DeepseekV41TrainingExperts(nn.Module):
 def deepseek_v41_megamoe_compute_fn(
         *, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any,
         local_num_tokens: int = 128, dispatch_mode: str = "push",
-        expert_capacity_factor: float | None = None,
+        initial_capacity_factor: float | None = None,
+        capacity_growth_factor: float | None = None,
 ) -> Callable:
     """Replace the entire routed branch while preserving its nested FSDP call.
 
@@ -159,7 +163,8 @@ def deepseek_v41_megamoe_compute_fn(
         ep_mesh: Derived expert mesh, with group-local ownership.
         local_num_tokens: Fixed local token count after boundary transformations.
         dispatch_mode: Native push or pull transport.
-        expert_capacity_factor: Optional bounded receive-capacity multiplier.
+        initial_capacity_factor: Push initial receive-capacity multiplier, default 1.25.
+        capacity_growth_factor: Push overflow growth multiplier, default 1.25.
 
     Returns:
         A text/multimodal-compatible routed-plus-shared compute function.
@@ -178,7 +183,7 @@ def deepseek_v41_megamoe_compute_fn(
     size = 1 if ep_mesh is None else ep_mesh["ep"].size()
     module.experts.configure(
         group, size, local_num_tokens, dispatch_mode, module.gate.top_k,
-        expert_capacity_factor,
+        initial_capacity_factor, capacity_growth_factor,
     )
 
     if "image_mask" not in inspect.signature(module.forward).parameters:

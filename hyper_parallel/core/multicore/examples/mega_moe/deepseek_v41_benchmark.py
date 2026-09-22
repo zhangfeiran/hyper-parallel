@@ -93,7 +93,7 @@ def _build(args):
         compute = deepseek_v41_megamoe_compute_fn(
             module=model, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=_EpMesh(),
             local_num_tokens=args.tokens, dispatch_mode=args.dispatch_mode,
-            expert_capacity_factor=args.expert_capacity_factor)
+            initial_capacity_factor=args.initial_capacity_factor)
     else:
         compute = deepseek_v41_ep_compute_fn(module=model, mesh=None, tp_mesh=None,
                                            cp_mesh=None, ep_mesh=_EpMesh(), use_grouped_gemm=True)
@@ -161,7 +161,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
-    parser.add_argument("--expert-capacity-factor", type=_capacity_factor, default=None)
+    parser.add_argument("--initial-capacity-factor", type=_capacity_factor, default=None)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--evidence-dir", help="Optional canonical BF16 output/gradient evidence directory")
