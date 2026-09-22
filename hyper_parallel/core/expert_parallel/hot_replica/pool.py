@@ -28,9 +28,10 @@ import torch.distributed as dist
 class ReplicaPool:
     """Reuse B guest slots across layers without retaining parameter snapshots."""
 
-    def __init__(self, weights: tuple[torch.Tensor, ...], slots: int) -> None:
-        """Allocate only guest matrices; parameter storage remains caller-owned."""
-        self.weights = tuple(weight.new_empty((slots, *weight.shape[1:])) for weight in weights)
+    def __init__(self, weights: tuple[torch.Tensor, ...], slots: int, *, borrow: bool = False) -> None:
+        """Allocate guest matrices or borrow externally owned execution views."""
+        self.weights = weights if borrow else tuple(weight.new_empty((slots, *weight.shape[1:])) for weight in weights)
+        self._borrowed = borrow
         self.gradients = None
         self._lock = threading.Lock()
         self._event = None
@@ -58,8 +59,9 @@ class ReplicaPool:
                 if stream is not None:
                     self._event = backend.Event()
                     self._event.record(stream)
-                    for tensor in self.weights + (self.gradients or ()):
-                        tensor.record_stream(stream)
+                    if not self._borrowed:
+                        for tensor in self.weights + (self.gradients or ()):
+                            tensor.record_stream(stream)
             finally:
                 self._lock.release()
 
