@@ -228,6 +228,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         plan.fwd_runtime_config = plan.bwd_runtime_config = None
         workspace = Mock(
             replica_inbox=None,
+            replica_provider=None,
             in_use=False,
             expert_capacity=128,
             expert_buffer=torch.empty(128, 4),
