@@ -191,7 +191,13 @@ def build_deepseek_v41_validation_config(
     config.v41_engram_table_pad_multiple = int(assets.get("table_pad_multiple", 16))
     config.v41_engram_assets_path = str(assets_path)
     config.v41_source_model_type = source["model_type"]
-    config.v41_validation_crop = True
+    config.v41_validation_crop = not (
+        num_hidden_layers == released_hidden_layers
+        and resolved_routed_experts == released_routed_experts
+        and vision_num_hidden_layers == source["vision_config"]["num_hidden_layers"]
+        and assets["num_embeddings"] == text["engram_num_embeddings"]
+        and not exercise_post_training_indexer
+    )
     vision = source["vision_config"]
     released_vision_layers = int(vision["num_hidden_layers"])
     if vision_num_hidden_layers is not None:

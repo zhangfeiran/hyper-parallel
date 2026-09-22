@@ -177,12 +177,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bucket-base", type=int, default=4096)
     parser.add_argument("--num-hidden-layers", type=int, default=4)
     parser.add_argument("--table-pad-multiple", type=int, default=16)
+    parser.add_argument("--full-model", action="store_true", help="Use released depth and Engram bucket size")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Prepare the requested local assets."""
     args = _parse_args(argv)
+    if args.full_model:
+        source = json.loads((Path(args.model_dir) / "config.json").read_text())["text_config"]
+        args.bucket_base = source["engram_vocab_size"]
+        args.num_hidden_layers = source["num_hidden_layers"]
     prepare_deepseek_v41_assets(
         Path(args.model_dir).expanduser().resolve(),
         Path(args.output).expanduser().resolve(),
@@ -190,6 +195,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         num_hidden_layers=args.num_hidden_layers,
         table_pad_multiple=args.table_pad_multiple,
     )
+    if args.full_model:
+        assets = json.loads(Path(args.output).read_text())
+        if assets["num_embeddings"] != source["engram_num_embeddings"]:
+            raise ValueError("Generated full-model Engram table sizes do not match the released config")
 
 
 if __name__ == "__main__":
