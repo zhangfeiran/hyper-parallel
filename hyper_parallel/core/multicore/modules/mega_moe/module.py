@@ -27,6 +27,9 @@ from typing import Any, Literal
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
+from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
+
 from hyper_parallel.core.multicore import _collective, shmem
 
 from ..module import MulticoreModule
@@ -336,6 +339,7 @@ class MegaMoeExperts(MulticoreModule):
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
+        replica_slots_per_rank: int = 0,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -349,6 +353,7 @@ class MegaMoeExperts(MulticoreModule):
             capacity_growth_factor: Push capacity multiplier on overflow, defaulting to 1.25.
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
+            replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
@@ -369,15 +374,19 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
+        ep_size = _resolve_ep_size(ep_size, ep_group)
+        replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
-            "num_experts": num_experts,
+            "num_experts": replica_config.physical_experts,
+            "logical_num_experts": num_experts,
+            "replica_slots_per_rank": replica_slots_per_rank,
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
-            "ep_size": _resolve_ep_size(ep_size, ep_group),
+            "ep_size": ep_size,
             "ep_group": ep_group,
             "expert_weight_layout": expert_weight_layout,
             "dispatch_mode": dispatch_mode,
@@ -394,6 +403,8 @@ class MegaMoeExperts(MulticoreModule):
             resource_compatibility_key=compatibility_key,
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
+        self.replica_config = replica_config
+        self.replica_slots_per_rank = replica_slots_per_rank
         self._initialize_module_state(specification, create_parameters=create_parameters)
 
     def _initialize_module_state(
@@ -402,7 +413,7 @@ class MegaMoeExperts(MulticoreModule):
         """Bind normalized configuration and initialize expert parameters."""
         self.hidden_size = specification["hidden_size"]
         self.intermediate_size = specification["intermediate_size"]
-        self.num_experts = specification["num_experts"]
+        self.num_experts = self.replica_config.num_experts
         self.top_k = specification["top_k"]
         self.expert_weight_layout = specification["expert_weight_layout"]
         self.initial_capacity_factor = specification["initial_capacity_factor"]
@@ -645,6 +656,14 @@ class MegaMoeExperts(MulticoreModule):
         try:
             # Pull source writes and execution must share one workspace lease.
             with torch.no_grad():
+                replica_route = None
+                if self.replica_slots_per_rank:
+                    replica_route = prepare_replica_route(
+                        topk_ids, self.replica_config, self._ep_group,
+                        target_load=resources.workspace.capacity_floor if not pull else None,
+                    )
+                    topk_ids = replica_route.physical_ids
+                    tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
                 route = prepare_topk_route(
                     hidden_flat,
                     topk_ids,
@@ -652,6 +671,7 @@ class MegaMoeExperts(MulticoreModule):
                     resources.spec,
                     tokens_per_expert,
                     workspace=resources.workspace,
+                    replica_route=replica_route,
                     **route_options,
                 )
             if not pull and not automatic:

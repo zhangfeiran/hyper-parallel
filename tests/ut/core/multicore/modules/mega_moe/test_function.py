@@ -215,7 +215,7 @@ class TestMegaMoeFunction(unittest.TestCase):
     def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True,
                                 vary_tokens: bool = False, replay: bool = False) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
-        spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
+        spec = SimpleNamespace(replica_slots_per_rank=0, hidden_size=4, intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
                                dispatch_mode="push", expert_weight_layout="EIO", auto_tokens=False)
         plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False)
@@ -313,7 +313,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             for tag, capacity in enumerate(capacities, start=1):
                 tokens = (1, 3, 2, 4)[tag - 1] if vary_tokens else 2
                 source = torch.full((tokens if permuted else 4, 4), float(tag), requires_grad=input_grad)
-                route = SimpleNamespace(expert_capacity=capacity, group_list=torch.tensor([0, capacity]))
+                route = SimpleNamespace(replica_route=None, expert_capacity=capacity, group_list=torch.tensor([0, capacity]))
                 for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
                              "combine_src_off", "combine_target_off", "combine_size"):
                     setattr(route, name, torch.zeros(4, dtype=torch.int64))

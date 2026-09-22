@@ -26,6 +26,8 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
+from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
+
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .spec import MegaMoeSpec, _align_capacity
@@ -53,6 +55,7 @@ class RouteMetadata:
     expert_capacity: int
     local_num_tokens: int | None = None
     plan_tokens: int | None = None
+    replica_route: ReplicaRoute | None = None
 
 
 @dataclass(frozen=True)
@@ -346,6 +349,7 @@ def prepare_topk_route(
     spec: MegaMoeSpec,
     tokens_per_expert: torch.Tensor | None,
     workspace: MegaMoeWorkspace | None = None,
+    replica_route: ReplicaRoute | None = None,
     *,
     autograd_mask: int = 0,
     prepare_workspace: Callable[[int, int], None] | None = None,
@@ -379,7 +383,10 @@ def prepare_topk_route(
             permutation_output = workspace.source_buffer
         else:
             workspace.wait_for_reuse()
-    counts_by_source, count_work = _start_count_gather(counts, spec)
+    if replica_route is None:
+        counts_by_source, count_work = _start_count_gather(counts, spec)
+    else:
+        counts_by_source, count_work = replica_route.counts_by_source, None
     if permutation_output is None:
         routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     else:
@@ -392,13 +399,13 @@ def prepare_topk_route(
         tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum_received_slots,
-        metadata=_compute_route_metadata(
+        metadata=replace(_compute_route_metadata(
             counts,
             counts_by_source,
             received_counts,
             spec,
             expert_capacity,
-        ),
+        ), replica_route=replica_route),
     )
 
 
