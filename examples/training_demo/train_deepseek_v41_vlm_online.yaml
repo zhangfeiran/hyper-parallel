@@ -2,6 +2,9 @@
 # This smoke uses one vision block (rather than the released 32) while retaining
 # every released hidden, attention, patch, aligner, vocabulary, and expert size.
 
+# Opt in with --megamoe=true; false retains native VLM expert execution.
+megamoe: false
+
 model:
   _target_: examples.training_demo.cropped_deepseek_v41.build_cropped_deepseek_v41
   config_path: /path/to/DeepSeek-V4.1-Flash

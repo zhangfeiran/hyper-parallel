@@ -1,6 +1,9 @@
 # Four-layer DeepSeek-V4.1 validation crop: Online 4K and EP16.
 # The launcher selects TP1/FSDP16 or TP2/FSDP8 with sequence parallel.
 
+# Opt in with --megamoe=true; the default retains the native EP path.
+megamoe: false
+
 model:
   _target_: examples.training_demo.cropped_deepseek_v41.build_cropped_deepseek_v41
   config_path: /path/to/DeepSeek-V4.1-Flash

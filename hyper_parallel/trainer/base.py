@@ -230,6 +230,13 @@ class BaseTrainer(Stateful, ABC):
 
     def _setup(self):
         """Initialize logging, distributed state, and the local device."""
+        if getattr(self.config, "megamoe", False):
+            # DSV4.1 and multicore dependencies are only needed by the opt-in path.
+            from hyper_parallel.models.deepseek_v41.adapter.expert_parallel import (  # pylint: disable=C0415
+                configure_megamoe,
+            )
+            configure_megamoe(self.config)
+
         # log args
         setup_logging()
 
@@ -311,6 +318,20 @@ class BaseTrainer(Stateful, ABC):
             for model_part in self.model_parts
             if isinstance(model_part, HSDPModule)
         ]
+        self._share_megamoe_resources()
+
+    def _share_megamoe_resources(self) -> None:
+        """Share serial expert workspaces for both text and VLM Trainers."""
+        self._megamoe_experts = []
+        if not getattr(self.config, "megamoe", False):
+            return
+        # Preserve native training without importing the optional multicore component.
+        from hyper_parallel.models.deepseek_v41.adapter.replacements import (  # pylint: disable=C0415
+            DeepseekV41TrainingExperts,
+        )
+        self._megamoe_experts = [module for module in self.model.modules()
+                                if isinstance(module, DeepseekV41TrainingExperts)]
+        DeepseekV41TrainingExperts.share_execution_resources(self._megamoe_experts)
 
     def _build_loss(self) -> None:
         """Build the configured loss module or use the model-output default."""
@@ -470,6 +491,8 @@ class BaseTrainer(Stateful, ABC):
         """Run all registered callbacks at the end of training."""
         for callback in self._callbacks:
             callback.on_train_end(self.state)
+        for module in getattr(self, "_megamoe_experts", ()):
+            module.close()
 
     def on_epoch_begin(self) -> None:
         """Run all registered callbacks at the start of an epoch."""

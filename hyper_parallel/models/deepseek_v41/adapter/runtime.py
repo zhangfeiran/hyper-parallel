@@ -24,6 +24,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedPackedSequence,
 )
+from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.data.batching.runtime_input import (
     RuntimeInputAdapter,
     RuntimeInputContext,
@@ -69,4 +70,12 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
         return runtime_inputs
 
 
-__all__ = ["DeepseekV41Runtime"]
+class DeepseekV41TextBatch(TextParallelBatch):
+    """Build text batches using the V4.1 packed-sequence runtime adapter."""
+
+    def _build_runtime_inputs(self, parallel_batch: Mapping[str, Any]) -> dict[str, Any]:
+        """Preserve compact sample boundaries for shared compressed attention."""
+        return DeepseekV41Runtime().build(batch=parallel_batch, parallel_context=self.parallel_context)
+
+
+__all__ = ["DeepseekV41Runtime", "DeepseekV41TextBatch"]
