@@ -35,6 +35,7 @@ class ReplicaRoute:
     counts_by_source: torch.Tensor
     rank: int
     group: object
+    transport: object | None = None
 
 
 def stable_expert_order(ids: torch.Tensor, num_experts: int) -> torch.Tensor:

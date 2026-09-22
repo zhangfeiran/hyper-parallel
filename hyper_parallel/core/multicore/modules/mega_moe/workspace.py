@@ -42,6 +42,8 @@ from .spec import MegaMoeSpec, initial_receive_capacity
 _GMM_WORKSPACE_BYTES = 512
 _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
+_SYMMETRIC_FIELDS = ("source_buffer", "expert_buffer", "routed_buffer",
+                     "forward_event_counters", "backward_event_counters", "replica_inbox")
 
 
 def _workspace_allocation_specs(
@@ -53,18 +55,31 @@ def _workspace_allocation_specs(
     ep_size: int,
     num_experts: int,
     dtype: torch.dtype,
+    replica_inbox_bytes: int = 0,
 ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
     """Return the single ordered physical Allocation description for a workspace."""
     data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
     data_rows = routed_slots if dispatch_mode == "pull" else receive_capacity
     event_bytes = event_workspace_bytes(ep_size, num_experts)
     allocation_spec = _lifecycle._AllocationSpec  # pylint: disable=protected-access
-    return (
+    allocations = (
         (data_field, allocation_spec((data_rows, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
         ("routed_buffer", allocation_spec((routed_slots, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
         ("forward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
         ("backward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
     )
+    if replica_inbox_bytes:
+        allocations += (("replica_inbox", allocation_spec(
+            (replica_inbox_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),)
+    return allocations
+
+
+def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
+    """Return the FP32 replica inbox payload tracked by SHMEM restart transactions."""
+    budget = specification.get("replica_slots_per_rank", 0)
+    if not budget or specification.get("replica_transport", "p2p") != "shmem":
+        return 0
+    return budget * specification["hidden_size"] * specification["intermediate_size"] * 2 * 4
 
 
 def _spec_workspace_bytes(
@@ -86,6 +101,7 @@ def _spec_workspace_bytes(
         ep_size=specification["ep_size"],
         num_experts=specification["num_experts"],
         dtype=dtype,
+        replica_inbox_bytes=_replica_inbox_bytes(specification),
     )
     return sum(
         spec.dtype.itemsize * math.prod(spec.shape)
@@ -109,6 +125,7 @@ class MegaMoeWorkspace:
     routed_buffer: Any | None = None
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
+    replica_inbox: Any | None = None
     gmm_workspace: Any | None = None
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
@@ -140,6 +157,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
+            replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
         )
         replacement = _lifecycle._AllocationReplacement  # pylint: disable=protected-access
         return tuple(replacement(getattr(self, field_name), target) for field_name, target in targets)
@@ -169,6 +187,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
+            replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
         )
         if len(replacements) != len(expected):
             raise RuntimeError("materialized workspace has an incomplete restart Allocation mapping")
@@ -197,6 +216,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
+            replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
         )
         self.source_buffer = None
         self.expert_buffer = None
@@ -227,6 +247,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
+            replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
         )
         if len(tensors) != len(targets):
             raise RuntimeError("SHMEM restart returned an unexpected Allocation count")
@@ -294,6 +315,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
+            replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
         )
         self.dispatch_mode = spec.dispatch_mode
         self.dtype = dtype
@@ -394,6 +416,7 @@ class MegaMoeWorkspace:
             "routed_buffer",
             "forward_event_counters",
             "backward_event_counters",
+            "replica_inbox",
         ):
             tensor = getattr(self, field_name)
             if tensor is None:

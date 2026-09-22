@@ -227,6 +227,8 @@ class TestMegaMoeFunction(unittest.TestCase):
         plan.bwd_diagnostics = MegaKernelDiagnostics(runtime)
         plan.fwd_runtime_config = plan.bwd_runtime_config = None
         workspace = Mock(
+            replica_inbox=None,
+            in_use=False,
             expert_capacity=128,
             expert_buffer=torch.empty(128, 4),
             routed_buffer=torch.empty(8 if vary_tokens else 4, 4),

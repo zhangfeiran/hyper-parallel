@@ -16,14 +16,18 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
+import struct
 from typing import Any
 
 import torch
 import torch_npu
 
+from hyper_parallel.core.expert_parallel.hot_replica.one_sided import OneSidedReplicaTransport
 from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
 
+from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan, record_plan_stream
@@ -318,6 +322,18 @@ def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
         workspace.release_graph(ctx)
 
 
+def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool = False) -> torch.Tensor:
+    """Append split addresses after profiler preparation, retaining the base ABI."""
+    if pool is None:
+        return base
+    pointers = (0, 0) if not backward else tuple(value.data_ptr() for value in pool.gradients)
+    data = struct.pack("<II5Q", 0x53505754, 2, home, *(value.data_ptr() for value in pool.weights), *pointers)
+    metadata = torch.tensor(list(data), dtype=torch.uint8, device=base.device)
+    result = torch.cat((base, metadata))
+    result.record_stream(torch.npu.current_stream(base.device))
+    return result
+
+
 def _launch_forward_kernel(
     plan: MegaMoePlan,
     metadata: RouteMetadata,
@@ -325,6 +341,7 @@ def _launch_forward_kernel(
     weight1: Any,
     weight2: Any,
     execution: _ForwardExecution,
+    pool: Any = None,
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -354,7 +371,7 @@ def _launch_forward_kernel(
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            plan.fwd_runtime_config,
+            _split_runtime(plan.fwd_runtime_config, pool, weight1.shape[0]),
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -376,7 +393,7 @@ def _launch_forward_kernel(
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            diagnostic_call.runtime_config,
+            _split_runtime(diagnostic_call.runtime_config, pool, weight1.shape[0]),
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
             spec.rank_id,
@@ -392,6 +409,7 @@ def _launch_backward_kernel(
     saved: _SavedBackwardState,
     grad_output: Any,
     execution: _BackwardExecution,
+    pool: Any = None,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -429,7 +447,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            plan.bwd_runtime_config,
+            _split_runtime(plan.bwd_runtime_config, pool, saved.weight1.shape[0], backward=True),
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -454,7 +472,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            diagnostic_call.runtime_config,
+            _split_runtime(diagnostic_call.runtime_config, pool, saved.weight1.shape[0], backward=True),
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
             spec.rank_id,
@@ -519,8 +537,6 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         metadata = route
         ctx.replica_route = route.replica_route
         home_weights = (weight1, weight2)
-        if ctx.replica_route is not None:
-            weight1, weight2 = prefetch_weights(home_weights, ctx.replica_route)
         permutation_inputs = ()
         if permutation is not None:
             routed_tokens, _, unpermute_mapping = permutation
@@ -538,7 +554,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
             workspace.claim()
         execution = None
+        leases = ExitStack()
         try:
+            provider = None if workspace.replica_inbox is None else OneSidedReplicaTransport(
+                shmem, workspace.replica_inbox)
+            pool = None if ctx.replica_route is None else leases.enter_context(
+                prefetch_weights(home_weights, ctx.replica_route, provider=provider))
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
             capacity = metadata.expert_capacity
             execution = _prepare_forward_execution(
@@ -554,6 +575,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 weight1,
                 weight2,
                 execution,
+                pool,
             )
             output = execution.combine[:ctx.source_rows].clone()
             if spec.dispatch_mode == "pull":
@@ -582,6 +604,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             )
             return output
         finally:
+            leases.close()
             if not workspace_claimed:
                 workspace.release()
 
@@ -603,13 +626,16 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         saved_tensors = ctx.saved_tensors
         ctx.maybe_clear_saved_tensors()
         saved = _saved_backward_state(saved_tensors)
-        if ctx.replica_route is not None:
-            weight1, weight2 = prefetch_weights((saved.weight1, saved.weight2), ctx.replica_route)
-            saved = replace(saved, weight1=weight1, weight2=weight2)
         permutation_inputs = saved_tensors[12:]
         del saved_tensors
         workspace.claim()
+        execution = None
+        leases = ExitStack()
         try:
+            provider = None if workspace.replica_inbox is None else OneSidedReplicaTransport(
+                shmem, workspace.replica_inbox)
+            pool = None if ctx.replica_route is None else leases.enter_context(
+                prefetch_weights((saved.weight1, saved.weight2), ctx.replica_route, backward=True, provider=provider))
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
             permutation_inputs = permutation_inputs[:1]
             execution = _prepare_backward_execution(
@@ -623,11 +649,13 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 saved,
                 source,
                 execution,
+                pool,
             )
             grad_weight1 = execution.intermediates.grad_weight1
             grad_weight2 = execution.intermediates.grad_weight2
             if ctx.replica_route is not None:
-                grad_weight1, grad_weight2 = return_gradients((grad_weight1, grad_weight2), ctx.replica_route)
+                grad_weight1, grad_weight2 = return_gradients(
+                    (grad_weight1, grad_weight2), ctx.replica_route, pool.gradients, provider)
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
             execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
@@ -655,6 +683,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None,
             )
         finally:
+            leases.close()
             workspace.release()
 
 

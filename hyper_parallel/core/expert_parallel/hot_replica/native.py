@@ -45,7 +45,8 @@ def _gmm(inputs: torch.Tensor, weights: torch.Tensor, groups: torch.Tensor) -> t
     )[0]
 
 
-def _weight_gradient(inputs: torch.Tensor, gradients: torch.Tensor, route: ReplicaRoute) -> torch.Tensor:
+def _weight_gradient(inputs: torch.Tensor, gradients: torch.Tensor, route: ReplicaRoute,
+                     home: torch.Tensor, guest: torch.Tensor) -> None:
     """Compute FP32 expert partials on native kernels that lack mixed-output GMM.
 
     CANN's non-quantized grouped-matmul contract ties output dtype to the input
@@ -55,14 +56,30 @@ def _weight_gradient(inputs: torch.Tensor, gradients: torch.Tensor, route: Repli
     width = route.plan.config.slots_per_rank
     begin = route.rank * width
     counts = [sum(row[begin + slot] for row in route.plan.dispatch_counts) for slot in range(width)]
-    result = torch.zeros((width, inputs.shape[1], gradients.shape[1]), dtype=torch.float32, device=inputs.device)
     inputs, gradients = inputs.float(), gradients.float()
     offset = 0
     for slot, count in enumerate(counts):
         if count:
-            torch.mm(inputs[offset:offset + count].T, gradients[offset:offset + count], out=result[slot])
+            output = home[slot] if slot < home.shape[0] else guest[slot - home.shape[0]]
+            torch.mm(inputs[offset:offset + count].T, gradients[offset:offset + count], out=output)
         offset += count
-    return result
+
+
+def _split_gmm(inputs: torch.Tensor, home: torch.Tensor, guest: torch.Tensor,
+               groups: torch.Tensor, route: ReplicaRoute, *, transpose: bool = False) -> torch.Tensor:
+    """Run home and guest segments without concatenating expert matrices."""
+    width = route.plan.config.slots_per_rank
+    start = route.rank * width
+    count = route.plan.config.home_experts
+    home_rows = sum(sum(row[start:start + count]) for row in route.plan.dispatch_counts)
+    if transpose:
+        home, guest = home.transpose(-1, -2), guest.transpose(-1, -2)
+    parts = []
+    if home_rows:
+        parts.append(_gmm(inputs[:home_rows], home, groups[:count]))
+    if inputs.shape[0] > home_rows:
+        parts.append(_gmm(inputs[home_rows:], guest, groups[count:] - home_rows))
+    return torch.cat(parts) if len(parts) > 1 else parts[0]
 
 
 class _NativeReplicaExperts(torch.autograd.Function):
@@ -72,16 +89,16 @@ class _NativeReplicaExperts(torch.autograd.Function):
     def forward(ctx: Any, inputs: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor,
                 counts: torch.Tensor, route: ReplicaRoute) -> torch.Tensor:
         """Prefetch this invocation's weights and execute native grouped SwiGLU."""
-        physical1, physical2 = prefetch_weights((weight1, weight2), route)
         groups = counts.to(torch.int64).cumsum(0)
-        if inputs.shape[0]:
-            up = _gmm(inputs, physical1, groups)
-            activation = _npu_ops().npu_swiglu(up)
-            output = _gmm(activation, physical2, groups)
-        else:
-            up = inputs.new_empty((0, weight1.shape[-1]))
-            activation = inputs.new_empty((0, weight2.shape[1]))
-            output = inputs.clone()
+        with prefetch_weights((weight1, weight2), route) as pool:
+            if inputs.shape[0]:
+                up = _split_gmm(inputs, weight1, pool.weights[0], groups, route)
+                activation = _npu_ops().npu_swiglu(up)
+                output = _split_gmm(activation, weight2, pool.weights[1], groups, route)
+            else:
+                up = inputs.new_empty((0, weight1.shape[-1]))
+                activation = inputs.new_empty((0, weight2.shape[1]))
+                output = inputs.clone()
         ctx.route = route
         ctx.save_for_backward(inputs, weight1, weight2, groups, up, activation)
         return output
@@ -90,19 +107,20 @@ class _NativeReplicaExperts(torch.autograd.Function):
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
         """Re-prefetch without retaining guest snapshots and sum FP32 partials."""
         inputs, weight1, weight2, groups, up, activation = ctx.saved_tensors
-        physical1, physical2 = prefetch_weights((weight1, weight2), ctx.route)
-        if inputs.shape[0]:
-            grad_output = grad_output.contiguous()
-            grad_activation = _gmm(grad_output, physical2.transpose(-1, -2), groups)
-            grad_up = _npu_ops().npu_swiglu_backward(grad_activation, up)
-            grad_input = _gmm(grad_up, physical1.transpose(-1, -2), groups)
-            grad1 = _weight_gradient(inputs, grad_up, ctx.route)
-            grad2 = _weight_gradient(activation, grad_output, ctx.route)
-        else:
-            grad_input = grad_output.clone()
-            grad1 = torch.zeros_like(physical1, dtype=torch.float32)
-            grad2 = torch.zeros_like(physical2, dtype=torch.float32)
-        grad1, grad2 = return_gradients((grad1, grad2), ctx.route)
+        route = ctx.route
+        with prefetch_weights((weight1, weight2), route, backward=True) as pool:
+            grad1 = torch.zeros_like(weight1, dtype=torch.float32)
+            grad2 = torch.zeros_like(weight2, dtype=torch.float32)
+            if inputs.shape[0]:
+                grad_output = grad_output.contiguous()
+                grad_activation = _split_gmm(grad_output, weight2, pool.weights[1], groups, route, transpose=True)
+                grad_up = _npu_ops().npu_swiglu_backward(grad_activation, up)
+                grad_input = _split_gmm(grad_up, weight1, pool.weights[0], groups, route, transpose=True)
+                _weight_gradient(inputs, grad_up, route, grad1, pool.gradients[0])
+                _weight_gradient(activation, grad_output, route, grad2, pool.gradients[1])
+            else:
+                grad_input = grad_output.clone()
+            grad1, grad2 = return_gradients((grad1, grad2), route, pool.gradients)
         return grad_input, grad1, grad2, None, None
 
 
@@ -126,7 +144,7 @@ class NativeReplicaDispatch:
 
 
 def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
-                             group: object) -> tuple[tuple, NativeReplicaDispatch]:
+                             group: object, transport: object = None) -> tuple[tuple, NativeReplicaDispatch]:
     """Dispatch existing native expert-major inputs through shared replicas."""
     values, counts = inputs[:2]
     rank = dist.get_rank(group)
@@ -152,7 +170,8 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
     recv_counts = torch.tensor(received, dtype=torch.int64, device=values.device)
     recv_order = stable_expert_order(torch.repeat_interleave(
         recv_ids, recv_counts.flatten(), output_size=sum(recv_splits)), width)
-    route = ReplicaRoute(plan, physical_ids, torch.tensor(plan.dispatch_counts, device=values.device), rank, group)
+    route = ReplicaRoute(
+        plan, physical_ids, torch.tensor(plan.dispatch_counts, device=values.device), rank, group, transport)
     state = NativeReplicaDispatch(route, send_splits, recv_splits, send_order, recv_order)
     routed = differentiable_all_to_all_single(values[send_order], send_splits, recv_splits, group)[recv_order]
     result = (routed, recv_counts.sum(0))
