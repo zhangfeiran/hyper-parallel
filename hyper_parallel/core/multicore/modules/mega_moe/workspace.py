@@ -32,7 +32,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
     mega_moe_event_capacity,
 )
 
-from .spec import MegaMoeSpec, _resolve_receive_capacity
+from .spec import MegaMoeSpec, initial_receive_capacity
 
 # The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
 # tensor arguments. Keep non-empty ABI placeholders; native tiling reserves
@@ -56,11 +56,7 @@ def _spec_workspace_bytes(
     """Return planned symmetric bytes for one execution-resource group."""
     local_tokens = specification["local_num_tokens"]
     routed_slots = local_tokens * specification["top_k"]
-    capacity = _resolve_receive_capacity(
-        specification["initial_capacity_factor"],
-        routed_slots,
-        specification["ep_size"],
-    )
+    capacity = initial_receive_capacity(specification)
     if receive_capacity is not None:
         capacity = receive_capacity
     if specification.get("dispatch_mode", "push") == "pull":

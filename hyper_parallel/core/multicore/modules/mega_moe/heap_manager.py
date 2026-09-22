@@ -31,7 +31,7 @@ import torch.distributed as dist
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.shmem import _lifecycle
 
-from .spec import _align_capacity, _resolve_receive_capacity
+from .spec import _align_capacity, initial_receive_capacity
 from .workspace import _HEAP_GRANULARITY_BYTES, _round_up, _spec_workspace_bytes, configure_symmetric_heap
 
 _MANAGER = None
@@ -97,8 +97,7 @@ class MegaMoeHeapManager:
     def _reserve(self, specifications: tuple[Any, ...]) -> None:
         for item in specifications:
             if not any(entry.specification is item for entry in self.entries):
-                capacity = _resolve_receive_capacity(item["initial_capacity_factor"],
-                                                     item["local_num_tokens"] * item["top_k"], item["ep_size"])
+                capacity = initial_receive_capacity(item)
                 self.entries.append(_Entry(item, capacity))
 
     def reserve(self, specifications: tuple[Any, ...]) -> None:
@@ -168,6 +167,9 @@ class MegaMoeHeapManager:
             resource: Managed owner about to launch its forward.
             maximum_received_slots: Maximum destination load from the existing root count exchange.
         """
+        upper = resource.spec.maximum_receive_capacity
+        if maximum_received_slots > upper:
+            raise ValueError("MegaMoe route exceeds the lossless token bound")
         if maximum_received_slots <= resource.workspace.capacity_floor:
             return
         with self.access():
@@ -177,9 +179,6 @@ class MegaMoeHeapManager:
             if maximum_received_slots <= current:
                 return
             spec = resource.spec
-            upper = _align_capacity(spec.ep_size * spec.routed_slots)
-            if maximum_received_slots > upper:
-                raise ValueError("MegaMoe route exceeds the lossless token bound")
             requested = max(maximum_received_slots, math.ceil(min(upper, current * spec.capacity_growth_factor)))
             capacities[index] = min(upper, _align_capacity(requested))
             required = self._required_bytes(capacities)

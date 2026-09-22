@@ -26,6 +26,9 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
+from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
+
 from hyper_parallel.core.multicore import shmem
 
 from ..module import MulticoreModule
@@ -158,6 +161,7 @@ class MegaMoeExperts(MulticoreModule):
         dispatch_mode: str = "push",
         initial_capacity_factor: float | None = None,
         capacity_growth_factor: float | None = None,
+        replica_slots_per_rank: int = 0,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -176,6 +180,7 @@ class MegaMoeExperts(MulticoreModule):
             capacity_growth_factor: Push capacity multiplier on overflow, defaulting to 1.25.
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
+            replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
@@ -198,11 +203,14 @@ class MegaMoeExperts(MulticoreModule):
         )
         if swiglu_limit is not None:
             swiglu_limit = float(swiglu_limit)
+        replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         specification = {
             "local_num_tokens": local_num_tokens,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
-            "num_experts": num_experts,
+            "num_experts": replica_config.physical_experts,
+            "logical_num_experts": num_experts,
+            "replica_slots_per_rank": replica_slots_per_rank,
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
@@ -223,12 +231,15 @@ class MegaMoeExperts(MulticoreModule):
             id(ep_group),
             dispatch_mode,
             capacity_growth_factor,
+            replica_slots_per_rank,
         )
         super().__init__(
             resource_specification=specification,
             resource_compatibility_key=compatibility_key,
             resource_scope_key=("mega_moe", root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
+        self.replica_config = replica_config
+        self.replica_slots_per_rank = replica_slots_per_rank
         self.local_num_tokens = local_num_tokens
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -408,6 +419,14 @@ class MegaMoeExperts(MulticoreModule):
             # Pull writes its permutation into SHMEM, so its lease must cover
             # route preparation as well as execution and output restoration.
             with torch.no_grad():
+                replica_route = None
+                if self.replica_slots_per_rank:
+                    replica_route = prepare_replica_route(
+                        topk_ids, self.replica_config, self._ep_group,
+                        target_load=resources.workspace.capacity_floor if not pull else None,
+                    )
+                    topk_ids = replica_route.physical_ids
+                    tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
                 route = prepare_topk_route(
                     hidden_flat,
                     topk_ids,
@@ -415,6 +434,7 @@ class MegaMoeExperts(MulticoreModule):
                     resources.spec,
                     tokens_per_expert,
                     workspace=resources.workspace,
+                    replica_route=replica_route,
                 )
             if not pull:
                 resources.heap_manager.ensure_capacity(resources, route.maximum_received_slots)

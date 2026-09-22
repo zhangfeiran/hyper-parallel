@@ -44,6 +44,11 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 from torch.nn import Module
 
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
+from hyper_parallel.core.expert_parallel.hot_replica.native import (
+    dispatch_native_replicas, combine_native_replicas,
+)
+
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
     distribute_module,
@@ -1091,10 +1096,12 @@ class ExpertParallel(BaseExpertParallel):
         >>> sharded_experts = ep_style.apply(experts_module, ep_device_mesh)
     """
 
-    def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False) -> None:
+    def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False,
+                 *, replica_slots_per_rank: int = 0) -> None:
         """Initialize ExpertParallel.
 
         Args:
+            replica_slots_per_rank: Extra execution slots per EP rank; zero disables hot replication.
             token_dispatcher: Token dispatch strategy. Supported values are
                 ``"all_to_all"`` and ``"deredundency"``.
             async_combine: If ``True``, use asynchronous combine all-to-all
@@ -1103,6 +1110,10 @@ class ExpertParallel(BaseExpertParallel):
         if isinstance(token_dispatcher, bool):
             async_combine = token_dispatcher
             token_dispatcher = "all_to_all"
+        ExpertReplicaConfig(1, 1, replica_slots_per_rank)
+        if replica_slots_per_rank and (token_dispatcher != "all_to_all" or async_combine):
+            raise ValueError("hot replicas require synchronous all_to_all token dispatch")
+        self.replica_slots_per_rank = replica_slots_per_rank
         self._dispatch_ctx: Optional[DispatchContext] = None
         self.async_combine = async_combine
         self._token_dispatcher_name = token_dispatcher
@@ -1129,6 +1140,13 @@ class ExpertParallel(BaseExpertParallel):
         # Delegate to the configured dispatcher (all_to_all or deredundency).
         # Hard-coding AllToAllTokenDispatcher here would mismatch _token_combine
         # (which uses self._token_dispatcher) and break deredundency.
+        # Dispatch state belongs to the module, matching the existing EP hook contract.
+        # pylint: disable=W0212
+        if self.replica_slots_per_rank:
+            config = ExpertReplicaConfig(inputs[1].numel(), device_mesh.size(), self.replica_slots_per_rank)
+            routed, state = dispatch_native_replicas(inputs, config, device_mesh.get_group())
+            module._hot_replica_dispatch = state
+            return routed
         dispatch_result = self._token_dispatcher.dispatch(module, inputs, device_mesh)
         ctx = dispatch_result[-1]
         # Store context in module attribute for _token_combine to read.
@@ -1168,6 +1186,8 @@ class ExpertParallel(BaseExpertParallel):
         """
         # Read dispatch context from module attribute set by _token_dispatch.
         # pylint: disable=W0212
+        if self.replica_slots_per_rank:
+            return combine_native_replicas(routed_output, module._hot_replica_dispatch)
         ctx = getattr(module, "_ep_dispatch_ctx", None)
         if ctx is None:
             raise RuntimeError(

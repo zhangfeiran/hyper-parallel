@@ -55,6 +55,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                     "hidden_size": 16,
                     "intermediate_size": 8,
                     "num_experts": 4,
+                    "logical_num_experts": 4,
+                    "replica_slots_per_rank": 0,
                     "top_k": 2,
                     "initial_capacity_factor": 1.25,
                     "swiglu_limit": None,
@@ -247,7 +249,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         torch.testing.assert_close(hidden_flat, hidden_states.reshape(128, 16))
         mock_prepare.assert_called_once_with(
             hidden_flat, topk_ids, topk_weights, resources.spec, tokens_per_expert,
-            workspace=resources.workspace,
+            workspace=resources.workspace, replica_route=None,
         )
         resources.heap_manager.ensure_capacity.assert_called_once_with(resources, 512)
         mock_execute.assert_called_once_with(

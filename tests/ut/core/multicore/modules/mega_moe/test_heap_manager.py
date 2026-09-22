@@ -34,7 +34,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                               "intermediate_size": 1792, "num_experts": 48, "ep_size": 8,
                               "initial_capacity_factor": 1.0, "dispatch_mode": "push", "capacity_growth_factor": 1.5}
         self.spec = SimpleNamespace(**self.specification, ep_group=None, rank_id=0, routed_slots=32768,
-                                    receive_capacity=32768)
+                                    receive_capacity=32768, maximum_receive_capacity=262144)
         self.addCleanup(patch.stopall)
         patch.object(manager_module._lifecycle, "_shutdown_failed", False).start()
         patch.dict(manager_module.os.environ, {}, clear=True).start()
@@ -60,6 +60,23 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 with self.subTest(received=received):
                     self.manager.ensure_capacity(self.resource, received)
                     rebuild.assert_called_with([capacity], heap_mib * 1024**2)
+
+    def test_replica_bound_precedes_capacity_fast_path(self) -> None:
+        """Reject impossible plans even if a previously allocated buffer is larger."""
+        self.spec.maximum_receive_capacity = 32768
+        self.resource.workspace.capacity_floor = 65536
+        with patch.object(self.manager, "_rebuild") as rebuild:
+            with self.assertRaisesRegex(ValueError, "lossless token bound"):
+                self.manager.ensure_capacity(self.resource, 32769)
+            rebuild.assert_not_called()
+
+    def test_replica_growth_clamps_geometric_headroom(self) -> None:
+        """Retain growth while capping a large multiplier at the planner bound."""
+        self.spec.maximum_receive_capacity = 40960
+        self.spec.capacity_growth_factor = 10.0
+        with patch.object(self.manager, "_rebuild") as rebuild:
+            self.manager.ensure_capacity(self.resource, 40000)
+            self.assertEqual(rebuild.call_args.args[0], [40960])
 
     def test_configurable_growth_multiplier(self) -> None:
         """Honor minimal growth, custom headroom and the lossless bound even for huge factors."""
