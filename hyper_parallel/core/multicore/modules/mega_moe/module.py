@@ -162,6 +162,7 @@ class MegaMoeExperts(MulticoreModule):
         initial_capacity_factor: float | None = None,
         capacity_growth_factor: float | None = None,
         replica_slots_per_rank: int = 0,
+        replica_transport: str = "p2p",
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -181,6 +182,7 @@ class MegaMoeExperts(MulticoreModule):
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
             replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
+            replica_transport: "p2p" or opt-in "shmem" one-sided weight/gradient copies.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
@@ -203,6 +205,8 @@ class MegaMoeExperts(MulticoreModule):
         )
         if swiglu_limit is not None:
             swiglu_limit = float(swiglu_limit)
+        if replica_transport not in ("p2p", "shmem"):
+            raise ValueError("replica_transport must be p2p or shmem")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         specification = {
             "local_num_tokens": local_num_tokens,
@@ -211,6 +215,7 @@ class MegaMoeExperts(MulticoreModule):
             "num_experts": replica_config.physical_experts,
             "logical_num_experts": num_experts,
             "replica_slots_per_rank": replica_slots_per_rank,
+            "replica_transport": replica_transport,
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
@@ -232,6 +237,7 @@ class MegaMoeExperts(MulticoreModule):
             dispatch_mode,
             capacity_growth_factor,
             replica_slots_per_rank,
+            replica_transport,
         )
         super().__init__(
             resource_specification=specification,

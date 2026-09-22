@@ -138,9 +138,18 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
                 by_expert[expert].append([rank * width + slot, row[expert]])
     dispatch = [[0] * config.physical_experts for _ in counts]
     for expert, quotas in enumerate(by_expert):
+        pending_by_source = [row[expert] for row in counts]
+        # Local source rows and destination quotas are independent per rank;
+        # saturating their intersections minimizes remote rows for this placement.
+        for quota in quotas:
+            physical, remaining = quota
+            source = physical // width
+            local = min(pending_by_source[source], remaining)
+            dispatch[source][physical] = local
+            pending_by_source[source] -= local
+            quota[1] -= local
         index = 0
-        for source, row in enumerate(counts):
-            pending = row[expert]
+        for source, pending in enumerate(pending_by_source):
             while pending:
                 while quotas[index][1] == 0:
                     index += 1

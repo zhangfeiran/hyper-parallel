@@ -57,6 +57,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                     "num_experts": 4,
                     "logical_num_experts": 4,
                     "replica_slots_per_rank": 0,
+                    "replica_transport": "p2p",
                     "top_k": 2,
                     "initial_capacity_factor": 1.25,
                     "swiglu_limit": None,

@@ -55,6 +55,8 @@ per receiver. It retains floor(b*m/H) rows from each balanced transfer of m rows
 using its largest b expert segments. It then uses remaining guest slots and
 existing replicas for further moves that decrease overload. Per-source,
 per-logical-expert counts are conserved exactly; no rows are dropped.
+For each fixed placement, source-rank affinity fills local quotas first, reaching
+the maximum possible local row count before assigning remaining remote traffic.
 
 For 0 < b < H, a conservative bound is:
 
@@ -77,8 +79,31 @@ scratch.
 
 Only selected owner-to-guest weight slices travel through HCCL P2P. Transfer order
 is deterministic and every asynchronous handle is waited before consumption.
-Weights use ordinary allocations, so push heap rebuilds do not invalidate guest
-storage or require unmanaged SHMEM allocations.
+The group shares a persistent B-slot pool per device, dtype and matrix layout.
+The pool borrows home matrices and stores only guest weights and FP32 guest dW.
+Exclusive leases and completion events order reuse across streams; different
+layers can share storage without retaining their parameters in the pool. Native
+runs separate home and guest GMM segments. Multicore uses a versioned address
+extension to select home/guest matrices and gradient outputs. B=0 keeps the dense
+kernel ABI. Rebuild the multicore native payload from this revision before
+using split weights. Native's existing W1/W3 packing is still required.
+
+Ordinary guest allocations survive push heap replacement. Set
+`MegaMoeExperts(..., replica_transport="shmem")` to opt into one-sided weight puts
+and owner-side FP32 gradient gets. A symmetric B-slot inbox is included in heap
+accounting, collective allocation/free, and growth preflight. Each invocation
+binds the current inbox after a rebuild. No remote FP32 atomic fan-in is used.
+This implementation uses blocking publication/consumption barriers and an extra
+staging copy. P2P remains the default; RMA is not assumed to be faster.
+
+Native can inject `ExpertParallel(..., replica_transport=provider)`. The shared
+[`OneSidedReplicaTransport`](one_sided.py) requires an externally leased symmetric
+uint8 inbox and a runtime exposing `put`, `get`, and `host_barrier`. Runtime PE
+numbering must match the EP group's local rank numbering. The inbox must hold
+`B * max(expert_matrix_numel) * 4` bytes and remain exclusively owned until the
+call returns. The caller owns initialization, heap budget and teardown. Native
+and the shared provider do not import multicore; the NPU tests explicitly inject
+multicore's SHMEM runtime to validate this optional provider.
 
 Each autograd invocation saves its immutable route and original owner weights.
 Backward re-prefetches that route, allowing other forwards to run before it.
@@ -98,12 +123,15 @@ sorting. The current planner still runs on the host after the count exchange.
 
 ## Current implementation limits
 
-The eager executor materializes a dense H+B weight tensor and re-prefetches for
-backward. It does not yet implement segmented home/guest kernel pointers, a shared
-persistent B-slot weight pool, or one-sided RMA transport. These require separate
-lifetime and performance validation; the present P2P allocations safely coexist
-with dynamic push growth. Multi-node operation, expert TP, graph capture and FSDP
+The planner still performs one host readback after count exchange. Device-side
+planning, transport/compute overlap and signal-based asynchronous RMA consumption
+remain future work. Multi-node operation, expert TP, graph capture and FSDP
 composition need dedicated system tests before being advertised as supported.
+Pool leases reject overlapping host submissions rather than allocating extra B
+slots. Native parameter packing and per-expert FP32 dW matmuls remain costs to
+measure. RMA additionally reserves a B-slot FP32 symmetric inbox per execution
+resource group; share execution resources across compatible multicore layers to
+share this inbox as well.
 
 No end-to-end speedup or peak-HBM reduction is claimed by precision validation.
 
@@ -113,9 +141,11 @@ CPU planner/capacity tests are in
 [`test_hot_replica.py`](../../../../tests/ut/core/expert_parallel/test_hot_replica.py).
 Distributed native/push/pull launchers are in
 [`test_hot_replica.py`](../../../../tests/torch/expert_parallel/test_hot_replica.py).
-The worker additionally accepts `--backend`, `--budget`, and `--result-dir` for
+The worker additionally accepts `--backend`, `--budget`, `--replica-transport`, and `--result-dir` for
 controlled fresh-process validation. Tests compare outputs, input/router/weight
 gradients, SGD updates and momentum, and reversed backward of live distinct plans.
+Small shapes also exercise independent layers sharing the guest pool, with
+different weights and reversed backward.
 
 The worker can select production dimensions with `--tokens`, `--hidden`,
 `--intermediate`, and `--top-k`. `--same-backend-reference` compares multicore

@@ -36,7 +36,7 @@ from .workspace import _HEAP_GRANULARITY_BYTES, _round_up, _spec_workspace_bytes
 
 _MANAGER = None
 _SYMMETRIC_FIELDS = ("source_buffer", "expert_buffer", "routed_buffer",
-                     "forward_event_counters", "backward_event_counters")
+                     "forward_event_counters", "backward_event_counters", "replica_inbox")
 
 
 def root_members(group: Any) -> tuple[int, ...]:

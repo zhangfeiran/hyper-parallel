@@ -54,6 +54,7 @@ class MegaMoeSpec:
     swiglu_limit: float | None = None
     replica_slots_per_rank: int = 0
     logical_num_experts: int = 0
+    replica_transport: str = "p2p"
 
     @property
     def local_experts(self) -> int:
@@ -204,6 +205,7 @@ def bind_mega_moe_spec(
         num_experts=specification["num_experts"],
         logical_num_experts=specification.get("logical_num_experts", specification["num_experts"]),
         replica_slots_per_rank=specification.get("replica_slots_per_rank", 0),
+        replica_transport=specification.get("replica_transport", "p2p"),
         top_k=top_k,
         initial_capacity_factor=initial_capacity_factor,
         receive_capacity=receive_capacity,

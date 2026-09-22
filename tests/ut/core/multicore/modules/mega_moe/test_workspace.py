@@ -110,10 +110,20 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                     with self.assertRaises(error):
                         workspace_module.configure_symmetric_heap((spec,), reference)
 
+    def test_replica_inbox_is_part_of_heap_budget(self) -> None:
+        """RMA adds only the B-slot FP32 inbox and its allocation alignment."""
+        specification = {"local_num_tokens": 128, "top_k": 2, "hidden_size": 5120,
+                         "intermediate_size": 1792, "num_experts": 28, "ep_size": 4,
+                         "logical_num_experts": 24, "replica_slots_per_rank": 1, "initial_capacity_factor": 1.0}
+        before = workspace_module._spec_workspace_bytes(specification, 2)
+        specification["replica_transport"] = "shmem"
+        after = workspace_module._spec_workspace_bytes(specification, 2)
+        self.assertEqual(after - before, 5120 * 1792 * 2 * 4 + 511)
+
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Retain expanded event storage when allocating through the SHMEM API."""
         spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
-                               ep_size=64, num_experts=1024, dispatch_mode="push")
+                               ep_size=64, num_experts=1024, dispatch_mode="push", replica_slots_per_rank=0)
         workspace = MegaMoeWorkspace(shared=True)
         with (
             patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
