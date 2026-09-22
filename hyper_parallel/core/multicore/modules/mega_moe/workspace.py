@@ -41,7 +41,7 @@ _GMM_WORKSPACE_BYTES = 512
 _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
 _SYMMETRIC_FIELDS = ("source_buffer", "expert_buffer", "routed_buffer",
-                     "forward_event_counters", "backward_event_counters")
+                     "forward_event_counters", "backward_event_counters", "replica_inbox")
 
 
 def _spec_workspace_bytes(
@@ -59,7 +59,16 @@ def _spec_workspace_bytes(
         (capacity + routed_slots) * specification["hidden_size"] * element_size
     )
     event_bytes = event_workspace_bytes(specification["ep_size"], specification["num_experts"])
-    return tensor_bytes + 2 * event_bytes + 4 * (_WORKSPACE_ALIGNMENT - 1)
+    replica_bytes = _replica_inbox_bytes(specification)
+    return tensor_bytes + 2 * event_bytes + 4 * (_WORKSPACE_ALIGNMENT - 1) + replica_bytes
+
+
+def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
+    """Reserve one B-slot FP32 inbox, including symmetric alignment padding."""
+    budget = specification.get("replica_slots_per_rank", 0)
+    if not budget or specification.get("replica_transport", "p2p") != "shmem":
+        return 0
+    return budget * specification["hidden_size"] * specification["intermediate_size"] * 2 * 4 + _WORKSPACE_ALIGNMENT - 1
 
 
 @dataclass
@@ -77,6 +86,7 @@ class MegaMoeWorkspace:
     routed_buffer: Any | None = None
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
+    replica_inbox: Any | None = None
     gmm_workspace: Any | None = None
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
@@ -177,6 +187,9 @@ class MegaMoeWorkspace:
                 dtype=torch.uint8,
                 alignment=_WORKSPACE_ALIGNMENT,
             )
+            if spec.replica_slots_per_rank and spec.replica_transport == "shmem":
+                size = spec.replica_slots_per_rank * spec.hidden_size * spec.intermediate_size * 2 * 4
+                self.replica_inbox = shmem.empty((size,), dtype=torch.uint8, alignment=_WORKSPACE_ALIGNMENT)
             self.gmm_workspace = torch.empty(
                 (_GMM_WORKSPACE_BYTES,),
                 dtype=torch.uint8,
@@ -258,6 +271,7 @@ class MegaMoeWorkspace:
             "routed_buffer",
             "forward_event_counters",
             "backward_event_counters",
+            "replica_inbox",
         ):
             tensor = getattr(self, field_name)
             if tensor is None:

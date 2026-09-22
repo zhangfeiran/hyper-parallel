@@ -63,6 +63,21 @@ class KernelWorkerBase {
     if (!isRuntimeStorageValid(runtimeConfigPtr, runtime_bytes, event_bytes, ep_size, local_experts)) {
       AscendC::Trap();
     }
+    const uint64_t base_bytes = getAtomicAddValuesOffset(runtimeConfigPtr) + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
+    if (runtime_bytes != base_bytes) {
+      if (runtime_bytes != base_bytes + 48) {
+        AscendC::Trap();
+      }
+      __gm__ uint64_t *extension = reinterpret_cast<__gm__ uint64_t *>(runtimeConfigPtr + base_bytes);
+      // Split-weight ABI v2: magic/version, home count, then W1/W2/dW1/dW2 guest addresses.
+      if (extension[0] != 0x0000000253505754ULL || extension[1] == 0 || extension[1] >= local_experts) {
+        AscendC::Trap();
+      }
+      home_experts_ = extension[1];
+      for (uint32_t index = 0; index < 4; ++index) {
+        replica_matrix_bases_[index] = reinterpret_cast<GM_ADDR>(extension[index + 2]);
+      }
+    }
     this->runtime_task_capacity = getRuntimeTaskCapacity(runtimeConfigPtr);
     this->runtime_event_capacity = getRuntimeEventCapacity(runtimeConfigPtr);
 #ifdef __DAV_C220_CUBE__
@@ -107,6 +122,17 @@ class KernelWorkerBase {
   }
 
  protected:
+  __aicore__ inline GM_ADDR GetExpertMatrix(
+      uint32_t position, int64_t expert, int64_t matrix_bytes, uint32_t replica_index) const {
+    if (expert >= home_experts_) {
+      return replica_matrix_bases_[replica_index] + (expert - home_experts_) * matrix_bytes;
+    }
+    return input_list[position] + expert * matrix_bytes;
+  }
+
+  int64_t home_experts_ = 0;
+  GM_ADDR replica_matrix_bases_[4] = {};
+
   __aicore__ inline void ProcessFast() {
 #ifdef __DAV_C220_CUBE__
     uint32_t block_idx = this->worker_id_;
