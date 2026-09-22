@@ -25,6 +25,10 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.core.expert_parallel.hot_replica.one_sided import OneSidedReplicaTransport
+from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
+    SignalReplicaTransport, signal_storage_bytes,
+)
 from hyper_parallel.core.multicore import _automatic, shmem
 from hyper_parallel.core.multicore.scheduler.config import (
     MIN_EVENT_CAPACITY,
@@ -64,11 +68,18 @@ def _spec_workspace_bytes(
 
 
 def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
-    """Reserve one B-slot FP32 inbox, including symmetric alignment padding."""
+    """Reserve bounded replica storage, including symmetric alignment padding."""
     budget = specification.get("replica_slots_per_rank", 0)
-    if not budget or specification.get("replica_transport", "p2p") != "shmem":
+    mode = specification.get("replica_transport", "p2p")
+    if not budget or mode == "p2p":
         return 0
-    return budget * specification["hidden_size"] * specification["intermediate_size"] * 2 * 4 + _WORKSPACE_ALIGNMENT - 1
+    hidden, intermediate = specification["hidden_size"], specification["intermediate_size"]
+    if mode == "shmem_signal":
+        size = signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)), budget,
+                                    specification["ep_size"], 2)
+    else:
+        size = budget * hidden * intermediate * 2 * 4
+    return size + _WORKSPACE_ALIGNMENT - 1
 
 
 @dataclass
@@ -87,6 +98,7 @@ class MegaMoeWorkspace:
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
     replica_inbox: Any | None = None
+    replica_provider: Any | None = None
     gmm_workspace: Any | None = None
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
@@ -187,9 +199,8 @@ class MegaMoeWorkspace:
                 dtype=torch.uint8,
                 alignment=_WORKSPACE_ALIGNMENT,
             )
-            if spec.replica_slots_per_rank and spec.replica_transport == "shmem":
-                size = spec.replica_slots_per_rank * spec.hidden_size * spec.intermediate_size * 2 * 4
-                self.replica_inbox = shmem.empty((size,), dtype=torch.uint8, alignment=_WORKSPACE_ALIGNMENT)
+            if spec.replica_slots_per_rank and spec.replica_transport != "p2p":
+                self._allocate_replica_storage(spec)
             self.gmm_workspace = torch.empty(
                 (_GMM_WORKSPACE_BYTES,),
                 dtype=torch.uint8,
@@ -205,6 +216,19 @@ class MegaMoeWorkspace:
             self._free_symmetric_tensors()
             self._free_local_tensors()
             raise
+
+    def _allocate_replica_storage(self, spec: MegaMoeSpec) -> None:
+        """Recreate provider state with the new symmetric heap generation."""
+        shapes = ((spec.hidden_size, 2 * spec.intermediate_size), (spec.intermediate_size, spec.hidden_size))
+        size = (signal_storage_bytes(shapes, spec.replica_slots_per_rank, spec.ep_size, 2)
+                if spec.replica_transport == "shmem_signal" else
+                spec.replica_slots_per_rank * spec.hidden_size * spec.intermediate_size * 2 * 4)
+        self.replica_inbox = shmem.empty((size,), dtype=torch.uint8, alignment=_WORKSPACE_ALIGNMENT)
+        if spec.replica_transport == "shmem_signal":
+            self.replica_provider = SignalReplicaTransport(shmem, self.replica_inbox,
+                                                          spec.replica_slots_per_rank, spec.ep_size)
+        else:
+            self.replica_provider = OneSidedReplicaTransport(shmem, self.replica_inbox)
 
     def prepare_event_counters(self, *, forward: bool) -> Any:
         """Reset per-call counters while preserving the ready generation."""
@@ -265,6 +289,7 @@ class MegaMoeWorkspace:
                 self.forward_event_counters, self.backward_event_counters))
             if any(peer != remaining for peer in _automatic.exchange(remaining)):
                 raise RuntimeError("partial symmetric teardown differs across ranks; restart the process")
+        self.replica_provider = None
         for field_name in (
             "source_buffer",
             "expert_buffer",
