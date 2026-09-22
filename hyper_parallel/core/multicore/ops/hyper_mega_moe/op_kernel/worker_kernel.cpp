@@ -195,6 +195,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
             grouped_list_tensor_real.SetValue(i, 0);
           }
         }
+        if (this->home_experts_ > 0) {
+          grouped_list_tensor_real.SetValue(0, value);
+        }
         cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
 
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
@@ -204,6 +207,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         tilingdata_data->mmTilingData.singleCoreM = value;
         cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
         cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+        if (this->home_experts_ > 0) {
+          tilingdata_data->gmmBaseParams.groupNum = 1;
+          cacheWriteThrough(tiling_data_addr, sizeof(tilingdata_data->gmmBaseParams));
+        }
         PipeBarrier<PIPE_ALL>();
 
         int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
@@ -212,8 +219,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         int64_t output_0_offset = task_desc.outputs[0].dynamic_shape == 1
                                     ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
                                     : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
+        const uint32_t weight_position = task_desc.inputs[1].input_position;
+        GM_ADDR weight_base = input_list[weight_position];
+        if (this->home_experts_ > 0) {
+          const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
+                                       task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+          weight_base = this->GetExpertMatrix(weight_position, data_index, matrix_bytes, weight_position == 5 ? 0 : 1);
+        }
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position], nullptr, nullptr, nullptr, nullptr, nullptr,
+                       weight_base, nullptr, nullptr, nullptr, nullptr, nullptr,
                        grouped_list_real, nullptr, input_list[task_desc.outputs[0].input_position] + output_0_offset,
                        input_list[WORKSPACE_IDX], tiling_data_addr, false, false);
       }

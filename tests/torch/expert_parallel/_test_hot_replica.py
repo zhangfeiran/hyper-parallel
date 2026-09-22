@@ -134,9 +134,46 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
     return {"invocations": checks, "accumulated": accumulated_error}
 
 
+def _cross_layer_pool(backend, budget, mesh, provider, executor, reference, tokens, hidden, intermediate, top_k):
+    """Two independent parameter owners share storage through reversed backward."""
+    experts = mesh.size() * 6
+    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
+    pairs = []
+    for seed in (731, 951):
+        modules = []
+        for hot in (False, True):
+            torch.manual_seed(seed)
+            module = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(
+                device=device, dtype=torch.bfloat16)
+            ExpertParallel(replica_slots_per_rank=budget if hot and backend == "native" else 0,
+                           replica_transport=provider if hot else None).apply(module, mesh)
+            modules.append(module)
+        pairs.append(modules)
+    pending = []
+    for index, (base, candidate) in enumerate(pairs):
+        torch.manual_seed(581 + index + dist.get_rank())
+        values = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16).requires_grad_()
+        other = values.detach().clone().requires_grad_()
+        ids = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k).remainder(max(top_k, 2)).long()
+        probs = torch.full((tokens, top_k), 1 / top_k, device=device)
+        expected = _expert_forward(base, reference, values, ids, probs, experts)
+        actual = _expert_forward(candidate, executor, other, ids, probs, experts)
+        pending.append((base, candidate, values, other, expected, actual))
+    checks = []
+    for base, candidate, values, other, expected, actual in reversed(pending):
+        grad = torch.randn_like(expected)
+        expected.backward(grad)
+        actual.backward(grad)
+        checks.append({"output": _check(actual, expected, "cross-layer output"),
+                       "dx": _check(other.grad, values.grad, "cross-layer dx"),
+                       **{name: _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad),
+                                       "cross-layer " + name) for name in ("w1", "w2", "w3")}})
+    return checks
+
+
 def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         hidden: int = 128, intermediate: int = 128, top_k: int = 2,
-        same_backend_reference: bool = False) -> None:
+        same_backend_reference: bool = False, replica_transport: str = "p2p") -> None:
     """Compare full forward/backward with native B=0, preserving EP ownership."""
     rank, size = dist.get_rank(), dist.get_world_size()
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
@@ -148,19 +185,35 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
     torch.manual_seed(371)
     candidate = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(
         device=device, dtype=torch.bfloat16)
-    ExpertParallel().apply(base, mesh)
-    ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0).apply(candidate, mesh)
-    executor = None
-    reference = None
-    if backend != "native":
+    provider = None
+    symmetric = None
+    shmem_api = None
+    if backend != "native" or replica_transport == "shmem":
         endpoint = [f"tcp://127.0.0.1:{allocate_port()}" if rank == 0 else None]
         dist.broadcast_object_list(endpoint, src=0)
         os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
+    if backend == "native" and replica_transport == "shmem":
+        # Explicitly inject a test runtime; the native adapter has no multicore import.
+        shmem_api = importlib.import_module("hyper_parallel.core.multicore.shmem")
+        provider_type = importlib.import_module(
+            "hyper_parallel.core.expert_parallel.hot_replica.one_sided").OneSidedReplicaTransport
+        needed = budget * hidden * intermediate * 2 * 4
+        heap = ((needed + 511 + 2**21 - 1) // 2**21) * 2**21
+        shmem_api.acquire(mesh.get_group(), heap_size_bytes=heap)
+        symmetric = shmem_api.empty((needed,), dtype=torch.uint8, alignment=512)
+        provider = provider_type(shmem_api, symmetric)
+    ExpertParallel().apply(base, mesh)
+    ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0,
+                   replica_transport=provider).apply(candidate, mesh)
+    executor = None
+    reference = None
+    if backend != "native":
         mega_moe = importlib.import_module("hyper_parallel.core.multicore").MegaMoeExperts
         options = {"initial_capacity_factor": 1.0} if backend == "push" else {}
         executor = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
                                  num_experts=experts, top_k=top_k, ep_size=size, ep_group=mesh.get_group(),
                                  create_parameters=False, dispatch_mode=backend, replica_slots_per_rank=budget,
+                                 replica_transport=replica_transport,
                                  **options)
         if same_backend_reference:
             reference = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
@@ -217,22 +270,33 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference)
         if rank == 0:
             print(json.dumps({"backend": backend, "B": budget, "deferred": deferred}), flush=True)
-        if backend == "native" and any(name.startswith("hyper_parallel.core.multicore") for name in sys.modules):
+        if backend == "native" and replica_transport == "p2p" and any(
+                name.startswith("hyper_parallel.core.multicore") for name in sys.modules):
             raise AssertionError("native execution imported multicore")
+        cross_layer = []
+        if hidden <= 128:
+            cross_layer = _cross_layer_pool(backend, budget, mesh, provider, executor, reference,
+                                           tokens, hidden, intermediate, top_k)
         Path(result_dir).mkdir(parents=True, exist_ok=True)
         Path(result_dir, f"{backend}-b{budget}-rank{rank}.json").write_text(
-            json.dumps({"steps": results, "deferred": deferred}, indent=2) + "\n", encoding="utf-8")
+            json.dumps({"steps": results, "deferred": deferred, "cross_layer": cross_layer,
+                        "replica_transport": replica_transport}, indent=2) + "\n", encoding="utf-8")
     finally:
         if executor is not None:
             executor.close()
         if reference is not None:
             reference.close()
+        if symmetric is not None:
+            torch.npu.synchronize()
+            shmem_api.free(symmetric)
+            shmem_api.release()
 
 
 def main() -> None:
     """Initialize one worker group and run the selected executor."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("native", "push", "pull"), default="native")
+    parser.add_argument("--replica-transport", choices=("p2p", "shmem"), default="p2p")
     parser.add_argument("--budget", type=int, default=1)
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--hidden", type=int, default=128)
@@ -249,7 +313,7 @@ def main() -> None:
     try:
         run(args.backend, args.budget, args.result_dir, tokens=args.tokens,
             hidden=args.hidden, intermediate=args.intermediate, top_k=args.top_k,
-            same_backend_reference=args.same_backend_reference)
+            same_backend_reference=args.same_backend_reference, replica_transport=args.replica_transport)
     finally:
         dist.destroy_process_group()
 

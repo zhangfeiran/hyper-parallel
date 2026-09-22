@@ -236,6 +236,7 @@ class MegaMoeExperts(MulticoreModule):
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
         replica_slots_per_rank: int = 0,
+        replica_transport: str = "p2p",
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -251,6 +252,7 @@ class MegaMoeExperts(MulticoreModule):
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
             replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
+            replica_transport: "p2p" or opt-in "shmem" one-sided weight/gradient copies.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
@@ -268,6 +270,8 @@ class MegaMoeExperts(MulticoreModule):
                 PP/DP groups bootstrap independently; one process can have only
                 one ordered EP membership active in SHMEM at a time.
         """
+        if replica_transport not in ("p2p", "shmem"):
+            raise ValueError("replica_transport must be p2p or shmem")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         specification = {
             "local_num_tokens": local_num_tokens,
@@ -276,6 +280,7 @@ class MegaMoeExperts(MulticoreModule):
             "num_experts": replica_config.physical_experts,
             "logical_num_experts": num_experts,
             "replica_slots_per_rank": replica_slots_per_rank,
+            "replica_transport": replica_transport,
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
