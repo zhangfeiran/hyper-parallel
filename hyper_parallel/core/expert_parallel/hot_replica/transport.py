@@ -41,10 +41,14 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
     Ordinary pool allocations remain valid across push SHMEM heap growth.
     The lease spans all consumers, including gradient return in backward.
     """
+    provider = route.transport if provider is None else provider
+    if provider is not None and callable(getattr(provider, "lease", None)):
+        with provider.lease(weights, route, backward=backward) as pool:
+            yield pool
+        return
     config = route.plan.config
     pool = replica_pool(weights, config.replica_slots_per_rank, route.group)
     with pool.lease(backward=backward):
-        provider = route.transport if provider is None else provider
         if provider is not None:
             provider.prefetch(weights, pool.weights, route)
             yield pool

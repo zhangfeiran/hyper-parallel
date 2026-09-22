@@ -93,17 +93,42 @@ Ordinary guest allocations survive push heap replacement. Set
 and owner-side FP32 gradient gets. A symmetric B-slot inbox is included in heap
 accounting, collective allocation/free, and growth preflight. Each invocation
 binds the current inbox after a rebuild. No remote FP32 atomic fan-in is used.
-This implementation uses blocking publication/consumption barriers and an extra
-staging copy. P2P remains the default; RMA is not assumed to be faster.
+This barrier-based provider uses publication/consumption barriers and an extra
+staging copy. P2P remains the default; one-sided transport is opt-in.
+
+`replica_transport="shmem_signal"` selects direct symmetric B-slot execution
+weights and FP32 guest dW. The kernel reads/writes these views directly, removing
+the intermediate inbox copies and ordinary guest pool. A persistent provider
+owns the stream lease and protocol epoch. The receiver grants credit only after
+its previous slot consumer, owners put weights then publish ready, and the
+receiver acknowledges arrival. For gradients, each guest publishes its finished
+FP32 outputs; owners get and accumulate them, then acknowledge completed reads.
+All incoming credits are enqueued before any outgoing wait, avoiding wait cycles.
+Signals for distinct channel/peer/slot tuples occupy separate 64-byte cache lines.
+Initialization and rare int32 epoch rollover use host barriers; steady-state
+prefetch/return uses stream-ordered signals without host barriers. This does not
+yet overlap communication with home-expert computation.
+
+Signal storage and the persistent provider are freed/recreated together by the
+heap manager. Autograd saves neither symmetric addresses nor an old provider for
+multicore. Native callers must keep their externally supplied provider/storage
+alive until all queued consumers finish and reinitialize after replacing a heap.
+Compatible multicore layers must share execution resources to share direct
+symmetric slots; native layers share the injected provider.
 
 Native can inject `ExpertParallel(..., replica_transport=provider)`. The shared
 [`OneSidedReplicaTransport`](one_sided.py) requires an externally leased symmetric
-uint8 inbox and a runtime exposing `put`, `get`, and `host_barrier`. Runtime PE
-numbering must match the EP group's local rank numbering. The inbox must hold
-`B * max(expert_matrix_numel) * 4` bytes and remain exclusively owned until the
-call returns. The caller owns initialization, heap budget and teardown. Native
-and the shared provider do not import multicore; the NPU tests explicitly inject
-multicore's SHMEM runtime to validate this optional provider.
+uint8 inbox and a runtime exposing `put`, `get`, and `host_barrier`. Its inbox must
+hold `B * max(expert_matrix_numel) * 4` bytes. The direct
+[`SignalReplicaTransport`](signal_transport.py) also needs `signal` and
+`wait_signal`, with transfer completion and signal operations ordered on the
+calling stream. Size its 64-byte-aligned uint8 allocation with
+`signal_storage_bytes(matrix_shapes, B, ep_size, weight_element_size)`, then pass
+`SignalReplicaTransport(runtime, storage, B, ep_size)`. All ranks must invoke the
+same provider call sequence. Runtime PE numbering must match EP-group local
+ranks. The caller owns initialization, heap budget, exclusive submission and
+teardown. Both native providers and the planner remain independent of multicore;
+the tests explicitly inject its SHMEM runtime for NPU validation.
 
 Each autograd invocation saves its immutable route and original owner weights.
 Backward re-prefetches that route, allowing other forwards to run before it.
@@ -124,14 +149,15 @@ sorting. The current planner still runs on the host after the count exchange.
 ## Current implementation limits
 
 The planner still performs one host readback after count exchange. Device-side
-planning, transport/compute overlap and signal-based asynchronous RMA consumption
-remain future work. Multi-node operation, expert TP, graph capture and FSDP
-composition need dedicated system tests before being advertised as supported.
+planning and transport/compute overlap remain future work. Multi-node operation,
+expert TP, graph capture and FSDP composition need dedicated system tests before
+being advertised as supported.
 Pool leases reject overlapping host submissions rather than allocating extra B
 slots. Native parameter packing and per-expert FP32 dW matmuls remain costs to
-measure. RMA additionally reserves a B-slot FP32 symmetric inbox per execution
-resource group; share execution resources across compatible multicore layers to
-share this inbox as well.
+measure. Barrier RMA additionally reserves a B-slot FP32 symmetric inbox. Signal RMA
+places the guest weights and gradients directly in symmetric memory, plus
+`5 * ep_size * B * 64` signal bytes and matrix alignment padding. Allocation size
+changes are not a measured end-to-end peak-HBM claim.
 
 No end-to-end speedup or peak-HBM reduction is claimed by precision validation.
 
@@ -154,3 +180,10 @@ Incoming gradient partials retain the per-element precision gate. Deferred
 backward also checks exact BF16 accumulation of captured partials, because
 cancellation can amplify relative error in a final BF16 gradient. Comparison
 failures are reported collectively before cleanup to avoid stranding other ranks.
+
+Signal tests additionally rotate owners twelve times over two NPU streams before
+checking results, with a delayed rank on each iteration. CPU protocol tests
+exercise arbitrary rank progress with many calls queued ahead. The worker accepts
+`--benchmark-iterations` for warmed forward/backward/SGD timing on a fixed hot
+route; performance comparisons require fresh-process paired runs and ownership
+auditing, separate from the precision results.

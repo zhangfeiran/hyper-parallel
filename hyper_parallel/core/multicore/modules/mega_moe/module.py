@@ -182,7 +182,7 @@ class MegaMoeExperts(MulticoreModule):
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
             replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
-            replica_transport: "p2p" or opt-in "shmem" one-sided weight/gradient copies.
+            replica_transport: "p2p", barrier-based "shmem", or direct "shmem_signal" copies.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
@@ -205,8 +205,8 @@ class MegaMoeExperts(MulticoreModule):
         )
         if swiglu_limit is not None:
             swiglu_limit = float(swiglu_limit)
-        if replica_transport not in ("p2p", "shmem"):
-            raise ValueError("replica_transport must be p2p or shmem")
+        if replica_transport not in ("p2p", "shmem", "shmem_signal"):
+            raise ValueError("replica_transport must be p2p, shmem or shmem_signal")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         specification = {
             "local_num_tokens": local_num_tokens,

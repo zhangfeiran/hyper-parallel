@@ -24,10 +24,8 @@ from typing import Any
 import torch
 import torch_npu
 
-from hyper_parallel.core.expert_parallel.hot_replica.one_sided import OneSidedReplicaTransport
 from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
 
-from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
@@ -477,8 +475,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         profile_call = None
         leases = ExitStack()
         try:
-            provider = None if workspace.replica_inbox is None else OneSidedReplicaTransport(
-                shmem, workspace.replica_inbox)
+            provider = workspace.replica_provider
             pool = None if ctx.replica_route is None else leases.enter_context(
                 prefetch_weights(home_weights, ctx.replica_route, provider=provider))
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
@@ -558,8 +555,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         profile_call = None
         leases = ExitStack()
         try:
-            provider = None if workspace.replica_inbox is None else OneSidedReplicaTransport(
-                shmem, workspace.replica_inbox)
+            provider = workspace.replica_provider
             pool = None if ctx.replica_route is None else leases.enter_context(
                 prefetch_weights((saved.weight1, saved.weight2), ctx.replica_route, backward=True, provider=provider))
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)

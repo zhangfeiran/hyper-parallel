@@ -120,6 +120,31 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         after = workspace_module._spec_workspace_bytes(specification, 2)
         self.assertEqual(after - before, 5120 * 1792 * 2 * 4 + 511)
 
+    def test_signal_storage_budget_and_rebuild_reset(self) -> None:
+        """Heap replacement drops the old provider's address views and epoch."""
+        specification = {"local_num_tokens": 128, "top_k": 2, "hidden_size": 5120,
+                         "intermediate_size": 1792, "num_experts": 28, "ep_size": 4,
+                         "logical_num_experts": 24, "replica_slots_per_rank": 1, "initial_capacity_factor": 1.0}
+        before = workspace_module._spec_workspace_bytes(specification, 2)
+        specification["replica_transport"] = "shmem_signal"
+        after = workspace_module._spec_workspace_bytes(specification, 2)
+        self.assertEqual(after - before, 5120 * 1792 * 3 * 6 + 5 * 4 * 64 + 511)
+        spec = SimpleNamespace(hidden_size=8, intermediate_size=4, ep_size=4,
+                               replica_slots_per_rank=1, replica_transport="shmem_signal")
+        workspace = MegaMoeWorkspace(shared=True)
+        with patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
+                shape, dtype=kw["dtype"])), patch.object(workspace_module.shmem, "free"):
+            workspace._allocate_replica_storage(spec)
+            previous = workspace.replica_provider
+            previous.epoch = 17
+            workspace._free_symmetric_tensors()
+            self.assertIsNone(workspace.replica_provider)
+            self.assertIsNone(workspace.replica_inbox)
+            workspace._allocate_replica_storage(spec)
+            self.assertIsNot(workspace.replica_provider, previous)
+            self.assertEqual(workspace.replica_provider.epoch, 0)
+            self.assertIsNone(workspace.replica_provider.pool)
+
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Retain expanded event storage when allocating through the SHMEM API."""
         spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,

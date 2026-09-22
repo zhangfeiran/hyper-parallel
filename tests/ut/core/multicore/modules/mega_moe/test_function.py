@@ -75,6 +75,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         plan.bwd_runtime = runtime
         workspace = Mock(
             replica_inbox=None,
+            replica_provider=None,
             in_use=False,
             expert_capacity=128,
             source_buffer=torch.empty(4, 4),
@@ -202,7 +203,8 @@ class TestMegaMoeFunction(unittest.TestCase):
         ):
             for tag, capacity in enumerate(capacities, start=1):
                 source = torch.full((2 if permuted else 4, 4), float(tag), requires_grad=input_grad)
-                route = SimpleNamespace(replica_route=None, expert_capacity=capacity, group_list=torch.tensor([0, capacity]))
+                route = SimpleNamespace(replica_route=None, expert_capacity=capacity,
+                                        group_list=torch.tensor([0, capacity]))
                 for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
                              "combine_src_off", "combine_target_off", "combine_size"):
                     setattr(route, name, torch.zeros(4, dtype=torch.int64))

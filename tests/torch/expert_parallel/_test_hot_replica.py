@@ -19,6 +19,7 @@ import importlib
 import sys
 import json
 import os
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -29,6 +30,9 @@ import torch_npu
 from hyper_parallel import init_device_mesh
 from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.core.expert_parallel import ExpertParallel
+from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
+from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
+from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
 from tests.common.port_utils import allocate_port
 
 
@@ -171,9 +175,83 @@ def _cross_layer_pool(backend, budget, mesh, provider, executor, reference, toke
     return checks
 
 
+def _signal_stress(provider, mesh, hidden, intermediate, budget):
+    """Queue rotating owners on alternating streams before checking any result."""
+    rank, size = dist.get_rank(), mesh.size()
+    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
+    streams = [torch.npu.Stream(), torch.npu.Stream()]
+    snapshots = []
+    for step in range(12):
+        owner = step % size
+        counts = [[0] * (size * 6) for _ in range(size)]
+        for row in counts:
+            row[owner * 6] = 120
+        plan = build_expert_replica_plan(counts, budget)
+        route = ReplicaRoute(plan, torch.empty(0), torch.empty(0), rank, mesh.get_group(), provider)
+        weights = (torch.full((6, hidden, 2 * intermediate), step * 10 + rank,
+                              device=device, dtype=torch.bfloat16),
+                   torch.full((6, intermediate, hidden), step * 10 + rank,
+                              device=device, dtype=torch.bfloat16))
+        stream = streams[step % 2]
+        stream.wait_stream(torch.npu.current_stream())
+        if rank == step % size:
+            time.sleep(0.003)
+        with torch.npu.stream(stream):
+            with prefetch_weights(weights, route, backward=True) as pool:
+                copies = [(value[slot - 6].clone(), step * 10 + owner)
+                          for slot, expert in enumerate(plan.slot_to_logical[rank]) if slot >= 6 and expert >= 0
+                          for value in pool.weights]
+                for gradient in pool.gradients:
+                    gradient.fill_(rank + 1)
+                home = tuple(torch.ones_like(weight, dtype=torch.float32) for weight in weights)
+                gradients = return_gradients(home, route, pool.gradients)
+                expected = [torch.ones_like(value) for value in gradients]
+                if rank == owner:
+                    for value in expected:
+                        value[0].add_(sum(item.target_rank + 1 for item in plan.transfers))
+                snapshots.append((copies, gradients, expected))
+            for weight in weights:
+                weight.record_stream(stream)
+    torch.npu.synchronize()
+    for copies, gradients, expected in snapshots:
+        for actual, value in copies:
+            torch.testing.assert_close(actual, torch.full_like(actual, value), rtol=0, atol=0)
+        for actual, value in zip(gradients, expected):
+            torch.testing.assert_close(actual, value, rtol=0, atol=0)
+    return {"iterations": 12, "streams": 2, "owners": size}
+
+
+def _benchmark(candidate, executor, experts, tokens, hidden, top_k, iterations):
+    """Measure fresh-process warmed forward/backward plus SGD on a fixed hot route."""
+    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
+    torch.manual_seed(712 + dist.get_rank())
+    values = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device).requires_grad_()
+    ids = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k).remainder(max(6, top_k)).long()
+    probabilities = torch.full((tokens, top_k), 1 / top_k, device=device)
+    gradient = torch.randn_like(values) / tokens
+    optimizer = torch.optim.SGD(candidate.parameters(), lr=0.001, momentum=0.9)
+    measured = []
+    for iteration in range(iterations + 3):
+        optimizer.zero_grad(set_to_none=True)
+        values.grad = None
+        dist.barrier()
+        torch.npu.synchronize()
+        start = time.perf_counter()
+        output = _expert_forward(candidate, executor, values, ids, probabilities, experts)
+        output.backward(gradient)
+        optimizer.step()
+        torch.npu.synchronize()
+        elapsed = torch.tensor([(time.perf_counter() - start) * 1000], device=device)
+        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+        if iteration >= 3:
+            measured.append(float(elapsed.cpu()[0]))
+    return {"step_ms": measured, "iterations": iterations, "warmup": 3}
+
+
 def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         hidden: int = 128, intermediate: int = 128, top_k: int = 2,
-        same_backend_reference: bool = False, replica_transport: str = "p2p") -> None:
+        same_backend_reference: bool = False, replica_transport: str = "p2p",
+        benchmark_iterations: int = 0) -> None:
     """Compare full forward/backward with native B=0, preserving EP ownership."""
     rank, size = dist.get_rank(), dist.get_world_size()
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
@@ -188,20 +266,26 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
     provider = None
     symmetric = None
     shmem_api = None
-    if backend != "native" or replica_transport == "shmem":
+    if backend != "native" or replica_transport != "p2p":
         endpoint = [f"tcp://127.0.0.1:{allocate_port()}" if rank == 0 else None]
         dist.broadcast_object_list(endpoint, src=0)
         os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
-    if backend == "native" and replica_transport == "shmem":
+    if backend == "native" and replica_transport != "p2p":
         # Explicitly inject a test runtime; the native adapter has no multicore import.
         shmem_api = importlib.import_module("hyper_parallel.core.multicore.shmem")
         provider_type = importlib.import_module(
             "hyper_parallel.core.expert_parallel.hot_replica.one_sided").OneSidedReplicaTransport
         needed = budget * hidden * intermediate * 2 * 4
+        if replica_transport == "shmem_signal":
+            signal_module = importlib.import_module("hyper_parallel.core.expert_parallel.hot_replica.signal_transport")
+            provider_type = signal_module.SignalReplicaTransport
+            needed = signal_module.signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)),
+                                                        budget, size, 2)
         heap = ((needed + 511 + 2**21 - 1) // 2**21) * 2**21
         shmem_api.acquire(mesh.get_group(), heap_size_bytes=heap)
         symmetric = shmem_api.empty((needed,), dtype=torch.uint8, alignment=512)
-        provider = provider_type(shmem_api, symmetric)
+        provider = (provider_type(shmem_api, symmetric, budget, size) if replica_transport == "shmem_signal" else
+                    provider_type(shmem_api, symmetric))
     ExpertParallel().apply(base, mesh)
     ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0,
                    replica_transport=provider).apply(candidate, mesh)
@@ -277,10 +361,17 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         if hidden <= 128:
             cross_layer = _cross_layer_pool(backend, budget, mesh, provider, executor, reference,
                                            tokens, hidden, intermediate, top_k)
+        signal_stress = None
+        if replica_transport == "shmem_signal" and hidden <= 128:
+            active_provider = provider if executor is None else resources.workspace.replica_provider
+            signal_stress = _signal_stress(active_provider, mesh, hidden, intermediate, budget)
+        timing = None if not benchmark_iterations else _benchmark(
+            candidate, executor, experts, tokens, hidden, top_k, benchmark_iterations)
         Path(result_dir).mkdir(parents=True, exist_ok=True)
         Path(result_dir, f"{backend}-b{budget}-rank{rank}.json").write_text(
             json.dumps({"steps": results, "deferred": deferred, "cross_layer": cross_layer,
-                        "replica_transport": replica_transport}, indent=2) + "\n", encoding="utf-8")
+                        "replica_transport": replica_transport, "signal_stress": signal_stress, "timing": timing},
+                       indent=2) + "\n", encoding="utf-8")
     finally:
         if executor is not None:
             executor.close()
@@ -296,7 +387,8 @@ def main() -> None:
     """Initialize one worker group and run the selected executor."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("native", "push", "pull"), default="native")
-    parser.add_argument("--replica-transport", choices=("p2p", "shmem"), default="p2p")
+    parser.add_argument("--replica-transport", choices=("p2p", "shmem", "shmem_signal"), default="p2p")
+    parser.add_argument("--benchmark-iterations", type=int, default=0)
     parser.add_argument("--budget", type=int, default=1)
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--hidden", type=int, default=128)
@@ -313,7 +405,8 @@ def main() -> None:
     try:
         run(args.backend, args.budget, args.result_dir, tokens=args.tokens,
             hidden=args.hidden, intermediate=args.intermediate, top_k=args.top_k,
-            same_backend_reference=args.same_backend_reference, replica_transport=args.replica_transport)
+            same_backend_reference=args.same_backend_reference, replica_transport=args.replica_transport,
+            benchmark_iterations=args.benchmark_iterations)
     finally:
         dist.destroy_process_group()
 
