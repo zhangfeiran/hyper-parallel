@@ -1,0 +1,282 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Native and multicore expert-replica distributed precision acceptance."""
+
+import argparse
+import importlib
+import sys
+import json
+import os
+from datetime import timedelta
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+import torch_npu
+
+from hyper_parallel import init_device_mesh
+from hyper_parallel.components.modules.moe import GroupedExperts
+from hyper_parallel.core.expert_parallel import ExpertParallel
+from tests.common.port_utils import allocate_port
+
+
+def _local(tensor):
+    """Read the local EP shard when a parameter or gradient is a DTensor."""
+    return tensor.to_local() if hasattr(tensor, "to_local") else tensor
+
+
+def _native_forward(module, values, ids, probabilities, experts):
+    """Use the real GroupedExperts entry with EP pre/post forward hooks."""
+    order = torch.argsort(ids.flatten(), stable=True)
+    expanded = values[:, None, :].expand(-1, ids.shape[1], -1).reshape(-1, values.shape[-1])
+    counts = torch.bincount(ids.flatten(), minlength=experts)
+    output = module(expanded[order], counts)
+    restored = torch.empty_like(output)
+    restored[order] = output
+    return (restored.reshape(values.shape[0], ids.shape[1], -1) * probabilities.unsqueeze(-1)).sum(1)
+
+
+def _expert_forward(module, executor, values, ids, probabilities, experts):
+    """Select the controlled reference executor without changing parameters."""
+    if executor is None:
+        return _native_forward(module, values, ids, probabilities, experts)
+    packed = torch.cat((_local(module.w1), _local(module.w3)), dim=1).transpose(1, 2).contiguous()
+    down = _local(module.w2).transpose(1, 2).contiguous()
+    return executor(values, ids, probabilities, expert_weights=(packed, down))
+
+
+def _check(actual, expected, label, *, elementwise=True, rtol=2e-2, atol=2e-3):
+    """Check precision collectively so failure cannot strand peers in cleanup."""
+    actual, expected = actual.detach().float(), expected.detach().float()
+    difference = actual - expected
+    relative = float(difference.square().sum().sqrt() / expected.square().sum().sqrt().clamp_min(1e-8))
+    maximum = float(difference.abs().max())
+    error = None
+    try:
+        if elementwise:
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+        if not torch.isfinite(actual).all() or relative > 0.01:
+            raise AssertionError(f"relative_l2={relative}, max_abs={maximum}")
+    except AssertionError as failure:
+        error = f"rank={dist.get_rank()} {label}: {failure}"
+    errors = [None] * dist.get_world_size()
+    dist.all_gather_object(errors, error)
+    failures = [error for error in errors if error is not None]
+    if failures:
+        raise AssertionError("\n".join(failures))
+    return {"relative_l2": relative, "max_abs": maximum}
+
+
+def _deferred_backward(base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference):
+    """Keep different plans live, then run backward in reverse invocation order."""
+    # Isolate saved-plan lifetime from tolerated optimizer-rounding drift.
+    with torch.no_grad():
+        for name in ("w1", "w2", "w3"):
+            _local(getattr(candidate, name)).copy_(_local(getattr(base, name)))
+    base.zero_grad(set_to_none=True)
+    candidate.zero_grad(set_to_none=True)
+    partials = ({}, {})
+    accumulated = ({}, {})
+    hooks = []
+    for index, module in enumerate((base, candidate)):
+        for name in ("w1", "w2", "w3"):
+            def _capture(gradient, destination=partials[index], key=name):
+                destination[key] = _local(gradient).detach().clone()
+            hooks.append(getattr(module, name).register_hook(_capture))
+    pending = []
+    for modulus in (max(6, top_k), 2 if top_k <= 6 else experts):
+        torch.manual_seed(833 + rank + modulus)
+        values = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device).requires_grad_()
+        other = values.detach().clone().requires_grad_()
+        ids = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k).remainder(modulus).long()
+        probabilities = torch.full((tokens, top_k), 1.0 / top_k, device=device, requires_grad=True)
+        other_probabilities = probabilities.detach().clone().requires_grad_()
+        expected = _expert_forward(base, reference, values, ids, probabilities, experts)
+        actual = _expert_forward(candidate, executor, other, ids, other_probabilities, experts)
+        pending.append((expected, actual, values, other, probabilities, other_probabilities))
+    checks = []
+    for expected, actual, values, other, probabilities, other_probabilities in reversed(pending):
+        gradient = torch.randn_like(expected)
+        expected.backward(gradient)
+        actual.backward(gradient)
+        for name in ("w1", "w2", "w3"):
+            _check(partials[1][name], partials[0][name], "deferred partial " + name)
+            for index, module in enumerate((base, candidate)):
+                if name not in accumulated[index]:
+                    accumulated[index][name] = partials[index][name].clone()
+                else:
+                    accumulated[index][name].add_(partials[index][name])
+                _check(_local(getattr(module, name).grad), accumulated[index][name],
+                       "exact accumulated " + name, rtol=0, atol=0)
+        checks.append({"output": _check(actual, expected, "deferred output"),
+                       "dx": _check(other.grad, values.grad, "deferred dx"),
+                       "dprob": _check(other_probabilities.grad, probabilities.grad, "deferred dprob")})
+    for hook in hooks:
+        hook.remove()
+    # Elementwise tolerances apply to each incoming partial above. BF16 summation
+    # can amplify relative error at cancellation; exact accumulation is checked
+    # against the captured partials, with a separate normwise comparison here.
+    accumulated_error = {name: _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad),
+                                      "accumulated " + name, elementwise=False)
+                         for name in ("w1", "w2", "w3")}
+    return {"invocations": checks, "accumulated": accumulated_error}
+
+
+def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
+        hidden: int = 128, intermediate: int = 128, top_k: int = 2,
+        same_backend_reference: bool = False) -> None:
+    """Compare full forward/backward with native B=0, preserving EP ownership."""
+    rank, size = dist.get_rank(), dist.get_world_size()
+    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
+    home = 6
+    experts = size * home
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(size,), mesh_dim_names=("ep",))
+    torch.manual_seed(371)
+    base = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(device=device, dtype=torch.bfloat16)
+    torch.manual_seed(371)
+    candidate = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(
+        device=device, dtype=torch.bfloat16)
+    ExpertParallel().apply(base, mesh)
+    ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0).apply(candidate, mesh)
+    executor = None
+    reference = None
+    if backend != "native":
+        endpoint = [f"tcp://127.0.0.1:{allocate_port()}" if rank == 0 else None]
+        dist.broadcast_object_list(endpoint, src=0)
+        os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
+        mega_moe = importlib.import_module("hyper_parallel.core.multicore").MegaMoeExperts
+        options = {"initial_capacity_factor": 1.0} if backend == "push" else {}
+        executor = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
+                                 num_experts=experts, top_k=top_k, ep_size=size, ep_group=mesh.get_group(),
+                                 create_parameters=False, dispatch_mode=backend, replica_slots_per_rank=budget,
+                                 **options)
+        if same_backend_reference:
+            reference = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
+                                 num_experts=experts, top_k=top_k, ep_size=size, ep_group=mesh.get_group(),
+                                 create_parameters=False, dispatch_mode=backend, replica_slots_per_rank=0,
+                                 **options)
+    results = []
+    optimizer_base = torch.optim.SGD(base.parameters(), lr=0.01, momentum=0.9)
+    optimizer_candidate = torch.optim.SGD(candidate.parameters(), lr=0.01, momentum=0.9)
+    try:
+        for pattern in ("balanced", "home_hot", "one_hot_pair", "balanced"):
+            torch.manual_seed(719 + rank)
+            x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16).requires_grad_()
+            x_candidate = x.detach().clone().requires_grad_()
+            positions = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k)
+            modulus = experts if pattern == "balanced" else (max(home, top_k) if pattern == "home_hot" else top_k)
+            ids = positions.remainder(modulus).long()
+            probs = torch.softmax(torch.randn(tokens, top_k, device=device), dim=-1).requires_grad_()
+            probs_candidate = probs.detach().clone().requires_grad_()
+            base.zero_grad(set_to_none=True)
+            candidate.zero_grad(set_to_none=True)
+            expected = _expert_forward(base, reference, x, ids, probs, experts)
+            actual = _expert_forward(candidate, executor, x_candidate, ids, probs_candidate, experts)
+            gradient = torch.randn_like(expected)
+            expected.backward(gradient)
+            actual.backward(gradient)
+            evidence = {"pattern": pattern, "output": _check(actual, expected, "output"),
+                        "dx": _check(x_candidate.grad, x.grad, "dx"),
+                        "dprob": _check(probs_candidate.grad, probs.grad, "dprob")}
+            for name in ("w1", "w2", "w3"):
+                evidence[name] = _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad), name)
+            if executor is not None:
+                resources = executor._get_execution_resources(x_candidate)
+                evidence["capacity"] = resources.workspace.capacity_floor
+                evidence["maximum_capacity"] = resources.spec.maximum_receive_capacity
+                evidence["heap_epoch"] = resources.heap_manager.epoch
+                if evidence["capacity"] > evidence["maximum_capacity"]:
+                    raise AssertionError("dynamic push capacity exceeded theoretical bound")
+            optimizer_base.step()
+            optimizer_candidate.step()
+            for name in ("w1", "w2", "w3"):
+                expected_parameter, actual_parameter = getattr(base, name), getattr(candidate, name)
+                evidence[name + "_updated"] = _check(_local(actual_parameter), _local(expected_parameter), name)
+                evidence[name + "_momentum"] = _check(
+                    _local(optimizer_candidate.state[actual_parameter]["momentum_buffer"]),
+                    _local(optimizer_base.state[expected_parameter]["momentum_buffer"]), name + " momentum")
+            results.append(evidence)
+            if rank == 0:
+                print(json.dumps({"backend": backend, "B": budget, **evidence}), flush=True)
+        if backend == "push" and budget == 1 and size >= 4:
+            if not any(row["heap_epoch"] > 0 for row in results):
+                raise AssertionError("expected a real dynamic push growth event")
+        deferred = _deferred_backward(
+            base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference)
+        if rank == 0:
+            print(json.dumps({"backend": backend, "B": budget, "deferred": deferred}), flush=True)
+        if backend == "native" and any(name.startswith("hyper_parallel.core.multicore") for name in sys.modules):
+            raise AssertionError("native execution imported multicore")
+        Path(result_dir).mkdir(parents=True, exist_ok=True)
+        Path(result_dir, f"{backend}-b{budget}-rank{rank}.json").write_text(
+            json.dumps({"steps": results, "deferred": deferred}, indent=2) + "\n", encoding="utf-8")
+    finally:
+        if executor is not None:
+            executor.close()
+        if reference is not None:
+            reference.close()
+
+
+def main() -> None:
+    """Initialize one worker group and run the selected executor."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=("native", "push", "pull"), default="native")
+    parser.add_argument("--budget", type=int, default=1)
+    parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--intermediate", type=int, default=128)
+    parser.add_argument("--top-k", type=int, default=2)
+    parser.add_argument("--same-backend-reference", action="store_true")
+    parser.add_argument("--result-dir", required=True)
+    args = parser.parse_args()
+    if int(os.environ["LOCAL_RANK"]) == 0:
+        print(json.dumps({"torch": torch.__version__, "torch_npu": torch_npu.__version__,
+                          "cann": os.getenv("ASCEND_HOME_PATH"), "worker": str(Path(__file__).resolve())}), flush=True)
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
+    try:
+        run(args.backend, args.budget, args.result_dir, tokens=args.tokens,
+            hidden=args.hidden, intermediate=args.intermediate, top_k=args.top_k,
+            same_backend_reference=args.same_backend_reference)
+    finally:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+
+
+def test_native_hot_replica_npu() -> None:
+    """Exercise native EP with no multicore import or payload."""
+    _pytest_case("native")
+
+
+def test_push_hot_replica_npu() -> None:
+    """Exercise push replication and real dynamic heap growth."""
+    _pytest_case("push")
+
+
+def test_pull_hot_replica_npu() -> None:
+    """Exercise pull replication without receive-heap growth."""
+    _pytest_case("pull")
+
+
+def _pytest_case(backend: str) -> None:
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
+    try:
+        run(backend, 1, os.getenv("HP_HOT_REPLICA_RESULTS", "./logs/hot_replica"))
+    finally:
+        dist.destroy_process_group()

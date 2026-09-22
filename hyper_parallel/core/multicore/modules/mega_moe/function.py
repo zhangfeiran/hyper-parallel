@@ -22,6 +22,8 @@ from typing import Any
 import torch
 import torch_npu
 
+from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
+
 from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
@@ -154,7 +156,8 @@ def _allocate_backward_intermediates(
     reusable_dispatch: Any | None = None,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    grad_weight2 = torch.zeros_like(weight2)
+    gradient_dtype = torch.float32 if spec.replica_slots_per_rank else weight2.dtype
+    grad_weight2 = torch.zeros_like(weight2, dtype=gradient_dtype)
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -171,7 +174,7 @@ def _allocate_backward_intermediates(
         device=grad_output.device,
     )
     # Empty experts must retain exact zero gradients on the baseline kernel.
-    grad_weight1 = torch.zeros_like(weight1)
+    grad_weight1 = torch.zeros_like(weight1, dtype=gradient_dtype)
     return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
 
 
@@ -446,6 +449,10 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         if topk_weights is not None and (spec.dispatch_mode != "pull" or permutation is None):
             raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
         metadata = route
+        ctx.replica_route = route.replica_route
+        home_weights = (weight1, weight2)
+        if ctx.replica_route is not None:
+            weight1, weight2 = prefetch_weights(home_weights, ctx.replica_route)
         permutation_inputs = ()
         if permutation is not None:
             routed_tokens, _, unpermute_mapping = permutation
@@ -497,8 +504,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 saved_dispatch,
                 execution.intermediates.up_proj,
                 execution.intermediates.activation,
-                weight1,
-                weight2,
+                home_weights[0],
+                home_weights[1],
                 metadata,
                 permutation_inputs,
             )
@@ -527,6 +534,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         saved_tensors = ctx.saved_tensors
         ctx.maybe_clear_saved_tensors()
         saved = _saved_backward_state(saved_tensors)
+        if ctx.replica_route is not None:
+            weight1, weight2 = prefetch_weights((saved.weight1, saved.weight2), ctx.replica_route)
+            saved = replace(saved, weight1=weight1, weight2=weight2)
         permutation_inputs = saved_tensors[12:]
         del saved_tensors
         workspace.claim()
@@ -547,11 +557,15 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution,
             )
             execution.profile_call.complete()
+            grad_weight1 = execution.intermediates.grad_weight1
+            grad_weight2 = execution.intermediates.grad_weight2
+            if ctx.replica_route is not None:
+                grad_weight1, grad_weight2 = return_gradients((grad_weight1, grad_weight2), ctx.replica_route)
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
             execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
-                execution.intermediates.grad_weight1,
-                execution.intermediates.grad_weight2,
+                grad_weight1,
+                grad_weight2,
                 None, None, None,
             ))
             grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)

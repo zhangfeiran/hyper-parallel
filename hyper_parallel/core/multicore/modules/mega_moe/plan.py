@@ -147,6 +147,11 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
     )
+    if spec.replica_slots_per_rank:
+        for operation in backward_graph.topological_sort():
+            for tensor_spec in (*operation.inputs, *operation.outputs):
+                if tensor_spec.param_position in (6, 18):
+                    tensor_spec.dtype_size = 4
     backward_graph.propagate_splits(task_values)
     backward_data = build_backward_config(
         backward_graph,

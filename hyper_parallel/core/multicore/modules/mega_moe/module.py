@@ -23,6 +23,9 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
+from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
+
 from hyper_parallel.core.multicore import shmem
 
 from ..module import MulticoreModule
@@ -31,7 +34,7 @@ from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
     _COMMUNICATION_SPLIT, _grow_receive_capacity, _resolve_capacity_factors,
-    _resolve_receive_capacity, bind_mega_moe_spec,
+    bind_mega_moe_spec, initial_receive_capacity,
 )
 from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
 
@@ -56,9 +59,7 @@ def _create_mega_moe_parameters(
 def _heap_layout(specification: dict[str, Any], element_size: int, capacity: int | None = None) -> tuple[Any, ...]:
     """Describe byte demand and deterministic configuration with an opaque capacity payload."""
     if capacity is None:
-        capacity = _resolve_receive_capacity(specification["initial_capacity_factor"],
-                                             specification["local_num_tokens"] * specification["top_k"],
-                                             specification["ep_size"])
+        capacity = initial_receive_capacity(specification)
     signature = tuple(sorted((key, value) for key, value in specification.items() if key != "ep_group"))
     return _spec_workspace_bytes(specification, element_size, receive_capacity=capacity), signature, capacity
 
@@ -101,6 +102,8 @@ class _MegaMoeExecutionResources:
         Args:
             maximum_received_slots: Maximum destination load from the root count exchange.
         """
+        if maximum_received_slots > self.spec.maximum_receive_capacity:
+            raise ValueError("MegaMoe route exceeds the lossless token bound")
         if maximum_received_slots <= self.workspace.capacity_floor:
             return
         with self.heap_manager.access():
@@ -200,6 +203,7 @@ class MegaMoeExperts(MulticoreModule):
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
+        replica_slots_per_rank: int = 0,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -214,6 +218,7 @@ class MegaMoeExperts(MulticoreModule):
             capacity_growth_factor: Push capacity multiplier on overflow, defaulting to 1.25.
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
+            replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
@@ -239,11 +244,14 @@ class MegaMoeExperts(MulticoreModule):
             dispatch_split=dispatch_split,
             combine_split=combine_split,
         )
+        replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         specification = {
             "local_num_tokens": local_num_tokens,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
-            "num_experts": num_experts,
+            "num_experts": replica_config.physical_experts,
+            "logical_num_experts": num_experts,
+            "replica_slots_per_rank": replica_slots_per_rank,
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "ep_size": ep_size,
@@ -260,6 +268,8 @@ class MegaMoeExperts(MulticoreModule):
             resource_compatibility_key=compatibility_key,
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
+        self.replica_config = replica_config
+        self.replica_slots_per_rank = replica_slots_per_rank
         self.local_num_tokens = local_num_tokens
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -447,6 +457,14 @@ class MegaMoeExperts(MulticoreModule):
             # Pull writes its permutation into SHMEM, so its lease must cover
             # route preparation as well as execution and output restoration.
             with torch.no_grad():
+                replica_route = None
+                if self.replica_slots_per_rank:
+                    replica_route = prepare_replica_route(
+                        topk_ids, self.replica_config, self._ep_group,
+                        target_load=resources.workspace.capacity_floor if not pull else None,
+                    )
+                    topk_ids = replica_route.physical_ids
+                    tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
                 route = prepare_topk_route(
                     hidden_flat,
                     topk_ids,
@@ -454,6 +472,7 @@ class MegaMoeExperts(MulticoreModule):
                     resources.spec,
                     tokens_per_expert,
                     workspace=resources.workspace,
+                    replica_route=replica_route,
                 )
             if not pull:
                 resources.ensure_capacity(route.maximum_received_slots)
