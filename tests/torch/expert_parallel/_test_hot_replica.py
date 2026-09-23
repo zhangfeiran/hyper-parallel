@@ -276,7 +276,7 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         provider_type = importlib.import_module(
             "hyper_parallel.core.expert_parallel.hot_replica.one_sided").OneSidedReplicaTransport
         needed = budget * hidden * intermediate * 2 * 4
-        if replica_transport in ("shmem_signal", "shmem_signal_sdma"):
+        if replica_transport in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel"):
             signal_module = importlib.import_module("hyper_parallel.core.expert_parallel.hot_replica.signal_transport")
             provider_type = signal_module.SignalReplicaTransport
             needed = signal_module.signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)),
@@ -284,9 +284,10 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         heap = ((needed + 511 + 2**21 - 1) // 2**21) * 2**21
         shmem_api.acquire(mesh.get_group(), heap_size_bytes=heap)
         symmetric = shmem_api.empty((needed,), dtype=torch.uint8, alignment=512)
-        if replica_transport in ("shmem_signal", "shmem_signal_sdma"):
+        if replica_transport in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel"):
             provider = provider_type(shmem_api, symmetric, budget, size,
-                                     use_sdma=replica_transport == "shmem_signal_sdma")
+                                     use_sdma=replica_transport != "shmem_signal",
+                                     parallel_prefetch=replica_transport == "shmem_signal_sdma_parallel")
         else:
             provider = provider_type(shmem_api, symmetric)
     ExpertParallel().apply(base, mesh)
@@ -365,7 +366,7 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             cross_layer = _cross_layer_pool(backend, budget, mesh, provider, executor, reference,
                                            tokens, hidden, intermediate, top_k)
         signal_stress = None
-        if replica_transport in ("shmem_signal", "shmem_signal_sdma") and hidden <= 128:
+        if replica_transport in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel") and hidden <= 128:
             active_provider = provider if executor is None else resources.workspace.replica_provider
             signal_stress = _signal_stress(active_provider, mesh, hidden, intermediate, budget)
         timing = None if not benchmark_iterations else _benchmark(
@@ -390,7 +391,8 @@ def main() -> None:
     """Initialize one worker group and run the selected executor."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("native", "push", "pull"), default="native")
-    parser.add_argument("--replica-transport", choices=("p2p", "shmem", "shmem_signal", "shmem_signal_sdma"),
+    parser.add_argument("--replica-transport",
+                        choices=("p2p", "shmem", "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel"),
                         default="p2p")
     parser.add_argument("--benchmark-iterations", type=int, default=0)
     parser.add_argument("--budget", type=int, default=1)

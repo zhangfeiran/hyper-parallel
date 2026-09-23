@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import math
 import threading
 from typing import Any, Iterator
@@ -64,7 +64,7 @@ class SignalReplicaTransport:
     """
 
     def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int,
-                 *, use_sdma: bool = False) -> None:
+                 *, use_sdma: bool = False, parallel_prefetch: bool = False) -> None:
         """Bind externally owned, 64-byte-aligned symmetric uint8 storage.
 
         Args:
@@ -74,13 +74,19 @@ class SignalReplicaTransport:
             ep_size: Number of ranks in the runtime's peer namespace.
             use_sdma: Request runtime put/get with use_sdma=True. The runtime must
                 support direct peer mapping and complete copies in stream order.
+            parallel_prefetch: Enqueue outgoing SDMA weights on one stream per peer.
+                Join these streams before releasing the lease; gradients remain ordered.
         """
         if (storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous()
                 or storage.data_ptr() % _SIGNAL_BYTES):
             raise ValueError("Signal replica storage must be a cache-line-aligned contiguous uint8 vector")
         _integer(slots, "slots")
         _integer(ep_size, "ep_size")
+        if parallel_prefetch and not use_sdma:
+            raise ValueError("Parallel replica prefetch requires SDMA copies")
         self.runtime = runtime
+        self._parallel_prefetch = parallel_prefetch
+        self._streams = {}
         self._copy_options = {"use_sdma": True} if use_sdma else {}
         self.storage = storage
         self.slots = slots
@@ -164,22 +170,59 @@ class SignalReplicaTransport:
         for item in transfers:
             if route.rank == item.target_rank:
                 self._publish(0, route.rank, item.target_slot - home, item.owner_rank, epoch)
-        for item in transfers:
-            if route.rank == item.owner_rank:
-                slot = item.target_slot - home
-                self._wait(0, item.target_rank, slot, epoch)
-                for weight, guest in zip(weights, guests):
-                    self.runtime.put(guest[slot], weight[item.owner_slot].contiguous(),
-                                     item.target_rank, **self._copy_options)
-                self._publish(1, route.rank, slot, item.target_rank, epoch)
-        for item in transfers:
-            if route.rank == item.target_rank:
-                slot = item.target_slot - home
-                self._wait(1, item.owner_rank, slot, epoch)
-                self._publish(2, route.rank, slot, item.owner_rank, epoch)
-        for item in transfers:
-            if route.rank == item.owner_rank:
-                self._wait(2, item.target_rank, item.target_slot - home, epoch)
+        with self._prefetch_streams(route, weights[0].device) as (backend, streams):
+            for item in transfers:
+                if route.rank == item.owner_rank:
+                    stream = streams.get(item.target_rank)
+                    with nullcontext() if stream is None else backend.stream(stream):
+                        self._put_weights(weights, guests, item, home, epoch, stream)
+            for item in transfers:
+                if route.rank == item.target_rank:
+                    slot = item.target_slot - home
+                    self._wait(1, item.owner_rank, slot, epoch)
+                    self._publish(2, route.rank, slot, item.owner_rank, epoch)
+            for item in transfers:
+                if route.rank == item.owner_rank:
+                    self._wait(2, item.target_rank, item.target_slot - home, epoch)
+
+    def _put_weights(self, weights: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
+                     item: Any, home: int, epoch: int, stream: Any) -> None:
+        slot = item.target_slot - home
+        self._wait(0, item.target_rank, slot, epoch)
+        for weight, guest in zip(weights, guests):
+            source = weight[item.owner_slot].contiguous()
+            if stream is not None:
+                source.record_stream(stream)
+            self.runtime.put(guest[slot], source, item.target_rank, **self._copy_options)
+        self._publish(1, item.owner_rank, slot, item.target_rank, epoch)
+
+    @contextmanager
+    def _prefetch_streams(self, route: ReplicaRoute, device: torch.device) -> Iterator[tuple[Any, dict]]:
+        if not self._parallel_prefetch:
+            yield None, {}
+            return
+        peers = sorted({item.target_rank for item in route.plan.transfers if item.owner_rank == route.rank})
+        backend = getattr(torch, device.type)
+        caller = backend.current_stream(device)
+        streams = {}
+        try:
+            if peers:
+                ready = backend.Event()
+                # Fork after source preparation and all incoming credits, avoiding cyclic waits.
+                ready.record(caller)
+                for peer in peers:
+                    if peer not in self._streams:
+                        self._streams[peer] = backend.Stream(device=device)
+                    stream = self._streams[peer]
+                    stream.wait_event(ready)
+                    streams[peer] = stream
+            yield backend, streams
+        finally:
+            # The pool/workspace completion event must include every remote copy consumer.
+            for stream in streams.values():
+                done = backend.Event()
+                done.record(stream)
+                caller.wait_event(done)
 
     def return_gradients(self, gradients: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
                          route: ReplicaRoute) -> tuple[torch.Tensor, ...]:
