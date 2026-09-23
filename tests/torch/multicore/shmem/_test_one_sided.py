@@ -62,6 +62,37 @@ def test_binding_put_get() -> None:
     release_runtime()
 
 
+def test_binding_sdma_put_get() -> None:
+    """Copy bounded symmetric views through DMA, preserving untouched guard bytes."""
+    acquire_runtime()
+    rank, size = dist.get_rank(), dist.get_world_size()
+    peer, previous = (rank + 1) % size, (rank - 1) % size
+    buffer = shmem.empty(65536 + 128, dtype=torch.uint8, alignment=512)
+    source = torch.full_like(buffer, rank + 1)
+    destination = torch.empty_like(source)
+    for length in (0, 16, 64, 513, 65536):
+        buffer.zero_()
+        destination.zero_()
+        shmem.host_barrier()
+        shmem.put(buffer[64:64 + length], source[64:64 + length], peer, use_sdma=True)
+        shmem.host_barrier()
+        expected = torch.zeros_like(buffer)
+        expected[64:64 + length].fill_(previous + 1)
+        torch.testing.assert_close(buffer, expected, rtol=0, atol=0)
+        shmem.get(destination[64:64 + length], buffer[64:64 + length], peer, use_sdma=True)
+        torch.npu.synchronize()
+        expected[64:64 + length].fill_(rank + 1)
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="source_pe"):
+        shmem.get(destination[:16], buffer[:16], size, use_sdma=True)
+    shmem.host_barrier()
+    stale = buffer[:16]
+    shmem.free(buffer)
+    with pytest.raises(RuntimeError, match="invalidated"):
+        shmem.get(destination[:16], stale, peer, use_sdma=True)
+    release_runtime()
+
+
 def test_binding_config_projection() -> None:
     """Exercise the debug_state config and allocation-table projections (no device barrier)."""
     acquire_runtime()
