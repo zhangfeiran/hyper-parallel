@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections.abc import Callable
 import threading
 from typing import Iterator
 from weakref import WeakKeyDictionary
@@ -35,6 +36,11 @@ class ReplicaPool:
         self.gradients = None
         self._lock = threading.Lock()
         self._event = None
+        self.weight_ready = None
+
+    def wait_weights(self) -> None:
+        """Keep the eager pool compatible with deferred guest consumers."""
+
 
     @contextmanager
     def lease(self, *, backward: bool = False) -> Iterator[ReplicaPool]:
@@ -64,6 +70,24 @@ class ReplicaPool:
                             tensor.record_stream(stream)
             finally:
                 self._lock.release()
+
+
+class ReplicaPrefetch:
+    """Invocation-owned view that separates local work from guest readiness."""
+
+    def __init__(self, pool: ReplicaPool, wait: Callable[[], None], ready: tuple[int, int]) -> None:
+        """Borrow leased tensors and expose device ready base/epoch to fused consumers."""
+        self.weights = pool.weights
+        self.gradients = pool.gradients
+        self.weight_ready = ready
+        self._wait = wait
+        self._waited = False
+
+    def wait_weights(self) -> None:
+        """Order this invocation's caller before its first guest-weight read."""
+        if not self._waited:
+            self._wait()
+            self._waited = True
 
 
 _POOLS = WeakKeyDictionary()

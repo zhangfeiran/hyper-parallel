@@ -200,7 +200,8 @@ def _signal_stress(provider, mesh, hidden, intermediate, budget):
         if rank == step % size:
             time.sleep(0.003)
         with torch.npu.stream(stream):
-            with prefetch_weights(weights, route, backward=True) as pool:
+            with prefetch_weights(weights, route, backward=True, overlap=True) as pool:
+                pool.wait_weights()
                 copies = [(value[slot - 6].clone(), step * 10 + owner)
                           for slot, expert in enumerate(plan.slot_to_logical[rank]) if slot >= 6 and expert >= 0
                           for value in pool.weights]

@@ -70,7 +70,7 @@ def test_binding_sdma_put_get() -> None:
     buffer = shmem.empty(65536 + 128, dtype=torch.uint8, alignment=512)
     source = torch.full_like(buffer, rank + 1)
     destination = torch.empty_like(source)
-    for length in (0, 16, 64, 513, 65536):
+    for length in (0, 4, 16, 64, 513, 65536):
         buffer.zero_()
         destination.zero_()
         shmem.host_barrier()

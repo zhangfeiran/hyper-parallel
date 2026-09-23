@@ -14,7 +14,9 @@
 # ============================================================================
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
+import struct
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
@@ -58,6 +60,24 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertIs(result[1], execution.intermediates.grad_weight1)
         self.assertIs(result[2], execution.intermediates.grad_weight2)
         context.workspace.release.assert_called_once_with()
+
+    def test_split_runtime_preserves_v2_and_encodes_deferred_ready_v3(self) -> None:
+        """Only deferred consumers receive the per-slot device ready base and epoch."""
+        base = torch.arange(16, dtype=torch.uint8)
+        weights = (torch.empty(1), torch.empty(2))
+        gradients = (torch.empty(3), torch.empty(4))
+        for ready, backward in product((None, (4096, 17)), (False, True)):
+            with self.subTest(ready=ready, backward=backward):
+                pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=ready)
+                with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream"):
+                    result = function_module._split_runtime(  # pylint: disable=protected-access
+                        base, pool, 6, backward=backward)
+                torch.testing.assert_close(result[:16], base)
+                data = bytes(result[16:].tolist())
+                values = struct.unpack("<II5Q" if ready is None else "<II7Q", data)
+                pointers = tuple(g.data_ptr() for g in gradients) if backward else (0, 0)
+                expected = (0x53505754, 2 if ready is None else 3, 6, *(w.data_ptr() for w in weights), *pointers)
+                self.assertEqual(values, expected + (() if ready is None else ready))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

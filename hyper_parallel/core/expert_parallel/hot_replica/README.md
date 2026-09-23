@@ -146,6 +146,28 @@ it is released with the provider after all streams finish. It is not a measured
 net peak-HBM increase relative to transient buffers in the ordered implementation.
 The original P2P, serial SDMA and weight-only parallel SDMA options remain available.
 
+`replica_transport="shmem_signal_sdma_overlap"` retains bidirectional parallel
+copies and lets home computation begin before guest weights arrive. Native
+providers select `overlap_home=True` together with parallel SDMA prefetch.
+The shared `prefetch_weights(..., overlap=True)` scope returns leased tensors
+with `wait_weights()` and optional `weight_ready=(base_address, epoch)` metadata.
+Ordinary eager providers retain their existing behavior. A native consumer waits
+before its first guest GMM; a fused consumer honors the per-slot ready metadata.
+The initial implementation overlaps home GMM1 in forward and home activation
+gradient matmul in backward, preserving the existing task order.
+
+Credits and any source contiguity conversion run before the copy streams fork.
+Those streams then issue only SDMA weight and ready-word copies: publication
+does not need an AIV helper to run alongside a fused kernel. Readiness uses an
+existing cache line per guest slot, adding no symmetric heap bytes. The shared
+lease joins copies and acknowledges receivers before releasing storage, even
+when the caller has no guest rows. All ranks must use the same mode.
+
+Multicore deferred consumers require split-weight runtime ABI v3, which appends
+the ready base and epoch to the v2 layout. Matching forward/backward kernels
+must be rebuilt; an older payload does not support this optional mode. The
+new kernels continue accepting v2 for eager prefetch.
+
 Signal storage and the persistent provider are freed/recreated together by the
 heap manager. Autograd saves neither symmetric addresses nor an old provider for
 multicore. Native callers must keep their externally supplied provider/storage

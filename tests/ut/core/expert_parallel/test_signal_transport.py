@@ -214,6 +214,65 @@ def _guest_gradient(step: int, rank: int, projection: int) -> float:
 class TestSignalReplicaTransport(unittest.TestCase):
     """Check changing owners with many calls queued before any device progress."""
 
+    def test_home_work_can_precede_copy_completion(self):
+        """Delay all DMA until home work runs, including ring routes and changing owners."""
+        ranks = 4
+        size = signal_storage_bytes(((2, 2), (2, 1)), 1, ranks, 2)
+        for seed in range(24):
+            world = _World(ranks, size)
+            runtimes = [_Runtime(world, rank, use_sdma=True) for rank in range(ranks)]
+            providers = [SignalReplicaTransport(runtime, storage, 1, ranks, use_sdma=True,
+                                                parallel_prefetch=True, overlap_home=True)
+                         for runtime, storage in zip(runtimes, world.storage)]
+            checked = []
+            for step in range(12):
+                counts = [[100 if expert == step % ranks else 0 for expert in range(ranks)]] * ranks
+                plan = _cyclic_plan(ranks) if step % 3 == 2 else build_expert_replica_plan(counts, 1)
+                for rank, provider in enumerate(providers):
+                    runtime = runtimes[rank]
+                    home_done = SimpleNamespace(done=False)
+                    weights = (torch.full((1, 2, 2), step * 10 + rank, dtype=torch.bfloat16),
+                               torch.full((1, 2, 1), step * 10 + rank, dtype=torch.bfloat16))
+
+                    def _put(destination, source, target, *, use_sdma=False,
+                             rank=rank, home_done=home_done):
+                        self.assertTrue(use_sdma)
+                        self.assertNotEqual(world.current[rank], rank)
+                        remote = world.remote(destination, rank, target)
+                        world.queues[world.current[rank]].append(
+                            (lambda: home_done.done, lambda: remote.copy_(source)))
+
+                    route = SimpleNamespace(plan=plan, rank=rank)
+                    signal, wait_signal = runtime.signal, runtime.wait_signal
+
+                    def _signal(*args, signal=signal, rank=rank, **kwargs):
+                        self.assertEqual(world.current[rank], rank)
+                        signal(*args, **kwargs)
+
+                    def _wait_signal(*args, wait_signal=wait_signal, rank=rank, **kwargs):
+                        self.assertEqual(world.current[rank], rank)
+                        wait_signal(*args, **kwargs)
+
+                    with patch.object(torch, "cpu", _Backend(world, rank)), \
+                            patch.object(torch.Tensor, "record_stream"), patch.object(runtime, "put", _put), \
+                            patch.object(runtime, "signal", _signal), \
+                            patch.object(runtime, "wait_signal", _wait_signal), \
+                            provider.lease(weights, route, overlap=True) as pool:
+                        runtime.enqueue(lambda home_done=home_done: setattr(home_done, "done", True))
+                        self.assertIsNotNone(pool.weight_ready)
+                        pool.wait_weights()
+                        pool.wait_weights()
+                        owner = plan.slot_to_logical[rank][1]
+                        if owner >= 0:
+                            def _consume(values=pool.weights, expected=step * 10 + owner):
+                                for value in values:
+                                    torch.testing.assert_close(value, torch.full_like(value, expected))
+                                checked.append(True)
+                            runtime.enqueue(_consume)
+            world.drain(seed)
+            self.assertEqual(len(checked), 40)
+            self.assertEqual(world.barriers, [1] * ranks)
+
     def test_owner_rotation_never_overwrites_live_slots(self):
         """Credits protect a slot even when an unrelated next owner runs ahead."""
         ranks = 4
@@ -375,6 +434,9 @@ class TestSignalReplicaTransport(unittest.TestCase):
             SignalReplicaTransport(runtime, torch.empty(64, dtype=torch.uint8), 1, 2, parallel_prefetch=True)
         with self.assertRaisesRegex(ValueError, "requires SDMA"):
             SignalReplicaTransport(runtime, torch.empty(64, dtype=torch.uint8), 1, 2, parallel_gradients=True)
+        with self.assertRaisesRegex(ValueError, "requires parallel SDMA"):
+            SignalReplicaTransport(runtime, torch.empty(64, dtype=torch.uint8), 1, 2,
+                                   use_sdma=True, overlap_home=True)
         self.assertFalse(runtime.host_barrier.called)
 
     def test_invalid_layout_fails_before_collectives(self):
