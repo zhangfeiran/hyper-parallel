@@ -24,7 +24,7 @@ import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaConfig, build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, prepare_replica_route
-from hyper_parallel.core.expert_parallel.hot_replica import transport
+from hyper_parallel.core.expert_parallel.hot_replica import native, transport
 from hyper_parallel.core.multicore.modules.mega_moe.spec import initial_receive_capacity
 from tests.common.mark_utils import arg_mark
 
@@ -32,6 +32,34 @@ from tests.common.mark_utils import arg_mark
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestHotReplica(unittest.TestCase):
     """Check capacity against independent distinct-TopK route generation."""
+
+    def test_native_guest_wait_follows_home_matmul(self):
+        """Preserve exact row ordering while home computation precedes the guest wait."""
+        for home_rows, guest_rows in ((2, 3), (0, 3), (2, 0)):
+            for transpose in (False, True):
+                with self.subTest(home=home_rows, guest=guest_rows, transpose=transpose):
+                    route = SimpleNamespace(rank=0, plan=SimpleNamespace(
+                        config=SimpleNamespace(home_experts=1, slots_per_rank=2),
+                        dispatch_counts=((home_rows, guest_rows),)))
+                    inputs = torch.arange((home_rows + guest_rows) * 2).reshape(-1, 2).float()
+                    home, guest = torch.eye(2).unsqueeze(0), (torch.eye(2) * 3).unsqueeze(0)
+                    events = []
+
+                    def _gmm(values, weights, groups):
+                        events.append("home" if weights.data_ptr() == home.data_ptr() else "guest")
+                        self.assertEqual(int(groups[-1]), len(values))
+                        return values @ weights[0]
+
+                    prefetch = SimpleNamespace(wait_weights=lambda: events.append("wait"))
+                    with patch.object(native, "_gmm", _gmm):
+                        result = native._split_gmm(  # pylint: disable=protected-access
+                            inputs, home, guest, torch.tensor([home_rows, home_rows + guest_rows]),
+                            route, transpose=transpose, prefetch=prefetch)
+                    expected = inputs.clone()
+                    expected[home_rows:] *= 3
+                    torch.testing.assert_close(result, expected)
+                    self.assertEqual(events, (["home"] if home_rows else []) +
+                                     (["wait", "guest"] if guest_rows else []))
 
     def test_exhaustive_small_routes(self):
         """All two-rank token routes conserve counts and obey the B bound."""

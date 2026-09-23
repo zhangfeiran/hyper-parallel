@@ -22,7 +22,7 @@ from typing import Iterator
 import torch
 import torch.distributed as dist
 
-from .pool import ReplicaPool, replica_pool
+from .pool import ReplicaPool, ReplicaPrefetch, replica_pool
 from .routing import ReplicaRoute
 
 
@@ -35,15 +35,19 @@ def _exchange(operations: list) -> None:
 
 @contextmanager
 def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
-                     *, backward: bool = False, provider: object = None) -> Iterator[ReplicaPool]:
+                     *, backward: bool = False, provider: object = None,
+                     overlap: bool = False) -> Iterator[ReplicaPool | ReplicaPrefetch]:
     """Borrow home weights and fill only the shared B guest slots.
 
     Ordinary pool allocations remain valid across push SHMEM heap growth.
     The lease spans all consumers, including gradient return in backward.
+    With overlap=True, an enabled provider may defer guest readiness. Call
+    wait_weights() before guest reads, or honor weight_ready in a fused kernel.
     """
     provider = route.transport if provider is None else provider
     if provider is not None and callable(getattr(provider, "lease", None)):
-        with provider.lease(weights, route, backward=backward) as pool:
+        options = {"overlap": True} if overlap and getattr(provider, "overlap_home", False) else {}
+        with provider.lease(weights, route, backward=backward, **options) as pool:
             yield pool
         return
     config = route.plan.config
