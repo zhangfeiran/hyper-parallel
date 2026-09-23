@@ -50,7 +50,7 @@ def stable_expert_order(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
 
 def prepare_replica_route(
     topk_ids: torch.Tensor, config: ExpertReplicaConfig, group: object = None,
-    *, target_load: int | None = None,
+    *, target_load: int | None = None, minimum_replica_rows: int = 0,
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
@@ -86,6 +86,7 @@ def prepare_replica_route(
     plan = build_expert_replica_plan(
         [row[:-1] for row in host], config.replica_slots_per_rank,
         target_load=min(upper, target_load) if target_load is not None else None,
+        minimum_replica_rows=minimum_replica_rows, capacity_limit=upper,
     )
     if max(plan.destination_loads) > upper:
         raise RuntimeError("replica planner exceeded the theoretical receive bound")
