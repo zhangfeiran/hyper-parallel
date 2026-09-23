@@ -22,7 +22,7 @@ import weakref
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
-from hyper_parallel.core.expert_parallel.hot_replica.pool import ReplicaPool, replica_pool
+from hyper_parallel.core.expert_parallel.hot_replica.pool import ReplicaPool, ReplicaPrefetch, replica_pool
 from tests.common.mark_utils import arg_mark
 
 
@@ -33,6 +33,15 @@ class _Group:
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestReplicaPool(unittest.TestCase):
     """Exercise the pool independently of accelerator and collective setup."""
+
+    def test_whole_slot_prefetch_keeps_its_original_callback_contract(self):
+        """Legacy no-argument ready callbacks run once even for matrix-specific reads."""
+        pool = ReplicaPool((torch.ones(1, 2, 2),), 1)
+        waited = []
+        prefetched = ReplicaPrefetch(pool, lambda: waited.append(True), (4096, 17))
+        prefetched.wait_weights(0)
+        prefetched.wait_weights()
+        self.assertEqual(waited, [True])
 
     def test_layer_reuse_and_group_lifetime(self):
         """Different layers reuse B storage without pinning parameters or groups."""

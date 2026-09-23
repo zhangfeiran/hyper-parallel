@@ -34,7 +34,7 @@ _MAX_EPOCH = 2**31 - 1
 
 SIGNAL_TRANSPORT_MODES = (
     "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel", "shmem_signal_sdma_bidir",
-    "shmem_signal_sdma_overlap",
+    "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection",
 )
 
 
@@ -45,7 +45,8 @@ def signal_transport_options(mode: str) -> dict[str, bool]:
     return {"use_sdma": mode != "shmem_signal",
             "parallel_prefetch": mode in SIGNAL_TRANSPORT_MODES[2:],
             "parallel_gradients": mode in SIGNAL_TRANSPORT_MODES[3:],
-            "overlap_home": mode == "shmem_signal_sdma_overlap"}
+            "overlap_home": mode in SIGNAL_TRANSPORT_MODES[4:],
+            "projection_ready": mode == "shmem_signal_sdma_projection"}
 
 
 def _aligned(size: int) -> int:
@@ -53,7 +54,7 @@ def _aligned(size: int) -> int:
 
 
 def signal_storage_bytes(shapes: tuple[tuple[int, ...], ...], slots: int,
-                         ep_size: int, element_size: int) -> int:
+                         ep_size: int, element_size: int, *, projection_ready: bool = False) -> int:
     """Size B weight/FP32-gradient slots and cache-line-separated peer signals."""
     _integer(slots, "slots")
     _integer(ep_size, "ep_size")
@@ -66,7 +67,8 @@ def signal_storage_bytes(shapes: tuple[tuple[int, ...], ...], slots: int,
         for dim in shape:
             _integer(dim, "expert matrix dimension")
     matrices = sum(_aligned(slots * math.prod(shape) * size) for size in (element_size, 4) for shape in shapes)
-    return matrices + _SIGNAL_CHANNELS * ep_size * slots * _SIGNAL_BYTES
+    ready_bytes = len(shapes) * slots * _SIGNAL_BYTES if projection_ready else 0
+    return matrices + _SIGNAL_CHANNELS * ep_size * slots * _SIGNAL_BYTES + ready_bytes
 
 
 class SignalReplicaTransport:
@@ -81,7 +83,7 @@ class SignalReplicaTransport:
 
     def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int,
                  *, use_sdma: bool = False, parallel_prefetch: bool = False,
-                 parallel_gradients: bool = False, overlap_home: bool = False) -> None:
+                 parallel_gradients: bool = False, overlap_home: bool = False, projection_ready: bool = False) -> None:
         """Bind externally owned, 64-byte-aligned symmetric uint8 storage.
 
         Args:
@@ -98,6 +100,9 @@ class SignalReplicaTransport:
                 FP32 expert gradient across projections, independent of slots/peers.
             overlap_home: Permit deferred guest reads when the caller requests overlap.
                 Requires parallel SDMA prefetch; ready publication also uses SDMA.
+            projection_ready: Publish separate ready words for each weight matrix. Requires
+                home overlap. Forward copies matrices in tuple order; backward reverses it.
+                Include projection_ready=True when sizing the symmetric storage.
         """
         if (storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous()
                 or storage.data_ptr() % _SIGNAL_BYTES):
@@ -108,6 +113,10 @@ class SignalReplicaTransport:
             raise ValueError("Parallel replica transport requires SDMA copies")
         if overlap_home and not (use_sdma and parallel_prefetch):
             raise ValueError("Home overlap requires parallel SDMA prefetch")
+        if projection_ready and not overlap_home:
+            raise ValueError("Projection readiness requires home overlap")
+        self._projection_ready = projection_ready
+        self.projection_signals = None
         self.runtime = runtime
         self.overlap_home = overlap_home
         self._parallel_prefetch = parallel_prefetch
@@ -141,7 +150,8 @@ class SignalReplicaTransport:
         if any(weight.device != self.storage.device or weight.dtype != weights[0].dtype for weight in weights):
             raise ValueError("Signal weights must share the symmetric storage device and one dtype")
         shapes = tuple(tuple(weight.shape[1:]) for weight in weights)
-        required = signal_storage_bytes(shapes, self.slots, self.ep_size, weights[0].element_size())
+        required = signal_storage_bytes(shapes, self.slots, self.ep_size, weights[0].element_size(),
+                                        projection_ready=self._projection_ready)
         if required > self.storage.numel():
             raise ValueError("Symmetric signal replica storage is too small")
         views = []
@@ -151,9 +161,14 @@ class SignalReplicaTransport:
                 length = self.slots * math.prod(shape) * size
                 views.append(self.storage[offset:offset + length].view(dtype).reshape(self.slots, *shape))
                 offset += _aligned(length)
-        self.signals = self.storage[offset:required].view(torch.int32).reshape(
+        signal_end = offset + _SIGNAL_CHANNELS * self.ep_size * self.slots * _SIGNAL_BYTES
+        self.signals = self.storage[offset:signal_end].view(torch.int32).reshape(
             _SIGNAL_CHANNELS, self.ep_size, self.slots, _SIGNAL_BYTES // 4)
         self.signals.zero_()
+        if self._projection_ready:
+            self.projection_signals = self.storage[signal_end:required].view(torch.int32).reshape(
+                len(weights), self.slots, _SIGNAL_BYTES // 4)
+            self.projection_signals.zero_()
         self.runtime.host_barrier()
         self.pool = ReplicaPool(tuple(views[:len(weights)]), self.slots, borrow=True)
         self.pool.gradients = tuple(views[len(weights):])
@@ -163,6 +178,8 @@ class SignalReplicaTransport:
         if self.epoch == _MAX_EPOCH:
             self.runtime.host_barrier()
             self.signals.zero_()
+            if self.projection_signals is not None:
+                self.projection_signals.zero_()
             self.runtime.host_barrier()
             self.epoch = 0
         self.epoch += 1
@@ -190,7 +207,7 @@ class SignalReplicaTransport:
             self._bind(weights)
             with self.pool.lease(backward=backward):
                 if overlap and self.overlap_home:
-                    with self._overlapped_prefetch(weights, route) as prefetched:
+                    with self._overlapped_prefetch(weights, route, backward=backward) as prefetched:
                         yield prefetched
                 else:
                     self.prefetch(weights, self.pool.weights, route)
@@ -200,7 +217,7 @@ class SignalReplicaTransport:
 
     @contextmanager
     def _overlapped_prefetch(self, weights: tuple[torch.Tensor, ...],
-                             route: ReplicaRoute) -> Iterator[ReplicaPrefetch]:
+                             route: ReplicaRoute, *, backward: bool = False) -> Iterator[ReplicaPrefetch]:
         epoch = self._advance()
         home = route.plan.config.home_experts
         incoming = [item for item in route.plan.transfers if item.target_rank == route.rank]
@@ -214,23 +231,39 @@ class SignalReplicaTransport:
                    for item in outgoing}
         value = torch.tensor([epoch], dtype=torch.int32, device=weights[0].device)
 
-        def _wait():
+        def _wait(matrix_index=None):
             for item in incoming:
-                self._wait(1, 0, item.target_slot - home, epoch)
+                slot = item.target_slot - home
+                if self._projection_ready:
+                    self.runtime.wait_signal(self.projection_signals[matrix_index, slot, :1], epoch, comparison="ge")
+                else:
+                    self._wait(1, 0, slot, epoch)
+
+        order = tuple(range(len(weights)))
+        if self._projection_ready and backward:
+            order = order[::-1]
 
         peers = sorted({item.target_rank for item in outgoing})
         with self._copy_streams(peers, self._streams, weights[0].device) as (backend, streams):
             for item in outgoing:
                 stream = streams[item.target_rank]
                 with backend.stream(stream):
-                    for source, guest in zip(sources[item.owner_slot], self.pool.weights):
-                        source.record_stream(stream)
-                        self.runtime.put(guest[item.target_slot - home], source, item.target_rank,
-                                         **self._copy_options)
+                    slot = item.target_slot - home
                     value.record_stream(stream)
-                    self.runtime.put(self._word(1, 0, item.target_slot - home), value, item.target_rank,
-                                     **self._copy_options)
-            prefetched = ReplicaPrefetch(self.pool, _wait, (self.signals[1, 0].data_ptr(), epoch))
+                    for index in order:
+                        source = sources[item.owner_slot][index]
+                        source.record_stream(stream)
+                        self.runtime.put(self.pool.weights[index][slot], source, item.target_rank,
+                                         **self._copy_options)
+                        if self._projection_ready:
+                            self.runtime.put(self.projection_signals[index, slot, :1], value, item.target_rank,
+                                             **self._copy_options)
+                    if not self._projection_ready:
+                        self.runtime.put(self._word(1, 0, slot), value, item.target_rank, **self._copy_options)
+            ready = None if self._projection_ready else (self.signals[1, 0].data_ptr(), epoch)
+            projection_ready = ((tuple(value.data_ptr() for value in self.projection_signals), epoch)
+                                if self._projection_ready else None)
+            prefetched = ReplicaPrefetch(self.pool, _wait, ready, projection_ready=projection_ready)
             try:
                 yield prefetched
             finally:

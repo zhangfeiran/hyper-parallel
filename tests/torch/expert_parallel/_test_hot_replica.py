@@ -283,8 +283,9 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         if replica_transport in SIGNAL_TRANSPORT_MODES:
             signal_module = importlib.import_module("hyper_parallel.core.expert_parallel.hot_replica.signal_transport")
             provider_type = signal_module.SignalReplicaTransport
-            needed = signal_module.signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)),
-                                                        budget, size, 2)
+            needed = signal_module.signal_storage_bytes(
+                ((hidden, 2 * intermediate), (intermediate, hidden)), budget, size, 2,
+                projection_ready=signal_transport_options(replica_transport)["projection_ready"])
         heap = ((needed + 511 + 2**21 - 1) // 2**21) * 2**21
         shmem_api.acquire(mesh.get_group(), heap_size_bytes=heap)
         symmetric = shmem_api.empty((needed,), dtype=torch.uint8, alignment=512)
