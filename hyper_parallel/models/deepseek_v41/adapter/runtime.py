@@ -75,7 +75,9 @@ class DeepseekV41TextBatch(TextParallelBatch):
 
     def _build_runtime_inputs(self, parallel_batch: Mapping[str, Any]) -> dict[str, Any]:
         """Preserve compact sample boundaries for shared compressed attention."""
-        return DeepseekV41Runtime().build(batch=parallel_batch, parallel_context=self.parallel_context)
+        runtime_inputs = DeepseekV41Runtime().build(batch=parallel_batch, parallel_context=self.parallel_context)
+        # TextParallelBatch owns positions, including packed resets and CP slicing.
+        return {"packed_seq_params": runtime_inputs["packed_seq_params"]}
 
 
 __all__ = ["DeepseekV41Runtime", "DeepseekV41TextBatch"]

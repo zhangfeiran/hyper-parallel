@@ -37,7 +37,7 @@ from hyper_parallel.models.deepseek_v41.adapter.replacements import (
     DeepseekV41TrainingExperts,
 )
 
-from hyper_parallel.models.deepseek_v41.adapter.runtime import DeepseekV41TextBatch
+from hyper_parallel.models.deepseek_v41.adapter.runtime import DeepseekV41Runtime, DeepseekV41TextBatch
 from hyper_parallel.models.deepseek_v41.adapter.expert_parallel import configure_megamoe, deepseek_v41_ep_compute_fn
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
 from hyper_parallel.trainer.base import BaseTrainer
@@ -218,7 +218,38 @@ class TestDeepseekV41TrainingExperts(unittest.TestCase):
                                                 "cu_seq_lens": boundaries})
         torch.testing.assert_close(result["packed_seq_params"].cu_seq_lens, boundaries)
         self.assertEqual(result["packed_seq_params"].global_sequence_length, 128)
-        self.assertEqual(result["position_ids"].shape, (1, 128))
+        self.assertEqual(set(result), {"packed_seq_params"})
+
+    def test_text_batch_preserves_framework_positions_through_input_split(self):
+        """Packed resets and CP offsets survive the complete text batch call without collisions."""
+        for cp_rank, reset, expected in ((0, False, [0, 1, 2, 3]), (1, False, [4, 5, 6, 7]),
+                                        (0, True, [0, 1, 2, 0]), (1, True, [1, 2, 3, 4])):
+            with self.subTest(cp_rank=cp_rank, reset=reset):
+                batcher = object.__new__(DeepseekV41TextBatch)
+                batcher.parallel_context = SimpleNamespace(tp_rank=0, cp_rank=cp_rank,
+                                                           tp_world_size=1, cp_world_size=2)
+                batcher.reset_position_ids = reset
+                batcher.eod_mask_loss = False
+                batcher.labels_are_shifted = True
+                boundaries = torch.tensor([0, 3, 8], dtype=torch.int32)
+                batch = {"input_ids": torch.ones(1, 4, dtype=torch.long),
+                         "labels": torch.tensor([[1, 2, -100, 4]]), "cu_seq_lens": boundaries}
+                batcher.cp_sharder = SimpleNamespace(shard=lambda value: value)
+                batcher.tp_broadcaster = SimpleNamespace(broadcast=lambda value, _: value)
+                with (patch.object(batcher, "_read_source_batch", return_value=batch),
+                      patch.object(batcher, "_normalize_source_batch", side_effect=lambda value: value),
+                      patch.object(batcher, "_resolve_sequence_boundaries", return_value=boundaries),
+                      patch.object(batcher, "_log_batch_flow")):
+                    model_inputs, loss_inputs = batcher(iter(()))
+                torch.testing.assert_close(model_inputs["position_ids"], torch.tensor([expected]))
+                torch.testing.assert_close(loss_inputs["loss_mask"], torch.tensor([[1, 1, 0, 1]]))
+                self.assertIs(model_inputs["shift_labels"], batch["labels"])
+                self.assertEqual(model_inputs["packed_seq_params"].local_query_start, cp_rank * 4)
+                self.assertNotIn("image_sequence_start", model_inputs)
+
+                visual = DeepseekV41Runtime().build(batch=batch, parallel_context=batcher.parallel_context)
+                torch.testing.assert_close(visual["position_ids"], torch.arange(cp_rank * 4, cp_rank * 4 + 4)[None])
+                self.assertEqual(visual["image_sequence_start"], cp_rank * 4)
 
     def test_disabled_recipe_and_entrypoint_keep_original_behavior(self):
         """Default and explicit false preserve all config values and use TextTrainer."""
