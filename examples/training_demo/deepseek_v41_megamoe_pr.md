@@ -36,7 +36,9 @@ master 的示例使用 `components.modules.moe.GroupedExperts`；trainer_dev 尚
   训练结束时在销毁分布式进程组前关闭资源。文本和 VLM 共用 `BaseTrainer` 的配置、
   workspace 共享和资源关闭步骤，不另建 MegaMoe Trainer 子类。
 - 文本批次复用上游 `TextParallelBatch` 和 `DeepseekV41Runtime`，传入 V4.1 的
-  `SharedCompressedPackedSequence`，保留 packed sample 边界。
+  `SharedCompressedPackedSequence`，保留 packed sample 边界。文本 adapter 只添加
+  packed attention 元数据；`position_ids` 由框架生成，保留 packed reset 和 CP 切片。
+  VLM adapter 继续生成图像插入所需的位置编号和 `image_sequence_start`。
 
 multicore 的实现来自上述 master 提交、PR #847 和 `megamoe-push-pull` 的外部权重接口。
 permute-grad 沿用上游对 `torch_npu.npu_moe_token_permute_grad_v2` 的调用，
@@ -145,7 +147,7 @@ HYPER_PARALLEL_PLATFORM=torch python -m pytest -q \
 
 当前环境为 Torch 2.9.0、torch_npu 2.9.0.post6、CANN 9.1，已确认提供
 `npu_moe_token_permute_grad_v2`。本轮从合并后的源码重新构建 native payload，构建通过。
-动态 token 接入后的上述 CPU 回归为 **137 passed、424 subtests passed**。
+动态 token 接入及文本 batch 修复后的上述 CPU 回归为 **138 passed、428 subtests passed**。
 文本与 VLM 的 `megamoe=false` 配置保持不变。适配、测试文件 pylint、
 `git diff --check` 和 ST launcher 的框架导入边界检查通过。
 
@@ -186,7 +188,63 @@ HYPER_PARALLEL_PLATFORM=torch python -m pytest -vs \
 单层测试已通过：8 个 rank × 5 组输入，输出、输入梯度与路由梯度逐元素一致，
 专家权重梯度通过上述阈值。重饱和输入下，纯 FP32 的梯度误差仍存在，
 动态与固定路径的相对误差基本相同。设备监控发现并发外部进程，此次仅作为精度证据。
-整网任务继续排队，尚不声明新适配的整网精度通过。
+文本整网已经完成三步对照：EP8/E48、H5120/I2304、TopK6、每卡 256 token，
+`limit=10`、Muon。8 个 rank 的三步 loss、梯度范数和参数抽样均逐元素一致，
+optimizer 正常更新，资源正常关闭。该文本样例使用 `expert_capacity_factor=null`；
+`factor=2` 时实际接收 3368 行，超过为 256 token 配置预留的 3072 行，会正确报错。
+此处只调整容量预留，不改变路由或数值阈值。
+
+VLM 的固定补位和动态版本均完成三步训练，动态专家实际接收 224/240 行。
+前两步 loss、梯度范数一致；第三步 loss 从 12.381835 到 12.357615，差约 0.196%，
+梯度范数从 77.020416 到 77.055603。重复运行复现相同轨迹，不能称为逐步完全一致。
+
+分阶段诊断保留原模型与 optimizer 计算，仅在边界读取快照：
+
+- 前两步专家输入、router ID/权重、专家输出的抽样一致。
+- 最早的已观测差异在 native 专家权重梯度输出，样例差值为 `1.90735e-6` 和
+  `3.81470e-6`，均为对应数值的一个 BF16 表示间隔。
+- FSDP 梯度缩放和 clipping 后，传入主参数的梯度抽样差异最大为 `6.08702e-9`；
+  梯度拷贝未引入新的差异位置。
+- Muon BF16 Newton–Schulz 输出差异增大：第二步更新方向抽样的相对 L2 差约 0.141%。
+  第一步学习率为零，主参数不变；第二步更新后主参数抽样差异最大为 `4.09782e-7`，
+  且差异仅出现在专家参数。
+
+进一步针对非空专家保存实际 GMM 输入，移除零补位行后，两版真实操作数逐元素一致：
+
+| 观察点 | 固定补位归约行数 | 动态归约行数 | 两版 dW 相对 L2 差 | 各自对 FP32 参考的相对 L2 误差 |
+| --- | ---: | ---: | ---: | ---: |
+| 第一步，rank3 / 本地 expert1，down_proj | 4536 | 672 | 2.899e-5 | 约 0.001659 |
+| 第二步，rank1 / 本地 expert5，gate_up_proj | 4932 | 1066 | 2.881e-5 | 约 0.001660 |
+
+两版在这两个完整矩阵上均通过既定 `rtol=2e-2, atol=2e-3`，没有超阈值元素。
+第一个矩阵共 11796480 个元素，其中 342 个在两版之间不同；第二个矩阵共
+23592960 个元素，其中 1109 个不同。大多数差异为 BF16 末位，也有少量超过一个
+表示间隔的差异，不能将全部差异概括为一个 ULP。
+
+对已捕获元素进一步使用 FP64 点积：第一个参考值为 `0.0002565383713`，
+固定/动态结果分别为 `0.0002574920654` 和 `0.0002555847168`；第二个参考值为
+`-0.0006008147708`，固定/动态分别为 `-0.0005989074707` 和 `-0.0006027221680`。
+这些值位于 BF16 舍入分界附近。第一处动态结果更接近 FP64，第二处固定结果更接近，
+没有证据表明固定补位路径在数值上始终更准确。观测结果支持不同归约长度下的 GMM
+累加舍入差异，随后被 BF16 输出量化，而非真实输入或路由语义变化。
+
+完整矩阵的第二步 Muon 诊断补充了抽样无法覆盖的尾部差异：
+
+| 观察点 | dW 相对 L2 差 | NS 更新方向相对 L2 差 | 更新后 FP32 权重最大差 | 转为 BF16 后不同的元素数 |
+| --- | ---: | ---: | ---: | ---: |
+| rank1 / 本地 expert5，gate_up_proj | 2.881e-5 | 0.005713 | 1.626e-6 | 1911 |
+| rank3 / 本地 expert1，down_proj | 2.164e-5 | 0.006504 | 2.791e-6 | 1954 |
+
+第三步第一层的输入、router ID 和权重仍一致，专家输出抽样开始不同。
+随后第 2/3/4 层分别有 33/83/122 个 token 的 Top-K **集合**变化，
+统计覆盖 8 个 rank 的全部 1840 个真实 token，已排除仅交换槽位顺序的情况。
+因此已定位的数值链路为：GMM 专家权重梯度舍入 → Muon BF16 NS 放大 → 参数转换时
+跨越 BF16 舍入分界 → 后续层 Top-K 集合变化 → 第三步 loss 分化。
+
+文本三步对照已通过；VLM 三步训练可运行，且差异来源已定位，但尚未达到逐步严格一致。
+原逐元素阈值保持不变，也未修改 Muon、关闭 clipping 或恢复模型 token 补位。
+初次完整矩阵采样命中了空专家，其全零结果不作为上述非空专家的 oracle 证据。
+本轮包含诊断同步及部分外部进程重叠，仅报告数值结果，不据此计算加速比或显存收益。
 
 性能需在精度通过后单独测量：固定 canonical 权重、数据、学习率计划和任务队列设置，
 基线使用 trainer_dev 原生 EP，候选使用本适配，按独立进程 ABBA 顺序运行。
