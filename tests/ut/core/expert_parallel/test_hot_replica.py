@@ -76,6 +76,76 @@ class TestHotReplica(unittest.TestCase):
         torch.testing.assert_close(result, inputs)
         self.assertEqual(waited, [True])
 
+    def test_copy_threshold_removes_small_balancing_transfers(self):
+        """Nearly balanced routes do not copy full experts for one and nine rows."""
+        row = [0] * 24
+        for index in range(512 * 8):
+            row[index % 24] += 1
+        original = build_expert_replica_plan([row] * 4, 1)
+        plan = build_expert_replica_plan([row] * 4, 1, minimum_replica_rows=16)
+        self.assertEqual(len(original.transfers), 2)
+        self.assertEqual(plan.transfers, ())
+        self.assertEqual(plan.destination_loads, (4104, 4104, 4096, 4080))
+        self.assertEqual(plan.logical_counts, original.logical_counts)
+
+    def test_copy_threshold_keeps_mandatory_work_and_consolidates_fragments(self):
+        """One existing copy absorbs necessary work before another small copy is removed."""
+        counts = [[512] * 8 + [0] * 16] * 4
+        config = ExpertReplicaConfig(24, 4, 1)
+        upper = config.maximum_receive_rows(512, 8, alignment=1)
+        for target in (None, 5120, 7168, 11008):
+            with self.subTest(target=target):
+                plan = build_expert_replica_plan(counts, 1, target_load=min(target, upper) if target else None,
+                                                minimum_replica_rows=4096, capacity_limit=upper)
+                plan.validate()
+                self.assertEqual(len(plan.transfers), 1)
+                self.assertLessEqual(max(plan.destination_loads), upper)
+                self.assertGreater(max(plan.destination_loads), 8192)
+
+    def test_histogram_inference_allows_optional_single_hot_copies_to_stay_home(self):
+        """Infer a conservative shape bound from distinct-TopK source histograms."""
+        row = [512] + [0] * 23
+        for index in range(512 * 7):
+            row[1 + index % 23] += 1
+        plan = build_expert_replica_plan([row] * 4, 1, minimum_replica_rows=1024)
+        self.assertEqual(plan.transfers, ())
+        self.assertEqual(plan.destination_loads, (5168, 3744, 3744, 3728))
+        self.assertLessEqual(max(plan.destination_loads), plan.config.maximum_receive_rows(512, 8, alignment=1))
+
+    def test_copy_threshold_preserves_capacity_across_valid_topk_shapes(self):
+        """Consolidation keeps all integer source quotas, budgets, and receive limits."""
+        rng = random.Random(9428)
+        for _ in range(80):
+            ranks, home, tokens = rng.randint(2, 6), rng.randint(1, 6), rng.randint(1, 40)
+            experts = ranks * home
+            top_k = rng.randint(1, experts)
+            counts = [[0] * experts for _ in range(ranks)]
+            for row in counts:
+                for _ in range(tokens):
+                    for expert in rng.sample(range(experts), top_k):
+                        row[expert] += 1
+            original_peak = max(sum(sum(row[rank * home:(rank + 1) * home]) for row in counts)
+                                for rank in range(ranks))
+            for budget in (0, 1, 2, home, home + 1):
+                original = build_expert_replica_plan(counts, budget)
+                upper = original.config.maximum_receive_rows(tokens, top_k, alignment=1)
+                for minimum, limit in itertools.product((0, 16, 4096), (None, upper)):
+                    plan = build_expert_replica_plan(counts, budget, minimum_replica_rows=minimum,
+                                                    capacity_limit=limit)
+                    plan.validate()
+                    self.assertLessEqual(max(plan.destination_loads), min(upper, original_peak))
+                    self.assertLessEqual(len(plan.transfers), len(original.transfers))
+                    if not minimum:
+                        self.assertEqual(plan, original)
+
+    def test_copy_threshold_rejects_invalid_policy_or_infeasible_capacity(self):
+        """Invalid thresholds and impossible receive limits fail before execution."""
+        for threshold in (-1, True, 1.5):
+            with self.assertRaisesRegex(ValueError, "minimum_replica_rows"):
+                build_expert_replica_plan([[2, 0], [2, 0]], 1, minimum_replica_rows=threshold)
+        with self.assertRaisesRegex(ValueError, "capacity_limit"):
+            build_expert_replica_plan([[2, 0], [2, 0]], 1, capacity_limit=1)
+
     def test_exhaustive_small_routes(self):
         """All two-rank token routes conserve counts and obey the B bound."""
         choices = list(itertools.combinations(range(4), 2))

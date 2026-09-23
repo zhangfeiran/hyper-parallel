@@ -263,3 +263,33 @@ exercise arbitrary rank progress with many calls queued ahead. The worker accept
 `--benchmark-iterations` for warmed forward/backward/SGD timing on a fixed hot
 route; performance comparisons require fresh-process paired runs and ownership
 auditing, separate from the precision results.
+
+## Filtering small expert copies
+
+`ExpertParallel(..., replica_min_rows=N)` and
+`MegaMoeExperts(..., replica_min_rows=N)` use the same host planner policy.
+The default `N=0` preserves token-balancing placement. With a positive threshold,
+the planner prefers returning smaller copies to their home owner. If capacity
+requires some of that work to remain remote, it first tries consolidating those
+rows into already selected copies. It creates no additional replica and keeps
+mandatory copies even when their row count is below the threshold.
+
+The threshold is a workload-specific proxy for exposed copy cost. Calibrate it
+with complete training-step comparisons; a fixed row threshold is not a complete
+compute/communication cost model. Source histograms and all logical TopK choices
+are unchanged, and original owners still receive the complete FP32 gradient sum.
+
+Multicore supplies its proven receive bound from the exact `S/K/B` shape. Native
+has expert-major histograms without original `S/K` metadata. For equal source
+sizes, the planner uses `T=S*K` and `max(count)<=S` to choose the largest feasible
+integer `K` dividing `T`. The receive bound is nonincreasing in `K` for fixed `T`,
+so the resulting bound is safe for every compatible distinct-TopK shape. Unequal
+source sizes use the constructive formula with observed home loads. A copy is
+removed only if the new plan respects the bound and does not exceed the original
+home-only peak load.
+
+Returning work home can increase receive capacity and reduce remote weight/grad
+bytes. Push retains dynamic growth up to the same theoretical maximum; the policy
+does not change the resident guest budget `B` or allocate another weight cache.
+Planner policy is per module and does not change the layout of shared execution
+storage. All EP ranks must use the same policy for a given invocation.

@@ -26,7 +26,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
 from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import SIGNAL_TRANSPORT_MODES
 
@@ -164,6 +164,7 @@ class MegaMoeExperts(MulticoreModule):
         capacity_growth_factor: float | None = None,
         replica_slots_per_rank: int = 0,
         replica_transport: str = "p2p",
+        replica_min_rows: int = 0,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -191,6 +192,10 @@ class MegaMoeExperts(MulticoreModule):
                 "shmem_signal_sdma_overlap" lets home compute precede guest-weight readiness.
                 "shmem_signal_sdma_projection" waits per projection, prefetching W13
                 first in forward and W2 first in backward.
+            replica_min_rows: Soft minimum rows per copied expert, default zero. Smaller
+                copies are retained when capacity requires them. Removing a copy can grow
+                the push receive buffer up to its theoretical bound. Calibrate the threshold
+                for the intended shape and use the same value on all EP ranks.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
@@ -218,6 +223,8 @@ class MegaMoeExperts(MulticoreModule):
                              "shmem_signal_sdma, shmem_signal_sdma_parallel, shmem_signal_sdma_bidir "
                              "shmem_signal_sdma_overlap or shmem_signal_sdma_projection")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
+        _integer(replica_min_rows, "replica_min_rows", 0)
+        self.replica_min_rows = replica_min_rows
         specification = {
             "local_num_tokens": local_num_tokens,
             "hidden_size": hidden_size,
@@ -440,6 +447,7 @@ class MegaMoeExperts(MulticoreModule):
                     replica_route = prepare_replica_route(
                         topk_ids, self.replica_config, self._ep_group,
                         target_load=resources.workspace.capacity_floor if not pull else None,
+                        minimum_replica_rows=self.replica_min_rows,
                     )
                     topk_ids = replica_route.physical_ids
                     tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]

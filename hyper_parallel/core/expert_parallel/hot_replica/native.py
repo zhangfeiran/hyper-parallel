@@ -153,7 +153,8 @@ class NativeReplicaDispatch:
 
 
 def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
-                             group: object, transport: object = None) -> tuple[tuple, NativeReplicaDispatch]:
+                             group: object, transport: object = None,
+                             *, minimum_replica_rows: int = 0) -> tuple[tuple, NativeReplicaDispatch]:
     """Dispatch existing native expert-major inputs through shared replicas."""
     values, counts = inputs[:2]
     rank = dist.get_rank(group)
@@ -162,7 +163,7 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
     work = dist.all_gather(gathered, payload, group=group, async_op=True)
     work.wait()
     host = torch.stack(gathered).cpu().tolist()
-    plan = build_expert_replica_plan(host, config.replica_slots_per_rank)
+    plan = build_expert_replica_plan(host, config.replica_slots_per_rank, minimum_replica_rows=minimum_replica_rows)
     physical = plan.physical_to_logical
     runs = sorted((expert, slot, plan.dispatch_counts[rank][slot])
                   for slot, expert in enumerate(physical) if expert >= 0)

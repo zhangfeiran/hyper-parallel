@@ -44,7 +44,7 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 from torch.nn import Module
 
-from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
 from hyper_parallel.core.expert_parallel.hot_replica.native import (
     dispatch_native_replicas, combine_native_replicas,
 )
@@ -80,11 +80,12 @@ class AsyncHandle:
     :meth:`wait` method that is safe to call multiple times.
     """
 
-    def __init__(self, async_tensor) -> None:
+    def __init__(self, async_tensor: object) -> None:
+        """Retain the asynchronous collective result until its first wait."""
         self._tensor = async_tensor
         self._waited = False
 
-    def wait(self):
+    def wait(self) -> object:
         """Wait for the async collective to complete.
 
         Idempotent — the first call blocks until the collective finishes;
@@ -434,6 +435,7 @@ class _DeredundencyCombineHandle(AsyncHandle):
         mesh_info: _DeredundencyMeshInfo,
         ctx: DeredundencyDispatchContext,
     ) -> None:
+        """Retain the reverse-dispatch metadata needed after collective completion."""
         super().__init__(async_tensor)
         self._mesh_info = mesh_info
         self._ctx = ctx
@@ -690,7 +692,7 @@ class AllToAllTokenDispatcher:
         return combined
 
     @staticmethod
-    def combine_start(routed_output, device_mesh, ctx):
+    def combine_start(routed_output: object, device_mesh: DeviceMesh, ctx: DispatchContext) -> AsyncHandle:
         """Launch async combine all-to-all without waiting for completion.
 
         Splits the combine into two phases so that the caller can overlap
@@ -729,7 +731,7 @@ class AllToAllTokenDispatcher:
         return AsyncHandle(combined_async)
 
     @staticmethod
-    def combine_wait(handle):
+    def combine_wait(handle: AsyncHandle) -> object:
         """Wait for the async combine all-to-all to complete.
 
         Args:
@@ -1097,12 +1099,16 @@ class ExpertParallel(BaseExpertParallel):
     """
 
     def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False,
-                 *, replica_slots_per_rank: int = 0, replica_transport: object = None) -> None:
+                 *, replica_slots_per_rank: int = 0, replica_transport: object = None,
+                 replica_min_rows: int = 0) -> None:
         """Initialize ExpertParallel.
 
         Args:
             replica_slots_per_rank: Extra execution slots per EP rank; zero disables hot replication.
             replica_transport: Optional externally owned prefetch/FP32-return provider; default uses HCCL P2P.
+            replica_min_rows: Soft minimum rows per copied expert. Zero retains token balancing.
+                Smaller copies remain when required by the receive bound. Calibrate this
+                threshold for the intended shape; all EP ranks must use the same value.
             token_dispatcher: Token dispatch strategy. Supported values are
                 ``"all_to_all"`` and ``"deredundency"``.
             async_combine: If ``True``, use asynchronous combine all-to-all
@@ -1112,6 +1118,8 @@ class ExpertParallel(BaseExpertParallel):
             async_combine = token_dispatcher
             token_dispatcher = "all_to_all"
         ExpertReplicaConfig(1, 1, replica_slots_per_rank)
+        _integer(replica_min_rows, "replica_min_rows", 0)
+        self.replica_min_rows = replica_min_rows
         if replica_slots_per_rank and (token_dispatcher != "all_to_all" or async_combine):
             raise ValueError("hot replicas require synchronous all_to_all token dispatch")
         self.replica_slots_per_rank = replica_slots_per_rank
@@ -1147,7 +1155,8 @@ class ExpertParallel(BaseExpertParallel):
         if self.replica_slots_per_rank:
             config = ExpertReplicaConfig(inputs[1].numel(), device_mesh.size(), self.replica_slots_per_rank)
             routed, state = dispatch_native_replicas(
-                inputs, config, device_mesh.get_group(), self.replica_transport)
+                inputs, config, device_mesh.get_group(), self.replica_transport,
+                minimum_replica_rows=self.replica_min_rows)
             module._hot_replica_dispatch = state
             return routed
         dispatch_result = self._token_dispatcher.dispatch(module, inputs, device_mesh)
