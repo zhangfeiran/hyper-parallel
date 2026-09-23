@@ -117,6 +117,18 @@ accept that keyword. The SHMEM runtime also exposes `put/get(..., use_sdma=True)
 This option preserves stream ordering and allocation validation; it does not add
 staging buffers or change the planner and capacity policy. P2P remains the default.
 
+`replica_transport="shmem_signal_sdma_parallel"` additionally prefetches outgoing
+weights on one lazily created stream per target peer. Native callers select
+`SignalReplicaTransport(..., use_sdma=True, parallel_prefetch=True)`. Each copy
+stream waits for source preparation and all incoming credits; received weights
+are acknowledged on the caller stream before it joins outgoing copies. The pool
+lease therefore covers all copy streams, including when owners or caller streams
+change. Source tensors are recorded on their copy stream for allocator lifetime.
+Gradient reads and FP32 accumulation retain their original deterministic order.
+This mode adds stream/event resources but no expert staging buffers or symmetric
+heap bytes. It does not overlap prefetch with home-expert computation. All ranks
+must select the same mode; the runtime must support calls on different streams.
+
 Signal storage and the persistent provider are freed/recreated together by the
 heap manager. Autograd saves neither symmetric addresses nor an old provider for
 multicore. Native callers must keep their externally supplied provider/storage
