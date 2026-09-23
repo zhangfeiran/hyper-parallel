@@ -48,6 +48,18 @@ class _Tensor:
 class TestShmemApiDiagnostics(unittest.TestCase):
     """Validate that opt-in diagnostics remain useful and best-effort."""
 
+    def test_sdma_selection_preserves_legacy_copy_calls(self) -> None:
+        """Explicit DMA reaches the binding while default calls retain their ABI."""
+        native = SimpleNamespace(_put=Mock(), _get=Mock())
+        destination, source = object(), object()
+        with patch.object(_api, "_load_native", return_value=native):
+            for function, method in ((_api.put, native._put), (_api.get, native._get)):
+                function(destination, source, 1)
+                method.assert_called_once_with(destination, source, 1)
+                method.reset_mock()
+                function(destination, source, 1, use_sdma=True)
+                method.assert_called_once_with(destination, source, 1, use_sdma=True)
+
     def test_debug_state_reports_reference_count_after_runtime_state(self) -> None:
         """Expose the local lifecycle count next to the Native Runtime state."""
         native = SimpleNamespace(

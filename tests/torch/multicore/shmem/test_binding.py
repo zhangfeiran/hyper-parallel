@@ -219,6 +219,15 @@ def test_binding_put_get(monkeypatch) -> None:
 
 
 @arg_mark(
+    plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential",
+)
+def test_binding_sdma_put_get(monkeypatch) -> None:
+    """Validate mapped-peer DMA copies and their allocation boundary checks."""
+    _set_unique_bootstrap_endpoint(monkeypatch)
+    _run(_ONE_SIDED_WORKER, "test_binding_sdma_put_get", num_proc=2)
+
+
+@arg_mark(
     plat_marks=["platform_ascend910b"],
     level_mark="level1",
     card_mark="allcards",
