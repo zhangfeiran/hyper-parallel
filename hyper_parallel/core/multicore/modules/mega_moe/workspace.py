@@ -27,7 +27,7 @@ import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica.one_sided import OneSidedReplicaTransport
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    SignalReplicaTransport, signal_storage_bytes,
+    SIGNAL_TRANSPORT_MODES, SignalReplicaTransport, signal_storage_bytes, signal_transport_options,
 )
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.scheduler.config import (
@@ -80,7 +80,7 @@ def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
     if not budget or mode == "p2p":
         return 0
     hidden, intermediate = specification["hidden_size"], specification["intermediate_size"]
-    if mode in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel"):
+    if mode in SIGNAL_TRANSPORT_MODES:
         size = signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)), budget,
                                     specification["ep_size"], 2)
     else:
@@ -247,15 +247,13 @@ class MegaMoeWorkspace:
         """Recreate provider state with the new symmetric heap generation."""
         shapes = ((spec.hidden_size, 2 * spec.intermediate_size), (spec.intermediate_size, spec.hidden_size))
         size = (signal_storage_bytes(shapes, spec.replica_slots_per_rank, spec.ep_size, 2)
-                if spec.replica_transport in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel") else
+                if spec.replica_transport in SIGNAL_TRANSPORT_MODES else
                 spec.replica_slots_per_rank * spec.hidden_size * spec.intermediate_size * 2 * 4)
         self.replica_inbox = shmem.empty((size,), dtype=torch.uint8, alignment=_WORKSPACE_ALIGNMENT)
-        if spec.replica_transport in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel"):
+        if spec.replica_transport in SIGNAL_TRANSPORT_MODES:
             self.replica_provider = SignalReplicaTransport(shmem, self.replica_inbox,
                                                           spec.replica_slots_per_rank, spec.ep_size,
-                                                          use_sdma=spec.replica_transport != "shmem_signal",
-                                                          parallel_prefetch=spec.replica_transport ==
-                                                          "shmem_signal_sdma_parallel")
+                                                          **signal_transport_options(spec.replica_transport))
         else:
             self.replica_provider = OneSidedReplicaTransport(shmem, self.replica_inbox)
 

@@ -32,6 +32,9 @@ from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.core.expert_parallel import ExpertParallel
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
+from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
+    SIGNAL_TRANSPORT_MODES, signal_transport_options,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
 from tests.common.port_utils import allocate_port
 
@@ -276,7 +279,7 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         provider_type = importlib.import_module(
             "hyper_parallel.core.expert_parallel.hot_replica.one_sided").OneSidedReplicaTransport
         needed = budget * hidden * intermediate * 2 * 4
-        if replica_transport in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel"):
+        if replica_transport in SIGNAL_TRANSPORT_MODES:
             signal_module = importlib.import_module("hyper_parallel.core.expert_parallel.hot_replica.signal_transport")
             provider_type = signal_module.SignalReplicaTransport
             needed = signal_module.signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)),
@@ -284,10 +287,9 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         heap = ((needed + 511 + 2**21 - 1) // 2**21) * 2**21
         shmem_api.acquire(mesh.get_group(), heap_size_bytes=heap)
         symmetric = shmem_api.empty((needed,), dtype=torch.uint8, alignment=512)
-        if replica_transport in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel"):
+        if replica_transport in SIGNAL_TRANSPORT_MODES:
             provider = provider_type(shmem_api, symmetric, budget, size,
-                                     use_sdma=replica_transport != "shmem_signal",
-                                     parallel_prefetch=replica_transport == "shmem_signal_sdma_parallel")
+                                     **signal_transport_options(replica_transport))
         else:
             provider = provider_type(shmem_api, symmetric)
     ExpertParallel().apply(base, mesh)
@@ -340,6 +342,12 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
                 evidence["heap_epoch"] = resources.heap_manager.epoch
                 if evidence["capacity"] > evidence["maximum_capacity"]:
                     raise AssertionError("dynamic push capacity exceeded theoretical bound")
+            if replica_transport in SIGNAL_TRANSPORT_MODES:
+                active_provider = provider if executor is None else resources.workspace.replica_provider
+                evidence["gradient_scratch_bytes"] = active_provider.gradient_scratch_bytes
+                evidence["gradient_scratch_limit_bytes"] = hidden * intermediate * 3 * 4
+                if evidence["gradient_scratch_bytes"] > evidence["gradient_scratch_limit_bytes"]:
+                    raise AssertionError("gradient scratch exceeded one FP32 expert")
             optimizer_base.step()
             optimizer_candidate.step()
             for name in ("w1", "w2", "w3"):
@@ -366,7 +374,7 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             cross_layer = _cross_layer_pool(backend, budget, mesh, provider, executor, reference,
                                            tokens, hidden, intermediate, top_k)
         signal_stress = None
-        if replica_transport in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel") and hidden <= 128:
+        if replica_transport in SIGNAL_TRANSPORT_MODES and hidden <= 128:
             active_provider = provider if executor is None else resources.workspace.replica_provider
             signal_stress = _signal_stress(active_provider, mesh, hidden, intermediate, budget)
         timing = None if not benchmark_iterations else _benchmark(
@@ -392,7 +400,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("native", "push", "pull"), default="native")
     parser.add_argument("--replica-transport",
-                        choices=("p2p", "shmem", "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel"),
+                        choices=("p2p", "shmem", *SIGNAL_TRANSPORT_MODES),
                         default="p2p")
     parser.add_argument("--benchmark-iterations", type=int, default=0)
     parser.add_argument("--budget", type=int, default=1)

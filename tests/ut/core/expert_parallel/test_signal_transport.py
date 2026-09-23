@@ -109,6 +109,13 @@ class _Runtime:
         remote = self.world.remote(destination, self.rank, target)
         self.enqueue(lambda: remote.copy_(source))
 
+    def get(self, destination: torch.Tensor, source: torch.Tensor, peer: int, *, use_sdma: bool = False) -> None:
+        """Read remote data only after preceding publication waits complete."""
+        if use_sdma != self.use_sdma:
+            raise AssertionError("the requested copy engine was not preserved")
+        remote = self.world.remote(source, self.rank, peer)
+        self.enqueue(lambda: destination.copy_(remote))
+
     def signal(self, word: torch.Tensor, value: int, target: int) -> None:
         """Publish a generation to the corresponding remote cache line."""
         remote = self.world.remote(word, self.rank, target)
@@ -179,6 +186,30 @@ class _Backend:
             self.world.current[self.rank] = previous
 
 
+@contextmanager
+def _queued_math(runtime: _Runtime) -> Iterator[None]:
+    """Defer result initialization and accumulation onto the active device queue."""
+    add = torch.Tensor.add_
+
+    def _clone(source, *args, **kwargs):
+        del args, kwargs
+        destination = torch.empty_like(source)
+        runtime.enqueue(lambda: destination.copy_(source))
+        return destination
+
+    def _accumulate(destination, source):
+        runtime.enqueue(lambda: add(destination, source))
+        return destination
+
+    with patch.object(torch.Tensor, "clone", _clone), patch.object(torch.Tensor, "add_", _accumulate):
+        yield
+
+
+def _guest_gradient(step: int, rank: int, projection: int) -> float:
+    """Use cancellation-sensitive values to expose changes in peer accumulation order."""
+    return (0.0, float(2**24), 1.0, -float(2**24))[rank] + step * 32 + projection
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestSignalReplicaTransport(unittest.TestCase):
     """Check changing owners with many calls queued before any device progress."""
@@ -229,6 +260,75 @@ class TestSignalReplicaTransport(unittest.TestCase):
             self.assertEqual(world.barriers, [1] * ranks)
             self.assertTrue(all(provider.epoch == 12 for provider in providers))
 
+    def test_parallel_gradients_preserve_order_and_slot_reuse(self):
+        """All matrix reads must finish before ACK allows a different owner to reuse the slot."""
+        ranks = 4
+        size = signal_storage_bytes(((2, 2), (2, 1)), 1, ranks, 2)
+        for seed in range(24):
+            world = _World(ranks, size)
+            runtimes = [_Runtime(world, rank, use_sdma=True) for rank in range(ranks)]
+            providers = [SignalReplicaTransport(runtime, storage, 1, ranks, use_sdma=True,
+                                                parallel_prefetch=seed >= 12, parallel_gradients=True)
+                         for runtime, storage in zip(runtimes, world.storage)]
+            checked = []
+            scratch_allocations = []
+            empty_like = torch.empty_like
+
+            def _allocate(tensor, **kwargs):
+                result = empty_like(tensor, **kwargs)
+                if tensor.ndim == 2:
+                    scratch_allocations.append(result.data_ptr())
+                return result
+
+            for step in range(12):
+                counts = [[100 if expert == step % ranks else 0 for expert in range(ranks)]] * ranks
+                plan = _cyclic_plan(ranks) if step % 3 == 2 else build_expert_replica_plan(counts, 1)
+                for rank, provider in enumerate(providers):
+                    runtime = runtimes[rank]
+                    route = SimpleNamespace(plan=plan, rank=rank)
+                    weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16),
+                               torch.ones(1, 2, 1, dtype=torch.bfloat16))
+                    home = tuple(torch.full_like(weight, step + 0.5, dtype=torch.float32) for weight in weights)
+                    expected = tuple(value.clone() for value in home)
+                    owned = sorted((item for item in plan.transfers if item.owner_rank == rank),
+                                   key=lambda item: item.target_rank)
+                    for item in owned:
+                        for index, value in enumerate(expected):
+                            value[item.owner_slot].add_(_guest_gradient(step, item.target_rank, index))
+                    with patch.object(torch, "cpu", _Backend(world, rank)), \
+                            patch.object(torch.Tensor, "record_stream"), patch.object(torch, "empty_like", _allocate), \
+                            _queued_math(runtime), provider.lease(weights, route) as pool:
+                        def _produce(guests=pool.gradients, step=step, rank=rank):
+                            for index, guest in enumerate(guests):
+                                guest.fill_(_guest_gradient(step, rank, index))
+                        runtime.enqueue(_produce)
+                        result = provider.return_gradients(home, pool.gradients, route)
+
+                        def _consume(result=result, expected=expected):
+                            for value, reference in zip(result, expected):
+                                torch.testing.assert_close(value, reference, rtol=0, atol=0)
+                            checked.append(True)
+                        runtime.enqueue(_consume)
+            world.drain(seed)
+            self.assertEqual(len(checked), 48)
+            self.assertEqual(len(scratch_allocations), 2 * ranks)
+            self.assertEqual([provider.gradient_scratch_bytes for provider in providers], [24] * ranks)
+            self.assertEqual(world.barriers, [1] * ranks)
+
+    def test_parallel_gradients_without_remote_replicas_allocate_no_scratch(self):
+        """Balanced routes without fan-in must not retain an unused expert-sized cache."""
+        runtime = MagicMock()
+        size = signal_storage_bytes(((2, 2),), 1, 2, 4)
+        provider = SignalReplicaTransport(runtime, torch.empty(size, dtype=torch.uint8), 1, 2,
+                                          use_sdma=True, parallel_gradients=True)
+        route = SimpleNamespace(plan=build_expert_replica_plan([[1, 0], [0, 1]], 1), rank=0)
+        weights = (torch.ones(1, 2, 2),)
+        with provider.lease(weights, route) as pool:
+            actual = provider.return_gradients(weights, pool.gradients, route)
+        torch.testing.assert_close(actual[0], weights[0], rtol=0, atol=0)
+        self.assertEqual(provider.gradient_scratch_bytes, 0)
+        self.assertFalse(runtime.get.called)
+
     def test_gradient_get_acknowledges_after_all_projections(self):
         """The owner sums FP32 values and acknowledges only after both gets."""
         runtime = MagicMock()
@@ -273,6 +373,8 @@ class TestSignalReplicaTransport(unittest.TestCase):
         runtime = MagicMock()
         with self.assertRaisesRegex(ValueError, "requires SDMA"):
             SignalReplicaTransport(runtime, torch.empty(64, dtype=torch.uint8), 1, 2, parallel_prefetch=True)
+        with self.assertRaisesRegex(ValueError, "requires SDMA"):
+            SignalReplicaTransport(runtime, torch.empty(64, dtype=torch.uint8), 1, 2, parallel_gradients=True)
         self.assertFalse(runtime.host_barrier.called)
 
     def test_invalid_layout_fails_before_collectives(self):
