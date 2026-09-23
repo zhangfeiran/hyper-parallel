@@ -68,7 +68,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         gradients = (torch.empty(3), torch.empty(4))
         for ready, backward in product((None, (4096, 17)), (False, True)):
             with self.subTest(ready=ready, backward=backward):
-                pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=ready)
+                pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=ready, projection_ready=None)
                 with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream"):
                     result = function_module._split_runtime(  # pylint: disable=protected-access
                         base, pool, 6, backward=backward)
@@ -78,6 +78,22 @@ class TestMegaMoeFunction(unittest.TestCase):
                 pointers = tuple(g.data_ptr() for g in gradients) if backward else (0, 0)
                 expected = (0x53505754, 2 if ready is None else 3, 6, *(w.data_ptr() for w in weights), *pointers)
                 self.assertEqual(values, expected + (() if ready is None else ready))
+
+    def test_split_runtime_encodes_independent_projection_ready_v4(self) -> None:
+        """Pass distinct W13/W2 cache-line bases and one epoch to forward/backward."""
+        base = torch.arange(16, dtype=torch.uint8)
+        weights = (torch.empty(1), torch.empty(2))
+        gradients = (torch.empty(3), torch.empty(4))
+        pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=None,
+                               projection_ready=((4096, 8192), 23))
+        for backward in (False, True):
+            with self.subTest(backward=backward), patch.object(torch.npu, "current_stream"), \
+                    patch.object(torch.Tensor, "record_stream"):
+                result = function_module._split_runtime(base, pool, 6, backward=backward)
+            torch.testing.assert_close(result[:16], base)
+            pointers = tuple(g.data_ptr() for g in gradients) if backward else (0, 0)
+            self.assertEqual(struct.unpack("<II8Q", bytes(result[16:].tolist())),
+                             (0x53505754, 4, 6, *(w.data_ptr() for w in weights), *pointers, 4096, 8192, 23))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

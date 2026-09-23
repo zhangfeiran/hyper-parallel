@@ -42,7 +42,8 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
     Ordinary pool allocations remain valid across push SHMEM heap growth.
     The lease spans all consumers, including gradient return in backward.
     With overlap=True, an enabled provider may defer guest readiness. Call
-    wait_weights() before guest reads, or honor weight_ready in a fused kernel.
+    wait_weights(matrix_index) before each guest projection read, or honor the
+    weight_ready/projection_ready metadata in a fused kernel.
     """
     provider = route.transport if provider is None else provider
     if provider is not None and callable(getattr(provider, "lease", None)):

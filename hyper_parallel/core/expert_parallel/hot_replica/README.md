@@ -168,6 +168,23 @@ the ready base and epoch to the v2 layout. Matching forward/backward kernels
 must be rebuilt; an older payload does not support this optional mode. The
 new kernels continue accepting v2 for eager prefetch.
 
+`replica_transport="shmem_signal_sdma_projection"` adds independent matrix
+publications. Native providers additionally select `projection_ready=True`,
+including that option in `signal_storage_bytes(...)`. The shared view exposes
+`projection_ready=((matrix0_base, matrix1_base, ...), epoch)`;
+`wait_weights(matrix_index)` waits only for that projection and `wait_weights()`
+joins every projection. Each publication has its own 64-byte cache line per
+slot, adding `64 * B * matrix_count` symmetric bytes. These lines do not alias
+the peer credit, whole-slot ready, or ACK channels.
+
+Forward copies W13 then W2; backward copies W2 then W13. Each matrix publishes
+ready immediately after its own SDMA copy, allowing the first guest matmul to
+start while the other matrix is still being copied. Multicore uses split runtime
+ABI v4 with both ready bases and the epoch; the matching kernels also accept v2
+and v3. Slot release still waits for every matrix consumer and all copy streams.
+The default remains P2P; selecting a transport requires measuring the complete
+training step for the intended shape and route.
+
 Signal storage and the persistent provider are freed/recreated together by the
 heap manager. Autograd saves neither symmetric addresses nor an old provider for
 multicore. Native callers must keep their externally supplied provider/storage
