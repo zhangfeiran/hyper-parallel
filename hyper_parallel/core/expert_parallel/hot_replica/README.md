@@ -109,6 +109,14 @@ Initialization and rare int32 epoch rollover use host barriers; steady-state
 prefetch/return uses stream-ordered signals without host barriers. This does not
 yet overlap communication with home-expert computation.
 
+`replica_transport="shmem_signal_sdma"` uses the same direct slots and signal
+protocol, with ACL asynchronous copies against SHMEM-mapped peer addresses.
+It requires direct peer mapping and rejects unmapped peers. Native callers select
+it with `SignalReplicaTransport(..., use_sdma=True)` and a runtime whose put/get
+accept that keyword. The SHMEM runtime also exposes `put/get(..., use_sdma=True)`.
+This option preserves stream ordering and allocation validation; it does not add
+staging buffers or change the planner and capacity policy. P2P remains the default.
+
 Signal storage and the persistent provider are freed/recreated together by the
 heap manager. Autograd saves neither symmetric addresses nor an old provider for
 multicore. Native callers must keep their externally supplied provider/storage
