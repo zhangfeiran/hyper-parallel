@@ -14,12 +14,15 @@
 # ============================================================================
 """Adversarial interleavings for direct symmetric expert slot ownership."""
 
+from __future__ import annotations
+
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 import random
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -54,6 +57,7 @@ class _World:
         self.storage = [torch.empty(size, dtype=torch.uint8) for _ in range(ranks)]
         self.queues = [deque() for _ in range(ranks)]
         self.barriers = [0] * ranks
+        self.current = list(range(ranks))
 
     def remote(self, tensor: torch.Tensor, source: int, target: int) -> torch.Tensor:
         """Translate a symmetric view by its byte offset, preserving shape/dtype."""
@@ -92,7 +96,7 @@ class _Runtime:
 
     def enqueue(self, action: Callable) -> None:
         """Preserve the calling device stream's operation order."""
-        self.world.queues[self.rank].append((lambda: True, action))
+        self.world.queues[self.world.current[self.rank]].append((lambda: True, action))
 
     def host_barrier(self) -> None:
         """Account for initialization before the simulator starts scheduling."""
@@ -114,7 +118,65 @@ class _Runtime:
         """Allow only monotonic, stream-ordered signal waits."""
         if comparison != "ge":
             raise AssertionError("epoch waits must tolerate a newer generation")
-        self.world.queues[self.rank].append((lambda: int(word[0]) >= value, lambda: None))
+        self.world.queues[self.world.current[self.rank]].append((lambda: int(word[0]) >= value, lambda: None))
+
+
+class _Stream:
+    """Keep event waits in the simulated queue, rather than executing them on the host."""
+
+    def __init__(self, world: _World, index: int) -> None:
+        """Bind a simulated stream to one device queue."""
+        self.world, self.index = world, index
+
+    def wait_event(self, event: _Event) -> None:
+        """Wait for the event record operation to execute on another queue."""
+        self.world.queues[self.index].append((lambda: event.done, lambda: None))
+
+
+class _Event:
+    """Model a fresh event with a deferred recording operation."""
+
+    def __init__(self) -> None:
+        """Start with an event that no stream has completed."""
+        self.done = False
+
+    def record(self, stream: _Stream) -> None:
+        """Publish completion only when all preceding stream operations have run."""
+        stream.world.queues[stream.index].append((lambda: True, self._complete))
+
+    def _complete(self):
+        self.done = True
+
+
+class _Backend:
+    """Supply per-rank streams to the CPU protocol simulator."""
+
+    Event = _Event
+
+    def __init__(self, world: _World, rank: int) -> None:
+        """Bind backend stream selection to a single rank."""
+        self.world, self.rank = world, rank
+
+    def current_stream(self, _device: torch.device) -> _Stream:
+        """Return the caller's active queue."""
+        return _Stream(self.world, self.world.current[self.rank])
+
+    def Stream(self, *, device: torch.device) -> _Stream:  # pylint: disable=invalid-name
+        """Allocate an independent copy queue using the Torch backend contract."""
+        del device
+        index = len(self.world.queues)
+        self.world.queues.append(deque())
+        return _Stream(self.world, index)
+
+    @contextmanager
+    def stream(self, stream: _Stream) -> Iterator[None]:
+        """Switch the runtime's enqueue target only for this host scope."""
+        previous = self.world.current[self.rank]
+        self.world.current[self.rank] = stream.index
+        try:
+            yield
+        finally:
+            self.world.current[self.rank] = previous
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
@@ -125,11 +187,13 @@ class TestSignalReplicaTransport(unittest.TestCase):
         """Credits protect a slot even when an unrelated next owner runs ahead."""
         ranks = 4
         size = signal_storage_bytes(((2, 2), (2, 1)), 1, ranks, 2)
-        for seed in range(48):
+        for seed in range(72):
             use_sdma = seed >= 24
+            parallel = seed >= 48
             world = _World(ranks, size)
             runtimes = [_Runtime(world, rank, use_sdma=use_sdma) for rank in range(ranks)]
-            providers = [SignalReplicaTransport(runtime, storage, 1, ranks, use_sdma=use_sdma)
+            providers = [SignalReplicaTransport(runtime, storage, 1, ranks, use_sdma=use_sdma,
+                                                parallel_prefetch=parallel)
                          for runtime, storage in zip(runtimes, world.storage)]
             checked = []
             for step in range(12):
@@ -141,7 +205,16 @@ class TestSignalReplicaTransport(unittest.TestCase):
                     weights = (torch.full((1, 2, 2), step * 10 + rank, dtype=torch.bfloat16),
                                torch.full((1, 2, 1), step * 10 + rank, dtype=torch.bfloat16))
                     route = SimpleNamespace(plan=plan, rank=rank)
-                    with provider.lease(weights, route) as pool:
+                    if parallel:
+                        values = tuple(weight.clone() for weight in weights)
+                        for weight in weights:
+                            weight.zero_()
+                        def _prepare(weights=weights, values=values):
+                            for weight, value in zip(weights, values):
+                                weight.copy_(value)
+                        runtimes[rank].enqueue(_prepare)
+                    with patch.object(torch, "cpu", _Backend(world, rank)), \
+                            patch.object(torch.Tensor, "record_stream"), provider.lease(weights, route) as pool:
                         owner = plan.slot_to_logical[rank][1]
                         expected = step * 10 + owner
                         if owner >= 0:
@@ -152,6 +225,7 @@ class TestSignalReplicaTransport(unittest.TestCase):
                             runtimes[rank].enqueue(_consume)
             world.drain(seed)
             self.assertEqual(len(checked), 40)
+            self.assertEqual(len(world.queues), ranks * ranks if parallel else ranks)
             self.assertEqual(world.barriers, [1] * ranks)
             self.assertTrue(all(provider.epoch == 12 for provider in providers))
 
@@ -193,6 +267,13 @@ class TestSignalReplicaTransport(unittest.TestCase):
             torch.testing.assert_close(result[0], torch.full((1, 2, 2), 1.125))
             self.assertEqual([call[0] for call in runtime.mock_calls], ["wait_signal", "get", "signal"])
             self.assertEqual(runtime.get.call_args.kwargs, {"use_sdma": True})
+
+    def test_parallel_prefetch_requires_sdma(self):
+        """Reject a parallel copy request that cannot use the selected runtime engine."""
+        runtime = MagicMock()
+        with self.assertRaisesRegex(ValueError, "requires SDMA"):
+            SignalReplicaTransport(runtime, torch.empty(64, dtype=torch.uint8), 1, 2, parallel_prefetch=True)
+        self.assertFalse(runtime.host_barrier.called)
 
     def test_invalid_layout_fails_before_collectives(self):
         """Reject malformed public sizing arguments and insufficient storage early."""
