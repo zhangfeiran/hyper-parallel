@@ -355,7 +355,8 @@ class MegaMoeExperts(MulticoreModule):
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
             replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
-            replica_transport: "p2p", barrier-based "shmem", or direct "shmem_signal" copies.
+            replica_transport: "p2p", barrier-based "shmem", direct "shmem_signal",
+                or mapped-peer "shmem_signal_sdma" copies.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
@@ -376,8 +377,8 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
-        if replica_transport not in ("p2p", "shmem", "shmem_signal"):
-            raise ValueError("replica_transport must be p2p, shmem or shmem_signal")
+        if replica_transport not in ("p2p", "shmem", "shmem_signal", "shmem_signal_sdma"):
+            raise ValueError("replica_transport must be p2p, shmem, shmem_signal or shmem_signal_sdma")
         ep_size = _resolve_ep_size(ep_size, ep_group)
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         specification = {

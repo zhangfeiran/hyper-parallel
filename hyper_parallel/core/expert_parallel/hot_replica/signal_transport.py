@@ -63,14 +63,25 @@ class SignalReplicaTransport:
     steady-state transfers enqueue stream operations without host barriers.
     """
 
-    def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int) -> None:
-        """Bind externally owned, 64-byte-aligned symmetric uint8 storage."""
+    def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int,
+                 *, use_sdma: bool = False) -> None:
+        """Bind externally owned, 64-byte-aligned symmetric uint8 storage.
+
+        Args:
+            runtime: Stream-ordered put/get, signal/wait and host-barrier provider.
+            storage: Symmetric storage kept alive through all remote consumers.
+            slots: Guest expert budget per rank.
+            ep_size: Number of ranks in the runtime's peer namespace.
+            use_sdma: Request runtime put/get with use_sdma=True. The runtime must
+                support direct peer mapping and complete copies in stream order.
+        """
         if (storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous()
                 or storage.data_ptr() % _SIGNAL_BYTES):
             raise ValueError("Signal replica storage must be a cache-line-aligned contiguous uint8 vector")
         _integer(slots, "slots")
         _integer(ep_size, "ep_size")
         self.runtime = runtime
+        self._copy_options = {"use_sdma": True} if use_sdma else {}
         self.storage = storage
         self.slots = slots
         self.ep_size = ep_size
@@ -158,7 +169,8 @@ class SignalReplicaTransport:
                 slot = item.target_slot - home
                 self._wait(0, item.target_rank, slot, epoch)
                 for weight, guest in zip(weights, guests):
-                    self.runtime.put(guest[slot], weight[item.owner_slot].contiguous(), item.target_rank)
+                    self.runtime.put(guest[slot], weight[item.owner_slot].contiguous(),
+                                     item.target_rank, **self._copy_options)
                 self._publish(1, route.rank, slot, item.target_rank, epoch)
         for item in transfers:
             if route.rank == item.target_rank:
@@ -187,7 +199,7 @@ class SignalReplicaTransport:
                 self._wait(3, target, slot, epoch)
                 for output, guest in zip(result, guests):
                     value = torch.empty_like(output[item.owner_slot])
-                    self.runtime.get(value, guest[slot], target)
+                    self.runtime.get(value, guest[slot], target, **self._copy_options)
                     output[item.owner_slot].add_(value)
                 self._publish(4, route.rank, slot, target, epoch)
         for item in transfers:
