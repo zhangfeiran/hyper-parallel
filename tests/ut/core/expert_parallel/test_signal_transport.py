@@ -214,6 +214,88 @@ def _guest_gradient(step: int, rank: int, projection: int) -> float:
 class TestSignalReplicaTransport(unittest.TestCase):
     """Check changing owners with many calls queued before any device progress."""
 
+    def test_projection_consumer_does_not_wait_for_the_other_matrix(self):
+        """Hold the second DMA until the first guest GMM consumes its own ready matrix."""
+        ranks = 4
+        size = signal_storage_bytes(((2, 2), (2, 1)), 1, ranks, 2, projection_ready=True)
+        for seed in range(24):
+            world = _World(ranks, size)
+            runtimes = [_Runtime(world, rank, use_sdma=True) for rank in range(ranks)]
+            providers = [SignalReplicaTransport(runtime, storage, 1, ranks, use_sdma=True,
+                                                parallel_prefetch=True, overlap_home=True, projection_ready=True)
+                         for runtime, storage in zip(runtimes, world.storage)]
+            checked = []
+            for step in range(12):
+                backward = bool(step % 2)
+                first, second = (1, 0) if backward else (0, 1)
+                consumed = [SimpleNamespace(done=False) for _ in range(ranks)]
+                counts = [[100 if expert == step % ranks else 0 for expert in range(ranks)]] * ranks
+                plan = _cyclic_plan(ranks) if step % 3 == 2 else build_expert_replica_plan(counts, 1)
+                for rank, provider in enumerate(providers):
+                    runtime = runtimes[rank]
+                    weights = (torch.full((1, 2, 2), step * 10 + rank, dtype=torch.bfloat16),
+                               torch.full((1, 2, 1), step * 10 + rank + 1, dtype=torch.bfloat16))
+
+                    def _put(destination, source, target, *, use_sdma=False,
+                             rank=rank, consumed=consumed, second=second):
+                        self.assertTrue(use_sdma)
+                        self.assertNotEqual(world.current[rank], rank)
+                        remote = world.remote(destination, rank, target)
+                        delayed = source.dtype == torch.bfloat16 and source.numel() == (4, 2)[second]
+                        world.queues[world.current[rank]].append(
+                            (lambda: not delayed or consumed[target].done, lambda: remote.copy_(source)))
+
+                    route = SimpleNamespace(plan=plan, rank=rank)
+                    with patch.object(torch, "cpu", _Backend(world, rank)), \
+                            patch.object(torch.Tensor, "record_stream"), patch.object(runtime, "put", _put), \
+                            provider.lease(weights, route, overlap=True, backward=backward) as pool:
+                        self.assertIsNone(pool.weight_ready)
+                        self.assertEqual(len(pool.projection_ready[0]), 2)
+                        self.assertNotEqual(*pool.projection_ready[0])
+                        owner = plan.slot_to_logical[rank][1]
+                        pool.wait_weights(first)
+
+                        def _consume_first(value=pool.weights[first], expected=step * 10 + owner + first,
+                                           owner=owner, state=consumed[rank]):
+                            if owner >= 0:
+                                torch.testing.assert_close(value, torch.full_like(value, expected))
+                                checked.append(True)
+                            state.done = True
+
+                        runtime.enqueue(_consume_first)
+                        pool.wait_weights(first)
+                        pool.wait_weights(second)
+                        if owner >= 0:
+                            def _consume_second(value=pool.weights[second], expected=step * 10 + owner + second):
+                                torch.testing.assert_close(value, torch.full_like(value, expected))
+                                checked.append(True)
+                            runtime.enqueue(_consume_second)
+            world.drain(seed)
+            self.assertEqual(len(checked), 80)
+            self.assertEqual(world.barriers, [1] * ranks)
+
+    def test_projection_storage_and_rollover_keep_signals_disjoint(self):
+        """Zero both publications on rollover without aliasing credit/ACK cache lines."""
+        shapes = ((2, 2), (2, 1))
+        base_size = signal_storage_bytes(shapes, 1, 2, 2)
+        size = signal_storage_bytes(shapes, 1, 2, 2, projection_ready=True)
+        self.assertEqual(size - base_size, 128)
+        runtime = MagicMock()
+        provider = SignalReplicaTransport(runtime, torch.empty(size, dtype=torch.uint8), 1, 2,
+                                          use_sdma=True, parallel_prefetch=True, overlap_home=True,
+                                          projection_ready=True)
+        weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16), torch.ones(1, 2, 1, dtype=torch.bfloat16))
+        provider._bind(weights)  # pylint: disable=protected-access
+        self.assertGreaterEqual(provider.projection_signals.data_ptr(),
+                                provider.signals.data_ptr() + provider.signals.numel() * 4)
+        provider.signals.fill_(17)
+        provider.projection_signals.fill_(17)
+        provider.epoch = 2**31 - 1
+        self.assertEqual(provider._advance(), 1)  # pylint: disable=protected-access
+        self.assertEqual(int(provider.signals.count_nonzero()), 0)
+        self.assertEqual(int(provider.projection_signals.count_nonzero()), 0)
+        self.assertEqual(runtime.host_barrier.call_count, 3)
+
     def test_home_work_can_precede_copy_completion(self):
         """Delay all DMA until home work runs, including ring routes and changing owners."""
         ranks = 4
@@ -437,6 +519,8 @@ class TestSignalReplicaTransport(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires parallel SDMA"):
             SignalReplicaTransport(runtime, torch.empty(64, dtype=torch.uint8), 1, 2,
                                    use_sdma=True, overlap_home=True)
+        with self.assertRaisesRegex(ValueError, "requires home overlap"):
+            SignalReplicaTransport(runtime, torch.empty(64, dtype=torch.uint8), 1, 2, projection_ready=True)
         self.assertFalse(runtime.host_barrier.called)
 
     def test_invalid_layout_fails_before_collectives(self):

@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Process-group shared guest storage with stream-ordered exclusive leases."""
-
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -37,10 +36,12 @@ class ReplicaPool:
         self._lock = threading.Lock()
         self._event = None
         self.weight_ready = None
+        self.projection_ready = None
 
-    def wait_weights(self) -> None:
+    def wait_weights(self, matrix_index: int | None = None) -> None:
         """Keep the eager pool compatible with deferred guest consumers."""
-
+        if matrix_index is not None and not 0 <= matrix_index < len(self.weights):
+            raise ValueError("Replica matrix index is out of range")
 
     @contextmanager
     def lease(self, *, backward: bool = False) -> Iterator[ReplicaPool]:
@@ -75,19 +76,30 @@ class ReplicaPool:
 class ReplicaPrefetch:
     """Invocation-owned view that separates local work from guest readiness."""
 
-    def __init__(self, pool: ReplicaPool, wait: Callable[[], None], ready: tuple[int, int]) -> None:
+    def __init__(self, pool: ReplicaPool, wait: Callable[..., None], ready: tuple[int, int] | None,
+                 *, projection_ready: tuple[tuple[int, ...], int] | None = None) -> None:
         """Borrow leased tensors and expose device ready base/epoch to fused consumers."""
         self.weights = pool.weights
         self.gradients = pool.gradients
         self.weight_ready = ready
+        self.projection_ready = projection_ready
         self._wait = wait
-        self._waited = False
+        self._waited = set()
 
-    def wait_weights(self) -> None:
-        """Order this invocation's caller before its first guest-weight read."""
-        if not self._waited:
-            self._wait()
-            self._waited = True
+    def wait_weights(self, matrix_index: int | None = None) -> None:
+        """Order guest reads of one matrix, or every matrix before releasing the slot."""
+        if matrix_index is not None and not 0 <= matrix_index < len(self.weights):
+            raise ValueError("Replica matrix index is out of range")
+        if self.projection_ready is None:
+            if not self._waited:
+                self._wait()
+                self._waited.update(range(len(self.weights)))
+            return
+        indices = range(len(self.weights)) if matrix_index is None else (matrix_index,)
+        for index in indices:
+            if index not in self._waited:
+                self._wait(index)
+                self._waited.add(index)
 
 
 _POOLS = WeakKeyDictionary()
