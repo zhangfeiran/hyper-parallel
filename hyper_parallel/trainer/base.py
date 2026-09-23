@@ -82,6 +82,7 @@ from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
     MixedPrecisionOptimizer,
 )
+from hyper_parallel.models.runtime_resources import ModelRuntimeResources
 from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 from hyper_parallel.trainer.runtime import model_integration as model_integration_runtime
 from hyper_parallel.trainer.runtime.data_iterator import HyperIter
@@ -265,6 +266,7 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.config: TrainerConfig = config
+        self.model_runtime_resources: ModelRuntimeResources | None = None
 
         # General setup owns distributed initialization as its first stage.
         # ``_build_distributed_setup`` remains a reserved backend hook; the
@@ -399,6 +401,8 @@ class BaseTrainer(Stateful, ABC):
             if getattr(self.config.debug, "check_fsdp_runtime", False)
             else None
         )
+        self.model_runtime_resources = ModelRuntimeResources(self.model)
+        self.model_runtime_resources.prepare()
 
     def _build_loss(self) -> None:
         """Build the configured loss module or use the model-output default."""
@@ -909,9 +913,23 @@ class BaseTrainer(Stateful, ABC):
         dist.barrier()
 
         synchronize()
+        self._close_model_runtime_resources()
         destroy_process_group()
 
+    def _close_model_runtime_resources(self) -> None:
+        """Release model-owned resources before destroying communication groups."""
+        resources = getattr(self, "model_runtime_resources", None)
+        if resources is not None:
+            resources.close()
+
     def train(self) -> None:
+        """Train and close model resources on both completion and failure."""
+        try:
+            self._train()
+        finally:
+            self._close_model_runtime_resources()
+
+    def _train(self) -> None:
         """Run the configured training loop."""
         config: TrainerConfig = self.config
         self.on_train_begin()
