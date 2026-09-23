@@ -141,7 +141,8 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
     return {"invocations": checks, "accumulated": accumulated_error}
 
 
-def _cross_layer_pool(backend, budget, mesh, provider, executor, reference, tokens, hidden, intermediate, top_k):
+def _cross_layer_pool(backend, budget, mesh, provider, executor, reference, tokens, hidden, intermediate, top_k,
+                      replica_min_rows=0):
     """Two independent parameter owners share storage through reversed backward."""
     experts = mesh.size() * 6
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
@@ -153,7 +154,8 @@ def _cross_layer_pool(backend, budget, mesh, provider, executor, reference, toke
             module = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(
                 device=device, dtype=torch.bfloat16)
             ExpertParallel(replica_slots_per_rank=budget if hot and backend == "native" else 0,
-                           replica_transport=provider if hot else None).apply(module, mesh)
+                           replica_transport=provider if hot else None,
+                           replica_min_rows=replica_min_rows if hot else 0).apply(module, mesh)
             modules.append(module)
         pairs.append(modules)
     pending = []
@@ -255,7 +257,7 @@ def _benchmark(candidate, executor, experts, tokens, hidden, top_k, iterations):
 def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         hidden: int = 128, intermediate: int = 128, top_k: int = 2,
         same_backend_reference: bool = False, replica_transport: str = "p2p",
-        benchmark_iterations: int = 0) -> None:
+        benchmark_iterations: int = 0, replica_min_rows: int = 0) -> None:
     """Compare full forward/backward with native B=0, preserving EP ownership."""
     rank, size = dist.get_rank(), dist.get_world_size()
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
@@ -296,7 +298,7 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             provider = provider_type(shmem_api, symmetric)
     ExpertParallel().apply(base, mesh)
     ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0,
-                   replica_transport=provider).apply(candidate, mesh)
+                   replica_transport=provider, replica_min_rows=replica_min_rows).apply(candidate, mesh)
     executor = None
     reference = None
     if backend != "native":
@@ -305,7 +307,7 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         executor = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
                                  num_experts=experts, top_k=top_k, ep_size=size, ep_group=mesh.get_group(),
                                  create_parameters=False, dispatch_mode=backend, replica_slots_per_rank=budget,
-                                 replica_transport=replica_transport,
+                                 replica_transport=replica_transport, replica_min_rows=replica_min_rows,
                                  **options)
         if same_backend_reference:
             reference = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
@@ -374,7 +376,7 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         cross_layer = []
         if hidden <= 128:
             cross_layer = _cross_layer_pool(backend, budget, mesh, provider, executor, reference,
-                                           tokens, hidden, intermediate, top_k)
+                                           tokens, hidden, intermediate, top_k, replica_min_rows)
         signal_stress = None
         if replica_transport in SIGNAL_TRANSPORT_MODES and hidden <= 128:
             active_provider = provider if executor is None else resources.workspace.replica_provider
@@ -384,7 +386,8 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         Path(result_dir).mkdir(parents=True, exist_ok=True)
         Path(result_dir, f"{backend}-b{budget}-rank{rank}.json").write_text(
             json.dumps({"steps": results, "deferred": deferred, "cross_layer": cross_layer,
-                        "replica_transport": replica_transport, "signal_stress": signal_stress, "timing": timing},
+                        "replica_transport": replica_transport, "replica_min_rows": replica_min_rows,
+                        "signal_stress": signal_stress, "timing": timing},
                        indent=2) + "\n", encoding="utf-8")
     finally:
         if executor is not None:
@@ -406,6 +409,7 @@ def main() -> None:
                         default="p2p")
     parser.add_argument("--benchmark-iterations", type=int, default=0)
     parser.add_argument("--budget", type=int, default=1)
+    parser.add_argument("--replica-min-rows", type=int, default=0)
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--intermediate", type=int, default=128)
@@ -422,7 +426,7 @@ def main() -> None:
         run(args.backend, args.budget, args.result_dir, tokens=args.tokens,
             hidden=args.hidden, intermediate=args.intermediate, top_k=args.top_k,
             same_backend_reference=args.same_backend_reference, replica_transport=args.replica_transport,
-            benchmark_iterations=args.benchmark_iterations)
+            benchmark_iterations=args.benchmark_iterations, replica_min_rows=args.replica_min_rows)
     finally:
         dist.destroy_process_group()
 
