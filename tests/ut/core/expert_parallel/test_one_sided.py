@@ -77,6 +77,20 @@ class TestOneSidedReplicaTransport(unittest.TestCase):
         self.assertFalse(runtime.put.called)
         torch.testing.assert_close(home, torch.ones_like(home))
 
+    def test_owned_fp32_return_reuses_the_callers_storage(self):
+        """The owned path sums into fresh home storage and leaves guest gradients intact."""
+        plan = build_expert_replica_plan([[100, 0, 0, 0]] * 4, 1)
+        runtime = MagicMock()
+        runtime.get.side_effect = lambda dst, _src, _rank: dst.fill_(0.125)
+        provider = OneSidedReplicaTransport(runtime, torch.empty(16, dtype=torch.uint8))
+        home, guest = torch.ones(1, 2, 2), torch.full((1, 2, 2), 7.0)
+        result, = provider.return_gradients_owned((home,), (guest,), SimpleNamespace(plan=plan, rank=0))
+        self.assertIs(result, home)
+        torch.testing.assert_close(result, torch.full_like(home, 1.375))
+        torch.testing.assert_close(guest, torch.full_like(guest, 7.0))
+        self.assertEqual(runtime.get.call_count, 3)
+        self.assertEqual(runtime.host_barrier.call_count, 6)
+
     def test_inbox_size_is_checked_before_publication(self):
         """Reject an undersized externally supplied inbox before starting a put."""
         runtime = MagicMock()
