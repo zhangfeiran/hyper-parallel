@@ -585,7 +585,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             grad_weight2 = execution.intermediates.grad_weight2
             if ctx.replica_route is not None:
                 grad_weight1, grad_weight2 = return_gradients(
-                    (grad_weight1, grad_weight2), ctx.replica_route, pool.gradients, provider)
+                    (grad_weight1, grad_weight2), ctx.replica_route, pool.gradients, provider, consume=True)
             # Both kernels use the current stream. Release ordinary scratch
             # before allocating the owned token gradient; SHMEM stays leased.
             execution = None

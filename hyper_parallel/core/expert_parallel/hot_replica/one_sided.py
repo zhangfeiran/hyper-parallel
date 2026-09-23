@@ -21,6 +21,7 @@ from typing import Any
 import torch
 
 from .routing import ReplicaRoute
+from .transport import _gradient_accumulators
 
 
 class OneSidedReplicaTransport:
@@ -72,7 +73,17 @@ class OneSidedReplicaTransport:
     def return_gradients(self, gradients: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
                          route: ReplicaRoute) -> tuple[torch.Tensor, ...]:
         """Read bounded guest partials and accumulate at the original FP32 owner."""
-        result = tuple(gradient.float().clone() for gradient in gradients)
+        result = _gradient_accumulators(gradients, consume=False)
+        return self._return_gradients(result, guests, route)
+
+    def return_gradients_owned(self, gradients: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
+                               route: ReplicaRoute) -> tuple[torch.Tensor, ...]:
+        """Consume fresh, exclusive FP32 home buffers using the shared transport contract."""
+        result = _gradient_accumulators(gradients, consume=True)
+        return self._return_gradients(result, guests, route)
+
+    def _return_gradients(self, result: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
+                          route: ReplicaRoute) -> tuple[torch.Tensor, ...]:
         config = route.plan.config
         for target in range(config.ep_size):
             transfers = [item for item in route.plan.transfers if item.target_rank == target]
