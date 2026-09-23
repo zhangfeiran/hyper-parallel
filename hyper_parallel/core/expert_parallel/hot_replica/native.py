@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -118,18 +119,29 @@ class _NativeReplicaExperts(torch.autograd.Function):
         with prefetch_weights((weight1, weight2), route, backward=True, overlap=True) as pool:
             grad1 = torch.zeros_like(weight1, dtype=torch.float32)
             grad2 = torch.zeros_like(weight2, dtype=torch.float32)
+            early = bool(route.plan.transfers) and getattr(route.transport, "overlap_gradients", False)
             if inputs.shape[0]:
                 grad_output = grad_output.contiguous()
-                grad_activation = _split_gmm(grad_output, weight2, pool.weights[1], groups, route,
-                                             transpose=True, prefetch=pool, matrix_index=1)
-                grad_up = _npu_ops().npu_swiglu_backward(grad_activation, up)
-                grad_input = _split_gmm(grad_up, weight1, pool.weights[0], groups, route,
-                                        transpose=True, prefetch=pool, matrix_index=0)
-                _weight_gradient(inputs, grad_up, route, grad1, pool.gradients[0])
-                _weight_gradient(activation, grad_output, route, grad2, pool.gradients[1])
+                if early:
+                    _weight_gradient(activation, grad_output, route, grad2, pool.gradients[1])
+            pending = (route.transport.return_gradient_owned_early(
+                grad2, pool.gradients[1], route, matrix_index=1) if early else nullcontext())
+            with pending:
+                if inputs.shape[0]:
+                    grad_activation = _split_gmm(grad_output, weight2, pool.weights[1], groups, route,
+                                                 transpose=True, prefetch=pool, matrix_index=1)
+                    grad_up = _npu_ops().npu_swiglu_backward(grad_activation, up)
+                    grad_input = _split_gmm(grad_up, weight1, pool.weights[0], groups, route,
+                                            transpose=True, prefetch=pool, matrix_index=0)
+                    _weight_gradient(inputs, grad_up, route, grad1, pool.gradients[0])
+                    if not early:
+                        _weight_gradient(activation, grad_output, route, grad2, pool.gradients[1])
+                else:
+                    grad_input = grad_output.clone()
+            if early:
+                grad1, = return_gradients((grad1,), route, pool.gradients[:1], consume=True)
             else:
-                grad_input = grad_output.clone()
-            grad1, grad2 = return_gradients((grad1, grad2), route, pool.gradients, consume=True)
+                grad1, grad2 = return_gradients((grad1, grad2), route, pool.gradients, consume=True)
         return grad_input, grad1, grad2, None, None
 
 

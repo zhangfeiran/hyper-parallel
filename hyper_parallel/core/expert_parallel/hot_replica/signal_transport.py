@@ -35,7 +35,7 @@ _MAX_EPOCH = 2**31 - 1
 
 SIGNAL_TRANSPORT_MODES = (
     "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel", "shmem_signal_sdma_bidir",
-    "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection",
+    "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection", "shmem_signal_sdma_gradient_overlap",
 )
 
 
@@ -47,7 +47,8 @@ def signal_transport_options(mode: str) -> dict[str, bool]:
             "parallel_prefetch": mode in SIGNAL_TRANSPORT_MODES[2:],
             "parallel_gradients": mode in SIGNAL_TRANSPORT_MODES[3:],
             "overlap_home": mode in SIGNAL_TRANSPORT_MODES[4:],
-            "projection_ready": mode == "shmem_signal_sdma_projection"}
+            "projection_ready": mode in SIGNAL_TRANSPORT_MODES[5:],
+            "overlap_gradients": mode == "shmem_signal_sdma_gradient_overlap"}
 
 
 def _aligned(size: int) -> int:
@@ -84,7 +85,8 @@ class SignalReplicaTransport:
 
     def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int,
                  *, use_sdma: bool = False, parallel_prefetch: bool = False,
-                 parallel_gradients: bool = False, overlap_home: bool = False, projection_ready: bool = False) -> None:
+                 parallel_gradients: bool = False, overlap_home: bool = False, projection_ready: bool = False,
+                 overlap_gradients: bool = False) -> None:
         """Bind externally owned, 64-byte-aligned symmetric uint8 storage.
 
         Args:
@@ -104,6 +106,8 @@ class SignalReplicaTransport:
             projection_ready: Publish separate ready words for each weight matrix. Requires
                 home overlap. Forward copies matrices in tuple order; backward reverses it.
                 Include projection_ready=True when sizing the symmetric storage.
+            overlap_gradients: Allow eager native W2 gradient return before remaining backward
+                work. Requires projection readiness and parallel gradient streams.
         """
         if (storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous()
                 or storage.data_ptr() % _SIGNAL_BYTES):
@@ -116,7 +120,10 @@ class SignalReplicaTransport:
             raise ValueError("Home overlap requires parallel SDMA prefetch")
         if projection_ready and not overlap_home:
             raise ValueError("Projection readiness requires home overlap")
+        if overlap_gradients and not (projection_ready and parallel_gradients):
+            raise ValueError("Early gradients require projection readiness and parallel gradient streams")
         self._projection_ready = projection_ready
+        self._overlap_gradients = overlap_gradients
         self.projection_signals = None
         self.runtime = runtime
         self.overlap_home = overlap_home
@@ -134,6 +141,11 @@ class SignalReplicaTransport:
         self.epoch = 0
         self._layout = None
         self._lock = threading.Lock()
+
+    @property
+    def overlap_gradients(self) -> bool:
+        """Allow eager producers to overlap one ready projection with remaining work."""
+        return self._overlap_gradients
 
     @property
     def gradient_scratch_bytes(self) -> int:
@@ -355,6 +367,44 @@ class SignalReplicaTransport:
         result = _gradient_accumulators(gradients, consume=True)
         return self._return_gradients(result, guests, route)
 
+    @contextmanager
+    def return_gradient_owned_early(self, gradient: torch.Tensor, guest: torch.Tensor,
+                                    route: ReplicaRoute, *, matrix_index: int) -> Iterator[torch.Tensor]:
+        """Consume one ready FP32 projection while the caller enqueues independent work.
+
+        All ranks must enter in the same projection order within an active lease.
+        Both home and guest producers must precede entry on the current stream.
+        The body must not read or modify either tensor, or begin another return.
+        Exit joins the copy stream and waits for remote readers before reuse.
+        This interface is for eager producers, not readiness inside a fused kernel.
+        """
+        if (not self.overlap_gradients or not self._lock.locked() or self.pool is None
+                or self.pool.gradients is None):
+            raise ValueError("Early gradients require an active projection SDMA lease")
+        if not 0 <= matrix_index < len(self.pool.gradients):
+            raise ValueError("Replica gradient matrix index is out of range")
+        _gradient_accumulators((gradient,), consume=True)
+        epoch = self._advance()
+        home = route.plan.config.home_experts
+        incoming = [item for item in route.plan.transfers if item.target_rank == route.rank]
+        owned = sorted((item for item in route.plan.transfers if item.owner_rank == route.rank),
+                       key=lambda item: item.target_rank)
+        for item in incoming:
+            self._publish(3, route.rank, item.target_slot - home, item.owner_rank, epoch)
+        try:
+            with self._copy_streams([matrix_index] if owned else [], self._gradient_streams,
+                                   gradient.device) as (backend, streams):
+                if owned:
+                    stream = streams[matrix_index]
+                    with backend.stream(stream):
+                        self._accumulate_projection(gradient, guest, owned, home, epoch, matrix_index, stream)
+                        for item in owned:
+                            self._publish(4, route.rank, item.target_slot - home, item.target_rank, epoch)
+                yield gradient
+        finally:
+            for item in incoming:
+                self._wait(4, item.owner_rank, item.target_slot - home, epoch)
+
     def _return_gradients(self, result: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
                           route: ReplicaRoute) -> tuple[torch.Tensor, ...]:
         epoch = self._advance()
@@ -394,15 +444,19 @@ class SignalReplicaTransport:
             for index, (output, guest) in enumerate(zip(result, guests)):
                 stream = streams[index]
                 with backend.stream(stream):
-                    output.record_stream(stream)
-                    if index not in self._gradient_scratch:
-                        self._gradient_scratch[index] = torch.empty_like(output[0])
-                    scratch = self._gradient_scratch[index]
-                    for item in owned:
-                        slot = item.target_slot - home
-                        self._wait(3, item.target_rank, slot, epoch)
-                        self.runtime.get(scratch, guest[slot], item.target_rank, **self._copy_options)
-                        output[item.owner_slot].add_(scratch)
+                    self._accumulate_projection(output, guest, owned, home, epoch, index, stream)
         # A single ACK releases every projection in a guest slot, so join before publishing it.
         for item in owned:
             self._publish(4, route.rank, item.target_slot - home, item.target_rank, epoch)
+
+    def _accumulate_projection(self, output: torch.Tensor, guest: torch.Tensor, owned: list,
+                               home: int, epoch: int, index: int, stream: Any) -> None:
+        output.record_stream(stream)
+        if index not in self._gradient_scratch:
+            self._gradient_scratch[index] = torch.empty_like(output[0])
+        scratch = self._gradient_scratch[index]
+        for item in owned:
+            slot = item.target_slot - home
+            self._wait(3, item.target_rank, slot, epoch)
+            self.runtime.get(scratch, guest[slot], item.target_rank, **self._copy_options)
+            output[item.owner_slot].add_(scratch)

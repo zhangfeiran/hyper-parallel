@@ -315,3 +315,23 @@ after gradient production and publication. Copy streams wait for that event,
 record the output tensors on their streams, and join before ACK and lease
 release. The returned home gradients are ordinary invocation allocations; they
 do not belong to the reusable guest pool or symmetric heap.
+
+## Early native W2 gradient return
+
+With `replica_transport="shmem_signal_sdma_gradient_overlap"`, native backward
+computes W2 partials first when the plan has replicas. The shared
+`return_gradient_owned_early` context publishes that projection, reads and sums
+remote partials on its copy stream, and lets the caller submit dActivation, dX
+and W13 gradients on the producer stream. Exiting the context joins the copy
+stream and waits for remote readers before W13 return or slot reuse.
+
+The context consumes detached, invocation-owned FP32 gradients. All ranks must
+enter it in the same order inside a backward lease, after both home and guest
+producers. The body must not access those gradients or start another return.
+Each projection uses a separate epoch; acknowledgements cover its completed
+reads. Scratch remains bounded by one FP32 expert across the two projections.
+
+This mode is opt-in: `shmem_signal_sdma_projection` keeps late gradient return.
+Plans without replicas, other transport modes and legacy providers retain the
+ordinary return path. Multicore still returns gradients after its fused backward
+kernel; the eager context does not expose completion inside that kernel.
