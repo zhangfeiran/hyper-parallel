@@ -129,7 +129,7 @@ class _NativeReplicaExperts(torch.autograd.Function):
                 _weight_gradient(activation, grad_output, route, grad2, pool.gradients[1])
             else:
                 grad_input = grad_output.clone()
-            grad1, grad2 = return_gradients((grad1, grad2), route, pool.gradients)
+            grad1, grad2 = return_gradients((grad1, grad2), route, pool.gradients, consume=True)
         return grad_input, grad1, grad2, None, None
 
 

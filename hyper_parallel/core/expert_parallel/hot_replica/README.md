@@ -293,3 +293,25 @@ bytes. Push retains dynamic growth up to the same theoretical maximum; the polic
 does not change the resident guest budget `B` or allocate another weight cache.
 Planner policy is per module and does not change the layout of shared execution
 storage. All EP ranks must use the same policy for a given invocation.
+
+## Consuming invocation-owned gradients
+
+The native and multicore adapters allocate fresh FP32 home gradients for each
+backward. They pass `consume=True` to the shared `return_gradients(...)` helper,
+allowing accumulation directly into those buffers instead of cloning all home
+experts. Only detached FP32 buffers with exclusive invocation ownership may be
+consumed. They must not alias parameters, saved activations, guest slots, other
+projections, or previously returned gradients. The caller must use the returned
+tensors and must not reuse the original gradient values afterward.
+
+The ordinary `return_gradients` provider method keeps its non-consuming contract.
+A provider explicitly supports ownership transfer by implementing
+`return_gradients_owned(gradients, guests, route)`. P2P and the built-in one-sided
+providers support it; providers without that method receive their original
+three-argument call. All paths keep the same FP32 peer accumulation order.
+
+On parallel signal transport, the producer stream still records the fork event
+after gradient production and publication. Copy streams wait for that event,
+record the output tensors on their streams, and join before ACK and lease
+release. The returned home gradients are ordinary invocation allocations; they
+do not belong to the reusable guest pool or symmetric heap.
