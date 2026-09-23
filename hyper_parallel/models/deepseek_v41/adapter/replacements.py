@@ -104,7 +104,6 @@ class DeepseekV41TrainingExperts(nn.Module):
         self.down_proj = nn.Parameter(module.down_proj.detach().transpose(1, 2).contiguous(),
                                       requires_grad=module.down_proj.requires_grad)
         self._executor: MegaMoeExperts | None = None
-        self._pad_to_capacity = False
         self.train(module.training)
 
     def reset_parameters(self) -> None:
@@ -118,18 +117,16 @@ class DeepseekV41TrainingExperts(nn.Module):
                                 operations=[Transpose(dim0=-2, dim1=-1)])
                 for name in ("gate_up_proj", "down_proj")]
 
-    def configure(self, ep_group: Any, ep_size: int, local_num_tokens: int,
-                  top_k: int, expert_capacity_factor: float | None = None,
-                  *, pad_to_capacity: bool = False) -> None:
+    def configure(self, ep_group: Any, ep_size: int, max_local_num_tokens: int,
+                  top_k: int, expert_capacity_factor: float | None = None) -> None:
         """Bind the upstream executor without allocating a second set of weights.
 
         Args:
             ep_group: Whole-world EP group in global rank order.
             ep_size: Expert-parallel world size.
-            local_num_tokens: Fixed token count at the expert boundary.
+            max_local_num_tokens: Upper bound on real tokens at the expert boundary.
             top_k: Experts selected per token.
             expert_capacity_factor: Optional fixed receive capacity, with overflow errors.
-            pad_to_capacity: Pad shorter batches only at the expert boundary, then restore their shape.
         """
         if self._executor is not None:
             raise RuntimeError("Cannot reconfigure an active MegaMoe expert executor")
@@ -137,13 +134,12 @@ class DeepseekV41TrainingExperts(nn.Module):
         from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
 
         self._executor = MegaMoeExperts(
-            local_num_tokens=local_num_tokens, hidden_size=self.hidden_size,
+            max_local_num_tokens=max_local_num_tokens, hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size, num_experts=self.global_experts,
             top_k=top_k, ep_group=ep_group, ep_size=ep_size,
             expert_capacity_factor=expert_capacity_factor, swiglu_limit=self.swiglu_limit,
             create_parameters=False,
         )
-        self._pad_to_capacity = pad_to_capacity
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor) -> torch.Tensor:
@@ -161,26 +157,7 @@ class DeepseekV41TrainingExperts(nn.Module):
             raise RuntimeError("Configure MegaMoe EP execution before forward")
         weights = tuple(parameter.to_local() if isinstance(parameter, DTensor) else parameter
                         for parameter in (self.gate_up_proj, self.down_proj))
-        if not self._pad_to_capacity:
-            return self._executor(hidden_states, top_k_index, top_k_weights, expert_weights=weights)
-        original_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, self.hidden_size)
-        num_tokens = hidden_flat.shape[0]
-        top_k = self._executor.top_k
-        if top_k_index.shape != (num_tokens, top_k) or top_k_weights.shape != (num_tokens, top_k):
-            raise ValueError("MegaMoe routing tensors must match the unpadded token count and top_k")
-        padding = self._executor.local_num_tokens - num_tokens
-        if padding < 0:
-            raise ValueError("Packed token count exceeds configured MegaMoe capacity; increase the packing bound")
-        if padding:
-            # Balanced synthetic routes avoid overloading expert zero; zero weights remove their gradients.
-            padding_ids = torch.arange(padding * top_k, device=top_k_index.device, dtype=top_k_index.dtype)
-            padding_ids = padding_ids.remainder(self.global_experts).reshape(padding, top_k)
-            hidden_flat = torch.cat((hidden_flat, hidden_flat.new_zeros((padding, self.hidden_size))))
-            top_k_index = torch.cat((top_k_index, padding_ids))
-            top_k_weights = torch.cat((top_k_weights, top_k_weights.new_zeros((padding, top_k))))
-        output = self._executor(hidden_flat, top_k_index, top_k_weights, expert_weights=weights)
-        return output[:num_tokens].reshape(original_shape)
+        return self._executor(hidden_states, top_k_index, top_k_weights, expert_weights=weights)
 
     @staticmethod
     def share_execution_resources(experts: list[DeepseekV41TrainingExperts]) -> None:

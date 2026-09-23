@@ -80,9 +80,8 @@ def deepseek_v41_ep_compute_fn(
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
         megamoe: bool = False,
-        local_num_tokens: int = 128,
+        max_local_num_tokens: int = 128,
         expert_capacity_factor: float | None = 2.0,
-        pad_to_capacity: bool = False,
 ) -> Callable:
     """Build the complete V4.1 routed-plus-shared expert forward."""
     del mesh
@@ -106,8 +105,8 @@ def deepseek_v41_ep_compute_fn(
             raise TypeError("Apply DeepseekV41TrainingExperts replacement before enabling MegaMoe")
         if _swiglu_limit(module.shared_experts.limit) != module.experts.swiglu_limit:
             raise ValueError("DSV4.1 routed and shared experts must use the same swiglu_limit")
-        module.experts.configure(ep_group, 1 if ep_mesh is None else ep_mesh["ep"].size(), local_num_tokens,
-                                 module.gate.top_k, expert_capacity_factor, pad_to_capacity=pad_to_capacity)
+        module.experts.configure(ep_group, 1 if ep_mesh is None else ep_mesh["ep"].size(), max_local_num_tokens,
+                                 module.gate.top_k, expert_capacity_factor)
     else:
         bind_local_expert_forward(
             module,
@@ -223,7 +222,7 @@ def configure_megamoe(config: TrainerConfig) -> None:
     if max_length <= 0 or token_budget <= 0:
         raise ValueError("MegaMoe sequence length and packing budget must be positive")
     # Omni packing may emit one full sample even when it exceeds the selection budget.
-    tokens = ((max(max_length, token_budget) + 127) // 128) * 128
+    tokens = max(max_length, token_budget)
     for entry in entries:
         entry.when = None
         entry.local_compute_fn = Target(
@@ -231,7 +230,7 @@ def configure_megamoe(config: TrainerConfig) -> None:
             target_path="hyper_parallel.models.deepseek_v41.adapter.expert_parallel.deepseek_v41_ep_compute_fn",
             use_grouped_gemm=getattr(entry.local_compute_fn, "use_grouped_gemm", False),
             expert_capacity_factor=getattr(entry.local_compute_fn, "expert_capacity_factor", 2.0),
-            megamoe=True, local_num_tokens=tokens, pad_to_capacity=True,
+            megamoe=True, max_local_num_tokens=tokens,
         )
     config.plan_overrides.insert(0, PlanOverride(
         match="*.mlp.experts",

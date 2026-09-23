@@ -58,6 +58,8 @@ def _source(limit=10.0):
 
 def _native_reference(module, inputs, indices, weights, *, expert_weights=None):
     gate_up, down_weight = expert_weights or (module.gate_up_weight, module.down_weight)
+    original_shape = inputs.shape
+    inputs = inputs.reshape(-1, inputs.shape[-1])
     result = torch.zeros_like(inputs)
     for slot in range(indices.shape[1]):
         up = torch.bmm(inputs.unsqueeze(1), gate_up[indices[:, slot]]).squeeze(1)
@@ -68,7 +70,7 @@ def _native_reference(module, inputs, indices, weights, *, expert_weights=None):
         act = F.silu(gate) * value
         down = torch.bmm(act.unsqueeze(1), down_weight[indices[:, slot]]).squeeze(1)
         result = result + down * weights[:, slot, None]
-    return result
+    return result.reshape(original_shape)
 
 
 class TestDeepseekV41TrainingExperts(unittest.TestCase):
@@ -196,7 +198,7 @@ class TestDeepseekV41TrainingExperts(unittest.TestCase):
         module = SimpleNamespace(experts=experts, shared_experts=shared, gate=gate, is_hash=False,
                                  forward=lambda hidden_states, input_ids=None: hidden_states)
         compute = deepseek_v41_ep_compute_fn(megamoe=True, module=module, mesh=None, tp_mesh=None, cp_mesh=None,
-                                                  ep_mesh=None, local_num_tokens=128)
+                                                  ep_mesh=None, max_local_num_tokens=128)
         calls = []
         handle = experts.register_forward_pre_hook(lambda *_: calls.append(True))
         self.addCleanup(handle.remove)
@@ -248,7 +250,7 @@ class TestDeepseekV41TrainingExperts(unittest.TestCase):
         entry = next(rule for rule in config.plan_overrides
                          if getattr(rule.local_compute_fn, "megamoe", False))
         self.assertTrue(entry.local_compute_fn.megamoe)
-        self.assertEqual(entry.local_compute_fn.local_num_tokens, 128)
+        self.assertEqual(entry.local_compute_fn.max_local_num_tokens, 128)
         self.assertEqual(entry.local_compute_fn.expert_capacity_factor, 2.0)
         self.assertIsNone(entry.when)
         self.assertIs(config.dataloader.get_batch._target_, DeepseekV41TextBatch)
@@ -323,15 +325,15 @@ class TestDeepseekV41TrainingExperts(unittest.TestCase):
                         entry = next(rule for rule in config.plan_overrides
                                      if getattr(rule.local_compute_fn, "megamoe", False))
                         self.assertTrue(entry.local_compute_fn.megamoe)
-                        self.assertTrue(entry.local_compute_fn.pad_to_capacity)
+                        self.assertFalse(hasattr(entry.local_compute_fn, "pad_to_capacity"))
                     else:
                         self.assertEqual(config.to_dict(), before)
 
     def test_vlm_capacity_covers_full_samples_and_packing_budget(self):
-        """Resolve a common aligned capacity without altering image or batching metadata."""
+        """Resolve a common token bound without altering image or batching metadata."""
         recipe = str(Path(__file__).resolve().parents[5]
                      / "examples/training_demo/train_deepseek_v41_vlm_online.yaml")
-        for budget, expected in ((128, 256), (300, 384)):
+        for budget, expected in ((128, 250), (300, 300)):
             config = parse_training_args([recipe, "--megamoe=true", "--dataset.data_transform.max_seq_len=250",
                                           f"--dataloader.token_budget={budget}"])
             before = deepcopy(config.to_dict())
@@ -340,15 +342,15 @@ class TestDeepseekV41TrainingExperts(unittest.TestCase):
                 self.assertEqual(config.to_dict()[field], before[field])
             entry = next(rule for rule in config.plan_overrides
                          if getattr(rule.local_compute_fn, "megamoe", False))
-            self.assertEqual(entry.local_compute_fn.local_num_tokens, expected)
+            self.assertEqual(entry.local_compute_fn.max_local_num_tokens, expected)
 
     def test_variable_length_experts_preserve_output_and_all_gradients(self):
-        """Expert-only padding keeps real-token output and gradients equal to the unpadded oracle."""
+        """Real-token execution preserves output and gradients without synthetic routes."""
         torch.manual_seed(74)
         experts = DeepseekV41TrainingExperts(module=_source())
-        experts.configure(None, 1, 128, 2, pad_to_capacity=True)
+        experts.configure(None, 1, 128, 2)
         self.addCleanup(experts.close)
-        for tokens in (17, 126, 128):
+        for tokens in (0, 1, 17, 126, 128):
             with self.subTest(tokens=tokens):
                 hidden = (torch.randn(1, tokens, 8) * 5).requires_grad_()
                 ids = torch.arange(tokens * 2).reshape(tokens, 2) % 4
@@ -358,12 +360,9 @@ class TestDeepseekV41TrainingExperts(unittest.TestCase):
                                              expert_weights=parameters).reshape_as(hidden)
                 with patch.object(MegaMoeExperts, "forward", autospec=True, side_effect=_native_reference) as call:
                     actual = experts(hidden, ids, routing)
-                self.assertEqual(call.call_args.args[1].shape, (128, 8))
-                padded_ids, padded_weights = call.call_args.args[2:4]
-                self.assertEqual(torch.count_nonzero(padded_weights[tokens:]).item(), 0)
-                if tokens < 128:
-                    counts = torch.bincount(padded_ids[tokens:].flatten(), minlength=4)
-                    self.assertLessEqual((counts.max() - counts.min()).item(), 1)
+                self.assertIs(call.call_args.args[1], hidden)
+                self.assertIs(call.call_args.args[2], ids)
+                self.assertIs(call.call_args.args[3], routing)
                 torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
                 gradient = torch.randn_like(actual)
                 targets = (hidden, routing, *parameters)
@@ -371,13 +370,9 @@ class TestDeepseekV41TrainingExperts(unittest.TestCase):
                 expected_grads = torch.autograd.grad(expected, targets, gradient)
                 for actual_grad, expected_grad in zip(actual_grads, expected_grads):
                     torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-5)
-        with self.assertRaisesRegex(ValueError, "exceeds configured"):
-            experts(torch.zeros(1, 129, 8), torch.zeros(129, 2, dtype=torch.int32), torch.ones(129, 2))
-        with self.assertRaisesRegex(ValueError, "routing tensors"):
-            experts(torch.zeros(1, 17, 8), torch.zeros(16, 2, dtype=torch.int32), torch.ones(17, 2))
 
     def test_multimodal_router_and_shared_expert_gradients(self):
-        """Use real image/text router biases and propagate image-token gradients through padded experts."""
+        """Use real image/text router biases and propagate image-token gradients through variable-length experts."""
         torch.manual_seed(81)
         gate = DeepseekV41TopKRouter(SimpleNamespace(
             hidden_size=8, num_local_experts=4, num_experts_per_tok=2, scoring_func="sigmoid",
@@ -394,7 +389,7 @@ class TestDeepseekV41TrainingExperts(unittest.TestCase):
         module = SimpleNamespace(experts=experts, shared_experts=shared, gate=gate, is_hash=False,
                                  forward=lambda hidden_states, input_ids=None, image_mask=None: hidden_states)
         compute = deepseek_v41_ep_compute_fn(megamoe=True, module=module, mesh=None, tp_mesh=None, cp_mesh=None,
-                                             ep_mesh=None, local_num_tokens=128, pad_to_capacity=True)
+                                             ep_mesh=None, max_local_num_tokens=128)
         hidden = (torch.randn(1, 18, 8) * 5).requires_grad_()
         image_mask = torch.zeros(1, 18, dtype=torch.bool)
         image_mask[:, 3:8] = True

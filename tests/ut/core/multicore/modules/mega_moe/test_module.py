@@ -25,8 +25,8 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
-from tests.common.mark_utils import arg_mark
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
+from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeExperts(unittest.TestCase):
@@ -84,6 +84,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         self.assertIsNone(experts.gate_up_weight)
         self.assertIsNone(experts.down_weight)
         self.assertEqual(dict(experts.state_dict()), {})
+
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")
     def test_external_weights_validate_before_resource_allocation(self) -> None:
@@ -114,6 +115,39 @@ class TestMegaMoeExperts(unittest.TestCase):
                 with self.subTest(message=message), self.assertRaisesRegex(error, message):
                     experts(hidden, ids, probabilities, expert_weights=weights)
         acquire.assert_not_called()
+
+    def test_dynamic_external_weights_use_current_gradient_policy(self) -> None:
+        """External frozen and trainable weights participate without owned parameters or padding."""
+        experts = MegaMoeExperts(max_local_num_tokens=250, hidden_size=16, intermediate_size=8,
+                                 num_experts=4, top_k=2, create_parameters=False, swiglu_limit=10.0)
+        self.addCleanup(experts.close)
+        hidden = torch.ones(17, 16, dtype=torch.bfloat16)
+        ids = torch.zeros(17, 2, dtype=torch.int32)
+        probabilities = torch.full((17, 2), 0.5)
+        spec = SimpleNamespace(max_local_num_tokens=250)
+        resources = SimpleNamespace(spec=spec, plan_for_tokens=Mock(), workspace=object())
+        route = SimpleNamespace(unpermute_mapping=object(), metadata=SimpleNamespace(plan_tokens=128))
+        with (
+            patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+            patch.object(experts, "_get_execution_resources", return_value=resources),
+            patch.object(mega_moe_module, "prepare_topk_route", return_value=route) as prepare,
+            patch.object(mega_moe_module, "execute_mega_moe_with_permutation",
+                         side_effect=lambda states, _ids, first, second, *_args: states * (first.sum() + second.sum())),
+            patch.object(mega_moe_module, "restore_topk_output", side_effect=lambda output, *_args: output),
+        ):
+            for trainable in (False, True):
+                with self.subTest(trainable=trainable):
+                    weights = (torch.ones(4, 16, 16, dtype=torch.bfloat16, requires_grad=trainable),
+                               torch.ones(4, 8, 16, dtype=torch.bfloat16, requires_grad=True))
+                    output = experts(hidden, ids, probabilities, expert_weights=weights)
+                    output.sum().backward()
+                    self.assertEqual(prepare.call_args.kwargs["autograd_mask"], 9 + 4 * trainable)
+                    self.assertEqual(prepare.call_args.args[0].shape, hidden.shape)
+                    self.assertEqual(prepare.call_args.args[0].data_ptr(), hidden.data_ptr())
+                    torch.testing.assert_close(weights[1].grad, torch.full_like(weights[1], hidden.numel()))
+                    self.assertEqual(weights[0].grad is not None, trainable)
+        self.assertEqual(dict(experts.state_dict()), {})
+
     def test_dynamic_constructor_retains_capacity_and_accepts_real_shapes(self) -> None:
         """Arbitrary including empty inputs do not change the reserved resource specification."""
         experts = MegaMoeExperts(max_local_num_tokens=257, hidden_size=16, intermediate_size=8,

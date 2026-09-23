@@ -4,7 +4,9 @@ Trainer 基线为 `trainer_dev` 的 `edd4fae9`。在该基线上，按原顺序�
 截至 `605d5aa5` 的 multicore 及对应测试提交，再引入
 [PR #847](https://github.com/mindspore-ai/hyper-parallel/pull/847) 的 `73f09787`，
 再从 `megamoe-push-pull` 引入 `01839418` 的外部专家权重接口，
-DSV4.1 Trainer 适配合并为顶部的一条提交；底层 multicore 来源提交独立保留。
+DSV4.1 文本/VLM 接入基线为 `f888e467`；底层 multicore 来源提交独立保留。
+本轮再引入基于 master `051d821f` 开发的动态 token 实现（原提交 `b02ae750`），
+将模型入口切换为真实 token 执行。
 
 重放范围包含 SHMEM stream-enqueue、MegaMoe 内存和大任务图、profiling、native
 库加固、静态检查及对应测试。两个全仓 Platform/MindSpore 清理提交仅提取 multicore
@@ -12,8 +14,7 @@ DSV4.1 Trainer 适配合并为顶部的一条提交；底层 multicore 来源提
 检查名单随各自原提交完整保留。
 
 引入 PR #847 前，multicore、其 UT 和 ST 目录均与上述 master 快照完全一致。
-PR #847 尚未合入 master；当前以该 master 快照加 PR #847 的语义合并结果为对照，
-上游实际合入后仍需重新比较。冲突处理保留 master 的字段读取、缓存刷新范围及代码结构，
+本次以该 master 快照加 PR #847 的语义合并结果为对照。冲突处理保留 master 的字段读取、缓存刷新范围及代码结构，
 增加 clipped SwiGLU 分支。适配与此文档位于 multicore 目录之外。
 
 master 的示例使用 `components.modules.moe.GroupedExperts`；trainer_dev 尚未迁移该类，
@@ -41,7 +42,9 @@ multicore 的实现来自上述 master 提交、PR #847 和 `megamoe-push-pull` 
 permute-grad 沿用上游对 `torch_npu.npu_moe_token_permute_grad_v2` 的调用，
 使用已提供此接口的 `torch_npu 2.9.0.post6`，不添加自定义 permute-grad Torch binding。
 外部权重接口保留默认自持参数行为，仅在显式传入权重时使用调用方参数。
-不引入 push/pull 切换、动态容量、Muon 或 Indexer 优化。
+不引入 push/pull 切换、SHMEM 容量自动增长、Muon 或 Indexer 优化。
+动态 token 模式使用固定的通信容量和按本次全局最大 token 数选择的执行计划，
+不会逐步重新分配 SHMEM。
 
 ## 配置与运行
 
@@ -60,15 +63,22 @@ router、workspace 共享及关闭顺序。原分支由 benchmark 脚本手动�
 保留原 `bias_vl` 与文本 bias 选路、shared experts、视觉编码器和图像插入流程。
 
 启用后，专家执行 token 容量由解析后的配置统一计算：取 `max_seq_len` 与 packing
-`token_budget` 的较大值，再向上对齐到 128；未指定 budget 时使用
+`token_budget` 的较大值，作为 `max_local_num_tokens`；未指定 budget 时使用
 `micro_batch_size × max_seq_len`。Omni packing 允许单个样本超过选择 budget，
 因此容量至少覆盖完整的 `max_seq_len`。TP/CP/PP 必须均为 1，EP 组覆盖整个 world
 且保持相同 rank 顺序。
 
-变长 batch 仅在专家边界补零到固定容量，计算后裁回真实长度。补位使用均匀分布的全局
-expert ID 和零路由权重，不进入原 router，不改变图像坐标、attention packed 边界或 loss
-输入，也不贡献真实 token 和参数梯度。超过配置 token 容量直接报错，不截断输入。
-这种补位会增加短序列的 MoE 计算和通信；性能报告需同时记录真实及补位后的 token 数。
+变长 batch 直接传入真实 hidden states、expert ID 和路由权重，不添加零 token 或虚假
+路由，不再裁剪输出。128 对齐只用于内部预留容量和任务计划，不改变模型张量形状。
+例如上限 4096、实际 224/240 token 的 VLM batch，专家计算仍接收 224/240 行。
+各 EP rank 可以有不同长度，也允许空 rank；所有 rank 仍需参与同次前后向。
+源 token 或接收路由超出预留容量时，在进入 native 通信前协调报错，不截断输入。
+模型侧图像坐标、attention packed 边界和 loss 输入保持原样。
+
+动态路由握手按本次外部权重判断梯度参与状态，兼容 `create_parameters=False`；
+资源配置握手包含 `swiglu_limit`，避免 rank 间夹断语义不一致。
+执行计划采用有界缓存，首次出现新的长度桶有构建开销，超过缓存覆盖范围可能重复构建。
+冷启动和稳定长度阶段的性能应分别统计。
 
 以下文本命令覆盖为 EP8、全局 E48、每卡 6 个专家，保留四层、H5120/I2304、TopK6，
 每卡专家执行 token 容量为 4096。
@@ -121,7 +131,8 @@ CPU 回归覆盖：真实 checkpoint 转换往返、meta 初始化、连续两�
 输出与全部梯度、异常后不保留外部权重、无重复参数、router 调用次数、嵌套 hooks、
 packed sample 边界、limit 和并行配置检查。另验证开关缺省和显式 `false` 的配置一致，
 仍选择原训练器和 native EP；两种 Trainer 都在分布式配置归一化前处理 MegaMoe 开关。
-新增变长 token 补位前后的输出、输入/路由/专家权重梯度对照，真实 V4.1 `bias_vl` 选路、
+新增零/短 token 原样传入检查、输出与输入/路由/专家权重梯度对照、外部权重冻结策略检查，
+真实 V4.1 `bias_vl` 选路、
 图像 token 梯度及 shared expert 梯度检查。CPU 数值测试以独立参考替代 native executor，
 验证适配语义，不作为 native kernel 或整网 NPU 精度结论。关闭资源前先执行训练回调。
 
@@ -132,13 +143,11 @@ HYPER_PARALLEL_PLATFORM=torch python -m pytest -q \
   tests/ut/trainer
 ```
 
-当前环境为 Torch 2.9.0、torch_npu 2.9.0.post6，已确认提供
-`npu_moe_token_permute_grad_v2`。接入 VLM 后重新执行上述 CPU 回归；
-结果为 **126 passed、397 subtests passed**，无失败。没有跳过缺失接口相关测试或放宽阈值。
-独立进程验证文本和 VLM 默认 YAML 及共用初始化路径，`megamoe=false` 保持配置不变，
-且不会导入 multicore。`git diff --check` 通过。适配与测试文件 pylint 通过；
-`BaseTrainer` 的检查报告 3 条成员声明问题，涉及 `data_transform` 和 `num_micro_batches`。
-对修改前源码重复检查得到相同 3 条报告，本轮未新增 pylint 问题。
+当前环境为 Torch 2.9.0、torch_npu 2.9.0.post6、CANN 9.1，已确认提供
+`npu_moe_token_permute_grad_v2`。本轮从合并后的源码重新构建 native payload，构建通过。
+动态 token 接入后的上述 CPU 回归为 **137 passed、424 subtests passed**。
+文本与 VLM 的 `megamoe=false` 配置保持不变。适配、测试文件 pylint、
+`git diff --check` 和 ST launcher 的框架导入边界检查通过。
 
 额外收集整个 DSV4.1 UT 目录时，`test_deepseek_v41_crop.py` 因导入 batching 包中不存在的
 `ParallelBatch` 而失败。该测试及 batching 代码均与 trainer_dev 基线相同；本轮未修改或
@@ -155,8 +164,29 @@ NPU 验证应先检查无 clipping 和 limit=1/10 的前后向，再以 EP8/E48�
 对照独立 FP32 参考，检查输出、输入梯度、router 权重梯度和本地专家权重梯度，输入须
 实际触发 clamp。逐算子对照使用各算子的实际输入，区分算子误差与 BF16 中间舍入累积。
 整块精度通过后运行 Trainer 前向、反向和 optimizer step。不得通过放宽阈值掩盖问题。
-新基线尚未取得 MegaMoe 整块 NPU 精度或文本/VLM 整网通过结论；VLM 还需在目标设备上
-验证视觉编码器到 loss 的完整前反向和 optimizer step。
+动态适配的设备回归包含下列独立阶段，结果须区分记录：
+
+1. EP8/E48 单层，以 `limit=10` 和实际触发 clamp 的输入，对比动态执行与旧固定容量补位
+   执行的输出、输入/路由/专家权重梯度；采用 `rtol=2e-2, atol=2e-3`，不放宽阈值。
+   覆盖 224/240、不等长、空 rank、全空批次、128 边界和 4096 上限。
+   独立 FP32 数学参考的误差单独报告，不能把两条 BF16 路径的一致性称为纯 FP32 逐元素通过。
+2. 四层 VLM，EP8/E48、H5120/I2304、TopK6、单层视觉编码器，执行三步训练。
+   动态版本与重建的固定容量补位版本用相同权重初始化、图片、文本、优化器和学习率计划。
+3. 同配置文本 crop 执行三步训练，保留原文本入口和数据管线。
+   整网比较 loss、梯度范数以及每个本地可训练参数的固定位置抽样；抽样一致不能代替全部梯度检查。
+
+单层设备回归入口：
+
+```bash
+HYPER_PARALLEL_PLATFORM=torch python -m pytest -vs \
+  tests/torch/multicore/test_mega_moe.py::test_deepseek_v41_dynamic_tokens
+```
+
+整网验收同时检查专家实际输入行数、有限 loss/梯度、optimizer 调用和正常关闭资源。
+单层测试已通过：8 个 rank × 5 组输入，输出、输入梯度与路由梯度逐元素一致，
+专家权重梯度通过上述阈值。重饱和输入下，纯 FP32 的梯度误差仍存在，
+动态与固定路径的相对误差基本相同。设备监控发现并发外部进程，此次仅作为精度证据。
+整网任务继续排队，尚不声明新适配的整网精度通过。
 
 性能需在精度通过后单独测量：固定 canonical 权重、数据、学习率计划和任务队列设置，
 基线使用 trainer_dev 原生 EP，候选使用本适配，按独立进程 ABBA 顺序运行。
