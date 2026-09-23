@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import threading
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -129,6 +130,13 @@ class MegaMoeWorkspace:
     forward_ready_initialized: bool = False
     backward_ready_initialized: bool = False
     lock: Any = field(default_factory=threading.Lock, repr=False)
+    pending_backwards: Any = field(default_factory=weakref.WeakSet, repr=False)
+
+    def validate_close(self) -> None:
+        """Keep communication storage alive until outstanding graphs finish backward."""
+        with self.lock:
+            if self.in_use or self.pending_backwards:
+                raise RuntimeError("Cannot close MegaMoe workspace with an active call or pending backward")
 
     def ensure(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
         """Allocate the fixed configured route capacity once.
@@ -271,6 +279,7 @@ class MegaMoeWorkspace:
 
     def close(self) -> None:
         """Synchronize, release all buffers, and reset the workspace."""
+        self.validate_close()
         with self.lock:
             if self.in_use:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")

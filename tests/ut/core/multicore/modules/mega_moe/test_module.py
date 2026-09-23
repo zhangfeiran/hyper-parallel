@@ -15,7 +15,10 @@
 """Unit tests for the model-facing MegaMoe module."""
 
 import unittest
+from collections import OrderedDict
+from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
 
 import torch
@@ -23,6 +26,7 @@ import torch
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from tests.common.mark_utils import arg_mark
+from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 
 
 class TestMegaMoeExperts(unittest.TestCase):
@@ -110,6 +114,58 @@ class TestMegaMoeExperts(unittest.TestCase):
                 with self.subTest(message=message), self.assertRaisesRegex(error, message):
                     experts(hidden, ids, probabilities, expert_weights=weights)
         acquire.assert_not_called()
+    def test_dynamic_constructor_retains_capacity_and_accepts_real_shapes(self) -> None:
+        """Arbitrary including empty inputs do not change the reserved resource specification."""
+        experts = MegaMoeExperts(max_local_num_tokens=257, hidden_size=16, intermediate_size=8,
+                                 num_experts=4, top_k=2)
+        self.addCleanup(experts.close)
+        self.assertIsNone(experts.local_num_tokens)
+        self.assertEqual(experts._resource_group.specification["local_num_tokens"], 384)
+        with patch.object(experts, "_validate_tensors"):
+            for tokens in (0, 1, 127, 128, 129, 257):
+                with self.subTest(tokens=tokens):
+                    result = experts._validate_forward_inputs(
+                        torch.empty(1, tokens, 16), torch.empty(tokens, 2, dtype=torch.int32),
+                        torch.empty(tokens, 2), None, (experts.gate_up_weight, experts.down_weight))
+                    self.assertEqual(tuple(result.shape), (tokens, 16))
+        for kwargs in ({}, {"local_num_tokens": 128, "max_local_num_tokens": 256},
+                       {"max_local_num_tokens": 0}, {"max_local_num_tokens": True}, {"max_local_num_tokens": 2**31}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **kwargs)
+
+    def test_plan_cache_evicts_without_mutating_retained_plans_or_capacity(self) -> None:
+        """A deferred backward retains its old plan after cache eviction and a new shape."""
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources.spec = MegaMoeSpec(4096, 16, 8, 4, 2, None, 8192, 1, None, 0, 24,
+                                    max_local_num_tokens=4096)
+        resources._plans = OrderedDict()
+        with patch.object(mega_moe_module, "build_mega_moe_plan",
+                          side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
+            retained = resources.plan_for_tokens(128, "cpu")
+            self.assertIs(retained, resources.plan_for_tokens(128, "cpu"))
+            for tokens in (256, 384, 512, 4096):
+                resources.plan_for_tokens(tokens, "cpu")
+            self.assertEqual(len(resources._plans), 4)
+            self.assertNotIn(128, resources._plans)
+            self.assertEqual(retained.spec.plan_tokens, 128)
+            self.assertEqual(retained.spec.routed_slots, 8192)
+            self.assertEqual(retained.spec.receive_capacity, 8192)
+            self.assertEqual(resources.spec, replace(retained.spec, schedule_tokens=None))
+            self.assertEqual(build.call_count, 5)
+
+    def test_resource_manifest_rejects_rank_configuration_mismatch(self) -> None:
+        """Static and dynamic ranks enter the same check before symmetric allocation."""
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources.spec = SimpleNamespace(ep_size=2, ep_group=object())
+
+        def gather(output: list, value: Any, **kwargs: Any) -> None:
+            """Simulate a peer using another resource mode or capacity."""
+            self.assertIs(kwargs["group"], resources.spec.ep_group)
+            output[:] = [value, ("different",)]
+
+        with patch.object(mega_moe_module.dist, "all_gather_object", side_effect=gather):
+            with self.assertRaisesRegex(ValueError, "configurations differ"):
+                resources._validate_distributed_configuration(({"local_num_tokens": 128},))
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_constructor_defaults_to_lossless_capacity(
@@ -378,7 +434,7 @@ class TestMegaMoeExperts(unittest.TestCase):
     def test_execution_resource_pairs_shmem_acquire_and_release(self) -> None:
         """Pair one SHMEM reference with one execution-resource lifetime."""
         root_group = object()
-        bound_spec = SimpleNamespace(ep_group=root_group)
+        bound_spec = SimpleNamespace(ep_group=root_group, max_local_num_tokens=None)
         workspace = Mock()
 
         with (
@@ -410,7 +466,7 @@ class TestMegaMoeExperts(unittest.TestCase):
     def test_execution_resource_construction_failure_releases_shmem(self) -> None:
         """Release the acquired SHMEM reference when resource construction fails."""
         root_group = object()
-        bound_spec = SimpleNamespace(ep_group=root_group)
+        bound_spec = SimpleNamespace(ep_group=root_group, max_local_num_tokens=None)
 
         with (
             patch.object(

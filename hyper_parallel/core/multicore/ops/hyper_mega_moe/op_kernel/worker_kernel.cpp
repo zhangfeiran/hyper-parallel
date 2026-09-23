@@ -125,9 +125,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     }
     __gm__ SwiGluTilingData *tiling_data = reinterpret_cast<__gm__ SwiGluTilingData *>(tiling);
     tiling_data->rowLen = row_count;
-    if (row_count < SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT) {
-      tiling_data->baseRowLen = row_count;
-    }
+    tiling_data->baseRowLen = row_count < SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT
+                               ? row_count : SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT;
     cacheWriteThrough(tiling + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
   }
 

@@ -1,10 +1,10 @@
 # MegaMoe 动态 token 数设计
 
-状态：设计草案，尚未实现或完成设备验证。日期：2026-09-23。
+状态：第一版已实现，已完成 EP1/EP2/EP8 精度、生命周期及 EP8 性能回归。日期：2026-09-23。
 
 基线：本轮 fetch 后的 `upstream/master`，提交
 `051d821fbb8c873983a640ba5db356f8c52c4540`。
-本文只设计 multicore 本身的能力，不移植 DSV4.1 Trainer 或实验分支代码。
+本文记录 multicore 本身的设计和实现，不移植 DSV4.1 Trainer 或实验分支代码。
 
 ## 1. 目标和选定方案
 
@@ -59,7 +59,7 @@
 
 ## 3. 对外接口和兼容性
 
-拟议接口，尚不可在当前 master 直接调用：
+本分支已实现接口：
 
 ```python
 # 旧接口保持严格固定长度及原有默认值。
@@ -378,7 +378,11 @@ C 的零 size 和尾部安全是 A/B 设备测试及功能交付的前置条件�
 | 残留检测 | 对称 buffer 无效区和普通中间量填 poison，切换长短后结果不受旧值影响 |
 | 故障 | 单 rank 上限违规、组内配置不一致；必须明确失败，不依赖超时才发现死锁 |
 
-精度主对照使用相同真实输入、权重和路由的独立 FP32 oracle，检查输出及全部相关梯度。
+精度主对照使用独立 CPU 实现：FP32 matmul/导数计算，在 kernel 的 BF16 中间张量边界显式舍入，
+检查输出及全部相关梯度，保持已有逐元素 `rtol=2e-2, atol=2e-3`。
+SwiGLU 前向按 `gate / (1 + exp(-gate)) * up` 的计算顺序，避免不同等价表达式的中间舍入差异。
+另外保留全程不舍入的 FP32 autograd 数学 oracle，报告动态和固定路径相对它的误差及超阈值元素数。
+不能把 BF16 实现通过舍入参考，表述成所有元素均通过纯 FP32 对照。
 同时与 native EP 参考、旧固定长度路径对照；旧路径为比较而构造的零权重补位不得作为唯一 oracle。
 阈值使用已有同 dtype/shape 验收标准并在运行前冻结；若发生 BF16 舍入争议，用相同算子输入定位，
 不通过放宽阈值掩盖 route 丢失、重复或梯度缩放错误。CPU 数学验证不代替 NPU kernel 精度。
@@ -408,23 +412,109 @@ SHMEM heap 和在途保存量。heap 与其中 buffer 字节不重复相加；�
 将配置推导值作为最大容量。保留原 router、image_mask、shared experts、外部权重和 FSDP hooks，
 重新验文本/VLM 整网数值、MoE 时间占比与整网吞吐，不能直接外推单层加速比。
 
-## 11. 本轮交付边界和待设备确认项
+## 11. 实现与验证记录
 
-本轮仅交付设计文档。已基于上述 master 核对 Python 路由、容量、任务图、资源、autograd，
-以及 native 通信、动态 GMM/SwiGLU、事件触发和 host seq_size 检查位置。
-未修改 kernel、未构建 payload、未运行 NPU，也未取得新的精度或性能结果。
+本轮实现仅修改 multicore、对应 UT/ST 和使用文档，不包含模型 Trainer 的适配。
+基线未包含的 clipped SwiGLU、外部权重与 push/pull 接口不在本改动中引入。
 
-设计公式以独立 Python 整数模型检查：固定随机种子 `20260923`，覆盖 EP1/2/4/8、边界长度、
-上表的不等长组合及随机 Top-K 计数，共 172 组、1,378,350 条真实路由。
-验证源/目标区间、dispatch/combine 往返、计划覆盖及无损容量上界；其中包含 36 个
-“源长度为零但接收非零”的 rank。该检查没有调用框架或 native，只验证公式和索引关系。
+### 11.1 实现位置
 
-实现前需明确验证的关键点：
+- `module.py` / `spec.py`：互斥的动态容量参数、首次 EP 配置 manifest、固定容量、4 项 LRU 计划缓存。
+- `route.py`：复用单次 counts gather，交换长度/状态/梯度标志；INT64 前缀和，精确的真实 route 区间。
+- `plan.py`：调度长度独立于 source 容量；提交时记录实际 runtime 和 tiling 的使用 stream。
+- `function.py`：每次 ctx 保存实际长度/计划/路由，只复制有效 source 前缀，反向使用本次 T。
+  非重入 checkpoint 的 saved tensors 仅解包一次，避免 Torch 2.9 重复 unpack 报错。
+- `workspace.py`：最后一个 owner 关闭前检查活动调用和待反向 ctx；不随 batch 改变对称分配。
+- 正反向 put helper：零 size 只发送依赖 signal，不计算数据区偏移/远端数据地址。
+- 正反向 worker：每次重置 SwiGLU 尾块 `baseRowLen`，防止小尾块污染后续较大尾块。
 
-- ACLNN 对空 source 的实际行为，以及 dummy storage 是否足以维持零数据的控制调用。
-- 空输出的 autograd 在各类冻结参数组合下是否保证所有 rank 都进入匹配反向。
-- SwiGLU 小尾部→大尾部、dW 动态 K 反复变化时 tiling 刷新与缓存可见性是否完整。
-- 计划淘汰后设备 stream 与延迟反向的 storage 生命周期。
-- 实际长度分布下的构图/cache 成本及最大 rank 对任务数的影响。
+### 11.2 验证环境和结果
 
-上述项目纳入实现验收；不能以保留输入补位、跳过零 token、只测均匀等长或放宽数值阈值规避。
+构建环境：CANN 9.1、Torch 2.9.0、torch_npu 2.9.0.post6，Ascend 910B target；
+native payload 由本分支 source 构建，实际设备为 910B3。设备测试使用独立进程和进程归属监测。
+
+- multicore UT：106 passed，368 subtests passed。
+- EP1 / EP2 / EP8：每 rank 17 组长度/路由样例，独立舍入参考的输出、输入梯度、
+  路由权重梯度及两组专家梯度通过；另测有限 factor 成功、三种冻结策略和 SHMEM poison。
+- 不等长 rank、空源但有接收、全空 batch、cache 复用与淘汰、正序/逆序延迟反向通过。
+- 配置模式/容量不一致、接收溢出、源 token 超上限、梯度参与策略不一致均在 native 前协调报错。
+- 两层共享 workspace 的跨 stream 非重入 checkpoint、梯度累积和 SGD 更新通过。
+- 性能尺寸 H5120/I2304、EP8/E48 的 224/240 与满 4096，动态/固定路径全部输出和梯度对照通过。
+- 旧固定长度补位路径的全部输出/梯度通过相同逐元素阈值；纯 FP32 误差另行记录。
+  例如 EP1、T=4096 的 dW1 相对 L2 为约 0.00378，动态与固定路径一致，
+  两条路径都存在纯 FP32 逐元素超阈值，不能宣称全程 FP32 等价。
+
+精度矩阵脚本位于
+[动态 token ST worker](../../../../tests/torch/multicore/_test_mega_moe_dynamic_tokens.py)，
+薄 launcher 为 [test_mega_moe.py](../../../../tests/torch/multicore/test_mega_moe.py)。
+
+### 11.3 复现精度和性能
+
+先按 [构建说明](build.md) 构建并激活同一 checkout 的 payload，确认 editable import 指向该源码。
+激活 CANN 和 Torch 环境后，精度可使用薄 launcher：
+
+```bash
+pytest -v tests/torch/multicore/test_mega_moe.py::test_mega_moe_dynamic_tokens
+```
+
+也可分别用 `torchrun --standalone --nproc-per-node=1/2/8` 启动动态 token ST worker。
+`HP_DYNAMIC_RESULT_DIR` 可指定输出目录，每个 rank 保存独立 JSON，包含误差和旧路径对照。
+
+性能使用 [独立 benchmark worker](../../../../tests/torch/multicore/_benchmark_mega_moe_dynamic_tokens.py)：
+
+```bash
+env -u HYPER_PARALLEL_SHMEM_HEAP_SIZE HP_MEGA_MOE_WORLD_SIZE=8 \
+  torchrun --standalone --nproc-per-node=8 \
+  tests/torch/multicore/_benchmark_mega_moe_dynamic_tokens.py \
+  --backend dynamic --hidden 5120 --intermediate 2304 --capacity 4096 \
+  --warmup 4 --steps 12 --output dynamic.json
+```
+
+`--backend` 支持 `fixed`、`dynamic`、`common`。固定路径将 dummy routes 均匀分布到专家，
+并将其 hidden/probability/upstream gradient 置零，避免用偏斜的补位制造性能差异。
+所有路径使用同一 seed 的本地专家权重、实际输入和 routes。
+按 `fixed → dynamic → common → common → dynamic → fixed` 的独立进程顺序运行，
+比较 rank-max 的同步 Host F+B，包含路由、Host 控制及设备执行，不包含 optimizer。
+脚本输出短序列、不等长、满长度和混合长度场景的稳态耗时、实际 token/s、allocator 峰值和 heap。
+每个场景的首个 F+B 单独记录；首场景含首次绑定/SHMEM/构图，后续场景可能命中已有计划，
+因此该值不是纯构图时间。整卡 HBM 需由外部监测另行采样，不能用 Torch allocator 峰值代替。
+
+### 11.4 单层性能与内存结果
+
+EP8、全局 E48、每卡 6 专家、K6、H5120、I2304、T_cap=4096，BF16。
+每条路径的两个独立进程各预热 4 次、计时 12 次，按上述顺序成对运行；六个进程的归属监测均无 foreign/unresolved。
+表中短序列和满长度取合并 24 个样本的中位数；混合场景包含不同工作量，使用完整序列的平均耗时。
+
+| 实际 T 场景 | 固定补到 4096 F+B/ms | 动态 F+B/ms | 普通 EP F+B/ms | 固定/动态 | 普通 EP/动态 |
+| --- | --- | --- | --- | --- | --- |
+| 各 rank 224/240 交替 | 27.800 | 7.093 | 8.772 | 3.92x | 1.24x |
+| 各 rank 4096 | 28.280 | 28.504 | 44.282 | 0.992x | 1.55x |
+| 129/130、224/225、513/514、4096 循环 | 28.397 | 12.703 | 18.279 | 2.24x | 1.44x |
+
+动态路径的满长度耗时在这组测量中增加约 0.8%；短序列收益主要来自消除 dummy routes，
+不能称为纯 kernel 计算加速，也不能外推为整网吞吐收益。普通 EP 为当前 master 的
+`GroupedExperts + ExpertParallel` 真实长度路径；固定基线是本分支保留的静态 API，
+与动态路径使用同一 native payload，并非另行编译的旧 master 二进制。
+
+缓存未命中的开销需要单独考虑：短序列预热后首次切换到 4096，动态路径首个 F+B 为
+339.75/342.85 ms，随后降到约 28.5 ms；固定路径已有对应计划，首次满长度约 29.56/31.32 ms。
+这些数据包含整个调用，未单独拆出构图耗时。频繁遍历超过 4 个调度长度可能发生 LRU 淘汰，
+上表稳态收益不能代表这种持续 miss 的负载；进一步降低构图成本属于后续优化。
+
+| 内存口径 | 固定 | 动态 | 普通 EP |
+| --- | --- | --- | --- |
+| 短序列 Torch allocated 峰值/MiB | 2361.27 | 988.43 | 1362.41 |
+| 满长度 Torch allocated 峰值/MiB | 2361.27 | 2362.30 | 2282.48 |
+| 固定 SHMEM heap/MiB | 2176 | 2176 | 0 |
+| 完整运行整卡 HBM 采样峰值/MB（npu-smi 原始单位） | 9201 | 8740 | 8062 |
+
+短序列 allocated 峰值减少约 1373 MiB；SHMEM 预留没有缩小。
+整卡采样覆盖首次构建、三个场景及所有 rank，包含系统基线，采样周期 1 秒；它不等于瞬时峰值，
+也不是短序列专属峰值。不能把 allocator、heap 和整卡采样直接相加。
+
+性能尺寸的固定/动态逐元素对照已通过；复现时在独立进程中增加 `--check-fixed`，
+覆盖真实 224/240 及满 4096 的前后向，避免与计时进程共用资源影响 HBM。
+小尺寸独立 FP32/舍入 oracle 使用 H512、I128；两类对照应分别标注。
+
+本分支未验证 DSV4.1 文本/VLM 整网，也未验证 `retain_graph=True`、动态 graph capture
+或超出现有 ABI 的大型整数/图容量。

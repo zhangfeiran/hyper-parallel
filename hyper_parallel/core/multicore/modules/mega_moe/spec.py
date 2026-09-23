@@ -47,6 +47,13 @@ class MegaMoeSpec:
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
     swiglu_limit: float | None = None
+    max_local_num_tokens: int | None = None
+    schedule_tokens: int | None = None
+
+    @property
+    def plan_tokens(self) -> int:
+        """Return schedule coverage independently of reserved source storage."""
+        return self.local_num_tokens if self.schedule_tokens is None else self.schedule_tokens
 
     @property
     def local_experts(self) -> int:
@@ -162,4 +169,5 @@ def bind_mega_moe_spec(
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit,
+        max_local_num_tokens=specification.get("max_local_num_tokens"),
     )

@@ -25,7 +25,7 @@ import torch_npu
 from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
-from .plan import MegaMoePlan
+from .plan import MegaMoePlan, record_plan_stream
 from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
 
@@ -232,14 +232,17 @@ def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any
     """Return an owned input gradient while the workspace lease is held."""
     if not ctx.needs_input_grad[0]:
         return None
+    grad_x = grad_x[:ctx.source_rows]
     if not ctx.has_permutation:
         return grad_x.clone()
     (unpermute_mapping,) = permutation_inputs
     spec = ctx.plan.spec
+    if ctx.token_rows == 0:
+        return grad_x[:0].clone()
     # Consume the shared gradient before release records completion.
     # The permutation gradient owns its reduced [T, H] output.
     return torch_npu.npu_moe_token_permute_grad_v2(
-        grad_x, unpermute_mapping, spec.local_num_tokens, grad_x.dtype, spec.top_k
+        grad_x, unpermute_mapping, ctx.token_rows, grad_x.dtype, spec.top_k
     )
 
 
@@ -258,6 +261,8 @@ def _save_forward_state(
     """Save owned forward tensors and route state for backward."""
     ctx.plan = plan
     ctx.workspace = workspace
+    if any(ctx.needs_input_grad[:3]):
+        workspace.pending_backwards.add(ctx)
     ctx.save_for_backward(
         saved_dispatch,
         up_proj,
@@ -285,10 +290,11 @@ def _launch_forward_kernel(
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
+    record_plan_stream(plan, execution.profile_call.runtime_config)
     multicore_ops.mega_moe_with_profile_buffer(
         execution.dispatch,
         metadata.dispatch_target_off * spec.hidden_size,
-        routed_tokens.contiguous(),
+        _native_source(routed_tokens),
         metadata.dispatch_src_off * spec.hidden_size,
         metadata.dispatch_size * spec.hidden_size,
         weight1.contiguous(),
@@ -313,7 +319,7 @@ def _launch_forward_kernel(
         spec.ep_size,
         spec.num_experts,
         spec.hidden_size,
-        spec.local_num_tokens,
+        getattr(spec, "plan_tokens", spec.local_num_tokens),
     )
 
 
@@ -325,11 +331,12 @@ def _launch_backward_kernel(
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
+    record_plan_stream(plan, execution.profile_call.runtime_config)
     gradients = execution.intermediates
     multicore_ops.mega_moe_grad_with_profile_buffer(
         execution.dispatch,
         saved.dispatch_target_off * spec.hidden_size,
-        grad_output.contiguous(),
+        _native_source(grad_output),
         saved.dispatch_src_off * spec.hidden_size,
         saved.dispatch_size * spec.hidden_size,
         saved.activation,
@@ -361,8 +368,15 @@ def _launch_backward_kernel(
         spec.ep_size,
         spec.num_experts,
         spec.hidden_size,
-        spec.local_num_tokens,
+        getattr(spec, "plan_tokens", spec.local_num_tokens),
     )
+
+
+def _native_source(tensor: torch.Tensor) -> torch.Tensor:
+    """Keep a non-null ABI pointer without introducing a logical routed row."""
+    if tensor.shape[0] == 0:
+        return tensor.new_empty((1, tensor.shape[1]))
+    return tensor.contiguous()
 
 
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
@@ -404,6 +418,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             routed_tokens, _, unpermute_mapping = permutation
             if ctx.needs_input_grad[0]:
                 permutation_inputs = (unpermute_mapping,)
+        ctx.source_rows = routed_tokens.shape[0]
+        ctx.token_rows = ctx.source_rows // spec.top_k
         ctx.has_permutation = permutation is not None
         workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
         workspace.claim()
@@ -426,7 +442,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution,
             )
             execution.profile_call.complete()
-            output = execution.combine.clone()
+            output = execution.combine[:ctx.source_rows].clone()
             # Combine has consumed down_proj on this stream. Retain its owned
             # storage for backward before the next call reuses SHMEM dispatch.
             execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
@@ -462,8 +478,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         """
         plan = ctx.plan
         workspace = ctx.workspace
-        saved = _saved_backward_state(ctx.saved_tensors)
-        permutation_inputs = ctx.saved_tensors[12:]
+        saved_tensors = ctx.saved_tensors
+        saved = _saved_backward_state(saved_tensors)
+        permutation_inputs = saved_tensors[12:]
         workspace.claim()
         execution = None
         try:
@@ -481,6 +498,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             )
             execution.profile_call.complete()
             grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
+            workspace.pending_backwards.discard(ctx)
             return (
                 grad_input,
                 execution.intermediates.grad_weight1,

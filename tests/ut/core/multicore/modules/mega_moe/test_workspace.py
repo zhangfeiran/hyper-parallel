@@ -35,6 +35,16 @@ from hyper_parallel.core.multicore.scheduler.config import event_workspace_bytes
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
 
+    def test_pending_backward_prevents_close_without_changing_buffers(self) -> None:
+        """An outstanding graph must release its claim before symmetric memory teardown."""
+        workspace = workspace_module.MegaMoeWorkspace(shared=False)
+        context = Mock()
+        workspace.pending_backwards.add(context)
+        with self.assertRaisesRegex(RuntimeError, "pending backward"):
+            workspace.validate_close()
+        workspace.pending_backwards.discard(context)
+        workspace.validate_close()
+
     @staticmethod
     def _specification(expert_capacity_factor):
         """Build a fixed capacity-planning specification."""

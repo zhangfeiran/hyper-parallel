@@ -15,11 +15,13 @@
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.core.multicore.modules.mega_moe import function as function_module
 
@@ -39,7 +41,16 @@ class TestMegaMoeFunction(unittest.TestCase):
         """Compute expert weight gradients without an unused token reduction."""
         self._check_deferred_backward(permuted=True, input_grad=False)
 
-    def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True) -> None:
+    def test_dynamic_tokens_restore_each_deferred_forward_length(self) -> None:
+        """Use per-call token counts despite later forwards reusing a larger source buffer."""
+        self._check_deferred_backward(permuted=True, vary_tokens=True)
+
+    def test_non_reentrant_checkpoint_unpacks_saved_tensors_once(self) -> None:
+        """Checkpoint recomputation must not fail when backward reads its permutation state."""
+        self._check_deferred_backward(permuted=False, replay=True)
+
+    def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True,
+                                vary_tokens: bool = False, replay: bool = False) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2)
@@ -53,7 +64,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         workspace = Mock(
             expert_capacity=128,
             expert_buffer=torch.empty(128, 4),
-            routed_buffer=torch.empty(4, 4),
+            routed_buffer=torch.empty(8 if vary_tokens else 4, 4),
             forward_event_counters=torch.empty(16),
             backward_event_counters=torch.empty(16),
             gmm_workspace=torch.empty(1),
@@ -74,9 +85,11 @@ class TestMegaMoeFunction(unittest.TestCase):
         def permutation_gradient(grad: Any, mapping: Any, token_rows: int, dtype: Any, top_k: int) -> Any:
             """Require direct consumption of shared rows and return owned token rows."""
             self.assertEqual(grad.data_ptr(), workspace.routed_buffer.data_ptr())
-            self.assertEqual((token_rows, top_k), (2, 2))
+            expected_rows = (1, 3, 2, 4)[int(grad[0, 0]) - 1] if vary_tokens else 2
+            self.assertEqual((token_rows, top_k), (expected_rows, 2))
+            self.assertEqual(grad.shape[0], token_rows * top_k)
             self.assertEqual(dtype, torch.float32)
-            self.assertEqual(mapping.tolist(), [0, 2, 1, 3])
+            self.assertEqual(mapping.tolist(), list(range(token_rows * 2)) if vary_tokens else [0, 2, 1, 3])
             self.assertTrue(torch.isfinite(grad).all())
             return grad.reshape(token_rows, top_k, 4).sum(dim=1)
 
@@ -107,7 +120,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             self.assertTrue(torch.equal(args[5], torch.full_like(args[5], tag + 20)))
             for tensor, width in ((args[8], 2), (args[10], 4), (args[12], 4)):
                 self.assertEqual(tuple(tensor.shape), (capacity, width))
-            self.assertEqual(tuple(args[13].shape), (4, 4))
+            self.assertEqual(tuple(args[13].shape), (8 if vary_tokens else 4, 4))
             self.assertEqual(torch.count_nonzero(args[6]).item(), 0)
             self.assertEqual(torch.count_nonzero(args[18]).item(), 0)
             args[13].fill_(tag)
@@ -132,33 +145,39 @@ class TestMegaMoeFunction(unittest.TestCase):
                          side_effect=permutation_gradient) as mock_permutation,
         ):
             for tag, capacity in enumerate(capacities, start=1):
-                source = torch.full((2 if permuted else 4, 4), float(tag), requires_grad=input_grad)
+                tokens = (1, 3, 2, 4)[tag - 1] if vary_tokens else 2
+                source = torch.full((tokens if permuted else 4, 4), float(tag), requires_grad=input_grad)
                 route = SimpleNamespace(expert_capacity=capacity, group_list=torch.tensor([0, capacity]))
                 for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
                              "combine_src_off", "combine_target_off", "combine_size"):
                     setattr(route, name, torch.zeros(4, dtype=torch.int64))
                 if permuted:
-                    ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+                    ids = torch.tensor([[0, 1]] * tokens, dtype=torch.int32)
                     prepared = SimpleNamespace(
                         routed_tokens=source.detach().repeat_interleave(2, dim=0),
                         metadata=route,
-                        unpermute_mapping=torch.tensor([0, 2, 1, 3], dtype=torch.int32),
+                        unpermute_mapping=(torch.arange(tokens * 2, dtype=torch.int32) if vary_tokens
+                                           else torch.tensor([0, 2, 1, 3], dtype=torch.int32)),
                     )
                     output = function_module.execute_mega_moe_with_permutation(
                         source, ids, weight1, weight2, prepared, plan, workspace
                     )
+                elif replay:
+                    operation = partial(function_module.execute_mega_moe, route=route, plan=plan, workspace=workspace)
+                    output = checkpoint(operation, source, weight1, weight2, use_reentrant=False)
                 else:
                     output = function_module.execute_mega_moe(source, weight1, weight2, route, plan, workspace)
-                saved = output.grad_fn.saved_tensors
-                self.assertEqual(len(saved), 13 if permuted and input_grad else 12)
-                self.assertEqual(saved[0].data_ptr(), down_pointers[-1])
-                self.assertNotEqual(saved[0].data_ptr(), workspace.expert_buffer.data_ptr())
-                self.assertEqual(saved[0].untyped_storage().nbytes(), capacity * 4 * source.element_size())
-                self.assertEqual(tuple(output.shape), (4, 4))
+                if not replay:
+                    saved = output.grad_fn.saved_tensors
+                    self.assertEqual(len(saved), 13 if permuted and input_grad else 12)
+                    self.assertEqual(saved[0].data_ptr(), down_pointers[-1])
+                    self.assertNotEqual(saved[0].data_ptr(), workspace.expert_buffer.data_ptr())
+                    self.assertEqual(saved[0].untyped_storage().nbytes(), capacity * 4 * source.element_size())
+                self.assertEqual(tuple(output.shape), (tokens * 2 if permuted else 4, 4))
                 outputs.append(output)
                 sources.append(source)
             for tag in range(len(outputs), 0, -1):
-                self.assertTrue(torch.equal(outputs[tag - 1], torch.full((4, 4), float(tag + 40))))
+                self.assertTrue(torch.equal(outputs[tag - 1], torch.full_like(outputs[tag - 1], float(tag + 40))))
                 outputs[tag - 1].sum().backward()
                 source = sources[tag - 1]
                 expected = torch.full_like(source, float(tag * (2 if permuted else 1)))
@@ -170,8 +189,8 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertTrue(torch.equal(weight2.grad, torch.full_like(weight2, 10.0)))
         self.assertEqual(mock_permutation.call_count, len(outputs) if permuted and input_grad else 0)
         self.assertEqual(backward_capacities, list(reversed(capacities)))
-        self.assertEqual(workspace.claim.call_count, 8)
-        self.assertEqual(workspace.release.call_count, 8)
+        self.assertEqual(workspace.claim.call_count, 12 if replay else 8)
+        self.assertEqual(workspace.release.call_count, 12 if replay else 8)
 
 
 if __name__ == "__main__":
