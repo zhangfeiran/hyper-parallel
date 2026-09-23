@@ -82,7 +82,8 @@ def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
     hidden, intermediate = specification["hidden_size"], specification["intermediate_size"]
     if mode in SIGNAL_TRANSPORT_MODES:
         size = signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)), budget,
-                                    specification["ep_size"], 2)
+                                    specification["ep_size"], 2,
+                                    projection_ready=signal_transport_options(mode)["projection_ready"])
     else:
         size = budget * hidden * intermediate * 2 * 4
     return size + _WORKSPACE_ALIGNMENT - 1
@@ -246,14 +247,17 @@ class MegaMoeWorkspace:
     def _allocate_replica_storage(self, spec: MegaMoeSpec) -> None:
         """Recreate provider state with the new symmetric heap generation."""
         shapes = ((spec.hidden_size, 2 * spec.intermediate_size), (spec.intermediate_size, spec.hidden_size))
-        size = (signal_storage_bytes(shapes, spec.replica_slots_per_rank, spec.ep_size, 2)
-                if spec.replica_transport in SIGNAL_TRANSPORT_MODES else
+        options = (signal_transport_options(spec.replica_transport)
+                   if spec.replica_transport in SIGNAL_TRANSPORT_MODES else None)
+        size = (signal_storage_bytes(shapes, spec.replica_slots_per_rank, spec.ep_size, 2,
+                                     projection_ready=options["projection_ready"])
+                if options is not None else
                 spec.replica_slots_per_rank * spec.hidden_size * spec.intermediate_size * 2 * 4)
         self.replica_inbox = shmem.empty((size,), dtype=torch.uint8, alignment=_WORKSPACE_ALIGNMENT)
-        if spec.replica_transport in SIGNAL_TRANSPORT_MODES:
+        if options is not None:
             self.replica_provider = SignalReplicaTransport(shmem, self.replica_inbox,
                                                           spec.replica_slots_per_rank, spec.ep_size,
-                                                          **signal_transport_options(spec.replica_transport))
+                                                          **options)
         else:
             self.replica_provider = OneSidedReplicaTransport(shmem, self.replica_inbox)
 

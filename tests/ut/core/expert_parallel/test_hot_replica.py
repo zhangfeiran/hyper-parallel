@@ -50,16 +50,31 @@ class TestHotReplica(unittest.TestCase):
                         self.assertEqual(int(groups[-1]), len(values))
                         return values @ weights[0]
 
-                    prefetch = SimpleNamespace(wait_weights=lambda: events.append("wait"))
+                    prefetch = SimpleNamespace(wait_weights=lambda index: events.append(("wait", index)),
+                                               projection_ready=((4096, 8192), 17))
                     with patch.object(native, "_gmm", _gmm):
                         result = native._split_gmm(  # pylint: disable=protected-access
                             inputs, home, guest, torch.tensor([home_rows, home_rows + guest_rows]),
-                            route, transpose=transpose, prefetch=prefetch)
+                            route, transpose=transpose, prefetch=prefetch, matrix_index=int(transpose))
                     expected = inputs.clone()
                     expected[home_rows:] *= 3
                     torch.testing.assert_close(result, expected)
                     self.assertEqual(events, (["home"] if home_rows else []) +
-                                     (["wait", "guest"] if guest_rows else []))
+                                     ([("wait", int(transpose)), "guest"] if guest_rows else []))
+
+    def test_native_legacy_provider_keeps_its_no_argument_wait(self):
+        """An eager or whole-slot provider need not implement projection metadata."""
+        route = SimpleNamespace(rank=0, plan=SimpleNamespace(
+            config=SimpleNamespace(home_experts=1, slots_per_rank=2), dispatch_counts=((1, 1),)))
+        waited = []
+        prefetch = SimpleNamespace(wait_weights=lambda: waited.append(True))
+        inputs = torch.ones(2, 2)
+        weights = torch.eye(2).unsqueeze(0)
+        with patch.object(native, "_gmm", lambda values, weight, _groups: values @ weight[0]):
+            result = native._split_gmm(inputs, weights, weights, torch.tensor([1, 2]), route,
+                                      prefetch=prefetch, matrix_index=1)
+        torch.testing.assert_close(result, inputs)
+        self.assertEqual(waited, [True])
 
     def test_exhaustive_small_routes(self):
         """All two-rank token routes conserve counts and obey the B bound."""

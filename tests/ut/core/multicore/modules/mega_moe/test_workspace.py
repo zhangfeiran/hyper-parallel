@@ -127,10 +127,11 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                          "logical_num_experts": 24, "replica_slots_per_rank": 1, "initial_capacity_factor": 1.0}
         before = workspace_module._spec_workspace_bytes(specification, 2)
         for mode in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel", "shmem_signal_sdma_bidir",
-                     "shmem_signal_sdma_overlap"):
+                     "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection"):
             specification["replica_transport"] = mode
             after = workspace_module._spec_workspace_bytes(specification, 2)
-            self.assertEqual(after - before, 5120 * 1792 * 3 * 6 + 5 * 4 * 64 + 511)
+            ready_bytes = 2 * 64 if mode == "shmem_signal_sdma_projection" else 0
+            self.assertEqual(after - before, 5120 * 1792 * 3 * 6 + 5 * 4 * 64 + ready_bytes + 511)
             spec = SimpleNamespace(hidden_size=8, intermediate_size=4, ep_size=4,
                                    replica_slots_per_rank=1, replica_transport=mode)
             workspace = MegaMoeWorkspace(shared=True)

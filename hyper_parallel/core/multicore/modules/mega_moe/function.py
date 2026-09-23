@@ -320,8 +320,15 @@ def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool =
     pointers = (0, 0) if not backward else tuple(value.data_ptr() for value in pool.gradients)
     ready = pool.weight_ready
     values = (home, *(value.data_ptr() for value in pool.weights), *pointers)
-    data = (struct.pack("<II5Q", 0x53505754, 2, *values) if ready is None else
-            struct.pack("<II7Q", 0x53505754, 3, *values, *ready))
+    projection_ready = getattr(pool, "projection_ready", None)
+    if projection_ready is not None:
+        bases, epoch = projection_ready
+        if len(bases) != 2:
+            raise ValueError("Multicore requires two projection ready addresses")
+        data = struct.pack("<II8Q", 0x53505754, 4, *values, *bases, epoch)
+    else:
+        data = (struct.pack("<II5Q", 0x53505754, 2, *values) if ready is None else
+                struct.pack("<II7Q", 0x53505754, 3, *values, *ready))
     metadata = torch.tensor(list(data), dtype=torch.uint8, device=base.device)
     result = torch.cat((base, metadata))
     result.record_stream(torch.npu.current_stream(base.device))

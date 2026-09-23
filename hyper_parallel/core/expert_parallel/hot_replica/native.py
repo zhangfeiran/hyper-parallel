@@ -67,7 +67,7 @@ def _weight_gradient(inputs: torch.Tensor, gradients: torch.Tensor, route: Repli
 
 def _split_gmm(inputs: torch.Tensor, home: torch.Tensor, guest: torch.Tensor,
                groups: torch.Tensor, route: ReplicaRoute, *, transpose: bool = False,
-               prefetch: Any = None) -> torch.Tensor:
+               prefetch: Any = None, matrix_index: int = 0) -> torch.Tensor:
     """Run home and guest segments without concatenating expert matrices."""
     width = route.plan.config.slots_per_rank
     start = route.rank * width
@@ -80,7 +80,10 @@ def _split_gmm(inputs: torch.Tensor, home: torch.Tensor, guest: torch.Tensor,
         parts.append(_gmm(inputs[:home_rows], home, groups[:count]))
     if inputs.shape[0] > home_rows:
         if prefetch is not None:
-            prefetch.wait_weights()
+            if getattr(prefetch, "projection_ready", None) is None:
+                prefetch.wait_weights()
+            else:
+                prefetch.wait_weights(matrix_index)
         parts.append(_gmm(inputs[home_rows:], guest, groups[count:] - home_rows))
     return torch.cat(parts) if len(parts) > 1 else parts[0]
 
@@ -97,7 +100,8 @@ class _NativeReplicaExperts(torch.autograd.Function):
             if inputs.shape[0]:
                 up = _split_gmm(inputs, weight1, pool.weights[0], groups, route, prefetch=pool)
                 activation = _npu_ops().npu_swiglu(up)
-                output = _split_gmm(activation, weight2, pool.weights[1], groups, route)
+                output = _split_gmm(activation, weight2, pool.weights[1], groups, route,
+                                    prefetch=pool, matrix_index=1)
             else:
                 up = inputs.new_empty((0, weight1.shape[-1]))
                 activation = inputs.new_empty((0, weight2.shape[1]))
@@ -117,9 +121,10 @@ class _NativeReplicaExperts(torch.autograd.Function):
             if inputs.shape[0]:
                 grad_output = grad_output.contiguous()
                 grad_activation = _split_gmm(grad_output, weight2, pool.weights[1], groups, route,
-                                             transpose=True, prefetch=pool)
+                                             transpose=True, prefetch=pool, matrix_index=1)
                 grad_up = _npu_ops().npu_swiglu_backward(grad_activation, up)
-                grad_input = _split_gmm(grad_up, weight1, pool.weights[0], groups, route, transpose=True)
+                grad_input = _split_gmm(grad_up, weight1, pool.weights[0], groups, route,
+                                        transpose=True, prefetch=pool, matrix_index=0)
                 _weight_gradient(inputs, grad_up, route, grad1, pool.gradients[0])
                 _weight_gradient(activation, grad_output, route, grad2, pool.gradients[1])
             else:
