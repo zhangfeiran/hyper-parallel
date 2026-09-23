@@ -188,6 +188,7 @@ class MegaMoeExperts(MulticoreModule):
                 prefetches weights concurrently on one stream per target peer.
                 "shmem_signal_sdma_bidir" also reads gradients on separate projection
                 streams, caching at most one full FP32 expert gradient per provider.
+                "shmem_signal_sdma_overlap" lets home compute precede guest-weight readiness.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
@@ -212,7 +213,8 @@ class MegaMoeExperts(MulticoreModule):
             swiglu_limit = float(swiglu_limit)
         if replica_transport not in ("p2p", "shmem", *SIGNAL_TRANSPORT_MODES):
             raise ValueError("Unsupported replica_transport; expected p2p, shmem, shmem_signal, "
-                             "shmem_signal_sdma, shmem_signal_sdma_parallel or shmem_signal_sdma_bidir")
+                             "shmem_signal_sdma, shmem_signal_sdma_parallel, shmem_signal_sdma_bidir "
+                             "or shmem_signal_sdma_overlap")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         specification = {
             "local_num_tokens": local_num_tokens,

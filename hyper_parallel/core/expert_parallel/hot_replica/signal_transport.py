@@ -24,7 +24,7 @@ from typing import Any, Iterator
 import torch
 
 from .capacity import _integer
-from .pool import ReplicaPool
+from .pool import ReplicaPool, ReplicaPrefetch
 from .routing import ReplicaRoute
 
 _SIGNAL_BYTES = 64
@@ -34,6 +34,7 @@ _MAX_EPOCH = 2**31 - 1
 
 SIGNAL_TRANSPORT_MODES = (
     "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel", "shmem_signal_sdma_bidir",
+    "shmem_signal_sdma_overlap",
 )
 
 
@@ -42,8 +43,9 @@ def signal_transport_options(mode: str) -> dict[str, bool]:
     if mode not in SIGNAL_TRANSPORT_MODES:
         raise ValueError(f"Unsupported signal replica transport: {mode}")
     return {"use_sdma": mode != "shmem_signal",
-            "parallel_prefetch": mode in ("shmem_signal_sdma_parallel", "shmem_signal_sdma_bidir"),
-            "parallel_gradients": mode == "shmem_signal_sdma_bidir"}
+            "parallel_prefetch": mode in SIGNAL_TRANSPORT_MODES[2:],
+            "parallel_gradients": mode in SIGNAL_TRANSPORT_MODES[3:],
+            "overlap_home": mode == "shmem_signal_sdma_overlap"}
 
 
 def _aligned(size: int) -> int:
@@ -79,7 +81,7 @@ class SignalReplicaTransport:
 
     def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int,
                  *, use_sdma: bool = False, parallel_prefetch: bool = False,
-                 parallel_gradients: bool = False) -> None:
+                 parallel_gradients: bool = False, overlap_home: bool = False) -> None:
         """Bind externally owned, 64-byte-aligned symmetric uint8 storage.
 
         Args:
@@ -94,6 +96,8 @@ class SignalReplicaTransport:
             parallel_gradients: Read and accumulate different projection matrices on
                 separate streams, preserving peer order within each matrix. Cache one
                 FP32 expert gradient across projections, independent of slots/peers.
+            overlap_home: Permit deferred guest reads when the caller requests overlap.
+                Requires parallel SDMA prefetch; ready publication also uses SDMA.
         """
         if (storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous()
                 or storage.data_ptr() % _SIGNAL_BYTES):
@@ -102,7 +106,10 @@ class SignalReplicaTransport:
         _integer(ep_size, "ep_size")
         if (parallel_prefetch or parallel_gradients) and not use_sdma:
             raise ValueError("Parallel replica transport requires SDMA copies")
+        if overlap_home and not (use_sdma and parallel_prefetch):
+            raise ValueError("Home overlap requires parallel SDMA prefetch")
         self.runtime = runtime
+        self.overlap_home = overlap_home
         self._parallel_prefetch = parallel_prefetch
         self._parallel_gradients = parallel_gradients
         self._gradient_streams = {}
@@ -172,7 +179,7 @@ class SignalReplicaTransport:
 
     @contextmanager
     def lease(self, weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
-              *, backward: bool = False) -> Iterator[ReplicaPool]:
+              *, backward: bool = False, overlap: bool = False) -> Iterator[ReplicaPool | ReplicaPrefetch]:
         """Borrow direct execution views through all kernel and remote consumers."""
         if (route.plan.config.replica_slots_per_rank != self.slots
                 or route.plan.config.ep_size != self.ep_size):
@@ -182,10 +189,56 @@ class SignalReplicaTransport:
         try:
             self._bind(weights)
             with self.pool.lease(backward=backward):
-                self.prefetch(weights, self.pool.weights, route)
-                yield self.pool
+                if overlap and self.overlap_home:
+                    with self._overlapped_prefetch(weights, route) as prefetched:
+                        yield prefetched
+                else:
+                    self.prefetch(weights, self.pool.weights, route)
+                    yield self.pool
         finally:
             self._lock.release()
+
+    @contextmanager
+    def _overlapped_prefetch(self, weights: tuple[torch.Tensor, ...],
+                             route: ReplicaRoute) -> Iterator[ReplicaPrefetch]:
+        epoch = self._advance()
+        home = route.plan.config.home_experts
+        incoming = [item for item in route.plan.transfers if item.target_rank == route.rank]
+        outgoing = [item for item in route.plan.transfers if item.owner_rank == route.rank]
+        for item in incoming:
+            self._publish(0, route.rank, item.target_slot - home, item.owner_rank, epoch)
+        # No AIV helper may be needed on a copy stream once a fused kernel occupies the device.
+        for item in outgoing:
+            self._wait(0, item.target_rank, item.target_slot - home, epoch)
+        sources = {item.owner_slot: tuple(weight[item.owner_slot].contiguous() for weight in weights)
+                   for item in outgoing}
+        value = torch.tensor([epoch], dtype=torch.int32, device=weights[0].device)
+
+        def _wait():
+            for item in incoming:
+                self._wait(1, 0, item.target_slot - home, epoch)
+
+        peers = sorted({item.target_rank for item in outgoing})
+        with self._copy_streams(peers, self._streams, weights[0].device) as (backend, streams):
+            for item in outgoing:
+                stream = streams[item.target_rank]
+                with backend.stream(stream):
+                    for source, guest in zip(sources[item.owner_slot], self.pool.weights):
+                        source.record_stream(stream)
+                        self.runtime.put(guest[item.target_slot - home], source, item.target_rank,
+                                         **self._copy_options)
+                    value.record_stream(stream)
+                    self.runtime.put(self._word(1, 0, item.target_slot - home), value, item.target_rank,
+                                     **self._copy_options)
+            prefetched = ReplicaPrefetch(self.pool, _wait, (self.signals[1, 0].data_ptr(), epoch))
+            try:
+                yield prefetched
+            finally:
+                prefetched.wait_weights()
+                for item in incoming:
+                    self._publish(2, route.rank, item.target_slot - home, item.owner_rank, epoch)
+                for item in outgoing:
+                    self._wait(2, item.target_rank, item.target_slot - home, epoch)
 
     def prefetch(self, weights: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
                  route: ReplicaRoute) -> None:

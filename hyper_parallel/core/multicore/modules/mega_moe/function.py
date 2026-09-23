@@ -318,7 +318,10 @@ def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool =
     if pool is None:
         return base
     pointers = (0, 0) if not backward else tuple(value.data_ptr() for value in pool.gradients)
-    data = struct.pack("<II5Q", 0x53505754, 2, home, *(value.data_ptr() for value in pool.weights), *pointers)
+    ready = pool.weight_ready
+    values = (home, *(value.data_ptr() for value in pool.weights), *pointers)
+    data = (struct.pack("<II5Q", 0x53505754, 2, *values) if ready is None else
+            struct.pack("<II7Q", 0x53505754, 3, *values, *ready))
     metadata = torch.tensor(list(data), dtype=torch.uint8, device=base.device)
     result = torch.cat((base, metadata))
     result.record_stream(torch.npu.current_stream(base.device))
@@ -477,7 +480,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         try:
             provider = workspace.replica_provider
             pool = None if ctx.replica_route is None else leases.enter_context(
-                prefetch_weights(home_weights, ctx.replica_route, provider=provider))
+                prefetch_weights(home_weights, ctx.replica_route, provider=provider, overlap=True))
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
             capacity = metadata.expert_capacity
             execution = _prepare_forward_execution(
@@ -557,7 +560,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         try:
             provider = workspace.replica_provider
             pool = None if ctx.replica_route is None else leases.enter_context(
-                prefetch_weights((saved.weight1, saved.weight2), ctx.replica_route, backward=True, provider=provider))
+                prefetch_weights((saved.weight1, saved.weight2), ctx.replica_route,
+                                 backward=True, provider=provider, overlap=True))
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
             permutation_inputs = permutation_inputs[:1]
             execution = _prepare_backward_execution(
