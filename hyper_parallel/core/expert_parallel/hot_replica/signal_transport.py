@@ -26,6 +26,7 @@ import torch
 from .capacity import _integer
 from .pool import ReplicaPool, ReplicaPrefetch
 from .routing import ReplicaRoute
+from .transport import _gradient_accumulators
 
 _SIGNAL_BYTES = 64
 _SIGNAL_CHANNELS = 5
@@ -344,10 +345,20 @@ class SignalReplicaTransport:
 
     def return_gradients(self, gradients: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
                          route: ReplicaRoute) -> tuple[torch.Tensor, ...]:
-        """Read direct FP32 guest outputs; acknowledge before any slot can be reused."""
+        """Preserve borrowed home gradients while summing direct FP32 guest outputs."""
+        result = _gradient_accumulators(gradients, consume=False)
+        return self._return_gradients(result, guests, route)
+
+    def return_gradients_owned(self, gradients: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
+                               route: ReplicaRoute) -> tuple[torch.Tensor, ...]:
+        """Consume fresh, exclusive FP32 home buffers using the shared transport contract."""
+        result = _gradient_accumulators(gradients, consume=True)
+        return self._return_gradients(result, guests, route)
+
+    def _return_gradients(self, result: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
+                          route: ReplicaRoute) -> tuple[torch.Tensor, ...]:
         epoch = self._advance()
         home = route.plan.config.home_experts
-        result = tuple(gradient.float().clone() for gradient in gradients)
         transfers = route.plan.transfers
         for item in transfers:
             if route.rank == item.target_rank:

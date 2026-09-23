@@ -73,20 +73,38 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
         yield pool
 
 
+def _gradient_accumulators(gradients: tuple[torch.Tensor, ...], *, consume: bool) -> tuple[torch.Tensor, ...]:
+    """Reuse explicitly owned FP32 buffers or preserve borrowed inputs by copying."""
+    if not consume:
+        return tuple(gradient.float().clone() for gradient in gradients)
+    if any(gradient.dtype != torch.float32 or gradient.requires_grad for gradient in gradients):
+        raise ValueError("Consumed owner gradients must be detached FP32 tensors")
+    return gradients
+
+
 def return_gradients(gradients: tuple[torch.Tensor, ...], route: ReplicaRoute,
                      guests: tuple[torch.Tensor, ...] | None = None,
-                     provider: object = None) -> tuple[torch.Tensor, ...]:
+                     provider: object = None, *, consume: bool = False) -> tuple[torch.Tensor, ...]:
     """Accumulate guest partials in FP32 before returning owner gradients.
 
     One target rank returns at a time. Each owner needs at most B incoming
     gradient slots, independent of the number of EP ranks or remote replicas.
     All ranks execute rounds in identical order, including ranks with no work.
+
+    With consume=True, the caller transfers exclusive ownership of detached
+    FP32 home gradients. These must be fresh invocation buffers, disjoint from
+    parameters, saved tensors, guest slots, and other live gradient buffers.
+    The caller must use the returned tensors and stop using the original values.
+    Providers opt in through return_gradients_owned; legacy providers retain
+    their original three-argument, non-consuming call.
     """
     provider = route.transport if provider is None else provider
     if provider is not None:
+        if consume and callable(getattr(provider, "return_gradients_owned", None)):
+            return provider.return_gradients_owned(gradients, guests, route)
         return provider.return_gradients(gradients, guests, route)
     home = route.plan.config.home_experts
-    result = tuple(gradient[:home].float().clone() for gradient in gradients)
+    result = _gradient_accumulators(tuple(gradient[:home] for gradient in gradients), consume=consume)
     for target in range(route.plan.config.ep_size):
         operations = []
         incoming = []

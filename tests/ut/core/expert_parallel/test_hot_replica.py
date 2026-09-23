@@ -76,6 +76,62 @@ class TestHotReplica(unittest.TestCase):
         torch.testing.assert_close(result, inputs)
         self.assertEqual(waited, [True])
 
+    def test_owned_p2p_return_preserves_guest_storage_and_fp32_order(self):
+        """Consume only home rows while preserving guest slices and cancellation order."""
+        plan = build_expert_replica_plan([[100, 0, 0, 0]] * 4, 1)
+        route = ReplicaRoute(plan, torch.empty(0), torch.empty(0), 0, None)
+        gradient = torch.full((2, 2, 2), 5.0)
+        gradient[0].fill_(0.5)
+        expected = gradient[:1].clone()
+        values = (0.0, float(2**24), 1.0, -float(2**24))
+        for peer in range(1, 4):
+            expected.add_(values[peer])
+
+        def _operation(op, tensor, peer, group):
+            return SimpleNamespace(op=op, tensor=tensor, peer=peer, group=group)
+
+        def _exchange(operations):
+            for pending in operations:
+                pending.tensor.fill_(values[pending.peer])
+
+        with patch.object(transport.dist, "P2POp", side_effect=_operation), \
+                patch.object(transport.dist, "get_global_rank", side_effect=lambda _group, peer: peer), \
+                patch.object(transport, "_exchange", side_effect=_exchange):
+            result, = transport.return_gradients((gradient,), route, consume=True)
+        self.assertEqual(result.data_ptr(), gradient.data_ptr())
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        torch.testing.assert_close(gradient[1], torch.full((2, 2), 5.0))
+
+    def test_owned_return_falls_back_to_legacy_provider_without_extra_arguments(self):
+        """Old providers retain their call contract even when the caller owns its buffers."""
+        home = (torch.ones(1, 2, 2),)
+        calls = []
+
+        def _legacy(gradients, guests, route):
+            calls.append((guests, route))
+            return tuple(value.clone() for value in gradients)
+
+        provider = SimpleNamespace(return_gradients=_legacy)
+        route = SimpleNamespace(transport=provider)
+        result = transport.return_gradients(home, route, consume=True)
+        self.assertEqual(calls, [(None, route)])
+        self.assertNotEqual(result[0].data_ptr(), home[0].data_ptr())
+        torch.testing.assert_close(result[0], home[0])
+        provider.return_gradients_owned = lambda gradients, _guests, _route: gradients
+        self.assertIs(transport.return_gradients(home, route, consume=True), home)
+        borrowed = transport.return_gradients(home, route)
+        self.assertNotEqual(borrowed[0].data_ptr(), home[0].data_ptr())
+        self.assertEqual(len(calls), 2)
+
+    def test_owned_return_rejects_non_fp32_or_autograd_owned_inputs(self):
+        """An ownership opt-in must not silently convert or mutate saved differentiable inputs."""
+        plan = build_expert_replica_plan([[1]], 0)
+        route = ReplicaRoute(plan, torch.empty(0), torch.empty(0), 0, None)
+        for value in (torch.ones(1, 2, 2, dtype=torch.bfloat16), torch.ones(1, 2, 2, requires_grad=True)):
+            with self.assertRaisesRegex(ValueError, "detached FP32"), patch.object(transport, "_exchange") as exchange:
+                transport.return_gradients((value,), route, consume=True)
+            exchange.assert_not_called()
+
     def test_copy_threshold_removes_small_balancing_transfers(self):
         """Nearly balanced routes do not copy full experts for one and nine rows."""
         row = [0] * 24
