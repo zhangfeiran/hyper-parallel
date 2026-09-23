@@ -27,6 +27,7 @@ import torch.distributed as dist
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
+from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import SIGNAL_TRANSPORT_MODES
 
 from hyper_parallel.core.multicore import shmem
 
@@ -255,6 +256,8 @@ class MegaMoeExperts(MulticoreModule):
             replica_transport: "p2p", barrier-based "shmem", direct "shmem_signal",
                 or mapped-peer "shmem_signal_sdma" copies. "shmem_signal_sdma_parallel"
                 prefetches weights concurrently on one stream per target peer.
+                "shmem_signal_sdma_bidir" also reads gradients on separate projection
+                streams, caching at most one full FP32 expert gradient per provider.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
@@ -272,9 +275,9 @@ class MegaMoeExperts(MulticoreModule):
                 PP/DP groups bootstrap independently; one process can have only
                 one ordered EP membership active in SHMEM at a time.
         """
-        if replica_transport not in ("p2p", "shmem", "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel"):
+        if replica_transport not in ("p2p", "shmem", *SIGNAL_TRANSPORT_MODES):
             raise ValueError("Unsupported replica_transport; expected p2p, shmem, shmem_signal, "
-                             "shmem_signal_sdma or shmem_signal_sdma_parallel")
+                             "shmem_signal_sdma, shmem_signal_sdma_parallel or shmem_signal_sdma_bidir")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         specification = {
             "local_num_tokens": local_num_tokens,

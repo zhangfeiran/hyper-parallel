@@ -129,6 +129,23 @@ This mode adds stream/event resources but no expert staging buffers or symmetric
 heap bytes. It does not overlap prefetch with home-expert computation. All ranks
 must select the same mode; the runtime must support calls on different streams.
 
+`replica_transport="shmem_signal_sdma_bidir"` also reads and accumulates guest
+gradients on one stream per projection matrix. Native callers add
+`parallel_gradients=True` to the provider options above. Each projection preserves
+its original target-rank accumulation order in FP32 and has a separate output,
+so no two streams update the same gradient matrix. All projections join the
+caller before it acknowledges remote reads or releases the slot lease.
+
+This mode lazily caches one FP32 expert gradient across projections per provider,
+independent of B and EP size: `4 * sum(prod(matrix_shape))` bytes, or `12 * D * I`
+bytes for packed W13/W2. It allocates only on ranks that read remote gradients and
+reuses that scratch across peers, slots and calls. The public
+`gradient_scratch_bytes` property reports allocated tensor bytes. This is a local
+allocator cache, separate from symmetric B slots and the SHMEM heap budget;
+it is released with the provider after all streams finish. It is not a measured
+net peak-HBM increase relative to transient buffers in the ordered implementation.
+The original P2P, serial SDMA and weight-only parallel SDMA options remain available.
+
 Signal storage and the persistent provider are freed/recreated together by the
 heap manager. Autograd saves neither symmetric addresses nor an old provider for
 multicore. Native callers must keep their externally supplied provider/storage

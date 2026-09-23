@@ -32,6 +32,20 @@ _SIGNAL_CHANNELS = 5
 _MAX_EPOCH = 2**31 - 1
 
 
+SIGNAL_TRANSPORT_MODES = (
+    "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel", "shmem_signal_sdma_bidir",
+)
+
+
+def signal_transport_options(mode: str) -> dict[str, bool]:
+    """Resolve a signal transport mode consistently for native and multicore adapters."""
+    if mode not in SIGNAL_TRANSPORT_MODES:
+        raise ValueError(f"Unsupported signal replica transport: {mode}")
+    return {"use_sdma": mode != "shmem_signal",
+            "parallel_prefetch": mode in ("shmem_signal_sdma_parallel", "shmem_signal_sdma_bidir"),
+            "parallel_gradients": mode == "shmem_signal_sdma_bidir"}
+
+
 def _aligned(size: int) -> int:
     return (size + _SIGNAL_BYTES - 1) // _SIGNAL_BYTES * _SIGNAL_BYTES
 
@@ -64,7 +78,8 @@ class SignalReplicaTransport:
     """
 
     def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int,
-                 *, use_sdma: bool = False, parallel_prefetch: bool = False) -> None:
+                 *, use_sdma: bool = False, parallel_prefetch: bool = False,
+                 parallel_gradients: bool = False) -> None:
         """Bind externally owned, 64-byte-aligned symmetric uint8 storage.
 
         Args:
@@ -75,17 +90,23 @@ class SignalReplicaTransport:
             use_sdma: Request runtime put/get with use_sdma=True. The runtime must
                 support direct peer mapping and complete copies in stream order.
             parallel_prefetch: Enqueue outgoing SDMA weights on one stream per peer.
-                Join these streams before releasing the lease; gradients remain ordered.
+                Join these streams before releasing the lease.
+            parallel_gradients: Read and accumulate different projection matrices on
+                separate streams, preserving peer order within each matrix. Cache one
+                FP32 expert gradient across projections, independent of slots/peers.
         """
         if (storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous()
                 or storage.data_ptr() % _SIGNAL_BYTES):
             raise ValueError("Signal replica storage must be a cache-line-aligned contiguous uint8 vector")
         _integer(slots, "slots")
         _integer(ep_size, "ep_size")
-        if parallel_prefetch and not use_sdma:
-            raise ValueError("Parallel replica prefetch requires SDMA copies")
+        if (parallel_prefetch or parallel_gradients) and not use_sdma:
+            raise ValueError("Parallel replica transport requires SDMA copies")
         self.runtime = runtime
         self._parallel_prefetch = parallel_prefetch
+        self._parallel_gradients = parallel_gradients
+        self._gradient_streams = {}
+        self._gradient_scratch = {}
         self._streams = {}
         self._copy_options = {"use_sdma": True} if use_sdma else {}
         self.storage = storage
@@ -96,6 +117,11 @@ class SignalReplicaTransport:
         self.epoch = 0
         self._layout = None
         self._lock = threading.Lock()
+
+    @property
+    def gradient_scratch_bytes(self) -> int:
+        """Return cached local FP32 scratch bytes, excluding symmetric execution slots."""
+        return sum(tensor.numel() * tensor.element_size() for tensor in self._gradient_scratch.values())
 
     def _bind(self, weights: tuple[torch.Tensor, ...]) -> None:
         if not weights:
@@ -202,20 +228,26 @@ class SignalReplicaTransport:
             yield None, {}
             return
         peers = sorted({item.target_rank for item in route.plan.transfers if item.owner_rank == route.rank})
+        with self._copy_streams(peers, self._streams, device) as state:
+            yield state
+
+    @contextmanager
+    def _copy_streams(self, keys: list[int], cache: dict[int, Any],
+                      device: torch.device) -> Iterator[tuple[Any, dict[int, Any]]]:
         backend = getattr(torch, device.type)
         caller = backend.current_stream(device)
         streams = {}
         try:
-            if peers:
+            if keys:
                 ready = backend.Event()
-                # Fork after source preparation and all incoming credits, avoiding cyclic waits.
+                # Fork after local producers and incoming publications, avoiding cyclic waits.
                 ready.record(caller)
-                for peer in peers:
-                    if peer not in self._streams:
-                        self._streams[peer] = backend.Stream(device=device)
-                    stream = self._streams[peer]
+                for key in keys:
+                    if key not in cache:
+                        cache[key] = backend.Stream(device=device)
+                    stream = cache[key]
                     stream.wait_event(ready)
-                    streams[peer] = stream
+                    streams[key] = stream
             yield backend, streams
         finally:
             # The pool/workspace completion event must include every remote copy consumer.
@@ -234,18 +266,46 @@ class SignalReplicaTransport:
         for item in transfers:
             if route.rank == item.target_rank:
                 self._publish(3, route.rank, item.target_slot - home, item.owner_rank, epoch)
-        for target in range(self.ep_size):
-            for item in transfers:
-                if item.target_rank != target or item.owner_rank != route.rank:
-                    continue
-                slot = item.target_slot - home
-                self._wait(3, target, slot, epoch)
-                for output, guest in zip(result, guests):
-                    value = torch.empty_like(output[item.owner_slot])
-                    self.runtime.get(value, guest[slot], target, **self._copy_options)
-                    output[item.owner_slot].add_(value)
-                self._publish(4, route.rank, slot, target, epoch)
+        if self._parallel_gradients:
+            self._return_parallel(result, guests, route, epoch)
+        else:
+            for target in range(self.ep_size):
+                for item in transfers:
+                    if item.target_rank != target or item.owner_rank != route.rank:
+                        continue
+                    slot = item.target_slot - home
+                    self._wait(3, target, slot, epoch)
+                    for output, guest in zip(result, guests):
+                        value = torch.empty_like(output[item.owner_slot])
+                        self.runtime.get(value, guest[slot], target, **self._copy_options)
+                        output[item.owner_slot].add_(value)
+                    self._publish(4, route.rank, slot, target, epoch)
         for item in transfers:
             if route.rank == item.target_rank:
                 self._wait(4, item.owner_rank, item.target_slot - home, epoch)
         return result
+
+    def _return_parallel(self, result: tuple[torch.Tensor, ...], guests: tuple[torch.Tensor, ...],
+                         route: ReplicaRoute, epoch: int) -> None:
+        owned = sorted((item for item in route.plan.transfers if item.owner_rank == route.rank),
+                       key=lambda item: item.target_rank)
+        if not owned:
+            return
+        home = route.plan.config.home_experts
+        with self._copy_streams(list(range(len(result))), self._gradient_streams,
+                               result[0].device) as (backend, streams):
+            for index, (output, guest) in enumerate(zip(result, guests)):
+                stream = streams[index]
+                with backend.stream(stream):
+                    output.record_stream(stream)
+                    if index not in self._gradient_scratch:
+                        self._gradient_scratch[index] = torch.empty_like(output[0])
+                    scratch = self._gradient_scratch[index]
+                    for item in owned:
+                        slot = item.target_slot - home
+                        self._wait(3, item.target_rank, slot, epoch)
+                        self.runtime.get(scratch, guest[slot], item.target_rank, **self._copy_options)
+                        output[item.owner_slot].add_(scratch)
+        # A single ACK releases every projection in a guest slot, so join before publishing it.
+        for item in owned:
+            self._publish(4, route.rank, item.target_slot - home, item.target_rank, epoch)
