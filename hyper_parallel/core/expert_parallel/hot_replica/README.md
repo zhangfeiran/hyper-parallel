@@ -342,3 +342,31 @@ uploaded dispatch counts. Routes without a replica plan retain their count
 readback. Push still grows dynamically up to the theoretical maximum capacity;
 pull keeps its preallocated bound. Count-exchange waits and routing offsets are
 unchanged.
+
+## Measured cost refinement
+
+`ExpertReplicaCostModel` optionally refines the existing replica quotas after
+capacity planning. Pass the same immutable model to every rank through
+`ExpertParallel(replica_cost_model=model)` or
+`MegaMoeExperts(replica_cost_model=model)`. Calibration must match hidden and
+intermediate dimensions, EP size, backend and transport. Native calibration uses
+ordinary HCCL P2P; only MegaMoe overlap modes discount weight readiness hidden by
+home computation.
+
+Supply monotonic `(rows, milliseconds)` forward/backward tables starting at
+`(0, 0)`, full weight-copy cost per replica, exposed gradient-return cost and
+optional remote-token cost. Include measurement uncertainty and additional host
+planning time in `minimum_gain_ms`. These are approximate costs: measure complete
+forward/backward/optimizer steps separately before enabling a model in training.
+Absent calibration or expert counts outside the measured range retain the
+original quota policy.
+
+Refinement searches only existing replica edges, may remove a replica, and
+accepts only a predicted reduction in worst-rank completion time. Receive rows
+may increase within the existing capacity limit. The B slot budget, lossless
+routing and push dynamic growth with a theoretical upper bound are preserved.
+
+Routing uploads invocation-owned runs and dispatch counts in one aligned buffer.
+For a globally replica-free plan it maps logical IDs directly to home physical
+slots, including holes reserved by B. CPU plan derivatives are cached only on
+the immutable plan; device metadata and weights are never cached across calls.

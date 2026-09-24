@@ -15,7 +15,8 @@
 """Shared bounded expert replication, independent of execution backend."""
 
 from .capacity import ExpertReplicaConfig
+from .cost import ExpertReplicaCostModel
 from .plan import ExpertExecutionPlan
 from .planner import build_expert_replica_plan
 
-__all__ = ["ExpertReplicaConfig", "ExpertExecutionPlan", "build_expert_replica_plan"]
+__all__ = ["ExpertReplicaCostModel", "ExpertReplicaConfig", "ExpertExecutionPlan", "build_expert_replica_plan"]
