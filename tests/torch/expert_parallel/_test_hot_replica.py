@@ -33,7 +33,7 @@ from hyper_parallel.core.expert_parallel import ExpertParallel
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    SIGNAL_TRANSPORT_MODES, signal_transport_options,
+    SIGNAL_TRANSPORT_MODES,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
 from tests.common.port_utils import allocate_port
@@ -141,7 +141,7 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
     return {"invocations": checks, "accumulated": accumulated_error}
 
 
-def _cross_layer_pool(backend, budget, mesh, provider, executor, reference, tokens, hidden, intermediate, top_k,
+def _cross_layer_pool(backend, budget, mesh, executor, reference, tokens, hidden, intermediate, top_k,
                       replica_min_rows=0):
     """Two independent parameter owners share storage through reversed backward."""
     experts = mesh.size() * 6
@@ -154,7 +154,6 @@ def _cross_layer_pool(backend, budget, mesh, provider, executor, reference, toke
             module = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(
                 device=device, dtype=torch.bfloat16)
             ExpertParallel(replica_slots_per_rank=budget if hot and backend == "native" else 0,
-                           replica_transport=provider if hot else None,
                            replica_min_rows=replica_min_rows if hot else 0).apply(module, mesh)
             modules.append(module)
         pairs.append(modules)
@@ -269,36 +268,15 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
     torch.manual_seed(371)
     candidate = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(
         device=device, dtype=torch.bfloat16)
-    provider = None
-    symmetric = None
-    shmem_api = None
-    if backend != "native" or replica_transport != "p2p":
+    if backend == "native" and replica_transport != "p2p":
+        raise ValueError("Native hot replicas use HCCL P2P; one-sided transports require MegaMoe")
+    if backend != "native":
         endpoint = [f"tcp://127.0.0.1:{allocate_port()}" if rank == 0 else None]
         dist.broadcast_object_list(endpoint, src=0)
         os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
-    if backend == "native" and replica_transport != "p2p":
-        # Explicitly inject a test runtime; the native adapter has no multicore import.
-        shmem_api = importlib.import_module("hyper_parallel.core.multicore.shmem")
-        provider_type = importlib.import_module(
-            "hyper_parallel.core.expert_parallel.hot_replica.one_sided").OneSidedReplicaTransport
-        needed = budget * hidden * intermediate * 2 * 4
-        if replica_transport in SIGNAL_TRANSPORT_MODES:
-            signal_module = importlib.import_module("hyper_parallel.core.expert_parallel.hot_replica.signal_transport")
-            provider_type = signal_module.SignalReplicaTransport
-            needed = signal_module.signal_storage_bytes(
-                ((hidden, 2 * intermediate), (intermediate, hidden)), budget, size, 2,
-                projection_ready=signal_transport_options(replica_transport)["projection_ready"])
-        heap = ((needed + 511 + 2**21 - 1) // 2**21) * 2**21
-        shmem_api.acquire(mesh.get_group(), heap_size_bytes=heap)
-        symmetric = shmem_api.empty((needed,), dtype=torch.uint8, alignment=512)
-        if replica_transport in SIGNAL_TRANSPORT_MODES:
-            provider = provider_type(shmem_api, symmetric, budget, size,
-                                     **signal_transport_options(replica_transport))
-        else:
-            provider = provider_type(shmem_api, symmetric)
     ExpertParallel().apply(base, mesh)
     ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0,
-                   replica_transport=provider, replica_min_rows=replica_min_rows).apply(candidate, mesh)
+                   replica_min_rows=replica_min_rows).apply(candidate, mesh)
     executor = None
     reference = None
     if backend != "native":
@@ -347,7 +325,7 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
                 if evidence["capacity"] > evidence["maximum_capacity"]:
                     raise AssertionError("dynamic push capacity exceeded theoretical bound")
             if replica_transport in SIGNAL_TRANSPORT_MODES:
-                active_provider = provider if executor is None else resources.workspace.replica_provider
+                active_provider = resources.workspace.replica_provider
                 evidence["gradient_scratch_bytes"] = active_provider.gradient_scratch_bytes
                 evidence["gradient_scratch_limit_bytes"] = hidden * intermediate * 3 * 4
                 if evidence["gradient_scratch_bytes"] > evidence["gradient_scratch_limit_bytes"]:
@@ -370,16 +348,16 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference)
         if rank == 0:
             print(json.dumps({"backend": backend, "B": budget, "deferred": deferred}), flush=True)
-        if backend == "native" and replica_transport == "p2p" and any(
+        if backend == "native" and any(
                 name.startswith("hyper_parallel.core.multicore") for name in sys.modules):
             raise AssertionError("native execution imported multicore")
         cross_layer = []
         if hidden <= 128:
-            cross_layer = _cross_layer_pool(backend, budget, mesh, provider, executor, reference,
+            cross_layer = _cross_layer_pool(backend, budget, mesh, executor, reference,
                                            tokens, hidden, intermediate, top_k, replica_min_rows)
         signal_stress = None
         if replica_transport in SIGNAL_TRANSPORT_MODES and hidden <= 128:
-            active_provider = provider if executor is None else resources.workspace.replica_provider
+            active_provider = resources.workspace.replica_provider
             signal_stress = _signal_stress(active_provider, mesh, hidden, intermediate, budget)
         timing = None if not benchmark_iterations else _benchmark(
             candidate, executor, experts, tokens, hidden, top_k, benchmark_iterations)
@@ -394,10 +372,6 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             executor.close()
         if reference is not None:
             reference.close()
-        if symmetric is not None:
-            torch.npu.synchronize()
-            shmem_api.free(symmetric)
-            shmem_api.release()
 
 
 def main() -> None:
