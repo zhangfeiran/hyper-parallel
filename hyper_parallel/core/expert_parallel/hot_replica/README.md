@@ -335,3 +335,24 @@ This mode is opt-in: `shmem_signal_sdma_projection` keeps late gradient return.
 Plans without replicas, other transport modes and legacy providers retain the
 ordinary return path. Multicore still returns gradients after its fused backward
 kernel; the eager context does not expose completion inside that kernel.
+
+
+## W2 return inside multicore backward
+
+`shmem_signal_kernel_gradient` keeps projection SDMA weight prefetch and uses
+one-sided MTE reads for W2 gradients inside the fused backward kernel. The
+adapter first verifies that every Cube executes W2Grad before ActGrad and that
+the expert's ActGrad event joins all its Cube workers. Unknown schedules retain
+late return. The shared planner and receive capacity policy are unchanged.
+
+The otherwise idle even AIV workers accumulate disjoint blocks of each home W2
+matrix, preserving target-rank order for every FP32 element. Worker zero
+publishes all local guest readiness before waiting for remote producers. After
+all workers finish, it acknowledges remote reads and waits for this rank's guest
+readers before the kernel can complete. Odd AIV and Cube queues do not depend
+on these workers. Python then returns W13 through the ordinary transport.
+
+The v5 runtime extension points to invocation-owned metadata and cache-line
+completion words. It reuses the provider's ready/ACK channels with a distinct
+epoch and adds no full expert inbox. The native adapter keeps its ordinary
+return path with this mode; its eager overlap mode remains available separately.
