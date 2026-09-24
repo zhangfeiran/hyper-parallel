@@ -26,7 +26,9 @@ import hyper_parallel
 from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import (
     build_config_for_rank as build_backward_config,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
+from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
+    can_reuse_backward_dispatch, replica_w2_ready_events,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
@@ -187,6 +189,14 @@ class TestRuntimeSerialization(unittest.TestCase):
                         cfg.task_index_num[2] = 1
                     self.assertEqual(can_reuse_backward_dispatch(cfg, values.single_rank_expert_num, cores),
                                      mutation is None)
+                    events = replica_w2_ready_events(cfg, values.single_rank_expert_num, cores)
+                    if mutation is not None:
+                        self.assertEqual(events, ())
+                    else:
+                        self.assertEqual(len(events), values.single_rank_expert_num)
+                        self.assertEqual(len(set(events)), values.single_rank_expert_num)
+                        for event in events:
+                            self.assertEqual(cfg.all_event_num_triggers[event], cores)
 
 
 class TestRuntimeCppReader(unittest.TestCase):

@@ -30,6 +30,7 @@
 #include "cycle_trace_recorder.h"
 
 #include "get_mem.h"
+#include "replica_gradient.h"
 
 using namespace AscendC;  // NOLINT(build/namespaces)
 
@@ -65,14 +66,16 @@ class KernelWorkerBase {
     }
     const uint64_t base_bytes = getAtomicAddValuesOffset(runtimeConfigPtr) + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
     if (runtime_bytes != base_bytes) {
-      if (runtime_bytes != base_bytes + 48 && runtime_bytes != base_bytes + 64 && runtime_bytes != base_bytes + 72) {
+      if (runtime_bytes != base_bytes + 48 && runtime_bytes != base_bytes + 64 &&
+          runtime_bytes != base_bytes + 72 && runtime_bytes != base_bytes + 80) {
         AscendC::Trap();
       }
       __gm__ uint64_t *extension = reinterpret_cast<__gm__ uint64_t *>(runtimeConfigPtr + base_bytes);
       // v3 shares one ready per slot; v4 publishes W13 and W2 independently.
-      const bool projection_ready = runtime_bytes == base_bytes + 72;
+      const bool kernel_gradients = runtime_bytes == base_bytes + 80;
+      const bool projection_ready = kernel_gradients || runtime_bytes == base_bytes + 72;
       const bool overlap = projection_ready || runtime_bytes == base_bytes + 64;
-      const uint64_t magic = projection_ready ? 0x0000000453505754ULL :
+      const uint64_t magic = kernel_gradients ? 0x0000000553505754ULL : projection_ready ? 0x0000000453505754ULL :
                              (overlap ? 0x0000000353505754ULL : 0x0000000253505754ULL);
       if (extension[0] != magic || extension[1] == 0 || extension[1] >= local_experts) {
         AscendC::Trap();
@@ -94,6 +97,12 @@ class KernelWorkerBase {
           replica_ready_[index] = reinterpret_cast<GM_ADDR>(address);
         }
         replica_epoch_ = static_cast<int32_t>(epoch);
+      }
+      if (kernel_gradients) {
+        if (extension[9] == 0 || extension[9] % DATA_CACHE_LINE_SIZE != 0) {
+          AscendC::Trap();
+        }
+        replica_gradient_config_ = reinterpret_cast<GM_ADDR>(extension[9]);
       }
     }
     this->runtime_task_capacity = getRuntimeTaskCapacity(runtimeConfigPtr);
@@ -122,6 +131,12 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void Process() {
+#ifndef __DAV_C220_CUBE__
+    if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0 && replica_gradient_config_ != nullptr) {
+      ProcessReplicaGradients();
+      return;
+    }
+#endif
     ReadyHandshakeMeta meta;
     bool has_ready = LoadReadyHandshakeMeta(&meta);
     pull_protocol_ = meta.completion_event != 0;
@@ -155,6 +170,77 @@ class KernelWorkerBase {
   GM_ADDR replica_matrix_bases_[4] = {};
   GM_ADDR replica_ready_[2] = {};
   int32_t replica_epoch_ = 0;
+  GM_ADDR replica_gradient_config_ = nullptr;
+
+  __aicore__ inline void ProcessReplicaGradients() {
+#ifndef __DAV_C220_CUBE__
+    __gm__ uint64_t *config = reinterpret_cast<__gm__ uint64_t *>(replica_gradient_config_);
+    const int32_t rank = config[1];
+    const int32_t slots = config[2];
+    const int32_t epoch = config[3];
+    const int64_t elements = config[4];
+    const int32_t incoming_count = config[10];
+    const int32_t owned_count = config[11];
+    const int32_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    if (config[0] != 1 || rank < 0 || rank >= ep || slots <= 0 || epoch <= 0 || elements <= 0 ||
+        incoming_count < 0 || incoming_count > slots || owned_count < 0 || owned_count > ep * slots) {
+      AscendC::Trap();
+    }
+    const int32_t worker = worker_id_ / VECTOR_WORKER_STRIDE;
+    GM_ADDR output = reinterpret_cast<GM_ADDR>(config[5]);
+    GM_ADDR guest = reinterpret_cast<GM_ADDR>(config[6]);
+    GM_ADDR ready = reinterpret_cast<GM_ADDR>(config[7]);
+    GM_ADDR ack = reinterpret_cast<GM_ADDR>(config[8]);
+    GM_ADDR done = reinterpret_cast<GM_ADDR>(config[9]);
+    __gm__ uint64_t *incoming = config + 12;
+    __gm__ uint64_t *owned = incoming + incoming_count * 3;
+    // Publishing every local producer before remote waits breaks ring dependencies.
+    if (worker == 0) {
+      for (int32_t index = 0; index < incoming_count; ++index) {
+        const int32_t peer = incoming[index * 3];
+        const int32_t slot = incoming[index * 3 + 1];
+        WaitForDependency(incoming[index * 3 + 2]);
+        aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(ready +
+            (rank * slots + slot) * DATA_CACHE_LINE_SIZE), epoch, ACLSHMEM_SIGNAL_SET, peer);
+      }
+    }
+    CycleTraceRecorder trace;
+    const bool profiling = isCycleProfileEnabled(runtimeConfigPtr);
+    if (profiling) {
+      trace.Init(worker_id_, input_list[Derived::PROFILE_IDX], getAicProfileRecordCapacity(runtimeConfigPtr),
+                  getAivProfileRecordCapacity(runtimeConfigPtr));
+    }
+    for (int32_t index = 0; index < owned_count; ++index) {
+      const int32_t peer = owned[index * 4];
+      const int32_t slot = owned[index * 4 + 1];
+      const int32_t owner = owned[index * 4 + 2];
+      WaitForDependency(owned[index * 4 + 3]);
+      WaitReplicaCompletion(ready + (peer * slots + slot) * DATA_CACHE_LINE_SIZE, epoch);
+      const uint64_t start = profiling ? trace.Now() : 0;
+      AddReplicaGradient(output + owner * elements * sizeof(float), guest + slot * elements * sizeof(float),
+                          elements, peer, worker, core_num);
+      if (profiling) {
+        trace.Record(0x10008, 0, peer, rank * (home_experts_ + slots) + owner, start, trace.Now());
+      }
+    }
+    StoreReplicaCompletion(done + worker * DATA_CACHE_LINE_SIZE, epoch);
+    if (worker == 0) {
+      for (int32_t index = 0; index < core_num; ++index) {
+        WaitReplicaCompletion(done + index * DATA_CACHE_LINE_SIZE, epoch);
+      }
+      for (int32_t index = 0; index < owned_count; ++index) {
+        const int32_t peer = owned[index * 4];
+        const int32_t slot = owned[index * 4 + 1];
+        aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(ack +
+            (rank * slots + slot) * DATA_CACHE_LINE_SIZE), epoch, ACLSHMEM_SIGNAL_SET, peer);
+      }
+      for (int32_t index = 0; index < incoming_count; ++index) {
+        WaitReplicaCompletion(ack + (incoming[index * 3] * slots + incoming[index * 3 + 1]) *
+                                    DATA_CACHE_LINE_SIZE, epoch);
+      }
+    }
+#endif
+  }
 
   __aicore__ inline void WaitForReplicaWeights(int64_t slot, uint32_t projection) const {
     GM_ADDR address = replica_ready_[projection] + slot * DATA_CACHE_LINE_SIZE;
