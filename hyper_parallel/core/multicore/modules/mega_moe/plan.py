@@ -28,7 +28,9 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data im
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
+from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
+    can_reuse_backward_dispatch, replica_w2_ready_events,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
     get_gate_grad_tiling_bytes,
@@ -73,6 +75,7 @@ class MegaMoePlan:
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
+    replica_w2_events: tuple[int, ...] = ()
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -215,6 +218,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     }
     return MegaMoePlan(
         spec=spec,
+        replica_w2_events=replica_w2_ready_events(backward_config, spec.local_experts, spec.num_cube_cores),
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
         ),

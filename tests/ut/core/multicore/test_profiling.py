@@ -26,12 +26,14 @@ from hyper_parallel.core.multicore.modules.mega_moe.profiling import (
     _configure_mega_moe_profile_metadata,
 )
 from hyper_parallel.core.multicore.profiler.profiling import (
+    DEFAULT_STAGE_NAMES,
     GRAPH_STAGE_DESC_BASE,
     MAX_PROFILE_BUFFER_BYTES,
     MAX_RECORDS_PER_CORE,
     _ProfileSpec,
     _apply_mega_kernel_profile_graph,
     _calculate_profile_layout,
+    _duration_trace_event,
     _get_mega_kernel_profile_metadata,
     _prepare_mega_kernel_runtime_config,
     _resolve_cycle_frequency_mhz,
@@ -93,6 +95,21 @@ def _add_profile_op(
 
 class TestMegaKernelProfilingMetadata(unittest.TestCase):
     """Validate graph-driven stage and owner resolution."""
+
+    def test_replica_return_records_do_not_inherit_graph_task_zero(self) -> None:
+        """Synthetic return work identifies its peer without borrowing a Cube task's stage."""
+        record = {"desc_id": 0x10008, "task_id": 0, "core_type": 2, "block_id": 2,
+                  "stage_task_index": 3, "owner_id": 0, "start_cycle": 1000,
+                  "end_cycle": 1100, "entry_cycle": 900}
+        event = _duration_trace_event(record, rank=0, device_id=0, anchor_cycle=900,
+                                      cycle_frequency_mhz=50, detailed_task_names=True,
+                                      owner_label="Expert", stage_names=DEFAULT_STAGE_NAMES,
+                                      task_stage_names={0: "W2Grad"})
+        self.assertEqual(event["args"]["task_stage"], "ReplicaW2Return")
+        self.assertEqual(event["args"]["peer_rank"], 3)
+        self.assertEqual(event["args"]["core_type"], "AIV")
+        self.assertIn("ReplicaW2Return", event["name"])
+        self.assertEqual(event["dur"], 2)
 
     def test_graph_serializes_stage_names_and_owner_ids(self):
         """Use graph task ranges and prefer an explicit diagnostic name."""

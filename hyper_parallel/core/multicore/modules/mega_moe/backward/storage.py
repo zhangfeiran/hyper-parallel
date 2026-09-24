@@ -126,3 +126,19 @@ def can_reuse_backward_dispatch(cfg: RuntimeConfigC, num_experts: int, num_cores
             return False
     return (_worker_read_order(cube_tasks, num_experts, num_cores)
             and _expert_events_join_readers(cfg, cube_tasks, vector_tasks, num_experts, num_cores))
+
+
+def replica_w2_ready_events(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> tuple[int, ...]:
+    """Use full ActGrad completion only when every Cube first finishes its W2Grad.
+
+    Unknown schedules return no events so the adapter retains late gradient
+    return. No additional dependency or counter is added to the Cube queue.
+    """
+    if not can_reuse_backward_dispatch(cfg, num_experts, num_cores):
+        return ()
+    events = [0] * num_experts
+    for index in cfg.cube_task_indices[:cfg.task_index_num[0]]:
+        task = cfg.all_tasks[index]
+        if task.outputs[0].input_position == _ACTIVATION_GRAD:
+            events[task.task_index // num_cores] = task.trigger_event
+    return tuple(events)

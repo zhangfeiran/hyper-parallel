@@ -30,6 +30,7 @@ from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan
+from .kernel_gradients import prepare_kernel_gradient_return
 from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
 
@@ -313,8 +314,11 @@ def _save_forward_state(
     )
 
 
-def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool = False) -> torch.Tensor:
+def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool = False,
+                   gradient_return: torch.Tensor | None = None) -> torch.Tensor:
     """Append split addresses after profiler preparation, retaining the base ABI."""
+    if gradient_return is not None and (not backward or getattr(pool, "projection_ready", None) is None):
+        raise ValueError("Kernel gradient metadata requires a projection-ready backward lease")
     if pool is None:
         return base
     pointers = (0, 0) if not backward else tuple(value.data_ptr() for value in pool.gradients)
@@ -325,7 +329,9 @@ def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool =
         bases, epoch = projection_ready
         if len(bases) != 2:
             raise ValueError("Multicore requires two projection ready addresses")
-        data = struct.pack("<II8Q", 0x53505754, 4, *values, *bases, epoch)
+        data = (struct.pack("<II9Q", 0x53505754, 5, *values, *bases, epoch, gradient_return.data_ptr())
+                if gradient_return is not None else
+                struct.pack("<II8Q", 0x53505754, 4, *values, *bases, epoch))
     else:
         data = (struct.pack("<II5Q", 0x53505754, 2, *values) if ready is None else
                 struct.pack("<II7Q", 0x53505754, 3, *values, *ready))
@@ -384,6 +390,7 @@ def _launch_backward_kernel(
     grad_output: Any,
     execution: _BackwardExecution,
     pool: Any = None,
+    gradient_return: torch.Tensor | None = None,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -416,7 +423,8 @@ def _launch_backward_kernel(
         plan.swiglu_grad_tiling,
         execution.gmm_workspace,
         execution.swiglu_workspace,
-        _split_runtime(execution.profile_call.runtime_config, pool, saved.weight1.shape[0], backward=True),
+        _split_runtime(execution.profile_call.runtime_config, pool, saved.weight1.shape[0], backward=True,
+                       gradient_return=gradient_return),
         execution.profile_call.event_counters,
         execution.profile_call.profile_buffer,
         spec.rank_id,
@@ -578,14 +586,22 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 grad_output,
             )
             profile_call = execution.profile_call
-            _launch_backward_kernel(plan, saved, source, execution, pool)
+            early_return = prepare_kernel_gradient_return(
+                plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,
+                None if pool is None else pool.gradients[1])
+            _launch_backward_kernel(plan, saved, source, execution, pool,
+                                    None if early_return is None else early_return.metadata)
             profile_call.complete()
             grad_x = execution.grad_x
             grad_weight1 = execution.intermediates.grad_weight1
             grad_weight2 = execution.intermediates.grad_weight2
             if ctx.replica_route is not None:
-                grad_weight1, grad_weight2 = return_gradients(
-                    (grad_weight1, grad_weight2), ctx.replica_route, pool.gradients, provider, consume=True)
+                if early_return is not None:
+                    grad_weight1, = return_gradients(
+                        (grad_weight1,), ctx.replica_route, pool.gradients[:1], provider, consume=True)
+                else:
+                    grad_weight1, grad_weight2 = return_gradients(
+                        (grad_weight1, grad_weight2), ctx.replica_route, pool.gradients, provider, consume=True)
             # Both kernels use the current stream. Release ordinary scratch
             # before allocating the owned token gradient; SHMEM stays leased.
             execution = None

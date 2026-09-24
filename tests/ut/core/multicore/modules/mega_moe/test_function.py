@@ -64,6 +64,29 @@ class TestMegaMoeFunction(unittest.TestCase):
             self.assertEqual(struct.unpack("<II8Q", bytes(result[16:].tolist())),
                              (0x53505754, 4, 6, *(w.data_ptr() for w in weights), *pointers, 4096, 8192, 23))
 
+    def test_split_runtime_v5_retains_projection_prefix_and_gradient_descriptor(self) -> None:
+        """Backward adds one invocation descriptor without changing existing projection addresses."""
+        base = torch.arange(16, dtype=torch.uint8)
+        weights = (torch.empty(1), torch.empty(2))
+        gradients = (torch.empty(3), torch.empty(4))
+        descriptor = torch.empty(128, dtype=torch.uint8)
+        pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=None,
+                               projection_ready=((4096, 8192), 23))
+        with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream"):
+            result = function_module._split_runtime(base, pool, 6, backward=True, gradient_return=descriptor)
+        torch.testing.assert_close(result[:16], base)
+        self.assertEqual(struct.unpack("<II9Q", bytes(result[16:].tolist())),
+                         (0x53505754, 5, 6, *(w.data_ptr() for w in weights),
+                          *(g.data_ptr() for g in gradients), 4096, 8192, 23, descriptor.data_ptr()))
+
+    def test_kernel_return_requires_backward_projection_readiness(self) -> None:
+        """Reject a descriptor that the consumer cannot safely interpret before allocation."""
+        base, descriptor = torch.empty(16, dtype=torch.uint8), torch.empty(128, dtype=torch.uint8)
+        for backward, pool in ((False, SimpleNamespace(projection_ready=((4096, 8192), 1))),
+                               (True, SimpleNamespace(projection_ready=None))):
+            with self.assertRaisesRegex(ValueError, "projection-ready backward"):
+                function_module._split_runtime(base, pool, 6, backward=backward, gradient_return=descriptor)
+
     def test_deferred_backward_keeps_local_owned_storage_after_workspace_reuse(self) -> None:
         """Retain each route's data and capacity across grow/shrink and reverse backward."""
         for reuse in (False, True):

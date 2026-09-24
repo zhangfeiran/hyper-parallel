@@ -36,6 +36,7 @@ _MAX_EPOCH = 2**31 - 1
 SIGNAL_TRANSPORT_MODES = (
     "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel", "shmem_signal_sdma_bidir",
     "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection", "shmem_signal_sdma_gradient_overlap",
+    "shmem_signal_kernel_gradient",
 )
 
 
@@ -48,7 +49,8 @@ def signal_transport_options(mode: str) -> dict[str, bool]:
             "parallel_gradients": mode in SIGNAL_TRANSPORT_MODES[3:],
             "overlap_home": mode in SIGNAL_TRANSPORT_MODES[4:],
             "projection_ready": mode in SIGNAL_TRANSPORT_MODES[5:],
-            "overlap_gradients": mode == "shmem_signal_sdma_gradient_overlap"}
+            "overlap_gradients": mode == "shmem_signal_sdma_gradient_overlap",
+            "kernel_gradients": mode == "shmem_signal_kernel_gradient"}
 
 
 def _aligned(size: int) -> int:
@@ -86,7 +88,7 @@ class SignalReplicaTransport:
     def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int,
                  *, use_sdma: bool = False, parallel_prefetch: bool = False,
                  parallel_gradients: bool = False, overlap_home: bool = False, projection_ready: bool = False,
-                 overlap_gradients: bool = False) -> None:
+                 overlap_gradients: bool = False, kernel_gradients: bool = False) -> None:
         """Bind externally owned, 64-byte-aligned symmetric uint8 storage.
 
         Args:
@@ -108,6 +110,8 @@ class SignalReplicaTransport:
                 Include projection_ready=True when sizing the symmetric storage.
             overlap_gradients: Allow eager native W2 gradient return before remaining backward
                 work. Requires projection readiness and parallel gradient streams.
+            kernel_gradients: Let a fused consumer perform W2 return on its own workers.
+                Requires projection readiness and parallel gradient streams.
         """
         if (storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous()
                 or storage.data_ptr() % _SIGNAL_BYTES):
@@ -120,10 +124,11 @@ class SignalReplicaTransport:
             raise ValueError("Home overlap requires parallel SDMA prefetch")
         if projection_ready and not overlap_home:
             raise ValueError("Projection readiness requires home overlap")
-        if overlap_gradients and not (projection_ready and parallel_gradients):
+        if (overlap_gradients or kernel_gradients) and not (projection_ready and parallel_gradients):
             raise ValueError("Early gradients require projection readiness and parallel gradient streams")
         self._projection_ready = projection_ready
         self._overlap_gradients = overlap_gradients
+        self._kernel_gradients = kernel_gradients
         self.projection_signals = None
         self.runtime = runtime
         self.overlap_home = overlap_home
@@ -146,6 +151,23 @@ class SignalReplicaTransport:
     def overlap_gradients(self) -> bool:
         """Allow eager producers to overlap one ready projection with remaining work."""
         return self._overlap_gradients
+
+    @property
+    def kernel_gradients(self) -> bool:
+        """Allow a fused consumer to own W2 publication, accumulation and acknowledgement."""
+        return self._kernel_gradients
+
+    def kernel_gradient_signals(self) -> tuple[int, int, int]:
+        """Reserve an epoch and return ready/ACK bases for an active backward lease.
+
+        All ranks must reserve exactly once in the same order. The consumer must
+        publish readiness after production, preserve FP32 peer order and wait for
+        every remote reader before returning control or reusing guest storage.
+        """
+        if (not self.kernel_gradients or not self._lock.locked() or self.pool is None
+                or self.pool.gradients is None):
+            raise ValueError("Kernel gradients require an active projection SDMA lease")
+        return self._advance(), self.signals[3].data_ptr(), self.signals[4].data_ptr()
 
     @property
     def gradient_scratch_bytes(self) -> int:
@@ -187,8 +209,8 @@ class SignalReplicaTransport:
         self.pool.gradients = tuple(views[len(weights):])
         self._layout = layout
 
-    def _advance(self) -> int:
-        if self.epoch == _MAX_EPOCH:
+    def _advance(self, *, reserve: int = 0) -> int:
+        if self.epoch >= _MAX_EPOCH - reserve:
             self.runtime.host_barrier()
             self.signals.zero_()
             if self.projection_signals is not None:
@@ -231,7 +253,9 @@ class SignalReplicaTransport:
     @contextmanager
     def _overlapped_prefetch(self, weights: tuple[torch.Tensor, ...],
                              route: ReplicaRoute, *, backward: bool = False) -> Iterator[ReplicaPrefetch]:
-        epoch = self._advance()
+        # A fused consumer still polls weight readiness when W2 return reserves its epoch.
+        # Roll over before publication, leaving room for both W2 and the W13 tail.
+        epoch = self._advance(reserve=2 if backward and self.kernel_gradients else 0)
         home = route.plan.config.home_experts
         incoming = [item for item in route.plan.transfers if item.target_rank == route.rank]
         outgoing = [item for item in route.plan.transfers if item.owner_rank == route.rank]
