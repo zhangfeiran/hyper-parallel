@@ -17,11 +17,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import struct
 
 import torch
 import torch.distributed as dist
 
 from .capacity import ExpertReplicaConfig
+from .cost import ExpertReplicaCostModel
 from .plan import ExpertExecutionPlan
 from .planner import build_expert_replica_plan
 
@@ -48,9 +50,40 @@ def stable_expert_order(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
     return torch.argsort(keys, stable=True)
 
 
+def _upload_route_metadata(plan: ExpertExecutionPlan, rank: int,
+                           device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Upload one owned buffer with aligned int64 runs and int32 dispatch counts."""
+    runs = plan.source_runs[rank] if plan.transfers else ()
+    slots = tuple(slot for slot, _ in runs)
+    lengths = tuple(count for _, count in runs)
+    counts = tuple(count for row in plan.dispatch_counts for count in row)
+    data = struct.pack(f"<{2 * len(runs)}q{len(counts)}i", *slots, *lengths, *counts)
+    # Blocking upload retains the host buffer until DMA completes. Device views
+    # own their storage through permutation and every downstream count consumer.
+    packed = torch.frombuffer(bytearray(data), dtype=torch.uint8).to(device)
+    run_bytes = 16 * len(runs)
+    indices = packed[:run_bytes].view(torch.int64).reshape(2, len(runs))
+    dispatch = packed[run_bytes:].view(torch.int32).reshape(plan.config.ep_size, plan.config.physical_experts)
+    return indices[0], indices[1], dispatch
+
+
+def _remap_replica_ids(ids: torch.Tensor, plan: ExpertExecutionPlan,
+                       slots: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Keep TopK order, bypassing quota expansion when all experts stay home."""
+    if not plan.transfers:
+        home = plan.config.home_experts
+        return ids + torch.div(ids, home, rounding_mode="floor") * plan.config.replica_slots_per_rank
+    destinations = torch.repeat_interleave(slots, lengths, output_size=ids.numel())
+    order = stable_expert_order(ids.flatten(), plan.config.num_experts)
+    remapped = torch.empty_like(ids.flatten())
+    remapped.scatter_(0, order, destinations)
+    return remapped.reshape_as(ids)
+
+
 def prepare_replica_route(
     topk_ids: torch.Tensor, config: ExpertReplicaConfig, group: object = None,
     *, target_load: int | None = None, minimum_replica_rows: int = 0,
+    cost_model: ExpertReplicaCostModel | None = None,
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
@@ -86,18 +119,10 @@ def prepare_replica_route(
     plan = build_expert_replica_plan(
         [row[:-1] for row in host], config.replica_slots_per_rank,
         target_load=min(upper, target_load) if target_load is not None else None,
-        minimum_replica_rows=minimum_replica_rows, capacity_limit=upper,
+        minimum_replica_rows=minimum_replica_rows, capacity_limit=upper, cost_model=cost_model,
     )
     if max(plan.destination_loads) > upper:
         raise RuntimeError("replica planner exceeded the theoretical receive bound")
-    physical = plan.physical_to_logical
-    runs = sorted((logical, slot, plan.dispatch_counts[rank][slot])
-                  for slot, logical in enumerate(physical) if logical >= 0)
-    slots = torch.tensor([slot for _, slot, _ in runs], device=ids.device, dtype=torch.int64)
-    lengths = torch.tensor([count for _, _, count in runs], device=ids.device, dtype=torch.int64)
-    destinations = torch.repeat_interleave(slots, lengths, output_size=ids.numel())
-    order = stable_expert_order(ids.flatten(), config.num_experts)
-    remapped = torch.empty_like(ids.flatten())
-    remapped.scatter_(0, order, destinations)
-    device_counts = torch.tensor(plan.dispatch_counts, dtype=torch.int32, device=ids.device)
-    return ReplicaRoute(plan, remapped.reshape_as(topk_ids).to(topk_ids.dtype), device_counts, rank, group)
+    slots, lengths, device_counts = _upload_route_metadata(plan, rank, ids.device)
+    remapped = _remap_replica_ids(ids, plan, slots, lengths)
+    return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_counts, rank, group)
