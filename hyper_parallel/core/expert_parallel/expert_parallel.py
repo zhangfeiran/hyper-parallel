@@ -1099,13 +1099,12 @@ class ExpertParallel(BaseExpertParallel):
     """
 
     def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False,
-                 *, replica_slots_per_rank: int = 0, replica_transport: object = None,
+                 *, replica_slots_per_rank: int = 0,
                  replica_min_rows: int = 0) -> None:
         """Initialize ExpertParallel.
 
         Args:
             replica_slots_per_rank: Extra execution slots per EP rank; zero disables hot replication.
-            replica_transport: Optional externally owned prefetch/FP32-return provider; default uses HCCL P2P.
             replica_min_rows: Soft minimum rows per copied expert. Zero retains token balancing.
                 Smaller copies remain when required by the receive bound. Calibrate this
                 threshold for the intended shape; all EP ranks must use the same value.
@@ -1123,7 +1122,6 @@ class ExpertParallel(BaseExpertParallel):
         if replica_slots_per_rank and (token_dispatcher != "all_to_all" or async_combine):
             raise ValueError("hot replicas require synchronous all_to_all token dispatch")
         self.replica_slots_per_rank = replica_slots_per_rank
-        self.replica_transport = replica_transport
         self._dispatch_ctx: Optional[DispatchContext] = None
         self.async_combine = async_combine
         self._token_dispatcher_name = token_dispatcher
@@ -1155,7 +1153,7 @@ class ExpertParallel(BaseExpertParallel):
         if self.replica_slots_per_rank:
             config = ExpertReplicaConfig(inputs[1].numel(), device_mesh.size(), self.replica_slots_per_rank)
             routed, state = dispatch_native_replicas(
-                inputs, config, device_mesh.get_group(), self.replica_transport,
+                inputs, config, device_mesh.get_group(),
                 minimum_replica_rows=self.replica_min_rows)
             module._hot_replica_dispatch = state
             return routed

@@ -23,6 +23,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
+from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
 from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
 from hyper_parallel.core.multicore.modules.mega_moe.route import (
     _expert_capacity,
@@ -215,6 +217,46 @@ class TestMegaMoeRoute(unittest.TestCase):
                     self.assertEqual(actual, (expected, max(capacities)))
                     self.assertEqual(rank_spec.receive_capacity, 256)
                     self.assertEqual(rank_spec.routed_slots, 4)
+
+    def test_replica_plan_avoids_receive_readback_for_push_and_pull(self) -> None:
+        """Reuse exact plan loads, including an empty destination and a growth trigger."""
+        saw_empty_rank = False
+        saw_growth = False
+        for logical_counts in ([[4, 0, 0, 0]] * 2, [[2, 2, 0, 0]] * 2):
+            for minimum, target in ((0, None), (100, None), (100, 8)):
+                plan = build_expert_replica_plan(logical_counts, 1, minimum_replica_rows=minimum,
+                                                 target_load=target)
+                counts = torch.tensor(plan.dispatch_counts, dtype=torch.int32)
+                for mode in ("push", "pull"):
+                    for rank in range(2):
+                        with self.subTest(counts=logical_counts, minimum=minimum, mode=mode, rank=rank, target=target):
+                            spec = replace(self._spec(ep_size=2, rank_id=rank, receive_capacity=4),
+                                           num_experts=plan.config.physical_experts, dispatch_mode=mode)
+                            expected = _expert_capacity(counts, spec)
+                            saw_empty_rank |= plan.destination_loads[rank] == 0
+                            saw_growth |= expected[1] > spec.receive_capacity
+                            ids = torch.zeros((2, 2), dtype=torch.int32)
+                            replica = ReplicaRoute(plan, ids, counts, rank, None)
+                            tokens = torch.ones((2, 4), dtype=torch.bfloat16)
+                            permuted = tokens.repeat_interleave(2, dim=0)
+                            mapping = torch.arange(4, dtype=torch.int32)
+                            workspace = Mock(in_use=True, source_buffer=permuted)
+                            with (patch.object(route_module, "_start_count_gather") as gather,
+                                  patch.object(route_module, "_permute_topk_input",
+                                               return_value=(permuted, mapping)),
+                                  patch.object(route_module, "_permute_topk_input_out",
+                                               return_value=(permuted, mapping)),
+                                  patch.object(torch.Tensor, "tolist", side_effect=AssertionError("D2H readback"))):
+                                result = prepare_topk_route(tokens, ids, torch.ones((2, 2)), spec,
+                                                            counts[rank], workspace, replica)
+                            gather.assert_not_called()
+                            self.assertEqual((result.metadata.expert_capacity, result.maximum_received_slots), expected)
+                            self.assertIs(result.metadata.replica_route, replica)
+                            begin = rank * plan.config.slots_per_rank
+                            torch.testing.assert_close(result.received_counts,
+                                                       counts[:, begin:begin + plan.config.slots_per_rank])
+        self.assertTrue(saw_empty_rank)
+        self.assertTrue(saw_growth)
 
     def test_overflow_load_is_reported_on_every_rank_including_empty_destinations(self) -> None:
         """Both hot and empty ranks report the same maximum so push can grow before execution."""

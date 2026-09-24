@@ -33,8 +33,8 @@ from tests.common.mark_utils import arg_mark
 class TestHotReplica(unittest.TestCase):
     """Check capacity against independent distinct-TopK route generation."""
 
-    def test_native_guest_wait_follows_home_matmul(self):
-        """Preserve exact row ordering while home computation precedes the guest wait."""
+    def test_native_home_guest_matmul_preserves_row_order(self):
+        """Preserve exact row ordering for home-only, guest-only and mixed inputs."""
         for home_rows, guest_rows in ((2, 3), (0, 3), (2, 0)):
             for transpose in (False, True):
                 with self.subTest(home=home_rows, guest=guest_rows, transpose=transpose):
@@ -50,31 +50,15 @@ class TestHotReplica(unittest.TestCase):
                         self.assertEqual(int(groups[-1]), len(values))
                         return values @ weights[0]
 
-                    prefetch = SimpleNamespace(wait_weights=lambda index: events.append(("wait", index)),
-                                               projection_ready=((4096, 8192), 17))
                     with patch.object(native, "_gmm", _gmm):
                         result = native._split_gmm(  # pylint: disable=protected-access
                             inputs, home, guest, torch.tensor([home_rows, home_rows + guest_rows]),
-                            route, transpose=transpose, prefetch=prefetch, matrix_index=int(transpose))
+                            route, transpose=transpose)
                     expected = inputs.clone()
                     expected[home_rows:] *= 3
                     torch.testing.assert_close(result, expected)
                     self.assertEqual(events, (["home"] if home_rows else []) +
-                                     ([("wait", int(transpose)), "guest"] if guest_rows else []))
-
-    def test_native_legacy_provider_keeps_its_no_argument_wait(self):
-        """An eager or whole-slot provider need not implement projection metadata."""
-        route = SimpleNamespace(rank=0, plan=SimpleNamespace(
-            config=SimpleNamespace(home_experts=1, slots_per_rank=2), dispatch_counts=((1, 1),)))
-        waited = []
-        prefetch = SimpleNamespace(wait_weights=lambda: waited.append(True))
-        inputs = torch.ones(2, 2)
-        weights = torch.eye(2).unsqueeze(0)
-        with patch.object(native, "_gmm", lambda values, weight, _groups: values @ weight[0]):
-            result = native._split_gmm(inputs, weights, weights, torch.tensor([1, 2]), route,
-                                      prefetch=prefetch, matrix_index=1)
-        torch.testing.assert_close(result, inputs)
-        self.assertEqual(waited, [True])
+                                     (["guest"] if guest_rows else []))
 
     def test_owned_p2p_return_preserves_guest_storage_and_fp32_order(self):
         """Consume only home rows while preserving guest slices and cancellation order."""

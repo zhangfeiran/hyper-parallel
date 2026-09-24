@@ -192,8 +192,6 @@ class MegaMoeExperts(MulticoreModule):
                 "shmem_signal_sdma_overlap" lets home compute precede guest-weight readiness.
                 "shmem_signal_sdma_projection" waits per projection, prefetching W13
                 first in forward and W2 first in backward.
-                "shmem_signal_sdma_gradient_overlap" uses the same multicore path;
-                early W2 gradient return is supported by the native adapter.
                 "shmem_signal_kernel_gradient" uses idle kernel AIV workers for W2 return
                 with one-sided MTE reads and ordered FP32 accumulation.
             replica_min_rows: Soft minimum rows per copied expert, default zero. Smaller
@@ -226,7 +224,7 @@ class MegaMoeExperts(MulticoreModule):
             raise ValueError("Unsupported replica_transport; expected p2p, shmem, shmem_signal, "
                              "shmem_signal_sdma, shmem_signal_sdma_parallel, shmem_signal_sdma_bidir "
                              "shmem_signal_sdma_overlap, shmem_signal_sdma_projection "
-                             "shmem_signal_sdma_gradient_overlap or shmem_signal_kernel_gradient")
+                             "or shmem_signal_kernel_gradient")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         _integer(replica_min_rows, "replica_min_rows", 0)
         self.replica_min_rows = replica_min_rows

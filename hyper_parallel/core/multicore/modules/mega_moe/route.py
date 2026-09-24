@@ -147,16 +147,15 @@ def _finish_count_gather(
 def _expert_capacity(
     counts_by_source: torch.Tensor,
     spec: MegaMoeSpec,
+    loads: tuple[int, ...] | None = None,
 ) -> tuple[int, int]:
-    """Validate the global bound and size rank-local computation tensors."""
-    destination_loads = counts_by_source.reshape(
-        spec.ep_size,
-        spec.ep_size,
-        spec.local_experts,
-    ).sum(dim=(0, 2), dtype=torch.int32)
-    # One host transfer serves both the coordinated overflow check and local
-    # allocation; the existing gathered counts require no extra collective.
-    loads = destination_loads.tolist()
+    """Size rank-local tensors, reusing exact host loads from a replica plan."""
+    if loads is None:
+        destination_loads = counts_by_source.reshape(
+            spec.ep_size, spec.ep_size, spec.local_experts,
+        ).sum(dim=(0, 2), dtype=torch.int32)
+        # Ordinary routes need one readback for local allocation and global growth.
+        loads = destination_loads.tolist()
     # Keep a non-null ABI argument on ranks whose experts receive no tokens.
     # Source outputs and symmetric communication buffers retain their own sizes.
     return max(1, loads[spec.rank_id]), max(loads)
@@ -254,6 +253,7 @@ def prepare_topk_route(
         tokens_per_expert: Optional trusted Router histogram.
         workspace: Optional workspace ordered before the count exchange. Pull
             requires an initialized, caller-held lease covering route execution.
+        replica_route: Optional shared placement plan and completed dispatch counts.
 
     Returns:
         Permuted tokens and exact native route metadata.
@@ -277,7 +277,8 @@ def prepare_topk_route(
     else:
         routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
     received_counts = _finish_count_gather(counts_by_source, count_work, spec)
-    expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec)
+    loads = None if replica_route is None else replica_route.plan.destination_loads
+    expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec, loads)
     return PreparedTopKRoute(
         routed_tokens=routed_tokens,
         unpermute_mapping=unpermute_mapping,
