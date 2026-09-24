@@ -20,6 +20,7 @@ from collections.abc import Sequence
 
 from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
+from .cost import ExpertReplicaCostModel, refine_replica_quotas
 
 
 def _counts_matrix(counts: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:
@@ -271,7 +272,8 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
 
 def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica_slots_per_rank: int,
                               *, target_load: int | None = None, minimum_replica_rows: int = 0,
-                              capacity_limit: int | None = None) -> ExpertExecutionPlan:
+                              capacity_limit: int | None = None,
+                              cost_model: ExpertReplicaCostModel | None = None) -> ExpertExecutionPlan:
     """Build a bounded single-execution plan, then reduce residual imbalance.
 
     Args:
@@ -286,17 +288,24 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
             Without shape metadata, use a bound safe for every compatible distinct-TopK
             shape, falling back to observed home loads for unequal source sizes.
 
+        cost_model: Optional matching offline calibration for refining existing
+            replica quotas. Uncalibrated row ranges retain the original policy.
+
     Returns:
         Immutable physical placement and exact per-source dispatch quotas.
     """
     _integer(minimum_replica_rows, "minimum_replica_rows", 0)
     if capacity_limit is not None:
         _integer(capacity_limit, "capacity_limit", 0)
+    if cost_model is not None and not isinstance(cost_model, ExpertReplicaCostModel):
+        raise ValueError("cost_model must be an ExpertReplicaCostModel")
     counts = _counts_matrix(counts_by_source)
     config = ExpertReplicaConfig(len(counts[0]), len(counts), replica_slots_per_rank)
     if target_load is not None:
         _integer(target_load, "target_load", 0)
     expert_counts = [sum(row[expert] for row in counts) for expert in range(config.num_experts)]
+    if cost_model is not None and cost_model.ep_size != config.ep_size:
+        raise ValueError("Replica cost model EP size does not match the plan")
     home = config.home_experts
     loads = [sum(expert_counts[rank * home:(rank + 1) * home]) for rank in range(config.ep_size)]
     average = (sum(loads) + config.ep_size - 1) // config.ep_size
@@ -312,4 +321,7 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
     _prune_small_copies(copies, counts, loads, config, minimum_replica_rows, capacity_limit)
     if minimum_replica_rows:
         _rebalance_existing_copies(copies, config)
+    if cost_model is not None:
+        limit = _pruning_capacity(counts, loads, config) if capacity_limit is None else capacity_limit
+        refine_replica_quotas(copies, counts, config, limit, cost_model)
     return _materialize(counts, copies, config, capacity_limit)
