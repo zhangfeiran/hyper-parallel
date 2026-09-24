@@ -73,6 +73,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         runtime = SimpleNamespace(normal_tensor=None)
         plan.fwd_runtime = runtime
         plan.bwd_runtime = runtime
+        plan.backward_runtime = Mock(return_value=runtime)
         workspace = Mock(
             in_use=False,
             expert_capacity=128,
@@ -229,6 +230,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertTrue(torch.equal(weight2.grad, torch.full_like(weight2, 10.0)))
         self.assertEqual(mock_permutation.call_count, len(outputs) if permuted and input_grad else 0)
         self.assertEqual(backward_capacities, list(reversed(capacities)))
+        self.assertEqual([call.args[0] for call in plan.backward_runtime.call_args_list], list(reversed(capacities)))
         self.assertEqual(workspace.claim.call_count, 8)
         self.assertEqual(workspace.release.call_count, 8)
 

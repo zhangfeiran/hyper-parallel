@@ -427,7 +427,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
             events = workspace.prepare_event_counters(forward=False)
             profile_call = prepare_mega_kernel_call(
-                plan.bwd_runtime,
+                plan.backward_runtime(saved_dispatch.shape[0]),
                 direction="backward",
                 fallback_event_counters=events,
             )
