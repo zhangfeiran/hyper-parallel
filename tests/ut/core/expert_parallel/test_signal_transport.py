@@ -468,23 +468,6 @@ class TestSignalReplicaTransport(unittest.TestCase):
             self.assertEqual([provider.gradient_scratch_bytes for provider in providers], [24] * ranks)
             self.assertEqual(world.barriers, [1] * ranks)
 
-    def test_early_gradients_require_explicit_transport_opt_in(self):
-        """The projection mode keeps its old behavior and incomplete capabilities fail early."""
-        size = signal_storage_bytes(((2, 2), (2, 1)), 1, 4, 2, projection_ready=True)
-        storage = torch.empty(size, dtype=torch.uint8)
-        old = SignalReplicaTransport(MagicMock(), storage, 1, 4,
-                                     **signal_transport_options("shmem_signal_sdma_projection"))
-        new = SignalReplicaTransport(MagicMock(), storage, 1, 4,
-                                     **signal_transport_options("shmem_signal_sdma_gradient_overlap"))
-        self.assertFalse(old.overlap_gradients)
-        self.assertTrue(new.overlap_gradients)
-        with self.assertRaisesRegex(ValueError, "projection readiness"):
-            SignalReplicaTransport(MagicMock(), storage, 1, 4, overlap_gradients=True)
-        with self.assertRaisesRegex(ValueError, "active projection SDMA lease"):
-            with new.return_gradient_owned_early(torch.ones(1, 2, 1), torch.ones(1, 2, 1),
-                                                  SimpleNamespace(), matrix_index=1):
-                self.fail("A return outside a lease must be rejected")
-
     def test_kernel_epoch_rollover_precedes_weight_publication(self):
         """Reserving W2 and W13 epochs must not clear words a fused kernel still polls."""
         shapes = ((2, 2), (2, 1))
@@ -493,7 +476,6 @@ class TestSignalReplicaTransport(unittest.TestCase):
         provider = SignalReplicaTransport(runtime, world.storage[0], 1, 2,
                                           **signal_transport_options("shmem_signal_kernel_gradient"))
         self.assertTrue(provider.kernel_gradients)
-        self.assertFalse(provider.overlap_gradients)
         with self.assertRaisesRegex(ValueError, "active projection SDMA lease"):
             provider.kernel_gradient_signals()
         weights = tuple(torch.ones(1, *shape, dtype=torch.bfloat16) for shape in shapes)
@@ -520,69 +502,6 @@ class TestSignalReplicaTransport(unittest.TestCase):
             provider.kernel_gradient_signals()
         with self.assertRaisesRegex(ValueError, "projection readiness"):
             SignalReplicaTransport(runtime, world.storage[0], 1, 2, kernel_gradients=True)
-
-    def test_early_projection_return_survives_delayed_work_and_slot_reuse(self):
-        """A copy must progress alongside later work; ACK protects rotating guest slots."""
-        ranks = 4
-        size = signal_storage_bytes(((2, 2), (2, 1)), 1, ranks, 2, projection_ready=True)
-        for seed in range(24):
-            world = _World(ranks, size)
-            runtimes = [_Runtime(world, rank, use_sdma=True) for rank in range(ranks)]
-            providers = [SignalReplicaTransport(runtime, storage, 1, ranks, use_sdma=True,
-                                                parallel_prefetch=True, parallel_gradients=True,
-                                                overlap_home=True, projection_ready=True, overlap_gradients=True)
-                         for runtime, storage in zip(runtimes, world.storage)]
-            retained = []
-            for step in range(12):
-                counts = [[100 if expert == step % ranks else 0 for expert in range(ranks)]] * ranks
-                plan = _cyclic_plan(ranks) if step % 3 == 2 else build_expert_replica_plan(counts, 1)
-                for rank, provider in enumerate(providers):
-                    runtime = runtimes[rank]
-                    route = SimpleNamespace(plan=plan, rank=rank)
-                    weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16),
-                               torch.ones(1, 2, 1, dtype=torch.bfloat16))
-                    home = tuple(torch.zeros_like(weight, dtype=torch.float32) for weight in weights)
-                    expected = tuple(torch.full_like(value, step + 0.5) for value in home)
-                    for item in sorted(plan.transfers, key=lambda item: item.target_rank):
-                        if item.owner_rank == rank:
-                            for index, value in enumerate(expected):
-                                value[item.owner_slot].add_(_guest_gradient(step, item.target_rank, index))
-                    with patch.object(torch, "cpu", _Backend(world, rank)), \
-                            patch.object(torch.Tensor, "record_stream"), _queued_math(runtime), \
-                            provider.lease(weights, route, backward=True) as pool:
-                        def _produce(index, home=home, guests=pool.gradients, step=step, rank=rank):
-                            home[index].fill_(step + 0.5)
-                            guests[index].fill_(_guest_gradient(step, rank, index))
-
-                        runtime.enqueue(lambda produce=_produce: produce(1))
-                        body_started = SimpleNamespace(ready=False)
-                        original_get = runtime.get
-
-                        def _delayed_get(*args, started=body_started, get=original_get, runtime=runtime, **kwargs):
-                            runtime.world.queues[runtime.world.current[runtime.rank]].append(
-                                (lambda: started.ready, lambda: None))
-                            get(*args, **kwargs)
-
-                        with patch.object(runtime, "get", side_effect=_delayed_get):
-                            try:
-                                with provider.return_gradient_owned_early(
-                                        home[1], pool.gradients[1], route, matrix_index=1) as result:
-                                    self.assertIs(result, home[1])
-                                    runtime.enqueue(lambda started=body_started: setattr(started, "ready", True))
-                                    runtime.enqueue(lambda produce=_produce: produce(0))
-                                    if seed % 2:
-                                        raise RuntimeError("body failure")
-                            except RuntimeError as error:
-                                self.assertEqual(str(error), "body failure")
-                        first, = provider.return_gradients_owned(home[:1], pool.gradients[:1], route)
-                        self.assertIs(first, home[0])
-                        retained.append((home, expected))
-            world.drain(seed)
-            for result, expected in retained:
-                for value, reference in zip(result, expected):
-                    torch.testing.assert_close(value, reference, rtol=0, atol=0)
-            self.assertEqual([provider.gradient_scratch_bytes for provider in providers], [24] * ranks)
-            self.assertEqual(world.barriers, [1] * ranks)
 
     def test_parallel_gradients_without_remote_replicas_allocate_no_scratch(self):
         """Balanced routes without fan-in must not retain an unused expert-sized cache."""

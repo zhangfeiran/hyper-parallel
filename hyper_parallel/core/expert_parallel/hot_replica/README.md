@@ -147,12 +147,12 @@ net peak-HBM increase relative to transient buffers in the ordered implementatio
 The original P2P, serial SDMA and weight-only parallel SDMA options remain available.
 
 `replica_transport="shmem_signal_sdma_overlap"` retains bidirectional parallel
-copies and lets home computation begin before guest weights arrive. Native
-providers select `overlap_home=True` together with parallel SDMA prefetch.
+copies and lets MegaMoe home computation begin before guest weights arrive.
+This overlap is specific to MegaMoe; native uses eager HCCL P2P weight copies.
 The shared `prefetch_weights(..., overlap=True)` scope returns leased tensors
 with `wait_weights()` and optional `weight_ready=(base_address, epoch)` metadata.
-Ordinary eager providers retain their existing behavior. A native consumer waits
-before its first guest GMM; a fused consumer honors the per-slot ready metadata.
+Ordinary eager providers retain their existing behavior. The MegaMoe fused
+consumer honors the per-slot ready metadata.
 The initial implementation overlaps home GMM1 in forward and home activation
 gradient matmul in backward, preserving the existing task order.
 
@@ -169,7 +169,7 @@ must be rebuilt; an older payload does not support this optional mode. The
 new kernels continue accepting v2 for eager prefetch.
 
 `replica_transport="shmem_signal_sdma_projection"` adds independent matrix
-publications. Native providers additionally select `projection_ready=True`,
+publications. The MegaMoe provider selects `projection_ready=True`,
 including that option in `signal_storage_bytes(...)`. The shared view exposes
 `projection_ready=((matrix0_base, matrix1_base, ...), epoch)`;
 `wait_weights(matrix_index)` waits only for that projection and `wait_weights()`
@@ -187,24 +187,14 @@ training step for the intended shape and route.
 
 Signal storage and the persistent provider are freed/recreated together by the
 heap manager. Autograd saves neither symmetric addresses nor an old provider for
-multicore. Native callers must keep their externally supplied provider/storage
-alive until all queued consumers finish and reinitialize after replacing a heap.
-Compatible multicore layers must share execution resources to share direct
-symmetric slots; native layers share the injected provider.
+multicore. Compatible MegaMoe layers must share execution resources to share
+symmetric slots. Native layers share the ordinary HCCL P2P guest pool.
 
-Native can inject `ExpertParallel(..., replica_transport=provider)`. The shared
-[`OneSidedReplicaTransport`](one_sided.py) requires an externally leased symmetric
-uint8 inbox and a runtime exposing `put`, `get`, and `host_barrier`. Its inbox must
-hold `B * max(expert_matrix_numel) * 4` bytes. The direct
-[`SignalReplicaTransport`](signal_transport.py) also needs `signal` and
-`wait_signal`, with transfer completion and signal operations ordered on the
-calling stream. Size its 64-byte-aligned uint8 allocation with
-`signal_storage_bytes(matrix_shapes, B, ep_size, weight_element_size)`, then pass
-`SignalReplicaTransport(runtime, storage, B, ep_size)`. All ranks must invoke the
-same provider call sequence. Runtime PE numbering must match EP-group local
-ranks. The caller owns initialization, heap budget, exclusive submission and
-teardown. Both native providers and the planner remain independent of multicore;
-the tests explicitly inject its SHMEM runtime for NPU validation.
+One-sided transport and weight-copy/home-compute overlap are MegaMoe capabilities.
+Native uses `ExpertParallel(..., replica_slots_per_rank=B, replica_min_rows=...)`
+with the shared planner, eager HCCL P2P weight prefetch and FP32 gradient return.
+It does not accept a replica transport provider or initialize a SHMEM runtime.
+The shared planner remains outside multicore and independent of its runtime.
 
 Each autograd invocation saves its immutable route and original owner weights.
 Backward re-prefetches that route, allowing other forwards to run before it.
@@ -322,27 +312,6 @@ record the output tensors on their streams, and join before ACK and lease
 release. The returned home gradients are ordinary invocation allocations; they
 do not belong to the reusable guest pool or symmetric heap.
 
-## Early native W2 gradient return
-
-With `replica_transport="shmem_signal_sdma_gradient_overlap"`, native backward
-computes W2 partials first when the plan has replicas. The shared
-`return_gradient_owned_early` context publishes that projection, reads and sums
-remote partials on its copy stream, and lets the caller submit dActivation, dX
-and W13 gradients on the producer stream. Exiting the context joins the copy
-stream and waits for remote readers before W13 return or slot reuse.
-
-The context consumes detached, invocation-owned FP32 gradients. All ranks must
-enter it in the same order inside a backward lease, after both home and guest
-producers. The body must not access those gradients or start another return.
-Each projection uses a separate epoch; acknowledgements cover its completed
-reads. Scratch remains bounded by one FP32 expert across the two projections.
-
-This mode is opt-in: `shmem_signal_sdma_projection` keeps late gradient return.
-Plans without replicas, other transport modes and legacy providers retain the
-ordinary return path. Multicore still returns gradients after its fused backward
-kernel; the eager context does not expose completion inside that kernel.
-
-
 ## W2 return inside multicore backward
 
 `shmem_signal_kernel_gradient` keeps projection SDMA weight prefetch and uses
@@ -360,5 +329,16 @@ on these workers. Python then returns W13 through the ordinary transport.
 
 The v5 runtime extension points to invocation-owned metadata and cache-line
 completion words. It reuses the provider's ready/ACK channels with a distinct
-epoch and adds no full expert inbox. The native adapter keeps its ordinary
-return path with this mode; its eager overlap mode remains available separately.
+epoch and adds no full expert inbox. This mode is available only to MegaMoe;
+native returns both projections through HCCL P2P after local backward computation.
+
+
+## Reuse planned receive loads
+
+A hot-replica route already contains exact CPU `destination_loads`. MegaMoe uses
+these for both rank-local intermediate allocation (`max(1, local_load)`) and the
+global push growth check, avoiding a second device sum and host readback of the
+uploaded dispatch counts. Routes without a replica plan retain their count
+readback. Push still grows dynamically up to the theoretical maximum capacity;
+pull keeps its preallocated bound. Count-exchange waits and routing offsets are
+unchanged.
