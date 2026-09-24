@@ -40,7 +40,7 @@ class TestHotReplica(unittest.TestCase):
                 with self.subTest(home=home_rows, guest=guest_rows, transpose=transpose):
                     route = SimpleNamespace(rank=0, plan=SimpleNamespace(
                         config=SimpleNamespace(home_experts=1, slots_per_rank=2),
-                        dispatch_counts=((home_rows, guest_rows),)))
+                        dispatch_counts=((home_rows, guest_rows),), destination_counts=((home_rows, guest_rows),)))
                     inputs = torch.arange((home_rows + guest_rows) * 2).reshape(-1, 2).float()
                     home, guest = torch.eye(2).unsqueeze(0), (torch.eye(2) * 3).unsqueeze(0)
                     events = []

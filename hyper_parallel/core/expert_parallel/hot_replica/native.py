@@ -25,6 +25,7 @@ import torch.distributed as dist
 from hyper_parallel.core.utils.communication import differentiable_all_to_all_single
 
 from .capacity import ExpertReplicaConfig
+from .cost import ExpertReplicaCostModel
 from .planner import build_expert_replica_plan
 from .routing import ReplicaRoute, stable_expert_order
 from .transport import prefetch_weights, return_gradients
@@ -53,9 +54,7 @@ def _weight_gradient(inputs: torch.Tensor, gradients: torch.Tensor, route: Repli
     dtype. Ordinary FP32 matmul avoids an irreversible BF16 rounding of each
     replica partial. Boundaries come from the host plan, with no device readback.
     """
-    width = route.plan.config.slots_per_rank
-    begin = route.rank * width
-    counts = [sum(row[begin + slot] for row in route.plan.dispatch_counts) for slot in range(width)]
+    counts = route.plan.destination_counts[route.rank]
     inputs, gradients = inputs.float(), gradients.float()
     offset = 0
     for slot, count in enumerate(counts):
@@ -68,10 +67,8 @@ def _weight_gradient(inputs: torch.Tensor, gradients: torch.Tensor, route: Repli
 def _split_gmm(inputs: torch.Tensor, home: torch.Tensor, guest: torch.Tensor,
                groups: torch.Tensor, route: ReplicaRoute, *, transpose: bool = False) -> torch.Tensor:
     """Run home and guest segments without concatenating expert matrices."""
-    width = route.plan.config.slots_per_rank
-    start = route.rank * width
     count = route.plan.config.home_experts
-    home_rows = sum(sum(row[start:start + count]) for row in route.plan.dispatch_counts)
+    home_rows = sum(route.plan.destination_counts[route.rank][:count])
     if transpose:
         home, guest = home.transpose(-1, -2), guest.transpose(-1, -2)
     parts = []
@@ -146,7 +143,8 @@ class NativeReplicaDispatch:
 
 def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
                              group: object,
-                             *, minimum_replica_rows: int = 0) -> tuple[tuple, NativeReplicaDispatch]:
+                             *, minimum_replica_rows: int = 0,
+                             cost_model: ExpertReplicaCostModel | None = None) -> tuple[tuple, NativeReplicaDispatch]:
     """Dispatch existing native expert-major inputs through shared replicas."""
     values, counts = inputs[:2]
     rank = dist.get_rank(group)
@@ -155,7 +153,8 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
     work = dist.all_gather(gathered, payload, group=group, async_op=True)
     work.wait()
     host = torch.stack(gathered).cpu().tolist()
-    plan = build_expert_replica_plan(host, config.replica_slots_per_rank, minimum_replica_rows=minimum_replica_rows)
+    plan = build_expert_replica_plan(host, config.replica_slots_per_rank, minimum_replica_rows=minimum_replica_rows,
+                                     cost_model=cost_model)
     physical = plan.physical_to_logical
     runs = sorted((expert, slot, plan.dispatch_counts[rank][slot])
                   for slot, expert in enumerate(physical) if expert >= 0)

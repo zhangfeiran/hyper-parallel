@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 from .capacity import ExpertReplicaConfig
 
@@ -41,19 +42,35 @@ class ExpertExecutionPlan:
     slot_to_logical: tuple[tuple[int, ...], ...]
     dispatch_counts: tuple[tuple[int, ...], ...]
 
-    @property
+    def __post_init__(self) -> None:
+        """Own immutable rows so cached derived metadata cannot become stale."""
+        for name in ("logical_counts", "slot_to_logical", "dispatch_counts"):
+            object.__setattr__(self, name, tuple(tuple(row) for row in getattr(self, name)))
+
+    @cached_property
+    def destination_counts(self) -> tuple[tuple[int, ...], ...]:
+        """Return per-slot work for every destination without device readback."""
+        width = self.config.slots_per_rank
+        totals = tuple(sum(row[slot] for row in self.dispatch_counts) for slot in range(self.config.physical_experts))
+        return tuple(totals[rank * width:(rank + 1) * width] for rank in range(self.config.ep_size))
+
+    @cached_property
     def destination_loads(self) -> tuple[int, ...]:
         """Return total real work assigned to each execution rank."""
-        width = self.config.slots_per_rank
-        return tuple(sum(sum(row[rank * width:(rank + 1) * width]) for row in self.dispatch_counts)
-                     for rank in range(self.config.ep_size))
+        return tuple(sum(row) for row in self.destination_counts)
 
-    @property
+    @cached_property
+    def source_runs(self) -> tuple[tuple[tuple[int, int], ...], ...]:
+        """Return stable logical-expert runs as physical slot and source quota."""
+        order = sorted((expert, slot) for slot, expert in enumerate(self.physical_to_logical) if expert >= 0)
+        return tuple(tuple((slot, row[slot]) for _, slot in order) for row in self.dispatch_counts)
+
+    @cached_property
     def physical_to_logical(self) -> tuple[int, ...]:
         """Return flattened physical-slot ownership, using -1 for empty slots."""
         return tuple(expert for row in self.slot_to_logical for expert in row)
 
-    @property
+    @cached_property
     def transfers(self) -> tuple[ExpertReplicaTransfer, ...]:
         """Return transfers in globally identical target/slot order."""
         home = self.config.home_experts
