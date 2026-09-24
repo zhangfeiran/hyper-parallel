@@ -485,6 +485,42 @@ class TestSignalReplicaTransport(unittest.TestCase):
                                                   SimpleNamespace(), matrix_index=1):
                 self.fail("A return outside a lease must be rejected")
 
+    def test_kernel_epoch_rollover_precedes_weight_publication(self):
+        """Reserving W2 and W13 epochs must not clear words a fused kernel still polls."""
+        shapes = ((2, 2), (2, 1))
+        world = _World(2, signal_storage_bytes(shapes, 1, 2, 2, projection_ready=True))
+        runtime = _Runtime(world, 0, use_sdma=True)
+        provider = SignalReplicaTransport(runtime, world.storage[0], 1, 2,
+                                          **signal_transport_options("shmem_signal_kernel_gradient"))
+        self.assertTrue(provider.kernel_gradients)
+        self.assertFalse(provider.overlap_gradients)
+        with self.assertRaisesRegex(ValueError, "active projection SDMA lease"):
+            provider.kernel_gradient_signals()
+        weights = tuple(torch.ones(1, *shape, dtype=torch.bfloat16) for shape in shapes)
+        route = SimpleNamespace(plan=build_expert_replica_plan([[1, 0], [0, 1]], 1), rank=0)
+        for previous_epoch in (2**31 - 2, 2**31 - 3):
+            provider.epoch = previous_epoch
+            with patch.object(torch, "cpu", _Backend(world, 0)), \
+                    patch.object(torch.Tensor, "record_stream"), \
+                    provider.lease(weights, route, backward=True, overlap=True) as pool:
+                weight_epoch = pool.projection_ready[1]
+                self.assertEqual(weight_epoch, 1)
+                provider.projection_signals.fill_(weight_epoch)
+                barriers = world.barriers[0]
+                epoch, ready, ack = provider.kernel_gradient_signals()
+                self.assertEqual(epoch, weight_epoch + 1)
+                self.assertNotEqual(ready, ack)
+                provider.return_gradients_owned(tuple(torch.ones_like(w, dtype=torch.float32) for w in weights),
+                                                pool.gradients, route)
+                self.assertEqual(provider.epoch, weight_epoch + 2)
+                self.assertEqual(world.barriers[0], barriers)
+                torch.testing.assert_close(provider.projection_signals,
+                                           torch.full_like(provider.projection_signals, weight_epoch))
+        with self.assertRaisesRegex(ValueError, "active projection SDMA lease"):
+            provider.kernel_gradient_signals()
+        with self.assertRaisesRegex(ValueError, "projection readiness"):
+            SignalReplicaTransport(runtime, world.storage[0], 1, 2, kernel_gradients=True)
+
     def test_early_projection_return_survives_delayed_work_and_slot_reuse(self):
         """A copy must progress alongside later work; ACK protects rotating guest slots."""
         ranks = 4

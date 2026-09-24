@@ -40,6 +40,7 @@ from hyper_parallel.core.multicore.modules.mega_gate.plan import (
     MEGA_GATE_AIV_WORKER_CAPACITY, MEGA_GATE_ROUTE_TASK_TYPES, MEGA_GATE_ROUTE_GRAD_TASK_TYPES,
     MEGA_GATE_ROUTE_GRAD_K1_TASK_TYPES, _build_pipeline_runtime_config, build_mega_gate_plan,
 )
+from hyper_parallel.core.multicore.diagnostics.profiler.cycle_trace import DEFAULT_STAGE_NAMES, _duration_trace_event
 from tests.common.mark_utils import arg_mark
 
 
@@ -86,6 +87,22 @@ class TestDiagnosticMetadata(unittest.TestCase):
         self.assertEqual(bytes(config), original)
         with self.assertRaises(TypeError):
             metadata.stage_names[0] = "changed"
+
+    def test_replica_return_records_do_not_inherit_graph_task_zero(self) -> None:
+        """Synthetic return work identifies its peer without borrowing a Cube task's stage."""
+        record = {"desc_id": 0x10008, "task_id": 0, "core_type": 2, "block_id": 2,
+                  "stage_task_index": 3, "owner_id": 0, "start_cycle": 1000,
+                  "end_cycle": 1100, "entry_cycle": 900}
+        event = _duration_trace_event(record, rank=0, device_id=0, anchor_cycle=900,
+                                      cycle_frequency_mhz=50, detailed_task_names=True,
+                                      owner_label="Expert", stage_names=DEFAULT_STAGE_NAMES,
+                                      task_stage_names={0: "W2Grad"})
+        self.assertEqual(event["args"]["task_stage"], "ReplicaW2Return")
+        self.assertEqual(event["args"]["peer_rank"], 3)
+        self.assertEqual(event["args"]["core_type"], "AIV")
+        self.assertIn("ReplicaW2Return", event["name"])
+        self.assertEqual(event["dur"], 2)
+
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
