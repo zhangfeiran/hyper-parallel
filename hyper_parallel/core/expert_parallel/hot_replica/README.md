@@ -274,6 +274,12 @@ requires some of that work to remain remote, it first tries consolidating those
 rows into already selected copies. It creates no additional replica and keeps
 mandatory copies even when their row count is below the threshold.
 
+After filtering, retained copies may absorb more of their original owner's rows.
+Each move stops at the pair's load balance, so the global receive peak cannot
+increase. This preserves replica positions and full-expert weight/gradient bytes;
+token traffic and compute timing can still change. The current refinement uses
+row counts rather than a calibrated backend cost model.
+
 The threshold is a workload-specific proxy for exposed copy cost. Calibrate it
 with complete training-step comparisons; a fixed row threshold is not a complete
 compute/communication cost model. Source histograms and all logical TopK choices
