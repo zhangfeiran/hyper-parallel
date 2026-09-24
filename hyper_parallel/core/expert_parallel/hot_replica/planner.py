@@ -195,6 +195,36 @@ def _prune_small_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, .
             current[rank] += moved
 
 
+def _rebalance_existing_copies(copies: list[dict[int, int]], config: ExpertReplicaConfig) -> None:
+    """Reduce pairwise load peaks using only already retained guest experts.
+
+    Each move transfers original home work, stops before reversing the load
+    difference, and preserves every guest slot. Thus the global receive peak
+    cannot increase, and the integer sum of squared loads strictly decreases.
+    """
+    home = config.home_experts
+    loads = [sum(row.values()) for row in copies]
+    edges = [(target, expert) for target, row in enumerate(copies)
+             for expert, rows in sorted(row.items()) if expert // home != target and rows > 0]
+    while True:
+        best = None
+        best_score = (0, 0, 0, 0)
+        for target, expert in edges:
+            owner = expert // home
+            rows = min(copies[owner][expert], (loads[owner] - loads[target]) // 2)
+            score = (rows, loads[owner], -target, -expert)
+            if rows > 0 and score > best_score:
+                best_score = score
+                best = (owner, target, expert, rows)
+        if best is None:
+            return
+        owner, target, expert, rows = best
+        copies[owner][expert] -= rows
+        copies[target][expert] += rows
+        loads[owner] -= rows
+        loads[target] += rows
+
+
 def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int]],
                  config: ExpertReplicaConfig, capacity_limit: int | None = None) -> ExpertExecutionPlan:
     """Assign each logical expert's source occurrences to final copy quotas."""
@@ -250,7 +280,8 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
         target_load: Preferred receive size, normally the current push capacity.
             It is a target, not a drop threshold: residual load remains lossless.
         minimum_replica_rows: Prefer removing copies below this threshold. Zero retains
-            token-balancing placement. Mandatory copies remain when capacity requires them.
+            token-balancing placement. Mandatory copies remain when capacity requires them;
+            retained copies may take additional home rows without raising the receive peak.
         capacity_limit: Optional receive bound already derived from the invocation shape.
             Without shape metadata, use a bound safe for every compatible distinct-TopK
             shape, falling back to observed home loads for unequal source sizes.
@@ -279,4 +310,6 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
         copies = baseline
     _improve_copies(copies, config, target)
     _prune_small_copies(copies, counts, loads, config, minimum_replica_rows, capacity_limit)
+    if minimum_replica_rows:
+        _rebalance_existing_copies(copies, config)
     return _materialize(counts, copies, config, capacity_limit)

@@ -24,7 +24,7 @@ import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaConfig, build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, prepare_replica_route
-from hyper_parallel.core.expert_parallel.hot_replica import native, transport
+from hyper_parallel.core.expert_parallel.hot_replica import native, planner, transport
 from hyper_parallel.core.multicore.modules.mega_moe.spec import initial_receive_capacity
 from tests.common.mark_utils import arg_mark
 
@@ -167,6 +167,69 @@ class TestHotReplica(unittest.TestCase):
         self.assertEqual(plan.transfers, ())
         self.assertEqual(plan.destination_loads, (5168, 3744, 3744, 3728))
         self.assertLessEqual(max(plan.destination_loads), plan.config.maximum_receive_rows(512, 8, alignment=1))
+
+    def test_retained_copy_uses_home_rows_below_capacity_target(self):
+        """A mandatory copy absorbs remaining expert rows without another weight transfer."""
+        counts = [[512] * 8 + [0] * 16] * 4
+        config = ExpertReplicaConfig(24, 4, 1)
+        upper = config.maximum_receive_rows(512, 8, alignment=1)
+        options = {"target_load": upper, "minimum_replica_rows": 4096, "capacity_limit": upper}
+        with patch.object(planner, "_rebalance_existing_copies"):
+            original = build_expert_replica_plan(counts, 1, **options)
+        plan = build_expert_replica_plan(counts, 1, **options)
+        plan.validate()
+        self.assertEqual(original.destination_loads, (10926, 4096, 0, 1362))
+        self.assertEqual(plan.destination_loads, (10240, 4096, 0, 2048))
+        self.assertEqual(plan.transfers, original.transfers)
+        self.assertEqual(plan.slot_to_logical, original.slot_to_logical)
+        self.assertEqual(plan.logical_counts, original.logical_counts)
+
+    def test_existing_copy_stops_at_pair_balance_and_keeps_odd_row(self):
+        """A large expert must not make a lighter receiver the new load peak."""
+        config = ExpertReplicaConfig(4, 2, 1)
+        for total in (20, 21):
+            with self.subTest(total=total):
+                copies = [{0: total - 1, 1: 0}, {2: 0, 3: 0, 0: 1}]
+                planner._rebalance_existing_copies(copies, config)
+                self.assertEqual([sum(row.values()) for row in copies], [(total + 1) // 2, total // 2])
+                self.assertEqual([set(row) for row in copies], [{0, 1}, {0, 2, 3}])
+
+    def test_existing_copy_does_not_pull_from_a_lighter_home(self):
+        """Keep existing guest contributions and avoid moving guest work through another rank."""
+        config = ExpertReplicaConfig(4, 2, 1)
+        copies = [{0: 2, 1: 0}, {2: 3, 3: 0, 0: 5}]
+        expected = [dict(row) for row in copies]
+        planner._rebalance_existing_copies(copies, config)
+        self.assertEqual(copies, expected)
+
+    def test_retained_copy_refinement_preserves_placements_for_skewed_routes(self):
+        """Independent histograms retain source quotas and cannot exceed the old receive peak."""
+        rng = random.Random(8157)
+        for _ in range(120):
+            ranks, home = rng.randint(2, 6), rng.randint(1, 6)
+            experts, tokens = ranks * home, rng.randint(1, 80)
+            top_k = rng.randint(1, experts)
+            popular = rng.sample(range(experts), top_k)
+            counts = [[0] * experts for _ in range(ranks)]
+            for row in counts:
+                for _ in range(tokens):
+                    selected = popular if rng.random() < 0.85 else rng.sample(range(experts), top_k)
+                    for expert in selected:
+                        row[expert] += 1
+            budget = rng.randint(0, home + 1)
+            config = ExpertReplicaConfig(experts, ranks, budget)
+            upper = config.maximum_receive_rows(tokens, top_k, alignment=1)
+            options = {"minimum_replica_rows": rng.choice((1, 16, 4096)), "capacity_limit": upper,
+                       "target_load": rng.choice((None, tokens * top_k, upper))}
+            with patch.object(planner, "_rebalance_existing_copies"):
+                original = build_expert_replica_plan(counts, budget, **options)
+            plan = build_expert_replica_plan(counts, budget, **options)
+            plan.validate()
+            self.assertEqual(plan.slot_to_logical, original.slot_to_logical)
+            self.assertEqual(plan.transfers, original.transfers)
+            self.assertEqual(plan.logical_counts, original.logical_counts)
+            self.assertLessEqual(max(plan.destination_loads), min(upper, max(original.destination_loads)))
+            self.assertEqual(plan, build_expert_replica_plan(counts, budget, **options))
 
     def test_copy_threshold_preserves_capacity_across_valid_topk_shapes(self):
         """Consolidation keeps all integer source quotas, budgets, and receive limits."""
