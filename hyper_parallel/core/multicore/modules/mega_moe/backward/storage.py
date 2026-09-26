@@ -142,3 +142,67 @@ def replica_w2_ready_events(cfg: RuntimeConfigC, num_experts: int, num_cores: in
         if task.outputs[0].input_position == _ACTIVATION_GRAD:
             events[task.task_index // num_cores] = task.trigger_event
     return tuple(events)
+
+
+def prepare_w13_overlap_schedule(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> bool:
+    """Move each W13 producer ahead of dX only for the recognized backward DAG.
+
+    W13 reads saved input and the complete SwiGLU gradient. It does not consume
+    dX. Keeping each Cube's W13 before dX makes the existing full-expert dX
+    event a conservative W13-ready fence without another Cube atomic counter.
+    """
+    if not can_reuse_backward_dispatch(cfg, num_experts, num_cores):
+        return False
+    indices = list(cfg.cube_task_indices[:cfg.task_index_num[0]])
+    if len(indices) != 4 * num_experts * num_cores:
+        return False
+    groups = defaultdict(list)
+    for index in indices:
+        task = cfg.all_tasks[index]
+        groups[task.outputs[0].input_position].append(index)
+    gates, weights = groups[_INPUT_GRAD], groups[18]
+    if len(gates) != num_experts * num_cores or len(weights) != len(gates):
+        return False
+    for gate_index, weight_index in zip(gates, weights):
+        gate, weight = cfg.all_tasks[gate_index], cfg.all_tasks[weight_index]
+        if (gate.task_index != weight.task_index or weight.task_type != TaskType.TASK_GROUPED_MATMUL
+                or weight.dependent_event != gate.trigger_event
+                or weight.num_inputs != 3
+                or tuple(weight.inputs[i].input_position for i in range(3)) != (17, 10, 19)):
+            return False
+    tail = []
+    for expert in range(num_experts):
+        begin = expert * num_cores
+        for gate_index, weight_index in zip(gates[begin:begin + num_cores], weights[begin:begin + num_cores]):
+            cfg.all_tasks[weight_index].dependent_event = cfg.all_tasks[gate_index].dependent_event
+        tail.extend(weights[begin:begin + num_cores])
+        tail.extend(gates[begin:begin + num_cores])
+    prefix = [index for index in indices if cfg.all_tasks[index].outputs[0].input_position not in (12, 18)]
+    cfg.cube_task_indices[:len(indices)] = prefix + tail
+    return True
+
+
+def replica_w13_ready_events(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> tuple[int, ...]:
+    """Prove every W13 producer precedes the full-expert dX completion event."""
+    if not can_reuse_backward_dispatch(cfg, num_experts, num_cores):
+        return ()
+    tasks = [cfg.all_tasks[index] for index in cfg.cube_task_indices[:cfg.task_index_num[0]]]
+    producers = defaultdict(list)
+    for index in (*cfg.cube_task_indices[:cfg.task_index_num[0]],
+                  *cfg.vector_task_indices[:cfg.task_index_num[1]]):
+        task = cfg.all_tasks[index]
+        producers[task.trigger_event].append(task)
+    events = []
+    for expert in range(num_experts):
+        gates = [task for task in tasks if task.outputs[0].input_position == _INPUT_GRAD
+                 and task.task_index // num_cores == expert]
+        if len(gates) != num_cores or not _event_joins_tasks(cfg, gates, producers):
+            return ()
+        for worker in range(num_cores):
+            selected = [task for task in tasks[worker::num_cores]
+                        if task.task_index // num_cores == expert and task.outputs[0].input_position in (12, 18)]
+            if (len(selected) != 2 or tuple(task.outputs[0].input_position for task in selected) != (18, 12)
+                    or selected[0].dependent_event != selected[1].dependent_event):
+                return ()
+        events.append(gates[0].trigger_event)
+    return tuple(events)

@@ -107,7 +107,7 @@ class SignalReplicaTransport:
             projection_ready: Publish separate ready words for each weight matrix. Requires
                 home overlap. Forward copies matrices in tuple order; backward reverses it.
                 Include projection_ready=True when sizing the symmetric storage.
-            kernel_gradients: Let a fused consumer perform W2 return on its own workers.
+            kernel_gradients: Let a fused consumer return both projections on its own workers.
                 Requires projection readiness and parallel gradient streams.
         """
         if (storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous()
@@ -145,7 +145,7 @@ class SignalReplicaTransport:
 
     @property
     def kernel_gradients(self) -> bool:
-        """Allow a fused consumer to own W2 publication, accumulation and acknowledgement."""
+        """Allow fused projection publication, accumulation and acknowledgement."""
         return self._kernel_gradients
 
     def kernel_gradient_signals(self) -> tuple[int, int, int]:

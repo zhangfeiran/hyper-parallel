@@ -23,6 +23,11 @@ import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
 from hyper_parallel.core.multicore.modules.mega_moe.kernel_gradients import prepare_kernel_gradient_return
+from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts
+from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
+    can_reuse_backward_dispatch, replica_w13_ready_events,
+)
 
 
 class TestKernelGradientReturn(unittest.TestCase):
@@ -82,3 +87,53 @@ class TestKernelGradientReturn(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "detached contiguous FP32"):
                 prepare_kernel_gradient_return(plan, route, provider, gradient, torch.ones(1, 4, 8))
         provider.kernel_gradient_signals.assert_not_called()
+
+    def test_two_projections_use_distinct_epochs_and_completion_storage(self):
+        """A W13 ready word must never be mistaken for an unfinished W2 epoch."""
+        placement = build_expert_replica_plan([[100, 0, 0, 0]] * 4, 1)
+        plan = SimpleNamespace(replica_w2_events=(32, 64), replica_w13_events=(96, 128),
+                               spec=SimpleNamespace(num_cube_cores=20))
+        route = SimpleNamespace(plan=placement, rank=0)
+        provider = SimpleNamespace(kernel_gradients=True,
+                                   kernel_gradient_signals=Mock(side_effect=((7, 4096, 8192), (8, 4096, 8192))))
+        owner, guest = torch.zeros(1, 4, 8), torch.zeros(1, 4, 8)
+        w13, guest13 = torch.zeros(1, 8, 8), torch.zeros(1, 8, 8)
+        with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream"):
+            result = prepare_kernel_gradient_return(plan, route, provider, owner, guest,
+                                                    gradient_w13=w13, guest_w13=guest13)
+        raw = bytes(result.metadata.tolist())
+        values = struct.unpack("<" + "Q" * (len(raw) // 8), raw)
+        self.assertEqual(result.matrices, (1, 0))
+        self.assertEqual(values[:2], (2, 3))
+        first, second = values[values[1]:values[2]], values[values[2]:]
+        self.assertEqual((first[3], second[3]), (7, 8))
+        self.assertEqual((first[4], second[4]), (32, 64))
+        self.assertEqual((first[5], second[5]), (owner.data_ptr(), w13.data_ptr()))
+        self.assertNotEqual(first[9], second[9])
+        self.assertEqual(second[15], 96)
+        self.assertEqual(tuple(result.completion.shape), (2, 20, 16))
+
+    def test_w13_schedule_proves_complete_expert_before_return(self):
+        """Real generated push/pull queues retain receive reuse and per-Cube ordering."""
+        for mode in ("push", "pull"):
+            for rank in range(2):
+                with self.subTest(mode=mode, rank=rank):
+                    spec = MegaMoeSpec(128, 128, 128, 12, 2, 1.25, 512, 2, None, rank, 20,
+                                       dispatch_mode=mode, replica_slots_per_rank=2, logical_num_experts=8,
+                                       replica_transport="shmem_signal_kernel_gradient")
+                    _, _, _, config = _build_runtime_artifacts(spec)
+                    self.assertTrue(can_reuse_backward_dispatch(config, 6, 20))
+                    events = replica_w13_ready_events(config, 6, 20)
+                    self.assertEqual(len(events), 6)
+                    self.assertEqual(len(set(events)), 6)
+                    indices = list(config.cube_task_indices[:config.task_index_num[0]])
+                    for worker in range(20):
+                        queue = [config.all_tasks[index] for index in indices[worker::20]]
+                        for expert in range(6):
+                            stages = [task.outputs[0].input_position for task in queue
+                                      if task.task_index // 20 == expert]
+                            self.assertEqual(stages, [6, 8, 18, 12])
+                    weight = next(config.all_tasks[index] for index in indices
+                                  if config.all_tasks[index].outputs[0].input_position == 18)
+                    weight.dependent_event = events[0]
+                    self.assertFalse(replica_w13_ready_events(config, 6, 20))
