@@ -227,6 +227,8 @@ def _prepare_backward_execution(
     plan: MegaMoePlan,
     saved: _SavedBackwardState,
     grad_output: Any,
+    *,
+    has_replica_transfers: bool = True,
 ) -> _BackwardExecution:
     """Resolve workspace, profiler, and intermediate tensors for backward."""
     capacity = saved.dispatch.shape[0]
@@ -238,8 +240,13 @@ def _prepare_backward_execution(
     profile_call = None
     try:
         events = workspace.prepare_event_counters(forward=False)
+        runtime = plan.bwd_runtime
+        if not has_replica_transfers:
+            fallback = getattr(plan, "bwd_runtime_no_replica", None)
+            if fallback is not None:
+                runtime = fallback
         profile_call = prepare_mega_kernel_call(
-            plan.bwd_runtime,
+            runtime,
             direction="backward",
             fallback_event_counters=events,
         )
@@ -584,6 +591,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 plan,
                 saved,
                 grad_output,
+                has_replica_transfers=ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers),
             )
             profile_call = execution.profile_call
             early_return = prepare_kernel_gradient_return(

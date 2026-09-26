@@ -87,6 +87,25 @@ class TestMegaMoeFunction(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "projection-ready backward"):
                 function_module._split_runtime(base, pool, 6, backward=backward, gradient_return=descriptor)
 
+    def test_backward_selects_runtime_from_global_replica_presence(self) -> None:
+        """Repeated empty/nonempty routes choose schedules without mutating the plan."""
+        regular, overlap = object(), object()
+        plan = SimpleNamespace(spec=SimpleNamespace(dispatch_mode="push"), bwd_runtime=overlap,
+                               bwd_runtime_no_replica=regular, reuse_backward_dispatch=False)
+        saved = SimpleNamespace(dispatch=torch.empty(3, 4), weight1=None, weight2=None)
+        workspace = Mock(expert_buffer=torch.empty(3, 4), routed_buffer=torch.empty(3, 4),
+                         gmm_workspace=torch.empty(1), swiglu_grad_workspace=torch.empty(1))
+        with patch.object(function_module, "_allocate_backward_intermediates"), \
+                patch.object(function_module, "prepare_mega_kernel_call") as prepare:
+            for transfers in (False, True, False, True):
+                function_module._prepare_backward_execution(
+                    workspace, plan, saved, torch.empty(3, 4), has_replica_transfers=transfers)
+                self.assertIs(prepare.call_args.args[0], overlap if transfers else regular)
+            plan.bwd_runtime_no_replica = None
+            function_module._prepare_backward_execution(
+                workspace, plan, saved, torch.empty(3, 4), has_replica_transfers=False)
+            self.assertIs(prepare.call_args.args[0], overlap)
+
     def test_deferred_backward_keeps_local_owned_storage_after_workspace_reuse(self) -> None:
         """Retain each route's data and capacity across grow/shrink and reverse backward."""
         for reuse in (False, True):

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -78,6 +79,7 @@ class MegaMoePlan:
     reuse_backward_dispatch: bool = False
     replica_w2_events: tuple[int, ...] = ()
     replica_w13_events: tuple[int, ...] = ()
+    bwd_runtime_no_replica: _PreparedMegaKernelRuntime | None = None
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -124,7 +126,7 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     )
 
 
-def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
+def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> tuple[Any, Any, Any, Any]:
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     task_values = _build_task_values(spec)
     forward_graph = build_forward_graph(
@@ -166,17 +168,16 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         spec.rank_id,
         spec.num_cube_cores,
     )
-    if spec.replica_slots_per_rank and spec.replica_transport == "shmem_signal_kernel_gradient":
+    if overlap_w13 and spec.replica_slots_per_rank and spec.replica_transport == "shmem_signal_kernel_gradient":
         prepare_w13_overlap_schedule(backward_data, spec.local_experts, spec.num_cube_cores)
     return forward_graph, forward_data, backward_graph, backward_data
 
 
 def _prepare_runtimes(
     spec: MegaMoeSpec,
-    forward_config: Any,
-    backward_config: Any,
+    configs: tuple[Any, ...],
     device: Any,
-) -> tuple[_PreparedMegaKernelRuntime, _PreparedMegaKernelRuntime]:
+) -> tuple[_PreparedMegaKernelRuntime, ...]:
     """Materialize profiler-aware forward and backward runtime images."""
     device_id = device.index
     if device_id is None:
@@ -196,10 +197,7 @@ def _prepare_runtimes(
         "rank": spec.rank_id,
         "device_id": device_id,
     }
-    return (
-        _prepare_mega_kernel_runtime_config(forward_config, **options),
-        _prepare_mega_kernel_runtime_config(backward_config, **options),
-    )
+    return tuple(_prepare_mega_kernel_runtime_config(config, **options) for config in configs)
 
 
 def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
@@ -212,8 +210,14 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     Returns:
         Rank-local forward and backward runtime resources.
     """
-    forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec)
-    fwd_runtime, bwd_runtime = _prepare_runtimes(spec, forward_config, backward_config, device)
+    forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec, overlap_w13=False)
+    configs = (forward_config, backward_config)
+    if spec.replica_slots_per_rank and spec.replica_transport == "shmem_signal_kernel_gradient":
+        overlap_config = deepcopy(backward_config)
+        if prepare_w13_overlap_schedule(overlap_config, spec.local_experts, spec.num_cube_cores):
+            configs = (forward_config, overlap_config, backward_config)
+            backward_config = overlap_config
+    fwd_runtime, bwd_runtime, *fallback = _prepare_runtimes(spec, configs, device)
     gmm_options = {
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
@@ -247,6 +251,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
             device,
         ),
         bwd_runtime=bwd_runtime,
+        bwd_runtime_no_replica=fallback[0] if fallback else None,
         act_grad_tiling=_tensor_from_bytes(
             get_act_grad_tiling_bytes(backward_graph.get_op("act_grad").split_value, **gmm_options),
             device,
