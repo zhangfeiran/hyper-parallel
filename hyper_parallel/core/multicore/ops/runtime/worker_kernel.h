@@ -175,6 +175,24 @@ class KernelWorkerBase {
   __aicore__ inline void ProcessReplicaGradients() {
 #ifndef __DAV_C220_CUBE__
     __gm__ uint64_t *config = reinterpret_cast<__gm__ uint64_t *>(replica_gradient_config_);
+    CycleTraceRecorder trace;
+    const bool profiling = isCycleProfileEnabled(runtimeConfigPtr);
+    if (profiling) {
+      trace.Init(worker_id_, input_list[Derived::PROFILE_IDX], getAicProfileRecordCapacity(runtimeConfigPtr),
+                  getAivProfileRecordCapacity(runtimeConfigPtr));
+    }
+    if (config[0] == 2) {
+      ProcessReplicaGradient(config + config[1], 0x10008, trace, profiling);
+      ProcessReplicaGradient(config + config[2], 0x10009, trace, profiling);
+    } else {
+      ProcessReplicaGradient(config, 0x10008, trace, profiling);
+    }
+#endif
+  }
+
+  __aicore__ inline void ProcessReplicaGradient(__gm__ uint64_t *config, uint32_t profile_desc,
+                                                CycleTraceRecorder &trace, bool profiling) {
+#ifndef __DAV_C220_CUBE__
     const int32_t rank = config[1];
     const int32_t slots = config[2];
     const int32_t epoch = config[3];
@@ -204,12 +222,6 @@ class KernelWorkerBase {
             (rank * slots + slot) * DATA_CACHE_LINE_SIZE), epoch, ACLSHMEM_SIGNAL_SET, peer);
       }
     }
-    CycleTraceRecorder trace;
-    const bool profiling = isCycleProfileEnabled(runtimeConfigPtr);
-    if (profiling) {
-      trace.Init(worker_id_, input_list[Derived::PROFILE_IDX], getAicProfileRecordCapacity(runtimeConfigPtr),
-                  getAivProfileRecordCapacity(runtimeConfigPtr));
-    }
     for (int32_t index = 0; index < owned_count; ++index) {
       const int32_t peer = owned[index * 4];
       const int32_t slot = owned[index * 4 + 1];
@@ -220,7 +232,7 @@ class KernelWorkerBase {
       AddReplicaGradient(output + owner * elements * sizeof(float), guest + slot * elements * sizeof(float),
                           elements, peer, worker, core_num);
       if (profiling) {
-        trace.Record(0x10008, 0, peer, rank * (home_experts_ + slots) + owner, start, trace.Now());
+        trace.Record(profile_desc, 0, peer, rank * (home_experts_ + slots) + owner, start, trace.Now());
       }
     }
     StoreReplicaCompletion(done + worker * DATA_CACHE_LINE_SIZE, epoch);

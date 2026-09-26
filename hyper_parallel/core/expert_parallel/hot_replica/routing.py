@@ -24,6 +24,8 @@ import torch.distributed as dist
 
 from .capacity import ExpertReplicaConfig
 from .cost import ExpertReplicaCostModel
+from .device import DeviceExpertExecutionPlan, ReplicaPlanSummary, build_device_expert_replica_plan
+from .device import validate_planner_backend
 from .plan import ExpertExecutionPlan
 from .planner import build_expert_replica_plan
 
@@ -32,12 +34,13 @@ from .planner import build_expert_replica_plan
 class ReplicaRoute:
     """Invocation-owned logical plan and device execution metadata."""
 
-    plan: ExpertExecutionPlan
+    plan: ExpertExecutionPlan | ReplicaPlanSummary
     physical_ids: torch.Tensor
     counts_by_source: torch.Tensor
     rank: int
     group: object
     transport: object | None = None
+    device_plan: DeviceExpertExecutionPlan | None = None
 
 
 def stable_expert_order(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -83,7 +86,7 @@ def _remap_replica_ids(ids: torch.Tensor, plan: ExpertExecutionPlan,
 def prepare_replica_route(
     topk_ids: torch.Tensor, config: ExpertReplicaConfig, group: object = None,
     *, target_load: int | None = None, minimum_replica_rows: int = 0,
-    cost_model: ExpertReplicaCostModel | None = None,
+    cost_model: ExpertReplicaCostModel | None = None, planner_backend: str = "cpu",
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
@@ -91,6 +94,7 @@ def prepare_replica_route(
     by all ranks before any sparse weight transfers. All ranks must supply the
     same shape and configuration, as required by the EP module contract.
     """
+    validate_planner_backend(planner_backend, minimum_replica_rows, cost_model)
     if topk_ids.ndim != 2 or topk_ids.dtype not in (torch.int32, torch.int64):
         raise ValueError("topk_ids must be a two-dimensional integer tensor")
     rank = dist.get_rank(group) if dist.is_initialized() else 0
@@ -111,6 +115,15 @@ def prepare_replica_route(
         work.wait()
     else:
         gathered[0].copy_(payload)
+    if planner_backend == "device":
+        matrix = torch.stack(gathered)
+        device_plan = build_device_expert_replica_plan(matrix[:, :-1], config, capacity_limit=upper)
+        device_plan.control[:1].bitwise_or_(matrix[:, -1].any().to(torch.int64))
+        plan = device_plan.host_summary()
+        slots, lengths = device_plan.source_runs(rank)
+        remapped = _remap_replica_ids(ids, plan, slots, lengths)
+        return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_plan.dispatch_counts.to(torch.int32),
+                            rank, group, device_plan=device_plan)
     # The deterministic host planner shares the route-count synchronization with
     # split sizing; no per-expert device-to-host reads occur below.
     host = torch.stack(gathered).cpu().tolist()

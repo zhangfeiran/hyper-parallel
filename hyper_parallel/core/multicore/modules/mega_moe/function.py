@@ -588,7 +588,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             profile_call = execution.profile_call
             early_return = prepare_kernel_gradient_return(
                 plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,
-                None if pool is None else pool.gradients[1])
+                None if pool is None else pool.gradients[1],
+                gradient_w13=execution.intermediates.grad_weight1,
+                guest_w13=None if pool is None else pool.gradients[0])
             _launch_backward_kernel(plan, saved, source, execution, pool,
                                     None if early_return is None else early_return.metadata)
             profile_call.complete()
@@ -596,7 +598,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             grad_weight1 = execution.intermediates.grad_weight1
             grad_weight2 = execution.intermediates.grad_weight2
             if ctx.replica_route is not None:
-                if early_return is not None:
+                if early_return is not None and 0 in early_return.matrices:
+                    pass  # The fused kernel owns both returns through their final ACKs.
+                elif early_return is not None:
                     grad_weight1, = return_gradients(
                         (grad_weight1,), ctx.replica_route, pool.gradients[:1], provider, consume=True)
                 else:

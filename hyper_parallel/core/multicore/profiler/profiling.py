@@ -66,6 +66,7 @@ DEFAULT_STAGE_NAMES = {
     0x10006: "TerminateTask",
     0x10007: "TriggerEvent",
     0x10008: "ReplicaW2Return",
+    0x10009: "ReplicaW13Return",
 }
 TASK_TYPE_NAMES = {
     0: "Terminate",
@@ -864,8 +865,8 @@ def _duration_trace_event(
         "end_cycle": record["end_cycle"],
         "core_entry_cycle": record["entry_cycle"],
     }
-    if desc_id == 0x10008:
-        args["task_stage"] = "ReplicaW2Return"
+    if desc_id in (0x10008, 0x10009):
+        args["task_stage"] = "ReplicaW2Return" if desc_id == 0x10008 else "ReplicaW13Return"
         args["peer_rank"] = record["stage_task_index"]
     elif task_id in task_stage_names:
         args["task_stage"] = task_stage_names[task_id]

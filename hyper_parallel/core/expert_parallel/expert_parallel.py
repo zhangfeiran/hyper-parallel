@@ -46,6 +46,7 @@ from torch.nn import Module
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
 from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
+from hyper_parallel.core.expert_parallel.hot_replica.device import validate_planner_backend
 from hyper_parallel.core.expert_parallel.hot_replica.native import (
     dispatch_native_replicas, combine_native_replicas,
 )
@@ -1101,11 +1102,13 @@ class ExpertParallel(BaseExpertParallel):
 
     def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False,
                  *, replica_slots_per_rank: int = 0,
-                 replica_min_rows: int = 0, replica_cost_model: Optional[ExpertReplicaCostModel] = None) -> None:
+                 replica_min_rows: int = 0, replica_cost_model: Optional[ExpertReplicaCostModel] = None,
+                 replica_planner: str = "cpu") -> None:
         """Initialize ExpertParallel.
 
         Args:
             replica_slots_per_rank: Extra execution slots per EP rank; zero disables hot replication.
+            replica_planner: Shared CPU heuristic or device constructive quota policy.
             replica_cost_model: Optional native/p2p offline calibration shared by all EP ranks.
             replica_min_rows: Soft minimum rows per copied expert. Zero retains token balancing.
                 Smaller copies remain when required by the receive bound. Calibrate this
@@ -1120,6 +1123,8 @@ class ExpertParallel(BaseExpertParallel):
             token_dispatcher = "all_to_all"
         ExpertReplicaConfig(1, 1, replica_slots_per_rank)
         _integer(replica_min_rows, "replica_min_rows", 0)
+        validate_planner_backend(replica_planner, replica_min_rows, replica_cost_model)
+        self.replica_planner = replica_planner
         self.replica_min_rows = replica_min_rows
         if replica_cost_model is not None and (not isinstance(replica_cost_model, ExpertReplicaCostModel)
                                               or replica_cost_model.backend != "native"):
@@ -1163,7 +1168,8 @@ class ExpertParallel(BaseExpertParallel):
                     "native", module.w1.shape[-1], module.w1.shape[-2], device_mesh.size(), "p2p")
             routed, state = dispatch_native_replicas(
                 inputs, config, device_mesh.get_group(),
-                minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model)
+                minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
+                planner_backend=self.replica_planner)
             module._hot_replica_dispatch = state
             return routed
         dispatch_result = self._token_dispatcher.dispatch(module, inputs, device_mesh)

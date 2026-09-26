@@ -30,6 +30,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
     can_reuse_backward_dispatch, replica_w2_ready_events,
+    prepare_w13_overlap_schedule, replica_w13_ready_events,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
@@ -76,6 +77,7 @@ class MegaMoePlan:
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
     replica_w2_events: tuple[int, ...] = ()
+    replica_w13_events: tuple[int, ...] = ()
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -164,6 +166,8 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         spec.rank_id,
         spec.num_cube_cores,
     )
+    if spec.replica_slots_per_rank and spec.replica_transport == "shmem_signal_kernel_gradient":
+        prepare_w13_overlap_schedule(backward_data, spec.local_experts, spec.num_cube_cores)
     return forward_graph, forward_data, backward_graph, backward_data
 
 
@@ -218,6 +222,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     }
     return MegaMoePlan(
         spec=spec,
+        replica_w13_events=replica_w13_ready_events(backward_config, spec.local_experts, spec.num_cube_cores),
         replica_w2_events=replica_w2_ready_events(backward_config, spec.local_experts, spec.num_cube_cores),
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
