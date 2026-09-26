@@ -371,22 +371,51 @@ For a globally replica-free plan it maps logical IDs directly to home physical
 slots, including holes reserved by B. CPU plan derivatives are cached only on
 the immutable plan; device metadata and weights are never cached across calls.
 
-## Device constructive planner
+## Shared fused device planner
 
-Set `replica_planner="device"` on either `ExpertParallel` or `MegaMoeExperts`
-with `replica_min_rows=0` and no offline host cost model. This selects the shared
-constructive placement policy, rather than the CPU planner's additional quota
-heuristics. Unsupported combinations fail before communication. The default
-remains `"cpu"`.
+Set `replica_planner="device"` on either `ExpertParallel` or `MegaMoeExperts`.
+The default remains `"cpu"`. The device solver implements the same integer
+placement policy, including `target_load`, `replica_min_rows`, capacity-safe
+small-copy consolidation and retained-edge rebalancing. Offline calibrated
+cost refinement requires the CPU planner and is rejected with the device backend.
 
-The solver runs a fixed number of tensor rounds from gathered device histograms.
-Per-source quota assignment uses source/destination prefix intersections after
-retaining local rows. `DeviceExpertExecutionPlan` keeps physical placement,
-destination counts and the complete dispatch matrix on device; remap and count
-consumers use these tensors directly. One compact control copy provides physical
-ownership, destination boundaries and rank splits for host P2P calls, native
-allocations and push capacity growth. This is not a fully asynchronous host-free
-execution path. Native imports no multicore or one-sided transport implementation.
+The optional Ascend 910B kernel builds independently of multicore and SHMEM.
+After activating the CANN environment, run from the repository root:
+
+```bash
+cmake -S hyper_parallel/core/expert_parallel/hot_replica/_device_kernel \
+  -B build/replica-planner
+cmake --build build/replica-planner -j 4
+cmake --install build/replica-planner \
+  --prefix "$PWD/hyper_parallel/core/expert_parallel/hot_replica/_device_kernel"
+```
+
+To package the optional library, install it to
+`build/replica-planner-payload/core/expert_parallel/hot_replica/_device_kernel`
+and use the existing wheel build option
+`HYPER_PARALLEL_NATIVE_OUTPUT_ROOT="$PWD/build/replica-planner-payload"`.
+When also packaging multicore, stage both components under the same payload root.
+An unbuilt source installation must run the CMake commands with the prefix pointing
+to its installed `hot_replica/_device_kernel` directory. Loading is lazy;
+CPU planning and ordinary native EP do not load this library. This first fused
+implementation uses 180 KiB of AIV scratch and accepts topologies satisfying
+`5*EP*E + 3*E + 4*EP <= 23040`, including EP16/E256. Larger topologies are rejected
+before launch. Count values and arithmetic overflow are checked on device.
+
+One device task consumes the gathered histograms and writes physical placement,
+destination counts, rank splits, int32 dispatch quotas and preordered source runs.
+The runs and int32 counts feed routing without extra sorting, quota gather or
+count conversion kernels. Only the compact control prefix is read back. Each call
+owns its output storage; later calls and different streams cannot overwrite a
+retained route. Producers must establish normal current-stream dependencies;
+the launch records tensor lifetimes on that stream. No graph cache or mutable
+replay workspace is needed.
+
+Remap and count consumers use the device tensors directly. One compact control
+copy provides physical ownership, destination boundaries and rank splits for
+host P2P calls, native allocations and push capacity growth. This remains a
+host-controlled execution boundary. Native imports no multicore or one-sided
+transport implementation, and push retains growth up to the theoretical bound.
 
 MegaMoe's `shmem_signal_kernel_gradient` mode also returns W13 inside backward
 when the generated Cube schedule proves per-expert readiness. W13Grad precedes
