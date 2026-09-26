@@ -1108,7 +1108,7 @@ class ExpertParallel(BaseExpertParallel):
 
         Args:
             replica_slots_per_rank: Extra execution slots per EP rank; zero disables hot replication.
-            replica_planner: Shared CPU heuristic or device constructive quota policy.
+            replica_planner: Shared CPU or fused device replica quota policy.
             replica_cost_model: Optional native/p2p offline calibration shared by all EP ranks.
             replica_min_rows: Soft minimum rows per copied expert. Zero retains token balancing.
                 Smaller copies remain when required by the receive bound. Calibrate this

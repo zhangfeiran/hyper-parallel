@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Device-resident constructive placement and lossless source quota assignment."""
+"""Device-resident bounded placement and lossless source quota assignment."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from functools import cached_property
 import torch
 
 from .capacity import ExpertReplicaConfig, _integer
+from .device_kernel import launch_device_planner
 from .plan import ExpertReplicaTransfer
 
 
@@ -62,6 +63,8 @@ class DeviceExpertExecutionPlan:
     destination_counts: torch.Tensor
     dispatch_counts: torch.Tensor
     control: torch.Tensor
+    source_order: torch.Tensor
+    source_counts: torch.Tensor
 
     def host_summary(self) -> ReplicaPlanSummary:
         """Read placement, destination boundaries and rank splits once, never quotas."""
@@ -79,119 +82,45 @@ class DeviceExpertExecutionPlan:
 
     def source_runs(self, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return device physical slots in stable logical occurrence order."""
-        logical = self.slot_to_logical.flatten()
-        keys = torch.where(logical >= 0, logical, self.config.num_experts)
-        order = torch.argsort(keys, stable=True)
-        return order, self.dispatch_counts[rank].index_select(0, order)
-
-
-def _bounded_device_copies(counts: torch.Tensor, config: ExpertReplicaConfig) -> torch.Tensor:
-    """Execute the constructive capacity proof in a fixed number of device rounds."""
-    ranks, home = config.ep_size, config.home_experts
-    experts = torch.arange(config.num_experts, device=counts.device)
-    owners = torch.div(experts, home, rounding_mode="floor")
-    rank_ids = torch.arange(ranks, device=counts.device)
-    totals = counts.sum(0)
-    copies = totals.unsqueeze(0) * (rank_ids.unsqueeze(1) == owners.unsqueeze(0))
-    budget = min(config.replica_slots_per_rank, home)
-    if not budget or ranks == 1:
-        return copies
-    loads = copies.sum(1)
-    targets = torch.div(loads.sum(), ranks, rounding_mode="floor") + (rank_ids < loads.sum().remainder(ranks))
-    remaining = totals.clone()
-    # Each round finalizes a previously unsatisfied receiver. The last rank is
-    # determined by conservation, so no device scalar drives Python control.
-    for _ in range(ranks - 1):
-        difference = loads - targets
-        donor = difference.argmax().reshape(1)
-        receiver = difference.argmin().reshape(1)
-        amount = (-difference.index_select(0, receiver)).clamp_min(0)
-        available = remaining * (owners == donor)
-        order = torch.argsort(available, descending=True, stable=True)
-        sorted_rows = available.index_select(0, order)
-        before = sorted_rows.cumsum(0) - sorted_rows
-        segments = torch.minimum(sorted_rows, (amount - before).clamp_min(0))
-        consumed = torch.zeros_like(remaining).scatter(0, order, segments)
-        remaining = remaining - consumed
-        # Select top-B balanced-edge segments, using logical ID for equal sizes.
-        selected = torch.argsort(consumed, descending=True, stable=True)[:budget]
-        sizes = consumed.index_select(0, selected)
-        quota = torch.div(amount * budget, home, rounding_mode="floor")
-        kept = torch.minimum(sizes, (quota - (sizes.cumsum(0) - sizes)).clamp_min(0))
-        move = torch.zeros_like(remaining).scatter(0, selected, kept).unsqueeze(0)
-        copies = copies.index_add(0, donor, -move).index_add(0, receiver, move)
-        loads = loads.index_add(0, donor, -amount).index_add(0, receiver, amount)
-    return copies
-
-
-def _device_materialize(counts: torch.Tensor, copies: torch.Tensor,
-                        config: ExpertReplicaConfig, capacity_limit: int | torch.Tensor) -> DeviceExpertExecutionPlan:
-    """Intersect source and destination prefix intervals after retaining local rows."""
-    ranks, home, width = config.ep_size, config.home_experts, config.slots_per_rank
-    experts = torch.arange(config.num_experts, device=counts.device)
-    rank_ids = torch.arange(ranks, device=counts.device)
-    local = torch.minimum(counts, copies)
-    source_end = (counts - local).cumsum(0)
-    target_end = (copies - local).cumsum(0)
-    source_begin = source_end - counts + local
-    target_begin = target_end - copies + local
-    quotas = (torch.minimum(source_end[:, None, :], target_end[None, :, :])
-              - torch.maximum(source_begin[:, None, :], target_begin[None, :, :])).clamp_min(0)
-    quotas = quotas + torch.eye(ranks, dtype=torch.int64, device=counts.device)[:, :, None] * local[:, None, :]
-    is_guest = torch.div(experts, home, rounding_mode="floor").unsqueeze(0) != rank_ids.unsqueeze(1)
-    guests = torch.where(is_guest & (copies > 0), experts.unsqueeze(0), config.num_experts).sort(1).values
-    budget = config.replica_slots_per_rank
-    guests = guests[:, :min(budget, config.num_experts)]
-    if budget > config.num_experts:
-        guests = torch.cat((guests, torch.full((ranks, budget - config.num_experts), config.num_experts,
-                                              device=counts.device, dtype=torch.int64)), dim=1)
-    slots = torch.cat((experts.reshape(ranks, home), guests), dim=1)
-    valid = slots < config.num_experts
-    indices = slots.clamp_max(config.num_experts - 1)
-    destination = copies.gather(1, indices) * valid
-    dispatch = (quotas.gather(2, indices.unsqueeze(0).expand(ranks, -1, -1)) * valid.unsqueeze(0))
-    splits = dispatch.sum(2)
-    slots = torch.where(valid, slots, -1)
-    status = ((counts < 0).any() | (destination.sum(1) > capacity_limit).any()
-              | (quotas.sum(1) != counts).any() | (quotas.sum(0) != copies).any()
-              | ((is_guest & (copies > 0)).sum(1) > budget).any()).to(torch.int64).reshape(1)
-    control = torch.cat((status, slots.flatten(), destination.flatten(), splits.flatten()))
-    return DeviceExpertExecutionPlan(config, slots, destination, dispatch.reshape(ranks, ranks * width), control)
+        return self.source_order, self.source_counts[rank]
 
 
 @torch.no_grad()
 def build_device_expert_replica_plan(counts_by_source: torch.Tensor, config: ExpertReplicaConfig,
-                                     *, capacity_limit: int | None = None) -> DeviceExpertExecutionPlan:
-    """Solve constructive bounded placement without a counts-to-host roundtrip.
+                                     *, capacity_limit: int | None = None, target_load: int | None = None,
+                                     minimum_replica_rows: int = 0) -> DeviceExpertExecutionPlan:
+    """Execute the shared integer policy on NPU without reading source counts.
 
-    Only static topology controls Python loops. Tensor outputs are independent
-    of this invocation's host control copy and can feed remap/count consumers
-    directly. This entry uses the constructive policy; host quota heuristics
-    and offline cost refinement are not applied to its device result.
+    The fused solver matches CPU constructive placement, target-load preference,
+    greedy improvement, capacity-safe small-copy consolidation and rebalancing.
+    Each invocation owns its outputs, including when backward is deferred.
+    Offline calibrated cost refinement is available only with the CPU planner.
     """
-    if capacity_limit is not None:
-        _integer(capacity_limit, "capacity_limit", 0)
+    for name, value in (("capacity_limit", capacity_limit), ("target_load", target_load),
+                        ("minimum_replica_rows", minimum_replica_rows)):
+        if value is not None:
+            _integer(value, name, 0)
+            if value > torch.iinfo(torch.int64).max:
+                raise ValueError(f"{name} exceeds the device integer range")
     if counts_by_source.shape != (config.ep_size, config.num_experts):
         raise ValueError("Device source counts do not match the replica topology")
     if counts_by_source.dtype not in (torch.int32, torch.int64):
         raise ValueError("Device source counts require int32 or int64")
-    counts = counts_by_source.to(torch.int64)
-    if capacity_limit is None:
-        # Native lacks the original TopK shape. Derive a globally identical
-        # histogram bound, including uneven source sizes, without scalar reads.
-        home, ranks = config.home_experts, config.ep_size
-        budget = min(config.replica_slots_per_rank, home)
-        owner_max = counts.sum(0).reshape(ranks, home).sum(1).max()
-        average = torch.div(counts.sum() + ranks - 1, ranks, rounding_mode="floor")
-        mixed = torch.div((home - budget) * owner_max + budget * average + home - 1,
-                          home, rounding_mode="floor")
-        capacity_limit = average if budget == home else torch.minimum(owner_max, mixed + ranks - 1)
-    return _device_materialize(counts, _bounded_device_copies(counts, config), config, capacity_limit)
+    control, dispatch = launch_device_planner(counts_by_source, config, capacity_limit, target_load,
+                                               minimum_replica_rows)
+    size = config.physical_experts
+    shape = (config.ep_size, config.slots_per_rank)
+    summary_size = 1 + 2 * size + config.ep_size * config.ep_size
+    return DeviceExpertExecutionPlan(config, control[1:1 + size].view(shape),
+                                     control[1 + size:1 + 2 * size].view(shape), dispatch, control[:summary_size],
+                                     control[summary_size:summary_size + size],
+                                     control[summary_size + size:].view(config.ep_size, size))
 
 
 def validate_planner_backend(backend: str, minimum_rows: int, cost_model: object) -> None:
-    """Reject silently mixing host-only quota heuristics into device execution."""
+    """Reject unsupported host-only cost refinement before any communication."""
     if backend not in ("cpu", "device"):
         raise ValueError("replica_planner must be cpu or device")
-    if backend == "device" and (minimum_rows or cost_model is not None):
-        raise ValueError("Device constructive planning requires replica_min_rows=0 and no host cost model")
+    _integer(minimum_rows, "replica_min_rows", 0)
+    if backend == "device" and cost_model is not None:
+        raise ValueError("Device planning does not support a host cost model")

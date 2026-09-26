@@ -158,7 +158,8 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
     width = config.slots_per_rank
     device_plan = None
     if planner_backend == "device":
-        device_plan = build_device_expert_replica_plan(torch.stack(gathered), config)
+        device_plan = build_device_expert_replica_plan(torch.stack(gathered), config,
+                                                       minimum_replica_rows=minimum_replica_rows)
         plan = device_plan.host_summary()
         slots, repeats = device_plan.source_runs(rank)
         send_splits = list(plan.rank_splits[rank])

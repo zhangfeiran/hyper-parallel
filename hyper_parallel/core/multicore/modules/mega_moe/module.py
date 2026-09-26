@@ -198,7 +198,7 @@ class MegaMoeExperts(MulticoreModule):
                 first in forward and W2 first in backward.
                 "shmem_signal_kernel_gradient" uses idle kernel AIV workers for W2 return
                 with one-sided MTE reads and ordered FP32 accumulation.
-            replica_planner: Shared CPU heuristic or device constructive quota policy.
+            replica_planner: Shared CPU or fused device replica quota policy.
             replica_cost_model: Optional matching offline cost calibration shared by all EP ranks.
             replica_min_rows: Soft minimum rows per copied expert, default zero. Smaller
                 copies are retained when capacity requires them. Removing a copy can grow
