@@ -16,7 +16,9 @@
 
 from .capacity import ExpertReplicaConfig
 from .cost import ExpertReplicaCostModel
+from .device import DeviceExpertExecutionPlan, build_device_expert_replica_plan
 from .plan import ExpertExecutionPlan
 from .planner import build_expert_replica_plan
 
-__all__ = ["ExpertReplicaCostModel", "ExpertReplicaConfig", "ExpertExecutionPlan", "build_expert_replica_plan"]
+__all__ = ["ExpertReplicaCostModel", "ExpertReplicaConfig", "ExpertExecutionPlan", "build_expert_replica_plan",
+           "DeviceExpertExecutionPlan", "build_device_expert_replica_plan"]
