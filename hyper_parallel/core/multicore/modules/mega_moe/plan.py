@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,6 +81,7 @@ class MegaMoePlan:
     reuse_backward_dispatch: bool = False
     replica_w2_events: tuple[int, ...] = ()
     replica_w13_events: tuple[int, ...] = ()
+    bwd_diagnostics_no_replica: MegaKernelDiagnostics | None = None
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -135,7 +137,7 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     )
 
 
-def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
+def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> tuple[Any, Any, Any, Any]:
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     task_values = _build_task_values(spec)
     forward_graph = build_forward_graph(
@@ -181,7 +183,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         spec.rank_id,
         spec.num_cube_cores,
     )
-    if spec.replica_slots_per_rank and spec.replica_transport == "shmem_signal_kernel_gradient":
+    if overlap_w13 and spec.replica_slots_per_rank and spec.replica_transport == "shmem_signal_kernel_gradient":
         prepare_w13_overlap_schedule(backward_data, spec.local_experts, spec.num_cube_cores)
     return forward_graph, forward_data, backward_graph, backward_data
 
@@ -219,7 +221,15 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     Returns:
         Rank-local forward and backward runtime resources.
     """
-    forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec)
+    forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec, overlap_w13=False)
+    fallback = None
+    if spec.replica_slots_per_rank and spec.replica_transport == "shmem_signal_kernel_gradient":
+        overlap_config = deepcopy(backward_config)
+        if prepare_w13_overlap_schedule(overlap_config, spec.local_experts, spec.num_cube_cores):
+            _, fallback = _prepare_diagnostics(
+                spec, forward_graph, forward_config, backward_graph, backward_config, device,
+            )
+            backward_config = overlap_config
     fwd_diagnostics, bwd_diagnostics = _prepare_diagnostics(
         spec, forward_graph, forward_config, backward_graph, backward_config, device,
     )
@@ -258,6 +268,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         ),
         backward_graph=backward_graph,
         bwd_diagnostics=bwd_diagnostics,
+        bwd_diagnostics_no_replica=fallback,
         act_grad_tiling=_tensor_from_bytes(
             get_act_grad_tiling_bytes(backward_graph.get_op("act_grad").split_value, **gmm_options),
             device,

@@ -95,6 +95,7 @@ class _BackwardExecution:
     gmm_workspace: Any
     swiglu_workspace: Any
     intermediates: _BackwardIntermediates
+    diagnostics: Any = None
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -238,6 +239,8 @@ def _prepare_backward_execution(
     plan: MegaMoePlan,
     saved: _SavedBackwardState,
     grad_output: Any,
+    *,
+    has_replica_transfers: bool = True,
 ) -> _BackwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for backward."""
     dispatch = (torch.empty_like(saved.dispatch) if plan.spec.dispatch_mode == "pull"
@@ -246,6 +249,7 @@ def _prepare_backward_execution(
     return _BackwardExecution(
         dispatch=dispatch,
         grad_x=grad_x,
+        diagnostics=(getattr(plan, "bwd_diagnostics_no_replica", None) if not has_replica_transfers else None),
         event_counters=workspace.prepare_event_counters(forward=False),
         gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
         swiglu_workspace=_workspace_tensor(
@@ -429,6 +433,7 @@ def _launch_backward_kernel(
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
+    diagnostics = execution.diagnostics or plan.bwd_diagnostics
     gradients = execution.intermediates
     kernel_parameters = (
         execution.dispatch,
@@ -452,8 +457,8 @@ def _launch_backward_kernel(
         gradients.grad_weight1,
         saved.group_list,
     )
-    if not plan.bwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.bwd_runtime_config)
+    if not diagnostics.is_active:
+        record_plan_stream(plan, diagnostics.runtime_config)
         multicore_ops.mega_moe_grad(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -463,7 +468,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            _split_runtime(plan.bwd_runtime_config, pool, saved.weight1.shape[0], backward=True,
+            _split_runtime(diagnostics.runtime_config, pool, saved.weight1.shape[0], backward=True,
                            gradient_return=gradient_return),
             execution.event_counters,
             spec.rank_id,
@@ -474,7 +479,7 @@ def _launch_backward_kernel(
         )
         return
 
-    with plan.bwd_diagnostics.launch(
+    with diagnostics.launch(
         kernel_parameters,
         direction="backward",
         fallback_event_counters=execution.event_counters,
@@ -660,6 +665,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 plan,
                 saved,
                 grad_output,
+                has_replica_transfers=ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers),
             )
             early_return = prepare_kernel_gradient_return(
                 plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,
