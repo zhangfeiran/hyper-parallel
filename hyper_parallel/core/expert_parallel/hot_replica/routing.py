@@ -117,7 +117,10 @@ def prepare_replica_route(
         gathered[0].copy_(payload)
     if planner_backend == "device":
         matrix = torch.stack(gathered)
-        device_plan = build_device_expert_replica_plan(matrix[:, :-1], config, capacity_limit=upper)
+        device_plan = build_device_expert_replica_plan(
+            matrix[:, :-1], config, capacity_limit=upper,
+            target_load=min(upper, target_load) if target_load is not None else None,
+            minimum_replica_rows=minimum_replica_rows)
         device_plan.control[:1].bitwise_or_(matrix[:, -1].any().to(torch.int64))
         plan = device_plan.host_summary()
         slots, lengths = device_plan.source_runs(rank)
