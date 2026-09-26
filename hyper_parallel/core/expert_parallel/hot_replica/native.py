@@ -26,6 +26,7 @@ from hyper_parallel.core.utils.communication import differentiable_all_to_all_si
 
 from .capacity import ExpertReplicaConfig
 from .cost import ExpertReplicaCostModel
+from .device import build_device_expert_replica_plan, validate_planner_backend
 from .planner import build_expert_replica_plan
 from .routing import ReplicaRoute, stable_expert_order
 from .transport import prefetch_weights, return_gradients
@@ -144,35 +145,46 @@ class NativeReplicaDispatch:
 def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
                              group: object,
                              *, minimum_replica_rows: int = 0,
-                             cost_model: ExpertReplicaCostModel | None = None) -> tuple[tuple, NativeReplicaDispatch]:
+                             cost_model: ExpertReplicaCostModel | None = None,
+                             planner_backend: str = "cpu") -> tuple[tuple, NativeReplicaDispatch]:
     """Dispatch existing native expert-major inputs through shared replicas."""
+    validate_planner_backend(planner_backend, minimum_replica_rows, cost_model)
     values, counts = inputs[:2]
     rank = dist.get_rank(group)
     payload = counts.to(torch.int64).contiguous()
     gathered = [torch.empty_like(payload) for _ in range(config.ep_size)]
     work = dist.all_gather(gathered, payload, group=group, async_op=True)
     work.wait()
-    host = torch.stack(gathered).cpu().tolist()
-    plan = build_expert_replica_plan(host, config.replica_slots_per_rank, minimum_replica_rows=minimum_replica_rows,
-                                     cost_model=cost_model)
-    physical = plan.physical_to_logical
-    runs = sorted((expert, slot, plan.dispatch_counts[rank][slot])
-                  for slot, expert in enumerate(physical) if expert >= 0)
-    slots = torch.tensor([slot for _, slot, _ in runs], device=values.device)
-    repeats = torch.tensor([count for _, _, count in runs], device=values.device)
+    width = config.slots_per_rank
+    device_plan = None
+    if planner_backend == "device":
+        device_plan = build_device_expert_replica_plan(torch.stack(gathered), config)
+        plan = device_plan.host_summary()
+        slots, repeats = device_plan.source_runs(rank)
+        send_splits = list(plan.rank_splits[rank])
+        recv_splits = [row[rank] for row in plan.rank_splits]
+        device_counts = device_plan.dispatch_counts
+        recv_counts = device_counts[:, rank * width:(rank + 1) * width].contiguous()
+    else:
+        host = torch.stack(gathered).cpu().tolist()
+        plan = build_expert_replica_plan(host, config.replica_slots_per_rank,
+                                         minimum_replica_rows=minimum_replica_rows, cost_model=cost_model)
+        runs = sorted((expert, slot, plan.dispatch_counts[rank][slot])
+                      for slot, expert in enumerate(plan.physical_to_logical) if expert >= 0)
+        slots = torch.tensor([slot for _, slot, _ in runs], device=values.device)
+        repeats = torch.tensor([count for _, _, count in runs], device=values.device)
+        send_splits = [sum(plan.dispatch_counts[rank][peer * width:(peer + 1) * width])
+                       for peer in range(config.ep_size)]
+        received = [row[rank * width:(rank + 1) * width] for row in plan.dispatch_counts]
+        recv_splits = [sum(row) for row in received]
+        recv_counts = torch.tensor(received, dtype=torch.int64, device=values.device)
+        device_counts = torch.tensor(plan.dispatch_counts, device=values.device)
     physical_ids = torch.repeat_interleave(slots, repeats, output_size=values.shape[0])
     send_order = stable_expert_order(physical_ids, config.physical_experts)
-    width = config.slots_per_rank
-    send_splits = [sum(plan.dispatch_counts[rank][peer * width:(peer + 1) * width])
-                   for peer in range(config.ep_size)]
-    received = [row[rank * width:(rank + 1) * width] for row in plan.dispatch_counts]
-    recv_splits = [sum(row) for row in received]
     recv_ids = torch.arange(width, device=values.device).repeat(config.ep_size)
-    recv_counts = torch.tensor(received, dtype=torch.int64, device=values.device)
     recv_order = stable_expert_order(torch.repeat_interleave(
         recv_ids, recv_counts.flatten(), output_size=sum(recv_splits)), width)
-    route = ReplicaRoute(
-        plan, physical_ids, torch.tensor(plan.dispatch_counts, device=values.device), rank, group)
+    route = ReplicaRoute(plan, physical_ids, device_counts, rank, group, device_plan=device_plan)
     state = NativeReplicaDispatch(route, send_splits, recv_splits, send_order, recv_order)
     routed = differentiable_all_to_all_single(values[send_order], send_splits, recv_splits, group)[recv_order]
     result = (routed, recv_counts.sum(0))

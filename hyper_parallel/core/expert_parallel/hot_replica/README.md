@@ -370,3 +370,26 @@ Routing uploads invocation-owned runs and dispatch counts in one aligned buffer.
 For a globally replica-free plan it maps logical IDs directly to home physical
 slots, including holes reserved by B. CPU plan derivatives are cached only on
 the immutable plan; device metadata and weights are never cached across calls.
+
+## Device constructive planner
+
+Set `replica_planner="device"` on either `ExpertParallel` or `MegaMoeExperts`
+with `replica_min_rows=0` and no offline host cost model. This selects the shared
+constructive placement policy, rather than the CPU planner's additional quota
+heuristics. Unsupported combinations fail before communication. The default
+remains `"cpu"`.
+
+The solver runs a fixed number of tensor rounds from gathered device histograms.
+Per-source quota assignment uses source/destination prefix intersections after
+retaining local rows. `DeviceExpertExecutionPlan` keeps physical placement,
+destination counts and the complete dispatch matrix on device; remap and count
+consumers use these tensors directly. One compact control copy provides physical
+ownership, destination boundaries and rank splits for host P2P calls, native
+allocations and push capacity growth. This is not a fully asynchronous host-free
+execution path. Native imports no multicore or one-sided transport implementation.
+
+MegaMoe's `shmem_signal_kernel_gradient` mode also returns W13 inside backward
+when the generated Cube schedule proves per-expert readiness. W13Grad precedes
+dX on every Cube; the complete dX event fences the W13 output. W2 and W13 use
+distinct epochs and completion storage, and the kernel joins all remote readers
+before releasing the guest lease. Unrecognized schedules retain late return.
