@@ -26,7 +26,8 @@ class TestReplicaCost(unittest.TestCase):
 
     @staticmethod
     def _model(**options):
-        values = {"backend": "native", "hidden_size": 8, "intermediate_size": 4, "ep_size": 2, "transport": "p2p",
+        values = {"calibration_version": 2, "backend": "native", "hidden_size": 8,
+                  "intermediate_size": 4, "ep_size": 2, "transport": "p2p",
                   "forward_ms": ((0, 0), (8, 1), (16, 1.1), (128, 3)),
                   "backward_ms": ((0, 0), (8, 1), (16, 1.1), (128, 3)), "weight_ms": 0.0, "gradient_ms": 0.0}
         return ExpertReplicaCostModel(**(values | options))
@@ -93,7 +94,31 @@ class TestReplicaCost(unittest.TestCase):
             build_expert_replica_plan([[1, 1]], 1, cost_model=model)
         with self.assertRaises(ValueError):
             build_expert_replica_plan([[1, 1]], 1, cost_model=object())
-        overlapping = replace(model, backend="push", transport="shmem_signal_sdma_projection", weight_ms=10)
-        serial = replace(overlapping, backend="native", transport="p2p")
+        overlapping = replace(model, backend="push", transport="shmem_signal_sdma_projection",
+                              schedule="fixed_queue_v1", weight_ms=10)
+        serial = replace(overlapping, backend="native", transport="p2p", schedule="native_grouped_v1")
         plan = build_expert_replica_plan([[10, 4, 0, 0]] * 2, 1)
-        self.assertLess(overlapping.estimate_ms(plan), serial.estimate_ms(plan))
+        self.assertEqual(overlapping.estimate_ms(plan), serial.estimate_ms(plan))
+
+    def test_missing_prefix_calibration_cannot_hide_later_home_work(self):
+        """Even long home compute gives no automatic readiness discount."""
+        plan = build_expert_replica_plan([[10, 4, 0, 0]] * 2, 1)
+        model = self._model(backend="push", transport="shmem_signal_sdma_projection",
+                            weight_ms=10, gradient_ms=3)
+        without_transfer_time = replace(model, weight_ms=0, gradient_ms=0)
+        self.assertAlmostEqual(model.estimate_ms(plan) - without_transfer_time.estimate_ms(plan), 23)
+
+    def test_forward_and_backward_can_have_different_slowest_ranks(self):
+        """A rank-summed score underestimates this pair of phase bottlenecks."""
+        model = self._model(forward_ms=((0, 0), (8, 4), (16, 5)),
+                            backward_ms=((0, 0), (8, 1), (16, 8)))
+        plan = build_expert_replica_plan([[8, 8, 0, 0], [0, 0, 16, 0]], 0)
+        self.assertAlmostEqual(model.estimate_ms(plan), 16)
+        self.assertGreater(model.estimate_ms(plan), max(8 + 2, 5 + 8))
+
+    def test_old_or_incompatible_calibration_is_rejected(self):
+        """Version, schedule and dW dtype are part of the calibration contract."""
+        for options in ({"calibration_version": 1}, {"calibration_version": True},
+                        {"schedule": "whole_home_overlap"}, {"gradient_dtype": "bfloat16"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self._model(**options)

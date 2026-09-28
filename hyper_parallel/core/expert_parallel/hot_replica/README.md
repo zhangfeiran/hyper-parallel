@@ -383,8 +383,20 @@ capacity planning. Pass the same immutable model to every rank through
 `ExpertParallel(replica_cost_model=model)` or
 `MegaMoeExperts(replica_cost_model=model)`. Calibration must match hidden and
 intermediate dimensions, EP size, backend and transport. Native calibration uses
-ordinary HCCL P2P; only MegaMoe overlap modes discount weight readiness hidden by
-home computation.
+ordinary HCCL P2P. Version 2 requires explicit `calibration_version=2`, FP32 weight
+partials, and a compatible schedule identity (`native_grouped_v1`,
+`fixed_queue_v1`, or `fixed_queue_w13_first_v1`). The schedule defaults to the
+identity implied by backend/transport. Regenerate old calibration data; merely
+changing its version does not validate it against the new model.
+
+Without measured schedule-prefix windows, all modes charge the full exposed
+weight and gradient transfers. Later home work cannot hide a stall at the first
+guest dependency in a fixed queue. Incoming and outgoing transfers are counted
+separately and added; neither full-duplex bandwidth nor multi-peer contention is
+inferred. The score is `max(rank forward) + max(rank backward)`, shared by
+reporting and quota refinement. This is a conservative phase heuristic, not a
+claim that real execution has an intervening global barrier or a guaranteed
+latency bound. Stage-prefix overlap discounts remain unsupported.
 
 Supply monotonic `(rows, milliseconds)` forward/backward tables starting at
 `(0, 0)`, full weight-copy cost per replica, exposed gradient-return cost and
@@ -395,7 +407,7 @@ Absent calibration or expert counts outside the measured range retain the
 original quota policy.
 
 Refinement searches only existing replica edges, may remove a replica, and
-accepts only a predicted reduction in worst-rank completion time. Receive rows
+accepts only a strict reduction of the same phase score beyond `minimum_gain_ms`. Receive rows
 may increase within the existing capacity limit. The B slot budget, lossless
 routing and push dynamic growth with a theoretical upper bound are preserved.
 
@@ -455,3 +467,72 @@ when the generated Cube schedule proves per-expert readiness. W13Grad precedes
 dX on every Cube; the complete dX event fences the W13 output. W2 and W13 use
 distinct epochs and completion storage, and the kernel joins all remote readers
 before releasing the guest lease. Unrecognized schedules retain late return.
+
+
+## Controlled performance and diagnostics
+
+Run the fresh-process worker through the same four-card environment and native
+payload as the correctness tests:
+
+```bash
+torchrun --standalone --nproc-per-node=4 tests/torch/expert_parallel/_benchmark_hot_replica.py \
+  --backend push --budget 1 --replica-transport shmem_signal_sdma_projection \
+  --replica-planner cpu --result-dir /tmp/replica-benchmark
+```
+
+The default EP4/E24 shape has six home experts per rank, S=512, D=5120,
+I=1792, K=8. The worker times complete forward/backward/SGD steps on directly
+owned MegaMoe parameters, with fixed router probabilities. Rank maximum is
+reduced outside the timed interval. It records lazy initialization, first hot
+route/growth, balanced, steady hot and rotating-hot distributions separately.
+Warm windows must keep capacity and SHMEM epoch constant. Audit the recorded
+plans and capacities before comparing variants; timing does not establish
+numerical correctness.
+
+Compare adjacent modes in separate fresh processes in ABBA order: B=0, B=1
+CPU/P2P, bidirectional SDMA, slot overlap, projection readiness, kernel gradient
+return, then CPU/device with the selected transport. Keep shape, routes, plan,
+precision and warmed capacity identical for mechanism comparisons. B=0 computes
+BF16 weight partials while B=1 uses FP32 partials, so that first comparison is an
+actual production baseline comparison, not an isolated communication result.
+Optimizer and direct parameter ownership are identical within this worker;
+absolute timings from different drivers are not interchangeable.
+
+Add `--diagnose` to collect an extra, untimed TorchNPU trace, internal cycle trace,
+and inclusive host/stream intervals. The spans cover count gather, solver/AIV
+launch, control D2H, remap, metadata upload, invocation metadata and transport
+submission. They can nest, overlap, and include queue gaps; do not sum them into
+step latency or treat stream intervals as pure device kernel time. The host
+observer excludes profiler teardown and plan-audit readbacks. Use the framework
+trace for kernel duration. Internal `ReplicaWeightReadyWait` records
+identify rank, projection, slot, epoch, consumer stage, logical expert and owner
+peer. `epoch` is not a task number. Only the profiling path records cycle pairs;
+normal execution adds no synchronization or poll-loop logging. The trace checks
+for dropped records and missing wait records on active guest ranks.
+
+Memory snapshots distinguish Torch allocated/reserved peaks from the external
+SHMEM heap and list guest weight/FP32 gradient payload bytes, their shared backing
+storage, gradient scratch, expected home FP32 partials, and saved nonparameter storage. Subcategories
+can overlap and must not be added again. Saved storage is a lower bound, not all
+activation memory. Only a constant SHMEM reservation in a no-growth window may
+be added to that window's Torch peak; peaks from different steps are not summed.
+
+For a separate candidate-plan experiment, first generate calibration:
+
+```bash
+torchrun --standalone --nproc-per-node=4 tests/torch/expert_parallel/_benchmark_replica_calibration.py \
+  --replica-transport shmem_signal_sdma_projection --result-dir /tmp/replica-calibration
+```
+
+Then pass `--cost-model /tmp/replica-calibration/cost-model.json` to the CPU
+benchmark and compare against an uncalibrated CPU run in fresh-process ABBA
+order. Calibration measures single-expert F/B, full weight copy, both gradient
+projections, and host refinement overhead. Its additive per-expert tables
+include launch/control costs and approximate link contention; they are not a
+whole-schedule oracle. Actual candidate plans, complete step distributions and
+capacity changes must be reported separately from transport ablations. A lower
+model score alone is insufficient evidence for enabling calibration in training.
+
+The precision worker accepts the same `--cost-model` file. Validate its output,
+dX, router-probability gradients and owner dW against `--fp32-reference` before
+using a changed plan. The reference never receives the candidate calibration.
