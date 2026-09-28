@@ -127,6 +127,8 @@ class MegaMoeExperts(MulticoreModule):
         dispatch_mode: str = "push",
         initial_capacity_factor: float | None = None,
         capacity_growth_factor: float | None = None,
+        dispatch_split: int = _COMMUNICATION_SPLIT,
+        combine_split: int = _COMMUNICATION_SPLIT,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -143,6 +145,10 @@ class MegaMoeExperts(MulticoreModule):
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
+            dispatch_split: Dispatch tile rows in forward and backward, default 128.
+                Must be a positive multiple of 128 that divides local_num_tokens.
+            combine_split: Combine tile rows in forward and backward, with the same
+                constraints and default as dispatch_split. Sharing requires equal splits.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             ep_group: Torch expert-parallel process group, possibly a subgroup of
@@ -159,6 +165,8 @@ class MegaMoeExperts(MulticoreModule):
             num_experts=num_experts,
             top_k=top_k,
             ep_size=ep_size,
+            dispatch_split=dispatch_split,
+            combine_split=combine_split,
         )
         specification = {
             "local_num_tokens": local_num_tokens,
@@ -171,6 +179,8 @@ class MegaMoeExperts(MulticoreModule):
             "ep_group": ep_group,
             "dispatch_mode": dispatch_mode,
             "capacity_growth_factor": capacity_growth_factor,
+            "dispatch_split": dispatch_split,
+            "combine_split": combine_split,
         }
         compatibility_key = (
             local_num_tokens,
@@ -183,6 +193,8 @@ class MegaMoeExperts(MulticoreModule):
             id(ep_group),
             dispatch_mode,
             capacity_growth_factor,
+            dispatch_split,
+            combine_split,
         )
         super().__init__(
             resource_specification=specification,
@@ -197,6 +209,8 @@ class MegaMoeExperts(MulticoreModule):
         self.initial_capacity_factor = initial_capacity_factor
         self.capacity_growth_factor = capacity_growth_factor
         self.dispatch_mode = dispatch_mode
+        self.dispatch_split = dispatch_split
+        self.combine_split = combine_split
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
@@ -217,6 +231,8 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         ep_size: int,
+        dispatch_split: int,
+        combine_split: int,
     ) -> None:
         """Validate static shape and topology values before allocation."""
         values = {
@@ -238,11 +254,13 @@ class MegaMoeExperts(MulticoreModule):
             raise ValueError(
                 f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})."
             )
-        if local_num_tokens % _COMMUNICATION_SPLIT:
-            raise ValueError(
-                "local_num_tokens must be divisible by the fixed communication "
-                f"split {_COMMUNICATION_SPLIT}, got {local_num_tokens}."
-            )
+        for name, split in (("dispatch_split", dispatch_split), ("combine_split", combine_split)):
+            if (not isinstance(split, int) or isinstance(split, bool)
+                    or split <= 0 or split % _COMMUNICATION_SPLIT):
+                raise ValueError(
+                    f"{name} must be a positive integer multiple of {_COMMUNICATION_SPLIT}, got {split!r}.")
+            if local_num_tokens % split:
+                raise ValueError(f"local_num_tokens ({local_num_tokens}) must be divisible by {name} ({split}).")
 
     def _validate_tensors(self, hidden_states: torch.Tensor, expert_weights: tuple) -> None:
         """Validate activation and parameter metadata before acquiring resources."""

@@ -23,10 +23,56 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
+from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_configs, _build_task_values
+from hyper_parallel.core.multicore.modules.mega_moe.spec import bind_mega_moe_spec
 
 
 class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
+
+    def test_communication_splits_reach_both_graphs_and_isolate_sharing(self) -> None:
+        """Propagate independent public split values without sharing incompatible plans."""
+        arguments = dict(local_num_tokens=512, hidden_size=16, intermediate_size=8,
+                         num_experts=4, top_k=2, create_parameters=False)
+        for mode in ("push", "pull"):
+            for dispatch_split, combine_split in ((128, 128), (512, 512), (128, 512), (512, 128)):
+                with self.subTest(mode=mode, dispatch=dispatch_split, combine=combine_split):
+                    layer = MegaMoeExperts(**arguments, dispatch_mode=mode,
+                                           dispatch_split=dispatch_split, combine_split=combine_split)
+                    self.addCleanup(layer.close)
+                    with (patch.object(mega_moe_module.dist, "is_initialized", return_value=False),
+                          patch.object(torch.npu, "get_device_limit", return_value={"cube_core_num": 24})):
+                        spec = bind_mega_moe_spec(
+                            layer._resource_group.specification,
+                            SimpleNamespace(device="npu:0", dtype=torch.bfloat16),
+                        )
+                    self.assertEqual((spec.dispatch_split, spec.combine_split), (dispatch_split, combine_split))
+                    forward, _, backward, _ = _build_runtime_configs(spec, _build_task_values(spec))
+                    for graph in (forward, backward):
+                        self.assertEqual(graph.get_op("dispatch").split_value, dispatch_split)
+                        self.assertEqual(graph.get_op("combine").split_value, combine_split)
+                    same = MegaMoeExperts(**arguments, dispatch_mode=mode,
+                                          dispatch_split=dispatch_split, combine_split=combine_split)
+                    self.addCleanup(same.close)
+                    for key in ("dispatch_split", "combine_split"):
+                        splits = dict(dispatch_split=dispatch_split, combine_split=combine_split)
+                        splits[key] = 512 if splits[key] == 128 else 128
+                        other = MegaMoeExperts(**arguments, dispatch_mode=mode, **splits)
+                        self.addCleanup(other.close)
+                        with self.assertRaises(ValueError):
+                            MegaMoeExperts.share_execution_resources([same, other])
+                    MegaMoeExperts.share_execution_resources([layer, same])
+                    self.assertIs(layer._resource_group, same._resource_group)
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_invalid_communication_splits_fail_before_allocation(self, allocate: Mock) -> None:
+        """Reject invalid types, alignment, and incomplete communication tiles."""
+        for key in ("dispatch_split", "combine_split"):
+            for value in (0, -128, True, 128.0, "512", 64, 129, 384, 1024):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, key):
+                    MegaMoeExperts(local_num_tokens=512, hidden_size=16, intermediate_size=8,
+                                   num_experts=4, top_k=2, **{key: value})
+        allocate.assert_not_called()
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_constructor_defaults_to_growing_push(
@@ -60,6 +106,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                     "ep_group": None,
                     "dispatch_mode": "push",
                     "capacity_growth_factor": 1.25,
+                    "dispatch_split": 128,
+                    "combine_split": 128,
                 },
             )
             mock_create_parameters.assert_called_once_with(2, 16, 8)
