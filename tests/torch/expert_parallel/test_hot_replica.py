@@ -42,3 +42,82 @@ def test_push_hot_replica() -> None:
 def test_pull_hot_replica() -> None:
     """Check multicore pull training with the shared placement planner."""
     torchrun_case(_WORKER, "test_pull_hot_replica_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_native_device_hot_replica() -> None:
+    """Native AIV planner with P2P."""
+    torchrun_case(str(Path(__file__).with_name("_test_hot_replica.py")),
+                  "test_native_device_hot_replica_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_push_default_group() -> None:
+    """Push default-group P2P."""
+    torchrun_case(str(Path(__file__).with_name("_test_hot_replica.py")),
+                  "test_push_default_group_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_pull_default_group() -> None:
+    """Pull default-group P2P."""
+    torchrun_case(str(Path(__file__).with_name("_test_hot_replica.py")),
+                  "test_pull_default_group_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_replica_groups() -> None:
+    """Default and noncontiguous group round trips."""
+    torchrun_case(str(Path(__file__).with_name("_test_replica_boundaries.py")),
+                  "test_replica_groups_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_device_replica_boundaries() -> None:
+    """AIV parity and retained cross-stream plans."""
+    torchrun_case(str(Path(__file__).with_name("_test_replica_boundaries.py")),
+                  "test_device_replica_boundaries_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_push_device_projection() -> None:
+    """push AIV planner and projection."""
+    torchrun_case(str(Path(__file__).with_name("_test_hot_replica.py")),
+                  "test_push_device_projection_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_push_device_kernel_gradient() -> None:
+    """push AIV planner and kernel_gradient."""
+    torchrun_case(str(Path(__file__).with_name("_test_hot_replica.py")),
+                  "test_push_device_kernel_gradient_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_pull_device_projection() -> None:
+    """pull AIV planner and projection."""
+    torchrun_case(str(Path(__file__).with_name("_test_hot_replica.py")),
+                  "test_pull_device_projection_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_pull_device_kernel_gradient() -> None:
+    """pull AIV planner and kernel_gradient."""
+    torchrun_case(str(Path(__file__).with_name("_test_hot_replica.py")),
+                  "test_pull_device_kernel_gradient_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_native_deferred_topk() -> None:
+    """Check legal routes and reverse backward across K=1/2/3/4/5/6/8."""
+    torchrun_case(_WORKER, "test_native_deferred_topk_npu", num_proc=4)

@@ -33,6 +33,11 @@ def _exchange(operations: list) -> None:
             work.wait()
 
 
+def _global_peer_rank(group: object, peer: int) -> int:
+    """Default-group ranks already are global; subgroup ranks need translation."""
+    return peer if group is None else dist.get_global_rank(group, peer)
+
+
 @contextmanager
 def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
                      *, backward: bool = False, provider: object = None,
@@ -52,7 +57,10 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
             yield pool
         return
     config = route.plan.config
-    pool = replica_pool(weights, config.replica_slots_per_rank, route.group)
+    if not dist.is_initialized() and config.ep_size == 1 and not route.plan.transfers:
+        pool = ReplicaPool(weights, config.replica_slots_per_rank)
+    else:
+        pool = replica_pool(weights, config.replica_slots_per_rank, route.group)
     with pool.lease(backward=backward):
         if provider is not None:
             provider.prefetch(weights, pool.weights, route)
@@ -62,11 +70,11 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
         for transfer in route.plan.transfers:
             for weight, output in zip(weights, pool.weights):
                 if route.rank == transfer.owner_rank:
-                    peer = dist.get_global_rank(route.group, transfer.target_rank)
+                    peer = _global_peer_rank(route.group, transfer.target_rank)
                     operations.append(dist.P2POp(
                         dist.isend, weight[transfer.owner_slot].contiguous(), peer, route.group))
                 elif route.rank == transfer.target_rank:
-                    peer = dist.get_global_rank(route.group, transfer.owner_rank)
+                    peer = _global_peer_rank(route.group, transfer.owner_rank)
                     guest = output[transfer.target_slot - config.home_experts]
                     operations.append(dist.P2POp(dist.irecv, guest, peer, route.group))
         _exchange(operations)
@@ -117,12 +125,12 @@ def return_gradients(gradients: tuple[torch.Tensor, ...], route: ReplicaRoute,
                     value = (gradient[transfer.target_slot] if guests is None else
                              guests[index][transfer.target_slot - home]).float().contiguous()
                     outgoing.append(value)
-                    peer = dist.get_global_rank(route.group, transfer.owner_rank)
+                    peer = _global_peer_rank(route.group, transfer.owner_rank)
                     operations.append(dist.P2POp(dist.isend, value, peer, route.group))
                 elif route.rank == transfer.owner_rank:
                     value = torch.empty_like(result[index][transfer.owner_slot])
                     incoming.append((index, transfer.owner_slot, value))
-                    peer = dist.get_global_rank(route.group, target)
+                    peer = _global_peer_rank(route.group, target)
                     operations.append(dist.P2POp(dist.irecv, value, peer, route.group))
         _exchange(operations)
         for index, slot, value in incoming:

@@ -15,6 +15,10 @@
 """Native and multicore expert-replica distributed precision acceptance."""
 
 import argparse
+from contextlib import ExitStack
+from functools import wraps
+from typing import Any
+from unittest.mock import patch
 import importlib
 import sys
 import json
@@ -30,13 +34,19 @@ import torch_npu
 from hyper_parallel import init_device_mesh
 from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.core.expert_parallel import ExpertParallel
-from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
+from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaConfig, build_expert_replica_plan
+from hyper_parallel.core.expert_parallel.hot_replica.native import (
+    dispatch_native_replicas, combine_native_replicas, native_replica_experts,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    SIGNAL_TRANSPORT_MODES,
+    SIGNAL_TRANSPORT_MODES, SignalReplicaTransport,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
 from tests.common.port_utils import allocate_port
+from tests.torch.expert_parallel.hot_replica_checks import (
+    deferred_ids, execution_identity, file_identity, route_evidence,
+)
 
 
 def _local(tensor):
@@ -55,8 +65,26 @@ def _native_forward(module, values, ids, probabilities, experts):
     return (restored.reshape(values.shape[0], ids.shape[1], -1) * probabilities.unsqueeze(-1)).sum(1)
 
 
+def _native_fp32_forward(module, values, ids, probabilities, experts):
+    """Use native B=0 execution with FP32 dW, without modifying production hooks."""
+    order = torch.argsort(ids.flatten(), stable=True)
+    expanded = values[:, None, :].expand(-1, ids.shape[1], -1).reshape(-1, values.shape[-1])
+    counts = torch.bincount(ids.flatten(), minlength=experts)
+    config = ExpertReplicaConfig(experts, dist.get_world_size(), 0)
+    inputs, state = dispatch_native_replicas((expanded[order], counts), config, dist.group.WORLD)
+    packed = torch.cat((_local(module.w1), _local(module.w3)), dim=1).transpose(1, 2).contiguous()
+    down = _local(module.w2).transpose(1, 2).contiguous()
+    output = native_replica_experts(inputs[0], packed, down, inputs[1], state.route)
+    combined = combine_native_replicas(output, state)
+    restored = torch.empty_like(combined)
+    restored[order] = combined
+    return (restored.reshape(values.shape[0], ids.shape[1], -1) * probabilities.unsqueeze(-1)).sum(1)
+
+
 def _expert_forward(module, executor, values, ids, probabilities, experts):
     """Select the controlled reference executor without changing parameters."""
+    if executor == "native_fp32":
+        return _native_fp32_forward(module, values, ids, probabilities, experts)
     if executor is None:
         return _native_forward(module, values, ids, probabilities, experts)
     packed = torch.cat((_local(module.w1), _local(module.w3)), dim=1).transpose(1, 2).contiguous()
@@ -86,7 +114,8 @@ def _check(actual, expected, label, *, elementwise=True, rtol=2e-2, atol=2e-3):
     return {"relative_l2": relative, "max_abs": maximum}
 
 
-def _deferred_backward(base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference):
+def _deferred_backward(base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference,
+                       replica_planner, *, growth=False, require_transfers=True):
     """Keep different plans live, then run backward in reverse invocation order."""
     # Isolate saved-plan lifetime from tolerated optimizer-rounding drift.
     with torch.no_grad():
@@ -103,16 +132,30 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
                 destination[key] = _local(gradient).detach().clone()
             hooks.append(getattr(module, name).register_hook(_capture))
     pending = []
-    for modulus in (max(6, top_k), 2 if top_k <= 6 else experts):
-        torch.manual_seed(833 + rank + modulus)
+    plans = []
+    capacities = []
+    for invocation in range(2):
+        torch.manual_seed(833 + rank + invocation)
         values = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device).requires_grad_()
         other = values.detach().clone().requires_grad_()
-        ids = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k).remainder(modulus).long()
+        ids = deferred_ids(tokens, top_k, experts, invocation, device)
+        if growth and invocation == 0:
+            ids = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k).remainder(experts).long()
         probabilities = torch.full((tokens, top_k), 1.0 / top_k, device=device, requires_grad=True)
         other_probabilities = probabilities.detach().clone().requires_grad_()
         expected = _expert_forward(base, reference, values, ids, probabilities, experts)
         actual = _expert_forward(candidate, executor, other, ids, other_probabilities, experts)
+        plans.append(route_evidence(actual, replica_planner) if require_transfers else None)
+        if growth:
+            resources = executor._get_execution_resources(other)
+            capacities.append(resources.workspace.capacity_floor)
         pending.append((expected, actual, values, other, probabilities, other_probabilities))
+    if require_transfers:
+        active = plans[1]["transfers"] if growth else all(plan["transfers"] for plan in plans)
+        if plans[0] == plans[1] or not active:
+            raise AssertionError("Deferred acceptance requires different plans and active replicas")
+    if growth and capacities[1] <= capacities[0]:
+        raise AssertionError(f"Expected heap growth with an old forward alive: {capacities}")
     checks = []
     for expected, actual, values, other, probabilities, other_probabilities in reversed(pending):
         gradient = torch.randn_like(expected)
@@ -138,11 +181,11 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
     accumulated_error = {name: _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad),
                                       "accumulated " + name, elementwise=False)
                          for name in ("w1", "w2", "w3")}
-    return {"invocations": checks, "accumulated": accumulated_error}
+    return {"invocations": checks, "accumulated": accumulated_error, "plans": plans, "capacities": capacities}
 
 
 def _cross_layer_pool(backend, budget, mesh, executor, reference, tokens, hidden, intermediate, top_k,
-                      replica_min_rows=0):
+                      replica_min_rows=0, replica_planner="cpu"):
     """Two independent parameter owners share storage through reversed backward."""
     experts = mesh.size() * 6
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
@@ -154,7 +197,8 @@ def _cross_layer_pool(backend, budget, mesh, executor, reference, tokens, hidden
             module = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(
                 device=device, dtype=torch.bfloat16)
             ExpertParallel(replica_slots_per_rank=budget if hot and backend == "native" else 0,
-                           replica_min_rows=replica_min_rows if hot else 0).apply(module, mesh)
+                           replica_min_rows=replica_min_rows if hot else 0,
+                           replica_planner=replica_planner if hot else "cpu").apply(module, mesh)
             modules.append(module)
         pairs.append(modules)
     pending = []
@@ -226,6 +270,53 @@ def _signal_stress(provider, mesh, hidden, intermediate, budget):
     return {"iterations": 12, "streams": 2, "owners": size}
 
 
+def _kernel_wait_stress(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,
+                        reference, replica_planner):
+    """Publish ready words only after submitting the fused consumer kernel.
+
+    Fault injection delays only ready publication, retaining its original SDMA
+    stream and tensor lifetimes. It never calls wait_weights before computation.
+    """
+    runtime = importlib.import_module("hyper_parallel.core.multicore.shmem")
+    function = importlib.import_module("hyper_parallel.core.multicore.modules.mega_moe.function")
+    original_put = runtime.put
+    pending, publications = [], []
+
+    def _delayed_put(destination, source, peer, **options):
+        if destination.dtype == torch.int32 and destination.numel() == 1:
+            pending.append((torch.npu.current_stream(), destination, source, peer, options))
+        else:
+            original_put(destination, source, peer, **options)
+
+    def _after_launch(launch, direction):
+        @wraps(launch)
+        def _wrapped(*args, **kwargs):
+            result = launch(*args, **kwargs)
+            # Publication remains on the already-forked SDMA stream, never
+            # behind a consumer waiting for it on the main stream.
+            publications.append({"direction": direction, "ready_words": len(pending)})
+            for stream, destination, source, peer, options in pending:
+                with torch.npu.stream(stream):
+                    original_put(destination, source, peer, **options)
+                    source.record_stream(stream)
+            pending.clear()
+            return result
+        return _wrapped
+
+    with (patch.object(runtime, "put", _delayed_put),
+          patch.object(function, "_launch_forward_kernel", _after_launch(function._launch_forward_kernel, "forward")),
+          patch.object(function, "_launch_backward_kernel",
+                       _after_launch(function._launch_backward_kernel, "backward"))):
+        checks = _deferred_backward(base, candidate, executor, experts, rank, device,
+                                    tokens, hidden, top_k, reference, replica_planner)
+    totals = torch.tensor([sum(item["ready_words"] for item in publications if item["direction"] == direction)
+                           for direction in ("forward", "backward")], device=device)
+    dist.all_reduce(totals)
+    if not bool((totals > 0).all()) or pending:
+        raise AssertionError("Delayed kernel-ready publication was not exercised in both directions")
+    return {"checks": checks, "publications": publications, "global_ready_words": totals.cpu().tolist()}
+
+
 def _benchmark(candidate, executor, experts, tokens, hidden, top_k, iterations):
     """Measure fresh-process warmed forward/backward plus SGD on a fixed hot route."""
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
@@ -253,11 +344,14 @@ def _benchmark(candidate, executor, experts, tokens, hidden, top_k, iterations):
     return {"step_ms": measured, "iterations": iterations, "warmup": 3}
 
 
-def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
+def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         hidden: int = 128, intermediate: int = 128, top_k: int = 2,
         same_backend_reference: bool = False, replica_transport: str = "p2p",
-        benchmark_iterations: int = 0, replica_min_rows: int = 0) -> None:
+        benchmark_iterations: int = 0, replica_min_rows: int = 0, replica_planner: str = "cpu",
+        default_group: bool = False, fp32_reference: bool = False) -> None:
     """Compare full forward/backward with native B=0, preserving EP ownership."""
+    if fp32_reference and same_backend_reference:
+        raise ValueError("Select only one reference backend")
     rank, size = dist.get_rank(), dist.get_world_size()
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
     home = 6
@@ -276,26 +370,33 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
     ExpertParallel().apply(base, mesh)
     ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0,
-                   replica_min_rows=replica_min_rows).apply(candidate, mesh)
+                   replica_min_rows=replica_min_rows, replica_planner=replica_planner).apply(candidate, mesh)
     executor = None
-    reference = None
+    reference = "native_fp32" if fp32_reference else None
     if backend != "native":
         mega_moe = importlib.import_module("hyper_parallel.core.multicore").MegaMoeExperts
         options = {"initial_capacity_factor": 1.0} if backend == "push" else {}
         executor = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
-                                 num_experts=experts, top_k=top_k, ep_size=size, ep_group=mesh.get_group(),
+                                 num_experts=experts, top_k=top_k, ep_size=size,
+                                 ep_group=None if default_group else mesh.get_group(),
                                  create_parameters=False, dispatch_mode=backend, replica_slots_per_rank=budget,
                                  replica_transport=replica_transport, replica_min_rows=replica_min_rows,
+                                 replica_planner=replica_planner,
                                  **options)
         if same_backend_reference:
             reference = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
-                                 num_experts=experts, top_k=top_k, ep_size=size, ep_group=mesh.get_group(),
+                                 num_experts=experts, top_k=top_k, ep_size=size,
+                                 ep_group=None if default_group else mesh.get_group(),
                                  create_parameters=False, dispatch_mode=backend, replica_slots_per_rank=0,
                                  **options)
     results = []
     optimizer_base = torch.optim.SGD(base.parameters(), lr=0.01, momentum=0.9)
     optimizer_candidate = torch.optim.SGD(candidate.parameters(), lr=0.01, momentum=0.9)
     try:
+        growth = None
+        if backend == "push" and budget == 1 and top_k >= 5 and replica_min_rows == 0:
+            growth = _deferred_backward(base, candidate, executor, experts, rank, device,
+                                        tokens, hidden, top_k, reference, replica_planner, growth=True)
         for pattern in ("balanced", "home_hot", "one_hot_pair", "balanced"):
             torch.manual_seed(719 + rank)
             x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16).requires_grad_()
@@ -309,10 +410,11 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             candidate.zero_grad(set_to_none=True)
             expected = _expert_forward(base, reference, x, ids, probs, experts)
             actual = _expert_forward(candidate, executor, x_candidate, ids, probs_candidate, experts)
+            plan_record = route_evidence(actual, replica_planner) if budget else None
             gradient = torch.randn_like(expected)
             expected.backward(gradient)
             actual.backward(gradient)
-            evidence = {"pattern": pattern, "output": _check(actual, expected, "output"),
+            evidence = {"pattern": pattern, "plan": plan_record, "output": _check(actual, expected, "output"),
                         "dx": _check(x_candidate.grad, x.grad, "dx"),
                         "dprob": _check(probs_candidate.grad, probs.grad, "dprob")}
             for name in ("w1", "w2", "w3"):
@@ -345,7 +447,8 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             if not any(row["heap_epoch"] > 0 for row in results):
                 raise AssertionError("expected a real dynamic push growth event")
         deferred = _deferred_backward(
-            base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference)
+            base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference, replica_planner,
+            require_transfers=budget > 0 and replica_min_rows == 0)
         if rank == 0:
             print(json.dumps({"backend": backend, "B": budget, "deferred": deferred}), flush=True)
         if backend == "native" and any(
@@ -354,24 +457,77 @@ def run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         cross_layer = []
         if hidden <= 128:
             cross_layer = _cross_layer_pool(backend, budget, mesh, executor, reference,
-                                           tokens, hidden, intermediate, top_k, replica_min_rows)
+                                           tokens, hidden, intermediate, top_k, replica_min_rows, replica_planner)
         signal_stress = None
         if replica_transport in SIGNAL_TRANSPORT_MODES and hidden <= 128:
             active_provider = resources.workspace.replica_provider
             signal_stress = _signal_stress(active_provider, mesh, hidden, intermediate, budget)
+        kernel_wait = None
+        if (budget and replica_min_rows == 0 and
+                replica_transport in ("shmem_signal_sdma_projection", "shmem_signal_kernel_gradient")):
+            kernel_wait = _kernel_wait_stress(base, candidate, executor, experts, rank, device,
+                                              tokens, hidden, top_k, reference, replica_planner)
         timing = None if not benchmark_iterations else _benchmark(
             candidate, executor, experts, tokens, hidden, top_k, benchmark_iterations)
+        identity = execution_identity()
+        identity.update(torch_npu=torch_npu.__version__, ep_members=dist.get_process_group_ranks(mesh.get_group()),
+                        backend=backend, budget=budget, shape=[tokens, hidden, intermediate, top_k],
+                        requested_planner=replica_planner,
+                        actual_planner=results[0]["plan"]["planner"] if budget else "disabled",
+                        requested_transport=replica_transport, reference=("native-fp32" if fp32_reference else
+                        "same-backend" if same_backend_reference else "native"), default_group=default_group)
+        if replica_planner == "device":
+            library = importlib.import_module(
+                "hyper_parallel.core.expert_parallel.hot_replica.device_kernel")._planner_library()
+            identity["planner_payload"] = {**file_identity(Path(library._name)),
+                                           "abi": library.planner_abi_version()}
+        if executor is not None:
+            identity["actual_transport"] = resources.spec.replica_transport
+            loader = importlib.import_module("hyper_parallel.core.multicore._loader")
+            vendor, adapter = loader.get_multicore_paths()
+            identity["multicore_payload"] = [file_identity(adapter),
+                                             file_identity(vendor / "op_api/lib/libcust_opapi.so")]
+            identity["multicore_transport_abi"] = torch.ops.hyper_parallel.mega_moe_transport_version()
+            identity["multicore_schemas"] = [str(torch.ops.hyper_parallel.mega_moe.default._schema),
+                                             str(torch.ops.hyper_parallel.mega_moe_grad.default._schema)]
+            identity["multicore_kernels"] = [file_identity(path) for path in sorted(vendor.rglob("*.o"))]
+            provider = resources.workspace.replica_provider
+            identity["provider"] = type(provider).__name__
+            if replica_transport in SIGNAL_TRANSPORT_MODES:
+                identity["provider_options"] = {"overlap_home": provider.overlap_home,
+                                                "projection_ready": provider._projection_ready,
+                                                "kernel_gradients": provider.kernel_gradients}
+                expected_projection = replica_transport in (
+                    "shmem_signal_sdma_projection", "shmem_signal_kernel_gradient")
+                if (provider._projection_ready != expected_projection or
+                        provider.kernel_gradients != (replica_transport == "shmem_signal_kernel_gradient")):
+                    raise AssertionError("Requested signal transport did not execute")
+            binding = sys.modules.get("hyper_parallel_shmem_torch")
+            if binding is not None:
+                identity["shmem_binding"] = file_identity(Path(binding.__file__))
+        else:
+            identity["actual_transport"] = "p2p"
         Path(result_dir).mkdir(parents=True, exist_ok=True)
         Path(result_dir, f"{backend}-b{budget}-rank{rank}.json").write_text(
-            json.dumps({"steps": results, "deferred": deferred, "cross_layer": cross_layer,
+            json.dumps({"identity": identity, "growth_deferred": growth, "steps": results,
+                        "deferred": deferred, "cross_layer": cross_layer,
                         "replica_transport": replica_transport, "replica_min_rows": replica_min_rows,
-                        "signal_stress": signal_stress, "timing": timing},
+                        "signal_stress": signal_stress, "kernel_wait": kernel_wait, "timing": timing},
                        indent=2) + "\n", encoding="utf-8")
     finally:
         if executor is not None:
             executor.close()
-        if reference is not None:
+        if reference is not None and not isinstance(reference, str):
             reference.close()
+
+
+def run(backend: str, budget: int, result_dir: str, **options: Any) -> None:
+    """Run acceptance with native provider isolation and optional delayed readiness."""
+    with ExitStack() as stack:
+        if backend == "native":
+            stack.enter_context(patch.object(SignalReplicaTransport, "__init__", side_effect=AssertionError(
+                "Native constructed a one-sided provider")))
+        _run(backend, budget, result_dir, **options)
 
 
 def main() -> None:
@@ -381,6 +537,9 @@ def main() -> None:
     parser.add_argument("--replica-transport",
                         choices=("p2p", "shmem", *SIGNAL_TRANSPORT_MODES),
                         default="p2p")
+    parser.add_argument("--replica-planner", choices=("cpu", "device"), default="cpu")
+    parser.add_argument("--default-group", action="store_true")
+    parser.add_argument("--fp32-reference", action="store_true")
     parser.add_argument("--benchmark-iterations", type=int, default=0)
     parser.add_argument("--budget", type=int, default=1)
     parser.add_argument("--replica-min-rows", type=int, default=0)
@@ -400,7 +559,8 @@ def main() -> None:
         run(args.backend, args.budget, args.result_dir, tokens=args.tokens,
             hidden=args.hidden, intermediate=args.intermediate, top_k=args.top_k,
             same_backend_reference=args.same_backend_reference, replica_transport=args.replica_transport,
-            benchmark_iterations=args.benchmark_iterations, replica_min_rows=args.replica_min_rows)
+            benchmark_iterations=args.benchmark_iterations, replica_min_rows=args.replica_min_rows,
+            replica_planner=args.replica_planner, default_group=args.default_group, fp32_reference=args.fp32_reference)
     finally:
         dist.destroy_process_group()
 
@@ -424,10 +584,61 @@ def test_pull_hot_replica_npu() -> None:
     _pytest_case("pull")
 
 
-def _pytest_case(backend: str) -> None:
+def _pytest_case(backend: str, **options) -> None:
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl", timeout=timedelta(seconds=180))
     try:
-        run(backend, 1, os.getenv("HP_HOT_REPLICA_RESULTS", "./logs/hot_replica"))
+        run(backend, 1, os.getenv("HP_HOT_REPLICA_RESULTS", "./logs/hot_replica"), **options)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_native_device_hot_replica_npu() -> None:
+    """Run native device planning with ordinary P2P and no multicore load."""
+    _pytest_case("native", replica_planner="device", fp32_reference=True)
+
+
+def test_push_default_group_npu() -> None:
+    """Reach actual default-group P2P after balanced warmup."""
+    _pytest_case("push", default_group=True, fp32_reference=True)
+
+
+def test_pull_default_group_npu() -> None:
+    """Exercise default-group P2P in the pull forward and backward."""
+    _pytest_case("pull", default_group=True, fp32_reference=True)
+
+
+def test_push_device_projection_npu() -> None:
+    """Validate actual device planning and projection execution."""
+    _pytest_case("push", replica_planner="device", replica_transport="shmem_signal_sdma_projection",
+                 top_k=8, fp32_reference=True)
+
+
+def test_push_device_kernel_gradient_npu() -> None:
+    """Validate actual device planning and kernel_gradient execution."""
+    _pytest_case("push", replica_planner="device", replica_transport="shmem_signal_kernel_gradient",
+                 top_k=8, fp32_reference=True)
+
+
+def test_pull_device_projection_npu() -> None:
+    """Validate actual device planning and projection execution."""
+    _pytest_case("pull", replica_planner="device", replica_transport="shmem_signal_sdma_projection",
+                 top_k=8, fp32_reference=True)
+
+
+def test_pull_device_kernel_gradient_npu() -> None:
+    """Validate actual device planning and kernel_gradient execution."""
+    _pytest_case("pull", replica_planner="device", replica_transport="shmem_signal_kernel_gradient",
+                 top_k=8, fp32_reference=True)
+
+
+def test_native_deferred_topk_npu() -> None:
+    """Retain real native plans and reverse backward for every reviewed TopK."""
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
+    try:
+        for top_k in (1, 2, 3, 4, 5, 6, 8):
+            directory = Path(os.getenv("HP_HOT_REPLICA_RESULTS", "./logs/hot_replica")) / f"k{top_k}"
+            run("native", 1, str(directory), top_k=top_k, fp32_reference=True)
     finally:
         dist.destroy_process_group()
