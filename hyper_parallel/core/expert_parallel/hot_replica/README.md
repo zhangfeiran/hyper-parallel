@@ -210,14 +210,24 @@ matmul for dW, with boundaries taken from the plan rather than device readbacks.
 
 Expert sort keys use exact FP32 values when the expert-ID range fits 24 bits;
 permutation indices always remain integers. Larger expert-ID ranges use integer
-sorting. The current planner still runs on the host after the count exchange.
+sorting. CPU planning runs after count exchange; the optional device planner keeps
+quotas and source runs on the NPU and reads back one control summary.
 
 ## Current implementation limits
 
-The planner still performs one host readback after count exchange. Device-side
-planning and transport/compute overlap remain future work. Multi-node operation,
-expert TP, graph capture and FSDP composition need dedicated system tests before
-being advertised as supported.
+| Capability | Implemented execution | Validation boundary |
+| --- | --- | --- |
+| Shared CPU planner (default) | Native and MegaMoe push/pull | CPU policy/capacity tests and NPU training ST |
+| Shared device planner | Independent Ascend AIV; native and MegaMoe | Exact CPU parity, retained plans and two-stream NPU ST; one control-summary readback remains |
+| Native hot replicas | Ordinary HCCL P2P, FP32 guest-gradient merge | Forward/backward, optimizer, cross-layer and reversed-backward ST; no one-sided provider |
+| MegaMoe projection readiness | SDMA weight copies overlap home computation | Projection and kernel-gradient ST, including ready publication after fused consumer submission |
+| MegaMoe early gradient return | W2/W13 readiness and FP32 owner accumulation | Kernel-gradient ST; end-to-end benefit requires a separate matched benchmark |
+| Push receive capacity | Dynamic growth bounded by theoretical maximum | Growth with a retained forward, then reversed backward |
+| Offline calibrated quota refinement | CPU planner only | Device planning rejects this option; cost estimates are approximate |
+| Multi-node, expert TP, graph capture, FSDP/DP composition | No support claim from these tests | Dedicated composition ST required |
+
+The device planner retains its documented topology/scratch and int32-quota limits.
+Implemented capabilities and correctness tests do not establish a performance gain.
 Pool leases reject overlapping host submissions rather than allocating extra B
 slots. Native parameter packing and per-expert FP32 dW matmuls remain costs to
 measure. Barrier RMA additionally reserves a B-slot FP32 symmetric inbox. Signal RMA
@@ -233,7 +243,8 @@ CPU planner/capacity tests are in
 [`test_hot_replica.py`](../../../../tests/ut/core/expert_parallel/test_hot_replica.py).
 Distributed native/push/pull launchers are in
 [`test_hot_replica.py`](../../../../tests/torch/expert_parallel/test_hot_replica.py).
-The worker additionally accepts `--backend`, `--budget`, `--replica-transport`, and `--result-dir` for
+The worker additionally accepts `--backend`, `--budget`, `--replica-transport`,
+`--replica-planner={cpu,device}`, `--default-group`, and `--result-dir` for
 controlled fresh-process validation. Tests compare outputs, input/router/weight
 gradients, SGD updates and momentum, and reversed backward of live distinct plans.
 Small shapes also exercise independent layers sharing the guest pool, with
@@ -241,7 +252,29 @@ different weights and reversed backward.
 
 The worker can select production dimensions with `--tokens`, `--hidden`,
 `--intermediate`, and `--top-k`. `--same-backend-reference` compares multicore
-replication with the same transport at B=0; the default reference is native B=0.
+replication with the same compute backend at B=0; the default reference is native B=0.
+`--fp32-reference` selects an explicit native B=0 FP32-dW oracle without patching
+production hooks. It is mutually exclusive with `--same-backend-reference`.
+The FP32 oracle is a correctness control, not a production-baseline speed comparison.
+
+Named launchers cover default WORLD and noncontiguous subgroup P2P, native device
+planning, push/pull device planning with projection and kernel-gradient transport,
+and K=1/2/3/4/5/6/8 deferred backward. The latter checks distinct legal experts and
+two actual saved plans with replicas; the full active-replica acceptance uses
+B>0 and `--replica-min-rows=0`. The push K>=5/B1 case checks real growth while an
+older forward remains live. Planner parity probes retain twelve plans on two streams.
+Results record requested and observed configuration, source identity, EP membership,
+CANN/Torch versions and loaded payload hashes/ABI where exported.
+
+For example, after building and activating the payload as described below:
+
+```bash
+torchrun --standalone --nproc-per-node=4 tests/torch/expert_parallel/_test_hot_replica.py \
+  --backend push --budget 1 --top-k 8 --replica-planner device \
+  --replica-transport shmem_signal_kernel_gradient --fp32-reference \
+  --result-dir ./logs/hot_replica/push-device-kernel-gradient
+```
+
 Incoming gradient partials retain the per-element precision gate. Deferred
 backward also checks exact BF16 accumulation of captured partials, because
 cancellation can amplify relative error in a final BF16 gradient. Comparison
