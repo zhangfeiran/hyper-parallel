@@ -62,7 +62,7 @@ class MegaMoeSpec:
 
 
 def _align_capacity(capacity: int) -> int:
-    """Align one receive capacity to the fixed communication split."""
+    """Align receive capacity to the baseline compute tile, independent of communication tiles."""
     return (
         (capacity + _COMMUNICATION_SPLIT - 1)
         // _COMMUNICATION_SPLIT
@@ -186,4 +186,6 @@ def bind_mega_moe_spec(
         num_cube_cores=num_cube_cores,
         dispatch_mode=specification.get("dispatch_mode", "push"),
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
+        dispatch_split=specification.get("dispatch_split", _COMMUNICATION_SPLIT),
+        combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
     )
