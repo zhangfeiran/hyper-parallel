@@ -14,8 +14,11 @@
 # ============================================================================
 """Native and multicore expert-replica distributed precision acceptance."""
 
+from __future__ import annotations
+
 import argparse
 from contextlib import ExitStack
+from dataclasses import asdict
 from functools import wraps
 from typing import Any
 from unittest.mock import patch
@@ -34,7 +37,9 @@ import torch_npu
 from hyper_parallel import init_device_mesh
 from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.core.expert_parallel import ExpertParallel
-from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaConfig, build_expert_replica_plan
+from hyper_parallel.core.expert_parallel.hot_replica import (
+    ExpertReplicaConfig, ExpertReplicaCostModel, build_expert_replica_plan,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.native import (
     dispatch_native_replicas, combine_native_replicas, native_replica_experts,
 )
@@ -185,7 +190,7 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
 
 
 def _cross_layer_pool(backend, budget, mesh, executor, reference, tokens, hidden, intermediate, top_k,
-                      replica_min_rows=0, replica_planner="cpu"):
+                      replica_min_rows=0, replica_planner="cpu", cost_model=None):
     """Two independent parameter owners share storage through reversed backward."""
     experts = mesh.size() * 6
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
@@ -198,7 +203,8 @@ def _cross_layer_pool(backend, budget, mesh, executor, reference, tokens, hidden
                 device=device, dtype=torch.bfloat16)
             ExpertParallel(replica_slots_per_rank=budget if hot and backend == "native" else 0,
                            replica_min_rows=replica_min_rows if hot else 0,
-                           replica_planner=replica_planner if hot else "cpu").apply(module, mesh)
+                           replica_planner=replica_planner if hot else "cpu",
+                           replica_cost_model=cost_model if hot and backend == "native" else None).apply(module, mesh)
             modules.append(module)
         pairs.append(modules)
     pending = []
@@ -348,7 +354,8 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         hidden: int = 128, intermediate: int = 128, top_k: int = 2,
         same_backend_reference: bool = False, replica_transport: str = "p2p",
         benchmark_iterations: int = 0, replica_min_rows: int = 0, replica_planner: str = "cpu",
-        default_group: bool = False, fp32_reference: bool = False) -> None:
+        default_group: bool = False, fp32_reference: bool = False,
+        cost_model: ExpertReplicaCostModel | None = None) -> None:
     """Compare full forward/backward with native B=0, preserving EP ownership."""
     if fp32_reference and same_backend_reference:
         raise ValueError("Select only one reference backend")
@@ -370,7 +377,8 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
     ExpertParallel().apply(base, mesh)
     ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0,
-                   replica_min_rows=replica_min_rows, replica_planner=replica_planner).apply(candidate, mesh)
+                   replica_min_rows=replica_min_rows, replica_planner=replica_planner,
+                   replica_cost_model=cost_model if backend == "native" else None).apply(candidate, mesh)
     executor = None
     reference = "native_fp32" if fp32_reference else None
     if backend != "native":
@@ -381,7 +389,7 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
                                  ep_group=None if default_group else mesh.get_group(),
                                  create_parameters=False, dispatch_mode=backend, replica_slots_per_rank=budget,
                                  replica_transport=replica_transport, replica_min_rows=replica_min_rows,
-                                 replica_planner=replica_planner,
+                                 replica_planner=replica_planner, replica_cost_model=cost_model,
                                  **options)
         if same_backend_reference:
             reference = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
@@ -457,7 +465,8 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         cross_layer = []
         if hidden <= 128:
             cross_layer = _cross_layer_pool(backend, budget, mesh, executor, reference,
-                                           tokens, hidden, intermediate, top_k, replica_min_rows, replica_planner)
+                                           tokens, hidden, intermediate, top_k, replica_min_rows,
+                                           replica_planner, cost_model)
         signal_stress = None
         if replica_transport in SIGNAL_TRANSPORT_MODES and hidden <= 128:
             active_provider = resources.workspace.replica_provider
@@ -473,6 +482,7 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         identity.update(torch_npu=torch_npu.__version__, ep_members=dist.get_process_group_ranks(mesh.get_group()),
                         backend=backend, budget=budget, shape=[tokens, hidden, intermediate, top_k],
                         requested_planner=replica_planner,
+                        calibration=None if cost_model is None else asdict(cost_model),
                         actual_planner=results[0]["plan"]["planner"] if budget else "disabled",
                         requested_transport=replica_transport, reference=("native-fp32" if fp32_reference else
                         "same-backend" if same_backend_reference else "native"), default_group=default_group)
@@ -538,6 +548,7 @@ def main() -> None:
                         choices=("p2p", "shmem", *SIGNAL_TRANSPORT_MODES),
                         default="p2p")
     parser.add_argument("--replica-planner", choices=("cpu", "device"), default="cpu")
+    parser.add_argument("--cost-model")
     parser.add_argument("--default-group", action="store_true")
     parser.add_argument("--fp32-reference", action="store_true")
     parser.add_argument("--benchmark-iterations", type=int, default=0)
@@ -560,7 +571,9 @@ def main() -> None:
             hidden=args.hidden, intermediate=args.intermediate, top_k=args.top_k,
             same_backend_reference=args.same_backend_reference, replica_transport=args.replica_transport,
             benchmark_iterations=args.benchmark_iterations, replica_min_rows=args.replica_min_rows,
-            replica_planner=args.replica_planner, default_group=args.default_group, fp32_reference=args.fp32_reference)
+            replica_planner=args.replica_planner, default_group=args.default_group, fp32_reference=args.fp32_reference,
+            cost_model=None if args.cost_model is None else ExpertReplicaCostModel(
+                **json.loads(Path(args.cost_model).read_text(encoding="utf-8"))["model"]))
     finally:
         dist.destroy_process_group()
 

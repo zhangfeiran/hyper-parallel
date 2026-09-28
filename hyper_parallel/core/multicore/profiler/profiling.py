@@ -67,6 +67,8 @@ DEFAULT_STAGE_NAMES = {
     0x10007: "TriggerEvent",
     0x10008: "ReplicaW2Return",
     0x10009: "ReplicaW13Return",
+    0x1000A: "ReplicaW13WeightReadyWait",
+    0x1000B: "ReplicaW2WeightReadyWait",
 }
 TASK_TYPE_NAMES = {
     0: "Terminate",
@@ -186,8 +188,8 @@ def _round_up_record_capacity(required_records: int) -> int:
 
 
 def _records_for_task(task_desc: TaskDescC) -> int:
-    """Mirror the wait, compute, and trigger records emitted by ExecuteTaskProfiled()."""
-    record_count = 1
+    """Bound dependency, compute, trigger and optional guest-weight wait records."""
+    record_count = 1 + int(task_desc.task_type == TaskType.TASK_GROUPED_MATMUL)
     if task_desc.dependent_event != EVENT_INVALID_ID:
         record_count += 1
     if task_desc.task_type != TaskType.TASK_SHMEM_PUT_MEM_SIGNAL:
@@ -648,6 +650,8 @@ def _event_name(
         stage_name = f"{task_stage_name}_{stage_name}"
     if not detailed_task_names:
         return stage_name
+    if desc_id in (0x1000A, 0x1000B):
+        return f"ReplicaSlot{owner_id}_{stage_name}_epoch{stage_task_index}"
     task_name = f"{stage_name}_task{stage_task_index + 1}"
     if owner_id == INVALID_OWNER_ID:
         return task_name
@@ -865,14 +869,21 @@ def _duration_trace_event(
         "end_cycle": record["end_cycle"],
         "core_entry_cycle": record["entry_cycle"],
     }
-    if desc_id in (0x10008, 0x10009):
+    if desc_id in (0x1000A, 0x1000B):
+        args["task_stage"] = "ReplicaWeightReadyWait"
+        args["consumer_stage"] = task_stage_names.get(task_id)
+        args["projection"] = "W13" if desc_id == 0x1000A else "W2"
+        args["replica_slot"] = record["owner_id"]
+        args["epoch"] = record["stage_task_index"]
+        args.pop("task_number")
+    elif desc_id in (0x10008, 0x10009):
         args["task_stage"] = "ReplicaW2Return" if desc_id == 0x10008 else "ReplicaW13Return"
         args["peer_rank"] = record["stage_task_index"]
     elif task_id in task_stage_names:
         args["task_stage"] = task_stage_names[task_id]
     if desc_id >= TASK_TYPE_DESC_BASE:
         args["task_type"] = desc_id - TASK_TYPE_DESC_BASE
-    if record["owner_id"] != INVALID_OWNER_ID:
+    if record["owner_id"] != INVALID_OWNER_ID and desc_id not in (0x1000A, 0x1000B):
         args["owner_id"] = record["owner_id"]
     return {
         "name": _event_name(

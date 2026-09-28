@@ -61,7 +61,7 @@ def _runtime_config(task_capacity: int = 16) -> RuntimeConfigC:
     return allocate_runtime_config(task_capacity)
 
 
-def _three_record_task() -> TaskDescC:
+def _four_record_task() -> TaskDescC:
     task = TaskDescC()
     task.task_type = TaskType.TASK_GROUPED_MATMUL
     task.dependent_event = 0
@@ -110,6 +110,23 @@ class TestMegaKernelProfilingMetadata(unittest.TestCase):
         self.assertEqual(event["args"]["core_type"], "AIV")
         self.assertIn("ReplicaW2Return", event["name"])
         self.assertEqual(event["dur"], 2)
+
+    def test_replica_ready_wait_keeps_epoch_projection_and_consumer(self) -> None:
+        """Wait records must not mistake a guest slot for a logical expert or epoch for task index."""
+        for desc, projection in ((0x1000A, "W13"), (0x1000B, "W2")):
+            record = {"desc_id": desc, "task_id": 7, "core_type": 1, "block_id": 2,
+                      "stage_task_index": 2147483646, "owner_id": 3, "start_cycle": 1000,
+                      "end_cycle": 1100, "entry_cycle": 900}
+            event = _duration_trace_event(record, rank=0, device_id=0, anchor_cycle=900,
+                                          cycle_frequency_mhz=50, detailed_task_names=True,
+                                          owner_label="Expert", stage_names=DEFAULT_STAGE_NAMES,
+                                          task_stage_names={7: "GMM1"})
+            self.assertEqual(event["args"]["replica_slot"], 3)
+            self.assertEqual(event["args"]["epoch"], 2147483646)
+            self.assertEqual(event["args"]["projection"], projection)
+            self.assertEqual(event["args"]["consumer_stage"], "GMM1")
+            self.assertNotIn("owner_id", event["args"])
+            self.assertEqual(event["dur"], 2)
 
     def test_graph_serializes_stage_names_and_owner_ids(self):
         """Use graph task ranges and prefer an explicit diagnostic name."""
@@ -242,8 +259,8 @@ class TestMegaKernelProfilingMetadata(unittest.TestCase):
         _add_profile_op(graph, "second", task_num=1, diagnostic_name="Duplicate")
         runtime_config = _runtime_config()
         runtime_config.task_num = 2
-        runtime_config.all_tasks[0] = _three_record_task()
-        runtime_config.all_tasks[1] = _three_record_task()
+        runtime_config.all_tasks[0] = _four_record_task()
+        runtime_config.all_tasks[1] = _four_record_task()
 
         _apply_mega_kernel_profile_graph(
             runtime_config,
@@ -320,33 +337,33 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         """Mirror Device round-robin assignment for AIC and AIV independently."""
         runtime_config = _runtime_config(128)
         runtime_config.num_workers = 48
-        runtime_config.all_tasks[0] = _three_record_task()
+        runtime_config.all_tasks[0] = _four_record_task()
         runtime_config.task_index_num[0] = 121
         runtime_config.task_index_num[1] = 24
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 18)
-        self.assertEqual(layout.aiv_required_records, 3)
+        self.assertEqual(layout.aic_required_records, 24)
+        self.assertEqual(layout.aiv_required_records, 4)
         self.assertEqual(layout.aic_record_capacity, 32)
         self.assertEqual(layout.aiv_record_capacity, 16)
         self.assertEqual(layout.buffer_size, 53760)
         self.assertLess(layout.buffer_size, MAX_PROFILE_BUFFER_BYTES)
 
     def test_layout_preserves_records_above_former_limit(self) -> None:
-        """Keep all 258 records and reject a capacity that overflows the Device ABI."""
+        """Keep all 344 records and reject a capacity that overflows the Device ABI."""
         runtime_config = _runtime_config(2048)
         runtime_config.num_workers = 48
-        runtime_config.all_tasks[0] = _three_record_task()
+        runtime_config.all_tasks[0] = _four_record_task()
         runtime_config.task_index_num[0] = 2041
         runtime_config.task_index_num[1] = 2041
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 258)
-        self.assertEqual(layout.aic_record_capacity, 272)
-        self.assertEqual(layout.aiv_required_records, 258)
-        self.assertEqual(layout.aiv_record_capacity, 272)
+        self.assertEqual(layout.aic_required_records, 344)
+        self.assertEqual(layout.aic_record_capacity, 352)
+        self.assertEqual(layout.aiv_required_records, 344)
+        self.assertEqual(layout.aiv_record_capacity, 352)
         self.assertEqual(_round_up_record_capacity(MAX_RECORDS_PER_CORE), MAX_RECORDS_PER_CORE)
         with self.assertRaisesRegex(ValueError, "record limit"):
             _round_up_record_capacity(MAX_RECORDS_PER_CORE + 1)

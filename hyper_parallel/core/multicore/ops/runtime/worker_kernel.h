@@ -170,6 +170,8 @@ class KernelWorkerBase {
   GM_ADDR replica_matrix_bases_[4] = {};
   GM_ADDR replica_ready_[2] = {};
   int32_t replica_epoch_ = 0;
+  CycleTraceRecorder *replica_trace_ = nullptr;
+  uint32_t replica_trace_task_ = 0;
   GM_ADDR replica_gradient_config_ = nullptr;
 
   __aicore__ inline void ProcessReplicaGradients() {
@@ -255,6 +257,7 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void WaitForReplicaWeights(int64_t slot, uint32_t projection) const {
+    uint64_t start = replica_trace_ == nullptr ? 0 : replica_trace_->Now();
     GM_ADDR address = replica_ready_[projection] + slot * DATA_CACHE_LINE_SIZE;
     __gm__ volatile int32_t *ready_value =
       reinterpret_cast<__gm__ volatile int32_t *>(address);
@@ -264,6 +267,10 @@ class KernelWorkerBase {
     do {
       DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(ready);
     } while (*ready_value < replica_epoch_);
+    if (replica_trace_ != nullptr) {
+      replica_trace_->Record(0x1000A + projection, replica_trace_task_, replica_epoch_,
+                             static_cast<uint32_t>(slot), start, replica_trace_->Now());
+    }
   }
 
   __aicore__ inline void ProcessFast() {
@@ -506,9 +513,12 @@ class KernelWorkerBase {
     if (profile_desc_id == PROFILE_DESC_INVALID_ID) {
       profile_desc_id = PROFILE_DESC_TASK_TYPE_BASE + static_cast<uint32_t>(task_desc.task_type);
     }
+    replica_trace_ = &cycle_trace_recorder;
+    replica_trace_task_ = task_id;
     uint64_t compute_start_cycle = cycle_trace_recorder.Now();
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     uint64_t compute_end_cycle = cycle_trace_recorder.Now();
+    replica_trace_ = nullptr;
     cycle_trace_recorder.Record(profile_desc_id, task_id, task_desc.task_index, owner_id, compute_start_cycle,
                                 compute_end_cycle);
     if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
