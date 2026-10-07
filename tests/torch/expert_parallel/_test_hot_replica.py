@@ -208,36 +208,60 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
 
 
 def _cross_stream_deferred(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,
-                           reference, replica_planner):
-    """Prove that static images survive reuse on two streams and reverse backward."""
+                           reference, replica_planner, *, runtime_version=2):
+    """Check per-launch tails and image ownership on two streams with reverse backward."""
     function = importlib.import_module("hyper_parallel.core.multicore.modules.mega_moe.function")
-    launches = []
+    launches, snapshots, images = [], [], []
+
+    original_image = function._runtime_image
+
+    @wraps(original_image)
+    def _image(*args, **kwargs):
+        result = original_image(*args, **kwargs)
+        images.append((result, args[1]))
+        return result
 
     def _observe(original, direction, execution_index):
         @wraps(original)
         def _launch(*args, **kwargs):
             result = original(*args, **kwargs)
             execution = args[execution_index]
-            cache = execution.runtime_cache
-            entry = None if cache is None else cache.get(id(execution.profile_call.runtime_config))
-            if entry is None:
-                raise AssertionError("Cross-stream acceptance requires a cached static v2 image")
+            image, expected = images[-1]
+            snapshot = image[execution.profile_call.runtime_config.numel():].clone()
+            snapshots.append((snapshot, expected))
             launches.append({"direction": direction, "stream": torch.npu.current_stream().npu_stream,
-                             "image_pointer": entry[2].data_ptr(), "suffix": entry[1].hex()})
+                             "image_pointer": image.data_ptr(), "suffix": expected.hex()})
             return result
         return _launch
 
-    with (patch.object(function, "_launch_forward_kernel", _observe(function._launch_forward_kernel, "forward", 5)),
+    with (patch.object(function, "_runtime_image", _image),
+          patch.object(function, "_launch_forward_kernel", _observe(function._launch_forward_kernel, "forward", 5)),
           patch.object(function, "_launch_backward_kernel", _observe(function._launch_backward_kernel, "backward", 3))):
         checks = _deferred_backward(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,
                                     reference, replica_planner, cross_stream=True)
     for direction in ("forward", "backward"):
         records = [item for item in launches if item["direction"] == direction]
-        if len(records) != 2 or len({item["stream"] for item in records}) != 2:
-            raise AssertionError(f"Expected two actual {direction} streams: {records}")
-        if len({item["image_pointer"] for item in records}) != 1 or len({item["suffix"] for item in records}) != 1:
-            raise AssertionError(f"Static {direction} runtime image was not reused: {records}")
+        _check_runtime_direction(records, runtime_version, direction)
+    for snapshot, expected in snapshots:
+        if bytes(snapshot.cpu().tolist()) != expected:
+            raise AssertionError("Runtime tail was overwritten before its consumer completed")
     return {"checks": checks, "launches": launches}
+
+
+def _check_runtime_direction(records, runtime_version, direction):
+    """Require two actual streams and the expected image and epoch ownership."""
+    if len(records) != 2 or len({item["stream"] for item in records}) != 2:
+        raise AssertionError(f"Expected two actual {direction} streams: {records}")
+    expected_images = 1 if runtime_version == 2 else 2
+    if len({item["image_pointer"] for item in records}) != expected_images:
+        raise AssertionError(f"Unexpected {direction} runtime image ownership: {records}")
+    tails = [bytes.fromhex(item["suffix"]) for item in records]
+    if any(int.from_bytes(tail[4:8], "little") != runtime_version for tail in tails):
+        raise AssertionError(f"Unexpected runtime version: {records}")
+    if runtime_version == 2 and len(set(tails)) != 1:
+        raise AssertionError(f"Static suffix changed: {records}")
+    if runtime_version == 4 and tails[0][-8:] == tails[1][-8:]:
+        raise AssertionError(f"Projection epochs did not advance: {records}")
 
 
 def _cross_layer_pool(backend, budget, mesh, executor, reference, tokens, hidden, intermediate, top_k,
@@ -408,8 +432,8 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         default_group: bool = False, fp32_reference: bool = False,
         cost_model: ExpertReplicaCostModel | None = None, cross_stream: bool = False) -> None:
     """Compare full forward/backward with native B=0, preserving EP ownership."""
-    if cross_stream and (backend == "native" or replica_transport != "p2p"):
-        raise ValueError("Static runtime cross-stream acceptance requires MegaMoe P2P")
+    if cross_stream and (backend == "native" or replica_transport not in ("p2p", "shmem_signal_sdma_projection")):
+        raise ValueError("Runtime cross-stream acceptance requires MegaMoe P2P or projection")
     if fp32_reference and same_backend_reference:
         raise ValueError("Select only one reference backend")
     rank, size = dist.get_rank(), dist.get_world_size()
@@ -518,7 +542,8 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         cross_stream_result = None
         if cross_stream:
             cross_stream_result = _cross_stream_deferred(base, candidate, executor, experts, rank, device,
-                                                        tokens, hidden, top_k, reference, replica_planner)
+                                                        tokens, hidden, top_k, reference, replica_planner,
+                                                        runtime_version=2 if replica_transport == "p2p" else 4)
         cross_layer = []
         if hidden <= 128:
             cross_layer = _cross_layer_pool(backend, budget, mesh, executor, reference,
@@ -723,3 +748,15 @@ def test_push_static_runtime_streams_npu() -> None:
 def test_pull_static_runtime_streams_npu() -> None:
     """Reuse static v2 images across streams and reversed backward in pull."""
     _pytest_case("pull", top_k=8, fp32_reference=True, cross_stream=True)
+
+
+def test_push_projection_runtime_lifetime_npu() -> None:
+    """Verify independent v4 epochs on two streams with retained push plans."""
+    _pytest_case("push", top_k=8, fp32_reference=True, cross_stream=True,
+                 replica_transport="shmem_signal_sdma_projection")
+
+
+def test_pull_projection_runtime_lifetime_npu() -> None:
+    """Verify independent v4 epochs on two streams with retained pull plans."""
+    _pytest_case("pull", top_k=8, fp32_reference=True, cross_stream=True,
+                 replica_transport="shmem_signal_sdma_projection")
