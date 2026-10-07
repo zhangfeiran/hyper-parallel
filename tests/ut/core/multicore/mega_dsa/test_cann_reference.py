@@ -21,6 +21,10 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_parallel.components.functional.aux_loss import (
+    aux_loss_auto_scale,
+    set_aux_loss_scale,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.cann_reference import (
     CannDsaLayout,
     CannDsaReference,
@@ -185,6 +189,24 @@ class TestCannDsaReference(unittest.TestCase):
             torch.testing.assert_close(actual, expected * 4)
             torch.testing.assert_close(again, actual)
         self.assertEqual(self.ops.npu_sparse_lightning_indexer_grad_kl_loss_enhance.call_count, 2)
+
+    def test_existing_auxiliary_scaler_controls_injected_index_gradients(self):
+        """Trainer grad_aux is independent of the main objective's scalar multiplier."""
+        self.ops.npu_sparse_lightning_indexer_grad_kl_loss_enhance.return_value = self._kl_outputs()
+        scale_attribute = "hyper_parallel.components.functional.aux_loss._AuxLossAutoScaler.main_loss_backward_scale"
+        for auxiliary_scale, coefficient in ((1, 0.3), (7, 0.3), (7, 0)):
+            with self.subTest(scale=auxiliary_scale, coefficient=coefficient), patch(scale_attribute):
+                set_aux_loss_scale(torch.tensor(float(auxiliary_scale)))
+                output = torch.ones(3, 2, requires_grad=True)
+                loss = self._loss(coefficient=coefficient)
+                attached = aux_loss_auto_scale(output, loss)
+                gradients = torch.autograd.grad(attached.square().mean() * 13, (output, *self.index))
+                torch.testing.assert_close(attached, output)
+                torch.testing.assert_close(gradients[0], torch.full_like(output, 26 / output.numel()))
+                for actual, multiplier in zip(gradients[1:], (1, 2, 3)):
+                    expected = multiplier * coefficient / 3 * auxiliary_scale
+                    torch.testing.assert_close(actual, torch.full_like(actual, expected))
+                self.assertTrue(all(tensor.grad is None for tensor in self.main))
 
     def test_bad_dimensions_stats_and_normalization_fail_before_launch(self):
         """Unsupported support-matrix entries cannot reach the native operator."""

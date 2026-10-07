@@ -54,7 +54,9 @@ have a separate adapter contract. Unknown IDs and duplicate selections fail.
 `-1`, cross-sequence and future slots do not participate in attention or KL.
 Rows with no legal candidates produce zero output, zero loss and zero gradients,
 with softmax max/LSE `-inf` and sum zero. These are oracle conventions; backend
-empty-row behavior must still be compared on device.
+device tests now show the locked native backward/KL do not implement this
+empty-row contract. See the selected-set matrix below before using the CANN
+reference with externally supplied selections.
 
 FP64 is preserved for gradcheck; other floating-point inputs are promoted to
 FP32. The reference materializes selected KV and index scores and accepts CPU
@@ -165,9 +167,84 @@ CP>1 result, parameter-gradient acceptance or performance measurement. The
 standalone validator still reports measurements pending calibration because it
 does not perform the separate stock comparison itself.
 
-P0 still needs real model wiring/parameter-gradient acceptance, device cases with
-partial selected histories and empty rows, long-context selection/tie behavior,
-a broader BF16 tolerance matrix, training loss-scale integration and real index
-trace profiling. Follow those gates before SHMEM coexistence (P1) or mixed-team
-extraction (P2). CPU mocks validate wiring only; the device result above comes
-from the separately executed enhance and stock primitive comparisons.
+### Selected-set matrix and auxiliary scaling
+
+`mega_dsa_cann_matrix.py` runs five fixed selections on the same packed BF16
+shape, comparing enhance and stock primitives independently with the FP32 oracle.
+It uses the per-fixture calibration rule above and rejects a stock calibration
+whose relative L2 error is at least one (error as large as the reference signal).
+This sanity condition prevents mutually incorrect native results from providing
+a permissive error bound. Empty output/query derivatives/sum must be exactly
+zero, and empty LSE must be `-inf`. Native maximum values are also recorded,
+without equating their opaque representation with the oracle maximum.
+
+| Fixture | Device result |
+| --- | --- |
+| Complete legal history per query | Passed all attention/indexer gradient and loss checks |
+| Only current and sequence-start keys | Failed backward/KL oracle acceptance |
+| All slots `-1` | Forward zero; backward/KL nonfinite; native sum incorrectly one |
+| Empty first query of each packed sequence | Failed; nonfinite backward/KL |
+| Leading holes plus known future/cross-sequence IDs | Compacted forward correct; same partial-set backward/KL failure |
+
+The partial-set output relative L2 was 0.00142, but KL was approximately 0.18357
+instead of the oracle's 0.00001685. Enhance main-query gradient relative L2 was
+16.66 and merge-weight gradient relative L2 was 80.67. Stock reproduced the
+large errors and empty-row failures. These are unsupported native candidate
+counts, not ordinary BF16 rounding.
+
+The locked native SFA backward computes `actualSelectedBlockCount` from
+`min(selectedBlockCount, causal block count)`, without counting non-padding
+indices. KL likewise sets `s2RealSize = min(kSize, s2SparseLen)`; when the causal
+prefix fits K, `mergeKv` is false and it reads dense key storage. Its required
+selection therefore contains exactly `min(K, causal prefix length)` unique
+legal keys per row. Stable compaction does not satisfy this precondition for
+an underfilled or empty row. The current development adapter does not enforce
+this data-dependent precondition yet; use its native indexer-produced complete
+short histories only within the validated fixture. General selected sets and
+empty rows require a separately approved boundary/native change.
+
+The same device matrix reuses the existing `aux_loss_auto_scale` and
+`set_aux_loss_scale`. Complete-history checks pass for `grad_aux=1/7` with
+`loss_coeff=0.3`, and `grad_aux=7` with `loss_coeff=0`. Forward values and all four
+main gradients remain unchanged; only the three indexer gradients receive the
+declared auxiliary multiplier, independently of the main objective multiplier
+of 13. This validates the helper/bridge composition for one fixture, not an
+end-to-end trainer or DP/PP accumulation trajectory.
+
+Run the matrix with the same explicitly activated OPP and device idle gate:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 NPU_WAIT_VISIBLE_DEVICES=0 NPU_WAIT_NUM_CARDS=1 \
+NPU_WAIT_POLL_SECONDS=60 bash ~/doc/npu_wait_and_run.sh \
+  python hyper_parallel/core/multicore/examples/mega_dsa_cann_matrix.py \
+  --output /tmp/mega_dsa_cann_matrix.json
+```
+
+It deliberately exits nonzero for unsupported selections and retains metrics,
+calibration usability, exact empty-row checks, stage and traceback in JSON.
+
+### Offline index traces
+
+`profile_index_trace` accepts an explicitly captured CPU int32 `[Tq,K]` snapshot
+and `DsaBatchMeta`. For query tiles of 16/32/64/128 it records distinct keys,
+owner reference/distinct histograms, owner-local contiguous storage runs,
+adjacent-tile and invocation-wide reuse, deduplicated read counts, remote
+fractions and payload byte estimates. Ownership uses ordered CP indices rather
+than WORLD ranks, and query tiles follow actual Q storage order. Packed/future
+slots are masked; unknown and duplicate IDs fail. Missing local KV is allowed
+because final global selections may name remote tokens.
+
+The device matrix profiles a synthetic enhance-indexer snapshot. It is not a
+real model trace. The function never transfers device tensors implicitly;
+the caller must request capture outside the hot path. Reuse counts describe
+opportunities, not measured cache hits. Byte estimates assume one fetch per
+distinct key per tile; actual transport requests, allocation peaks and buffer
+lifecycles need separate runtime instrumentation.
+
+P0 still needs the candidate-count boundary/native decision above, real model
+wiring and parameter-gradient acceptance, long-context selection/tie behavior,
+a broader BF16 tolerance matrix, end-to-end trainer loss/accumulation validation
+and real model index traces with memory lifecycle measurements. Follow those
+gates before SHMEM coexistence (P1) or mixed-team extraction (P2). CPU mocks
+validate wiring only; the results here come from separately executed enhance
+and stock primitive comparisons.
