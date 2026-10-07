@@ -283,11 +283,100 @@ opportunities, not measured cache hits. Byte estimates assume one fetch per
 distinct key per tile; actual transport requests, allocation peaks and buffer
 lifecycles need separate runtime instrumentation.
 
-The candidate-count boundary is restricted; general underfilled/empty device
-semantics remain unavailable. P0 still needs real model wiring and
-parameter-gradient acceptance, long-context selection/tie behavior,
-a broader BF16 tolerance matrix, end-to-end trainer loss/accumulation validation
-and real model index traces with memory lifecycle measurements. Follow those
-gates before SHMEM coexistence (P1) or mixed-team extraction (P2). CPU mocks
-validate wiring only; the results here come from separately executed enhance
-and stock primitive comparisons.
+### Parameter-preserving HP model boundary
+
+`CannDsaReferenceAttention` replaces an already constructed
+`DeepseekV32DSAAttention` through the existing declarative `replace_module`
+mechanism. It retains the original Parameters, child modules, state dict,
+training state and module aliases. Its constructor does not repeat weight
+fusion, and `make_transforms()` returns no additional checkpoint conversion.
+The inherited input projections, norms, RoPE, key absorption, value
+restoration and output projection remain the model implementation. Only the
+indexer, sparse attention and selected-KL boundary uses the prepared reference.
+
+The replacement requires TP=CP=1 and K=2048, C=512, Dr=64. Each forward must
+receive `dsa_reference=prepared_backend`, with the original attention scale and
+matching layer metadata. Prepared metadata defines packed causal boundaries;
+optional `actual_seq_len` must agree with it. Passing the prepared
+`layout.length_tensor` is checked by identity without reading device values.
+Alternate packed-length aliases are rejected. There is no automatic backend
+construction or fallback. The caller continues to set the existing auxiliary
+loss scale, and `aux_loss_auto_scale` attaches KL exactly once under the
+original training/freeze/coefficient gates.
+
+This targets the existing HP attention class, rather than a Transformers
+module directly. It does not yet supply the prepared backend through an
+end-to-end trainer invocation. The validation fixture constructs the real HP
+class with random smaller projection dimensions; it is not a pretrained
+DeepSeek-V3.2 model or a full-model training result.
+
+CPU FP64 tests compare the absorbed boundary with independently expanded
+per-head K/V dense MLA over complete causal histories. Output, hidden-state
+gradients and all 11 Parameters align, including both slices of the key/value
+up-projection. Separate tests cover replacement identity/state dict/aliases,
+KL-only isolation, freeze/zero-coefficient/evaluation gates, non-reentrant
+checkpoint recomputation and unequal 3/5-token microbatch accumulation against
+the global packed mean. The accumulation test is local; distributed DP/PP and
+AMP behavior remain separate acceptance work. CPU tests explicitly select an
+oracle backend and mock only the optional NPU RoPE primitive.
+
+### BF16 model calibration and held-out failures
+
+`mega_dsa_model_validate.py` measures the actual HP boundary on one NPU with
+packed sequence lengths 3 and 5. It compares output, loss, hidden gradients,
+all 11 Parameters and the separate W_UK/W_UV slices against unabsorbed FP32 MLA
+using identical BF16-quantized weights and inputs. The stock SFA/KL comparison
+uses the same measured enhance selection. This isolates the selected operator
+calibration; it does not establish long-context Top-K or tie equivalence.
+
+The validator runs seven modes per seed: joint objectives with `grad_aux=1/7`,
+KL-only with `grad_aux=7`, zero coefficient, freeze, evaluation and
+non-reentrant checkpoint. Gradient availability must match the oracle exactly.
+The main objective multiplier is 13; auxiliary scaling is controlled separately.
+
+Model calibration uses relative L2, maximum absolute error and normalized
+angular distance `sqrt(2 * (1 - cosine))`. The angular bound uses the same
+1.25 multiplier as L2, with a 1e-4 floor; max-absolute error has a 1e-12 floor.
+Three calibration seeds (20261007/17/18) determine per-quantity, per-objective
+maximum stock-reference error bounds. The bounds are frozen and hashed before
+two held-out seeds (20261027/28). Candidate measurements cannot enlarge the
+bounds; both stock and enhance must satisfy the frozen bounds. Pointwise
+stock comparisons are also retained in the report.
+
+The recorded CANN 9.1 model run **failed acceptance: 22 of 35 cases passed,
+13 failed**. All 21 calibration cases passed the frozen envelope. The first
+held-out seed passed KL-only but failed hidden-gradient max-absolute bounds in
+the six main-objective modes. The second held-out seed failed all seven modes,
+with stock itself exceeding some frozen bounds. Gradient availability and
+the expected isolation pattern passed in all 35 cases. These results do not
+establish model parameter-gradient acceptance or a general BF16 tolerance.
+
+Read-only follow-up diagnosis found one indexer ReLU sign crossing between
+FP32 dot products on device BF16-projected states and full FP32 model-projected
+states in the second held-out fixture. Its `indexer.wq_b.weight` gradients
+matched stock exactly while differing from the FP32 model oracle. This observation
+identifies projection/precision sensitivity; it is not a kernel-internal
+activation trace or proof that every failed quantity has the same cause.
+Earlier cosine-margin and pointwise max-absolute failures remain separate
+evidence. The native source and payload were not changed for this model round.
+
+Run the model validator with the same activated OPP and device idle gate:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 NPU_WAIT_VISIBLE_DEVICES=0 NPU_WAIT_NUM_CARDS=1 \
+NPU_WAIT_POLL_SECONDS=60 bash ~/doc/npu_wait_and_run.sh \
+  python hyper_parallel/core/multicore/examples/mega_dsa_model_validate.py \
+  --output /tmp/mega_dsa_model_validation.json
+```
+
+The validator preserves measurements and returns a nonzero exit on failed
+acceptance. Its captured selections come from real HP projections of random
+fixtures, so their offline traces are not trained-model locality evidence.
+
+The candidate-count boundary remains restricted; general underfilled/empty
+device semantics remain unavailable. P0 still needs model BF16 calibration
+that generalizes to held-out inputs, parameter-gradient device acceptance,
+long-context selection/tie checks, end-to-end trainer backend plumbing and
+DP/PP/AMP accumulation validation, and trained-model index traces with memory
+lifecycle measurements. Follow those gates before SHMEM coexistence (P1) or
+mixed-team extraction (P2).
