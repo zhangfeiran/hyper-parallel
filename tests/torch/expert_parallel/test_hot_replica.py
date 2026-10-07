@@ -143,3 +143,15 @@ def test_pull_static_runtime_streams() -> None:
     Expectation: Match FP32 reference and reuse one image per direction.
     """
     torchrun_case(_WORKER, "test_pull_static_runtime_streams_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_device_route_validation() -> None:
+    """
+    Feature: Collective route validation
+    Description: Inject one rank's invalid or duplicate IDs with CPU and device planners.
+    Expectation: All ranks reject bad routes and recover for valid routes using None and WORLD groups.
+    """
+    torchrun_case(str(Path(__file__).with_name("_test_replica_boundaries.py")),
+                  "test_device_route_validation_npu", num_proc=4)
