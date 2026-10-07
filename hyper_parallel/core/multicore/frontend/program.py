@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping
 
 import torch
 
+from hyper_parallel.core.multicore.compiler.pipeline import compile_worker_pipeline
 from hyper_parallel.core.multicore.frontend.parser import (
     Helper,
     Parser,
@@ -30,13 +31,18 @@ from hyper_parallel.core.multicore.frontend.parser import (
 )
 from hyper_parallel.core.multicore.frontend.symbols import frozen
 from hyper_parallel.core.multicore.ir.program import ProgramIR, Value
-from hyper_parallel.core.multicore.ir.schedule import TaskDAG, WorkerPipeline
+from hyper_parallel.core.multicore.ir.schedule import (
+    HardwareSpec,
+    TaskDAG,
+    WorkerPipeline,
+)
 from hyper_parallel.core.multicore.language.types import TensorType
 from hyper_parallel.core.multicore.primitives.gate import TORCH_DTYPES
 from hyper_parallel.core.multicore.primitives.registry import (
     REGISTRY,
     PrimitiveRegistry,
 )
+from hyper_parallel.core.multicore.runtime.plan import KernelPlan
 
 
 def _capture(function: Callable) -> Source:
@@ -71,8 +77,8 @@ def _source(text, filename, first_line, symbols):
 class Program:
     """A captured DSL function, lowered without executing its Python body.
 
-    This first frontend produces semantic IR and CPU references only. Schedule
-    selection records intent; it does not produce RuntimeConfig or native code.
+    The Gate WorkerPipeline backend produces isolated legacy runtime images.
+    Native tiling, materialization and execution require a matching family payload.
     """
 
     def __init__(
@@ -110,6 +116,31 @@ class Program:
         static = {**self.constants, **constants}
         declared = self.signature if signature is None else dict(signature)
         return Parser(self.source, self.registry).lower(static, declared)
+
+    def plan(
+        self,
+        signature: Mapping[str, int] | None = None,
+        topology: HardwareSpec | None = None,
+        **constants: object,
+    ) -> KernelPlan:
+        """Compile a supported Gate Route program into a host compatibility plan.
+
+        Args:
+            signature: Positive sizes for exactly the symbolic input dimensions.
+            topology: Available AIV workers, supplied independently of computation.
+            **constants: Declared constexpr specializations, such as k and scale.
+
+        Returns:
+            A source-mapped host plan with normal/profiled native descriptor images.
+        """
+        if self.schedule is None or isinstance(self.schedule, TaskDAG):
+            raise ValueError("Only explicit WorkerPipeline Gate compatibility plans are implemented")
+        ir = self.lower(**constants)
+        for operation in ir.operations:
+            canonical = REGISTRY.schema(operation.logical_name, operation.version)
+            if self.registry.schema(operation.logical_name, operation.version) is not canonical:
+                raise ValueError("Gate compatibility plans require canonical registered primitive schemas")
+        return compile_worker_pipeline(ir, self.schedule, dict(signature or {}), topology or HardwareSpec())
 
     def explain(self, **constants: object) -> str:
         """Describe schedule intent and dump the source-mapped semantic IR."""
@@ -232,6 +263,7 @@ def from_source(
     filename: str = "<source>",
     first_line: int = 1,
     registry: PrimitiveRegistry = REGISTRY,
+    schedule: WorkerPipeline | TaskDAG | None = None,
 ) -> Program:
     """Capture explicit source for notebooks or generated functions without eval.
 
@@ -243,6 +275,7 @@ def from_source(
         filename: Source identity for diagnostics.
         first_line: Original 1-based starting line.
         registry: Trusted primitive registry used for lowering and interpretation.
+        schedule: Optional execution mode for compatibility plan generation.
 
     Returns:
         A program ready for semantic lowering or CPU interpretation.
@@ -252,4 +285,4 @@ def from_source(
     environment = dict(symbols or {})
     environment.setdefault("static_range", static_range)
     captured = _source(source, filename, first_line, environment)
-    return Program(captured, signature=signature, constants=constants, registry=registry)
+    return Program(captured, signature=signature, constants=constants, registry=registry, schedule=schedule)

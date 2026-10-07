@@ -1,0 +1,102 @@
+{
+  "sequences": {
+    "backward": {
+      "images": {
+        "normal": {
+          "bytes": 34112,
+          "sha256": "f9d9927d1cb48470780160aca9ca308178b7b7ca5fd562cee62c237e7debaed1"
+        },
+        "profiled": {
+          "bytes": 34112,
+          "sha256": "5af581e649935e238c636f7fda98ae259a4c010e9bbe4584980d80b601276656"
+        }
+      },
+      "kernel_name": "HyperMegaGateRouteGrad",
+      "stage_names": [
+        "MulsScaleGrad",
+        "BroadcastDenominator",
+        "Neg",
+        "DivSelected",
+        "DivSelectedRatio",
+        "MulCross",
+        "DivDirect",
+        "ReduceSum",
+        "BroadcastRowSum",
+        "AddSelectedGrad",
+        "ZerosLike"
+      ],
+      "task_types": [
+        "TASK_GATE_GRAD_MULS_SCALE",
+        "TASK_GATE_GRAD_BROADCAST_DENOMINATOR",
+        "TASK_GATE_GRAD_NEG",
+        "TASK_GATE_GRAD_DIV_SELECTED",
+        "TASK_GATE_GRAD_DIV_SELECTED_RATIO",
+        "TASK_GATE_GRAD_MUL_CROSS",
+        "TASK_GATE_GRAD_DIV_DIRECT",
+        "TASK_GATE_GRAD_REDUCE_SUM",
+        "TASK_GATE_GRAD_BROADCAST_ROW_SUM",
+        "TASK_GATE_GRAD_ADD_SELECTED",
+        "TASK_GATE_GRAD_ZEROS"
+      ]
+    },
+    "backward_k1": {
+      "images": {
+        "normal": {
+          "bytes": 34112,
+          "sha256": "a40f722e7e2dd855e640924019a53220e97889df4393b7bb2b2ef773ef08616e"
+        },
+        "profiled": {
+          "bytes": 34112,
+          "sha256": "bedd9aa63ec40d7c959e599e3edf6d259b66a17342cce8e03ce7bb4bb8c8c69b"
+        }
+      },
+      "kernel_name": "HyperMegaGateRouteGrad",
+      "stage_names": [
+        "MulsScaleGrad",
+        "ZerosLike"
+      ],
+      "task_types": [
+        "TASK_GATE_GRAD_MULS_SCALE",
+        "TASK_GATE_GRAD_ZEROS"
+      ]
+    },
+    "forward": {
+      "images": {
+        "normal": {
+          "bytes": 34112,
+          "sha256": "34cd1bf1f4e225d38c06de3cf12baff38749d4e08d20c10f7e1a5812c6075ca8"
+        },
+        "profiled": {
+          "bytes": 34112,
+          "sha256": "bb2eef62b090da5e29ea986e91990391a1e02b20db5e102e23942f741999a275"
+        }
+      },
+      "kernel_name": "HyperMegaGateRoute",
+      "stage_names": [
+        "Softplus",
+        "Sqrt",
+        "AddBias",
+        "TopK",
+        "Gather",
+        "ReduceSum",
+        "AddEpsilon",
+        "Div",
+        "MulScale",
+        "CastIndex"
+      ],
+      "task_types": [
+        "TASK_GATE_SOFTPLUS",
+        "TASK_GATE_SQRT",
+        "TASK_GATE_ADD_BIAS",
+        "TASK_GATE_TOPK",
+        "TASK_GATE_GATHER",
+        "TASK_GATE_REDUCE_SUM",
+        "TASK_GATE_ADD_EPSILON",
+        "TASK_GATE_DIV",
+        "TASK_GATE_MUL_SCALE",
+        "TASK_GATE_CAST_INDEX"
+      ]
+    }
+  },
+  "source_revision": "890a00ac71226594a7c69c4980ad7ac50bd8896c"
+}

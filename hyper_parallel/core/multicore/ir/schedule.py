@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from hyper_parallel.core.multicore.ir.program import SourceSpan
+
 
 @dataclass(frozen=True)
 class WorkerPipeline:
@@ -40,3 +42,52 @@ class TaskDAG:
     def __post_init__(self):
         if not isinstance(self.policy, str) or not self.policy:
             raise ValueError("TaskDAG requires an explicit policy name")
+
+
+@dataclass(frozen=True)
+class HardwareSpec:
+    """Available AIV workers supplied by the caller; no device probing at compile time."""
+
+    available_aiv_workers: int = 48
+
+    def __post_init__(self):
+        if type(self.available_aiv_workers) not in (int,) or not 0 < self.available_aiv_workers < 1 << 32:
+            raise ValueError("available_aiv_workers must be a positive uint32 integer")
+
+
+@dataclass(frozen=True)
+class RowPartition:
+    """Native launched worker's fixed row interval, including empty tail workers."""
+
+    worker_id: int
+    first_row: int
+    row_count: int
+
+
+@dataclass(frozen=True)
+class PipelineStage:
+    """A logical stage with source provenance, before family-local numeric binding."""
+
+    logical_name: str
+    display_name: str
+    source_spans: tuple[SourceSpan, ...]
+    reason: str = "native_primitive"
+
+
+@dataclass(frozen=True)
+class PipelineScheduleIR:
+    """Broadcast descriptor sequence and fixed worker row ownership."""
+
+    stages: tuple[PipelineStage, ...]
+    partitions: tuple[RowPartition, ...]
+    rows_per_worker: int
+    worker_slot_capacity: int = 48
+    execution_mode: str = "broadcast_aiv_pipeline"
+
+    def simulate(self) -> tuple[tuple[int, int, int, int], ...]:
+        """Enumerate each launched worker's ordered stages without global event waits."""
+        return tuple(
+            (partition.worker_id, stage, partition.first_row, partition.row_count)
+            for partition in self.partitions
+            for stage in range(len(self.stages))
+        )

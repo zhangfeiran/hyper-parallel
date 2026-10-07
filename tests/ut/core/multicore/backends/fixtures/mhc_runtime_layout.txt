@@ -1,0 +1,168 @@
+/**
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+#include <cstdint>
+#include <cstddef>
+namespace MulticoreRuntime {
+
+constexpr uint32_t MAX_TENSOR_DIMS = 4;
+constexpr uint32_t MAX_INPUTS_PER_TASK = 4;
+constexpr uint32_t MAX_OUTPUTS_PER_TASK = 4;
+
+constexpr uint32_t MIN_EVENT_CAPACITY = 1024;
+constexpr uint32_t NUM_WORKERS_VECTOR = 48;
+constexpr uint32_t NUM_WORKERS_CUBE = 24;
+constexpr uint32_t MAX_GROUP_LIST = 512;
+constexpr uint32_t MAX_EXPERT_NUM_PER_RANK = 16;
+constexpr uint32_t ATOMIC_ADD_VALUE_LEN = 8;
+
+constexpr uint32_t GROUP_LIST_CACHE_LINE_BYTES = 128;
+static_assert(MAX_EXPERT_NUM_PER_RANK * sizeof(int64_t) % GROUP_LIST_CACHE_LINE_BYTES == 0,
+              "Grouped-list worker stride must preserve cache-line alignment.");
+static_assert((GROUP_LIST_CACHE_LINE_BYTES - 1) + NUM_WORKERS_CUBE * MAX_EXPERT_NUM_PER_RANK * sizeof(int64_t) <=
+                MAX_GROUP_LIST * sizeof(int64_t),
+              "Grouped-list scratch slots exceed the runtime-config buffer.");
+
+constexpr uint32_t UB_32B_ALIGN = 32;
+constexpr uint32_t DATA_CACHE_LINE_SIZE = 64;
+constexpr uint32_t EXP_TOKEN_COUNT_FLAG_CNT = UB_32B_ALIGN / sizeof(int32_t);  // 8
+constexpr uint32_t DISPATCH_TOKEN_UB_SIZE = 3 * 32;
+
+constexpr uint32_t UINT32_T_SIZE = sizeof(uint32_t);
+constexpr uint32_t INT32_T_SIZE = sizeof(int32_t);
+constexpr uint32_t INT64_T_SIZE = sizeof(int64_t);
+
+constexpr uint32_t EVENT_INVALID_ID = 0xFFFFFFFF;
+constexpr uint32_t PROFILE_DESC_INVALID_ID = 0xFFFFFFFF;
+constexpr uint64_t RUNTIME_ADDRESS_SPACE_BYTES = 1ULL << 32;
+constexpr uint32_t RUNTIME_CAPACITY_ALIGNMENT = 16;
+constexpr uint32_t TASK_AICORE_INDEX_TYPE_COUNT = 3;
+
+using TaskId = uint32_t;
+
+enum class TaskAiCoreType : uint32_t {
+  TASK_AICORE_INVALID = 0,
+  TASK_AICORE_CUBE = 1,
+  TASK_AICORE_VECTOR = 2,
+  TASK_AICORE_MIX = 3,
+};
+
+enum class TaskType : uint32_t {
+  TASK_TERMINATE = 0,
+  TASK_BEGIN_TASK_GRAPH = 10,
+  // compute task starts from 100
+  TASK_ADD_CUSTOM = 101,
+  TASK_SWI_GLU = 102,
+  TASK_MATMUL = 103,
+  TASK_GROUPED_MATMUL = 104,
+  TASK_SHMEM_PUT_MEM_SIGNAL = 105,
+  TASK_SWI_GLU_GRAD = 106,
+  TASK_MHC_POST = 107,
+  TASK_MHC_NORM_CAST = 108,
+  TASK_MHC_PROJECTION = 109,
+  TASK_MHC_MAPPING = 110,
+  TASK_RMS_NORM = 111,
+  TASK_MHC_INPUT_MIX = 112,
+  TASK_RMS_NORM_GRAD = 113,
+  TASK_MHC_GRAD_PREV_A = 114,
+  TASK_MHC_GRAD_MAPPING = 115,
+  TASK_MHC_GRAD_PHI_RMS = 116,
+  TASK_MHC_GRAD_PREV_X_AND_POST = 117,
+  TASK_MHC_POST_GRAD = 118,
+  TASK_MHC_GRAD_PREV_A_AND_MAPPING = 119,
+};
+
+enum class EventType : uint32_t {
+  EVENT_EMPTY = 900,
+  EVENT_LAUNCH_TASKS = 901,
+  EVENT_LAUNCH_MASSIVE_TASKS = 902,
+  EVENT_LAUNCH_DEPENDENT_TASKS = 903,
+  EVENT_END_OF_TASK_GRAPH = 910,
+  EVENT_TERMINATION = 911,  // TASK_TERMINATE
+  EVENT_INVALID = 999,
+};
+
+static_assert(sizeof(TaskAiCoreType) == sizeof(uint32_t), "TaskAiCoreType must remain uint32_t in runtime data.");
+static_assert(sizeof(TaskType) == sizeof(uint32_t), "TaskType must remain uint32_t in runtime data.");
+static_assert(sizeof(EventType) == sizeof(uint32_t), "EventType must remain uint32_t in runtime data.");
+
+struct TensorDesc {
+  uint32_t tensor_type;
+  uint32_t num_dims;
+  uint32_t dim[MAX_TENSOR_DIMS];
+  uint32_t stride[MAX_TENSOR_DIMS];
+  uint32_t data_type;
+  uint32_t input_position;
+  uint32_t base_ptr_offset;
+  uint32_t transpose_flag;
+  uint32_t dynamic_shape;
+  uint32_t dynamic_dim;
+};
+
+struct EventDesc {
+  EventType event_type;
+  uint32_t num_triggers;
+  uint32_t first_task_id, last_task_id;
+};
+
+enum struct DynamicType : uint32_t {
+  DYNAMIC_EMPTY = 0,
+  DYNAMIC_DSV3_MOE = 101,
+};
+
+struct DynamicData {
+  DynamicType dynamic_type;
+  uint32_t dynamic_input_position;
+  uint32_t dynamic_group_size;
+  uint32_t dynamic_max_seq_len;
+};
+
+struct TaskDesc {
+  TaskType task_type;
+  TaskAiCoreType task_aicore_type;
+  uint32_t num_inputs, num_outputs;
+  uint32_t trigger_event;
+  uint32_t dependent_event;
+  TensorDesc inputs[MAX_INPUTS_PER_TASK];
+  TensorDesc outputs[MAX_OUTPUTS_PER_TASK];
+  uint32_t tiling_data_position;
+  uint32_t tiling_data_offset;
+  uint32_t task_index;
+  uint32_t task_split_num;
+  uint32_t task_split_value;
+  uint32_t extra_value_0;
+  uint32_t extra_value_1;
+  uint32_t extra_value_2;
+  uint32_t profile_desc_id;
+  uint32_t profile_owner_id;
+};
+
+struct ReadyHandshakeMeta {
+  uint32_t ready_event;
+};
+
+struct RuntimeHeader {
+  uint32_t task_num;
+  uint32_t num_workers;
+  uint32_t task_capacity;
+  uint32_t event_capacity;
+  uint32_t ready_event;
+  uint32_t cycle_profiling_enabled;
+  uint32_t aic_profile_record_capacity;
+  uint32_t aiv_profile_record_capacity;
+  uint32_t padding[8];
+};
+
+static_assert(sizeof(RuntimeHeader) == 64);
+static_assert(sizeof(TensorDesc) == 64);
+static_assert(sizeof(TaskDesc) == 576);
+
+
+}

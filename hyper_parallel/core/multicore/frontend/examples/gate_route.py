@@ -52,6 +52,8 @@ def main() -> None:
         print(_route.explain(k=count, scale=2.5))
         weights, indices = _route.interpret(logits, bias, count, 2.5)
         print(f"k={count}, weights={weights.tolist()}, indices={indices.tolist()}")
+        plan = _route.plan({"T": 2, "E": 4}, mc.HardwareSpec(48), k=count, scale=2.5)
+        print(plan.explain())
 
 
 if __name__ == "__main__":

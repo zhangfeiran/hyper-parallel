@@ -1,0 +1,1832 @@
+{
+  "design_revisions": {
+    "gate": "890a00ac71226594a7c69c4980ad7ac50bd8896c",
+    "little_kernel": "d9c29909d7fcd1202d3f676e84c9c3d456308ca2",
+    "mhc": "979e2a9ac913413e361f4fc2dd9987766af8ddb4",
+    "moe": "befaa01069e997d511987feec82464c5f4549b95"
+  },
+  "families": {
+    "gate": {
+      "constants": {
+        "ATOMIC_ADD_VALUE_LEN": 8,
+        "MIN_EVENT_CAPACITY": 1024,
+        "NUM_WORKERS_CUBE": 24,
+        "NUM_WORKERS_VECTOR": 48
+      },
+      "dependencies": {
+        "ops_nn": {
+          "commit": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+          "git_archive_tar_sha256": "20e717c1004de51bc2de594509ffde1a2cf84911a20fc8ab610bb4ec508fe14d",
+          "patches": [
+            {
+              "path": "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch",
+              "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks",
+              "sha256": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d"
+            }
+          ],
+          "repository": "https://gitcode.com/cann/ops-nn.git",
+          "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
+          "tag_object": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+          "tree": "52694bc828b50c83f37781b9d4a378466410f671",
+          "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+          "version": "v9.1.0.pre"
+        },
+        "ops_transformer": {
+          "commit": "121f37def44062491173b5ccf34bddb500b95e47",
+          "git_archive_tar_sha256": "00c8751c369b32373a3e77bce7f50efa1e239a1b2994db0cf79e07c85823a30d",
+          "patches": [
+            {
+              "path": "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch",
+              "purpose": "expose the selected grouped-matmul path as an inline building block",
+              "sha256": "53341da1cb6d8ca1a0bb3a16deaff8a67a2d01a4525fac8a8e529535330e2d9d"
+            }
+          ],
+          "repository": "https://gitcode.com/cann/ops-transformer.git",
+          "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
+          "tag_object": "121f37def44062491173b5ccf34bddb500b95e47",
+          "tree": "4c0ee7f90a7b91967c3cfb782745a70f92b20fe6",
+          "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+          "version": "v9.1.0.pre"
+        },
+        "shmem": {
+          "commit": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
+          "fetch_ref": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
+          "git_archive_tar_sha256": "c3f207178b6a4f020bc1f98187ca703814e4876064b83e7416010f2f379385f9",
+          "packaging_policy": {
+            "private_sonames": [
+              "libhyper_parallel_shmem.so",
+              "libhyper_parallel_shmem_utils.so"
+            ],
+            "reason": "avoid collision with framework-provided libshmem.so in one process",
+            "upstream_source_modified": false
+          },
+          "patches": [],
+          "repository": "https://gitcode.com/cann/shmem.git",
+          "resolution": "exact upstream commit supporting CANN 9.1 and 9.2 native builds",
+          "tag_object": null,
+          "tree": "dec6d50ff39113fe892cdc3d52d35e56b24cd0c0",
+          "version": "d30702bb55d0"
+        }
+      },
+      "family": "gate",
+      "pipelines": {
+        "backward": {
+          "images": {
+            "normal": {
+              "bytes": 34112,
+              "sha256": "f9d9927d1cb48470780160aca9ca308178b7b7ca5fd562cee62c237e7debaed1"
+            },
+            "profiled": {
+              "bytes": 34112,
+              "sha256": "5af581e649935e238c636f7fda98ae259a4c010e9bbe4584980d80b601276656"
+            }
+          },
+          "kernel_name": "HyperMegaGateRouteGrad",
+          "stage_names": [
+            "MulsScaleGrad",
+            "BroadcastDenominator",
+            "Neg",
+            "DivSelected",
+            "DivSelectedRatio",
+            "MulCross",
+            "DivDirect",
+            "ReduceSum",
+            "BroadcastRowSum",
+            "AddSelectedGrad",
+            "ZerosLike"
+          ],
+          "task_types": [
+            "TASK_GATE_GRAD_MULS_SCALE",
+            "TASK_GATE_GRAD_BROADCAST_DENOMINATOR",
+            "TASK_GATE_GRAD_NEG",
+            "TASK_GATE_GRAD_DIV_SELECTED",
+            "TASK_GATE_GRAD_DIV_SELECTED_RATIO",
+            "TASK_GATE_GRAD_MUL_CROSS",
+            "TASK_GATE_GRAD_DIV_DIRECT",
+            "TASK_GATE_GRAD_REDUCE_SUM",
+            "TASK_GATE_GRAD_BROADCAST_ROW_SUM",
+            "TASK_GATE_GRAD_ADD_SELECTED",
+            "TASK_GATE_GRAD_ZEROS"
+          ]
+        },
+        "backward_k1": {
+          "images": {
+            "normal": {
+              "bytes": 34112,
+              "sha256": "a40f722e7e2dd855e640924019a53220e97889df4393b7bb2b2ef773ef08616e"
+            },
+            "profiled": {
+              "bytes": 34112,
+              "sha256": "bedd9aa63ec40d7c959e599e3edf6d259b66a17342cce8e03ce7bb4bb8c8c69b"
+            }
+          },
+          "kernel_name": "HyperMegaGateRouteGrad",
+          "stage_names": [
+            "MulsScaleGrad",
+            "ZerosLike"
+          ],
+          "task_types": [
+            "TASK_GATE_GRAD_MULS_SCALE",
+            "TASK_GATE_GRAD_ZEROS"
+          ]
+        },
+        "forward": {
+          "images": {
+            "normal": {
+              "bytes": 34112,
+              "sha256": "34cd1bf1f4e225d38c06de3cf12baff38749d4e08d20c10f7e1a5812c6075ca8"
+            },
+            "profiled": {
+              "bytes": 34112,
+              "sha256": "bb2eef62b090da5e29ea986e91990391a1e02b20db5e102e23942f741999a275"
+            }
+          },
+          "kernel_name": "HyperMegaGateRoute",
+          "stage_names": [
+            "Softplus",
+            "Sqrt",
+            "AddBias",
+            "TopK",
+            "Gather",
+            "ReduceSum",
+            "AddEpsilon",
+            "Div",
+            "MulScale",
+            "CastIndex"
+          ],
+          "task_types": [
+            "TASK_GATE_SOFTPLUS",
+            "TASK_GATE_SQRT",
+            "TASK_GATE_ADD_BIAS",
+            "TASK_GATE_TOPK",
+            "TASK_GATE_GATHER",
+            "TASK_GATE_REDUCE_SUM",
+            "TASK_GATE_ADD_EPSILON",
+            "TASK_GATE_DIV",
+            "TASK_GATE_MUL_SCALE",
+            "TASK_GATE_CAST_INDEX"
+          ]
+        }
+      },
+      "runtime_abi_version": 1,
+      "scratch_policy": "fixed_512_int64",
+      "source_hashes": {
+        "hyper_parallel/core/multicore/_build/__init__.py": "5f9d6a858baf557b1c18b33bc12aac092a8c97fe111b03843a46066435c1528a",
+        "hyper_parallel/core/multicore/_build/assemble_multicore_source.py": "b6f44d955bb23961a813b59771c4eedf047577ed2c8baaad1bc4c9736fcf251e",
+        "hyper_parallel/core/multicore/_build/dependencies.lock.json": "7c84c75f24e60bbb080edec1bf544c55acf3d28a488772892819ab3ee0bc12da",
+        "hyper_parallel/core/multicore/_build/merge_multicore_vendors.py": "9019da0e236ce8da02979169343007eb3c0972a33bb636f4c937d23029475b03",
+        "hyper_parallel/core/multicore/_build/prepare_dependencies.py": "f15ee36c9ec7ad1a559658eb20d1bf41649869b8683c5b3c6c358e2c4c114a05",
+        "hyper_parallel/core/multicore/modules/mega_gate/__init__.py": "518560306c2dc915a8b7eaf8dcd8afaa31223a6987369d42b991ee7dc89c1d28",
+        "hyper_parallel/core/multicore/modules/mega_gate/function.py": "993a2e2bdf962e01eb89369d9aae72037e5f677fbee9e01c24e5f44e5999ab05",
+        "hyper_parallel/core/multicore/modules/mega_gate/module.py": "70c4a3a4164cf3929054fe948986e4dc6c6c7ea34c328c740b5f4532788c5f47",
+        "hyper_parallel/core/multicore/modules/mega_gate/plan.py": "d7e9893c8087d2136745a6592732b3b96085d4b3eadcee6ac5537d2e1f5cb51b",
+        "hyper_parallel/core/multicore/modules/mega_gate/profiling.py": "edd34e8172d2db4371985ca1126a3c42fda44599891267bd67ac24c4f57cef7f",
+        "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch": "53341da1cb6d8ca1a0bb3a16deaff8a67a2d01a4525fac8a8e529535330e2d9d",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/CMakeLists.txt": "47c20c91876931d7b76685c23819ad1dda167f3c8810cf350cd9e6d2c9c1140b",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_graph/CMakeLists.txt": "e87bc9c7b62793d71e55b3d2fa5bf3ff5ca1ed93535229bf9cb2346c4655b481",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_graph/hyper_mega_gate_route_proto.h": "8be0007071efa51cf7a8c7ea1229e958b4b2fddcb527b60ebc7406b0969f76dc",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/CMakeLists.txt": "4f0e89049ca383e320836b27e673036addbaf988bbfbc16231ba08cbcc8f9f15",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/config/ascend910_93/hyper_mega_gate_route_binary.json": "7dd91eeb01fbf0fd735f57896e99d21404fef5d55ce9592fffe7edec081ca835",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/config/ascend910_93/hyper_mega_gate_route_simplified_key.ini": "9bbaacc394ee20c94e02c0dd5f4c2f64a88ea76a08bfd53d33ea50b5e9c29f66",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/config/ascend910b/hyper_mega_gate_route_binary.json": "7dd91eeb01fbf0fd735f57896e99d21404fef5d55ce9592fffe7edec081ca835",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/config/ascend910b/hyper_mega_gate_route_simplified_key.ini": "9bbaacc394ee20c94e02c0dd5f4c2f64a88ea76a08bfd53d33ea50b5e9c29f66",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/hyper_mega_gate_route_def.cpp": "3225a27d8e4dc338bea56008321943e4ada0dc88bfe2acb1e137184d097e62f4",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/hyper_mega_gate_route_infershape.cpp": "363dac3bf1790beff0dd7d0ebc6233034bb63a6fb67d8809b50bd5b3117a8f5f",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/hyper_mega_gate_route_tiling.cpp": "db1bdcb5a90456873ae5dcbf89cf9fdb2ada8b201219a740365ac7ccca3d1f81",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/hyper_mega_gate_route_tiling.h": "3b39f2fd570047b243a5d2befdd73fcab55d66d5bfb4016c5d8afe6b75a7abe9",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/op_api/aclnn_hyper_mega_gate_route.cpp": "1fdc1f059e453253dd41f7250ce2046ef70fff74ee8a607ca4fb2b307eb74697",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/op_api/aclnn_hyper_mega_gate_route.h": "2fe5001c35b29b6eded84beac7045456cc457be68e60c529aef6526eb41fb2df",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/op_api/hyper_mega_gate_route.cpp": "3b7efaee6ab8d2fa7333dfce7d3353ab038906edd13baa5ed3387cf8d6a39d1a",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/op_api/hyper_mega_gate_route.h": "e804f75693396007071e275b7d72da0731dc858b0932e6869935738da11d2211",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_kernel/hyper_mega_gate_route.cpp": "c1fd7aea4567e380fa00cf432b0d87a1b2c5f783e64bdc91296f504e26c0d159",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_kernel/route_pipeline.h": "d4510300eeaf7451e169e7fdd3ff9086ce73b8a42d228a7a1a9645d440fcdfcb",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/CMakeLists.txt": "47c20c91876931d7b76685c23819ad1dda167f3c8810cf350cd9e6d2c9c1140b",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_graph/CMakeLists.txt": "e87bc9c7b62793d71e55b3d2fa5bf3ff5ca1ed93535229bf9cb2346c4655b481",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_graph/hyper_mega_gate_route_grad_proto.h": "0c1df45c0a2ca2eb4624d5eab88facc76a4a38b223738e38db5030a919f90393",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/CMakeLists.txt": "a1bf39deefa5b48fd818524ddcc817b6c5592174085aaac701de0f8ede12a64f",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/config/ascend910_93/hyper_mega_gate_route_grad_binary.json": "1df12bb4d65ad574361d0861f41903ec7dfc185e34638ac8c04d5b82e9116213",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/config/ascend910_93/hyper_mega_gate_route_grad_simplified_key.ini": "001677f52bfe6754ab4db6b936ca49e45df7a0726f1267b8eb4a2b05cfa70d12",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/config/ascend910b/hyper_mega_gate_route_grad_binary.json": "1df12bb4d65ad574361d0861f41903ec7dfc185e34638ac8c04d5b82e9116213",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/config/ascend910b/hyper_mega_gate_route_grad_simplified_key.ini": "001677f52bfe6754ab4db6b936ca49e45df7a0726f1267b8eb4a2b05cfa70d12",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_def.cpp": "b4448e1cce96e7d09f7f05dc058f351b66401cedd351e43a68c5ed972ad185ca",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_infershape.cpp": "56cab050d18f2019a5741e0f9b1c1deccdd9a2441c0b7fde441ed6ca8299798e",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_tiling.cpp": "ae8f8fae0338a950f7b7d3c9903bd186b00d700bd9ed77ccad43ddaacee6ded6",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_tiling.h": "e1aa41b12f018e13b986514ce11b19d94573b5732d3999862234eb16b2fc82ca",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/aclnn_hyper_mega_gate_route_grad.cpp": "3ac7f126483b7c5a23a68f57a4ecc4cbf5fd4097b841fc491dd1c3a9472c760b",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/aclnn_hyper_mega_gate_route_grad.h": "4939a7adbaa72f7ad4fbe1b6ae4e124684a8063644b8ed5d3b06de255c1223f7",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/hyper_mega_gate_route_grad.cpp": "c71269b19fd417e151ffed93870f2a4a476c5867b9d7653650bade3c426e753f",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/hyper_mega_gate_route_grad.h": "1580da6e66aadbe46590aa15b625489ac85b0ac87024c19d352a6c80c240f0a1",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/hyper_mega_gate_route_grad_post.cpp": "4a8344ffba97d1ebd3f360ec0f25a76e75371723cfacfeb52cbd298fb47f6501",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/hyper_mega_gate_route_grad_post.h": "9a5e31d78ba010ec1139be274a5e0668405a3972ca6662c5b44695077b2b9d3d",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_kernel/hyper_mega_gate_route_grad.cpp": "e22a4d9a7ae8f67d6d4f44690f2f36f1cb36aaba5c60590a77134115a663df99",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_kernel/route_grad_pipeline.h": "f141bb905596662772a6792381896fa2fb9599953d7992f80d9408a91c67ea74",
+        "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_kernel/route_grad_runtime.h": "21ef9d3fc78161a83a027e70c085097363e53c0457248fb75bc43eaf30fb1d8a",
+        "hyper_parallel/core/multicore/ops/runtime/aiv_pipeline_worker.h": "ee5ee035d138273da2ea682ef168537ab7327c609ba74ee4349d4f152d710b7c",
+        "hyper_parallel/core/multicore/ops/runtime/cycle_trace_recorder.h": "6223a7813d7638aa5940a09ca96ded6e2b9d1fa81495c46940bba98b4f99b5fd",
+        "hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp": "f19bf7039b935f566aba844ae7adc09b12e4edae6279f02d6551c0cfdf2da85a",
+        "hyper_parallel/core/multicore/ops/runtime/worker_kernel.h": "6579ed3097cbee166e82335b9fdca08d3719e626415fac2834b172a1e885b76b",
+        "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d",
+        "hyper_parallel/core/multicore/profiler/__init__.py": "2c94a8f00f2a2529b987d662a85ba2c6358a12fcc15f5a103688dd6596d95fa6",
+        "hyper_parallel/core/multicore/profiler/mega_gate_trace.py": "f2fa54983b2afd410a379c9a655af976ff84bbc23145780241c26f92e98dacb5",
+        "hyper_parallel/core/multicore/profiler/profiler.py": "dd0de63c882dcf9a8444d808c1e7dc939c98cf833ed2a1e82c45b85e285c3d05",
+        "hyper_parallel/core/multicore/profiler/profiling.py": "733446ff16663240f1b1894bcdef648b48151d11fdf3cb38d92c3df780f8b923",
+        "hyper_parallel/core/multicore/profiler/trace_merger.py": "715d0c6f34623950615236aeae4a44cd64a567894f787871f604a01f9698cc41",
+        "hyper_parallel/core/multicore/scheduler/__init__.py": "4c3ad9b34e3cb241b77ed90ff6cb4b8b37c7099edcb2bd87d7112a1ba857b423",
+        "hyper_parallel/core/multicore/scheduler/allocator.py": "e5279310f71ce2376b52bd35a5463a4e9c42ebb1e76759a129de24ebb585b809",
+        "hyper_parallel/core/multicore/scheduler/builder.py": "22a3fe043c37222a2543aca31f30d75ac2351a99ae8ec5ad671f534ff940a095",
+        "hyper_parallel/core/multicore/scheduler/config.py": "3f1e8dc86491ee2803fbef598f756f396e6b8546dfa6d10d718446cb248da6cc",
+        "hyper_parallel/core/multicore/scheduler/graph.py": "4a0884f5b735c81f90734dd086f3ebace51fe96e8ab0c6589d16cd0eb424401b",
+        "hyper_parallel/core/multicore/scheduler/runtime.py": "c56374b1b7b2317eed5aecb2637c3646b26932c00267eb32cabe537b68c58b48",
+        "hyper_parallel/core/multicore/scheduler/scheduler.py": "614f7a7e08b3ac2446b3be5fc1f4228925a7f9aa4312935c566c643f346f30a9"
+      },
+      "source_revision": "890a00ac71226594a7c69c4980ad7ac50bd8896c",
+      "structures": [
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "tensor_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_dims",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 4,
+              "name": "dim",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 4,
+              "name": "stride",
+              "offset": 24,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "data_type",
+              "offset": 40,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "input_position",
+              "offset": 44,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "base_ptr_offset",
+              "offset": 48,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "transpose_flag",
+              "offset": 52,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_shape",
+              "offset": 56,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_dim",
+              "offset": 60,
+              "type": "uint32"
+            }
+          ],
+          "name": "TensorDescC",
+          "size": 64
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "task_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_aicore_type",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_inputs",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_outputs",
+              "offset": 12,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "trigger_event",
+              "offset": 16,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dependent_event",
+              "offset": 20,
+              "type": "uint32"
+            },
+            {
+              "count": 4,
+              "name": "inputs",
+              "offset": 24,
+              "type": "TensorDescC"
+            },
+            {
+              "count": 4,
+              "name": "outputs",
+              "offset": 280,
+              "type": "TensorDescC"
+            },
+            {
+              "count": 1,
+              "name": "tiling_data_position",
+              "offset": 536,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "tiling_data_offset",
+              "offset": 540,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_index",
+              "offset": 544,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_split_num",
+              "offset": 548,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_split_value",
+              "offset": 552,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "extra_value_0",
+              "offset": 556,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "extra_value_1",
+              "offset": 560,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "extra_value_2",
+              "offset": 564,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "profile_desc_id",
+              "offset": 568,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "profile_owner_id",
+              "offset": 572,
+              "type": "uint32"
+            }
+          ],
+          "name": "TaskDescC",
+          "size": 576
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "event_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_triggers",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "first_task_id",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "last_task_id",
+              "offset": 12,
+              "type": "uint32"
+            }
+          ],
+          "name": "EventDescC",
+          "size": 16
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "dynamic_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_input_position",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_group_size",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_max_seq_len",
+              "offset": 12,
+              "type": "int32"
+            }
+          ],
+          "name": "DynamicDataC",
+          "size": 16
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "task_num",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_workers",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_capacity",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "event_capacity",
+              "offset": 12,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "ready_event",
+              "offset": 16,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "cycle_profiling_enabled",
+              "offset": 20,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "aic_profile_record_capacity",
+              "offset": 24,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "aiv_profile_record_capacity",
+              "offset": 28,
+              "type": "uint32"
+            },
+            {
+              "count": 8,
+              "name": "_padding",
+              "offset": 32,
+              "type": "uint32"
+            }
+          ],
+          "name": "RuntimeConfigC",
+          "size": 64
+        }
+      ],
+      "task_types": [
+        {
+          "logical_name": "runtime.terminate.v1",
+          "native_name": "TASK_TERMINATE",
+          "numeric_id": 0
+        },
+        {
+          "logical_name": "runtime.begin.v1",
+          "native_name": "TASK_BEGIN_TASK_GRAPH",
+          "numeric_id": 10
+        },
+        {
+          "logical_name": "runtime.add_custom.v1",
+          "native_name": "TASK_ADD_CUSTOM",
+          "numeric_id": 101
+        },
+        {
+          "logical_name": "moe.swi_glu.v1",
+          "native_name": "TASK_SWI_GLU",
+          "numeric_id": 102
+        },
+        {
+          "logical_name": "moe.matmul.v1",
+          "native_name": "TASK_MATMUL",
+          "numeric_id": 103
+        },
+        {
+          "logical_name": "moe.grouped_matmul.v1",
+          "native_name": "TASK_GROUPED_MATMUL",
+          "numeric_id": 104
+        },
+        {
+          "logical_name": "moe.shmem_put_mem_signal.v1",
+          "native_name": "TASK_SHMEM_PUT_MEM_SIGNAL",
+          "numeric_id": 105
+        },
+        {
+          "logical_name": "moe.swi_glu_grad.v1",
+          "native_name": "TASK_SWI_GLU_GRAD",
+          "numeric_id": 106
+        },
+        {
+          "logical_name": "gate.route.v1",
+          "native_name": "TASK_MEGA_GATE_ROUTE",
+          "numeric_id": 107
+        },
+        {
+          "logical_name": "gate.softplus.v1",
+          "native_name": "TASK_GATE_SOFTPLUS",
+          "numeric_id": 108
+        },
+        {
+          "logical_name": "gate.sqrt.v1",
+          "native_name": "TASK_GATE_SQRT",
+          "numeric_id": 109
+        },
+        {
+          "logical_name": "gate.add_bias.v1",
+          "native_name": "TASK_GATE_ADD_BIAS",
+          "numeric_id": 110
+        },
+        {
+          "logical_name": "gate.topk.v1",
+          "native_name": "TASK_GATE_TOPK",
+          "numeric_id": 111
+        },
+        {
+          "logical_name": "gate.gather.v1",
+          "native_name": "TASK_GATE_GATHER",
+          "numeric_id": 112
+        },
+        {
+          "logical_name": "gate.reduce_sum.v1",
+          "native_name": "TASK_GATE_REDUCE_SUM",
+          "numeric_id": 113
+        },
+        {
+          "logical_name": "gate.add_epsilon.v1",
+          "native_name": "TASK_GATE_ADD_EPSILON",
+          "numeric_id": 114
+        },
+        {
+          "logical_name": "gate.div.v1",
+          "native_name": "TASK_GATE_DIV",
+          "numeric_id": 115
+        },
+        {
+          "logical_name": "gate.mul_scale.v1",
+          "native_name": "TASK_GATE_MUL_SCALE",
+          "numeric_id": 116
+        },
+        {
+          "logical_name": "gate.cast_index.v1",
+          "native_name": "TASK_GATE_CAST_INDEX",
+          "numeric_id": 117
+        },
+        {
+          "logical_name": "gate.grad.muls_scale.v1",
+          "native_name": "TASK_GATE_GRAD_MULS_SCALE",
+          "numeric_id": 118
+        },
+        {
+          "logical_name": "gate.grad.neg.v1",
+          "native_name": "TASK_GATE_GRAD_NEG",
+          "numeric_id": 119
+        },
+        {
+          "logical_name": "gate.grad.div_selected.v1",
+          "native_name": "TASK_GATE_GRAD_DIV_SELECTED",
+          "numeric_id": 120
+        },
+        {
+          "logical_name": "gate.grad.div_selected_ratio.v1",
+          "native_name": "TASK_GATE_GRAD_DIV_SELECTED_RATIO",
+          "numeric_id": 121
+        },
+        {
+          "logical_name": "gate.grad.mul_cross.v1",
+          "native_name": "TASK_GATE_GRAD_MUL_CROSS",
+          "numeric_id": 122
+        },
+        {
+          "logical_name": "gate.grad.div_direct.v1",
+          "native_name": "TASK_GATE_GRAD_DIV_DIRECT",
+          "numeric_id": 123
+        },
+        {
+          "logical_name": "gate.grad.reduce_sum.v1",
+          "native_name": "TASK_GATE_GRAD_REDUCE_SUM",
+          "numeric_id": 124
+        },
+        {
+          "logical_name": "gate.grad.broadcast_row_sum.v1",
+          "native_name": "TASK_GATE_GRAD_BROADCAST_ROW_SUM",
+          "numeric_id": 125
+        },
+        {
+          "logical_name": "gate.grad.add_selected.v1",
+          "native_name": "TASK_GATE_GRAD_ADD_SELECTED",
+          "numeric_id": 126
+        },
+        {
+          "logical_name": "gate.grad.zeros.v1",
+          "native_name": "TASK_GATE_GRAD_ZEROS",
+          "numeric_id": 127
+        },
+        {
+          "logical_name": "gate.grad.linear_index.v1",
+          "native_name": "TASK_GATE_GRAD_LINEAR_INDEX",
+          "numeric_id": 128
+        },
+        {
+          "logical_name": "gate.grad.scatter_selected.v1",
+          "native_name": "TASK_GATE_GRAD_SCATTER_SELECTED",
+          "numeric_id": 129
+        },
+        {
+          "logical_name": "gate.grad.muls_double_score.v1",
+          "native_name": "TASK_GATE_GRAD_MULS_DOUBLE_SCORE",
+          "numeric_id": 130
+        },
+        {
+          "logical_name": "gate.grad.div_sqrt.v1",
+          "native_name": "TASK_GATE_GRAD_DIV_SQRT",
+          "numeric_id": 131
+        },
+        {
+          "logical_name": "gate.grad.softplus.v1",
+          "native_name": "TASK_GATE_GRAD_SOFTPLUS",
+          "numeric_id": 132
+        },
+        {
+          "logical_name": "gate.grad.add_direct.v1",
+          "native_name": "TASK_GATE_GRAD_ADD_DIRECT",
+          "numeric_id": 133
+        },
+        {
+          "logical_name": "gate.grad.broadcast_denominator.v1",
+          "native_name": "TASK_GATE_GRAD_BROADCAST_DENOMINATOR",
+          "numeric_id": 134
+        }
+      ]
+    },
+    "mhc": {
+      "constants": {
+        "ATOMIC_ADD_VALUE_LEN": 8,
+        "MIN_EVENT_CAPACITY": 1024,
+        "NUM_WORKERS_CUBE": 24,
+        "NUM_WORKERS_VECTOR": 48
+      },
+      "dependencies": {
+        "ops_nn": {
+          "commit": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+          "git_archive_tar_sha256": "20e717c1004de51bc2de594509ffde1a2cf84911a20fc8ab610bb4ec508fe14d",
+          "git_archive_tar_sha256_compat": [
+            "6797add7ec5380727a4d2dd9c86874864a093fdc5d1f6e3aaaacbf729991258d"
+          ],
+          "patches": [
+            {
+              "path": "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch",
+              "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks",
+              "sha256": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d"
+            },
+            {
+              "path": "hyper_parallel/core/multicore/ops/rms_norm_worker_fusion.patch",
+              "purpose": "add a logical token-block entry point while preserving the native RMSNorm entry behavior",
+              "sha256": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f"
+            },
+            {
+              "path": "hyper_parallel/core/multicore/ops/rms_norm_grad_worker_fusion.patch",
+              "purpose": "add a task-local RMSNormGrad entry point and explicit fused-task pipe cleanup",
+              "sha256": "b55856bdaa183684576febdcbf2df01cace97932f00d2a336e54cb7d59ee8964"
+            }
+          ],
+          "repository": "https://gitcode.com/cann/ops-nn.git",
+          "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
+          "tag_object": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+          "tree": "52694bc828b50c83f37781b9d4a378466410f671",
+          "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+          "version": "v9.1.0.pre"
+        },
+        "ops_transformer": {
+          "commit": "121f37def44062491173b5ccf34bddb500b95e47",
+          "git_archive_tar_sha256": "00c8751c369b32373a3e77bce7f50efa1e239a1b2994db0cf79e07c85823a30d",
+          "patches": [
+            {
+              "path": "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch",
+              "purpose": "expose the selected grouped-matmul path as an inline building block",
+              "sha256": "53341da1cb6d8ca1a0bb3a16deaff8a67a2d01a4525fac8a8e529535330e2d9d"
+            }
+          ],
+          "repository": "https://gitcode.com/cann/ops-transformer.git",
+          "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
+          "tag_object": "121f37def44062491173b5ccf34bddb500b95e47",
+          "tree": "4c0ee7f90a7b91967c3cfb782745a70f92b20fe6",
+          "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+          "version": "v9.1.0.pre"
+        },
+        "ops_transformer_mhc": {
+          "commit": "58b4a6bdeb29feeb0070dd266106bd4e130bb72b",
+          "fetch_ref": "58b4a6bdeb29feeb0070dd266106bd4e130bb72b",
+          "git_archive_tar_sha256": "72cbff27e7e1602c547e17ebccdba013c109e80c331ddd46b896b32628118aa1",
+          "git_archive_tar_sha256_compat": [
+            "f8a1baea0d188fdcff8426e7b7d11bf9d43f3ea3fb26fa4dd270eb88d1566229"
+          ],
+          "patches": [
+            {
+              "path": "hyper_parallel/core/multicore/ops/mhc_post_and_pre_sinkhorn_worker_primitives.patch",
+              "purpose": "expose task-local MhcPost, NormCast, Projection, InputMix, and Mapping/Sinkhorn primitives",
+              "sha256": "9d60a12e1b58fe5b8364b310a5938ac9d8f4b10137a0e697ea3018709d2419b5"
+            },
+            {
+              "path": "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_worker_primitives.patch",
+              "purpose": "expose shifted MhcPreSinkhornBackward and additive MhcPostBackward entry points",
+              "sha256": "20a1ad0d0ff548a12282c4331afb03bbff7aabfd8f391a2b085907b52cf5d260"
+            },
+            {
+              "path": "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_4_task_primitives.patch",
+              "purpose": "expose task-local Prepare, PhiRms, and PreviousX worker primitives",
+              "sha256": "12434fae310dca30b53bc285a0a54af49e221275c52b9b3437302d2f851c005e"
+            }
+          ],
+          "repository": "https://gitcode.com/cann/ops-transformer.git",
+          "resolution": "exact upstream commit providing MhcPost and MhcPreSinkhorn sources; adapters are applied only to an isolated source copy",
+          "tag_object": null,
+          "tree": "f941884a2f35988711169e77772c9faea4e942f2",
+          "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation",
+          "version": "58b4a6bde"
+        },
+        "shmem": {
+          "commit": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
+          "fetch_ref": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
+          "git_archive_tar_sha256": "c3f207178b6a4f020bc1f98187ca703814e4876064b83e7416010f2f379385f9",
+          "packaging_policy": {
+            "private_sonames": [
+              "libhyper_parallel_shmem.so",
+              "libhyper_parallel_shmem_utils.so"
+            ],
+            "reason": "avoid collision with framework-provided libshmem.so in one process",
+            "upstream_source_modified": false
+          },
+          "patches": [],
+          "repository": "https://gitcode.com/cann/shmem.git",
+          "resolution": "exact upstream commit supporting CANN 9.1 and 9.2 native builds",
+          "tag_object": null,
+          "tree": "dec6d50ff39113fe892cdc3d52d35e56b24cd0c0",
+          "version": "d30702bb55d0"
+        }
+      },
+      "family": "mhc",
+      "runtime_abi_version": 1,
+      "scratch_policy": "fixed_512_int64",
+      "source_hashes": {
+        "hyper_parallel/core/multicore/_build/__init__.py": "5f9d6a858baf557b1c18b33bc12aac092a8c97fe111b03843a46066435c1528a",
+        "hyper_parallel/core/multicore/_build/assemble_multicore_source.py": "9851cf2b73d1dbf3d8fbcaae0858ec67d76c2fab10092e3a9af1dd271d11c20e",
+        "hyper_parallel/core/multicore/_build/dependencies.lock.json": "5833b071d76eae248ec52079c307ed2475fcc2c225a118af70ed8ce9adbca523",
+        "hyper_parallel/core/multicore/_build/merge_multicore_vendors.py": "9019da0e236ce8da02979169343007eb3c0972a33bb636f4c937d23029475b03",
+        "hyper_parallel/core/multicore/_build/prepare_dependencies.py": "12658bcfce8b9fa9621a15b6ef2292979fa518a7c7b8bb4686a1c46f5a7ba28e",
+        "hyper_parallel/core/multicore/modules/mega_mhc/__init__.py": "66e6419a64c7cba3aaf1b0f8360359bb8870f44f699ac5a0a2a2d7e83bcafc9f",
+        "hyper_parallel/core/multicore/modules/mega_mhc/function.py": "9cc3f0f43b78f1e4e183e5a005a0dc9673ce86cdd2eebe2c4017b2b15b187d23",
+        "hyper_parallel/core/multicore/modules/mega_mhc/golden.py": "84320bff6bf4878e9c7b47a65c78bedb398ae99ac8186e56ec1de844ec972e19",
+        "hyper_parallel/core/multicore/modules/mega_mhc/graph.py": "ea42d86119116c4359949410d941e572cb5386ee9dd9a5c77633968389a1bbd7",
+        "hyper_parallel/core/multicore/modules/mega_mhc/module.py": "42870a48da4b9c6175da76bed6480c38efc908a78b6a25353ec8519445a410ef",
+        "hyper_parallel/core/multicore/modules/mega_mhc/plan.py": "9fc96e9dd1d92444a9dd209463a006f387e8733db37a03dcc0a1bb249501cb2f",
+        "hyper_parallel/core/multicore/modules/mega_mhc_grad/__init__.py": "60d47619a318115864ce4ee2f5dd958fdb15043f723ac843eb700c978322354a",
+        "hyper_parallel/core/multicore/modules/mega_mhc_grad/function.py": "d9c8dc3341ffab475dd123c61fba11aab3c3760a919f9b5391161f558fe68d27",
+        "hyper_parallel/core/multicore/modules/mega_mhc_grad/golden.py": "c7f5be6d70973c6c5c6e62f972e13fbb537c219f6561c60aacc1e0092adbfced",
+        "hyper_parallel/core/multicore/modules/mega_mhc_grad/graph.py": "3ea642641d6b278be6ccd277b719c5442b5d3eb693f743652f1a5d7343c6d42e",
+        "hyper_parallel/core/multicore/modules/mega_mhc_grad/plan.py": "fb11cf269ff6dc80c4e550f4002ae89f7df5adf6eb4711607b095d32fa4589ad",
+        "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch": "53341da1cb6d8ca1a0bb3a16deaff8a67a2d01a4525fac8a8e529535330e2d9d",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/hyper_mega_mhc_def.cpp": "44bbdccdbaab1e8ac83c702f29a5b249c2e4a7b6af4cdce4f217fe600600bc40",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/hyper_mega_mhc_infershape.cpp": "8f2b7388caf306db4fbdaf89239946b98fb332e49048849a2d5a5928867fe077",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/hyper_mega_mhc_tiling.cpp": "e5066a64f61235c73acd89f20dfc2baa9b9fd927cd901f4ffb39de8159fd484d",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/op_api/aclnn_hyper_mega_mhc.cpp": "1e8602c14abe2839aa097f5bf57ab2ec07073b278ec80de136bfc29e04cfbdcc",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/op_api/aclnn_hyper_mega_mhc.h": "e38619428507089164a4f7304eccf8a4a86074247468b2409ae061384ad30f6e",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/op_api/hyper_mega_mhc.cpp": "8e9de32618a0e7ecbb23ddf6d54d8a5ca9836b19537271bfb87051ae323d1e0b",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/op_api/hyper_mega_mhc.h": "f05a5eca1401fd19bbfca1d55ea05e0751b57c53849cbfbbbde111c751a35fd9",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/op_host/tiling_util.h": "b1de4c1327dd6a86772adf315747cd4531f5fc28f8367da1a406bf2ab3c873ad",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_kernel/hyper_mega_mhc.cpp": "95dcb2dc2158f8cfe44af1a0612fc1744472b7886e333dfbbda8a4022a6e95cb",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_kernel/hyper_mega_mhc_task_tiling.h": "0afdc31d402249b7ff733b43b6209c6a5bf24cf707bc59c6b7b86e4b06e8e5e4",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_kernel/hyper_mega_mhc_tiling_key.h": "440ca726ad1a15973910e32c257d83e254e7d1094c8f234f144c9bf9f58fba9c",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_kernel/worker_kernel.cpp": "6d2f2497cc08869d43d3354dc367f63f9e561be056cc0ca98a232260edc303df",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/hyper_mega_mhc_grad_def.cpp": "54aa92d3df88d781a20b400da580500960229dc61c0239a09f7353ff56611aa3",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/hyper_mega_mhc_grad_infershape.cpp": "c20ac690ceb22a4f4aee38146a5ffa330dc24cc88dcd639a47005c59a99ad51e",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/hyper_mega_mhc_grad_tiling.cpp": "360ac3f11f08f95cd90da00cb68270721c866f870a78b2ad10af598e39feb197",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/op_api/aclnn_hyper_mega_mhc_grad.cpp": "08ea208b55b033b9dc78c5e7a5e290d337d21d646f1da6b94d38ab3248263cc9",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/op_api/aclnn_hyper_mega_mhc_grad.h": "ba29e79b5e4bd1eec1103de4f98c5f552e5655feb48da56a448645a71bc994a4",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/op_api/hyper_mega_mhc_grad.cpp": "a331b5ac9c619dcc528fa77c6c7ff8f61b71f835d014d7f813fcd5d4afdccbdf",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/op_api/hyper_mega_mhc_grad.h": "735a0964ebb55e6f951e84c8dd4bbee32ac5fc56c9ec35ba2ad3e795ada5ac9c",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_kernel/hyper_mega_mhc_grad.cpp": "039429247206b5e62278f226b4313b14ae761bad35a1f6dd93048dcc42d8c1bb",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_kernel/hyper_mega_mhc_grad_task_tiling.h": "00b94c6333a6b538ddca280f4b7a174e324295faf8f2a563bf235eacfc8adc84",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_kernel/hyper_mega_mhc_grad_tiling_key.h": "5fa400a15b114213ac3896d14304db439959df5ee91ffa254d72624619f57dc2",
+        "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_kernel/worker_kernel.cpp": "0f0f7b4714957514b8c0e50c2e7982c2cca9159b894c9f2ec9c0a2e406bd837e",
+        "hyper_parallel/core/multicore/ops/mhc_post_and_pre_sinkhorn_worker_primitives.patch": "9d60a12e1b58fe5b8364b310a5938ac9d8f4b10137a0e697ea3018709d2419b5",
+        "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_4_task_primitives.patch": "12434fae310dca30b53bc285a0a54af49e221275c52b9b3437302d2f851c005e",
+        "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_worker_primitives.patch": "20a1ad0d0ff548a12282c4331afb03bbff7aabfd8f391a2b085907b52cf5d260",
+        "hyper_parallel/core/multicore/ops/rms_norm_grad_worker_fusion.patch": "b55856bdaa183684576febdcbf2df01cace97932f00d2a336e54cb7d59ee8964",
+        "hyper_parallel/core/multicore/ops/rms_norm_worker_fusion.patch": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f",
+        "hyper_parallel/core/multicore/ops/runtime/cycle_trace_recorder.h": "6223a7813d7638aa5940a09ca96ded6e2b9d1fa81495c46940bba98b4f99b5fd",
+        "hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp": "7aedabfdbe8879906ae07a6bdecdfc99ae759cd0c6131df6f0a4faa827541be7",
+        "hyper_parallel/core/multicore/ops/runtime/worker_kernel.h": "8a3c401bde9cdade3ff7b277a5db14d8e5942900edcd337a7b0d70301f94303b",
+        "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d",
+        "hyper_parallel/core/multicore/profiler/__init__.py": "7a2b26c9bfb25415e0daa14f0109ec980def0b7d2319b8e0042f868dc3e76167",
+        "hyper_parallel/core/multicore/profiler/profiler.py": "77b1c6375eb449149651c2e4cb0b79b15d9dce31cfd19ab8371e47d795d5ee47",
+        "hyper_parallel/core/multicore/profiler/profiling.py": "ddf7cc432c0ba5913d1c42dd4ce32f99043e1fc4f59e1cfe25ff77a8400ff84c",
+        "hyper_parallel/core/multicore/profiler/trace_merger.py": "715d0c6f34623950615236aeae4a44cd64a567894f787871f604a01f9698cc41",
+        "hyper_parallel/core/multicore/scheduler/__init__.py": "4c3ad9b34e3cb241b77ed90ff6cb4b8b37c7099edcb2bd87d7112a1ba857b423",
+        "hyper_parallel/core/multicore/scheduler/allocator.py": "e5279310f71ce2376b52bd35a5463a4e9c42ebb1e76759a129de24ebb585b809",
+        "hyper_parallel/core/multicore/scheduler/builder.py": "22a3fe043c37222a2543aca31f30d75ac2351a99ae8ec5ad671f534ff940a095",
+        "hyper_parallel/core/multicore/scheduler/config.py": "700883eddae79dce0272a54293b66fd6de3be367bf501b0e5878d16b97b56ecb",
+        "hyper_parallel/core/multicore/scheduler/graph.py": "8cf2447281ff1b2533ef3021141d9a62f5262300f17ee51e37a526a07551a48e",
+        "hyper_parallel/core/multicore/scheduler/runtime.py": "c56374b1b7b2317eed5aecb2637c3646b26932c00267eb32cabe537b68c58b48",
+        "hyper_parallel/core/multicore/scheduler/scheduler.py": "614f7a7e08b3ac2446b3be5fc1f4228925a7f9aa4312935c566c643f346f30a9"
+      },
+      "source_revision": "979e2a9ac913413e361f4fc2dd9987766af8ddb4",
+      "structures": [
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "tensor_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_dims",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 4,
+              "name": "dim",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 4,
+              "name": "stride",
+              "offset": 24,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "data_type",
+              "offset": 40,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "input_position",
+              "offset": 44,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "base_ptr_offset",
+              "offset": 48,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "transpose_flag",
+              "offset": 52,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_shape",
+              "offset": 56,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_dim",
+              "offset": 60,
+              "type": "uint32"
+            }
+          ],
+          "name": "TensorDescC",
+          "size": 64
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "task_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_aicore_type",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_inputs",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_outputs",
+              "offset": 12,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "trigger_event",
+              "offset": 16,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dependent_event",
+              "offset": 20,
+              "type": "uint32"
+            },
+            {
+              "count": 4,
+              "name": "inputs",
+              "offset": 24,
+              "type": "TensorDescC"
+            },
+            {
+              "count": 4,
+              "name": "outputs",
+              "offset": 280,
+              "type": "TensorDescC"
+            },
+            {
+              "count": 1,
+              "name": "tiling_data_position",
+              "offset": 536,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "tiling_data_offset",
+              "offset": 540,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_index",
+              "offset": 544,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_split_num",
+              "offset": 548,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_split_value",
+              "offset": 552,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "extra_value_0",
+              "offset": 556,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "extra_value_1",
+              "offset": 560,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "extra_value_2",
+              "offset": 564,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "profile_desc_id",
+              "offset": 568,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "profile_owner_id",
+              "offset": 572,
+              "type": "uint32"
+            }
+          ],
+          "name": "TaskDescC",
+          "size": 576
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "event_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_triggers",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "first_task_id",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "last_task_id",
+              "offset": 12,
+              "type": "uint32"
+            }
+          ],
+          "name": "EventDescC",
+          "size": 16
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "dynamic_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_input_position",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_group_size",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_max_seq_len",
+              "offset": 12,
+              "type": "int32"
+            }
+          ],
+          "name": "DynamicDataC",
+          "size": 16
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "task_num",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_workers",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_capacity",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "event_capacity",
+              "offset": 12,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "ready_event",
+              "offset": 16,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "cycle_profiling_enabled",
+              "offset": 20,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "aic_profile_record_capacity",
+              "offset": 24,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "aiv_profile_record_capacity",
+              "offset": 28,
+              "type": "uint32"
+            },
+            {
+              "count": 8,
+              "name": "_padding",
+              "offset": 32,
+              "type": "uint32"
+            }
+          ],
+          "name": "RuntimeConfigC",
+          "size": 64
+        }
+      ],
+      "task_types": [
+        {
+          "logical_name": "runtime.terminate.v1",
+          "native_name": "TASK_TERMINATE",
+          "numeric_id": 0
+        },
+        {
+          "logical_name": "runtime.begin.v1",
+          "native_name": "TASK_BEGIN_TASK_GRAPH",
+          "numeric_id": 10
+        },
+        {
+          "logical_name": "runtime.add_custom.v1",
+          "native_name": "TASK_ADD_CUSTOM",
+          "numeric_id": 101
+        },
+        {
+          "logical_name": "moe.swi_glu.v1",
+          "native_name": "TASK_SWI_GLU",
+          "numeric_id": 102
+        },
+        {
+          "logical_name": "moe.matmul.v1",
+          "native_name": "TASK_MATMUL",
+          "numeric_id": 103
+        },
+        {
+          "logical_name": "moe.grouped_matmul.v1",
+          "native_name": "TASK_GROUPED_MATMUL",
+          "numeric_id": 104
+        },
+        {
+          "logical_name": "moe.shmem_put_mem_signal.v1",
+          "native_name": "TASK_SHMEM_PUT_MEM_SIGNAL",
+          "numeric_id": 105
+        },
+        {
+          "logical_name": "moe.swi_glu_grad.v1",
+          "native_name": "TASK_SWI_GLU_GRAD",
+          "numeric_id": 106
+        },
+        {
+          "logical_name": "mhc.post.v1",
+          "native_name": "TASK_MHC_POST",
+          "numeric_id": 107
+        },
+        {
+          "logical_name": "mhc.norm_cast.v1",
+          "native_name": "TASK_MHC_NORM_CAST",
+          "numeric_id": 108
+        },
+        {
+          "logical_name": "mhc.projection.v1",
+          "native_name": "TASK_MHC_PROJECTION",
+          "numeric_id": 109
+        },
+        {
+          "logical_name": "mhc.mapping.v1",
+          "native_name": "TASK_MHC_MAPPING",
+          "numeric_id": 110
+        },
+        {
+          "logical_name": "mhc.rms_norm.v1",
+          "native_name": "TASK_RMS_NORM",
+          "numeric_id": 111
+        },
+        {
+          "logical_name": "mhc.input_mix.v1",
+          "native_name": "TASK_MHC_INPUT_MIX",
+          "numeric_id": 112
+        },
+        {
+          "logical_name": "mhc.rms_norm_grad.v1",
+          "native_name": "TASK_RMS_NORM_GRAD",
+          "numeric_id": 113
+        },
+        {
+          "logical_name": "mhc.grad_prev_a.v1",
+          "native_name": "TASK_MHC_GRAD_PREV_A",
+          "numeric_id": 114
+        },
+        {
+          "logical_name": "mhc.grad_mapping.v1",
+          "native_name": "TASK_MHC_GRAD_MAPPING",
+          "numeric_id": 115
+        },
+        {
+          "logical_name": "mhc.grad_phi_rms.v1",
+          "native_name": "TASK_MHC_GRAD_PHI_RMS",
+          "numeric_id": 116
+        },
+        {
+          "logical_name": "mhc.grad_prev_x_and_post.v1",
+          "native_name": "TASK_MHC_GRAD_PREV_X_AND_POST",
+          "numeric_id": 117
+        },
+        {
+          "logical_name": "mhc.post_grad.v1",
+          "native_name": "TASK_MHC_POST_GRAD",
+          "numeric_id": 118
+        },
+        {
+          "logical_name": "mhc.grad_prev_a_and_mapping.v1",
+          "native_name": "TASK_MHC_GRAD_PREV_A_AND_MAPPING",
+          "numeric_id": 119
+        }
+      ]
+    },
+    "moe": {
+      "constants": {
+        "ATOMIC_ADD_VALUE_LEN": 8,
+        "MIN_EVENT_CAPACITY": 1024,
+        "NUM_WORKERS_CUBE": 24,
+        "NUM_WORKERS_VECTOR": 48
+      },
+      "dependencies": {
+        "ops_nn": {
+          "commit": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+          "git_archive_tar_sha256": "20e717c1004de51bc2de594509ffde1a2cf84911a20fc8ab610bb4ec508fe14d",
+          "patches": [
+            {
+              "path": "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch",
+              "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks",
+              "sha256": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d"
+            },
+            {
+              "path": "hyper_parallel/core/multicore/ops/swi_glu_clamp.patch",
+              "purpose": "add task-configured DeepSeek clipped SwiGLU forward and backward semantics",
+              "sha256": "a7d69efa029fcb412d84cca03645bd3c4fd9788d6d62a10564fdf50b330b3427"
+            }
+          ],
+          "repository": "https://gitcode.com/cann/ops-nn.git",
+          "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
+          "tag_object": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+          "tree": "52694bc828b50c83f37781b9d4a378466410f671",
+          "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+          "version": "v9.1.0.pre"
+        },
+        "ops_transformer": {
+          "commit": "121f37def44062491173b5ccf34bddb500b95e47",
+          "git_archive_tar_sha256": "00c8751c369b32373a3e77bce7f50efa1e239a1b2994db0cf79e07c85823a30d",
+          "patches": [
+            {
+              "path": "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch",
+              "purpose": "expose the selected grouped-matmul path as an inline building block",
+              "sha256": "9311b39fc5b152935662cb665ea1ddb8a353ea6706aa8b3dacfd0d2d3ef72837"
+            }
+          ],
+          "repository": "https://gitcode.com/cann/ops-transformer.git",
+          "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
+          "tag_object": "121f37def44062491173b5ccf34bddb500b95e47",
+          "tree": "4c0ee7f90a7b91967c3cfb782745a70f92b20fe6",
+          "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+          "version": "v9.1.0.pre"
+        },
+        "shmem": {
+          "commit": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
+          "fetch_ref": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
+          "git_archive_tar_sha256": "c3f207178b6a4f020bc1f98187ca703814e4876064b83e7416010f2f379385f9",
+          "packaging_policy": {
+            "private_sonames": [
+              "libhyper_parallel_shmem.so",
+              "libhyper_parallel_shmem_utils.so"
+            ],
+            "reason": "avoid collision with framework-provided libshmem.so in one process",
+            "upstream_source_modified": false
+          },
+          "patches": [],
+          "repository": "https://gitcode.com/cann/shmem.git",
+          "resolution": "exact upstream commit supporting CANN 9.1 and 9.2 native builds",
+          "tag_object": null,
+          "tree": "dec6d50ff39113fe892cdc3d52d35e56b24cd0c0",
+          "version": "d30702bb55d0"
+        }
+      },
+      "family": "moe",
+      "runtime_abi_version": 1,
+      "scratch_policy": "dynamic_local_experts",
+      "source_hashes": {
+        "hyper_parallel/core/multicore/_build/__init__.py": "5f9d6a858baf557b1c18b33bc12aac092a8c97fe111b03843a46066435c1528a",
+        "hyper_parallel/core/multicore/_build/assemble_multicore_source.py": "48cff99b2042cb07631d2c3d50ada2a160a18486c880702daec3499a38e6e77a",
+        "hyper_parallel/core/multicore/_build/dependencies.lock.json": "44c44cc2fc3ae8b095abbc895e01eddd6e51857f2dcc4ec6821894ab4ed77394",
+        "hyper_parallel/core/multicore/_build/merge_multicore_vendors.py": "9019da0e236ce8da02979169343007eb3c0972a33bb636f4c937d23029475b03",
+        "hyper_parallel/core/multicore/_build/prepare_dependencies.py": "f15ee36c9ec7ad1a559658eb20d1bf41649869b8683c5b3c6c358e2c4c114a05",
+        "hyper_parallel/core/multicore/modules/mega_moe/__init__.py": "5f9d6a858baf557b1c18b33bc12aac092a8c97fe111b03843a46066435c1528a",
+        "hyper_parallel/core/multicore/modules/mega_moe/backward/__init__.py": "8233d9caec464aa7e010d4806aefe0feb18de5a0a9f3b10e5a8a13561196ec93",
+        "hyper_parallel/core/multicore/modules/mega_moe/backward/gen_runtime_data.py": "8ffdfd8a84de1b9690692c0ffda40c55076f8f12e75a6f2b473fb8fb7d900b25",
+        "hyper_parallel/core/multicore/modules/mega_moe/backward/graph.py": "651ee7e194f9045bc268886415de8cf7488a97ecd4c9eb4321fb8d763592edd5",
+        "hyper_parallel/core/multicore/modules/mega_moe/backward/storage.py": "8eecbc97c1b30a5495f87eb72f839f9bfce3241d0b5688ac022fe435ca5990d8",
+        "hyper_parallel/core/multicore/modules/mega_moe/backward/tiling_tables.py": "292cc1b35e492258fe4323741b9d0ac72cb1c8b73e4cf7454d2408bcb5603f9e",
+        "hyper_parallel/core/multicore/modules/mega_moe/forward/__init__.py": "8233d9caec464aa7e010d4806aefe0feb18de5a0a9f3b10e5a8a13561196ec93",
+        "hyper_parallel/core/multicore/modules/mega_moe/forward/gen_runtime_data.py": "1f51dc1d013a5e7bf75c1142a69c1e8e6e41b3d90df235af47fc9b4d3aa88318",
+        "hyper_parallel/core/multicore/modules/mega_moe/forward/graph.py": "087cf9019beb54ed46e880dc3f2e149ccdc3b80c6cf10e5537b22805d04a1385",
+        "hyper_parallel/core/multicore/modules/mega_moe/forward/tiling_tables.py": "87f82dd0ab09892825721800f89d11c924d17da1b1525254dc90af630ecd7828",
+        "hyper_parallel/core/multicore/modules/mega_moe/function.py": "9cc1e04e6361e4e81d89599c13fedf25d241248583b9ff9ed575d90970ad2bb9",
+        "hyper_parallel/core/multicore/modules/mega_moe/heap_manager.py": "33dd96fc066d71187385769c99c9e2e09850495d92b06901a3b5fbb595756edc",
+        "hyper_parallel/core/multicore/modules/mega_moe/kernel_gradients.py": "2dab9af2e3b6eeda84dcbe65d891c922df139d55df56ecdd084887236090c79f",
+        "hyper_parallel/core/multicore/modules/mega_moe/module.py": "bc7b643dd4aa04c0ecf74be04cfb39aab053b31b77f09d64edd64e35912096fd",
+        "hyper_parallel/core/multicore/modules/mega_moe/plan.py": "622f5e3dcc563c2bb46ea2081526ff20151922ca9e7155b5d23147a7a45a493e",
+        "hyper_parallel/core/multicore/modules/mega_moe/profiling.py": "f4e53b0f79d206af1ff7cf7cf69264d38d43a728359143c8e21bc8789f019c76",
+        "hyper_parallel/core/multicore/modules/mega_moe/route.py": "18eb15487b916c0e75eb78be29efebc1d50fe04313670e8b9ac4101def298346",
+        "hyper_parallel/core/multicore/modules/mega_moe/spec.py": "ea709b3eb7417fe42822339587d1d00b493489aeebacb6d1a39fc845e5175c62",
+        "hyper_parallel/core/multicore/modules/mega_moe/workspace.py": "6af80d5899c7a66a233e242b8707b923c86e71fdc93036c713992dae3530af5a",
+        "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch": "9311b39fc5b152935662cb665ea1ddb8a353ea6706aa8b3dacfd0d2d3ef72837",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/CMakeLists.txt": "360d2b785562e0ef72d34e69159a075f738e8402bb5f599b0aee3991accc9a5d",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_graph/CMakeLists.txt": "531271a714d780a9f6d1a6a5d3480fa4c6be8a6c25f93cd4e5ef3cd487b015d4",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_graph/fusion_pass/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_graph/hyper_mega_moe_proto.h": "3c1ca8ac7b618175fc0db7767eea5add2224a8ba3ea75f4b805754ab13d5cd70",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/CMakeLists.txt": "bda4f0cef929af01fe6a0f6e5a882159cba7d614ff421421bd5fbbb2db6f9fca",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/config/ascend910_93/hyper_mega_moe_binary.json": "69e07820cb3685cd9a7181dd479f44e8a8c5a2ee24455d37683d8f7ede61766f",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/config/ascend910_93/hyper_mega_moe_simplified_key.ini": "c74589154a81ba6250710f3fa1f5b9f21fe001a8dc8aa86a153f80fd435c1df7",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/config/ascend910b/hyper_mega_moe_binary.json": "69e07820cb3685cd9a7181dd479f44e8a8c5a2ee24455d37683d8f7ede61766f",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/config/ascend910b/hyper_mega_moe_simplified_key.ini": "c74589154a81ba6250710f3fa1f5b9f21fe001a8dc8aa86a153f80fd435c1df7",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_def.cpp": "5d4aaae15b910fa931cc6247564af4a6141347ef15266adad597d471c1fcf3ba",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_infershape.cpp": "087071b46114b06ae190ef63b7b2f17401d2fb76dc66da142b5d73443808fa5e",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_tiling.cpp": "1b6643a64781d16b87681c28a4f5b5a24a8973d963342e0f73253e594fd01fab",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_tiling.h": "9455233f3b9b0519f4659b71d1cc6a46415d2f9c1172791336445ba0e49b8502",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/op_api/aclnn_hyper_mega_moe.cpp": "f2adc132818a6f6e1301864a1c6b67b66e8f00657f0da4d5a2b05186c64e81bf",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/op_api/aclnn_hyper_mega_moe.h": "b36975784981d9a3f9c9f59f00bd5bc38e4917f87cb0292b66646a3896d5ca21",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/op_api/hyper_mega_moe.cpp": "b68858b4f42a74238a5c2dc5ad74f7deff111e2e3945567d0e8a0ebf01c2b228",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/op_api/hyper_mega_moe.h": "8f4777e2948a9e43e25397614130f0d061bd231674ec27d6b62e7bd65a8d9f3b",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_kernel/hyper_mega_moe.cpp": "59f9ec7bfdc24c3e7765fa90855f458608aed93559e64239ec03ce7d7fb60d66",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_kernel/hyper_mega_moe_tiling_key.h": "2d15a2497bcdda62ec69261cf12b4c5fdf74016f8d112b6728dc182a24c6fcb0",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_kernel/put_mem_signal/put_mem_signal_kernel.cpp": "d1546854ab93cd2420997f00fa287896041b20bd9ef90ac3db62198a934138f9",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp": "389c7f47cd89836c815934ffbb80387338a30943d8aa9fe4e36bcdfc1416ab63",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/CMakeLists.txt": "3d2416b6048d87c0033460842f3d548f8456892a6ec152ac6e675201d8d1c744",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_graph/CMakeLists.txt": "573d09df76b3f0ea7142ce2ad337235722992bd9b4244c978a9cf645840f8fc3",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_graph/fusion_pass/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_graph/hyper_mega_moe_grad_proto.h": "75959ee73857a4b7c561c4024b7bb945c46127fbcbb60f54335e5a4283d15f55",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/CMakeLists.txt": "12bde9d59f2d03b4bb93c7d0cc492b1b55ee6e2c60b8690175b62bf5c8f9a67c",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/config/ascend910_93/hyper_mega_moe_grad_binary.json": "25c6b4bec199ff779cad2a4cd305112ea428f35e9d302164bda1c048d33036cb",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/config/ascend910_93/hyper_mega_moe_grad_simplified_key.ini": "2d6f8602c94365e0df86012c785becec0ea168e029ce2256b9cafd0170abf5d6",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/config/ascend910b/hyper_mega_moe_grad_binary.json": "25c6b4bec199ff779cad2a4cd305112ea428f35e9d302164bda1c048d33036cb",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/config/ascend910b/hyper_mega_moe_grad_simplified_key.ini": "2d6f8602c94365e0df86012c785becec0ea168e029ce2256b9cafd0170abf5d6",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/hyper_mega_moe_grad_def.cpp": "6379b252236f4f187bf54e946154e08e0a72de1d94ca3752c53cdc606d130fb7",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/hyper_mega_moe_grad_infershape.cpp": "69615786fa9da6a0bcefdbdcd26e3caa10b4b7c3a8d530e54b060616394b047b",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/hyper_mega_moe_grad_tiling.cpp": "95525b81dba4b3471b0aef95b4deb605fb786f48f997dd04af325adc9d8f9771",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/hyper_mega_moe_grad_tiling.h": "f5dbe1d1d46c965ee7ed500cba36cdb0bf1dd1a60eca74c5ac58bc6963501a70",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/op_api/aclnn_hyper_mega_moe_grad.cpp": "6e3401b4993aff2a29b573e58ecbf119d7f98251ea74703639b5dfcbde525bab",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/op_api/aclnn_hyper_mega_moe_grad.h": "61dd4b3ca47bd65e9318ab31ba77fd6e1fcfbbe5c1dd2085d7f49b2fca3247cf",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/op_api/hyper_mega_moe_grad.cpp": "b04cb22c1cae542f40f83113b09d9737069a86e654f5e7bc478460f7d3a9fbd2",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/op_api/hyper_mega_moe_grad.h": "367cc8766afbf36453f2cff661aea8fb584fb2efcc03b7856070953f81ff96e5",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_kernel/hyper_mega_moe_grad.cpp": "91e019cc1cb8adaf1e1270a050f7bb4b9a6261c80d368761b51ca64274ccef1e",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_kernel/hyper_mega_moe_grad_tiling_key.h": "a4d0a60ccd5c338fdf3a9a13d62bc69101d551e97e2ea1006b1c7e8156e774a6",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_kernel/put_mem_signal/put_mem_signal_kernel.cpp": "d1546854ab93cd2420997f00fa287896041b20bd9ef90ac3db62198a934138f9",
+        "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp": "be2983a7b147a2261985672d8d62b8ee33aee229acb328ec9e26ca5de4b6ba80",
+        "hyper_parallel/core/multicore/ops/runtime/cycle_trace_recorder.h": "691f9160e8b94d8fa135dd4d21cce296fa1b62452496c9161a372e07bd8a577e",
+        "hyper_parallel/core/multicore/ops/runtime/get_mem.h": "2b1533a4dd9063ce9f0c2fcfafb810c8bc7acb0dba73fd28bb27c503ef000249",
+        "hyper_parallel/core/multicore/ops/runtime/replica_gradient.h": "24742a85b78aeccca297f6ab62f100bd019afab52710b39bb583035b28b6434b",
+        "hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp": "c2c14268c3caec2362dd08fd876dfa4b7cbbf845909b0447dd8abcb7d3260ecf",
+        "hyper_parallel/core/multicore/ops/runtime/worker_kernel.h": "cc40d8c4a781f6ed8f49053d7be5be042b17180ea73f2fc3ed19ace751c29504",
+        "hyper_parallel/core/multicore/ops/swi_glu_clamp.patch": "a7d69efa029fcb412d84cca03645bd3c4fd9788d6d62a10564fdf50b330b3427",
+        "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d",
+        "hyper_parallel/core/multicore/profiler/__init__.py": "7a2b26c9bfb25415e0daa14f0109ec980def0b7d2319b8e0042f868dc3e76167",
+        "hyper_parallel/core/multicore/profiler/profiler.py": "77b1c6375eb449149651c2e4cb0b79b15d9dce31cfd19ab8371e47d795d5ee47",
+        "hyper_parallel/core/multicore/profiler/profiling.py": "842f5ee4dbd78319e54ed717eb27b0449f3e1683a89fa6d41e4028077ac0f17a",
+        "hyper_parallel/core/multicore/profiler/trace_merger.py": "715d0c6f34623950615236aeae4a44cd64a567894f787871f604a01f9698cc41",
+        "hyper_parallel/core/multicore/scheduler/__init__.py": "4c3ad9b34e3cb241b77ed90ff6cb4b8b37c7099edcb2bd87d7112a1ba857b423",
+        "hyper_parallel/core/multicore/scheduler/allocator.py": "e5279310f71ce2376b52bd35a5463a4e9c42ebb1e76759a129de24ebb585b809",
+        "hyper_parallel/core/multicore/scheduler/builder.py": "af07c84376fc8129ea61f17b19711ff5ce4d31323db00cba69011d6eeb96e398",
+        "hyper_parallel/core/multicore/scheduler/config.py": "5f66d5cfb17832e21a609ddb8ce1fcf095e96a380ceafb62304e9c4f3ea1e214",
+        "hyper_parallel/core/multicore/scheduler/graph.py": "4a0884f5b735c81f90734dd086f3ebace51fe96e8ab0c6589d16cd0eb424401b",
+        "hyper_parallel/core/multicore/scheduler/runtime.py": "6f8218aac23872e312c922eefd5d830b9dec38652cc8759b7cd0728efd147082",
+        "hyper_parallel/core/multicore/scheduler/scheduler.py": "d5159bb51ceff53732915c0874c4a4fd3ee10e1b1a427e4d3d7a8f41d718e00b"
+      },
+      "source_revision": "befaa01069e997d511987feec82464c5f4549b95",
+      "structures": [
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "tensor_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_dims",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 4,
+              "name": "dim",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 4,
+              "name": "stride",
+              "offset": 24,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "data_type",
+              "offset": 40,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "input_position",
+              "offset": 44,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "base_ptr_offset",
+              "offset": 48,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "transpose_flag",
+              "offset": 52,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_shape",
+              "offset": 56,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_dim",
+              "offset": 60,
+              "type": "uint32"
+            }
+          ],
+          "name": "TensorDescC",
+          "size": 64
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "task_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_aicore_type",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_inputs",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_outputs",
+              "offset": 12,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "trigger_event",
+              "offset": 16,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dependent_event",
+              "offset": 20,
+              "type": "uint32"
+            },
+            {
+              "count": 4,
+              "name": "inputs",
+              "offset": 24,
+              "type": "TensorDescC"
+            },
+            {
+              "count": 4,
+              "name": "outputs",
+              "offset": 280,
+              "type": "TensorDescC"
+            },
+            {
+              "count": 1,
+              "name": "tiling_data_position",
+              "offset": 536,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "tiling_data_offset",
+              "offset": 540,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_index",
+              "offset": 544,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_split_num",
+              "offset": 548,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_split_value",
+              "offset": 552,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "extra_value_0",
+              "offset": 556,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "extra_value_1",
+              "offset": 560,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "extra_value_2",
+              "offset": 564,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "profile_desc_id",
+              "offset": 568,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "profile_owner_id",
+              "offset": 572,
+              "type": "uint32"
+            }
+          ],
+          "name": "TaskDescC",
+          "size": 576
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "event_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_triggers",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "first_task_id",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "last_task_id",
+              "offset": 12,
+              "type": "uint32"
+            }
+          ],
+          "name": "EventDescC",
+          "size": 16
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "dynamic_type",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_input_position",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_group_size",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "dynamic_max_seq_len",
+              "offset": 12,
+              "type": "int32"
+            }
+          ],
+          "name": "DynamicDataC",
+          "size": 16
+        },
+        {
+          "fields": [
+            {
+              "count": 1,
+              "name": "task_num",
+              "offset": 0,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "num_workers",
+              "offset": 4,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "task_capacity",
+              "offset": 8,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "event_capacity",
+              "offset": 12,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "ready_event",
+              "offset": 16,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "cycle_profiling_enabled",
+              "offset": 20,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "aic_profile_record_capacity",
+              "offset": 24,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "aiv_profile_record_capacity",
+              "offset": 28,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "completion_event",
+              "offset": 32,
+              "type": "uint32"
+            },
+            {
+              "count": 1,
+              "name": "protocol_version",
+              "offset": 36,
+              "type": "uint32"
+            },
+            {
+              "count": 6,
+              "name": "_padding",
+              "offset": 40,
+              "type": "uint32"
+            }
+          ],
+          "name": "RuntimeConfigC",
+          "size": 64
+        }
+      ],
+      "task_types": [
+        {
+          "logical_name": "runtime.terminate.v1",
+          "native_name": "TASK_TERMINATE",
+          "numeric_id": 0
+        },
+        {
+          "logical_name": "runtime.begin.v1",
+          "native_name": "TASK_BEGIN_TASK_GRAPH",
+          "numeric_id": 10
+        },
+        {
+          "logical_name": "runtime.add_custom.v1",
+          "native_name": "TASK_ADD_CUSTOM",
+          "numeric_id": 101
+        },
+        {
+          "logical_name": "moe.swi_glu.v1",
+          "native_name": "TASK_SWI_GLU",
+          "numeric_id": 102
+        },
+        {
+          "logical_name": "moe.matmul.v1",
+          "native_name": "TASK_MATMUL",
+          "numeric_id": 103
+        },
+        {
+          "logical_name": "moe.grouped_matmul.v1",
+          "native_name": "TASK_GROUPED_MATMUL",
+          "numeric_id": 104
+        },
+        {
+          "logical_name": "moe.shmem_put_mem_signal.v1",
+          "native_name": "TASK_SHMEM_PUT_MEM_SIGNAL",
+          "numeric_id": 105
+        },
+        {
+          "logical_name": "moe.shmem_get_mem.v1",
+          "native_name": "TASK_SHMEM_GET_MEM",
+          "numeric_id": 107
+        },
+        {
+          "logical_name": "moe.swi_glu_grad.v1",
+          "native_name": "TASK_SWI_GLU_GRAD",
+          "numeric_id": 106
+        }
+      ]
+    }
+  },
+  "manifest_version": 1
+}

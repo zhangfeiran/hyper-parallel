@@ -1,9 +1,9 @@
-# Python AST frontend: first implementation
+# Python AST frontend and Gate compatibility plans
 
 This implements the semantic frontend foundation from the 2026-10-07 AST design.
-The first milestone covers typed source capture, identity-based primitive schemas,
-ProgramIR and CPU reference interpretation. Native family integration remains a
-separate milestone.
+The implementation covers typed source capture, identity-based primitive schemas,
+ProgramIR, CPU reference interpretation and source-mapped Gate WorkerPipeline host
+plans. Device materialization and execution remain a separate milestone.
 
 ## Use the frontend
 
@@ -80,21 +80,74 @@ results. A custom access hook can declare read/write/reduce/atomic accesses to
 logical tensor arguments. Physical buffer aliasing and communication effects await
 buffer/runtime integration.
 
+## Gate WorkerPipeline host plans
+
+A supported text Route program with `schedule=mc.WorkerPipeline()` now provides
+`Program.plan(signature, topology, **constants)`:
+
+```python
+from hyper_parallel.core.multicore.frontend.examples.gate_route import _route
+
+plan = _route.plan({"T": 33, "E": 4}, mc.HardwareSpec(48), k=3, scale=2.5)
+print(plan.explain())
+print(plan.export_manifest())
+normal_runtime_bytes = plan.forward.normal
+profiled_runtime_bytes = plan.forward.profiled
+```
+
+The signature supplies exactly the symbolic input dimensions; a program with
+static input shapes needs no shape signature. Hardware topology supplies the
+available AIV workers independently of computation. Planning does not probe or
+read devices. `from_source(..., schedule=mc.WorkerPipeline())` supports the same
+plan API for explicit source.
+
+The compiler proves that the graph uses the canonical Route schemas and complete
+dataflow: FP32 logits and detached bias; sqrt after softplus; selection using
+scores plus bias; unsorted last-axis top-k; gathering original scores; row sums,
+`1.0e-20` epsilon and division for k greater than one; scale and int64 indices.
+Changing these contracts, adding extra operations or declaring mutating effects
+causes an explicit rejection. Matching only a familiar primitive name is not
+sufficient. The backend emits the pinned forward/backward templates after these
+checks.
+
+The Gate semantic IR has 11 operations for k greater than one and 8 for k equal to
+one. Both lower to the existing ten-stage forward descriptor sequence. For k equal
+to one, ReduceSum/AddEpsilon/Div descriptors remain present, with an explicit
+`retained_legacy_k1_stage` reason. Backward selects the original eleven-stage or
+two-stage descriptor template, retaining the separate CANN postprocessing and
+optional direct-logits gradient addition as external call metadata.
+
+`KernelPlan` includes normal/profiled images, logical/native stage identities,
+source spans, native binding order and the five saved-state names. The schedule
+keeps each launched worker's ordered stages and row interval, including native
+empty tail workers. Images retain the fixed 48-worker slot capacity and their
+bytes are independent of token count/available workers. `schedule.simulate()`
+enumerates the ordered descriptor visits for each launched worker; it does not
+simulate device instructions, streams or CANN postprocessing.
+
+Family contracts are documented in the
+[compatibility baseline](../runtime/baselines/README.md). CPU tests reproduce all
+six Gate wire images byte for byte against snapshots from the original builder,
+and compile extracted original C++ declarations to check Python structure sizes
+and field offsets for MoE, MHC and Gate.
+
 ## Current implementation boundary
 
-`WorkerPipeline` and `TaskDAG` currently record schedule selection metadata.
-There is no schedule emitter, device plan, native launcher, cache or generated
-Ascend code in this milestone. The Gate semantic IR has 11 operations for k greater
-than 1 and 8 for k equal to 1; those counts are not native stage descriptors. In
-particular, the existing Gate ten-stage forward sequence must be preserved by a
-future compatibility lowering even when constexpr removes normalization here.
-
+`TaskDAG` still records selection metadata; MoE/MHC schedule lowering is pending.
 The default MegaMoE call path, workers, runtime ABI and backward code are retained.
 The component package loads MegaMoE/profiler business exports on first access,
 allowing this frontend to import without torch_npu or a native payload.
 
-The next stages need the P0 family ABI manifests and fixed plan snapshots, followed
-by Gate WorkerPipeline lowering, MegaMoE's complete legacy finalize/RATR path and
-backward adapter, and MHC fork/ring-buffer contracts. Ragged tensors, tensor lists,
-runtime/shape scalars, buffer planning and native backward recipes are not yet
-implemented. No NPU correctness or performance result is claimed by these CPU tests.
+Gate plans currently report `native_status=unbound` and
+`device_tiling=required_from_legacy_host`. Native host tiling must still validate
+UB/workspace requirements and materialize the plan. No native library, tensor
+pointer, stream or workspace is bound by `Program.plan()`. A build-provided
+`NativeManifest` can be checked against the selected family ABI/source contract;
+this metadata guard does not inspect ELF contents or prove a device build. The
+native build does not yet emit this frontend manifest.
+
+The remaining Gate integration includes the legacy native payload, host tiling,
+materialization, autograd/saved-state resource adapter, vision masking and device
+validation. Full MoE/MHC plan snapshots and lowering remain pending, as do ragged
+tensors, tensor lists, runtime/shape scalars, buffer planning, cache and generated
+Ascend workers. CPU plan parity is not an NPU correctness or performance result.

@@ -24,10 +24,15 @@ from hyper_parallel.core.multicore.frontend.program import (
     helper,
     program,
 )
-from hyper_parallel.core.multicore.ir.schedule import TaskDAG, WorkerPipeline
+from hyper_parallel.core.multicore.ir.schedule import (
+    HardwareSpec,
+    TaskDAG,
+    WorkerPipeline,
+)
 
 __all__ = [
     "FrontendError",
+    "HardwareSpec",
     "Program",
     "TaskDAG",
     "WorkerPipeline",
