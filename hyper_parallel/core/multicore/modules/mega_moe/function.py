@@ -330,16 +330,22 @@ def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
 
 
 def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool = False,
-                   gradient_return: torch.Tensor | None = None) -> torch.Tensor:
+                   gradient_return: torch.Tensor | None = None, home_only: bool = False) -> torch.Tensor:
     """Append split addresses after profiler preparation, retaining the base ABI."""
     if gradient_return is not None and (not backward or getattr(pool, "projection_ready", None) is None):
         raise ValueError("Kernel gradient metadata requires a projection-ready backward lease")
-    if pool is None:
+    if pool is None and not home_only:
         return base
-    pointers = (0, 0) if not backward else tuple(value.data_ptr() for value in pool.gradients)
-    ready = pool.weight_ready
-    values = (home, *(value.data_ptr() for value in pool.weights), *pointers)
-    projection_ready = getattr(pool, "projection_ready", None)
+    # An enabled replica graph still needs per-home-expert GMM addressing.
+    # Empty global plans cannot read guest matrices, so their pointers stay null.
+    if pool is None:
+        ready, projection_ready = None, None
+        values = (home, 0, 0, 0, 0)
+    else:
+        pointers = (0, 0) if not backward else tuple(value.data_ptr() for value in pool.gradients)
+        ready = pool.weight_ready
+        values = (home, *(value.data_ptr() for value in pool.weights), *pointers)
+        projection_ready = getattr(pool, "projection_ready", None)
     if projection_ready is not None:
         bases, epoch = projection_ready
         if len(bases) != 2:
@@ -388,7 +394,8 @@ def _launch_forward_kernel(
         plan.up_proj_tiling,
         plan.swiglu_tiling,
         plan.down_proj_tiling,
-        _split_runtime(execution.profile_call.runtime_config, pool, weight1.shape[0]),
+        _split_runtime(execution.profile_call.runtime_config, pool, weight1.shape[0],
+                       home_only=pool is None and bool(spec.replica_slots_per_rank)),
         execution.profile_call.event_counters,
         execution.profile_call.profile_buffer,
         spec.rank_id,
@@ -439,7 +446,7 @@ def _launch_backward_kernel(
         execution.gmm_workspace,
         execution.swiglu_workspace,
         _split_runtime(execution.profile_call.runtime_config, pool, saved.weight1.shape[0], backward=True,
-                       gradient_return=gradient_return),
+                       gradient_return=gradient_return, home_only=pool is None and bool(spec.replica_slots_per_rank)),
         execution.profile_call.event_counters,
         execution.profile_call.profile_buffer,
         spec.rank_id,
@@ -505,11 +512,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         else:
             workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
             workspace.claim()
+        has_replica_transfers = ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers)
         execution = None
         leases = ExitStack()
         try:
             provider = workspace.replica_provider
-            pool = None if ctx.replica_route is None else leases.enter_context(
+            pool = None if not has_replica_transfers else leases.enter_context(
                 prefetch_weights(home_weights, ctx.replica_route, provider=provider, overlap=True))
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
             capacity = metadata.expert_capacity
@@ -582,11 +590,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         permutation_inputs = saved_tensors[12:]
         del saved_tensors
         workspace.claim()
+        has_replica_transfers = ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers)
         execution = None
         leases = ExitStack()
         try:
             provider = workspace.replica_provider
-            pool = None if ctx.replica_route is None else leases.enter_context(
+            pool = None if not has_replica_transfers else leases.enter_context(
                 prefetch_weights((saved.weight1, saved.weight2), ctx.replica_route,
                                  backward=True, provider=provider, overlap=True))
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
@@ -596,7 +605,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 plan,
                 saved,
                 grad_output,
-                has_replica_transfers=ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers),
+                has_replica_transfers=has_replica_transfers,
             )
             early_return = prepare_kernel_gradient_return(
                 plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,
@@ -608,7 +617,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             execution.profile_call.complete()
             grad_weight1 = execution.intermediates.grad_weight1
             grad_weight2 = execution.intermediates.grad_weight2
-            if ctx.replica_route is not None:
+            if has_replica_transfers:
                 if early_return is not None and 0 in early_return.matrices:
                     pass  # The fused kernel owns both returns through their final ACKs.
                 elif early_return is not None:
