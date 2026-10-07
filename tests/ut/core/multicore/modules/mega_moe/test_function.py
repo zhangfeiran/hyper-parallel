@@ -28,6 +28,8 @@ from hyper_parallel.core.multicore.modules.mega_moe import function as function_
 from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
 from tests.common.mark_utils import arg_mark
 
+from tests.common.mark_utils import arg_mark
+
 
 # The private autograd bridge and saved execution buffers are the contracts under test.
 class TestMegaMoeFunction(unittest.TestCase):
@@ -61,6 +63,64 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertIs(result[1], execution.intermediates.grad_weight1)
         self.assertIs(result[2], execution.intermediates.grad_weight2)
         context.workspace.release.assert_called_once_with()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_static_runtime_cache_reuses_image_and_bounds_replacement(self) -> None:
+        """
+        Feature: Static runtime caching
+        Description: Reuse writable scratch, then change base identity and suffix pointers.
+        Expectation: Reuse identical images and replace only changed entries.
+        """
+        base = torch.arange(16, dtype=torch.uint8)
+        cache = {}
+        with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream", autospec=True):
+            first = function_module._split_runtime(base, None, 6, home_only=True, cache=cache)
+            first[base.numel() - 1] = 93
+            repeated = function_module._split_runtime(base, None, 6, home_only=True, cache=cache)
+            self.assertIs(repeated, first)
+            self.assertEqual(repeated[base.numel() - 1].item(), 93)
+            self.assertEqual(base[-1].item(), 15)
+            weights, gradients = (torch.empty(1), torch.empty(2)), (torch.empty(3), torch.empty(4))
+            pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=None, projection_ready=None)
+            active = function_module._split_runtime(base, pool, 6, cache=cache)
+            self.assertIsNot(active, first)
+            self.assertIs(function_module._split_runtime(base, pool, 6, cache=cache), active)
+            backward = function_module._split_runtime(base, pool, 6, backward=True, cache=cache)
+            self.assertIsNot(backward, active)
+            self.assertEqual(len(cache), 1)
+            self.assertEqual(struct.unpack("<II5Q", bytes(active[base.numel():].tolist()))[-2:], (0, 0))
+            self.assertEqual(struct.unpack("<II5Q", bytes(backward[base.numel():].tolist()))[-2:],
+                             tuple(t.data_ptr() for t in gradients))
+            other_base = base.clone()
+            other = function_module._split_runtime(other_base, pool, 6, cache=cache)
+            self.assertIsNot(other, active)
+            self.assertEqual(len(cache), 2)
+            self.assertIs(cache[id(base)][0], base)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_dynamic_runtime_descriptors_never_enter_static_cache(self) -> None:
+        """
+        Feature: Dynamic runtime ownership
+        Description: Construct v3, v4 and v5 descriptors twice.
+        Expectation: Return independent images without static cache entries.
+        """
+        base = torch.arange(16, dtype=torch.uint8)
+        weights, gradients = (torch.empty(1), torch.empty(2)), (torch.empty(3), torch.empty(4))
+        descriptor = torch.empty(16, dtype=torch.uint8)
+        for version in (3, 4, 5):
+            cache = {}
+            ready = (4096, 1) if version == 3 else None
+            projection = None if version == 3 else ((4096, 8192), 1)
+            pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=ready,
+                                   projection_ready=projection)
+            options = {"backward": True, "gradient_return": descriptor} if version == 5 else {}
+            with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream", autospec=True):
+                first = function_module._split_runtime(base, pool, 6, cache=cache, **options)
+                second = function_module._split_runtime(base, pool, 6, cache=cache, **options)
+            self.assertIsNot(first, second)
+            self.assertFalse(cache)
 
     def test_home_only_runtime_keeps_split_addressing_without_guest_pointers(self) -> None:
         """A no-transfer B>0 graph still addresses home expert matrices separately."""
@@ -202,6 +262,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         workspace = Mock(
             replica_inbox=None,
             replica_provider=None,
+            replica_runtime_images={},
             in_use=False,
             expert_capacity=128,
             source_buffer=torch.empty(4, 4),

@@ -121,3 +121,25 @@ def test_pull_device_kernel_gradient() -> None:
 def test_native_deferred_topk() -> None:
     """Check legal routes and reverse backward across K=1/2/3/4/5/6/8."""
     torchrun_case(_WORKER, "test_native_deferred_topk_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_push_static_runtime_streams() -> None:
+    """
+    Feature: Push static invocation reuse
+    Description: Run two streams with retained plans and reversed backward.
+    Expectation: Match FP32 reference and reuse one image per direction.
+    """
+    torchrun_case(_WORKER, "test_push_static_runtime_streams_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_pull_static_runtime_streams() -> None:
+    """
+    Feature: Pull static invocation reuse
+    Description: Run two streams with retained plans and reversed backward.
+    Expectation: Match FP32 reference and reuse one image per direction.
+    """
+    torchrun_case(_WORKER, "test_pull_static_runtime_streams_npu", num_proc=4)

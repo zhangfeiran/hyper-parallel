@@ -109,8 +109,29 @@ def _diagnose(module, optimizer, values, ids, probabilities, gradient, directory
                      "use framework kernel records for device execution, not their sum as step latency."}
 
 
+def _host_breakdown(module, optimizer, values, ids, probabilities, gradient):
+    records = []
+    for _ in range(5):
+        optimizer.zero_grad(set_to_none=True)
+        values.grad = None
+        dist.barrier()
+        torch.npu.synchronize()
+        with HostMeasurements(device_intervals=False) as host:
+            output = module(values, ids, probabilities)
+            output.backward(gradient)
+            optimizer.step()
+        torch.npu.synchronize()
+        records.append(host.records)
+    return {"samples": records, "scope": "Untimed host-only inclusive spans; no Torch/internal profiler or "
+                                         "per-stage device events. Spans nest and must not be summed as step latency."}
+
+
 def run(args: argparse.Namespace) -> None:
-    """Run one shape/variant per process, keeping profiling out of timed samples."""
+    """Run one shape/variant per process, keeping profiling out of timed samples.
+
+    Args:
+        args: Benchmark shape, transport, planner and diagnostic options.
+    """
     rank, size = dist.get_rank(), dist.get_world_size()
     endpoint = [f"tcp://127.0.0.1:{allocate_port()}" if rank == 0 else None]
     dist.broadcast_object_list(endpoint, src=0)
@@ -159,8 +180,13 @@ def run(args: argparse.Namespace) -> None:
                 "plans": plans}
         diagnostic = None
         if args.diagnose:
-            diagnostic = _diagnose(module, optimizer, values, routes["home_hot"][0], probabilities, gradient,
-                                   directory, results["home_hot"]["plans"][0])
+            diagnostic = _diagnose(module, optimizer, values, routes[args.diagnose_pattern][0], probabilities, gradient,
+                                   directory, results[args.diagnose_pattern]["plans"][0])
+        host_breakdown = None
+        if args.host_breakdown:
+            host_breakdown = {pattern: _host_breakdown(module, optimizer, values, routes[pattern][0],
+                                                       probabilities, gradient)
+                              for pattern in ("balanced", "home_hot")}
         vendor, adapter = get_multicore_paths()
         identity = execution_identity()
         identity.update(torch_npu=torch_npu.__version__, configuration=vars(args),
@@ -168,7 +194,8 @@ def run(args: argparse.Namespace) -> None:
                         adapter=file_identity(adapter), kernels=[file_identity(p) for p in sorted(vendor.rglob("*.o"))],
                         transport_abi=torch.ops.hyper_parallel.mega_moe_transport_version())
         (directory / "result.json").write_text(json.dumps({"identity": identity, "cold": cold, "warm": results,
-                                                          "diagnostic": diagnostic, "calibration":
+                                                          "diagnostic": diagnostic, "host_breakdown": host_breakdown,
+                                                          "calibration":
                                                           None if calibration is None else asdict(calibration)},
                                                          indent=2) + "\n", encoding="utf-8")
         if rank == 0:
@@ -191,7 +218,9 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--cost-model")
+    parser.add_argument("--host-breakdown", action="store_true")
     parser.add_argument("--diagnose", action="store_true")
+    parser.add_argument("--diagnose-pattern", choices=("balanced", "home_hot"), default="home_hot")
     parser.add_argument("--result-dir", required=True)
     args = parser.parse_args()
     if args.iterations < 2 or args.warmup < 1:

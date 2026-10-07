@@ -103,6 +103,7 @@ class MegaMoeWorkspace:
     gmm_workspace: Any | None = None
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
+    replica_runtime_images: dict[int, tuple[Any, bytes, Any]] = field(default_factory=dict, repr=False)
     in_use: bool = False
     closing: bool = False
     used: bool = False
@@ -315,6 +316,9 @@ class MegaMoeWorkspace:
 
     def _free_local_tensors(self) -> None:
         """Release local-only workspaces after all queued kernels complete."""
+        for _, _, image in self.replica_runtime_images.values():
+            image.untyped_storage().resize_(0)
+        self.replica_runtime_images.clear()
         for field_name in ("gmm_workspace", "swiglu_grad_workspace"):
             tensor = getattr(self, field_name)
             if tensor is None:
@@ -343,7 +347,8 @@ class MegaMoeWorkspace:
                 self.gmm_workspace,
                 self.swiglu_grad_workspace,
                 self.completion_event,
-            ))
+                self.replica_inbox,
+            )) and not self.replica_runtime_images
             self.closing = True
         # An empty rank must still participate when peers retain buffers after a failure.
         if all(_automatic.exchange(empty)):
