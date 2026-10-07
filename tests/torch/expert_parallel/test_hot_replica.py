@@ -25,6 +25,18 @@ _WORKER = str(Path(__file__).with_name("_test_hot_replica.py"))
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
+def test_replica_count_payload() -> None:
+    """
+    Feature: Fixed-size route counting
+    Description: Exercise empty and invalid routes and a count exceeding FP32's exact range.
+    Expectation: Payloads retain exact int64 counts and collective error flags without readback.
+    """
+    torchrun_case(str(Path(__file__).with_name("_test_replica_boundaries.py")),
+                  "test_replica_count_payload_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
 def test_native_hot_replica() -> None:
     """Check native training with bounded expert replicas."""
     torchrun_case(_WORKER, "test_native_hot_replica_npu", num_proc=4)

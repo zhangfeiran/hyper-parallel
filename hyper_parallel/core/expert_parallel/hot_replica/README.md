@@ -44,6 +44,10 @@ Both push and pull execute a single physical expert schedule. B=0 retains the
 existing path. Hot replication requires distinct, in-range expert IDs within
 each token's TopK selection. Multicore validates this collectively before sparse
 weight communication. Native receives the existing expert-major count contract.
+Multicore builds a fixed-length int64 histogram with clamped IDs and
+`scatter_add_`, retaining out-of-range and duplicate flags in the same collective
+payload. This avoids `bincount`'s device min/max scalar reads without changing
+the collective validation contract or reducing count precision.
 
 ## Capacity and placement
 
