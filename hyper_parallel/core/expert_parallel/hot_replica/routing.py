@@ -94,6 +94,15 @@ def _gather_replica_counts(payload: torch.Tensor, size: int, group: object) -> t
     return gathered
 
 
+def _replica_count_payload(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Keep route validation and logical counts in one collective payload."""
+    ordered = (ids.float() if num_experts <= 2**24 else ids).sort(dim=1).values
+    invalid = ((ids < 0) | (ids >= num_experts)).any()
+    invalid = invalid | (ordered[:, 1:] == ordered[:, :-1]).any()
+    counts = torch.bincount(ids.clamp(0, num_experts - 1).flatten(), minlength=num_experts)
+    return torch.cat((counts, invalid.reshape(1).to(counts.dtype)))
+
+
 def prepare_replica_route(
     topk_ids: torch.Tensor, config: ExpertReplicaConfig, group: object = None,
     *, target_load: int | None = None, minimum_replica_rows: int = 0,
@@ -127,11 +136,7 @@ def prepare_replica_route(
     tokens, top_k = topk_ids.shape
     upper = config.maximum_receive_rows(tokens, top_k, alignment=1)
     ids = topk_ids.to(torch.int64)
-    ordered = (ids.float() if config.num_experts <= 2**24 else ids).sort(dim=1).values
-    invalid = ((ids < 0) | (ids >= config.num_experts)).any()
-    invalid = invalid | (ordered[:, 1:] == ordered[:, :-1]).any()
-    counts = torch.bincount(ids.clamp(0, config.num_experts - 1).flatten(), minlength=config.num_experts)
-    payload = torch.cat((counts, invalid.reshape(1).to(counts.dtype)))
+    payload = _replica_count_payload(ids, config.num_experts)
     matrix = _gather_replica_counts(payload, size, group)
     if planner_backend == "device":
         device_plan = build_device_expert_replica_plan(

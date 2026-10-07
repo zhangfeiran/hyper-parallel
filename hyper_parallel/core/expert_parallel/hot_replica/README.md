@@ -581,3 +581,15 @@ copies the local payload without creating a collective. CPU and device planners
 consume the same layout without stacking separate rank tensors. Placement,
 quotas, error validation and the existing device control-summary readback remain
 unchanged. Native continues to use HCCL P2P for expert weights and gradients.
+
+The lightweight benchmark observer also reports `validation_and_counts` for
+the route payload before count exchange. This inclusive host span covers ID
+validation, duplicate detection and logical histograms; it can include queue
+waits and must not be added to nested spans to infer step latency.
+
+The `test_push_projection_runtime_lifetime` and
+`test_pull_projection_runtime_lifetime` launchers retain v4 images on two actual
+NPU streams and reverse backward order. Each direction must use independent
+images with distinct epochs. Device tail snapshots taken after each consumer
+must match that invocation's packed bytes, and output/gradient checks use the
+FP32 native reference. Dynamic v4 images continue to be constructed independently.
