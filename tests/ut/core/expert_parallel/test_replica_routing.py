@@ -15,6 +15,7 @@
 """CPU oracles for packed route metadata and stable no-copy remapping."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -22,10 +23,58 @@ import torch
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
 from hyper_parallel.core.expert_parallel.hot_replica import routing
+from tests.common.mark_utils import arg_mark
 
 
 class TestReplicaRouting(unittest.TestCase):
     """Compare both remap paths with explicit per-expert occurrence quotas."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_gather_preserves_rank_order_flags_and_retained_invocations(self) -> None:
+        """
+        Feature: Invocation-owned count gather
+        Description: Complete delayed rank-major collectives and retain their outputs.
+        Expectation: Counts and validation flags remain exact, independent and ordered after wait.
+        """
+        expected = torch.tensor([[10, 11, 0], [20, 21, 1], [30, 31, 0], [40, 41, 0]])
+        group, waited = object(), []
+
+        def _gather(output, payload, **options):
+            self.assertIs(options["group"], group)
+            self.assertTrue(options["async_op"])
+            self.assertTrue(output.is_contiguous())
+            self.assertEqual(output.dtype, payload.dtype)
+
+            def _wait():
+                output.copy_(expected.flatten())
+                waited.append(True)
+
+            return SimpleNamespace(wait=_wait)
+
+        with patch.object(routing.dist, "all_gather_into_tensor", side_effect=_gather):
+            first = routing._gather_replica_counts(expected[0], 4, group)
+            self.assertEqual(len(waited), 1)
+            torch.testing.assert_close(first, expected)
+            expected.add_(100)
+            second = routing._gather_replica_counts(expected[0], 4, group)
+            torch.testing.assert_close(second, expected)
+            torch.testing.assert_close(first, expected - 100)
+            self.assertNotEqual(first.data_ptr(), second.data_ptr())
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_local_count_gather_owns_storage_without_distributed_setup(self) -> None:
+        """
+        Feature: Single-rank count ownership
+        Description: Gather a local integer payload without an initialized process group.
+        Expectation: The returned row preserves values and survives later input mutation.
+        """
+        payload = torch.tensor([3, 5, 0], dtype=torch.int32)
+        with patch.object(routing.dist, "all_gather_into_tensor", side_effect=AssertionError("Unexpected collective")):
+            result = routing._gather_replica_counts(payload, 1, None)
+        payload.zero_()
+        torch.testing.assert_close(result, torch.tensor([[3, 5, 0]], dtype=torch.int32))
 
     def test_remap_matches_occurrence_oracle_and_dispatch_counts(self):
         """Preserve every TopK position for zero, one and multiple guest budgets."""
