@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict
 from functools import wraps
 from typing import Any
@@ -120,7 +120,7 @@ def _check(actual, expected, label, *, elementwise=True, rtol=2e-2, atol=2e-3):
 
 
 def _deferred_backward(base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference,
-                       replica_planner, *, growth=False, require_transfers=True):
+                       replica_planner, *, growth=False, require_transfers=True, cross_stream=False):
     """Keep different plans live, then run backward in reverse invocation order."""
     # Isolate saved-plan lifetime from tolerated optimizer-rounding drift.
     with torch.no_grad():
@@ -139,6 +139,8 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
     pending = []
     plans = []
     capacities = []
+    streams = [torch.npu.Stream(), torch.npu.Stream()] if cross_stream else []
+    main_stream = torch.npu.current_stream() if cross_stream else None
     for invocation in range(2):
         torch.manual_seed(833 + rank + invocation)
         values = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device).requires_grad_()
@@ -148,8 +150,12 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
             ids = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k).remainder(experts).long()
         probabilities = torch.full((tokens, top_k), 1.0 / top_k, device=device, requires_grad=True)
         other_probabilities = probabilities.detach().clone().requires_grad_()
-        expected = _expert_forward(base, reference, values, ids, probabilities, experts)
-        actual = _expert_forward(candidate, executor, other, ids, other_probabilities, experts)
+        stream = None if not streams else streams[invocation % 2]
+        if stream is not None:
+            stream.wait_stream(main_stream)
+        with nullcontext() if stream is None else torch.npu.stream(stream):
+            expected = _expert_forward(base, reference, values, ids, probabilities, experts)
+            actual = _expert_forward(candidate, executor, other, ids, other_probabilities, experts)
         plans.append(route_evidence(actual, replica_planner) if require_transfers else None)
         if growth:
             resources = executor._get_execution_resources(other)
@@ -162,22 +168,34 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
     if growth and capacities[1] <= capacities[0]:
         raise AssertionError(f"Expected heap growth with an old forward alive: {capacities}")
     checks = []
-    for expected, actual, values, other, probabilities, other_probabilities in reversed(pending):
+    previous_backward = None
+    for invocation, (expected, actual, values, other, probabilities, other_probabilities) in reversed(
+            list(enumerate(pending))):
         gradient = torch.randn_like(expected)
-        expected.backward(gradient)
-        actual.backward(gradient)
-        for name in ("w1", "w2", "w3"):
-            _check(partials[1][name], partials[0][name], "deferred partial " + name)
-            for index, module in enumerate((base, candidate)):
-                if name not in accumulated[index]:
-                    accumulated[index][name] = partials[index][name].clone()
-                else:
-                    accumulated[index][name].add_(partials[index][name])
-                _check(_local(getattr(module, name).grad), accumulated[index][name],
-                       "exact accumulated " + name, rtol=0, atol=0)
-        checks.append({"output": _check(actual, expected, "deferred output"),
-                       "dx": _check(other.grad, values.grad, "deferred dx"),
-                       "dprob": _check(other_probabilities.grad, probabilities.grad, "deferred dprob")})
+        stream = None if not streams else streams[1 - invocation % 2]
+        if stream is not None:
+            stream.wait_stream(main_stream)
+            stream.wait_stream(streams[invocation % 2])
+            if previous_backward is not None:
+                stream.wait_stream(previous_backward)
+        with nullcontext() if stream is None else torch.npu.stream(stream):
+            expected.backward(gradient)
+            actual.backward(gradient)
+            for name in ("w1", "w2", "w3"):
+                _check(partials[1][name], partials[0][name], "deferred partial " + name)
+                for index, module in enumerate((base, candidate)):
+                    if name not in accumulated[index]:
+                        accumulated[index][name] = partials[index][name].clone()
+                    else:
+                        accumulated[index][name].add_(partials[index][name])
+                    _check(_local(getattr(module, name).grad), accumulated[index][name],
+                           "exact accumulated " + name, rtol=0, atol=0)
+            checks.append({"output": _check(actual, expected, "deferred output"),
+                           "dx": _check(other.grad, values.grad, "deferred dx"),
+                           "dprob": _check(other_probabilities.grad, probabilities.grad, "deferred dprob")})
+        previous_backward = stream
+    if previous_backward is not None:
+        main_stream.wait_stream(previous_backward)
     for hook in hooks:
         hook.remove()
     # Elementwise tolerances apply to each incoming partial above. BF16 summation
@@ -187,6 +205,39 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
                                       "accumulated " + name, elementwise=False)
                          for name in ("w1", "w2", "w3")}
     return {"invocations": checks, "accumulated": accumulated_error, "plans": plans, "capacities": capacities}
+
+
+def _cross_stream_deferred(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,
+                           reference, replica_planner):
+    """Prove that static images survive reuse on two streams and reverse backward."""
+    function = importlib.import_module("hyper_parallel.core.multicore.modules.mega_moe.function")
+    launches = []
+
+    def _observe(original, direction, execution_index):
+        @wraps(original)
+        def _launch(*args, **kwargs):
+            result = original(*args, **kwargs)
+            execution = args[execution_index]
+            cache = execution.runtime_cache
+            entry = None if cache is None else cache.get(id(execution.profile_call.runtime_config))
+            if entry is None:
+                raise AssertionError("Cross-stream acceptance requires a cached static v2 image")
+            launches.append({"direction": direction, "stream": torch.npu.current_stream().npu_stream,
+                             "image_pointer": entry[2].data_ptr(), "suffix": entry[1].hex()})
+            return result
+        return _launch
+
+    with (patch.object(function, "_launch_forward_kernel", _observe(function._launch_forward_kernel, "forward", 5)),
+          patch.object(function, "_launch_backward_kernel", _observe(function._launch_backward_kernel, "backward", 3))):
+        checks = _deferred_backward(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,
+                                    reference, replica_planner, cross_stream=True)
+    for direction in ("forward", "backward"):
+        records = [item for item in launches if item["direction"] == direction]
+        if len(records) != 2 or len({item["stream"] for item in records}) != 2:
+            raise AssertionError(f"Expected two actual {direction} streams: {records}")
+        if len({item["image_pointer"] for item in records}) != 1 or len({item["suffix"] for item in records}) != 1:
+            raise AssertionError(f"Static {direction} runtime image was not reused: {records}")
+    return {"checks": checks, "launches": launches}
 
 
 def _cross_layer_pool(backend, budget, mesh, executor, reference, tokens, hidden, intermediate, top_k,
@@ -355,8 +406,10 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         same_backend_reference: bool = False, replica_transport: str = "p2p",
         benchmark_iterations: int = 0, replica_min_rows: int = 0, replica_planner: str = "cpu",
         default_group: bool = False, fp32_reference: bool = False,
-        cost_model: ExpertReplicaCostModel | None = None) -> None:
+        cost_model: ExpertReplicaCostModel | None = None, cross_stream: bool = False) -> None:
     """Compare full forward/backward with native B=0, preserving EP ownership."""
+    if cross_stream and (backend == "native" or replica_transport != "p2p"):
+        raise ValueError("Static runtime cross-stream acceptance requires MegaMoe P2P")
     if fp32_reference and same_backend_reference:
         raise ValueError("Select only one reference backend")
     rank, size = dist.get_rank(), dist.get_world_size()
@@ -462,6 +515,10 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         if backend == "native" and any(
                 name.startswith("hyper_parallel.core.multicore") for name in sys.modules):
             raise AssertionError("native execution imported multicore")
+        cross_stream_result = None
+        if cross_stream:
+            cross_stream_result = _cross_stream_deferred(base, candidate, executor, experts, rank, device,
+                                                        tokens, hidden, top_k, reference, replica_planner)
         cross_layer = []
         if hidden <= 128:
             cross_layer = _cross_layer_pool(backend, budget, mesh, executor, reference,
@@ -520,7 +577,7 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         Path(result_dir).mkdir(parents=True, exist_ok=True)
         Path(result_dir, f"{backend}-b{budget}-rank{rank}.json").write_text(
             json.dumps({"identity": identity, "growth_deferred": growth, "steps": results,
-                        "deferred": deferred, "cross_layer": cross_layer,
+                        "deferred": deferred, "cross_layer": cross_layer, "cross_stream": cross_stream_result,
                         "replica_transport": replica_transport, "replica_min_rows": replica_min_rows,
                         "signal_stress": signal_stress, "kernel_wait": kernel_wait, "timing": timing},
                        indent=2) + "\n", encoding="utf-8")
@@ -548,6 +605,7 @@ def main() -> None:
                         choices=("p2p", "shmem", *SIGNAL_TRANSPORT_MODES),
                         default="p2p")
     parser.add_argument("--replica-planner", choices=("cpu", "device"), default="cpu")
+    parser.add_argument("--cross-stream", action="store_true")
     parser.add_argument("--cost-model")
     parser.add_argument("--default-group", action="store_true")
     parser.add_argument("--fp32-reference", action="store_true")
@@ -572,7 +630,7 @@ def main() -> None:
             same_backend_reference=args.same_backend_reference, replica_transport=args.replica_transport,
             benchmark_iterations=args.benchmark_iterations, replica_min_rows=args.replica_min_rows,
             replica_planner=args.replica_planner, default_group=args.default_group, fp32_reference=args.fp32_reference,
-            cost_model=None if args.cost_model is None else ExpertReplicaCostModel(
+            cross_stream=args.cross_stream, cost_model=None if args.cost_model is None else ExpertReplicaCostModel(
                 **json.loads(Path(args.cost_model).read_text(encoding="utf-8"))["model"]))
     finally:
         dist.destroy_process_group()
@@ -655,3 +713,13 @@ def test_native_deferred_topk_npu() -> None:
             run("native", 1, str(directory), top_k=top_k, fp32_reference=True)
     finally:
         dist.destroy_process_group()
+
+
+def test_push_static_runtime_streams_npu() -> None:
+    """Reuse static v2 images across streams and reversed backward in push."""
+    _pytest_case("push", top_k=8, fp32_reference=True, cross_stream=True)
+
+
+def test_pull_static_runtime_streams_npu() -> None:
+    """Reuse static v2 images across streams and reversed backward in pull."""
+    _pytest_case("pull", top_k=8, fp32_reference=True, cross_stream=True)

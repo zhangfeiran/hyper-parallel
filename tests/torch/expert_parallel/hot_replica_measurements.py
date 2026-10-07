@@ -37,17 +37,24 @@ from hyper_parallel.core.multicore.modules.mega_moe import function
 class HostMeasurements:
     """Measure inclusive host spans and stream intervals in a diagnostic invocation."""
 
-    def __init__(self) -> None:
-        """Keep all events alive until the diagnostic stream completes."""
+    def __init__(self, *, device_intervals: bool = True) -> None:
+        """Optionally omit device events for a lightweight host-only observation."""
+        self.device_intervals = device_intervals
         self.records = []
         self.stack = []
         self.patches = ExitStack()
 
     @contextmanager
     def span(self, name: str) -> Iterator[None]:
-        """Record queue intervals without synchronizing each observed operation."""
-        start_event, end_event = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-        start_event.record()
+        """Record queue intervals without synchronizing each observed operation.
+
+        Args:
+            name: Stage name for the inclusive interval.
+        """
+        start_event, end_event = None, None
+        if self.device_intervals:
+            start_event, end_event = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+            start_event.record()
         parent = self.stack[-1] if self.stack else None
         self.stack.append(name)
         start = time.perf_counter()
@@ -55,7 +62,8 @@ class HostMeasurements:
             yield
         finally:
             elapsed = (time.perf_counter() - start) * 1000
-            end_event.record()
+            if end_event is not None:
+                end_event.record()
             self.stack.pop()
             self.records.append({"stage": name, "parent": parent, "host_ms": elapsed,
                                  "events": (start_event, end_event)})
@@ -63,8 +71,14 @@ class HostMeasurements:
     def _wrap(self, original, name):
         @wraps(original)
         def _measured(*args, **kwargs):
+            cache = kwargs.get("cache") if name == "invocation_metadata" else None
+            previous = None if cache is None else cache.get(id(args[0]))
             with self.span(name):
-                return original(*args, **kwargs)
+                result = original(*args, **kwargs)
+            if name == "invocation_metadata":
+                self.records[-1].update(base_bytes=args[0].numel(), image_bytes=result.numel(),
+                                       cache_hit=previous is not None and previous[2] is result)
+            return result
         return _measured
 
     def __enter__(self) -> HostMeasurements:
@@ -118,10 +132,12 @@ class HostMeasurements:
     def __exit__(self, *args: Any) -> None:
         """Restore all functions before draining the diagnostic events."""
         self.patches.close()
-        torch.npu.synchronize()
+        if self.device_intervals:
+            torch.npu.synchronize()
         for record in self.records:
             start, end = record.pop("events")
-            record["stream_interval_ms"] = start.elapsed_time(end)
+            if start is not None:
+                record["stream_interval_ms"] = start.elapsed_time(end)
 
 
 def _payload_bytes(tensors):
@@ -132,7 +148,16 @@ def _payload_bytes(tensors):
 
 
 def memory_snapshot(module: object, values: torch.Tensor, output: torch.Tensor | None = None) -> dict:
-    """Separate external SHMEM reservations from overlapping Torch subcategories."""
+    """Separate external SHMEM reservations from overlapping allocator totals.
+
+    Args:
+        module: MegaMoe executor owning the execution resources.
+        values: Input used to resolve the active workspace.
+        output: Optional graph root for saved-storage accounting.
+
+    Returns:
+        Memory totals, overlapping component bytes and capacity information.
+    """
     resources = module._get_execution_resources(values)
     state = shmem.debug_state()
     weights = (module.gate_up_weight, module.down_weight)
@@ -167,6 +192,8 @@ def memory_snapshot(module: object, values: torch.Tensor, output: torch.Tensor |
             "guest_gradients": 0 if pool is None else _payload_bytes(pool.gradients or ()),
             "guest_pool_backing_storage": 0 if pool is None else _bytes(pool.weights + (pool.gradients or ())),
             "gradient_scratch": getattr(provider, "gradient_scratch_bytes", 0),
+            "replica_runtime_image_bytes": _bytes(tuple(entry[2] for entry in
+                getattr(resources.workspace, "replica_runtime_images", {}).values())),
             "saved_nonparameter_storages": _bytes(saved),
             "home_dw_fp32_expected": sum(weight.numel() for weight in weights) * 4 if budget else 0,
             "capacity": resources.workspace.capacity_floor, "maximum_capacity": resources.spec.maximum_receive_capacity,

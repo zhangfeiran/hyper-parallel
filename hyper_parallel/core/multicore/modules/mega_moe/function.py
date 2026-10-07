@@ -83,6 +83,7 @@ class _ForwardExecution:
     event_counters: Any
     gmm_workspace: Any
     intermediates: _ForwardIntermediates
+    runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,7 @@ class _BackwardExecution:
     swiglu_workspace: Any
     intermediates: _BackwardIntermediates
     diagnostics: Any = None
+    runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -220,6 +222,7 @@ def _prepare_forward_execution(
     dispatch, source = _dispatch_and_source(plan.spec, workspace, routed_tokens, capacity)
     combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
     return _ForwardExecution(
+        runtime_cache=workspace.replica_runtime_images,
         dispatch=dispatch,
         source=source,
         combine=combine,
@@ -247,6 +250,7 @@ def _prepare_backward_execution(
                 else _workspace_tensor(workspace.expert_buffer, "expert_buffer"))
     grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
     return _BackwardExecution(
+        runtime_cache=workspace.replica_runtime_images,
         dispatch=dispatch,
         grad_x=grad_x,
         diagnostics=(getattr(plan, "bwd_diagnostics_no_replica", None) if not has_replica_transfers else None),
@@ -327,7 +331,8 @@ def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
 
 
 def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool = False,
-                   gradient_return: torch.Tensor | None = None, home_only: bool = False) -> torch.Tensor:
+                   gradient_return: torch.Tensor | None = None, home_only: bool = False,
+                   cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None) -> torch.Tensor:
     """Append split addresses after profiler preparation, retaining the base ABI."""
     if gradient_return is not None and (not backward or getattr(pool, "projection_ready", None) is None):
         raise ValueError("Kernel gradient metadata requires a projection-ready backward lease")
@@ -353,9 +358,24 @@ def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool =
     else:
         data = (struct.pack("<II5Q", 0x53505754, 2, *values) if ready is None else
                 struct.pack("<II7Q", 0x53505754, 3, *values, *ready))
+    return _runtime_image(base, data, cache, static=projection_ready is None and ready is None)
+
+
+def _runtime_image(base: torch.Tensor, data: bytes,
+                   cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None, *, static: bool) -> torch.Tensor:
+    """Reuse static images only inside the caller's serial workspace lease."""
+    # Kernel scratch is writable; workspace completion events order reuse.
+    cache = cache if static else None
+    previous = None if cache is None else cache.get(id(base))
+    if previous is not None and previous[0] is base and previous[1] == data:
+        result = previous[2]
+        result.record_stream(torch.npu.current_stream(base.device))
+        return result
     metadata = torch.tensor(list(data), dtype=torch.uint8, device=base.device)
     result = torch.cat((base, metadata))
     result.record_stream(torch.npu.current_stream(base.device))
+    if cache is not None:
+        cache[id(base)] = (base, data, result)
     return result
 
 
@@ -397,7 +417,7 @@ def _launch_forward_kernel(
             plan.swiglu_tiling,
             plan.down_proj_tiling,
             _split_runtime(plan.fwd_runtime_config, pool, weight1.shape[0],
-                           home_only=pool is None and bool(spec.replica_slots_per_rank)),
+                           home_only=pool is None and bool(spec.replica_slots_per_rank), cache=execution.runtime_cache),
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -477,7 +497,7 @@ def _launch_backward_kernel(
             execution.gmm_workspace,
             execution.swiglu_workspace,
             _split_runtime(diagnostics.runtime_config, pool, saved.weight1.shape[0], backward=True,
-                           gradient_return=gradient_return, home_only=pool is None and bool(spec.replica_slots_per_rank)),
+                           gradient_return=gradient_return, home_only=pool is None and bool(spec.replica_slots_per_rank), cache=execution.runtime_cache),
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
