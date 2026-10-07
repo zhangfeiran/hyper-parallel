@@ -572,3 +572,12 @@ streams in each direction. They compare output, dX, router-probability gradients
 and owner weight gradients with the FP32 native reference. For profiler coverage
 of the home-only v2 path, use `--diagnose --diagnose-pattern balanced` with the
 benchmark; the default diagnostic pattern remains `home_hot`.
+
+Replica count exchange uses `all_gather_into_tensor` to fill one contiguous,
+rank-major buffer owned by the invocation. MegaMoe includes the collective route
+validation flag in each row; native gathers its existing logical counts. Both
+wait for the asynchronous collective before consuming the result, and EP=1
+copies the local payload without creating a collective. CPU and device planners
+consume the same layout without stacking separate rank tensors. Placement,
+quotas, error validation and the existing device control-summary readback remain
+unchanged. Native continues to use HCCL P2P for expert weights and gradients.

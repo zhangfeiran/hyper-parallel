@@ -28,7 +28,7 @@ from .capacity import ExpertReplicaConfig
 from .cost import ExpertReplicaCostModel
 from .device import build_device_expert_replica_plan, validate_planner_backend
 from .planner import build_expert_replica_plan
-from .routing import ReplicaRoute, stable_expert_order
+from .routing import ReplicaRoute, _gather_replica_counts, stable_expert_order
 from .transport import prefetch_weights, return_gradients
 
 
@@ -147,18 +147,28 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
                              *, minimum_replica_rows: int = 0,
                              cost_model: ExpertReplicaCostModel | None = None,
                              planner_backend: str = "cpu") -> tuple[tuple, NativeReplicaDispatch]:
-    """Dispatch existing native expert-major inputs through shared replicas."""
+    """Dispatch existing native expert-major inputs through shared replicas.
+
+    Args:
+        inputs: Native expert-major values, logical counts and optional scores.
+        config: Logical expert topology and per-rank replica budget.
+        group: EP process group.
+        minimum_replica_rows: Minimum useful row count for a guest copy.
+        cost_model: Optional calibrated model for CPU quota refinement.
+        planner_backend: CPU or device placement implementation.
+
+    Returns:
+        Dispatched inputs and invocation-owned inverse metadata for combine.
+    """
     validate_planner_backend(planner_backend, minimum_replica_rows, cost_model)
     values, counts = inputs[:2]
     rank = dist.get_rank(group)
     payload = counts.to(torch.int64).contiguous()
-    gathered = [torch.empty_like(payload) for _ in range(config.ep_size)]
-    work = dist.all_gather(gathered, payload, group=group, async_op=True)
-    work.wait()
+    gathered = _gather_replica_counts(payload, config.ep_size, group)
     width = config.slots_per_rank
     device_plan = None
     if planner_backend == "device":
-        device_plan = build_device_expert_replica_plan(torch.stack(gathered), config,
+        device_plan = build_device_expert_replica_plan(gathered, config,
                                                        minimum_replica_rows=minimum_replica_rows)
         plan = device_plan.host_summary()
         slots, repeats = device_plan.source_runs(rank)
@@ -167,7 +177,7 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
         device_counts = device_plan.dispatch_counts
         recv_counts = device_counts[:, rank * width:(rank + 1) * width].contiguous()
     else:
-        host = torch.stack(gathered).cpu().tolist()
+        host = gathered.cpu().tolist()
         plan = build_expert_replica_plan(host, config.replica_slots_per_rank,
                                          minimum_replica_rows=minimum_replica_rows, cost_model=cost_model)
         runs = sorted((expert, slot, plan.dispatch_counts[rank][slot])

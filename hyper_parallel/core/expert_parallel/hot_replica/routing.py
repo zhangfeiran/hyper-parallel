@@ -83,6 +83,17 @@ def _remap_replica_ids(ids: torch.Tensor, plan: ExpertExecutionPlan,
     return remapped.reshape_as(ids)
 
 
+def _gather_replica_counts(payload: torch.Tensor, size: int, group: object) -> torch.Tensor:
+    """Gather rank-major counts into one invocation-owned contiguous buffer."""
+    gathered = torch.empty((size, payload.numel()), dtype=payload.dtype, device=payload.device)
+    if size > 1:
+        work = dist.all_gather_into_tensor(gathered.flatten(), payload, group=group, async_op=True)
+        work.wait()
+    else:
+        gathered[0].copy_(payload)
+    return gathered
+
+
 def prepare_replica_route(
     topk_ids: torch.Tensor, config: ExpertReplicaConfig, group: object = None,
     *, target_load: int | None = None, minimum_replica_rows: int = 0,
@@ -93,6 +104,18 @@ def prepare_replica_route(
     Route validation is collective: invalid IDs and repeated experts are reported
     by all ranks before any sparse weight transfers. All ranks must supply the
     same shape and configuration, as required by the EP module contract.
+
+    Args:
+        topk_ids: Integer expert IDs, with distinct experts in each token's row.
+        config: Logical expert topology and per-rank replica budget.
+        group: EP process group; None selects the default group.
+        target_load: Optional preferred destination load, capped by the receive bound.
+        minimum_replica_rows: Minimum useful row count for a guest copy.
+        cost_model: Optional calibrated model for CPU quota refinement.
+        planner_backend: CPU or device placement implementation.
+
+    Returns:
+        Invocation-owned placement, physical IDs and dispatch counts.
     """
     validate_planner_backend(planner_backend, minimum_replica_rows, cost_model)
     if topk_ids.ndim != 2 or topk_ids.dtype not in (torch.int32, torch.int64):
@@ -109,14 +132,8 @@ def prepare_replica_route(
     invalid = invalid | (ordered[:, 1:] == ordered[:, :-1]).any()
     counts = torch.bincount(ids.clamp(0, config.num_experts - 1).flatten(), minlength=config.num_experts)
     payload = torch.cat((counts, invalid.reshape(1).to(counts.dtype)))
-    gathered = [torch.empty_like(payload) for _ in range(size)]
-    if size > 1:
-        work = dist.all_gather(gathered, payload, group=group, async_op=True)
-        work.wait()
-    else:
-        gathered[0].copy_(payload)
+    matrix = _gather_replica_counts(payload, size, group)
     if planner_backend == "device":
-        matrix = torch.stack(gathered)
         device_plan = build_device_expert_replica_plan(
             matrix[:, :-1], config, capacity_limit=upper,
             target_load=min(upper, target_load) if target_load is not None else None,
@@ -129,7 +146,7 @@ def prepare_replica_route(
                             rank, group, device_plan=device_plan)
     # The deterministic host planner shares the route-count synchronization with
     # split sizing; no per-expert device-to-host reads occur below.
-    host = torch.stack(gathered).cpu().tolist()
+    host = matrix.cpu().tolist()
     if any(row[-1] for row in host):
         raise ValueError("hot replication requires in-range, distinct expert IDs per token")
     plan = build_expert_replica_plan(

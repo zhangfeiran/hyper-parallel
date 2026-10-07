@@ -95,7 +95,6 @@ class HostMeasurements:
                 (function, "return_gradients", "gradient_return_enqueue")):
             self.patches.enter_context(patch.object(module, name, self._wrap(getattr(module, name), stage)))
         self.patches.enter_context(patch.object(torch.Tensor, "cpu", self._wrap(torch.Tensor.cpu, "device_to_host")))
-        original_gather = routing.dist.all_gather
         original_prefetch = function.prefetch_weights
         measurements = self
 
@@ -109,10 +108,13 @@ class HostMeasurements:
                 with measurements.span("count_gather_wait_enqueue"):
                     return self.work.wait()
 
-        def _gather(*args, **kwargs):
-            with self.span("count_gather_enqueue"):
-                work = original_gather(*args, **kwargs)
-            return _Work(work) if work is not None else None
+        def _gather_wrapper(original):
+            @wraps(original)
+            def _gather(*args, **kwargs):
+                with self.span("count_gather_enqueue"):
+                    work = original(*args, **kwargs)
+                return _Work(work) if work is not None else None
+            return _gather
 
         @contextmanager
         def _prefetch(*args, **kwargs):
@@ -125,7 +127,8 @@ class HostMeasurements:
                 with self.span("weight_lease_release"):
                     context.__exit__(*sys.exc_info())
 
-        self.patches.enter_context(patch.object(routing.dist, "all_gather", _gather))
+        for name in ("all_gather", "all_gather_into_tensor"):
+            self.patches.enter_context(patch.object(routing.dist, name, _gather_wrapper(getattr(routing.dist, name))))
         self.patches.enter_context(patch.object(function, "prefetch_weights", _prefetch))
         return self
 

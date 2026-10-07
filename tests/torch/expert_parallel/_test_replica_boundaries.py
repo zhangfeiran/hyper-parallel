@@ -126,3 +126,37 @@ def test_replica_groups_npu() -> None:
         print("DEFAULT_AND_SUBGROUP_ROUNDTRIP_OK", flush=True)
     finally:
         dist.destroy_process_group()
+
+
+def test_device_route_validation_npu() -> None:
+    """Reject one rank's invalid TopK globally before sparse expert transfers."""
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
+    try:
+        config = ExpertReplicaConfig(24, 4, 1)
+        for group in (None, dist.group.WORLD):
+            for planner in ("cpu", "device"):
+                for bad in (-1, 24, 1):
+                    ids = torch.arange(256, device="npu").reshape(128, 2).remainder(24).long()
+                    if dist.get_rank() == 2:
+                        ids[0, 0] = bad
+                    try:
+                        prepare_replica_route(ids, config, group, planner_backend=planner)
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError("Every rank must reject invalid or repeated expert IDs")
+                    dist.barrier()
+                valid = torch.arange(256, device="npu").reshape(128, 2).remainder(24).long()
+                route = prepare_replica_route(valid, config, group, planner_backend=planner)
+                logical = torch.tensor(route.plan.physical_to_logical, device="npu")
+                torch.testing.assert_close(logical[route.physical_ids], valid, rtol=0, atol=0)
+                counts = [sum(position % 24 == expert for position in range(256)) for expert in range(24)]
+                expected = build_expert_replica_plan([counts] * 4, 1)
+                if route.plan.slot_to_logical != expected.slot_to_logical:
+                    raise AssertionError("Valid-route recovery changed expert placement")
+                torch.testing.assert_close(route.counts_by_source.cpu(),
+                                           torch.tensor(expected.dispatch_counts, dtype=torch.int32), rtol=0, atol=0)
+        print("GLOBAL_ROUTE_VALIDATION_OK", flush=True)
+    finally:
+        dist.destroy_process_group()
