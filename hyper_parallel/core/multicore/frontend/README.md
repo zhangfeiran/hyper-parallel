@@ -138,16 +138,82 @@ The default MegaMoE call path, workers, runtime ABI and backward code are retain
 The component package loads MegaMoE/profiler business exports on first access,
 allowing this frontend to import without torch_npu or a native payload.
 
-Gate plans currently report `native_status=unbound` and
-`device_tiling=required_from_legacy_host`. Native host tiling must still validate
-UB/workspace requirements and materialize the plan. No native library, tensor
-pointer, stream or workspace is bound by `Program.plan()`. A build-provided
-`NativeManifest` can be checked against the selected family ABI/source contract;
-this metadata guard does not inspect ELF contents or prove a device build. The
-native build does not yet emit this frontend manifest.
+`Program.plan()` remains CPU-only and reports `native_status=unbound` until
+explicit materialization. The isolated Gate builder exports the fixed Gate
+revision and verifies its source hashes, plus the pinned ops-nn LinearIndex
+source. It builds only Route/RouteGrad into a separate vendor, without replacing
+the current MoE runtime or building SHMEM. CANN 9.2 or later is required by the
+pinned tiling API (`TensorShape` and `TensorDataType`); CANN 9.1 does not provide
+these types. The supported device targets are ascend910b and ascend910_93.
 
-The remaining Gate integration includes the legacy native payload, host tiling,
-materialization, autograd/saved-state resource adapter, vision masking and device
-validation. Full MoE/MHC plan snapshots and lowering remain pending, as do ragged
-tensors, tensor lists, runtime/shape scalars, buffer planning, cache and generated
-Ascend workers. CPU plan parity is not an NPU correctness or performance result.
+Build in an editable checkout with the fixed Gate commit available in its Git
+object database and a clean, locked ops-nn checkout:
+
+```bash
+source /path/to/cann/set_env.sh
+python -m hyper_parallel.core.multicore._build.build_gate \
+    --ops-nn-source /path/to/ops-nn --soc ascend910b --jobs 16
+source build/native/gate/payload/set_env.bash
+# Start a fresh Python process after activation.
+```
+
+The builder checks required ACLNN symbols, host ELF hardening and device binary
+presence, then emits `manifest.json`. Its build fingerprint covers build inputs,
+CANN/compiler/framework identity and hashes of all payload artifacts. Binding
+checks the family/source/schema identities, fingerprint and every artifact hash
+before loading the adapter. CANN, Torch and torch_npu identities must match the
+build. The compatibility payload uses an isolated custom OPP process: do not
+activate another custom vendor in the same process, since framework ACLNN and
+tiling caches are process-wide.
+
+```python
+import torch
+import torch_npu
+import hyper_parallel.core.multicore.frontend as mc
+from hyper_parallel.core.multicore.frontend.examples.gate_route import _route
+
+torch.npu.set_device(0)
+topology = mc.HardwareSpec(torch.npu.get_device_properties(0).vector_core_num)
+plan = _route.plan({"T": 49, "E": 64}, topology, k=3, scale=2.5)
+route = plan.materialize("npu:0")
+logits = torch.randn(49, 64, device="npu:0", requires_grad=True)
+bias = torch.zeros(64, device="npu:0", requires_grad=True)
+weights, indices = route(logits, bias, profile=True)
+(weights.square().sum() + logits.square().sum()).backward()
+records = [call.records() for call in route.take_profiles()]
+```
+
+The native host computes UB/workspace tiling. Materialization checks that the
+plan's launched row workers match the actual device topology. The 48 descriptor
+slots are a capacity, not a hardware core-count claim: Ascend910B3 has 40 AIV
+workers. Original backward tiling launches only nonempty row workers, while the
+forward launches the full row-worker count, including empty tails.
+
+Forward state belongs to each autograd invocation; correction bias is detached,
+indices are nondifferentiable, and double backward is unsupported. RouteGrad
+uses the original 11/2-stage template and CANN LinearIndex/scatter/sqrt/softplus
+postprocessing. Direct logits losses compose through Torch autograd. Normal and
+profiled descriptors remain separate; profiling buffers are private to each
+call, and reading records synchronizes only that call's completion event.
+Materialized descriptors use an initialization event and current-stream
+allocator recording for reuse across streams. Callers must establish input
+producer/consumer stream dependencies, following ordinary Torch stream rules.
+
+Run single-card acceptance after activation:
+
+```bash
+python -m pytest -s tests/torch/multicore/test_ast_gate.py
+```
+
+Acceptance compares selected expert sets exactly and FP32 weights/logits
+gradients against independent CPU and NPU Torch references at `rtol=2e-4`,
+`atol=2e-5`. It covers k=1/k>1, small/tail/batched rows, direct logits gradients,
+projection autograd, overlapping forwards, multiple streams, noncontiguous
+incoming gradients and actual stage-record coverage. Results are written to
+`build/native/gate/acceptance.json` (override with `HP_AST_GATE_RESULT`).
+
+Vision masking is not yet expressible by the supported frontend Route pattern.
+Full MoE/MHC plan snapshots and lowering remain pending, as do ragged tensors,
+tensor lists, runtime/shape scalars, buffer planning, cache and generated Ascend
+workers. Single-card Gate acceptance does not establish distributed MoE/MHC or
+performance results, and ascend910_93 still requires device validation.

@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 
 from hyper_parallel.core.multicore.ir.schedule import PipelineScheduleIR, PipelineStage
 from hyper_parallel.core.multicore.runtime.abi import FamilyABI, NativeManifest
+from hyper_parallel.core.multicore.runtime.gate import GateExecutable
 
 
 @dataclass(frozen=True)
@@ -44,7 +46,7 @@ class Binding:
 
 @dataclass(frozen=True)
 class KernelPlan:
-    """Gate host compilation result; device tiling/materialization is still external."""
+    """Gate compilation result with artifact-verified native materialization."""
 
     abi: FamilyABI
     schedule: PipelineScheduleIR
@@ -58,6 +60,18 @@ class KernelPlan:
     scale: float
     token_count: int
     expert_count: int
+
+    def materialize(self, device: str = "npu:0", *, payload_root: Path | None = None) -> GateExecutable:
+        """Bind the plan to a verified Gate payload and device.
+
+        Args:
+            device: Ascend device where all inputs and resources will reside.
+            payload_root: Build-produced payload; defaults to HP_GATE_PAYLOAD_ROOT.
+
+        Returns:
+            Callable with native forward/backward and optional per-call profiling.
+        """
+        return GateExecutable(self, device, payload_root)
 
     def export_manifest(self) -> dict[str, object]:
         """Export host plan contracts without runtime pointers or a native claim."""

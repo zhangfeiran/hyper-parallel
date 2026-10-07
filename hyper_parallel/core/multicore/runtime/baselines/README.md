@@ -79,6 +79,18 @@ byte for byte to the original builder snapshots. Row scheduling tests include
 small token counts, tails, available worker counts and empty launched workers.
 
 This completes host schema/source evidence and Gate snapshot/emission coverage.
-Full MoE/MHC plan snapshots, actual native artifact manifests and Gate device
-forward/backward validation remain outstanding. The metadata guard checks a
-supplied build manifest; it does not inspect or certify a native binary.
+The isolated Gate builder now emits artifact-bound manifests, and the Gate
+runtime checks all payload hashes before loading. It exports pinned Gate sources
+without modifying them, retaining original host tiling and CANN postprocessing;
+its separate CMake wrappers exclude MoE/SHMEM from the native build. The active
+Gate dependency is ops-nn LinearIndex; the full original dependency lock remains
+part of the baseline source fingerprint. The wrappers and actual build inputs
+are also recorded in the native build fingerprint.
+
+Single-card Gate forward/backward acceptance is available through
+`tests/torch/multicore/test_ast_gate.py`; see the
+[frontend native binding guide](../../frontend/README.md#current-implementation-boundary)
+for build, activation, stream and validation contracts. Full MoE/MHC plan
+snapshots and lowering, vision frontend masking, other-device and performance
+validation remain outstanding. `NativeManifest` alone is a metadata guard;
+`verify_gate_payload` additionally checks the complete build-produced artifacts.
