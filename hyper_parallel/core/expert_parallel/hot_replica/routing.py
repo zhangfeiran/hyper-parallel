@@ -99,7 +99,11 @@ def _replica_count_payload(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
     ordered = (ids.float() if num_experts <= 2**24 else ids).sort(dim=1).values
     invalid = ((ids < 0) | (ids >= num_experts)).any()
     invalid = invalid | (ordered[:, 1:] == ordered[:, :-1]).any()
-    counts = torch.bincount(ids.clamp(0, num_experts - 1).flatten(), minlength=num_experts)
+    # The clamped IDs have a known range. A fixed integer histogram avoids
+    # bincount's device min/max scalar reads while retaining exact counts.
+    clamped = ids.clamp(0, num_experts - 1).flatten()
+    counts = torch.zeros(num_experts, dtype=torch.int64, device=ids.device)
+    counts.scatter_add_(0, clamped, torch.ones_like(clamped))
     return torch.cat((counts, invalid.reshape(1).to(counts.dtype)))
 
 

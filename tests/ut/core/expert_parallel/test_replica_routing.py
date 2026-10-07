@@ -48,6 +48,36 @@ class TestReplicaRouting(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
+    def test_count_payload_matches_integer_oracle_across_layouts(self) -> None:
+        """
+        Feature: Fixed-size integer route histogram
+        Description: Count strided, empty and invalid routes using an independent scalar oracle.
+        Expectation: All occurrences and global validation flags remain exact int64 values.
+        """
+        generator = torch.Generator().manual_seed(9027)
+        for experts in (1, 7, 24):
+            for shape in ((0, 8), (3, 0), (32, 1), (16, 8)):
+                for dtype in (torch.int32, torch.int64):
+                    ids = torch.randint(-2, experts + 2, shape, generator=generator, dtype=dtype)
+                    if ids.numel():
+                        ids[0, 0] = torch.iinfo(dtype).min
+                        ids[-1, -1] = torch.iinfo(dtype).max
+                    ids = ids.T.contiguous().T.to(torch.int64)
+                    expected = [0] * (experts + 1)
+                    for row in ids.tolist():
+                        if len(set(row)) != len(row):
+                            expected[-1] = 1
+                        for expert in row:
+                            if not 0 <= expert < experts:
+                                expected[-1] = 1
+                            expected[min(max(expert, 0), experts - 1)] += 1
+                    with self.subTest(experts=experts, shape=shape, dtype=dtype):
+                        actual = routing._replica_count_payload(ids, experts)
+                        torch.testing.assert_close(actual, torch.tensor(expected, dtype=torch.int64))
+                        self.assertEqual(actual[:-1].sum().item(), ids.numel())
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_gather_preserves_rank_order_flags_and_retained_invocations(self) -> None:
         """
         Feature: Invocation-owned count gather
