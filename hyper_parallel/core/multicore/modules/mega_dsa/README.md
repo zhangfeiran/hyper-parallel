@@ -373,6 +373,64 @@ The validator preserves measurements and returns a nonzero exit on failed
 acceptance. Its captured selections come from real HP projections of random
 fixtures, so their offline traces are not trained-model locality evidence.
 
+### Layer diagnosis with identical inputs and cotangents
+
+`mega_dsa_layer_diagnose.py` separates two sources of model error without
+changing the frozen model acceptance bounds. It captures the real model's
+seven projected states, selection and sparse-output cotangent. Enhance, stock
+and the CPU FP32 primitive oracle then receive identical projected values,
+selected keys and output cotangent. Selected KL uses the same detached teacher
+inputs, coefficient 0.3 and auxiliary multiplier 7. This removes different
+downstream model errors from the primitive comparison.
+
+A separate comparison fixes the captured state cotangents and measures the
+main/index projection VJPs through the real BF16 NPU model and FP32 CPU model.
+These measurements include projection quantization and backward rounding;
+they are not isolated GEMM or norm-kernel acceptance. CPU absorbed and
+unabsorbed FP32 formulas are also compared. The diagnostic's staged execution
+is checked against the original model boundary before interpreting metrics.
+It does not install capture hooks in production model calls.
+
+For the two previously failing held-out seeds, staged execution exactly
+matched the original NPU boundary's output, loss, hidden and all 11 parameter
+gradients. Both identical-state primitive comparisons passed pointwise stock
+calibration. Their maximum enhance input-gradient relative L2 was 0.00352.
+Fixed-cotangent projection VJP relative L2 ranged from 0.00184 to 0.00359,
+while the CPU absorbed/unabsorbed model comparison reached approximately
+1.12e-6. The second seed's indexer ReLU sign crossing was reproduced.
+
+An offline sensitivity intervention held the FP32 projection Jacobian fixed
+and forced the indexer ReLU branch mask predicted by FP32 dots on the captured
+BF16 states. For the second seed, `wq_b.weight` relative L2 between the mapped
+native cotangent and the CPU KL reference fell from 0.08423 to 0.00966. The
+first seed had no crossing and its error stayed 0.00836. This is a
+counterfactual diagnostic of branch sensitivity, not a production mask policy
+or a replacement KL objective. It does not explain the first seed's hidden
+gradient failure or eliminate all second-seed error.
+
+These observations support further investigation of projection precision and
+composition sensitivity in these fixtures. They do not prove every failed
+model quantity has the same cause, establish a general primitive tolerance,
+or turn the original 22/35 model result into acceptance. Diagnostic reports
+use `status=diagnosis_measured` and keep `model_acceptance_changed=false` and
+`p0_complete=false`; metric failures remain in the report.
+
+Use the same activated OPP and idle gate to run:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 NPU_WAIT_VISIBLE_DEVICES=0 NPU_WAIT_NUM_CARDS=1 \
+NPU_WAIT_POLL_SECONDS=60 bash ~/doc/npu_wait_and_run.sh \
+  python hyper_parallel/core/multicore/examples/mega_dsa_layer_diagnose.py \
+  --output /tmp/mega_dsa_layer_diagnosis.json \
+  --snapshot-dir /tmp/mega_dsa_layer_snapshots
+```
+
+The optional snapshot directory stores explicit offline CPU captures of random
+fixture weights, inputs, projected states, cotangents and selection, with
+SHA256 identities in the report. The default seeds are 20261027 and 20261028;
+`--seeds` selects other diagnostic fixtures. Neither these short histories nor
+their snapshots provide trained-model locality or long-context Top-K evidence.
+
 The candidate-count boundary remains restricted; general underfilled/empty
 device semantics remain unavailable. P0 still needs model BF16 calibration
 that generalizes to held-out inputs, parameter-gradient device acceptance,
