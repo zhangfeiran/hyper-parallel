@@ -536,3 +536,12 @@ model score alone is insufficient evidence for enabling calibration in training.
 The precision worker accepts the same `--cost-model` file. Validate its output,
 dX, router-probability gradients and owner dW against `--fp32-reference` before
 using a changed plan. The reference never receives the candidate calibration.
+
+
+For a MegaMoe B>0 invocation whose global plan has no transfers, forward and
+backward skip the guest pool lease, guest gradient clearing and gradient return.
+The invocation still saves its immutable route and computes FP32 home weight
+partials. Its runtime keeps the existing v2 home-expert addressing marker with
+null guest pointers: the marker also selects per-expert GMM addressing and
+cannot be omitted. The global transfer list controls this path; an owner with
+outgoing transfers must participate even when it has no local guest work.
