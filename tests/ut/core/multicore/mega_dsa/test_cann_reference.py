@@ -28,6 +28,7 @@ from hyper_parallel.components.functional.aux_loss import (
 from hyper_parallel.core.multicore.modules.mega_dsa.cann_reference import (
     CannDsaLayout,
     CannDsaReference,
+    CannDsaSelection,
     CannDsaStats,
 )
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import (
@@ -99,6 +100,8 @@ class TestCannDsaReference(unittest.TestCase):
                            for shape in ((3, 8, 128), (3, 128), (3, 8)))
         self.indices = torch.full((3, 2048), -1, dtype=torch.int32)
         self.indices[:, 0] = torch.tensor([0, 1, 2], dtype=torch.int32)
+        self.indices[1, 1] = 0
+        self.selection = self.backend.prepare_selection(self.indices)
         self.stats = CannDsaStats(torch.zeros(1, 3, 32), torch.ones(1, 3, 32))
         self.ops = SimpleNamespace(
             npu_lightning_indexer_enhance=Mock(), npu_sparse_flash_attention_enhance=Mock(),
@@ -115,9 +118,11 @@ class TestCannDsaReference(unittest.TestCase):
         """Native sequence-local IDs become canonical IDs without another score scale."""
         native = torch.full((3, 1, 2048), -1, dtype=torch.int32)
         native[:, 0, 0] = torch.tensor([0, 1, 0], dtype=torch.int32)
+        native[1, 0, 1] = 0
         self.ops.npu_lightning_indexer_enhance.return_value = (native, torch.empty(0))
         selected = self.backend.indexer(*self.index)
-        self.assertEqual(selected[:, 0].tolist(), [0, 1, 2])
+        self.assertIsInstance(selected, CannDsaSelection)
+        self.assertEqual(selected.to_global_indices()[:, :2].tolist(), [[0, -1], [1, 0], [2, -1]])
         args, kwargs = self.ops.npu_lightning_indexer_enhance.call_args
         self.assertIs(args[2], self.index[2])
         self.assertEqual(args[1].shape, (3, 1, 128))
@@ -130,7 +135,7 @@ class TestCannDsaReference(unittest.TestCase):
             return query + key[:, 0, None, :] + value[:, 0, None, :], self.stats.maximum, self.stats.denominator
 
         self.ops.npu_sparse_flash_attention_enhance.side_effect = _native_attention
-        output, stats = self.backend.attention(*self.main, self.indices)
+        output, stats = self.backend.attention(*self.main, self.selection)
         output.sum().backward()
         torch.testing.assert_close(self.main[1].grad, torch.full_like(self.main[1], 64))
         args, kwargs = self.ops.npu_sparse_flash_attention_enhance.call_args
@@ -147,7 +152,7 @@ class TestCannDsaReference(unittest.TestCase):
             self.main[0] * 2, self.stats.maximum, self.stats.denominator)
         query, compressed, qr, kr = self.main
         output, _ = self.backend.attention_bsnd(query[None], compressed[None, :, None], qr[None],
-                                              kr[None, :, None], self.indices)
+                                              kr[None, :, None], self.selection)
         self.assertEqual(output.shape, (1, 3, 32, 576))
         self.assertEqual(output[..., 512:].count_nonzero(), 0)
         output[..., :512].sum().backward()
@@ -158,7 +163,7 @@ class TestCannDsaReference(unittest.TestCase):
                 torch.full_like(self.index[2], factor * 3), torch.tensor([15.0]))
 
     def _loss(self, coefficient=0.3):
-        return self.backend.kl_loss(*self.index, self.main, self.indices, self.stats,
+        return self.backend.kl_loss(*self.index, self.main, self.selection, self.stats,
                                     normalization=DsaLossNormalization(3), loss_coeff=coefficient)
 
     def test_kl_list_lengths_detached_teacher_and_scale_once(self):
@@ -211,15 +216,121 @@ class TestCannDsaReference(unittest.TestCase):
     def test_bad_dimensions_stats_and_normalization_fail_before_launch(self):
         """Unsupported support-matrix entries cannot reach the native operator."""
         with self.assertRaisesRegex(ValueError, "C=512"):
-            self.backend.attention(self.main[0][..., :256], *self.main[1:], self.indices)
+            self.backend.attention(self.main[0][..., :256], *self.main[1:], self.selection)
         with self.assertRaisesRegex(ValueError, "K=2048"):
-            self.backend.attention(*self.main, self.indices[:, :1024])
+            self.backend.prepare_selection(self.indices[:, :1024])
         with self.assertRaisesRegex(ValueError, "complete packed"):
-            self.backend.kl_loss(*self.index, self.main, self.indices, self.stats,
+            self.backend.kl_loss(*self.index, self.main, self.selection, self.stats,
                                  normalization=DsaLossNormalization(5))
         with self.assertRaisesRegex(ValueError, "native.*statistics"):
-            self.backend.kl_loss(*self.index, self.main, self.indices,
+            self.backend.kl_loss(*self.index, self.main, self.selection,
                                  CannDsaStats(torch.zeros(3, 32), torch.ones(3, 32)),
                                  normalization=DsaLossNormalization(3))
         self.ops.npu_sparse_flash_attention_enhance.assert_not_called()
         self.ops.npu_sparse_lightning_indexer_grad_kl_loss_enhance.assert_not_called()
+
+    def test_prepare_rejects_underfilled_empty_unknown_and_duplicate_selections(self):
+        """Invalid effective counts/IDs cannot reach native attention or KL."""
+        cases = []
+        partial = self.indices.clone()
+        partial[1, 1] = -1
+        cases.append((partial, "requires 2 legal keys; got 1"))
+        cases.append((torch.full_like(self.indices, -1), "requires 1 legal keys; got 0"))
+        for invalid, message in ((-2, "unknown"), (3, "unknown"), (1, "duplicate")):
+            bad = self.indices.clone()
+            bad[1, 1] = invalid
+            cases.append((bad, message))
+        for indices, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self.backend.prepare_selection(indices)
+        self.ops.npu_sparse_flash_attention_enhance.assert_not_called()
+        self.ops.npu_sparse_lightning_indexer_grad_kl_loss_enhance.assert_not_called()
+
+    def test_prepare_filters_holes_future_and_cross_sequence_before_count_check(self):
+        """Full legal histories survive stable filtering without admitting an underfilled row."""
+        indices = torch.full_like(self.indices, -1)
+        indices[0, :3] = torch.tensor([-1, 1, 0], dtype=torch.int32)
+        indices[1, :4] = torch.tensor([2, 1, -1, 0], dtype=torch.int32)
+        indices[2, :3] = torch.tensor([0, -1, 2], dtype=torch.int32)
+        selected = self.backend.prepare_selection(indices)
+        torch.testing.assert_close(selected.to_global_indices(), self.indices)
+        indices[1, 3] = -1
+        with self.assertRaisesRegex(ValueError, "requires 2 legal keys; got 1"):
+            self.backend.prepare_selection(indices)
+
+    def test_prepare_requires_an_explicit_host_snapshot(self):
+        """Preparation cannot silently synchronize or read device selections."""
+        for indices in (self.indices.float(), self.indices[:, :1024], self.indices[None],
+                        torch.empty(3, 2048, dtype=torch.int32, device="meta"), None):
+            with self.subTest(indices=type(indices)), self.assertRaises(ValueError):
+                self.backend.prepare_selection(indices)
+
+    def test_raw_tensors_are_rejected_by_all_execution_boundaries(self):
+        """Even a full-history tensor needs preparation before attention/BSND/KL."""
+        calls = (
+            lambda: self.backend.attention(*self.main, self.indices),
+            lambda: self.backend.kl_loss(*self.index, self.main, self.indices, self.stats,
+                                         normalization=DsaLossNormalization(3)),
+            lambda: self.backend.attention_bsnd(self.main[0][None], self.main[1][None, :, None],
+                                                self.main[2][None], self.main[3][None, :, None], self.indices),
+        )
+        for call in calls:
+            with self.assertRaisesRegex(TypeError, "raw indices"):
+                call()
+        self.ops.npu_sparse_flash_attention_enhance.assert_not_called()
+        self.ops.npu_sparse_lightning_indexer_grad_kl_loss_enhance.assert_not_called()
+
+    def test_selection_is_owned_and_exports_do_not_alias(self):
+        """Changing the host source or an exported tensor cannot invalidate admitted storage."""
+        expected = self.indices.clone()
+        self.indices.fill_(-1)
+        exported = self.selection.to_global_indices()
+        exported.fill_(-1)
+        torch.testing.assert_close(self.selection.to_global_indices(), expected)
+
+    def test_foreign_layout_mutated_storage_and_direct_construction_fail(self):
+        """A proof cannot be reused for another layout or after internal storage mutation."""
+        other = CannDsaReference(CannDsaLayout(self.layout.batch_meta, "cpu"), attention_scale=192**-0.5)
+        with self.assertRaisesRegex(ValueError, "different prepared layout"):
+            other.attention(*self.main, self.selection)
+        with self.assertRaisesRegex(ValueError, "prepare_selection or indexer"):
+            CannDsaSelection(self.layout, self.indices[:, None])
+        self.selection._native_indices[0, 0, 0] = 0
+        with self.assertRaisesRegex(ValueError, "storage was modified"):
+            self.backend.attention(*self.main, self.selection)
+        self.ops.npu_sparse_flash_attention_enhance.assert_not_called()
+
+    def test_native_indexer_and_execution_do_not_read_host_tensor_values(self):
+        """Native-produced selections need no cpu/item/tolist calls or repeated compaction."""
+        native = self.selection._native_indices.clone()
+        self.ops.npu_lightning_indexer_enhance.return_value = (native, torch.empty(0))
+        self.ops.npu_sparse_flash_attention_enhance.return_value = (
+            self.main[0] * 2, self.stats.maximum, self.stats.denominator)
+        self.ops.npu_sparse_lightning_indexer_grad_kl_loss_enhance.return_value = self._kl_outputs()
+        with patch.object(torch.Tensor, "cpu", side_effect=AssertionError("host transfer")), \
+                patch.object(torch.Tensor, "item", side_effect=AssertionError("scalar read")), \
+                patch.object(torch.Tensor, "tolist", side_effect=AssertionError("host values")), \
+                patch.object(self.layout, "global_to_sequence_indices", side_effect=AssertionError("compaction")):
+            selected = self.backend.indexer(*self.index)
+            self.backend.attention(*self.main, selected)
+            self.backend.kl_loss(*self.index, self.main, selected, self.stats, normalization=DsaLossNormalization(3))
+
+    def test_selection_preparation_in_inference_mode_retains_version_checks(self):
+        """Inference-mode callers still receive owned, versioned index storage."""
+        with torch.inference_mode():
+            selection = self.backend.prepare_selection(self.indices)
+            exported = selection.to_global_indices()
+        torch.testing.assert_close(exported, self.indices)
+
+    def test_long_prefix_accepts_exact_k_not_the_full_prefix(self):
+        """For causal histories beyond K, preparation admits K unique legal keys."""
+        total = 2049
+        backend = CannDsaReference(CannDsaLayout(DsaBatchMeta.packed((total,)), "cpu"), attention_scale=0.1)
+        ids = torch.arange(2048, dtype=torch.int32).expand(total, -1).clone()
+        ids.masked_fill_(ids > torch.arange(total, dtype=torch.int32)[:, None], -1)
+        ids[-1, -1] = 2048
+        selection = backend.prepare_selection(ids)
+        torch.testing.assert_close(selection.to_global_indices(), ids)
+        ids[-1, -1] = -1
+        with self.assertRaisesRegex(ValueError, "requires 2048 legal keys; got 2047"):
+            backend.prepare_selection(ids)

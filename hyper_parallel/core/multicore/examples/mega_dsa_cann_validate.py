@@ -79,14 +79,15 @@ def run_validation(report: dict) -> None:
     reference_main = tuple(tensor.float().requires_grad_() for tensor in cpu[:4])
     reference_index = tuple(tensor.float().requires_grad_() for tensor in cpu[4:])
     report["stage"] = "indexer"
-    indices = backend.indexer(*index)
+    selection = backend.indexer(*index)
     torch.npu.synchronize()
-    report["indices_first_slots"] = indices[:, :8].cpu().tolist()
+    indices = selection.to_global_indices().cpu()
+    report["indices_first_slots"] = indices[:, :8].tolist()
     report["stage"] = "attention_forward"
-    output, stats = backend.attention(*main_inputs, indices)
+    output, stats = backend.attention(*main_inputs, selection)
     torch.npu.synchronize()
     reference_output, reference_stats = sparse_attention_reference(
-        *reference_main, indices.cpu(), meta, attention_scale=backend.attention_scale)
+        *reference_main, indices, meta, attention_scale=backend.attention_scale)
     report["output"] = _metrics(output, reference_output)
     report["lse"] = _metrics(stats.lse[0], reference_stats.lse)
     report["stage"] = "attention_backward"
@@ -100,11 +101,11 @@ def run_validation(report: dict) -> None:
     }
     report["stage"] = "selected_kl"
     normalization = DsaLossNormalization(meta.global_valid_queries)
-    loss = backend.kl_loss(*index, main_inputs, indices, stats, normalization=normalization, loss_coeff=0.3)
+    loss = backend.kl_loss(*index, main_inputs, selection, stats, normalization=normalization, loss_coeff=0.3)
     (loss * 7).backward()
     torch.npu.synchronize()
     reference_loss = selected_kl_reference(
-        *reference_index, *reference_main, indices.cpu(), meta, attention_scale=backend.attention_scale,
+        *reference_index, *reference_main, indices, meta, attention_scale=backend.attention_scale,
         normalization=normalization, loss_coeff=0.3)
     reference_index_grad = torch.autograd.grad(reference_loss * 7, reference_index)
     report["kl_loss"] = _metrics(loss, reference_loss)

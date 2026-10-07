@@ -29,6 +29,8 @@ from hyper_parallel.core.multicore.modules.mega_dsa.metadata import (
     DsaLossNormalization,
 )
 
+_SELECTION_TOKEN = object()
+
 
 def _load_custom_ops() -> Any:
     # Omni registration is optional and must not be loaded by CPU metadata/oracle imports.
@@ -105,6 +107,48 @@ class CannDsaLayout:
         return torch.where(valid, local + self.sequence_starts, -1).contiguous()
 
 
+class CannDsaSelection:
+    """Owned native indices admitted by CPU preparation or the native indexer.
+
+    Obtain this object from ``CannDsaReference.prepare_selection`` or
+    ``indexer``. It belongs to one prepared layout/invocation. Exporting global
+    indices produces a separate tensor; changing that export cannot change the
+    admitted selection. This is a reference contract, not a runtime cache.
+    """
+
+    def __init__(
+        self, layout: CannDsaLayout, native_indices: torch.Tensor, *, _token: object | None = None,
+    ) -> None:
+        """Create owned storage only after an authorized preparation path."""
+        if _token is not _SELECTION_TOKEN:
+            raise ValueError("obtain a selection from prepare_selection or indexer")
+        layout._validate_indices(native_indices, native=True)
+        if native_indices.shape[-1] != 2048:
+            raise ValueError("the initial CANN reference supports K=2048 only")
+        self._layout = layout
+        self._batch_meta = layout.batch_meta
+        # Own versioned storage even when the caller is in inference mode.
+        with torch.inference_mode(False):
+            self._native_indices = native_indices.detach().clone()
+        self._version = self._native_indices._version
+
+    def _check(self, layout: CannDsaLayout) -> None:
+        if self._layout is not layout or self._batch_meta != layout.batch_meta:
+            raise ValueError("selection belongs to a different prepared layout/invocation")
+        if self._native_indices._version != self._version:
+            raise ValueError("prepared selection storage was modified; prepare a new selection")
+
+    def to_global_indices(self) -> torch.Tensor:
+        """Export a separate global packed [T,K] tensor on the layout device.
+
+        Returns:
+            Int32 global indices. An explicit ``.cpu()`` is required for an
+            oracle/trace snapshot; no device-to-host transfer occurs here.
+        """
+        self._check(self._layout)
+        return self._layout.sequence_to_global_indices(self._native_indices)
+
+
 class _SelectedKlFunction(torch.autograd.Function):
     """Save forward-computed indexer gradients once per invocation."""
 
@@ -147,6 +191,8 @@ class CannDsaReference:
     index H=8/16/32/64 and Di=128. This is an explicit development reference,
     never selected implicitly as a runtime fallback. Model projections,
     projection-input detach and aux_loss_auto_scale remain outside this class.
+    Each row must contain min(K, causal prefix length) unique legal keys. Raw
+    tensors, arbitrary underfilled selections and empty rows are not admitted.
     """
 
     def __init__(self, layout: CannDsaLayout, *, attention_scale: float) -> None:
@@ -185,16 +231,65 @@ class CannDsaReference:
         if query.shape[-1] != 128 or key.shape != (total, 128) or weight.shape != query.shape[:2]:
             raise ValueError("CANN reference index key/weights must match the fixed Di=128 layout")
 
-    def _native_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        native = self.layout.global_to_sequence_indices(indices)
-        if indices.shape[-1] != 2048:
-            raise ValueError("the initial CANN reference supports K=2048 only")
-        return native
+    def prepare_selection(self, indices: torch.Tensor) -> CannDsaSelection:
+        """Validate an external CPU snapshot and upload owned native indices.
+
+        Args:
+            indices: CPU int32 global packed [T,2048] selections. Padding and
+                known future/cross-sequence entries are filtered and compacted.
+                All non-padding IDs must be valid and unique within each row.
+
+        Returns:
+            Selection bound to this prepared layout. Each query contains exactly
+            min(2048, causal prefix length) legal keys after filtering.
+
+        Raises:
+            ValueError: A device tensor, invalid IDs/shape, duplicates or an
+                unsupported effective candidate count, including empty rows.
+
+        Note:
+            Run outside the hot path. This never implicitly reads device data.
+            For device-generated selections use ``indexer`` directly.
+        """
+        if not isinstance(indices, torch.Tensor) or indices.device.type != "cpu" or indices.dtype != torch.int32:
+            raise ValueError("prepare_selection requires an explicit CPU int32 snapshot")
+        meta = self.layout.batch_meta
+        if indices.shape != (meta.global_valid_queries, 2048):
+            raise ValueError("external selections must have shape [T,2048] (K=2048)")
+        native = torch.full((meta.global_valid_queries, 1, 2048), -1, dtype=torch.int32)
+        for query, row in enumerate(indices):
+            sequence, position = meta.sequence_position(query)
+            start = meta.global_cu_seqlens[sequence]
+            selected = [token for token in row.tolist() if token != -1]
+            if any(token < 0 or token >= meta.global_valid_queries for token in selected):
+                raise ValueError(f"query {query}: selection contains an unknown global token ID")
+            if len(set(selected)) != len(selected):
+                raise ValueError(f"query {query}: selection contains duplicate token IDs")
+            legal = [token - start for token in selected if start <= token <= query]
+            expected = min(2048, position + 1)
+            if len(legal) != expected:
+                raise ValueError(
+                    f"query {query}: native candidate count requires {expected} legal keys; got {len(legal)}"
+                )
+            native[query, 0, :expected] = torch.tensor(legal, dtype=torch.int32)
+        return CannDsaSelection(self.layout, native.to(self.layout.device), _token=_SELECTION_TOKEN)
+
+    def _native_indices(self, selection: CannDsaSelection) -> torch.Tensor:
+        if not isinstance(selection, CannDsaSelection):
+            raise TypeError("raw indices are not admitted; use prepare_selection or indexer")
+        selection._check(self.layout)
+        return selection._native_indices
 
     def indexer(
         self, index_query: torch.Tensor, index_key: torch.Tensor, merge_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return global packed int32 Top-K, preserving already-scaled signed weights."""
+    ) -> CannDsaSelection:
+        """Admit native Top-K without host reads, preserving already-scaled signed weights.
+
+        Returns:
+            Layout-bound selection. The native indexer contract supplies exactly
+            min(2048, causal prefix length) unique legal keys per query. Device
+            content correctness remains a separate numerical-validation gate.
+        """
         self._validate_index((index_query, index_key, merge_weight))
         with torch.no_grad():
             indices, _ = _load_custom_ops().npu_lightning_indexer_enhance(
@@ -203,11 +298,11 @@ class CannDsaReference:
                 actual_seq_lengths_key=self.layout.length_tensor, block_table=None,
                 layout_query="TND", layout_key="TND", sparse_count=2048, sparse_mode=3, return_value=False,
             )
-        return self.layout.sequence_to_global_indices(indices)
+        return CannDsaSelection(self.layout, indices, _token=_SELECTION_TOKEN)
 
     def attention(
         self, query: torch.Tensor, compressed_kv: torch.Tensor, query_rope: torch.Tensor,
-        key_rope: torch.Tensor, topk_indices: torch.Tensor,
+        key_rope: torch.Tensor, topk_indices: CannDsaSelection,
     ) -> tuple[torch.Tensor, CannDsaStats]:
         """Return compressed output and native statistics through enhance autograd.
 
@@ -232,7 +327,7 @@ class CannDsaReference:
 
     def kl_loss(
         self, index_query: torch.Tensor, index_key: torch.Tensor, merge_weight: torch.Tensor,
-        main_inputs: tuple[torch.Tensor, ...], topk_indices: torch.Tensor, stats: CannDsaStats,
+        main_inputs: tuple[torch.Tensor, ...], topk_indices: CannDsaSelection, stats: CannDsaStats,
         *, normalization: DsaLossNormalization, loss_coeff: float = 1.0,
     ) -> torch.Tensor:
         """Compute one normalized selected-set KL with forward-saved index gradients."""
@@ -256,12 +351,12 @@ class CannDsaReference:
 
     def attention_bsnd(
         self, query: torch.Tensor, compressed_kv: torch.Tensor, query_rope: torch.Tensor,
-        key_rope: torch.Tensor, topk_indices: torch.Tensor,
+        key_rope: torch.Tensor, topk_indices: CannDsaSelection,
     ) -> tuple[torch.Tensor, CannDsaStats]:
         """Adapt the existing model's BSND tensors and restore RoPE output padding.
 
-        Q/RoPE have H heads, KV/RoPE have one head. The externally supplied
-        indices retain the core global [T,K] namespace. Projections and model
+        Q/RoPE have H heads, KV/RoPE have one head. The admitted selection comes
+        from CPU preparation or this layout's native indexer. Projections and model
         parameters remain owned by the existing attention module.
         """
         if any(tensor.ndim != 4 for tensor in (query, compressed_kv, query_rope, key_rope)):

@@ -33,6 +33,7 @@ from hyper_parallel.core.multicore.examples.mega_dsa_cann_validate import _metri
 from hyper_parallel.core.multicore.modules.mega_dsa.cann_reference import (
     CannDsaLayout,
     CannDsaReference,
+    CannDsaSelection,
 )
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import (
     DsaBatchMeta,
@@ -80,10 +81,9 @@ def _oracle(values: tuple, indices: torch.Tensor, backend: CannDsaReference) -> 
             **dict(zip(_MAIN_NAMES, main_grad)), **dict(zip(_INDEX_NAMES, index_grad))}
 
 
-def _enhance(values: tuple, indices: torch.Tensor, backend: CannDsaReference) -> tuple[dict, dict]:
+def _enhance(values: tuple, selected: CannDsaSelection, backend: CannDsaReference) -> tuple[dict, dict]:
     main_inputs = tuple(tensor.to(backend.layout.device).requires_grad_() for tensor in values[:4])
     index = tuple(tensor.to(backend.layout.device).requires_grad_() for tensor in values[4:])
-    selected = indices.to(backend.layout.device)
     output, stats = backend.attention(*main_inputs, selected)
     output.float().square().mean().backward()
     main_grad = tuple(tensor.grad.detach().clone() for tensor in main_inputs)
@@ -176,6 +176,7 @@ def _empty_contract(candidate: dict, stats: dict, empty: torch.Tensor) -> dict:
 def _auxiliary_scaling(values: tuple, backend: CannDsaReference) -> dict:
     meta = backend.layout.batch_meta
     indices = _selection("complete", meta)
+    selected = backend.prepare_selection(indices)
     oracle = _oracle(values, indices, backend)
     stock = _stock(values, indices, backend)
     report = {}
@@ -183,7 +184,6 @@ def _auxiliary_scaling(values: tuple, backend: CannDsaReference) -> dict:
         for auxiliary_scale, coefficient in ((1, 0.3), (7, 0.3), (7, 0)):
             main_inputs = tuple(tensor.to(backend.layout.device).requires_grad_() for tensor in values[:4])
             index = tuple(tensor.to(backend.layout.device).requires_grad_() for tensor in values[4:])
-            selected = indices.to(backend.layout.device)
             output, stats = backend.attention(*main_inputs, selected)
             loss = backend.kl_loss(
                 *index, main_inputs, selected, stats,
@@ -212,7 +212,7 @@ def _auxiliary_scaling(values: tuple, backend: CannDsaReference) -> dict:
 
 
 def run_matrix(report: dict) -> None:
-    """Run complete/partial/empty/mixed/holey selections with primitive calibration."""
+    """Verify supported numerical behavior and pre-dispatch rejection of unsupported counts."""
     # Optional extension is loaded only for an explicitly requested device run.
     __import__("torch_npu")
     torch.npu.set_device(0)
@@ -227,31 +227,52 @@ def run_matrix(report: dict) -> None:
     for case in ("complete", "partial", "empty", "mixed_empty", "holes"):
         report["stage"] = case
         selected = _selection(case, meta)
-        legal = backend.layout.sequence_to_global_indices(
-            backend.layout.global_to_sequence_indices(selected.to(backend.layout.device))).cpu()
+        try:
+            admitted = backend.prepare_selection(selected)
+        except ValueError as error:
+            if case == "complete" or "native candidate count" not in str(error):
+                raise
+            report["cases"][case] = {"status": "rejected_before_dispatch", "expected_rejection": True,
+                                     "native_invoked": False, "reason": str(error)}
+            print(f"{case}: rejected_before_dispatch", flush=True)
+            continue
+        if case != "complete":
+            raise RuntimeError(f"unsupported fixture {case} was unexpectedly admitted")
+        legal = admitted.to_global_indices().cpu()
         nonempty = (legal >= 0).any(-1)
         oracle = _oracle(values, selected, backend)
-        candidate, stats = _enhance(values, selected, backend)
+        candidate, stats = _enhance(values, admitted, backend)
         stock = _stock(values, selected, backend)
         checks = _calibrate(candidate, stock, oracle, nonempty)
         empty = _empty_contract(candidate, stats, ~nonempty)
         accepted = (all(check["passed"] for check in checks.values()) and stats["main_gradient_isolation"]
                     and all(empty[name] for name in ("output_zero", "query_gradients_zero", "sum_zero",
                                                      "lse_is_negative_infinity")))
-        report["cases"][case] = {"checks": checks, "empty_rows": empty,
+        report["cases"][case] = {"status": "measured", "checks": checks, "empty_rows": empty,
                                  "main_gradient_isolation": stats["main_gradient_isolation"],
                                  "accepted_for_fixture": accepted}
         print(f"{case}: accepted_for_fixture={accepted}", flush=True)
     report["stage"] = "index_trace"
     index = tuple(tensor.to(backend.layout.device) for tensor in values[4:])
-    selected = backend.indexer(*index).detach().cpu()
+    native_selection = backend.indexer(*index)
+    selected = native_selection.to_global_indices().cpu()
+    native_candidate, _ = _enhance(values, native_selection, backend)
+    native_checks = _calibrate(native_candidate, _stock(values, selected, backend),
+                               _oracle(values, selected, backend), torch.ones(len(selected), dtype=torch.bool))
+    report["native_indexer_selection"] = {
+        "checks": native_checks, "accepted_for_fixture": all(check["passed"] for check in native_checks.values()),
+    }
     report["index_trace"] = {"provenance": "synthetic packed fixture through enhance indexer",
                               "profile": profile_index_trace(selected, meta, kv_bytes_per_token=(512 + 64) * 2)}
     report["stage"] = "auxiliary_scaling"
     report["auxiliary_scaling"] = _auxiliary_scaling(values, backend)
-    report["accepted_for_matrix"] = (all(case["accepted_for_fixture"] for case in report["cases"].values())
-                                     and all(case["accepted"] for case in report["auxiliary_scaling"].values()))
-    report["status"] = "accepted" if report["accepted_for_matrix"] else "failed_acceptance"
+    report["reference_contract_passed"] = (
+        all(case.get("accepted_for_fixture", False) or case.get("expected_rejection", False)
+            for case in report["cases"].values())
+        and report["native_indexer_selection"]["accepted_for_fixture"]
+        and all(case["accepted"] for case in report["auxiliary_scaling"].values())
+    )
+    report["status"] = "contract_verified" if report["reference_contract_passed"] else "failed_acceptance"
     report["stage"] = "complete"
 
 
@@ -270,8 +291,8 @@ def main() -> None:
                                 "exact zero for empty output/query grads/sum and LSE=-inf"}
     try:
         run_matrix(report)
-        if not report["accepted_for_matrix"]:
-            raise RuntimeError("selected-set matrix did not pass numerical acceptance")
+        if not report["reference_contract_passed"]:
+            raise RuntimeError("restricted reference contract did not pass validation")
     except Exception as error:
         report["status"] = "error" if report["status"] == "running" else report["status"]
         report["error"] = repr(error)

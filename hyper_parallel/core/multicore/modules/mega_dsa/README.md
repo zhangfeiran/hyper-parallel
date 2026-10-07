@@ -38,6 +38,11 @@ mixed-worker adapter, or production fallback is enabled yet.
   sparse-attention autograd and passes one shared K/V tensor. KL receives Python
   length lists, saves only its three indexer gradients per invocation, and
   applies the declared global normalization and upstream scale once.
+- `CannDsaSelection` admits only CPU-prepared external snapshots or the native
+  indexer's output. All execution entry points reject raw Tensor indices.
+  External snapshots are validated before upload; owned native storage is bound
+  to one prepared layout and checked for mutation using Tensor version metadata.
+  Device-indexer admission and execution do not read device values on the host.
 - `attention_bsnd` provides an explicit model boundary with Nkv=1 and zero RoPE
   output padding, preserving the model's projection/autograd ownership.
 
@@ -57,6 +62,34 @@ with softmax max/LSE `-inf` and sum zero. These are oracle conventions; backend
 device tests now show the locked native backward/KL do not implement this
 empty-row contract. See the selected-set matrix below before using the CANN
 reference with externally supplied selections.
+
+External CANN selections require CPU int32 `[T,2048]` snapshots. Preparation
+rejects unknown IDs and duplicate non-padding IDs, filters known future and
+cross-sequence IDs, compacts legal keys, and requires exactly
+`min(2048, causal prefix length)` legal keys per row. Underfilled and empty
+selections fail before upload or native dispatch. The general CPU oracle
+continues to support arbitrary legal selected sets and empty rows.
+
+```python
+# External snapshot preparation runs outside the training hot path.
+selection = backend.prepare_selection(cpu_global_indices)
+output, stats = backend.attention(q_nope, compressed_kv, q_rope, k_rope, selection)
+
+# Native indexer output already carries the native candidate-count contract.
+selection = backend.indexer(index_q, index_k, merge_weight)
+output, stats = backend.attention(q_nope, compressed_kv, q_rope, k_rope, selection)
+
+# Oracle/trace capture is an explicit device-to-host operation.
+cpu_global_indices = selection.to_global_indices().cpu()
+```
+
+`attention_bsnd` and `kl_loss` require the same admitted-selection type. A
+selection cannot be passed to a different layout instance, even with identical
+metadata. Source snapshots and exported global indices do not alias admitted
+storage. The native indexer path trusts that primitive's count/uniqueness
+contract; numerical device validation remains necessary, particularly for
+long contexts and ties. This restriction is a development API change; no model
+component or native payload is modified.
 
 FP64 is preserved for gradcheck; other floating-point inputs are promoted to
 FP32. The reference materializes selected KV and index scores and accepts CPU
@@ -169,9 +202,12 @@ does not perform the separate stock comparison itself.
 
 ### Selected-set matrix and auxiliary scaling
 
-`mega_dsa_cann_matrix.py` runs five fixed selections on the same packed BF16
-shape, comparing enhance and stock primitives independently with the FP32 oracle.
-It uses the per-fixture calibration rule above and rejects a stock calibration
+The original unrestricted matrix ran five fixed selections on the same packed
+BF16 shape, comparing enhance and stock primitives independently with the FP32
+oracle. Its failures below remain evidence of the native limitation. The
+current `mega_dsa_cann_matrix.py` verifies pre-dispatch rejection for the four
+unsupported cases and numerical acceptance for supported CPU-prepared and
+native-indexer selections. It uses the per-fixture calibration rule above and rejects a stock calibration
 whose relative L2 error is at least one (error as large as the reference signal).
 This sanity condition prevents mutually incorrect native results from providing
 a permissive error bound. Empty output/query derivatives/sum must be exactly
@@ -198,10 +234,10 @@ indices. KL likewise sets `s2RealSize = min(kSize, s2SparseLen)`; when the causa
 prefix fits K, `mergeKv` is false and it reads dense key storage. Its required
 selection therefore contains exactly `min(K, causal prefix length)` unique
 legal keys per row. Stable compaction does not satisfy this precondition for
-an underfilled or empty row. The current development adapter does not enforce
-this data-dependent precondition yet; use its native indexer-produced complete
-short histories only within the validated fixture. General selected sets and
-empty rows require a separately approved boundary/native change.
+an underfilled or empty row. The development adapter now enforces this
+precondition through CPU preparation or native-indexer provenance. General
+selected sets and empty rows are rejected; supporting them on device would
+require a separate native change. The native limitation remains unchanged.
 
 The same device matrix reuses the existing `aux_loss_auto_scale` and
 `set_aux_loss_scale`. Complete-history checks pass for `grad_aux=1/7` with
@@ -220,8 +256,14 @@ NPU_WAIT_POLL_SECONDS=60 bash ~/doc/npu_wait_and_run.sh \
   --output /tmp/mega_dsa_cann_matrix.json
 ```
 
-It deliberately exits nonzero for unsupported selections and retains metrics,
-calibration usability, exact empty-row checks, stage and traceback in JSON.
+Expected unsupported counts are reported as `rejected_before_dispatch`, with
+`native_invoked=false`; the four expected rejections are contract passes, not
+device numerical acceptance. The whole report sets `reference_contract_passed`
+and `status=contract_verified` only when all expected rejections, supported
+numerical checks and auxiliary-scaling checks pass. Unexpected admission,
+supported numerical failure or an execution error produces a nonzero exit and
+retains stage/traceback. It does not rerun unsupported raw native calls; the
+earlier failure reports remain preserved separately.
 
 ### Offline index traces
 
@@ -241,8 +283,9 @@ opportunities, not measured cache hits. Byte estimates assume one fetch per
 distinct key per tile; actual transport requests, allocation peaks and buffer
 lifecycles need separate runtime instrumentation.
 
-P0 still needs the candidate-count boundary/native decision above, real model
-wiring and parameter-gradient acceptance, long-context selection/tie behavior,
+The candidate-count boundary is restricted; general underfilled/empty device
+semantics remain unavailable. P0 still needs real model wiring and
+parameter-gradient acceptance, long-context selection/tie behavior,
 a broader BF16 tolerance matrix, end-to-end trainer loss/accumulation validation
 and real model index traces with memory lifecycle measurements. Follow those
 gates before SHMEM coexistence (P1) or mixed-team extraction (P2). CPU mocks
