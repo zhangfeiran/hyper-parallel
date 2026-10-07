@@ -30,6 +30,18 @@ from hyper_parallel.core.multicore.modules.mega_moe import function as function_
 class TestMegaMoeFunction(unittest.TestCase):
     """Exercise real autograd contexts with mocked communication and kernels."""
 
+    def test_home_only_runtime_keeps_split_addressing_without_guest_pointers(self) -> None:
+        """A no-transfer B>0 graph still addresses home expert matrices separately."""
+        base = torch.arange(16, dtype=torch.uint8)
+        for backward in (False, True):
+            with self.subTest(backward=backward), patch.object(torch.npu, "current_stream"), \
+                    patch.object(torch.Tensor, "record_stream", autospec=True):
+                result = function_module._split_runtime(base, None, 6, backward=backward, home_only=True)
+            self.assertTrue(torch.equal(result[:base.numel()], base))
+            self.assertEqual(struct.unpack("<II5Q", bytes(result[base.numel():].tolist())),
+                             (0x53505754, 2, 6, 0, 0, 0, 0))
+        self.assertIs(function_module._split_runtime(base, None, 6), base)
+
     def test_split_runtime_preserves_v2_and_encodes_deferred_ready_v3(self) -> None:
         """Only deferred consumers receive the per-slot device ready base and epoch."""
         base = torch.arange(16, dtype=torch.uint8)
@@ -136,18 +148,26 @@ class TestMegaMoeFunction(unittest.TestCase):
         function_module._dispatch_and_source(spec, workspace, rows, 3)
         torch.testing.assert_close(source, rows)
 
+    def test_empty_replica_plan_skips_leases_through_reversed_backward(self) -> None:
+        """B stays enabled while an immutable global plan has no transfers."""
+        for pull in (False, True):
+            with self.subTest(pull=pull):
+                self._check_deferred_backward(permuted=False, pull=pull, empty_replica_route=True)
+
     def _check_deferred_backward(
         self, *, permuted: bool, input_grad: bool = True, reuse: bool = False, pull: bool = False,
+        empty_replica_route: bool = False,
     ) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
-        spec = SimpleNamespace(replica_slots_per_rank=0, hidden_size=4, intermediate_size=2, rank_id=0,
+        spec = SimpleNamespace(replica_slots_per_rank=int(empty_replica_route), hidden_size=4,
+                               intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
                                dispatch_mode="pull" if pull else "push")
         plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=reuse)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
-        runtime = SimpleNamespace(normal_tensor=None)
+        runtime = SimpleNamespace(normal_tensor=torch.empty(16, dtype=torch.uint8) if empty_replica_route else None)
         plan.fwd_runtime = runtime
         plan.bwd_runtime = runtime
         workspace = Mock(
@@ -274,13 +294,18 @@ class TestMegaMoeFunction(unittest.TestCase):
                 "mega_moe_grad_with_profile_buffer",
                 new=backward_kernel,
             ),
+            patch.object(torch.npu, "current_stream"),
+            patch.object(torch.Tensor, "record_stream", autospec=True),
+            patch.object(function_module, "prefetch_weights", side_effect=AssertionError("Unexpected replica lease")),
+            patch.object(function_module, "return_gradients", side_effect=AssertionError("Unexpected replica return")),
             patch.object(function_module, "_restore_input_gradient", new=restore_without_scratch),
             patch.object(function_module.multicore_ops, "moe_token_permute_grad",
                          side_effect=permutation_gradient) as mock_permutation,
         ):
             for tag, capacity in enumerate(capacities, start=1):
                 source = torch.full((2 if permuted else 4, 4), float(tag), requires_grad=input_grad)
-                route = SimpleNamespace(replica_route=None, expert_capacity=capacity,
+                replica = SimpleNamespace(plan=SimpleNamespace(transfers=())) if empty_replica_route else None
+                route = SimpleNamespace(replica_route=replica, expert_capacity=capacity,
                                         group_list=torch.tensor([0, capacity]))
                 for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
                              "combine_src_off", "combine_target_off", "combine_size"):
