@@ -25,7 +25,9 @@ mixed-worker adapter, or production fallback is enabled yet.
   compensates a declared downstream CP sum or average. Projection input detach
   and the trainer's auxiliary upstream scale remain the caller's responsibility.
 - The offline backend probe records package versions, exact registered schemas
-  and custom-library SHA256 without launching device work.
+  and custom-library SHA256 without launching device work. It separately records
+  the active custom OPP compiler version and op-api hash; Python registration
+  alone does not identify the runtime vendor payload.
 - `CannDsaLayout` translates global packed indices into CANN's sequence-local
   namespace, removes illegal slots and stably compacts valid entries before the
   first `-1`. Backend lengths omit the metadata's initial zero. It rejects
@@ -112,17 +114,60 @@ Thus the schema difference alone does not establish a wrapper failure. The new
 reference passes precomputed Python lists to avoid a device-to-host length
 conversion at invocation time; no existing model wrapper is changed.
 
-The first actual NPU call initialized Ascend910B3 and allocated its BF16 inputs,
-then failed in indexer loading: `aclnnLightningIndexerEnhance` and its workspace
-entry were unavailable in the active op-api search path. The active CANN 9.1
-library exposes stock DSA names, which do not substitute for enhance symbols.
-An existing local enhance OPP exports the required names, but its `version.info`
-reports compiler 8.5.1; it was not activated under the 9.1 baseline. A matching
-isolated OPP build and explicit activation are required before device acceptance.
+The initial NPU call failed to resolve the enhance op-api symbols. An isolated
+build from Omni ops commit `14a3ed57aa9fd56c9dcb7ec282423711db4bce80` then produced
+the four target operators with `custom_opp_compiler_version=9.1.0`, including 16
+device object files. This reference dependency is separate from the Multicore
+`dependencies.lock.json` sources. Its op-api SHA256 is
+`5da9e2033e2f6dec138c73b6cce12c44cd986e96f84fecc50fa0362cdbf54fa0`.
 
-P0 still needs real model wiring/parameter-gradient acceptance, a loadable CANN
-reference with forward/backward comparison, hardware-calibrated BF16 tolerances,
-training loss-scale integration and real index trace profiling. Follow those
-gates before SHMEM coexistence (P1) or mixed-team extraction (P2). CPU mocks of
-the CANN boundary validate ABI/autograd wiring only; they establish no NPU
-numerical or performance result.
+The shared toolkit's vendor registry was unreadable during offline compilation.
+A private OPP view linked its CANN 9.1 contents and supplied an owned empty vendor
+registry for the compiler. Device execution must retain the original CANN 9.1
+`ASCEND_OPP_PATH`: a runtime probe showed the private view failed to load built-in
+tiling, while the original path computed `arange` and multiplication correctly.
+Activate the isolated vendor through `ASCEND_CUSTOM_OPP_PATH` and its op-api
+directory through `LD_LIBRARY_PATH` before importing Torch/NPU. No shared toolkit
+permission, registry or installation change is needed.
+
+### Single-fixture device evidence
+
+On Ascend910B3, CP=1, packed lengths `(3,5)`, BF16, main H=32, index H=8,
+C=512, Dr=64, Di=128 and K=2048, the host-dispatched enhance reference completed
+indexer, sparse attention forward/backward and selected KL. KL did not alter the
+main attention gradients. Native indices used the declared sequence-local
+namespace and converted to the expected global packed history sets.
+
+| Quantity | Enhance vs FP32 oracle relative L2 |
+| --- | ---: |
+| Compressed output | 0.00134942 |
+| q_nope gradient | 0.01267673 |
+| Compressed K/V gradient | 0.00170272 |
+| q_rope gradient | 0.01279705 |
+| k_rope gradient | 0.01372216 |
+| KL loss | 0.00024537 |
+| Index Q gradient | 0.00334042 |
+| Index K gradient | 0.00303772 |
+| Merge weight gradient | 0.00238999 |
+
+A second device run used stock `torch.ops.npu` indexer, SFA, explicit SFA grad
+and KL primitives from the installed CANN 9.1 runtime. Stock and enhance Top-K
+sets matched and covered the complete legal history. For this fixture, each
+enhance quantity passed bounds derived from stock-vs-oracle errors: relative L2
+at most `max(1.25 * stock_error, 1e-4)`, max absolute error at most
+`max(1.25 * stock_error, 1e-12)`, and cosine at least `stock_cosine - 1e-6`.
+LSE also passed. The largest enhance attention-gradient relative L2 was 0.01372,
+with max absolute error 2.41e-9; stock k_rope relative L2 was 0.01935.
+
+This is acceptance of one complete-history fixture, calibrated to these stock
+primitives. It is not a general BF16 tolerance, long-context Top-K equivalence,
+CP>1 result, parameter-gradient acceptance or performance measurement. The
+standalone validator still reports measurements pending calibration because it
+does not perform the separate stock comparison itself.
+
+P0 still needs real model wiring/parameter-gradient acceptance, device cases with
+partial selected histories and empty rows, long-context selection/tie behavior,
+a broader BF16 tolerance matrix, training loss-scale integration and real index
+trace profiling. Follow those gates before SHMEM coexistence (P1) or mixed-team
+extraction (P2). CPU mocks validate wiring only; the device result above comes
+from the separately executed enhance and stock primitive comparisons.

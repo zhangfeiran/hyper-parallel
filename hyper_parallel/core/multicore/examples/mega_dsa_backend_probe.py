@@ -32,6 +32,31 @@ _REQUIRED_OPS = (
 )
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _custom_opp_identities() -> list[dict]:
+    identities = []
+    for entry in os.environ.get("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        root = Path(entry).resolve()
+        version = root / "version.info"
+        library = root / "op_api/lib/libcust_opapi.so"
+        identities.append({
+            "root": str(root),
+            "compiler_version_info": version.read_text(encoding="utf-8").strip() if version.is_file() else None,
+            "op_api_library": str(library),
+            "op_api_sha256": _file_sha256(library) if library.is_file() else None,
+        })
+    return identities
+
+
 def probe_environment() -> dict:
     """Record exact schemas and library hashes; registration is not numerical validation."""
     root = Path(__file__).resolve().parents[4]
@@ -57,6 +82,7 @@ def probe_environment() -> dict:
                              ("ASCEND_HOME_PATH", "ASCEND_OPP_PATH", "ASCEND_TOOLKIT_HOME",
                               "ASCEND_CUSTOM_OPP_PATH", "LD_LIBRARY_PATH")},
         "device_execution": False,
+        "custom_opp_identities": _custom_opp_identities(),
     }
     # The optional registration package is inspected explicitly, never loaded by the CPU oracle.
     try:
@@ -68,11 +94,7 @@ def probe_environment() -> dict:
     result["omni_package"] = str(package_root)
     libraries = {}
     for library in sorted(package_root.rglob("*.so")):
-        digest = hashlib.sha256()
-        with library.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        libraries[str(library.relative_to(package_root))] = digest.hexdigest()
+        libraries[str(library.relative_to(package_root))] = _file_sha256(library)
     result["library_sha256"] = libraries
     schemas = {}
     for name in _REQUIRED_OPS:
