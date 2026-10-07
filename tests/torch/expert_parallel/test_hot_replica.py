@@ -155,3 +155,25 @@ def test_device_route_validation() -> None:
     """
     torchrun_case(str(Path(__file__).with_name("_test_replica_boundaries.py")),
                   "test_device_route_validation_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_push_projection_runtime_lifetime() -> None:
+    """
+    Feature: Projection invocation lifetime
+    Description: Retain v4 images on two streams with reversed backward.
+    Expectation: Each launch observes its own epoch and matches the FP32 native reference.
+    """
+    torchrun_case(_WORKER, "test_push_projection_runtime_lifetime_npu", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_pull_projection_runtime_lifetime() -> None:
+    """
+    Feature: Projection invocation lifetime
+    Description: Retain v4 images on two streams with reversed backward.
+    Expectation: Each launch observes its own epoch and matches the FP32 native reference.
+    """
+    torchrun_case(_WORKER, "test_pull_projection_runtime_lifetime_npu", num_proc=4)

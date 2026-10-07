@@ -85,6 +85,7 @@ class HostMeasurements:
         """Observe existing call boundaries without replacing their behavior."""
         device = importlib.import_module("hyper_parallel.core.expert_parallel.hot_replica.device")
         for module, name, stage in (
+                (routing, "_replica_count_payload", "validation_and_counts"),
                 (routing, "build_expert_replica_plan", "cpu_solver"),
                 (routing, "build_device_expert_replica_plan", "device_plan"),
                 (device, "launch_device_planner", "aiv_launch"),
