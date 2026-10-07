@@ -12,9 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=undefined-all-variable
 """Torch-only Multicore APIs, separate from the HyperParallel root exports."""
 
 __all__ = ["MegaMoeExperts", "profiler"]
 
-from hyper_parallel.core.multicore import profiler
-from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
+from importlib import import_module
+
+
+def __getattr__(name: str) -> object:
+    """Load NPU business modules when requested, allowing CPU frontend imports."""
+    if name == "MegaMoeExperts":
+        module = import_module("hyper_parallel.core.multicore.modules.mega_moe.module")
+        value = module.MegaMoeExperts
+        globals()[name] = value
+        return value
+    if name == "profiler":
+        value = import_module("hyper_parallel.core.multicore.profiler")
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

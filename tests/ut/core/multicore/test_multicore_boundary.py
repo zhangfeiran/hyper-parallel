@@ -17,8 +17,8 @@
 
 import ast
 import sys
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 import hyper_parallel
 from hyper_parallel.core import multicore
@@ -45,7 +45,7 @@ class TestMulticoreBoundary(unittest.TestCase):
         for name in ("MegaMoeExperts", "MulticoreModule", "mega_moe", "mega_moe_grad"):
             self.assertNotIn(name, hyper_parallel.__all__)
             self.assertFalse(hasattr(hyper_parallel, name))
-        self.assertFalse(hasattr(multicore, "__getattr__"))
+        self.assertFalse(hasattr(multicore, "unknown_business_symbol"))
         self.assertNotIn("hyper_parallel_shmem_torch", sys.modules)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
