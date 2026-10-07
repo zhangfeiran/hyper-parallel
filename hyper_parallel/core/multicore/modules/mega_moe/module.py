@@ -26,13 +26,27 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import (
+    ExpertReplicaConfig,
+    _integer,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
-from hyper_parallel.core.expert_parallel.hot_replica.device import validate_planner_backend
-from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
-from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import SIGNAL_TRANSPORT_MODES
-
+from hyper_parallel.core.expert_parallel.hot_replica.device import (
+    validate_planner_backend,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.routing import (
+    prepare_replica_route,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
+    SIGNAL_TRANSPORT_MODES,
+)
 from hyper_parallel.core.multicore import shmem
+from hyper_parallel.core.multicore.compiler.moe import MoeRecipe, match_moe_region
+from hyper_parallel.core.multicore.frontend.program import Program
+from hyper_parallel.core.multicore.ir.schedule import TaskDAG
+from hyper_parallel.core.multicore.primitives.registry import REGISTRY
+from hyper_parallel.core.multicore.runtime.moe import compile_moe_plan
+from hyper_parallel.core.multicore.runtime.moe_native import verify_moe_native
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
@@ -115,14 +129,21 @@ class _MegaMoeExecutionResources:
         *,
         shared: bool,
         active_specifications: tuple[Any, ...],
+        recipe: MoeRecipe | None = None,
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
+        self.frontend_plan = compile_moe_plan(recipe, self.spec) if recipe is not None else None
+        if recipe is not None:
+            verify_moe_native()
         _validate_resource_layout(active_specifications, tensor, self.spec)
         self.heap_manager = get_heap_manager(self.spec, tensor, active_specifications)
         shmem.acquire(self.spec.ep_group, heap_size_bytes=self.heap_manager.heap_bytes)
         try:
-            self.plan = build_mega_moe_plan(self.spec, tensor.device)
+            self.plan = (
+                self.frontend_plan.materialize(tensor.device) if self.frontend_plan is not None
+                else build_mega_moe_plan(self.spec, tensor.device)
+            )
             self.workspace = MegaMoeWorkspace(shared=shared)
             self.heap_manager.bind(self, specification)
         except Exception:
@@ -169,6 +190,7 @@ class MegaMoeExperts(MulticoreModule):
         replica_min_rows: int = 0,
         replica_cost_model: ExpertReplicaCostModel | None = None,
         replica_planner: str = "cpu",
+        program: Program | None = None,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -212,6 +234,7 @@ class MegaMoeExperts(MulticoreModule):
                 WORLD. Expert ownership follows group-local rank order. Disjoint
                 PP/DP groups bootstrap independently; one process can have only
                 one ordered EP membership active in SHMEM at a time.
+            program: Optional validated AST MoE TaskDAG region; omitted preserves native graph generation.
         """
         initial_capacity_factor, capacity_growth_factor = _resolve_capacity_factors(
             dispatch_mode, initial_capacity_factor, capacity_growth_factor)
@@ -226,6 +249,7 @@ class MegaMoeExperts(MulticoreModule):
         )
         if swiglu_limit is not None:
             swiglu_limit = float(swiglu_limit)
+        recipe = _program_recipe(program, swiglu_limit)
         if replica_transport not in ("p2p", "shmem", *SIGNAL_TRANSPORT_MODES):
             raise ValueError("Unsupported replica_transport; expected p2p, shmem, shmem_signal, "
                              "shmem_signal_sdma, shmem_signal_sdma_parallel, shmem_signal_sdma_bidir "
@@ -273,25 +297,15 @@ class MegaMoeExperts(MulticoreModule):
             replica_slots_per_rank,
             replica_transport,
         )
+        if recipe is not None:
+            specification["program_fingerprint"] = recipe.fingerprint
+            compatibility_key += (recipe.fingerprint,)
         super().__init__(
             resource_specification=specification,
             resource_compatibility_key=compatibility_key,
             resource_scope_key=("mega_moe", root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
-        self.replica_config = replica_config
-        self.replica_slots_per_rank = replica_slots_per_rank
-        self.local_num_tokens = local_num_tokens
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.initial_capacity_factor = initial_capacity_factor
-        self.capacity_growth_factor = capacity_growth_factor
-        self.dispatch_mode = dispatch_mode
-        self.swiglu_limit = swiglu_limit
-        self.ep_size = ep_size
-        self.local_experts = num_experts // ep_size
-        self._ep_group = ep_group
+        self._set_model_metadata(specification, replica_config, recipe)
         if create_parameters:
             self.gate_up_weight, self.down_weight = _create_mega_moe_parameters(
                 self.local_experts, hidden_size, intermediate_size,
@@ -299,6 +313,17 @@ class MegaMoeExperts(MulticoreModule):
         else:
             self.register_parameter("gate_up_weight", None)
             self.register_parameter("down_weight", None)
+
+    def _set_model_metadata(self, specification, replica_config, recipe):
+        self.replica_config = replica_config
+        self._moe_recipe = recipe
+        for name in ("replica_slots_per_rank", "local_num_tokens", "hidden_size", "intermediate_size",
+                     "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
+                     "swiglu_limit", "ep_size"):
+            setattr(self, name, specification[name])
+        self.num_experts = specification["logical_num_experts"]
+        self.local_experts = self.num_experts // self.ep_size
+        self._ep_group = specification["ep_group"]
 
     @staticmethod
     def _validate_topology(
@@ -516,4 +541,21 @@ class MegaMoeExperts(MulticoreModule):
             tensor,
             shared=shared,
             active_specifications=active_specifications,
+            recipe=self._moe_recipe,
         )
+
+
+def _program_recipe(program, limit):
+    if program is None:
+        return None
+    if not isinstance(program, Program) or not isinstance(program.schedule, TaskDAG):
+        raise TypeError("MegaMoeExperts program must be an AST TaskDAG program")
+    if program.schedule.policy != "moe_ratr_v1":
+        raise ValueError("MegaMoeExperts program requires moe_ratr_v1")
+    ir = program.lower(limit=limit)
+    for operation in ir.operations:
+        if program.registry.schema(operation.logical_name, operation.version) is not REGISTRY.schema(
+            operation.logical_name, operation.version,
+        ):
+            raise ValueError("MoE plans require canonical registered primitive schemas")
+    return match_moe_region(ir)

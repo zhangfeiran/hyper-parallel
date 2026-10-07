@@ -90,3 +90,64 @@ class Constexpr:
 
     def __class_getitem__(cls, scalar_type: object) -> ConstexprType:
         return ConstexprType(scalar_type)
+
+
+@dataclass(frozen=True)
+class RaggedTensorType:
+    """Capacity-shaped matrix; effective rows are supplied by runtime route metadata."""
+
+    dtype: DType
+    shape: tuple[int | str | None, ...]
+    layout: str = "contiguous"
+
+    def __post_init__(self):
+        if not isinstance(self.shape, tuple) or len(self.shape) != 2:
+            raise ValueError("RaggedTensor requires a capacity-shaped matrix tuple")
+        TensorType(self.dtype, tuple(0 if dim is None else dim for dim in self.shape), self.layout)
+
+
+@dataclass(frozen=True)
+class TensorListType:
+    """Homogeneous expert matrices, optionally specialized by a native shape contract."""
+
+    dtype: DType
+    shape: tuple[int | str, ...] | None = None
+    layout: str = "tensor_list"
+
+    def __post_init__(self):
+        TensorType(self.dtype, self.shape or ())
+        if self.shape is not None and len(self.shape) != 2:
+            raise ValueError("TensorList element shape must be a matrix")
+        if self.layout != "tensor_list":
+            raise ValueError("TensorList requires homogeneous matrix storage")
+
+
+@dataclass(frozen=True)
+class RouteMetadataType:
+    """Runtime counts/group-list identity, separate from frozen topology and capacities."""
+
+    num_experts: int | str = "LocalExperts"
+    dtype: DType = DType.INT64
+    layout: str = "route_metadata"
+
+    def __post_init__(self):
+        TensorType(self.dtype, (self.num_experts,))
+        if self.dtype != DType.INT64 or self.layout != "route_metadata" or self.num_experts == 0:
+            raise ValueError("RouteMetadata requires a nonempty INT64 group-list identity")
+
+    @property
+    def shape(self) -> tuple[int | str]:
+        """Return the rank-local group-list shape for semantic dumps."""
+        return (self.num_experts,)
+
+
+# pylint: disable-next=unsupported-binary-operation
+LogicalType = TensorType | RaggedTensorType | TensorListType | RouteMetadataType
+LOGICAL_TYPES = (TensorType, RaggedTensorType, TensorListType, RouteMetadataType)
+
+
+class TensorList:
+    """Annotation factory: TensorList[dtype] or TensorList[dtype, matrix_shape]."""
+
+    def __class_getitem__(cls, arguments: DType | tuple) -> TensorListType:
+        return TensorListType(*arguments) if isinstance(arguments, tuple) else TensorListType(arguments)

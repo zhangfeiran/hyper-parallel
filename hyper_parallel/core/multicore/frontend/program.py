@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping
 
 import torch
 
+from hyper_parallel.core.multicore.compiler.moe import match_moe_region
 from hyper_parallel.core.multicore.compiler.pipeline import compile_worker_pipeline
 from hyper_parallel.core.multicore.frontend.parser import (
     Helper,
@@ -36,12 +37,22 @@ from hyper_parallel.core.multicore.ir.schedule import (
     TaskDAG,
     WorkerPipeline,
 )
-from hyper_parallel.core.multicore.language.types import TensorType
+from hyper_parallel.core.multicore.language.types import (
+    LOGICAL_TYPES,
+    LogicalType,
+    RaggedTensorType,
+    RouteMetadataType,
+    TensorListType,
+    TensorType,
+)
+from hyper_parallel.core.multicore.language.values import RaggedTensor, RouteMetadata
+from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.primitives.gate import TORCH_DTYPES
 from hyper_parallel.core.multicore.primitives.registry import (
     REGISTRY,
     PrimitiveRegistry,
 )
+from hyper_parallel.core.multicore.runtime.moe import MoeKernelPlan, compile_moe_plan
 from hyper_parallel.core.multicore.runtime.plan import KernelPlan
 
 
@@ -87,7 +98,7 @@ class Program:
         *,
         target: str = "ascend",
         schedule: WorkerPipeline | TaskDAG | None = None,
-        signature: Mapping[str, TensorType] | None = None,
+        signature: Mapping[str, LogicalType] | None = None,
         constants: Mapping[str, object] | None = None,
         registry: PrimitiveRegistry = REGISTRY,
     ) -> None:
@@ -103,7 +114,7 @@ class Program:
         self.constants = {key: frozen(value) for key, value in (constants or {}).items()}
         self.registry = registry
 
-    def lower(self, *, signature: Mapping[str, TensorType] | None = None, **constants: object) -> ProgramIR:
+    def lower(self, *, signature: Mapping[str, LogicalType] | None = None, **constants: object) -> ProgramIR:
         """Specialize constexpr parameters and lower to immutable ProgramIR.
 
         Args:
@@ -119,27 +130,35 @@ class Program:
 
     def plan(
         self,
-        signature: Mapping[str, int] | None = None,
+        signature: Mapping[str, int] | MegaMoeSpec | None = None,
         topology: HardwareSpec | None = None,
         **constants: object,
-    ) -> KernelPlan:
-        """Compile a supported Gate Route program into a host compatibility plan.
+    ) -> KernelPlan | MoeKernelPlan:
+        """Compile a supported Gate Route or MoE region into a host compatibility plan.
 
         Args:
-            signature: Positive sizes for exactly the symbolic input dimensions.
-            topology: Available AIV workers, supplied independently of computation.
-            **constants: Declared constexpr specializations, such as k and scale.
+            signature: Symbolic Gate dimensions or a bound native MegaMoeSpec for TaskDAG.
+            topology: Physical worker availability, independent of computation.
+            **constants: Declared constexpr specializations, such as k, scale or limit.
 
         Returns:
             A source-mapped host plan with normal/profiled native descriptor images.
         """
-        if self.schedule is None or isinstance(self.schedule, TaskDAG):
-            raise ValueError("Only explicit WorkerPipeline Gate compatibility plans are implemented")
+        if self.schedule is None:
+            raise ValueError("An explicit WorkerPipeline or TaskDAG schedule is required")
         ir = self.lower(**constants)
         for operation in ir.operations:
             canonical = REGISTRY.schema(operation.logical_name, operation.version)
             if self.registry.schema(operation.logical_name, operation.version) is not canonical:
-                raise ValueError("Gate compatibility plans require canonical registered primitive schemas")
+                raise ValueError("Compatibility plans require canonical registered primitive schemas")
+        if isinstance(self.schedule, TaskDAG):
+            if self.schedule.policy != "moe_ratr_v1":
+                raise ValueError("Only the moe_ratr_v1 TaskDAG policy is implemented")
+            if not isinstance(signature, MegaMoeSpec):
+                raise TypeError("MoE TaskDAG plans require a bound MegaMoeSpec")
+            if topology is not None and topology.available_aiv_workers != 2 * signature.num_cube_cores:
+                raise ValueError("MoE topology must match the native spec's Cube/AIV worker ratio")
+            return compile_moe_plan(match_moe_region(ir), signature)
         return compile_worker_pipeline(ir, self.schedule, dict(signature or {}), topology or HardwareSpec())
 
     def explain(self, **constants: object) -> str:
@@ -182,7 +201,8 @@ class Program:
             declared[arg.arg] = self.signature.get(arg.arg)
             if arg.annotation is not None:
                 declared[arg.arg] = parser.resolve_annotation(arg.annotation)
-        constants = {key: value for key, value in bound.arguments.items() if not isinstance(declared[key], TensorType)}
+        constants = {key: value for key, value in bound.arguments.items()
+                     if not isinstance(declared[key], LOGICAL_TYPES)}
         return bound, constants
 
     def _execute_ir(self, ir, bound):
@@ -190,7 +210,7 @@ class Program:
         dimensions = {}
         for value in ir.inputs:
             tensor = bound.arguments[value.name]
-            _validate_tensor(tensor, value.type, dimensions, value.name)
+            _validate_value(tensor, value.type, dimensions, value.name)
             values[value.id] = tensor
         for operation in ir.operations:
             schema = self.registry.schema(operation.logical_name, operation.version)
@@ -203,10 +223,34 @@ class Program:
             if not isinstance(results, tuple) or len(results) != len(operation.outputs):
                 raise ValueError(f"Reference output arity mismatch for {operation.logical_name}")
             for value, tensor in zip(operation.outputs, results):
-                _validate_tensor(tensor, value.type, dimensions, value.name)
+                _validate_value(tensor, value.type, dimensions, value.name)
                 values[value.id] = tensor
         outputs = tuple(values[value.id] for value in ir.outputs)
         return outputs if ir.returns_tuple else outputs[0]
+
+
+def _validate_value(value, logical_type, dimensions, name):
+    if isinstance(logical_type, RaggedTensorType):
+        if not isinstance(value, RaggedTensor):
+            raise TypeError(f"Reference {name} requires a RaggedTensor storage/valid_rows pair")
+        _validate_tensor(value.storage, logical_type, dimensions, name)
+    elif isinstance(logical_type, RouteMetadataType):
+        if not isinstance(value, RouteMetadata):
+            raise TypeError(f"Reference {name} requires RouteMetadata")
+        _validate_tensor(value.group_list, TensorType(logical_type.dtype, logical_type.shape), dimensions, name)
+    elif isinstance(logical_type, TensorListType):
+        matrices = tuple(value.unbind(0)) if isinstance(value, torch.Tensor) and value.dim() == 3 else value
+        if not isinstance(matrices, (list, tuple)) or not matrices:
+            raise ValueError(f"Reference {name} requires a nonempty expert matrix list or stacked 3D tensor")
+        shape = logical_type.shape or tuple(matrices[0].shape)
+        if len(shape) != 2:
+            raise ValueError("TensorList elements must be matrices")
+        for matrix in matrices:
+            _validate_tensor(matrix, TensorType(logical_type.dtype, shape), dimensions, name)
+        if dimensions.setdefault("LocalExperts", len(matrices)) != len(matrices):
+            raise ValueError("Expert matrix lists must match the route group-list size")
+    else:
+        _validate_tensor(value, logical_type, dimensions, name)
 
 
 def _validate_tensor(tensor, tensor_type, dimensions, name):
@@ -217,6 +261,8 @@ def _validate_tensor(tensor, tensor_type, dimensions, name):
     if not tensor.is_contiguous():
         raise ValueError(f"Tensor {name} must be contiguous for the declared V0 layout")
     for expected, actual in zip(tensor_type.shape, tensor.shape):
+        if expected is None:
+            continue
         if isinstance(expected, str):
             if dimensions.setdefault(expected, actual) != actual:
                 raise ValueError(f"Symbolic dimension {expected} is inconsistent at {name}")
@@ -256,7 +302,7 @@ def helper(function: Callable) -> Helper:
 
 def from_source(
     source: str,
-    signature: Mapping[str, TensorType] | None = None,
+    signature: Mapping[str, LogicalType] | None = None,
     constants: Mapping[str, object] | None = None,
     *,
     symbols: Mapping[str, object] | None = None,

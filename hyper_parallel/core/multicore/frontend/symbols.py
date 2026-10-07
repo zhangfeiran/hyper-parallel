@@ -22,7 +22,14 @@ import operator
 from collections.abc import Callable
 from types import ModuleType
 
-from hyper_parallel.core.multicore.language.types import Constexpr, DType, Tensor
+from hyper_parallel.core.multicore.language.types import (
+    Constexpr,
+    DType,
+    RouteMetadataType,
+    Tensor,
+    TensorList,
+)
+from hyper_parallel.core.multicore.language.values import RaggedTensor, RouteMetadata
 
 _BINARY = {
     ast.Add: operator.add,
@@ -119,19 +126,30 @@ def annotation(node: ast.AST, evaluate: Callable[[ast.AST], object]) -> object:
     if isinstance(node, ast.Tuple):
         return tuple(annotation(item, evaluate) for item in node.elts)
     if isinstance(node, ast.Subscript):
-        factory = evaluate(node.value)
-        if factory is Tensor:
-            arguments = node.slice.elts if isinstance(node.slice, ast.Tuple) else ()
-            if len(arguments) != 2:
-                raise ValueError("Tensor annotation requires dtype and shape")
-            dtype, shape = (evaluate(item) for item in arguments)
-            return Tensor[dtype, shape]
-        if factory is Constexpr:
-            return Constexpr[_scalar_annotation(node.slice, evaluate)]
+        return _subscript_annotation(node, evaluate)
     result = evaluate(node)
+    if result is RouteMetadata:
+        return RouteMetadataType()
     if isinstance(result, DType):
         raise TypeError("Use Tensor[dtype, shape] for tensor arguments")
     return result
+
+
+def _subscript_annotation(node, evaluate):
+    factory = evaluate(node.value)
+    if factory is Tensor or factory is RaggedTensor:
+        arguments = node.slice.elts if isinstance(node.slice, ast.Tuple) else ()
+        if len(arguments) != 2:
+            raise ValueError("Tensor annotation requires dtype and shape")
+        dtype, shape = (evaluate(item) for item in arguments)
+        return Tensor[dtype, shape] if factory is Tensor else RaggedTensor[dtype, shape]
+    if factory is TensorList:
+        if isinstance(node.slice, ast.Tuple):
+            return TensorList[tuple(evaluate(item) for item in node.slice.elts)]
+        return TensorList[evaluate(node.slice)]
+    if factory is Constexpr:
+        return Constexpr[_scalar_annotation(node.slice, evaluate)]
+    raise ValueError("Unsupported type annotation factory")
 
 
 def _scalar_annotation(node, evaluate):

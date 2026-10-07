@@ -20,11 +20,11 @@ import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from hyper_parallel.core.multicore.language.types import TensorType
+from hyper_parallel.core.multicore.language.types import LOGICAL_TYPES, LogicalType
 
 
 def _read_effects(arguments: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
-    return tuple(("read", key) for key, value in arguments.items() if isinstance(value, TensorType))
+    return tuple(("read", key) for key, value in arguments.items() if isinstance(value, LOGICAL_TYPES))
 
 
 @dataclass(frozen=True)
@@ -39,7 +39,7 @@ class OpSchema:
     logical_name: str
     version: int
     signature: inspect.Signature
-    infer_types_and_shapes: Callable[[Mapping[str, object]], tuple[TensorType, ...]]
+    infer_types_and_shapes: Callable[[Mapping[str, object]], tuple[LogicalType, ...]]
     reference: Callable | None
     infer_effects: Callable[[Mapping[str, object]], tuple[tuple[str, str], ...]] = _read_effects
 

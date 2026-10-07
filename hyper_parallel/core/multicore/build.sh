@@ -642,6 +642,12 @@ while IFS= read -r packaged_library; do
     validate_shared_library_security "${packaged_library}"
 done < <(find "${COMPONENT_ROOT}/core/multicore" -type f -name '*.so' -print)
 
+CURRENT_REASON_CODE="MULTICORE_FRONTEND_MANIFEST_FAILED"
+"${PYTHON_BIN}" -m hyper_parallel.core.multicore._build.write_moe_manifest \
+    --multicore-root "${OUTPUT_ROOT}" \
+    --shmem-root "${COMPONENT_ROOT}/core/multicore/shmem/lib" \
+    --soc-list "${CANN_SOC_LIST}"
+
 trap - ERR
 echo "INFO: multicore build completed"
 echo "  framework: torch"

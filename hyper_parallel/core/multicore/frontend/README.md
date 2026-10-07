@@ -1,9 +1,10 @@
-# Python AST frontend and Gate compatibility plans
+# Python AST frontend and compatibility plans
 
 This implements the semantic frontend foundation from the 2026-10-07 AST design.
 The implementation covers typed source capture, identity-based primitive schemas,
-ProgramIR, CPU reference interpretation and source-mapped Gate WorkerPipeline host
-plans. Device materialization and execution remain a separate milestone.
+ProgramIR, CPU reference interpretation, Gate WorkerPipeline plans and MoE TaskDAG
+plans. Device bindings preserve the existing family-specific numerical kernels
+and explicit backward recipes.
 
 ## Use the frontend
 
@@ -212,8 +213,80 @@ projection autograd, overlapping forwards, multiple streams, noncontiguous
 incoming gradients and actual stage-record coverage. Results are written to
 `build/native/gate/acceptance.json` (override with `HP_AST_GATE_RESULT`).
 
-Vision masking is not yet expressible by the supported frontend Route pattern.
-Full MoE/MHC plan snapshots and lowering remain pending, as do ragged tensors,
-tensor lists, runtime/shape scalars, buffer planning, cache and generated Ascend
-workers. Single-card Gate acceptance does not establish distributed MoE/MHC or
-performance results, and ascend910_93 still requires device validation.
+## MoE TaskDAG integration
+
+The [MoE region](examples/moe_region.py) declares dispatch, grouped matmul,
+packed gate/up SwiGLU, grouped matmul and combine under
+`mc.TaskDAG(policy="moe_ratr_v1")`. The compiler verifies canonical primitive
+identities, BF16 storage, complete operand/group/metadata dataflow, packed layout,
+clamp specialization and preserved numerical order. It derives the forward DAG
+edges from ProgramIR, then uses the original native task nodes and complete
+`build_config_for_rank` path. Termination tasks, queue revision, dynamic group
+scratch, ready/completion protocols and profiling layouts retain their original
+contracts. The original autograd and replica gradient-return recipe supplies
+backward, including W13 overlap and its no-replica fallback.
+
+Models select the region through the existing module constructor:
+
+```python
+from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore.frontend.examples.moe_region import moe_region
+
+experts = MegaMoeExperts(
+    local_num_tokens=128, hidden_size=512, intermediate_size=128,
+    num_experts=4, top_k=2, ep_size=2, ep_group=ep_group,
+    dispatch_mode="push", swiglu_limit=10.0, program=moe_region,
+).to(device="npu", dtype=torch.bfloat16)
+output = experts(hidden_states, topk_ids, topk_weights,
+                 tokens_per_expert=tokens_per_expert)
+output.backward(grad_output)
+experts.close()
+```
+
+Router/permutation, histogram handling, caller-owned weights, capacity growth,
+hot-replica planning and SHMEM/workspace ownership continue through that module.
+Program identity participates in static rank agreement and shared-resource
+compatibility. Modules must have the same program to share execution resources.
+Changing runtime counts or route skew does not specialize the semantic program.
+Omitting `program` retains the original module entry.
+
+For CPU planning, call `moe_region.plan(spec, limit=spec.swiglu_limit)` with an
+existing `MegaMoeSpec` describing rank-local shapes, physical cores and guest
+slots. This emits full normal/profiled forward/backward images, fixed-stride
+worker queues, stage source spans, physical bindings and a provenance manifest;
+it requires no NPU import or device access. `plan.materialize(device)` returns
+the existing `MegaMoePlan` resource object. Model execution should use
+`MegaMoeExperts` so the module also owns routing and distributed lifetimes.
+
+`ml.RaggedTensor[dtype, (capacity, width)]` separates storage capacity from valid
+rows. `ml.TensorList[dtype, matrix_shape]` describes homogeneous expert matrices;
+the dtype-only form binds matrix shapes through the native specification.
+`ml.RouteMetadata` identifies runtime cumulative INT64 expert counts. The CPU
+interpreter accepts `ml.RaggedTensor(storage, valid_rows)` and
+`ml.RouteMetadata(group_list)` for already local, expert-major rows. Its dispatch
+and combine references validate local grouping and preserve row order; they do
+not simulate distributed communication or token permutation. Native execution
+binds the module's actual routing buffers and dynamic group lists.
+
+The normal MoE build now emits `lib/frontend_manifest.json`, sealing the fixed
+MoE ABI/native source baseline, build inputs, toolchain/framework identity and
+all MoE/private SHMEM payload files. AST materialization checks the seal,
+artifact set and CANN/Torch/C++ ABI identity before loading resources. Build and
+activate the MoE payload in a fresh process:
+
+```bash
+bash hyper_parallel/core/multicore/build.sh --soc-list ascend910b --jobs 16
+source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+python -m pytest -s tests/torch/multicore/test_ast_moe.py
+```
+
+The sealed MoE vendor must be first in `ASCEND_CUSTOM_OPP_PATH`. Use separate
+processes for Gate and MoE custom OPP activation because CANN/framework operator
+caches are process-wide. Older MoE builds need rebuilding to provide the seal
+before selecting the AST program.
+
+Vision masking, MHC lowering, runtime/shape scalars, general buffer planning,
+compilation caching and generated Ascend workers remain future stages. Device
+acceptance establishes the tested topology and shapes; it does not establish
+performance or full-model training equivalence. Ascend910_93 still requires
+device validation.

@@ -19,9 +19,14 @@ from __future__ import annotations
 from hyper_parallel.core.multicore.language.types import (
     Constexpr,
     DType,
+    RaggedTensorType,
+    RouteMetadataType,
     Tensor,
+    TensorList,
+    TensorListType,
     TensorType,
 )
+from hyper_parallel.core.multicore.language.values import RaggedTensor, RouteMetadata
 from hyper_parallel.core.multicore.primitives.gate import (
     add,
     cast,
@@ -34,6 +39,12 @@ from hyper_parallel.core.multicore.primitives.gate import (
     stop_gradient,
     topk_indices,
 )
+from hyper_parallel.core.multicore.primitives.moe import (
+    combine,
+    dispatch,
+    grouped_matmul,
+    swiglu_packed,
+)
 
 bf16 = DType.BF16
 fp16 = DType.FP16
@@ -45,16 +56,25 @@ boolean = DType.BOOL
 __all__ = [
     "Constexpr",
     "DType",
+    "RaggedTensor",
+    "RaggedTensorType",
+    "RouteMetadata",
+    "RouteMetadataType",
     "Tensor",
+    "TensorList",
+    "TensorListType",
     "TensorType",
     "add",
     "bf16",
     "boolean",
     "cast",
+    "combine",
+    "dispatch",
     "divide",
     "fp16",
     "fp32",
     "gather",
+    "grouped_matmul",
     "int32",
     "int64",
     "multiply",
@@ -62,5 +82,6 @@ __all__ = [
     "softplus",
     "sqrt",
     "stop_gradient",
+    "swiglu_packed",
     "topk_indices",
 ]

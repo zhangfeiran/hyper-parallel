@@ -34,9 +34,10 @@ from hyper_parallel.core.multicore.ir.program import (
     Value,
 )
 from hyper_parallel.core.multicore.language.types import (
+    LOGICAL_TYPES,
     ConstexprType,
     DType,
-    TensorType,
+    LogicalType,
 )
 from hyper_parallel.core.multicore.primitives.registry import (
     Primitive,
@@ -63,7 +64,7 @@ class IRBuilder:
     next_id: int = 0
     unrolled_iterations: int = 0
 
-    def value(self, name: str, tensor_type: TensorType) -> Value:
+    def value(self, name: str, tensor_type: LogicalType) -> Value:
         """Allocate a new SSA result.
 
         Args:
@@ -202,7 +203,7 @@ class Parser:
     def lower(
         self,
         constants: dict[str, object],
-        signature: dict[str, TensorType] | None = None,
+        signature: dict[str, LogicalType] | None = None,
     ) -> ProgramIR:
         """Bind input types/static values and produce semantic IR.
 
@@ -257,7 +258,7 @@ class Parser:
         return declared
 
     def _bind_parameter(self, arg, declared, constants, defaults):
-        if isinstance(declared, TensorType):
+        if isinstance(declared, LOGICAL_TYPES):
             if arg.arg in constants:
                 raise self.error(arg, "Runtime tensor inputs cannot be frozen as constants")
             value = self.builder.value(arg.arg, declared)
@@ -295,7 +296,7 @@ class Parser:
         if self.function.returns is not None:
             declared = self.resolve_annotation(self.function.returns)
             expected = declared if isinstance(declared, tuple) else (declared,)
-            if any(not isinstance(item, TensorType) for item in expected):
+            if any(not isinstance(item, LOGICAL_TYPES) for item in expected):
                 raise self.error(self.function.returns, "Return annotations require complete tensor types")
             if expected != tuple(value.type for value in self.outputs):
                 raise self.error(
@@ -450,7 +451,7 @@ class Parser:
                 frozen(value)
         typed = {key: value.type if isinstance(value, Value) else value for key, value in bound.arguments.items()}
         output_types = schema.infer_types_and_shapes(typed)
-        if not output_types or any(not isinstance(item, TensorType) for item in output_types):
+        if not output_types or any(not isinstance(item, LOGICAL_TYPES) for item in output_types):
             raise self.error(node, "Primitive inference must return tensor types")
         outputs = tuple(self.builder.value(f"result_{self.builder.next_id}", item) for item in output_types)
         effects = []
@@ -518,7 +519,7 @@ class Parser:
             raise self.error(arg, "Helper parameters require annotations")
         declared = self.resolve_annotation(arg.annotation)
         value = self.env[arg.arg]
-        if isinstance(declared, TensorType):
+        if isinstance(declared, LOGICAL_TYPES):
             if not isinstance(value, Value) or value.type != declared:
                 raise self.error(arg, "Helper tensor argument type mismatch")
         elif not isinstance(declared, ConstexprType) or not declared.accepts(value):

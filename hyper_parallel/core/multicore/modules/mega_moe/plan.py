@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -30,8 +31,10 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
-    can_reuse_backward_dispatch, replica_w2_ready_events,
-    prepare_w13_overlap_schedule, replica_w13_ready_events,
+    can_reuse_backward_dispatch,
+    prepare_w13_overlap_schedule,
+    replica_w2_ready_events,
+    replica_w13_ready_events,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
@@ -51,11 +54,13 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
-from hyper_parallel.core.multicore.profiler.profiling import (
-    _PreparedMegaKernelRuntime,
-    _prepare_mega_kernel_runtime_config,
+from hyper_parallel.core.multicore.profiler.profiler import (
+    _enable_runtime_config_tensor,
 )
-from hyper_parallel.core.multicore.profiler.profiler import _enable_runtime_config_tensor
+from hyper_parallel.core.multicore.profiler.profiling import (
+    _prepare_mega_kernel_runtime_config,
+    _PreparedMegaKernelRuntime,
+)
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
 from .spec import MegaMoeSpec
@@ -126,10 +131,13 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     )
 
 
-def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> tuple[Any, Any, Any, Any]:
+def _build_runtime_artifacts(
+    spec: MegaMoeSpec, *, overlap_w13: bool = True,
+    forward_graph_factory: Callable | None = None,
+) -> tuple[Any, Any, Any, Any]:
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     task_values = _build_task_values(spec)
-    forward_graph = build_forward_graph(
+    forward_graph = forward_graph_factory(spec) if forward_graph_factory is not None else build_forward_graph(
         task_values,
         dispatch_sv=spec.dispatch_split,
         swiglu_sv=spec.swiglu_split,
@@ -200,17 +208,22 @@ def _prepare_runtimes(
     return tuple(_prepare_mega_kernel_runtime_config(config, **options) for config in configs)
 
 
-def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
+def build_mega_moe_plan(
+    spec: MegaMoeSpec, device: Any, *, forward_graph_factory: Callable | None = None,
+) -> MegaMoePlan:
     """Build trimmed dense forward/backward runtime images without fusion slots.
 
     Args:
         spec: Validated local-token and expert topology specification.
         device: NPU device receiving serialized descriptors and tiling tensors.
+        forward_graph_factory: Optional compiler-provided graph preserving the native fill/finalize contract.
 
     Returns:
         Rank-local forward and backward runtime resources.
     """
-    forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec, overlap_w13=False)
+    forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(
+        spec, overlap_w13=False, forward_graph_factory=forward_graph_factory,
+    )
     configs = (forward_config, backward_config)
     if spec.replica_slots_per_rank and spec.replica_transport == "shmem_signal_kernel_gradient":
         overlap_config = deepcopy(backward_config)

@@ -18,13 +18,12 @@ from __future__ import annotations
 
 __all__ = []
 
+import importlib
+import struct
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-import struct
 from threading import Lock
 from typing import Any
-
-import torch_npu
 
 from hyper_parallel.core.multicore.scheduler.config import (
     EVENT_INVALID_ID,
@@ -38,7 +37,6 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode
 from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
-
 
 CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
 VECTOR_SLOT_COUNT = NUM_WORKERS_VECTOR
@@ -141,7 +139,8 @@ class _CycleTraceConfig:
 
 def _get_soc_name(device_id: int | None) -> str:
     """Return and validate the current Ascend SoC name through Torch NPU."""
-    get_device_name = torch_npu.npu.get_device_name
+    # Host graph compilation and byte serialization do not require the NPU backend.
+    get_device_name = importlib.import_module("torch_npu").npu.get_device_name
     try:
         soc_name = get_device_name(device_id)
     except TypeError:

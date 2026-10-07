@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from hyper_parallel.core.multicore.language.types import DType, TensorType
+from hyper_parallel.core.multicore.language.types import DType, LogicalType
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ class Value:
 
     id: int
     name: str
-    type: TensorType
+    type: LogicalType
 
 
 @dataclass(frozen=True)
@@ -90,6 +90,7 @@ class ProgramIR:
                     "dtype": item.type.dtype.value,
                     "shape": item.type.shape,
                     "layout": item.type.layout,
+                    "kind": type(item.type).__name__,
                 }
             if isinstance(item, DType):
                 return item.value
