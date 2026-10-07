@@ -365,7 +365,6 @@ completion words. It reuses the provider's ready/ACK channels with a distinct
 epoch and adds no full expert inbox. This mode is available only to MegaMoe;
 native returns both projections through HCCL P2P after local backward computation.
 
-
 ## Reuse planned receive loads
 
 A hot-replica route already contains exact CPU `destination_loads`. MegaMoe uses
@@ -468,7 +467,6 @@ dX on every Cube; the complete dX event fences the W13 output. W2 and W13 use
 distinct epochs and completion storage, and the kernel joins all remote readers
 before releasing the guest lease. Unrecognized schedules retain late return.
 
-
 ## Controlled performance and diagnostics
 
 Run the fresh-process worker through the same four-card environment and native
@@ -537,7 +535,6 @@ The precision worker accepts the same `--cost-model` file. Validate its output,
 dX, router-probability gradients and owner dW against `--fp32-reference` before
 using a changed plan. The reference never receives the candidate calibration.
 
-
 For a MegaMoe B>0 invocation whose global plan has no transfers, forward and
 backward skip the guest pool lease, guest gradient clearing and gradient return.
 The invocation still saves its immutable route and computes FP32 home weight
@@ -545,3 +542,33 @@ partials. Its runtime keeps the existing v2 home-expert addressing marker with
 null guest pointers: the marker also selects per-expert GMM addressing and
 cannot be omitted. The global transfer list controls this path; an owner with
 outgoing transfers must participate even when it has no local guest work.
+
+MegaMoe also reuses identical static v2 runtime images inside its serial
+workspace lease when profiling is disabled. The cache compares both the base
+tensor identity and the complete suffix bytes, keeps only the latest image per
+base, and records each use on the current stream. The workspace completion event
+orders cross-stream access, and close/heap rebuild releases the image storage at
+the existing synchronized teardown boundary. These images contain writable
+worker scratch and must not be reused outside that lease. They are not global
+immutable schedule tensors.
+
+Dynamic v3/v4/v5 readiness, epoch and gradient-return descriptors remain
+invocation-owned. Profiling uses independently constructed images; B=0 returns
+its original base runtime. This optimization retains the existing native ABI.
+
+Add `--host-breakdown` to the benchmark for five additional untimed balanced/hot
+steps with host-only spans. This mode does not enable Torch/internal profiling,
+insert per-stage device events, or synchronize individual spans. It reports
+runtime base/image sizes and observed cache hits. Host spans can still include
+submission waits for queued device work and can nest; complete-step ABBA remains
+the performance criterion. `replica_runtime_image_bytes` is an overlapping Torch
+memory subcategory and must not be added again to the recorded peak.
+
+The four-rank `test_push_static_runtime_streams` and
+`test_pull_static_runtime_streams` launchers in
+`tests/torch/expert_parallel/test_hot_replica.py` check two distinct retained
+plans, reverse backward order, and reuse of the same v2 image on two actual NPU
+streams in each direction. They compare output, dX, router-probability gradients
+and owner weight gradients with the FP32 native reference. For profiler coverage
+of the home-only v2 path, use `--diagnose --diagnose-pattern balanced` with the
+benchmark; the default diagnostic pattern remains `home_hot`.
