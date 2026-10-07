@@ -15,16 +15,36 @@
 """Keep payload accounting separate from shared storage reservations."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from tests.common.mark_utils import arg_mark
-from tests.torch.expert_parallel.hot_replica_measurements import _payload_bytes
+from tests.torch.expert_parallel.hot_replica_measurements import HostMeasurements, _payload_bytes
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestReplicaMeasurements(unittest.TestCase):
     """Pool tensor views must not each claim the whole SHMEM allocation."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_light_host_observation_adds_no_device_events_or_synchronize(self):
+        """
+        Feature: Host-only observation
+        Description: Observe a span with NPU events and synchronization forbidden.
+        Expectation: Record host time without device events or synchronization.
+        """
+        with patch.object(torch.npu, "Event", side_effect=AssertionError("Unexpected device event")), \
+                patch.object(torch.npu, "synchronize", side_effect=AssertionError("Unexpected synchronization")):
+            with HostMeasurements(device_intervals=False) as host:
+                with host.span("host_only"):
+                    pass
+        self.assertEqual(len(host.records), 1)
+        self.assertEqual(host.records[0]["stage"], "host_only")
+        self.assertGreaterEqual(host.records[0]["host_ms"], 0)
+        self.assertNotIn("stream_interval_ms", host.records[0])
+        self.assertNotIn("events", host.records[0])
 
     def test_shared_weight_gradient_backing_and_padding(self):
         """Count BF16/FP32 payload independently of common padded storage."""

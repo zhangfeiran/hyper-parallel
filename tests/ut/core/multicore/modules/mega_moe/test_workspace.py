@@ -32,9 +32,31 @@ from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
 )
 from hyper_parallel.core.multicore.scheduler.config import event_workspace_bytes
 
+from tests.common.mark_utils import arg_mark
+
 
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_close_releases_cached_runtime_images_and_keeps_base_owned(self):
+        """
+        Feature: Runtime image lifecycle
+        Description: Close a workspace containing only a cached image.
+        Expectation: Synchronize and free the image while preserving the base storage.
+        """
+        workspace = MegaMoeWorkspace(shared=False)
+        base, image = torch.empty(16, dtype=torch.uint8), torch.empty(64, dtype=torch.uint8)
+        workspace.replica_runtime_images[id(base)] = (base, b"suffix", image)
+        with patch.object(workspace_module.torch.npu, "synchronize") as synchronize, \
+                patch.object(workspace_module.shmem, "host_barrier") as barrier:
+            workspace.close()
+        synchronize.assert_called_once_with(None)
+        self.assertEqual(barrier.call_count, 2)
+        self.assertFalse(workspace.replica_runtime_images)
+        self.assertEqual(image.untyped_storage().nbytes(), 0)
+        self.assertEqual(base.untyped_storage().nbytes(), 16)
 
     @staticmethod
     def _specification(initial_capacity_factor):
