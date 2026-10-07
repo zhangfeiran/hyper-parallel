@@ -24,6 +24,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaConfig, build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.device import build_device_expert_replica_plan
+from hyper_parallel.core.expert_parallel.hot_replica import routing
 from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
 from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
 
@@ -37,6 +38,29 @@ class _NoReadback(TorchDispatchMode):
                                             str((kwargs or {}).get("device", "")) == "cpu"):
             raise AssertionError(f"Device solver readback: {name}")
         return func(*args, **(kwargs or {}))
+
+
+def test_replica_count_payload_npu() -> None:
+    """Check fixed integer counts, including values above FP32's exact range."""
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    for shape in ((0, 8), (3, 0), (512, 8)):
+        ids = torch.randint(-2, 27, shape, device="cpu", dtype=torch.int64).T.contiguous().T
+        flat = ids.clamp(0, 23).flatten()
+        invalid = any(len(set(row)) != len(row) or any(not 0 <= value < 24 for value in row)
+                      for row in ids.tolist())
+        expected = torch.cat((torch.bincount(flat, minlength=24), torch.tensor([int(invalid)])))
+        device_ids = ids.npu()
+        with _NoReadback():
+            actual = routing._replica_count_payload(device_ids, 24)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    rows = 2**24 + 7
+    ids = torch.zeros((rows, 1), device="npu", dtype=torch.int64)
+    with _NoReadback():
+        actual = routing._replica_count_payload(ids, 24)
+    expected = torch.zeros(25, dtype=torch.int64)
+    expected[0] = rows
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    print(f"FIXED_INT64_COUNT_PAYLOAD_OK rows={rows}", flush=True)
 
 
 def test_device_replica_boundaries_npu() -> None:
