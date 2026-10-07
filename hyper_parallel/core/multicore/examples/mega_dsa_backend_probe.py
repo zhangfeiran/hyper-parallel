@@ -27,6 +27,7 @@ import torch
 _REQUIRED_OPS = (
     "npu_lightning_indexer_enhance",
     "npu_sparse_flash_attention_enhance",
+    "npu_sparse_flash_attention_grad_enhance",
     "npu_sparse_lightning_indexer_grad_kl_loss_enhance",
 )
 
@@ -53,7 +54,8 @@ def probe_environment() -> dict:
         "torch_runtime": torch.__version__,
         "versions": versions,
         "cann_environment": {name: os.environ.get(name) for name in
-                             ("ASCEND_HOME_PATH", "ASCEND_OPP_PATH", "ASCEND_TOOLKIT_HOME")},
+                             ("ASCEND_HOME_PATH", "ASCEND_OPP_PATH", "ASCEND_TOOLKIT_HOME",
+                              "ASCEND_CUSTOM_OPP_PATH", "LD_LIBRARY_PATH")},
         "device_execution": False,
     }
     # The optional registration package is inspected explicitly, never loaded by the CPU oracle.

@@ -1,8 +1,9 @@
 # megaDSA development baseline
 
-This package begins P0 of the 2026-10-07 megaDSA implementation plan. It supplies
-logical metadata and a small CPU numerical oracle. No `MegaDsaCore` device runtime,
-SHMEM consumer, mixed-worker adapter, or production fallback is enabled yet.
+This package implements the P0 foundations of the 2026-10-07 megaDSA plan:
+logical metadata, a small CPU numerical oracle, and an explicit single-card
+enhance reference boundary. No `MegaDsaCore` device runtime, SHMEM consumer,
+mixed-worker adapter, or production fallback is enabled yet.
 
 ## Implemented contracts
 
@@ -25,6 +26,24 @@ SHMEM consumer, mixed-worker adapter, or production fallback is enabled yet.
   and the trainer's auxiliary upstream scale remain the caller's responsibility.
 - The offline backend probe records package versions, exact registered schemas
   and custom-library SHA256 without launching device work.
+- `CannDsaLayout` translates global packed indices into CANN's sequence-local
+  namespace, removes illegal slots and stably compacts valid entries before the
+  first `-1`. Backend lengths omit the metadata's initial zero. It rejects
+  incomplete/reordered Q/K or CP>1 before stock right-down masking can use an
+  incorrect query offset.
+- `CannDsaReference` wires indexer, sparse attention and forward-computed KL
+  derivatives through the installed enhance ABI. It reuses the registered
+  sparse-attention autograd and passes one shared K/V tensor. KL receives Python
+  length lists, saves only its three indexer gradients per invocation, and
+  applies the declared global normalization and upstream scale once.
+- `attention_bsnd` provides an explicit model boundary with Nkv=1 and zero RoPE
+  output padding, preserving the model's projection/autograd ownership.
+
+The initial CANN reference support matrix is CP=1 with complete, ordered packed
+TND storage; BF16; C=512, Dr=64, K=2048; main heads 32/64/128; index heads
+8/16/32/64 and Di=128. These checks describe the development adapter's intended
+range, not a completed hardware support certification. Native statistics stay
+opaque `[1,T,H]` FP32 buffers, separate from the CPU oracle's `[T,H]` buffers.
 
 The reference layouts are `[Tq,H,C]`, `[Tk,C]`, `[Tq,H,Dr]`, `[Tk,Dr]` and
 int32 `[Tq,K]` indices. The only accepted index namespace is `global_packed`.
@@ -52,6 +71,23 @@ OMP_NUM_THREADS=1 python -m pytest -q tests/ut/core/multicore
 python hyper_parallel/core/multicore/examples/mega_dsa_backend_probe.py
 ```
 
+Once a matching enhance OPP is explicitly activated, run the standalone device
+validator through the idle gate, in a process with this checkout installed:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 NPU_WAIT_VISIBLE_DEVICES=0 NPU_WAIT_NUM_CARDS=1 \
+NPU_WAIT_POLL_SECONDS=60 bash ~/doc/npu_wait_and_run.sh \
+  python hyper_parallel/core/multicore/examples/mega_dsa_cann_validate.py \
+  --output /tmp/mega_dsa_cann_validation.json
+```
+
+The validator records output, natural-log LSE, all four attention input gradients,
+KL loss and all three indexer gradients against the FP32 oracle, plus main/index
+gradient isolation. Failures retain a JSON stage/traceback and a nonzero process
+exit. The short packed case covers full legal histories; it is not evidence of
+long-context Top-K selection, CP, projection-parameter acceptance or performance.
+BF16 acceptance thresholds still require primitive-specific calibration.
+
 CPU acceptance compares against independent dense and unabsorbed MLA formulas,
 including all attention inputs, W_UK, W_UV and output projection gradients.
 Separate key/value gradients must sum to the merged compressed-KV gradient.
@@ -70,13 +106,23 @@ establishes registration only; it does not establish device support or the build
 provenance of the installed package relative to `dependencies.lock.json`.
 
 The installed KL schema declares `actual_seq_qlen` and `actual_seq_klen` as
-`SymInt[]?`, while the existing model wrapper passes Tensor lengths. This requires
-an actual ABI call and a deliberate adapter decision before backend integration.
-No existing model wrapper is changed by this baseline.
+`SymInt[]?`. A dispatcher diagnostic accepted both Python lists and CPU Tensor
+lengths through argument parsing, then stopped because KL has no Meta kernel.
+Thus the schema difference alone does not establish a wrapper failure. The new
+reference passes precomputed Python lists to avoid a device-to-host length
+conversion at invocation time; no existing model wrapper is changed.
 
-P0 still needs the real model boundary, explicit backend index-namespace and
-RoPE-padding adapters, single-card CANN forward/backward and parameter-gradient
-comparison, hardware-calibrated BF16 tolerances, training loss-scale integration,
-and real index trace profiling. Follow those gates before SHMEM coexistence (P1)
-or mixed-team kernel extraction (P2). No NPU numerical or performance claim is
-made by the CPU oracle.
+The first actual NPU call initialized Ascend910B3 and allocated its BF16 inputs,
+then failed in indexer loading: `aclnnLightningIndexerEnhance` and its workspace
+entry were unavailable in the active op-api search path. The active CANN 9.1
+library exposes stock DSA names, which do not substitute for enhance symbols.
+An existing local enhance OPP exports the required names, but its `version.info`
+reports compiler 8.5.1; it was not activated under the 9.1 baseline. A matching
+isolated OPP build and explicit activation are required before device acceptance.
+
+P0 still needs real model wiring/parameter-gradient acceptance, a loadable CANN
+reference with forward/backward comparison, hardware-calibrated BF16 tolerances,
+training loss-scale integration and real index trace profiling. Follow those
+gates before SHMEM coexistence (P1) or mixed-team extraction (P2). CPU mocks of
+the CANN boundary validate ABI/autograd wiring only; they establish no NPU
+numerical or performance result.
