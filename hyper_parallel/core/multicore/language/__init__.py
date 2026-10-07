@@ -39,6 +39,12 @@ from hyper_parallel.core.multicore.primitives.gate import (
     stop_gradient,
     topk_indices,
 )
+from hyper_parallel.core.multicore.primitives.mhc import (
+    mhc_input_mix,
+    mhc_mapping,
+    mhc_post,
+    rms_norm,
+)
 from hyper_parallel.core.multicore.primitives.moe import (
     combine,
     dispatch,
@@ -77,8 +83,12 @@ __all__ = [
     "grouped_matmul",
     "int32",
     "int64",
+    "mhc_input_mix",
+    "mhc_mapping",
+    "mhc_post",
     "multiply",
     "reduce_sum",
+    "rms_norm",
     "softplus",
     "sqrt",
     "stop_gradient",

@@ -15,7 +15,7 @@
 # pylint: disable=undefined-all-variable
 """Torch-only Multicore APIs, separate from the HyperParallel root exports."""
 
-__all__ = ["MegaMoeExperts", "profiler"]
+__all__ = ["HyperMegaMhc", "MegaMoeExperts", "profiler"]
 
 from importlib import import_module
 
@@ -25,6 +25,10 @@ def __getattr__(name: str) -> object:
     if name == "MegaMoeExperts":
         module = import_module("hyper_parallel.core.multicore.modules.mega_moe.module")
         value = module.MegaMoeExperts
+        globals()[name] = value
+        return value
+    if name == "HyperMegaMhc":
+        value = import_module("hyper_parallel.core.multicore.modules.mega_mhc.module").HyperMegaMhc
         globals()[name] = value
         return value
     if name == "profiler":

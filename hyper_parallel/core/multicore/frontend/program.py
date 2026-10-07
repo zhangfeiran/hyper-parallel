@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping
 
 import torch
 
+from hyper_parallel.core.multicore.compiler.mhc import match_mhc_region
 from hyper_parallel.core.multicore.compiler.moe import match_moe_region
 from hyper_parallel.core.multicore.compiler.pipeline import compile_worker_pipeline
 from hyper_parallel.core.multicore.frontend.parser import (
@@ -52,6 +53,8 @@ from hyper_parallel.core.multicore.primitives.registry import (
     REGISTRY,
     PrimitiveRegistry,
 )
+from hyper_parallel.core.multicore.runtime.mhc import MhcKernelPlan, compile_mhc_plan
+from hyper_parallel.core.multicore.runtime.mhc_spec import MhcSpec
 from hyper_parallel.core.multicore.runtime.moe import MoeKernelPlan, compile_moe_plan
 from hyper_parallel.core.multicore.runtime.plan import KernelPlan
 
@@ -130,14 +133,14 @@ class Program:
 
     def plan(
         self,
-        signature: Mapping[str, int] | MegaMoeSpec | None = None,
+        signature: Mapping[str, int] | MegaMoeSpec | MhcSpec | None = None,
         topology: HardwareSpec | None = None,
         **constants: object,
-    ) -> KernelPlan | MoeKernelPlan:
-        """Compile a supported Gate Route or MoE region into a host compatibility plan.
+    ) -> KernelPlan | MoeKernelPlan | MhcKernelPlan:
+        """Compile a supported Gate Route, MoE or MHC region into a host compatibility plan.
 
         Args:
-            signature: Symbolic Gate dimensions or a bound native MegaMoeSpec for TaskDAG.
+            signature: Symbolic Gate dimensions or a bound MegaMoeSpec/MhcSpec for TaskDAG.
             topology: Physical worker availability, independent of computation.
             **constants: Declared constexpr specializations, such as k, scale or limit.
 
@@ -152,14 +155,23 @@ class Program:
             if self.registry.schema(operation.logical_name, operation.version) is not canonical:
                 raise ValueError("Compatibility plans require canonical registered primitive schemas")
         if isinstance(self.schedule, TaskDAG):
-            if self.schedule.policy != "moe_ratr_v1":
-                raise ValueError("Only the moe_ratr_v1 TaskDAG policy is implemented")
-            if not isinstance(signature, MegaMoeSpec):
-                raise TypeError("MoE TaskDAG plans require a bound MegaMoeSpec")
-            if topology is not None and topology.available_aiv_workers != 2 * signature.num_cube_cores:
-                raise ValueError("MoE topology must match the native spec's Cube/AIV worker ratio")
-            return compile_moe_plan(match_moe_region(ir), signature)
+            return self._task_dag_plan(ir, signature, topology)
         return compile_worker_pipeline(ir, self.schedule, dict(signature or {}), topology or HardwareSpec())
+
+    def _task_dag_plan(self, ir, signature, topology):
+        if self.schedule.policy == "shifted_mhc_v1":
+            if not isinstance(signature, MhcSpec):
+                raise TypeError("MHC TaskDAG plans require a bound MhcSpec")
+            if topology is not None and topology.available_aiv_workers != signature.num_vector_cores:
+                raise ValueError("MHC topology must match the specification's physical core ratio")
+            return compile_mhc_plan(match_mhc_region(ir), signature)
+        if self.schedule.policy != "moe_ratr_v1":
+            raise ValueError("Only moe_ratr_v1 and shifted_mhc_v1 TaskDAG policies are implemented")
+        if not isinstance(signature, MegaMoeSpec):
+            raise TypeError("MoE TaskDAG plans require a bound MegaMoeSpec")
+        if topology is not None and topology.available_aiv_workers != 2 * signature.num_cube_cores:
+            raise ValueError("MoE topology must match the native spec's Cube/AIV worker ratio")
+        return compile_moe_plan(match_moe_region(ir), signature)
 
     def explain(self, **constants: object) -> str:
         """Describe schedule intent and dump the source-mapped semantic IR."""

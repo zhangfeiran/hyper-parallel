@@ -52,8 +52,9 @@ this baseline.
    Build-produced family/schema/source metadata must be verified before binding.
 
 The capture tool verifies every patch's actual bytes against its declared lock
-hash. This document is a transplant plan; no dependency patch, worker merge or
-native ABI change is performed by this host milestone.
+hash. The initial host milestone did not transplant workers. Gate and MHC now have
+isolated native builders; MoE reuses its current builder. Their artifact-bound
+manifests retain separate family ABI and dependency identities.
 
 ## Independent snapshots and reproduction
 
@@ -90,7 +91,10 @@ are also recorded in the native build fingerprint.
 Single-card Gate forward/backward acceptance is available through
 `tests/torch/multicore/test_ast_gate.py`; see the
 [frontend native binding guide](../../frontend/README.md#current-implementation-boundary)
-for build, activation, stream and validation contracts. Full MoE/MHC plan
-snapshots and lowering, vision frontend masking, other-device and performance
-validation remain outstanding. `NativeManifest` alone is a metadata guard;
-`verify_gate_payload` additionally checks the complete build-produced artifacts.
+for build, activation, stream and validation contracts. MoE now emits complete
+current rank-local plans; MHC has sixteen independently captured fixed-revision
+normal/profiled forward/backward snapshots and an isolated builder. Reproduce
+MHC snapshots through `python -m tests.ut.core.multicore.backends.fixtures.capture_mhc_snapshots`.
+Vision masking, other-device and performance validation remain outstanding.
+`NativeManifest` alone is a metadata guard; family artifact admission additionally
+checks the complete build-produced payload before loading.

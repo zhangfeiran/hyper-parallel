@@ -2,7 +2,7 @@
 
 This implements the semantic frontend foundation from the 2026-10-07 AST design.
 The implementation covers typed source capture, identity-based primitive schemas,
-ProgramIR, CPU reference interpretation, Gate WorkerPipeline plans and MoE TaskDAG
+ProgramIR, CPU reference interpretation, Gate WorkerPipeline plans and MoE/MHC TaskDAG
 plans. Device bindings preserve the existing family-specific numerical kernels
 and explicit backward recipes.
 
@@ -285,8 +285,118 @@ processes for Gate and MoE custom OPP activation because CANN/framework operator
 caches are process-wide. Older MoE builds need rebuilding to provide the seal
 before selecting the AST program.
 
-Vision masking, MHC lowering, runtime/shape scalars, general buffer planning,
+Vision masking, runtime/shape scalars, general buffer planning,
 compilation caching and generated Ascend workers remain future stages. Device
 acceptance establishes the tested topology and shapes; it does not establish
 performance or full-model training equivalence. Ascend910_93 still requires
 device validation.
+
+## MegaMHC shifted TaskDAG integration
+
+The [MHC boundary](examples/mhc_boundary.py) declares post, mapping, input mix
+and RMSNorm under `mc.TaskDAG(policy="shifted_mhc_v1")`. It returns updated
+residual, next pre/post/residual mixes and the current block input. InputMix
+uses **previous** pre coefficients; the mapping branch predicts the next layer's
+coefficients. The compiler checks canonical primitive identity, all nine typed
+operands, ordered five outputs, fixed four streams, twenty Sinkhorn iterations
+and equal NormCast/RMSNorm epsilon before deriving the semantic fork from SSA.
+
+Mapping expands to NormCast, Projection and Mapping. The six native stages retain
+the original AIV gap-filling order and AIC projection overlap. NormCast waits
+for Projection before reusing an X-cast ring slot. The backward recipe retains
+output initialization, RMSNormGrad, previous-A/mapping preparation, AIC Phi/RMS
+and previous-X/post gradients. Each AIC macro waits for all of its corresponding
+AIV producers. `plan.explain()` exposes stage source locations, worker queues,
+ring ownership, macro joins and seven distinct saved cache buffers; the legacy
+TensorSpec placeholder does not imply physical buffer aliasing.
+
+```python
+from hyper_parallel.core.multicore.frontend.examples.mhc_boundary import mhc_boundary
+from hyper_parallel.core.multicore.runtime.mhc_spec import MhcSpec
+
+plan = mhc_boundary.plan(MhcSpec(2593, 128, num_cube_cores=20))
+print(plan.explain())
+# Compilation and complete normal/profiled serialization require only CPU Torch.
+```
+
+Native forward/backward workers and adapters come from the design's exact MHC
+revision `979e2a9ac913413e361f4fc2dd9987766af8ddb4`. MHC task IDs remain local
+to that family; the MoE task enum and native headers are not extended. The
+builder exports verified sources into an isolated directory, checks and applies
+their locked patches, and records all actual build inputs and payload artifacts.
+The CANN 9.2 wrapper removes one unused obsolete SDK include from exported common
+headers. It does not alter the pinned worker's numerical implementation.
+
+```bash
+source /path/to/cann-9.2/set_env.sh
+# Prepare the normal MoE dependencies/private SDK with the existing build first.
+python -m hyper_parallel.core.multicore._build.build_mhc \
+    --ops-nn-source build/native/deps/ops_nn/src \
+    --ops-mhc-source /path/to/clean/ops-transformer-mhc
+unset ASCEND_CUSTOM_OPP_PATH
+source build/native/mhc/payload/set_env.bash
+python -m pytest -s tests/torch/multicore/test_ast_mhc.py
+```
+
+The MHC dependency checkout must identify
+`58b4a6bdeb29feeb0070dd266106bd4e130bb72b` with its locked tree and archive
+hash, including a compatible hash from the original lock. Git LFS smudging can
+change archive bytes: preserve the committed pointer bytes when materializing
+this source checkout. The builder currently consumes the existing private SDK
+record at `build/native/work/multicore/shmem/sdk.json` for generic worker header
+dependencies. It does not initialize SHMEM or link a SHMEM runtime into MHC.
+Use a fresh process with exactly the activated MHC vendor in
+`ASCEND_CUSTOM_OPP_PATH`; Gate/MoE/MHC operator caches cannot share a process.
+
+The model entry point preserves the original parameter names, shapes and dtypes:
+
+```python
+from hyper_parallel.core.multicore import HyperMegaMhc
+
+layer = HyperMegaMhc(128, device="npu:0")
+updated, next_pre, next_post, next_matrix, block_input = layer(
+    previous_output, residual, previous_pre, previous_post, previous_matrix,
+    profile=True,
+)
+loss = block_input.float().square().mean() + next_pre.square().mean()
+loss.backward()
+records = [record for call in layer.take_profiles() for record in call.records()]
+layer.close()
+```
+
+Phi/alpha/bias stay FP32 and norm weight stays BF16. A compatible custom region
+can be supplied through `program=`. Model descriptors are cached per flattened
+shape/device/backward contract; inputs and parameters bind anew on every call.
+Each invocation owns fresh event counters, saved caches and optional profile
+storage, permitting multiple pending forwards and checkpoint recomputation.
+Closing a binding rejects future forwards; pending autograd contexts retain
+its descriptors. Initialization events and allocator stream recording make
+cross-stream reuse safe after callers establish their input producer ordering.
+Native double backward is unsupported. Profiling reports actual task cycles,
+source locations and direction, and rejects dropped/corrupted records.
+
+Native backward requires T at least the physical AIV count and H <=5760; H must
+be divisible by 128. Use `need_backward=False` for smaller inference inputs.
+Epsilons must stay finite and positive after FP32 conversion. Planning rejects
+both forward/backward event boundaries that lack padding for the original
+8-element atomic counter write; it does not enlarge or silently change that ABI.
+For example, T=10817 with a 32-row tile is rejected, while a larger safe tile
+can be selected explicitly. General automatic buffer planning, generated workers
+and unified schema-derived bindings are P5 work.
+
+Committed CPU fixtures contain sixteen complete original forward/backward images
+covering tails, ring wrap and 32/64/96-row tiles. Reproduce them with:
+
+```bash
+python -m tests.ut.core.multicore.backends.fixtures.capture_mhc_snapshots
+python -m pytest -q tests/ut/core/multicore/backends/test_mhc.py
+```
+
+The single-card device suite checks all five outputs and all nine gradients
+against the independent pinned Torch oracle using its original precision gate
+(relative L2 <=0.02, cosine >=0.999). It also checks streams, multiple pending
+forwards, missing output gradients, closing before backward, checkpoint/SGD,
+and profile coverage. The CPU primitive references expose the native BF16
+mixed-input cache boundary explicitly; the independent acceptance oracle retains
+its original mathematical reference. Device admission applies to the validated
+shapes/topology, without a performance or full-model convergence claim.

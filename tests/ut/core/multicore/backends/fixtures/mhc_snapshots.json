@@ -1,0 +1,117 @@
+{
+  "revision": "979e2a9ac913413e361f4fc2dd9987766af8ddb4",
+  "cases": [
+    {
+      "T": 48,
+      "H": 128,
+      "C": 24,
+      "tile": 32,
+      "images": {
+        "forward_0": {
+          "file": "mhc_t48_tile32_forward_0.bin.gz",
+          "bytes": 34112,
+          "sha256": "fe186fadd0dc43d35779289db9312d763345fd39b724dca2c44430db1f5b6664"
+        },
+        "forward_1": {
+          "file": "mhc_t48_tile32_forward_1.bin.gz",
+          "bytes": 34112,
+          "sha256": "8e2b8a30e3160b640cdffc2452958f2e6cae7ea5395b37c1384012c5a3a54257"
+        },
+        "backward_0": {
+          "file": "mhc_t48_tile32_backward_0.bin.gz",
+          "bytes": 62336,
+          "sha256": "c9e6bd3567bf719caf5ee2ea9af5dea4395b23b0e32790b16a9165b39470dfac"
+        },
+        "backward_1": {
+          "file": "mhc_t48_tile32_backward_1.bin.gz",
+          "bytes": 62336,
+          "sha256": "5b1667d23e166e214118a56c0679112ed9bf621b9c0f1a67684a9801cd3b416e"
+        }
+      }
+    },
+    {
+      "T": 129,
+      "H": 128,
+      "C": 20,
+      "tile": 64,
+      "images": {
+        "forward_0": {
+          "file": "mhc_t129_tile64_forward_0.bin.gz",
+          "bytes": 43520,
+          "sha256": "099914d0db11af38befb3107c055d22920f8fe39d576e4a4e3dc84da0d55c1dd"
+        },
+        "forward_1": {
+          "file": "mhc_t129_tile64_forward_1.bin.gz",
+          "bytes": 43520,
+          "sha256": "180d75e35ee440541010d8ea5cc2e52dd8eab771458ae2eebb17bdf6d517ba44"
+        },
+        "backward_0": {
+          "file": "mhc_t129_tile64_backward_0.bin.gz",
+          "bytes": 62336,
+          "sha256": "0c78bf87d3dcfa7b92f63be26a022d33e0d3b3fab9f531fbae8cc82b7db8c7b5"
+        },
+        "backward_1": {
+          "file": "mhc_t129_tile64_backward_1.bin.gz",
+          "bytes": 62336,
+          "sha256": "85e0efc53592e52cf2e0aa3a5cc9481b4f9148c3893e319651e3060dfa8185e0"
+        }
+      }
+    },
+    {
+      "T": 2593,
+      "H": 128,
+      "C": 20,
+      "tile": 32,
+      "images": {
+        "forward_0": {
+          "file": "mhc_t2593_tile32_forward_0.bin.gz",
+          "bytes": 316352,
+          "sha256": "acd2fddb36f5b1b1d428e9ea4166a1b131c5c5713ec8441f88c49ba536120d61"
+        },
+        "forward_1": {
+          "file": "mhc_t2593_tile32_forward_1.bin.gz",
+          "bytes": 316352,
+          "sha256": "964c7e2cce4914fd5bbfd0841de90d45210588e8291bd200910be67e7b505a59"
+        },
+        "backward_0": {
+          "file": "mhc_t2593_tile32_backward_0.bin.gz",
+          "bytes": 222272,
+          "sha256": "ecee100add62065b79ac52346f89190a305eab476d4d7af4d8af8833cdb8d111"
+        },
+        "backward_1": {
+          "file": "mhc_t2593_tile32_backward_1.bin.gz",
+          "bytes": 222272,
+          "sha256": "2f364d6f2043582b8428ccf34621d5030c5403396347f150f1a2b041e83cfe8a"
+        }
+      }
+    },
+    {
+      "T": 12000,
+      "H": 128,
+      "C": 20,
+      "tile": 96,
+      "images": {
+        "forward_0": {
+          "file": "mhc_t12000_tile96_forward_0.bin.gz",
+          "bytes": 466880,
+          "sha256": "709561866bbee856e617f9076af3613ad66ff1bdd2b0ce7f718e2abcabd65174"
+        },
+        "forward_1": {
+          "file": "mhc_t12000_tile96_forward_1.bin.gz",
+          "bytes": 466880,
+          "sha256": "b3491e6446cae4f1ac0676bd4a7f80ecb2f6c79362aae74eaa09290230aa5e65"
+        },
+        "backward_0": {
+          "file": "mhc_t12000_tile96_backward_0.bin.gz",
+          "bytes": 344576,
+          "sha256": "6299958375bf09925c570968e0dcdfce7cd438c1058c9a0d547b29eafbf136dd"
+        },
+        "backward_1": {
+          "file": "mhc_t12000_tile96_backward_1.bin.gz",
+          "bytes": 344576,
+          "sha256": "f73c0ad92a358e476ee259d96349ee9c0e208635815b2f17d465db575a2bc55f"
+        }
+      }
+    }
+  ]
+}
