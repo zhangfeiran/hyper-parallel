@@ -31,6 +31,23 @@ class TestReplicaRouting(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
+    def test_count_payload_retains_global_validation_flags(self) -> None:
+        """
+        Feature: Collective count and validation payload
+        Description: Build payloads for legal, duplicate, out-of-range and empty routes.
+        Expectation: Preserve exact clamped histograms and report invalid routes before transfer.
+        """
+        cases = (([[0, 1], [2, 3]], [1, 1, 1, 1, 0]),
+                 ([[0, 0], [2, 3]], [2, 0, 1, 1, 1]),
+                 ([[-1, 4], [2, 3]], [1, 0, 1, 2, 1]))
+        for ids, expected in cases:
+            payload = routing._replica_count_payload(torch.tensor(ids), 4)
+            torch.testing.assert_close(payload, torch.tensor(expected))
+        empty = routing._replica_count_payload(torch.empty((0, 2), dtype=torch.int64), 4)
+        torch.testing.assert_close(empty, torch.zeros(5, dtype=torch.int64))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_gather_preserves_rank_order_flags_and_retained_invocations(self) -> None:
         """
         Feature: Invocation-owned count gather
