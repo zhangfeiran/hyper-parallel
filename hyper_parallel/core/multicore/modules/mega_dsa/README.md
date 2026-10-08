@@ -714,6 +714,58 @@ P2 remains incomplete until complete backward, alternating task types and
 communication pressure pass. This probe does not establish multi-card fused
 DSA, model CP integration, training acceptance or performance improvement.
 
+## P2 mixed SFA backward probe
+
+The experimental [training probe](mixed_attention.py) combines the callable
+SFA forward with a [locked gradient adapter](../../ops/sparse_flash_attention_grad_mixed.patch).
+It runs initialization, non-deterministic computation and output conversion
+as three kernels on one stream. Initialization completes the global FP32
+gradient zeroing before any compute group starts accumulation. Output
+conversion starts after all compute groups finish. No reserved physical
+group participates in a full-chip barrier.
+
+Logical query partitions retain their original ownership; physical groups
+own reusable MM and scatter scratch. The wrapper reserves cross-core flags
+13/14, separately from the gradient tile's flags 0 through 8. Each phase
+records all three group members' completion. The retained workspace is
+ordinary HBM with a conservative bound checked against host tiling; it is
+not a shared-root allocation or a communication buffer.
+
+The raw interface returns separate K and V gradients. The autograd interface
+adds those contributions once for the shared compressed K/V input. Each
+forward saves independent output and softmax statistics and versioned input
+tensors; each backward obtains fresh accumulation scratch. `retain_graph`
+therefore repeats a complete three-phase backward. Higher derivatives,
+deterministic algorithms, model integration and SHMEM communication remain
+outside this probe's contract.
+
+Support matches the forward probe's CP1 BF16 geometry, with one logical
+traversal per phase. After [building and activating the payload](../../docs/build.md), run:
+
+```bash
+python -m hyper_parallel.core.multicore.examples.mega_dsa_mixed_grad_validate \
+  --output mixed_sfa_grad_report.json --long-history
+```
+
+The validator checks all five raw gradients against stock CANN and all four
+merged input gradients against an independent CPU FP32 oracle at
+rtol=0.02, atol=2e-5. It retains every numerical comparison, including stock
+CANN against FP32, before reporting an acceptance failure. It also checks
+forward output, custom against stock autograd with shared K/V, repeated
+backward and all three phase traces. Numerical summaries accumulate relative
+L2 and cosine in CPU FP64; elementwise acceptance retains the declared
+FP32 comparison thresholds. Native contract checks and FP32 acceptance are
+reported separately, with the complete report failing if either fails.
+Each fixture also holds two different forwards until reverse-order backward
+on a second stream, with explicit stream waits, and runs non-reentrant
+checkpoint recomputation. These checks compare against independent stock
+invocations and do not establish shared-root or concurrent stream support.
+Long history includes 4096 tokens to exercise the optimized scatter path;
+only three query rows have nonzero cotangents in that fixture to bound the
+independent CPU graph. Short fixtures use nonzero cotangents on every row.
+Passing native-to-native comparisons alone does not establish FP32 gradient
+acceptance or complete P2.
+
 ## P2 mixed LI probe
 
 The experimental [LI adapter](mixed_indexer.py) preserves the locked 910B

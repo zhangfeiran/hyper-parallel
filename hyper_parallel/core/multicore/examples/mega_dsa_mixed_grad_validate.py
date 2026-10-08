@@ -24,6 +24,7 @@ from pathlib import Path
 
 import torch
 import torch_npu  # noqa: F401  # pylint: disable=unused-import  # Registers the NPU backend.
+from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.core.multicore.modules.mega_dsa.cann_reference import (
     CannDsaLayout,
@@ -88,31 +89,43 @@ def _oracle(meta: DsaBatchMeta, states: tuple, selected: torch.Tensor,
 
 
 def _stock(states: tuple, native: torch.Tensor, lengths: torch.Tensor, cotangent: torch.Tensor) -> tuple:
-    query, compressed, query_rope, key_rope = states
+    inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in states)
+    query, compressed, query_rope, key_rope = inputs
     key = compressed[:, None, :]
     output = torch.ops.npu.npu_sparse_flash_attention(
         query, key, key, native, _SCALE, actual_seq_lengths_query=lengths, actual_seq_lengths_kv=lengths,
         query_rope=query_rope, key_rope=key_rope[:, None, :], layout_query="TND", layout_kv="TND",
         sparse_block_size=1, sparse_mode=3, attention_mode=2, return_softmax_lse=True)
-    gradients = torch.ops.npu.npu_sparse_flash_attention_grad(
-        query, key, key, native, cotangent, *output, _SCALE, 1,
-        query_rope=query_rope, key_rope=key_rope[:, None, :], actual_seq_qlen=lengths,
-        actual_seq_kvlen=lengths, layout="TND", sparse_mode=3, attention_mode=0)
-    return output, gradients
+    with torch.no_grad():
+        gradients = torch.ops.npu.npu_sparse_flash_attention_grad(
+            query, key, key, native, cotangent, *output, _SCALE, 1,
+            query_rope=query_rope, key_rope=key_rope[:, None, :], actual_seq_qlen=lengths,
+            actual_seq_kvlen=lengths, layout="TND", sparse_mode=3, attention_mode=0)
+    autograd_gradients = torch.autograd.grad(output[0], inputs, grad_outputs=cotangent)
+    return output, gradients, autograd_gradients
 
 
 def _difference(actual: torch.Tensor, expected: torch.Tensor, *, rtol: float, atol: float) -> dict:
     actual, expected = actual.detach().float().cpu(), expected.detach().float().cpu()
-    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
-    delta = actual - expected
-    return {"max_abs": float(delta.abs().max()),
-            "relative_l2": float(delta.norm() / expected.norm().clamp_min(1e-30)), "rtol": rtol, "atol": atol}
+    close = torch.isclose(actual, expected, rtol=rtol, atol=atol)
+    metric_actual, metric_expected = actual.double(), expected.double()
+    delta = metric_actual - metric_expected
+    norm_product = (metric_actual.norm() * metric_expected.norm()).clamp_min(1e-30)
+    return {"passed": bool(close.all()), "mismatched_elements": int((~close).sum()),
+            "elements": actual.numel(), "max_abs": float(delta.abs().max()),
+            "relative_l2": float(delta.norm() / metric_expected.norm().clamp_min(1e-30)),
+            "cosine": float((metric_actual * metric_expected).sum() / norm_product), "rtol": rtol, "atol": atol}
+
+
+def _merged_gradients(gradients: tuple) -> tuple:
+    """Match the shared compressed-K/V autograd boundary with one addition."""
+    return gradients[0], (gradients[1] + gradients[2])[:, 0], gradients[3], gradients[4][:, 0]
 
 
 def _run_case(states: tuple, layout: CannDsaLayout, native: torch.Tensor, selection: object,
               cotangent: torch.Tensor, rows: tuple, oracle: tuple, stock: tuple,
               schedule: MixedSfaSchedule) -> dict:
-    output, stock_gradients = stock
+    output, stock_gradients, stock_autograd = stock
     retained = None
     raw_reports = []
     config = schedule.runtime_config(layout.device)
@@ -124,7 +137,7 @@ def _run_case(states: tuple, layout: CannDsaLayout, native: torch.Tensor, select
         metrics = {name: _difference(actual, expected, rtol=0.02, atol=2e-5)
                    for name, actual, expected in zip(("query", "key", "value", "query_rope", "key_rope"),
                                                      gradients, stock_gradients)}
-        merged = (gradients[0], (gradients[1] + gradients[2])[:, 0], gradients[3], gradients[4][:, 0])
+        merged = _merged_gradients(gradients)
         oracle_metrics = {name: _difference(actual, expected, rtol=0.02, atol=2e-5)
                           for name, actual, expected in zip(_NAMES, merged, oracle[1])}
         raw_reports.append({"repeat": repeat, "trace": evidence, "stock_gradients": metrics,
@@ -140,11 +153,60 @@ def _run_case(states: tuple, layout: CannDsaLayout, native: torch.Tensor, select
     oracle_output = _difference(result[list(rows)], oracle[0], rtol=0.02, atol=0.002)
     autograd = {name: _difference(actual, expected, rtol=0.02, atol=2e-5)
                 for name, actual, expected in zip(_NAMES, actual_gradients, oracle[1])}
+    autograd_stock = {name: _difference(actual, expected, rtol=0.02, atol=2e-5)
+                      for name, actual, expected in zip(_NAMES, actual_gradients, stock_autograd)}
     retain = {name: _difference(actual, expected, rtol=0.02, atol=2e-5)
               for name, actual, expected in zip(_NAMES, repeated_gradients, actual_gradients)}
-    return {"groups": schedule.compute_groups, "raw_backward_reuse": raw_reports,
-            "autograd": autograd, "retain_graph": retain, "stock_forward": output_metrics,
+    native_comparisons = [output_metrics, *autograd_stock.values(), *retain.values()]
+    comparisons = [*native_comparisons, oracle_output, *autograd.values()]
+    for raw in raw_reports:
+        comparisons.extend(raw["stock_gradients"].values())
+        comparisons.extend(raw["fp32_oracle_gradients"].values())
+        native_comparisons.extend(raw["stock_gradients"].values())
+    return {"groups": schedule.compute_groups, "passed": all(item["passed"] for item in comparisons),
+            "native_contract_passed": all(item["passed"] for item in native_comparisons),
+            "raw_backward_reuse": raw_reports,
+            "autograd": autograd, "autograd_stock": autograd_stock,
+            "retain_graph": retain, "stock_forward": output_metrics,
             "fp32_oracle_forward": oracle_output}
+
+
+def _lifecycle(states: tuple, layout: CannDsaLayout, native: torch.Tensor, selection: object,
+               cotangent: torch.Tensor, stock: tuple) -> dict:
+    """Check independent saved states, reverse backward, serial streams and checkpoint recomputation."""
+    core = MixedDsaCoreProbe(layout, attention_scale=_SCALE, schedule=MixedSfaSchedule(7))
+    first = tuple(tensor.detach().clone().requires_grad_() for tensor in states)
+    second = tuple((tensor.detach() * (0.75 if index == 0 else 1)).requires_grad_()
+                   for index, tensor in enumerate(states))
+    second_stock = _stock(tuple(tensor.detach() for tensor in second), native, layout.length_tensor, cotangent)
+    forward_stream, backward_stream = torch.npu.Stream(), torch.npu.Stream()
+    forward_stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(forward_stream):
+        first_output = core.attention(*first, selection)
+        second_output = core.attention(*second, selection)
+    backward_stream.wait_stream(forward_stream)
+    with torch.npu.stream(backward_stream):
+        second_gradients = torch.autograd.grad(second_output, second, grad_outputs=cotangent)
+        first_gradients = torch.autograd.grad(first_output, first, grad_outputs=cotangent)
+    torch.npu.current_stream().wait_stream(backward_stream)
+    torch.npu.synchronize()
+    comparisons = {}
+    for label, actual, baseline in (("first", first_gradients, stock),
+                                     ("second", second_gradients, second_stock)):
+        merged = baseline[2]
+        comparisons[label] = {name: _difference(value, expected, rtol=0.02, atol=2e-5)
+                              for name, value, expected in zip(_NAMES, actual, merged)}
+    checkpoint_output = checkpoint(core.attention, *first, selection, use_reentrant=False)
+    checkpoint_gradients = torch.autograd.grad(checkpoint_output, first, grad_outputs=cotangent)
+    torch.npu.synchronize()
+    comparisons["checkpoint"] = {name: _difference(actual, expected, rtol=0.02, atol=2e-5)
+                                 for name, actual, expected in zip(_NAMES, checkpoint_gradients, first_gradients)}
+    forward = {"first": _difference(first_output, stock[0][0], rtol=0, atol=0),
+               "second": _difference(second_output, second_stock[0][0], rtol=0, atol=0),
+               "checkpoint": _difference(checkpoint_output, first_output, rtol=0, atol=0)}
+    metrics = [*forward.values(), *(value for comparison in comparisons.values() for value in comparison.values())]
+    return {"passed": all(value["passed"] for value in metrics), "compute_groups": 7,
+            "reverse_backward_serial_streams": comparisons, "forward": forward}
 
 
 def run_validation(report: dict, *, long_history: bool, smoke: bool = False) -> None:
@@ -158,6 +220,7 @@ def run_validation(report: dict, *, long_history: bool, smoke: bool = False) -> 
     if long_history:
         fixtures.extend([((513,), 32), ((4096,), 32)])
     report["cases"] = []
+    report["lifecycle"] = []
     for lengths, heads in fixtures:
         report["stage"] = {"lengths": lengths, "heads": heads, "operation": "reference"}
         meta, layout, cpu, selected, selection, cotangent, rows = _fixture(lengths, heads, device)
@@ -166,13 +229,27 @@ def run_validation(report: dict, *, long_history: bool, smoke: bool = False) -> 
         cotangent = cotangent.to(device)
         native = layout.global_to_sequence_indices(selected.to(device))
         stock = _stock(states, native, layout.length_tensor, cotangent)
+        merged = _merged_gradients(stock[1])
+        stock_oracle = {name: _difference(actual, expected, rtol=0.02, atol=2e-5)
+                        for name, actual, expected in zip(_NAMES, merged, oracle[1])}
+        shared_kv_oracle = {name: _difference(actual, expected, rtol=0.02, atol=2e-5)
+                            for name, actual, expected in zip(_NAMES, stock[2], oracle[1])}
+        report["stage"] = {"lengths": lengths, "heads": heads, "operation": "lifecycle"}
+        lifecycle = _lifecycle(states, layout, native, selection, cotangent, stock)
+        lifecycle.update(lengths=lengths, heads=heads)
+        report["lifecycle"].append(lifecycle)
         for groups in ((1,) if smoke else (1, 2, 7, 19)):
             report["stage"] = {"lengths": lengths, "heads": heads, "groups": groups}
             result = _run_case(states, layout, native, selection, cotangent, rows, oracle, stock,
                                MixedSfaSchedule(groups))
-            result.update(lengths=lengths, heads=heads, nonzero_gradient_query_ids=rows)
+            result.update(lengths=lengths, heads=heads, nonzero_gradient_query_ids=rows,
+                          stock_fp32_oracle_gradients=stock_oracle,
+                          stock_shared_kv_autograd_fp32_oracle_gradients=shared_kv_oracle)
             report["cases"].append(result)
-    report.update(status="passed", stage="complete", case_count=len(report["cases"]))
+    passed = all(case["passed"] for case in (*report["cases"], *report["lifecycle"]))
+    report.update(status="passed" if passed else "failed", stage="complete", case_count=len(report["cases"]))
+    if not passed:
+        raise RuntimeError("mixed SFA acceptance failed; all completed comparisons are retained in the report")
 
 
 def main() -> None:
@@ -187,7 +264,9 @@ def main() -> None:
     try:
         run_validation(report, long_history=args.long_history, smoke=args.smoke)
     except Exception as error:
-        report.update(status="error", error=repr(error), traceback=traceback.format_exc())
+        report.update(error=repr(error), traceback=traceback.format_exc())
+        if report["status"] != "failed":
+            report["status"] = "error"
         raise
     finally:
         args.output.parent.mkdir(parents=True, exist_ok=True)

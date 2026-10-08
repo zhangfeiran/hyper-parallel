@@ -73,7 +73,7 @@
           },
           {
             "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_grad_mixed.patch",
-            "sha256": "10ba8bb736dcad894d9bfd84cf1ab76e96e76b13a99e1fcdf867ba34bcd0023b",
+            "sha256": "8110811605ef4921a7a11081d0f7f1a5926c103effd26f7ea1493d7bcf38e4a9",
             "purpose": "separate SFA gradient initialization, physical mixed scratch and logical query/post partitions across three retained-workspace phases"
           }
         ],

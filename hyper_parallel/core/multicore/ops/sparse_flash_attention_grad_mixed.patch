@@ -29,16 +29,17 @@
      uint32_t subBlockIdx;
      uint32_t formerCoreNum;
      uint32_t processBS1ByCore;
-@@ -175,7 +172,7 @@
+@@ -175,7 +172,8 @@
  };
  
  template <typename SFAGT>
 -__aicore__ inline void SelectedAttentionGradBasic<SFAGT>::Init(const TILING_CLASS *__restrict tilingData)
-+__aicore__ inline void SelectedAttentionGradBasic<SFAGT>::Init(const TILING_CLASS *__restrict tilingData, uint32_t logicalId)
++__aicore__ inline void SelectedAttentionGradBasic<SFAGT>::Init(const TILING_CLASS *__restrict tilingData,
++    uint32_t logicalId)
  {
      dimB = tilingData->opInfo.B;
      dimS1 = tilingData->opInfo.S1;
-@@ -199,11 +196,11 @@
+@@ -199,11 +197,11 @@
      }
  
      if ASCEND_IS_AIC {
@@ -53,7 +54,7 @@
      }
  
      formerCoreNum = tilingData->opInfo.formerCoreNum;
-@@ -231,23 +228,37 @@
+@@ -231,23 +229,37 @@
      GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR attention_out, GM_ADDR attention_out_grad, GM_ADDR softmax_max,
      GM_ADDR softmax_sum, GM_ADDR topk_indices, GM_ADDR actual_seq_qlen, GM_ADDR actual_seq_kvlen,
      GM_ADDR query_rope, GM_ADDR key_rope, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR dq_rope, GM_ADDR dk_rope,
@@ -107,26 +108,28 @@
  }
  
  template <typename SFAGT>
-@@ -266,7 +277,7 @@
+@@ -266,7 +278,8 @@
          TPipe pipeCube;
          CubeOp<SFAGT> cubeOp;
          cubeOp.Init(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum, topk_indices,
 -                    actual_seq_qlen, actual_seq_kvlen, query_rope, key_rope, dq, dk, dv, workspace, tilingData, &pipeCube);
-+                    actual_seq_qlen, actual_seq_kvlen, query_rope, key_rope, dq, dk, dv, workspace, tilingData, &pipeCube, scratchIdx);
++                    actual_seq_qlen, actual_seq_kvlen, query_rope, key_rope, dq, dk, dv, workspace,
++                        tilingData, &pipeCube, scratchIdx);
          AllocEventID();
          int64_t task = 0;
          bool changeS1 = false;
-@@ -314,8 +325,7 @@
+@@ -314,8 +327,8 @@
          TPipe pipeVec;
          VecOp<SFAGT> vecOp;
          vecOp.Init(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum, topk_indices,
 -                   actual_seq_qlen, actual_seq_kvlen, key_rope, dq, dk, dv, workspace, tilingData, &pipeVec);
 -        SyncAll();
-+                   actual_seq_qlen, actual_seq_kvlen, key_rope, dq, dk, dv, workspace, tilingData, &pipeVec, cubeBlockIdx, scratchIdx, false);
++                   actual_seq_qlen, actual_seq_kvlen, key_rope, dq, dk, dv, workspace, tilingData, &pipeVec,
++                       cubeBlockIdx, scratchIdx, false);
          tmpScatterRunInfo[0].changeS1 = false;
          tmpScatterRunInfo[1].changeS1 = false;
          scatterRunInfo.changeS1 = false;
-@@ -405,209 +415,8 @@
+@@ -405,209 +418,8 @@
          WAIT_FLAG(V, MTE2, scatterTmpVMte2WaitV);
          WAIT_FLAG(V, MTE2, scatterTmpKMte2WaitVPong);
          WAIT_FLAG(V, MTE2, scatterTmpVMte2WaitVPong);
@@ -404,16 +407,17 @@
      usedWorkspaceLen += selectedKWorkspaceLen * usedCoreNum;
 --- a/attention/sparse_flash_attention_grad/op_kernel/arch22/sparse_flash_attention_grad_post.h
 +++ b/attention/sparse_flash_attention_grad/op_kernel/arch22/sparse_flash_attention_grad_post.h
-@@ -25,7 +25,7 @@
+@@ -25,7 +25,8 @@
      __aicore__ inline void Init(__gm__ uint8_t *dq, __gm__ uint8_t *dk, __gm__ uint8_t *dv,
                                  __gm__ uint8_t *actual_seq_qlen, __gm__ uint8_t *actual_seq_kvlen,
                                  __gm__ uint8_t *dq_rope, __gm__ uint8_t *dk_rope,
 -                                __gm__ uint8_t *workspace, const TILING_TYPE *__restrict ordTilingData, TPipe *pipe_in);
-+                                __gm__ uint8_t *workspace, const TILING_TYPE *__restrict ordTilingData, TPipe *pipe_in, uint32_t logicalVectorId);
++                                __gm__ uint8_t *workspace, const TILING_TYPE *__restrict ordTilingData,
++                                    TPipe *pipe_in, uint32_t logicalVectorId);
      __aicore__ inline void Process();
      __aicore__ inline void InitIndex(uint64_t startIdx, int64_t curG, int64_t &curS, int64_t headDim,
                                       int64_t headDimAlign, GM_ADDR seqS);
-@@ -129,9 +129,9 @@
+@@ -129,9 +130,9 @@
      __gm__ uint8_t *dq, __gm__ uint8_t *dk, __gm__ uint8_t *dv, __gm__ uint8_t *actual_seq_qlen,
      __gm__ uint8_t *actual_seq_kvlen, __gm__ uint8_t *dq_rope, __gm__ uint8_t *dk_rope,
      __gm__ uint8_t *workspace, const TILING_TYPE *__restrict ordTilingData,
