@@ -35,6 +35,7 @@ from hyper_parallel.core.multicore._build.prepare_dependencies import (
     verify_git_dependency,
 )
 from hyper_parallel.core.multicore.backends.schema import install_cpp_schema
+from hyper_parallel.core.multicore.backends.workers import install_worker_glue
 from hyper_parallel.core.multicore.runtime.abi import family_abi
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -117,6 +118,7 @@ def _assemble(repository, ops_nn, ops_mhc, work):
         shutil.copytree(pinned / _MULTICORE / "ops" / name, operator)
         shutil.copytree(pinned / _MULTICORE / "ops/runtime", operator / "op_kernel/runtime")
         install_cpp_schema(operator / "op_kernel/runtime", "mhc")
+        install_worker_glue(operator, "mhc", "backward" if name.endswith("_grad") else "forward")
         shutil.copytree(nn / "norm" / norm / "op_kernel", operator / "op_kernel" / norm)
         shutil.copytree(mhc / "mhc" / post / "op_kernel/arch22", operator / "op_kernel" / post)
         shutil.copytree(mhc / "mhc" / pre / "op_kernel", operator / "op_kernel" / pre)
@@ -163,6 +165,9 @@ def _write_manifest(payload, work, soc, cann):
                 inputs[f"{directory.name}/{path.relative_to(directory)}"] = _hash_file(path)
     inputs["build_mhc.py"] = _hash_file(Path(__file__))
     inputs["families.json"] = _hash_file(_ROOT / _MULTICORE / "runtime/baselines/families.json")
+    for relative in ("backends/schema.py", "backends/workers.py",
+                     "runtime/native_calls.json", "runtime/worker_calls.json"):
+        inputs[relative] = _hash_file(_ROOT / _MULTICORE / relative)
     identity = {
         "soc": soc, "cann_root": str(cann), "cann_version": (cann / "opp/version.info").read_text(),
         "torch": torch.__version__, "torch_npu": subprocess.check_output(

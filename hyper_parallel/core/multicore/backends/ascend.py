@@ -27,6 +27,7 @@ from hyper_parallel.core.multicore.backends.schema import (
     python_calls,
     python_schema,
 )
+from hyper_parallel.core.multicore.backends.workers import generated_files, worker_manifest
 from hyper_parallel.core.multicore.ir.program import ProgramIR
 from hyper_parallel.core.multicore.runtime.abi import family_abi
 from hyper_parallel.core.multicore.runtime.mhc import MhcKernelPlan
@@ -98,6 +99,9 @@ def emit_plan(plan: KernelPlan | MoeKernelPlan | MhcKernelPlan, ir: ProgramIR) -
              "bindings/native_calls.hpp": cpp_calls().encode(), "bindings/schema.json": _json(bindings),
              "plan.json": _json(plan.export_manifest()), "source_map.json": _json(json.loads(plan.explain())),
              **images}
+    files["workers/manifest.json"] = _json(worker_manifest(family))
+    files.update({f"workers/{path.name}": text.encode() for path, text in generated_files().items()
+                  if path.name.startswith(family + "_")})
     return BackendEmission(plan, definition_key, plan_key,
                            tuple(EmittedFile(name, content) for name, content in sorted(files.items())))
 
@@ -107,7 +111,8 @@ def _definition(ir, family):
     for operation in semantic["operations"]:
         operation.pop("source")
         operation.pop("call_chain")
-    inputs = ("backends/schema.py", "backends/ascend.py", "runtime/bindings.py", "runtime/native_calls.json")
+    inputs = ("backends/schema.py", "backends/ascend.py", "backends/workers.py", "runtime/bindings.py",
+              "runtime/native_calls.json", "runtime/worker_calls.json")
     return {"generator_version": 1, "target": "ascend", "semantic": semantic,
             "abi": family_abi(family).export_manifest(),
             "generator_inputs": {name: _hash((CORE / name).read_bytes()) for name in inputs}}

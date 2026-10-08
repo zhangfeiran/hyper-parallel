@@ -30,6 +30,8 @@ from typing import Any
 
 from prepare_dependencies import verify_git_dependency
 
+from hyper_parallel.core.multicore.backends.workers import install_worker_glue
+
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _LOCK_PATH = Path(__file__).with_name("dependencies.lock.json")
@@ -193,6 +195,7 @@ def _compose_hyper_parallel_ops(
         operator_root = source_root / operator_name
         shutil.copytree(_MULTICORE_OPS / operator_name, operator_root)
         shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
+        install_worker_glue(operator_root, "moe", "backward" if operator_name.endswith("_grad") else "forward")
         shutil.copytree(
             ops_nn_copy / "activation" / "swi_glu" / "op_kernel",
             operator_root / "op_kernel" / "swi_glu",

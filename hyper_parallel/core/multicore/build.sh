@@ -459,6 +459,8 @@ function calculate_vendor_fingerprint() {
                 hyper_parallel/core/multicore/build.sh \
                 hyper_parallel/core/multicore/_build/assemble_multicore_source.py \
                 hyper_parallel/core/multicore/_build/merge_multicore_vendors.py \
+                hyper_parallel/core/multicore/backends/workers.py \
+                hyper_parallel/core/multicore/runtime/worker_calls.json \
                 hyper_parallel/core/multicore/cmake/hardening.cmake \
                 hyper_parallel/core/multicore/shmem/_build/shmem_sdk.sh
             while IFS= read -r -d '' source_file; do

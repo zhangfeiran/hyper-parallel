@@ -34,6 +34,7 @@ from hyper_parallel.core.multicore._build.prepare_dependencies import (
     verify_git_dependency,
 )
 from hyper_parallel.core.multicore.backends.schema import install_cpp_schema
+from hyper_parallel.core.multicore.backends.workers import install_worker_glue
 from hyper_parallel.core.multicore.runtime.abi import family_abi
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -77,6 +78,7 @@ def _assemble(repository, ops_nn, work):
         shutil.copytree(pinned / _MULTICORE / "ops" / name, source / name)
         shutil.copytree(pinned / _MULTICORE / "ops/runtime", source / name / "op_kernel/runtime")
         install_cpp_schema(source / name / "op_kernel/runtime", "gate")
+        install_worker_glue(source / name, "gate", "backward" if name.endswith("_grad") else "forward")
     upstream = work / "upstream"
     _export(ops_nn, dependency["commit"], ["index/linear_index/op_host/op_api"], upstream)
     shutil.copytree(
@@ -121,6 +123,9 @@ def _write_manifest(payload, work, soc, cann):
                 inputs[f"{directory.name}/{path.relative_to(directory)}"] = _hash_file(path)
     inputs["build_gate.py"] = _hash_file(Path(__file__))
     inputs["families.json"] = _hash_file(_ROOT / _MULTICORE / "runtime/baselines/families.json")
+    for relative in ("backends/schema.py", "backends/workers.py",
+                     "runtime/native_calls.json", "runtime/worker_calls.json"):
+        inputs[relative] = _hash_file(_ROOT / _MULTICORE / relative)
     identity = {
         "soc": soc, "cann_root": str(cann), "cann_version": (cann / "opp/version.info").read_text(),
         "torch": torch.__version__, "torch_npu": subprocess.check_output(

@@ -50,7 +50,8 @@ def _sources():
             if path.is_file():
                 sources[str(path.relative_to(_COMPONENT))] = _hash(path)
     for relative in ("build.sh", "_build/dependencies.lock.json", "_build/write_moe_manifest.py",
-                     "backends/schema.py", "runtime/native_calls.json"):
+                     "backends/schema.py", "backends/workers.py", "runtime/native_calls.json",
+                     "runtime/worker_calls.json", "_build/assemble_multicore_source.py"):
         sources[relative] = _hash(_COMPONENT / relative)
     return sources
 

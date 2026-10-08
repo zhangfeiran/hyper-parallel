@@ -1,0 +1,539 @@
+{
+  "format_version": 1,
+  "workers": {
+    "gate_forward": {
+      "family": "gate",
+      "direction": "forward",
+      "source": "ops/hyper_mega_gate/op_kernel/hyper_mega_gate_route.cpp",
+      "mode": "worker_pipeline",
+      "selector": "task_type",
+      "task_namespace": "MulticoreRuntime::",
+      "default": "Trap();",
+      "constants": {},
+      "members": [
+        {
+          "type": "HyperMegaGate::RoutePipeline",
+          "name": "route_",
+          "initializer": null
+        }
+      ],
+      "cases": [
+        {
+          "tasks": [
+            "TASK_GATE_SOFTPLUS"
+          ],
+          "call": "route_.Softplus()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_SQRT"
+          ],
+          "call": "route_.SqrtScore()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_ADD_BIAS"
+          ],
+          "call": "route_.AddBias()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_TOPK"
+          ],
+          "call": "route_.TopKScore()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GATHER"
+          ],
+          "call": "route_.GatherScore()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_REDUCE_SUM"
+          ],
+          "call": "route_.ReduceSelected()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_ADD_EPSILON"
+          ],
+          "call": "route_.AddEpsilon()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_DIV"
+          ],
+          "call": "route_.DivideSelected()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_MUL_SCALE"
+          ],
+          "call": "route_.ScaleSelected()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_CAST_INDEX"
+          ],
+          "call": "route_.CastIndices()"
+        }
+      ],
+      "context_owner": "worker",
+      "pipe_lifetime": "stage_call",
+      "context_initialization": "existing_family_Init_and_stage_methods",
+      "context_destruction": "existing_FinishStage"
+    },
+    "gate_backward": {
+      "family": "gate",
+      "direction": "backward",
+      "source": "ops/hyper_mega_gate_grad/op_kernel/hyper_mega_gate_route_grad.cpp",
+      "mode": "worker_pipeline",
+      "selector": "task_type",
+      "task_namespace": "MulticoreRuntime::",
+      "default": "Trap();",
+      "constants": {},
+      "members": [
+        {
+          "type": "HyperMegaGate::RouteGradPipeline",
+          "name": "pipeline_",
+          "initializer": null
+        },
+        {
+          "type": "uint32_t",
+          "name": "top_k_",
+          "initializer": "0"
+        }
+      ],
+      "cases": [
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_MULS_SCALE"
+          ],
+          "call": "pipeline_.MulsScaleGrad()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_BROADCAST_DENOMINATOR"
+          ],
+          "call": "pipeline_.BroadcastDenominator()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_NEG"
+          ],
+          "call": "pipeline_.NegScaledGrad()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_DIV_SELECTED"
+          ],
+          "call": "pipeline_.DivSelected()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_DIV_SELECTED_RATIO"
+          ],
+          "call": "pipeline_.DivSelectedRatio()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_MUL_CROSS"
+          ],
+          "call": "pipeline_.MulCross()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_DIV_DIRECT"
+          ],
+          "call": "pipeline_.DivDirect()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_REDUCE_SUM"
+          ],
+          "call": "pipeline_.ReduceCrossTerm()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_BROADCAST_ROW_SUM"
+          ],
+          "call": "pipeline_.BroadcastRowSum()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_ADD_SELECTED"
+          ],
+          "call": "pipeline_.AddSelectedGrad()"
+        },
+        {
+          "tasks": [
+            "TASK_GATE_GRAD_ZEROS"
+          ],
+          "call": "pipeline_.ZerosLike()"
+        }
+      ],
+      "context_owner": "worker",
+      "pipe_lifetime": "stage_call",
+      "context_initialization": "existing_family_Init_and_stage_methods",
+      "context_destruction": "existing_FinishStage"
+    },
+    "mhc_forward": {
+      "family": "mhc",
+      "direction": "forward",
+      "source": "ops/hyper_mega_mhc/op_kernel/worker_kernel.cpp",
+      "mode": "task_dag",
+      "selector": "taskDesc.task_type",
+      "task_namespace": "",
+      "default": "break;",
+      "constants": {
+        "TILING_IDX": 24,
+        "EVENT_IDX": 10,
+        "PROFILE_IDX": 11,
+        "WORKSPACE_IDX": 23
+      },
+      "members": [],
+      "cases": [
+        {
+          "tasks": [
+            "TASK_MHC_POST"
+          ],
+          "call": "ExecuteMhcPost(taskDesc)"
+        },
+        {
+          "tasks": [
+            "TASK_MHC_NORM_CAST"
+          ],
+          "call": "ExecuteMhcNormCast(taskDesc)"
+        },
+        {
+          "tasks": [
+            "TASK_MHC_PROJECTION"
+          ],
+          "call": "ExecuteMhcProjection(taskDesc)"
+        },
+        {
+          "tasks": [
+            "TASK_MHC_INPUT_MIX"
+          ],
+          "call": "ExecuteMhcInputMix(taskDesc)"
+        },
+        {
+          "tasks": [
+            "TASK_MHC_MAPPING"
+          ],
+          "call": "ExecuteMhcMapping(taskDesc)"
+        },
+        {
+          "tasks": [
+            "TASK_RMS_NORM"
+          ],
+          "call": "ExecuteRmsNorm(taskDesc)"
+        }
+      ],
+      "context_owner": "native_callback",
+      "pipe_lifetime": "native_callback_scope",
+      "context_initialization": "existing_native_task_methods",
+      "context_destruction": "existing_native_task_methods",
+      "entry_source": "ops/hyper_mega_mhc/op_kernel/hyper_mega_mhc.cpp",
+      "input_array": "inputList",
+      "input_addresses": [
+        "previousOutput",
+        "residual",
+        "previousPreMix",
+        "previousPostMix",
+        "previousResidualMix",
+        "phi",
+        "alpha",
+        "bias",
+        "normWeight",
+        "runtimeConfig",
+        "allEventCounters",
+        "profileBuffer",
+        "newResidual",
+        "nextPreMix",
+        "nextPostMix",
+        "nextResidualMix",
+        "blockInput",
+        "hcBeforeNorm",
+        "invRms",
+        "sumOut",
+        "normOut",
+        "mixedInput",
+        "rmsRstd",
+        "userWorkspace",
+        "tiling"
+      ]
+    },
+    "mhc_backward": {
+      "family": "mhc",
+      "direction": "backward",
+      "source": "ops/hyper_mega_mhc_grad/op_kernel/worker_kernel.cpp",
+      "mode": "task_dag",
+      "selector": "taskDesc.task_type",
+      "task_namespace": "",
+      "default": "break;",
+      "constants": {
+        "TILING_IDX": 34,
+        "EVENT_IDX": 22,
+        "PROFILE_IDX": 23,
+        "WORKSPACE_IDX": 33
+      },
+      "members": [],
+      "cases": [
+        {
+          "tasks": [
+            "TASK_MHC_GRAD_PREV_A_AND_MAPPING"
+          ],
+          "call": "ExecuteMhcGradPrevAAndMapping(taskDesc)"
+        },
+        {
+          "tasks": [
+            "TASK_RMS_NORM_GRAD"
+          ],
+          "call": "ExecuteRmsNormGrad(taskDesc)"
+        },
+        {
+          "tasks": [
+            "TASK_MHC_GRAD_PREV_A",
+            "TASK_MHC_GRAD_PHI_RMS"
+          ],
+          "call": "ExecuteMhcPreGrad(taskDesc)"
+        },
+        {
+          "tasks": [
+            "TASK_MHC_GRAD_PREV_X_AND_POST"
+          ],
+          "call": "ExecuteMhcGradPrevXAndPost(taskDesc)"
+        }
+      ],
+      "context_owner": "native_callback",
+      "pipe_lifetime": "native_callback_scope",
+      "context_initialization": "existing_native_task_methods",
+      "context_destruction": "existing_native_task_methods",
+      "entry_source": "ops/hyper_mega_mhc_grad/op_kernel/hyper_mega_mhc_grad.cpp",
+      "input_array": "inputList",
+      "input_addresses": [
+        "gradHinPlaceholder",
+        "gradHPost",
+        "gradHRes",
+        "x",
+        "phi",
+        "alpha",
+        "bias",
+        "previousPre",
+        "hcBeforeNorm",
+        "invRms",
+        "sumOut",
+        "normOut",
+        "gradCurrentPre",
+        "mixedInput",
+        "rmsRstd",
+        "normWeight",
+        "directGradX",
+        "previousResidual",
+        "previousOutput",
+        "previousPost",
+        "previousResidualMix",
+        "runtimeConfig",
+        "allEventCounters",
+        "profileBuffer",
+        "gradResidual",
+        "gradPhi",
+        "gradAlpha",
+        "gradBias",
+        "gradPreviousOutput",
+        "gradPreviousPre",
+        "gradPreviousPost",
+        "gradPreviousResidual",
+        "gradNormWeight",
+        "userWorkspace",
+        "tiling"
+      ]
+    },
+    "moe_forward": {
+      "family": "moe",
+      "direction": "forward",
+      "source": "ops/hyper_mega_moe/op_kernel/worker_kernel.cpp",
+      "mode": "task_dag",
+      "selector": "task_desc.task_type",
+      "task_namespace": "",
+      "default": "break;",
+      "constants": {
+        "TILING_IDX": 23,
+        "EVENT_IDX": 24,
+        "PROFILE_IDX": 25,
+        "WORKSPACE_IDX": 16
+      },
+      "members": [],
+      "cases": [
+        {
+          "tasks": [
+            "TASK_BEGIN_TASK_GRAPH"
+          ],
+          "call": ""
+        },
+        {
+          "tasks": [
+            "TASK_MATMUL"
+          ],
+          "call": "ExecuteMatmul(task_desc)"
+        },
+        {
+          "tasks": [
+            "TASK_GROUPED_MATMUL"
+          ],
+          "call": "ExecuteGroupedMatmul(task_desc)"
+        },
+        {
+          "tasks": [
+            "TASK_SWI_GLU"
+          ],
+          "call": "ExecuteSwiglu(task_desc)"
+        },
+        {
+          "tasks": [
+            "TASK_SHMEM_PUT_MEM_SIGNAL"
+          ],
+          "call": "ExecuteShmemPutMem(task_desc)"
+        },
+        {
+          "tasks": [
+            "TASK_SHMEM_GET_MEM"
+          ],
+          "call": "ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc)"
+        }
+      ],
+      "context_owner": "native_callback",
+      "pipe_lifetime": "native_callback_scope",
+      "context_initialization": "existing_native_task_methods",
+      "context_destruction": "existing_native_task_methods",
+      "entry_source": "ops/hyper_mega_moe/op_kernel/hyper_mega_moe.cpp",
+      "input_array": "input_list",
+      "input_addresses": [
+        "dispatch_target",
+        "dispatch_target_off",
+        "dispatch_src",
+        "dispatch_src_off",
+        "dispatch_size",
+        "weight",
+        "up_proj_glist",
+        "y",
+        "swiglu_out",
+        "down_proj_weight",
+        "down_proj_glist",
+        "down_proj_y",
+        "combine_target",
+        "combine_target_off",
+        "combine_src_off",
+        "combine_size",
+        "gmm_workspace",
+        "up_proj_tiling",
+        "swiglu_tiling",
+        "down_proj_tiling",
+        "runtime_config",
+        "nullptr",
+        "workspace",
+        "tiling",
+        "all_event_counters",
+        "profile_buffer"
+      ]
+    },
+    "moe_backward": {
+      "family": "moe",
+      "direction": "backward",
+      "source": "ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp",
+      "mode": "task_dag",
+      "selector": "task_desc.task_type",
+      "task_namespace": "",
+      "default": "break;",
+      "constants": {
+        "TILING_IDX": 30,
+        "EVENT_IDX": 31,
+        "PROFILE_IDX": 32,
+        "WORKSPACE_IDX": 25,
+        "SWIGLU_GRAD_WORKSPACE_IDX": 26
+      },
+      "members": [],
+      "cases": [
+        {
+          "tasks": [
+            "TASK_BEGIN_TASK_GRAPH"
+          ],
+          "call": ""
+        },
+        {
+          "tasks": [
+            "TASK_MATMUL"
+          ],
+          "call": "ExecuteMatmul(task_desc)"
+        },
+        {
+          "tasks": [
+            "TASK_GROUPED_MATMUL"
+          ],
+          "call": "ExecuteGroupedMatmul(task_desc)"
+        },
+        {
+          "tasks": [
+            "TASK_SHMEM_PUT_MEM_SIGNAL"
+          ],
+          "call": "ExecuteShmemPutMem(task_desc)"
+        },
+        {
+          "tasks": [
+            "TASK_SHMEM_GET_MEM"
+          ],
+          "call": "ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc)"
+        },
+        {
+          "tasks": [
+            "TASK_SWI_GLU_GRAD"
+          ],
+          "call": "ExecuteSwiGluGrad(task_desc)"
+        }
+      ],
+      "context_owner": "native_callback",
+      "pipe_lifetime": "native_callback_scope",
+      "context_initialization": "existing_native_task_methods",
+      "context_destruction": "existing_native_task_methods",
+      "entry_source": "ops/hyper_mega_moe_grad/op_kernel/hyper_mega_moe_grad.cpp",
+      "input_array": "input_list",
+      "input_addresses": [
+        "dispatch_target",
+        "dispatch_target_off",
+        "dy",
+        "dispatch_src_off",
+        "dispatch_size",
+        "hidden",
+        "hidden_dw",
+        "weight",
+        "y",
+        "gate",
+        "grad_gate",
+        "w1",
+        "gate_dx",
+        "grad_x",
+        "combine_target_off",
+        "combine_src_off",
+        "combine_size",
+        "permute_out",
+        "gate_dw",
+        "group_list",
+        "act_grad_tiling",
+        "gate_grad_tiling",
+        "w1_grad_tiling",
+        "w2_grad_tiling",
+        "swiglu_grad_tiling",
+        "gmm_workspace",
+        "swiglu_grad_workspace",
+        "runtime_config",
+        "nullptr",
+        "workspace",
+        "tiling",
+        "all_event_counters",
+        "profile_buffer"
+      ]
+    }
+  }
+}

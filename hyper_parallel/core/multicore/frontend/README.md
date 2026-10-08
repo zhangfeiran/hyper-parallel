@@ -470,7 +470,40 @@ Generated C++ forwarding wrappers are instantiated in CPU tests for argument
 order and const/mutable ownership; existing native Torch adapters still enqueue
 the family operators.
 
-This delivers the first P5 increment. Automatic worker switches/context factories,
-replacement of family native host adapters, general buffer planning and compiled
-binary/materialized-device caches remain subsequent work. New arbitrary primitive
+This delivers the first P5 increment. Worker dispatch and address-table generation
+are described below. Native context initialization factories, replacement of family
+native host adapters, general buffer planning and compiled binary/materialized-device
+caches remain subsequent work. New arbitrary primitive
 combinations still need supported numerical implementations and lowering recipes.
+
+## P5 generated native worker glue
+
+`runtime/worker_calls.json` declares each forward/backward worker's native task
+callbacks, ordered input address table, slot constants and owned member state.
+Numeric IDs and logical task names come from the shared family ABI. The schema
+rejects unknown or duplicate tasks and slot indices outside the address table.
+
+The common emitter includes `workers/manifest.json` and generated `.inc` fragments
+for both directions. These fragments replace the exact original dispatch switch,
+TaskDAG input/cache/workspace address array and slot constants. Gate also generates
+its worker-owned pipeline member declarations. Stage validation, the top-k=1
+backward path, family policies and numerical methods retain their original order.
+
+All three builders install the fragments into verified isolated source exports.
+The adapter requires token equality with the pinned dispatch and binding contract
+before replacing any block. MoE's tracked numerical sources retain their fixed
+hashes; its isolated assembler performs the worker transformation. Build manifests
+and the MoE native cache key include the worker generator and contract inputs.
+
+The worker manifest records the context boundary: Gate's pipeline object belongs
+to the worker, with TPipe use inside each stage call; MHC/MoE keep callback-owned
+local contexts. Existing Init, stream/pipe synchronization, reset and destruction
+remain inside those numerical recipes. This increment generates dispatch and
+binding glue; it does not generate new per-primitive initialization/destruction
+factories or replace the family Torch/ACLNN host adapters.
+
+CPU tests compile the generated switches against independent fixed-revision
+originals, exercising valid/unknown tasks and stage IDs, and execute all four
+TaskDAG address tables with distinct addresses. Drift tests reject changed native
+callbacks, slot constants, context members and input mappings. Device acceptance
+uses rebuilt payloads for Gate/MHC/MoE and the existing numerical/lifecycle gates.
