@@ -36,7 +36,9 @@ bool CheckSupport(gert::TilingContext *context) {
          desc != nullptr && desc->GetDataType() == ge::DT_BF16;
 }
 
-ge::graphStatus MixedGradTiling(gert::TilingContext *context) {
+}  // namespace
+
+ge::graphStatus TilingHyperDsaMixedGrad(gert::TilingContext *context) {
   if (context == nullptr || context->GetAttrs() == nullptr || !CheckSupport(context) || !CheckRuntime(context)) {
     return ge::GRAPH_FAILED;
   }
@@ -65,8 +67,6 @@ ge::graphStatus MixedGradTiling(gert::TilingContext *context) {
   context->GetRawTilingData()->SetDataSize(tile.tilingData.GetDataSize());
   return ge::GRAPH_SUCCESS;
 }
-}  // namespace
-
-IMPL_OP_OPTILING(HyperDsaMixedGrad).Tiling(MixedGradTiling);
+IMPL_OP_OPTILING(HyperDsaMixedGrad).Tiling(TilingHyperDsaMixedGrad);
 }  // namespace sfag
 }  // namespace optiling

@@ -976,6 +976,85 @@ values exactly. CP2/CP4 passed through the formal ST launchers. Existing
 CP2/CP4 reference and CP1 fused-forward regressions passed separately; the
 eight pre-existing LI/SFA/gradient device objects retained their hashes.
 
-This is a raw detached forward probe. It does not install autograd, native CP
-owner gradient return, selected-set KL or a production model backend. The
-previous FP32 backward and BF16 model acceptance failures remain open.
+This entry remains a raw detached forward probe. The main-attention backward
+and autograd bridge are described below; selected-set KL and a production model
+backend remain separate. Previous FP32 backward and BF16 model acceptance
+failures remain open.
+
+
+### Single-kernel CP backward and FP32 owner return
+
+The [backward probe](fused_cp_backward.py) consumes a forward-produced saved
+state. Global Q/KV/RoPE, final native indices, output and statistics live in
+ordinary invocation-owned HBM. Admission binds saved state to its producer,
+geometry/scale/schedule, tensor versions and prepared metadata. Local Q/KV
+storage orders remain fixed even though the cross-rank layout signature omits
+rank-specific permutations. Manually synthesized saved state and mutations
+fail before native dispatch.
+
+One `HyperDsaFusedGrad` mixed kernel executes the locked initialize, compute
+and post tiles, with all-member phase closure by a reserved progress Vector.
+Its host adapter calls the existing gradient tiler through an original-IR
+child context; it retains the original scalar attributes, geometry checks,
+workspace requirement and mathematical variant. The original separately
+launched backward API remains available.
+
+Only this member's local Q rows receive nonzero cotangents. After compute
+closes, the progress worker reads dK/dV FP32 accumulators using the original
+tiler's serialized offsets. It merges compressed dK+dV once, preserves
+K-RoPE separately and writes complete owner rows into the sender's exclusive
+inbox stripe. Each sender publishes write completion only after all MTE
+stores finish. Every owner waits for all senders, adds stripes in ascending
+rank order in FP32 and publishes ACK after consuming them. Source/inbox
+reuse waits for every ACK. There are no cross-rank floating-point atomics.
+
+Owner gradients return in the original local KV order and cast to BF16 only
+after the ordered owner reduction. Q/Q-RoPE gradients use their independent
+local Q permutation. A private 12 KiB progress UB is independent of the
+compute groups' tile buffers. The experimental raw result additionally
+exports FP32 pre-cast partials for independent transport certification; this
+diagnostic materialization is included in the prototype's cost.
+
+`FusedDsaCpAttentionProbe.attention(invocation, main_states, index_states)`
+provides an explicit first-order main-attention autograd bridge. Native LI
+selects the keys, while main attention returns gradients only for Q, shared
+compressed KV, Q-RoPE and K-RoPE. Indexer inputs stay detached from this
+objective; selected-set KL must establish its own gradient path and declared
+loss normalization. All original and native saved tensors go through
+`save_for_backward`; context metadata does not hold a second tensor cache,
+so saved-tensor hooks and non-reentrant checkpoint can reconstruct the VJP.
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  --module hyper_parallel.core.multicore.examples.mega_dsa_fused_cp_backward_validate \
+  --output-dir fused_cp_backward_report --long-history
+python -m pytest -q tests/torch/multicore/test_mega_dsa_fused_cp_backward.py
+```
+
+The validator independently checks exact FP32 owner bits against captured
+peer partials, separate Q/K ordering and original three-launch accumulators.
+Native gradient comparisons retain the existing rtol=0.02, atol=2e-5 checks
+and separately report zero-tolerance bitwise results. A fixed-state control
+found BF16 variation in stock and the original three-launch path themselves:
+the maximum observed absolute difference was 7.62939453125e-6 and relative
+L2 was 2.0951559621530854e-5. The fused path stayed in the same measured range.
+These controls explain why universal gradient bitwise identity is not
+certified; they do not clear the independent FP32 oracle or model failures.
+
+CP1/CP2/CP4 matrices passed 108 invocations per rank, 756 rank invocations
+in total, including 168 long-history invocations. Coverage includes H32/H64,
+unequal rank cotangents, short/long packed histories, empty owners and all
+four compute-group counts. All owner FP32 bits matched the independent
+ordered peer reduction. Accumulators compared with the original three-launch
+path had maximum relative L2 7.836094912391413e-7 and maximum absolute error
+4.887580871582031e-6. The separate native-gradient bitwise diagnostic was
+nonexact in 162/756 rank invocations; the established pointwise checks passed.
+
+Fresh CP2/CP4 ST launchers passed. CP1/CP2/CP4 lifecycle checks passed for
+zigzag and empty owners: four main gradients, indexer isolation, retained
+graphs, delayed backward after different-layer source republication,
+two-stream raw backward submission before observation and non-reentrant
+checkpoint. The existing CP1 fused-forward ST passed again. All ten previously
+accepted DSA device objects retained their hashes. These are primitive and
+transport gates; external-Top-K production installation, selected-set KL,
+independent model acceptance and full-step performance remain incomplete.

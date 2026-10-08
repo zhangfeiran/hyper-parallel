@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import pairwise
 
 import torch
@@ -41,6 +41,7 @@ from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
 from hyper_parallel.core.multicore.torch.ops import _load_native
 
 _TRANSPORT_MAGIC = 0x4850445341435031
+_SAVED_ATTENTION_TOKEN = object()
 
 
 def cp_owner_runs(meta: DsaBatchMeta) -> tuple[tuple[int, ...], ...]:
@@ -61,6 +62,28 @@ def _layout_signature(meta: DsaBatchMeta) -> tuple:
 
 
 @dataclass(frozen=True)
+class FusedCpSavedAttention:
+    """Invocation-owned attention activations, independent of reusable symmetric scratch."""
+
+    batch_meta: DsaBatchMeta
+    states: tuple[torch.Tensor, ...]
+    indices: torch.Tensor
+    forward: tuple[torch.Tensor, ...]
+    versions: tuple[int, ...]
+    backend: FusedDsaCpForwardProbe
+    geometry: tuple[int, float, MixedSfaSchedule]
+    _token: object = field(default=None, repr=False, compare=False)
+
+    def validate_versions(self) -> None:
+        """Reject mutation of any saved activation before a delayed or retained backward."""
+        if self._token is not _SAVED_ATTENTION_TOKEN:
+            raise ValueError("fused CP backward requires native forward-produced saved state")
+        tensors = (*self.states, self.indices, *self.forward)
+        if tuple(tensor._version for tensor in tensors) != self.versions:
+            raise ValueError("fused CP saved attention state was modified after forward")
+
+
+@dataclass(frozen=True)
 class FusedCpForwardResult:
     """Owned local outputs and explicit native transport/compute evidence.
 
@@ -78,6 +101,7 @@ class FusedCpForwardResult:
     phase_traces: tuple[torch.Tensor, ...]
     transport_trace: torch.Tensor
     epoch: int
+    saved: FusedCpSavedAttention | None = None
 
 
 class FusedDsaCpForwardProbe:
@@ -143,6 +167,11 @@ class FusedDsaCpForwardProbe:
         """
         if invocation.workspace is not self.workspace or _layout_signature(invocation.batch_meta) != self.signature:
             raise ValueError("fused CP invocation must preserve the prepared ownership/layout/generation")
+        meta = invocation.batch_meta
+        prepared = self.layout.batch_meta
+        if (meta.q_global_ids, meta.kv_global_ids, meta.cp_rank) != (
+                prepared.q_global_ids, prepared.kv_global_ids, prepared.cp_rank):
+            raise ValueError("fused CP invocation must preserve the prepared local Q/KV storage orders")
         if len(main_states) != 4 or len(index_states) != 3 or any(tensor.requires_grad
                                                                 for tensor in (*main_states, *index_states)):
             raise ValueError("fused CP raw forward requires four detached main and three detached index states")
@@ -183,10 +212,15 @@ class FusedDsaCpForwardProbe:
             self.workspace.arena, metadata, self.requests, transport_trace)
         local = self.layout.local_query_ids
         global_indices = self.native_layout.sequence_to_global_indices(indices)
+        states = (full_q, keys[1][:, 0], full_qr, keys[2][:, 0])
+        tensors = (*states, indices, output, maximum, denominator)
+        saved = FusedCpSavedAttention(invocation.batch_meta, states, indices, (output, maximum, denominator),
+                                      tuple(tensor._version for tensor in tensors), self,
+                                      (self.heads, self.scale, self.schedule), _SAVED_ATTENTION_TOKEN)
         return FusedCpForwardResult(output.index_select(0, local), global_indices.index_select(0, local),
                                     values.index_select(0, local), maximum.index_select(1, local),
                                     denominator.index_select(1, local), keys, tuple(trace.unbind()),
-                                    transport_trace, epoch)
+                                    transport_trace, epoch, saved)
 
     @staticmethod
     def _transport_interval(transport: torch.Tensor) -> tuple[int, int]:

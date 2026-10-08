@@ -93,6 +93,16 @@ class TestFusedCpSubmission(SharedRootFixture):
             with self.assertRaisesRegex(RuntimeError, "active invocation"):
                 self.workspace.next_transport_epoch(foreign)
 
+    def test_local_order_changes_reject_before_collective_or_native_dispatch(self):
+        """Global protocol signatures do not substitute for this rank's prepared storage permutation."""
+        backend = self._backend()
+        for field in ("q_global_ids", "kv_global_ids"):
+            changed = self.workspace.prepare(replace(self.meta, **{field: (0, 1, 2)}))
+            with self.subTest(field=field), patch.object(fused_cp, "_load_native") as load:
+                with self.assertRaisesRegex(ValueError, "local Q/KV storage orders"):
+                    backend.forward(changed, (), ())
+                load.assert_not_called()
+
     def test_query_gather_publication_and_native_launch_share_lease(self):
         backend = self._backend()
         query_ids = torch.tensor(self.meta.q_global_ids, dtype=torch.bfloat16)

@@ -18,6 +18,7 @@
 #include <cmath>
 #include <tuple>
 #include "csrc/cached_op_api.h"
+#include "csrc/dsa_grad_checks.h"
 
 namespace {
 using Result = std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&>;
@@ -82,6 +83,26 @@ Result dsa_mixed_grad_npu(
   const Tensors tensors = {&query, &key, &value, &indices, &gradOut, &out, &maximum, &sum,
       &actualQuery, &actualKv, &queryRope, &keyRope, &config, &trace, &retained,
       &gradQuery, &gradKey, &gradValue, &gradQueryRope, &gradKeyRope};
+  hyper_parallel::multicore::check_dsa_grad_inputs(tensors, scale);
+  TORCH_CHECK(phase >= 0 && phase <= 2, "mixed SFA grad invalid phase");
+  static const hyper_parallel::multicore::CachedOpApi api(
+      "aclnnHyperDsaMixedGrad", "aclnnHyperDsaMixedGradGetWorkspaceSize");
+  hyper_parallel::multicore::execute_cached_op(api, query, key, value, indices, gradOut, out, maximum, sum,
+      actualQuery, actualKv, queryRope, keyRope, config, trace, retained, scale, phase,
+      gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope);
+  return Result(gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope, trace, retained);
+}
+}  // namespace
+
+namespace hyper_parallel::multicore {
+void check_dsa_grad_inputs(const DsaGradInputs &tensors, double scale) {
+  const auto &query = *tensors[0], &key = *tensors[1], &value = *tensors[2];
+  const auto &indices = *tensors[3], &gradOut = *tensors[4], &out = *tensors[5];
+  const auto &maximum = *tensors[6], &sum = *tensors[7], &actualQuery = *tensors[8], &actualKv = *tensors[9];
+  const auto &queryRope = *tensors[10], &keyRope = *tensors[11], &config = *tensors[12];
+  const auto &trace = *tensors[13], &retained = *tensors[14];
+  const auto &gradQuery = *tensors[15], &gradKey = *tensors[16], &gradValue = *tensors[17];
+  const auto &gradQueryRope = *tensors[18], &gradKeyRope = *tensors[19];
   for (const auto* tensor : tensors) {
     TORCH_CHECK(tensor->device() == query.device() && tensor->is_contiguous(),
                 "mixed SFA grad requires contiguous tensors on one NPU");
@@ -96,15 +117,9 @@ Result dsa_mixed_grad_npu(
       TORCH_CHECK(output == tensor || !output->is_alias_of(*tensor), "mixed SFA grad mutable buffers must not alias");
     }
   }
-  TORCH_CHECK(std::isfinite(scale) && scale > 0 && phase >= 0 && phase <= 2, "mixed SFA grad invalid scale/phase");
-  static const hyper_parallel::multicore::CachedOpApi api(
-      "aclnnHyperDsaMixedGrad", "aclnnHyperDsaMixedGradGetWorkspaceSize");
-  hyper_parallel::multicore::execute_cached_op(api, query, key, value, indices, gradOut, out, maximum, sum,
-      actualQuery, actualKv, queryRope, keyRope, config, trace, retained, scale, phase,
-      gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope);
-  return Result(gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope, trace, retained);
+  TORCH_CHECK(std::isfinite(scale) && scale > 0, "mixed SFA grad invalid scale");
 }
-}  // namespace
+}  // namespace hyper_parallel::multicore
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("dsa_mixed_grad_out", &dsa_mixed_grad_npu);
