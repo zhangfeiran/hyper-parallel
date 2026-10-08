@@ -483,10 +483,93 @@ These results support composition/rounding sensitivity across several
 boundaries; they do not identify one defective operator or justify dropping
 the max-absolute criterion. The original 22/35 model result remains failed.
 
+### Long-history selection and exact cutoff ties
+
+`mega_dsa_indexer_validate.py` runs complete CP=TP=1 native query/key storage
+with packed lengths 2176 and 2240, Hi=8, Di=128 and K=2048. For every query it
+checks the unfiltered raw native indices for legal sequence-local IDs, exact
+native cardinality, uniqueness and trailing padding. Checking before global-ID
+conversion prevents an invalid native ID from disappearing into a masked slot.
+It compares all-row enhance/stock selected sets and an enhance repeat run.
+
+The increasing and signed-decreasing fixtures encode integer ranks with two
+BF16 coordinates so their FP32 dot products stay distinct above K. Their
+analytic winners are checked for every row. A concentrated fixture puts all
+K strictly preferred winners in the first K positions of each sequence;
+its all-row winner set must be complete. Its prefix partition is hypothetical,
+not an executed CP owner or a distributed communication test. The signed case
+requires negative merge weights to affect ordering without extra activation.
+
+The all-zero fixture uses a predeclared tie rule: any legal cutoff-tied subset
+is allowed, but every strictly better candidate is mandatory. Raw cardinality
+and uniqueness remain strict. FP32 certificates and stable global-ID oracle
+matches are reported separately. Random-input set differences require a
+structural ReLU-zero certificate for every exchanged ID: both selections must
+contain every strictly better candidate at cutoff zero, and every exchanged
+key's head dots must remain strictly negative under a conservative FP32
+accumulation error bound. Nonzero/near-cutoff differences are not admitted by
+a tolerance. At most 32 extra mismatch queries are evaluated; uncertified
+differences fail the gate. CPU score certificates use full key candidates for
+20 base queries plus those extra queries, including packed starts and prefixes
+just below/at/above K.
+
+The first CANN 9.1 run **reported four accepted cases and random_signed failed**
+because random-input sets were compared strictly without tie diagnosis. This
+original report and source remain preserved. All raw native checks passed for every row
+of every case. The three analytic fixtures matched all-row winners, stock and
+repeat results. The all-zero fixture had 320 enhance/stock set differences,
+all in histories longer than K, while both sets satisfied exact tie membership.
+The enhance repeat was identical, and its sampled sets matched the ascending
+global-ID CPU oracle. These observations do not guarantee that tie policy for
+other shapes or versions.
+
+The random fixture had one enhance/stock set difference at global query 2070;
+the repeat enhance result was identical. The original 20 sampled FP32
+certificates passed, so the all-row stock comparison caught a difference outside
+the oracle sample. Follow-up diagnosis found 2044 strictly better candidates
+and nine zero-cutoff candidates competing for four slots. Both selections
+contained all strictly better candidates; they exchanged four zero-score IDs.
+Their FP32/FP64 scores were exactly zero. Native returned scores were also
+zero, and enabling score return retained each backend's selected set. Returned
+BF16 equality alone would not prove an internal FP32 tie.
+
+The structural certificate checks the exchanged keys' FP64 head dots using
+the standard FP32 accumulation bound `gamma_n * sum(abs(products))`, with
+`gamma_n = n*u/(1-n*u)` and `u=2^-24`. Their minimum negative margin after
+this bound was approximately 0.000981; all head ReLUs are inactive. The report
+separates strict set agreement from this exact zero-tie equivalence, applies
+the same tie semantics to random inputs, and retains the first failed gate.
+This is conditional on FP32 dot accumulation, as used by the locked indexer;
+it does not establish equivalence for arbitrary floating-point near ties.
+
+The final run reports `selection_verified_with_ties`: all five membership
+cases passed, while strict enhance/stock set equality passed only the three
+analytic cases. All raw native hashes were identical to the initial run; the
+classification changed to account for the proven random ReLU-zero tie, not
+because the operator or data changed. Every enhance repeat was identical.
+The original BF16 model acceptance remains 22/35 and failed.
+
+Run with the same activated payload and idle gate:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 NPU_WAIT_VISIBLE_DEVICES=0 NPU_WAIT_NUM_CARDS=1 \
+NPU_WAIT_POLL_SECONDS=60 bash ~/doc/npu_wait_and_run.sh \
+  python hyper_parallel/core/multicore/examples/mega_dsa_indexer_validate.py \
+  --output /tmp/mega_dsa_indexer_validation.json \
+  --snapshot-dir /tmp/mega_dsa_indexer_snapshots
+```
+
+Optional snapshots store CPU inputs and sampled global selections; full raw
+native selections are hashed in the report. Failed selection or execution
+returns nonzero and preserves the report. This validates indexer selection
+only: long-history SFA/KL derivatives, distributed CP/TP, trained-model locality
+and performance remain separate work.
+
 The candidate-count boundary remains restricted; general underfilled/empty
 device semantics remain unavailable. P0 still needs model BF16 calibration
 that generalizes to held-out inputs, parameter-gradient device acceptance,
-long-context selection/tie checks, end-to-end trainer backend plumbing and
+random long-context selection agreement and long-history SFA/KL derivatives,
+end-to-end trainer backend plumbing and
 DP/PP/AMP accumulation validation, and trained-model index traces with memory
 lifecycle measurements. Follow those gates before SHMEM coexistence (P1) or
 mixed-team extraction (P2).
