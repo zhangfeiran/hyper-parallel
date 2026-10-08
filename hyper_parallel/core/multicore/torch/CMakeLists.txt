@@ -81,6 +81,7 @@ endforeach()
 
 add_library(hyper_parallel_mega_moe_torch SHARED
     csrc/registration.cpp
+    csrc/dsa_cp_attention.cpp
     csrc/dsa_fused_grad.cpp
     csrc/dsa_fused_forward.cpp
     csrc/dsa_mixed_tile.cpp

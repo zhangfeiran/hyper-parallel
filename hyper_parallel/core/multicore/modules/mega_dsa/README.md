@@ -1058,3 +1058,46 @@ checkpoint. The existing CP1 fused-forward ST passed again. All ten previously
 accepted DSA device objects retained their hashes. These are primitive and
 transport gates; external-Top-K production installation, selected-set KL,
 independent model acceptance and full-step performance remain incomplete.
+
+
+### External Top-K CP core: forward validated, padded backward pending
+
+The parameter-free [MegaDsaCore](module.py) admits caller-provided global
+packed Top-K without running LI or KL. Preparation accepts CPU int32
+`[local Q,2048]`, rejects unknown IDs and duplicates, gathers owner query
+rows collectively, masks packed/causal violations and compacts `-1` to the
+native tail. The owned selection exports independent storage. CPU preparation
+is outside the hot path; arbitrary device-produced selection admission remains
+part of the planned indexer integration.
+
+The new native `HyperDsaCpAttention` pulls only compressed KV and K-RoPE,
+then executes the original SFA tile in the same mixed kernel. It retains
+complete ready/read-ACK closure and invocation-owned full activations. Q/Q-RoPE
+are replicated in global packed order; owner-local Q and KV permutations stay
+independent. Backward reuses the existing FP32 owner-return backend.
+
+An external subset may contain fewer legal IDs than `min(K,causal_length)`.
+The locked gradient tile currently infers its compute/scatter count from that
+expression instead of the compacted valid prefix. Additional `-1` entries can
+therefore enter its gather. Stock backward also fails the independent FP32
+oracle for this fixture; native-to-native parity is insufficient proof.
+The public training entry rejects selections with this count mismatch before
+launching native code. This is a temporary incomplete capability, not the P3
+acceptance boundary: full external Top-K backward, including empty selected
+rows, still requires a reviewed and independently validated native correction.
+
+The [validator](../../examples/mega_dsa_core_cp_validate.py) has an explicit
+`--forward-only` mode to certify legal external forward sets without claiming
+padded backward acceptance. Small-case FP32 measurements remain visible.
+CPU tests cover admission, packed compaction, independent exports, saved-state
+hooks and the training guard. They do not establish device autograd acceptance.
+
+On 910B3/CANN 9.1, the forward-only CP1/CP2/CP4 matrix passed 88
+invocations per rank: 616 rank invocations, including 112 long-history calls.
+Native outputs and max/sum matched stock exactly. The matrix covers H32/H64,
+contiguous/strided/zigzag/empty owners, external holes/packed violations,
+all-empty selected sets, owner-zero sets and groups 1/2/7/19. All eleven
+previously accepted DSA device objects retained their hashes. The CPU multicore
+regression passed 300 tests and 985 subtests. These results certify forward
+and the admission/guard contracts; padded backward and device autograd remain
+unaccepted pending the selected-count correction.

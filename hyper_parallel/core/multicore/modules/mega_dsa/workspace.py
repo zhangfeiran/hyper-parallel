@@ -180,6 +180,14 @@ class MegaDsaWorkspace:
         barrier, host synchronization or autograd path is implied by publication.
         Saved activations must remain independent of the reusable arena.
         """
+        self._publish_owner_fields(invocation, states, ("source_compressed", "source_rope", "source_index"))
+
+    def publish_main_states(self, invocation: DsaWorkspaceInvocation, states: tuple[torch.Tensor, ...]) -> None:
+        """Publish only compressed KV and key RoPE for caller-provided Top-K attention."""
+        self._publish_owner_fields(invocation, states, ("source_compressed", "source_rope"))
+
+    def _publish_owner_fields(self, invocation: DsaWorkspaceInvocation, states: tuple,
+                              names: tuple[str, ...]) -> None:
         meta = invocation.batch_meta
         if (invocation.workspace is not self or self.active_invocation is None
                 or self.root.lease_owner is not self.consumer):
@@ -187,9 +195,8 @@ class MegaDsaWorkspace:
         expected = (meta.layer, meta.microbatch, meta.invocation, meta.layout_id, meta.heap_generation)
         if self.active_invocation[:5] != expected:
             raise ValueError("DSA publication belongs to another invocation/layout/generation")
-        names = ("source_compressed", "source_rope", "source_index")
         if len(states) != len(names):
-            raise ValueError("publish_owner_states requires compressed KV, key RoPE and index key")
+            raise ValueError("publication fields must match the declared owner source fields")
         for name, tensor in zip(names, states):
             destination = self.buffers[name]
             if (tensor.device != destination.device or tensor.dtype != destination.dtype

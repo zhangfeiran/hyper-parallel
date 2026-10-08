@@ -234,12 +234,13 @@ def _compose_hyper_parallel_ops(
     _compose_mixed_grad(source_root, transformer_copy)
     _compose_fused_forward(source_root, transformer_copy)
     _compose_fused_grad(source_root, transformer_copy)
+    _compose_cp_attention(source_root, transformer_copy)
     for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad",
-                 "hyper_dsa_fused_forward", "hyper_dsa_fused_grad"):
+                 "hyper_dsa_fused_forward", "hyper_dsa_fused_grad", "hyper_dsa_cp_attention"):
         runtime = source_root / name / "op_kernel" / "runtime"
         runtime.mkdir()
         shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_mixed_group.h", runtime / "dsa_mixed_group.h")
-        if name == "hyper_dsa_fused_forward":
+        if name in ("hyper_dsa_fused_forward", "hyper_dsa_cp_attention"):
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_transport.h", runtime / "dsa_cp_transport.h")
         if name == "hyper_dsa_fused_grad":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_grad_transport.h", runtime / "dsa_cp_grad_transport.h")
@@ -315,6 +316,19 @@ def _compose_fused_forward(source_root: Path, transformer_copy: Path) -> None:
         root / "op_kernel" / "sfa_template_modes.h")
 
 
+def _compose_cp_attention(source_root: Path, transformer_copy: Path) -> None:
+    """Compose only the locked attention closure for external Top-K CP execution."""
+    root = source_root / "hyper_dsa_cp_attention"
+    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_cp_attention", root)
+    upstream = transformer_copy / "attention" / "sparse_flash_attention"
+    shutil.copytree(upstream / "op_kernel", root / "op_kernel" / "sfa")
+    _export_tiling_declarations(upstream / "op_host" / "sparse_flash_attention_tiling.h",
+                                root / "op_host" / "sfa_tiling_data.h")
+    _export_sfa_template_modes(
+        root / "op_kernel" / "sfa" / "sparse_flash_attention_template_tiling_key.h",
+        root / "op_kernel" / "sfa_template_modes.h")
+
+
 def _compose_fused_grad(source_root: Path, transformer_copy: Path) -> None:
     """Use the same locked gradient tiles and one exported original tiling schema."""
     root = source_root / "hyper_dsa_fused_grad"
@@ -338,6 +352,7 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
         source_root / "hyper_dsa_fused_forward" / "op_kernel" / "hyper_dsa_fused_forward.cpp",
         source_root / "hyper_dsa_fused_grad" / "op_kernel" / "hyper_dsa_fused_grad.cpp",
+        source_root / "hyper_dsa_cp_attention" / "op_kernel" / "hyper_dsa_cp_attention.cpp",
         source_root / "shmem" / "data_plane" / "rma.h",
         source_root / "shmem" / "data_plane" / "sync.h",
         source_root / "hyper_dsa_mixed_tile" / "op_kernel" / "hyper_dsa_mixed_tile.cpp",

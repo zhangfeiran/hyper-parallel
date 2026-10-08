@@ -50,6 +50,16 @@ npu_op_kernel_sources(ascendc_kernels
 
 if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
     npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE HyperDsaCpAttention
+        KERNEL_DIR ./hyper_dsa_cp_attention/op_kernel
+        KERNEL_FILE hyper_dsa_cp_attention.cpp
+        COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+    )
+    npu_op_kernel_options(ascendc_kernels OP_TYPE HyperDsaCpAttention OPTIONS
+        --cce-auto-sync=off -Wno-deprecated-declarations
+        -mllvm -cce-vf-remove-membar=false
+        -mllvm -cce-aicore-hoist-movemask=false)
+    npu_op_kernel_sources(ascendc_kernels
         OP_TYPE HyperDsaFusedGrad
         KERNEL_DIR ./hyper_dsa_fused_grad/op_kernel
         KERNEL_FILE hyper_dsa_fused_grad.cpp

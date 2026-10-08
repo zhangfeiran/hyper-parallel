@@ -72,15 +72,18 @@ class CpTransport {
 #endif
   }
 
+  template<bool WaitIndexer = true>
   __aicore__ inline void PullMain(__gm__ uint8_t *compressed, __gm__ uint8_t *rope,
                                  GlobalTensor<int64_t> &compute, uint32_t groups) {
 #ifndef __DAV_C220_CUBE__
-    for (uint32_t group = 0; group < groups; ++group) {
-      for (uint32_t member = 0; member < 3; ++member) {
-        while (ReadVisible(compute, group * kGroupWords + member * kMemberWords + 7) != 1) {}
+    if constexpr (WaitIndexer) {
+      for (uint32_t group = 0; group < groups; ++group) {
+        for (uint32_t member = 0; member < 3; ++member) {
+          while (ReadVisible(compute, group * kGroupWords + member * kMemberWords + 7) != 1) {}
+        }
       }
+      PublishControl(trace_, 13, 3 * groups);
     }
-    PublishControl(trace_, 13, 3 * groups);
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECCALC> storage;
     pipe.InitBuffer(storage, 8192);
