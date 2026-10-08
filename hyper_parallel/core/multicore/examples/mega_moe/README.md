@@ -10,8 +10,8 @@ This directory contains a deliberately small end-to-end training benchmark:
 - `run_qwen_moe_benchmark.sh` activates CANN and the native payload, verifies
   the editable install, and launches the eight-rank job.
 
-It is a runnable integration example, not a profiler. It does not collect
-traces, timelines, HBM samples, or artifact inventories.
+It is a runnable integration example, not a profiler. It reports allocator
+peaks and configured SHMEM capacity, without collecting traces or timelines.
 
 ## MegaMoe integration
 
@@ -132,3 +132,58 @@ bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
 此 runner 只在首个 optimizer step 比较 common 与 MegaMoE 的数值。
 后续参数更新可能导致路由逐渐分叉，稳态耗时不能直接视为相同通信负载下的后端比较。
 研究容量策略的开销时，应另用固定参数和固定路由，分别报告稳态与扩容步。
+
+## AST training-graph acceptance
+
+`QwenMoeModel(..., program=moe_region)` forwards the existing AST program to
+each routed-expert module. The learned Qwen softmax router and the rest of the
+causal-LM training graph retain their existing implementation.
+
+For independent native/AST trajectories, activate the sealed AST MoE payload
+and use the existing launcher:
+
+```bash
+bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
+  --validation-steps 100 --dispatch-mode push --output output/ast_push.json
+
+bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
+  --validation-steps 100 --dispatch-mode pull --output output/ast_pull.json
+```
+
+This mode replaces timing with numerical validation. Both models start from
+exactly equal weights and train on the same deterministic rank-local batch.
+Their AdamW states and parameters advance independently; weights are never
+resynchronized between steps. Every step compares full logits/loss, all local
+dense/expert gradients, updated BF16 parameters, FP32 main parameters and
+optimizer state. Model comparisons use `rtol=0.02, atol=0.002`; optimizer
+state uses `rtol=0.02, atol=1e-8`. Learned route IDs and probabilities must agree
+exactly. Program fingerprints must remain present and stable. For multiple
+steps, final loss must decrease on every rank in both backends.
+
+Each rank incrementally writes `*.rankN.json`, retaining completed steps and
+the failure location if validation stops. Successful runs also write
+`*.rankN.identity.json` with the verified native build fingerprint and each
+layer's semantic fingerprint, workspace capacity and heap epoch. The model
+has two randomly initialized layers and synthetic repeated token batches:
+passing proves this training graph learns consistently, without establishing
+pretrained-model or real-data long-term convergence.
+
+For performance, launch one backend per fresh process:
+
+```bash
+bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
+  --backend mega_moe --warmup-steps 10 --measured-steps 20 --output output/native.json
+
+bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
+  --backend ast --warmup-steps 10 --measured-steps 20 --output output/ast.json
+```
+
+Repeat these commands in native/AST/AST/native order, with fixed seeds, shape,
+optimizer settings and payload. Calibrate timing noise using independent
+native repeats, and observe device and host ownership throughout the block.
+First-step timing includes gradient capture; steady timing excludes diagnostic
+hooks, comparisons and identity checks. Allocator peaks reset after warmup and
+are reduced by maximum across ranks. They exclude allocations outside the
+Torch allocator; configured SHMEM capacity is reported separately and must
+not be added blindly to allocator measurements. A speedup requires evidence
+above repeat noise; AST compatibility alone does not imply a performance gain.

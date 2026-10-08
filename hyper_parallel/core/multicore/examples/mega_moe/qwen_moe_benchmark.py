@@ -24,14 +24,20 @@ import os
 import statistics
 import sys
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
-import torch_npu
-from qwen_moe_model import QwenMoeConfig, QwenMoeModel
+
+# Keep argument parsing and the optimizer-loop CPU oracle importable without NPU packages.
+try:
+    import torch_npu
+except ModuleNotFoundError as import_error:
+    if import_error.name != "torch_npu":
+        raise
+    torch_npu = None
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.components.optim import (
@@ -40,7 +46,11 @@ from hyper_parallel.components.optim import (
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts, shmem
+from hyper_parallel.core.multicore.examples.mega_moe.qwen_moe_model import QwenMoeConfig, QwenMoeModel
+from hyper_parallel.core.multicore.frontend.examples.moe_region import moe_region
+from hyper_parallel.core.multicore.frontend.program import Program
 from hyper_parallel.core.multicore.modules.mega_moe.spec import _resolve_capacity_factors
+from hyper_parallel.core.multicore.runtime.moe_native import verify_moe_native
 from hyper_parallel.core.optimizer import get_hyper_optimizer
 from hyper_parallel.components.modules.moe import GroupedExperts
 
@@ -72,6 +82,7 @@ class _TensorComparison:
     tensor_names: list[str] = field(default_factory=list)
     absolute_errors: list[torch.Tensor] = field(default_factory=list)
     normalized_errors: list[torch.Tensor] = field(default_factory=list)
+    relative_l2_errors: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass
@@ -172,12 +183,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--capacity-growth-factor", type=float, default=None,
                         help="push only: growth multiplier (default: 1.25; 1.0 fits actual demand)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--backend", choices=("comparison", "common", "mega_moe", "ast"), default="comparison",
+                        help="select one backend for fresh-process performance runs")
+    parser.add_argument("--validation-steps", type=int, default=0,
+                        help="compare independent native/AST trajectories instead of common/MegaMoe timing")
     parser.add_argument(
         "--output",
         default="output/qwen_moe_benchmark.json",
         help="rank-zero JSON result path",
     )
     args = parser.parse_args(argv)
+    if args.validation_steps < 0:
+        raise ValueError("validation_steps must be nonnegative.")
+    if args.validation_steps and args.backend != "comparison":
+        raise ValueError("trajectory validation requires --backend comparison.")
     args.initial_capacity_factor, args.capacity_growth_factor = _resolve_capacity_factors(
         args.dispatch_mode, args.initial_capacity_factor, args.capacity_growth_factor)
     if args.warmup_steps < 1:
@@ -197,6 +216,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _init_runtime() -> tuple[int, int, torch.device]:
     """Bind the local NPU and initialize the fixed EP world."""
+    if torch_npu is None:
+        raise RuntimeError("Qwen NPU benchmark requires torch_npu.")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.npu.set_device(local_rank)
     if not dist.is_initialized():
@@ -210,12 +231,12 @@ def _init_runtime() -> tuple[int, int, torch.device]:
     return rank, world_size, torch.device("npu", local_rank)
 
 
-def _build_model(config: QwenMoeConfig, device: torch.device) -> QwenMoeModel:
+def _build_model(config: QwenMoeConfig, device: torch.device, program: Program | None = None) -> QwenMoeModel:
     """Build BF16 model weights and keep rotary buffers in their native dtype."""
     default_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(_DTYPE)
-        model = QwenMoeModel(config, ep_group=dist.group.WORLD)
+        model = QwenMoeModel(config, ep_group=dist.group.WORLD, program=program)
     finally:
         torch.set_default_dtype(default_dtype)
     return model.to(device=device)
@@ -240,8 +261,8 @@ def _build_backend_model(
 ) -> QwenMoeModel:
     """Build one deterministically initialized MegaMoe or common model."""
     _reset_seed(seed)
-    model = _build_model(config, device)
-    if backend == "mega_moe":
+    model = _build_model(config, device, moe_region if backend == "ast" else None)
+    if backend in ("mega_moe", "ast"):
         return model
     if backend != "common":
         raise ValueError(f"unsupported Qwen expert backend {backend!r}.")
@@ -512,6 +533,7 @@ def _compare_tensor_maps(
     *,
     rtol: float,
     atol: float,
+    fail_on_error: bool = True,
 ) -> dict[str, Any]:
     """Compare tensor maps on device and reduce diagnostics across ranks."""
     if common_tensors.keys() != mega_tensors.keys():
@@ -532,7 +554,7 @@ def _compare_tensor_maps(
             rtol=rtol,
             atol=atol,
         )
-    return _finalize_tensor_comparison(name, comparison, rtol=rtol, atol=atol)
+    return _finalize_tensor_comparison(name, comparison, rtol=rtol, atol=atol, fail_on_error=fail_on_error)
 
 
 def _compare_tensor_pair(
@@ -557,7 +579,8 @@ def _compare_tensor_pair(
     difference = (mega_float - common_float).abs()
     comparison.passed = torch.minimum(
         comparison.passed,
-        torch.isclose(mega_float, common_float, rtol=rtol, atol=atol)
+        (torch.isclose(mega_float, common_float, rtol=rtol, atol=atol)
+         & torch.isfinite(common_float) & torch.isfinite(mega_float))
         .all()
         .to(torch.int32),
     )
@@ -565,6 +588,9 @@ def _compare_tensor_pair(
     tolerance = atol + rtol * common_float.abs()
     normalized_error = difference / tolerance.clamp_min(torch.finfo(torch.float32).tiny)
     comparison.normalized_errors.append(normalized_error.max())
+    reference_norm = common_float.norm()
+    comparison.relative_l2_errors.append(
+        difference.norm() / reference_norm.clamp_min(torch.finfo(torch.float32).tiny))
 
 
 def _finalize_tensor_comparison(
@@ -573,15 +599,19 @@ def _finalize_tensor_comparison(
     *,
     rtol: float,
     atol: float,
+    fail_on_error: bool = True,
 ) -> dict[str, Any]:
     """Reduce accumulated diagnostics and return the public result mapping."""
     absolute_by_tensor = torch.stack(comparison.absolute_errors)
     normalized_by_tensor = torch.stack(comparison.normalized_errors)
+    relative_l2_by_tensor = torch.stack(comparison.relative_l2_errors)
     dist.all_reduce(comparison.passed, op=dist.ReduceOp.MIN)
     dist.all_reduce(absolute_by_tensor, op=dist.ReduceOp.MAX)
     dist.all_reduce(normalized_by_tensor, op=dist.ReduceOp.MAX)
+    dist.all_reduce(relative_l2_by_tensor, op=dist.ReduceOp.MAX)
     maximum_absolute, absolute_index = absolute_by_tensor.max(dim=0)
     maximum_normalized, normalized_index = normalized_by_tensor.max(dim=0)
+    maximum_relative_l2, relative_l2_index = relative_l2_by_tensor.max(dim=0)
     result = {
         "passed": bool(comparison.passed.cpu().item()),
         "tensor_count": len(comparison.tensor_names),
@@ -591,8 +621,10 @@ def _finalize_tensor_comparison(
         "max_absolute_error_tensor": comparison.tensor_names[int(absolute_index.cpu().item())],
         "max_normalized_error": float(maximum_normalized.cpu().item()),
         "max_normalized_error_tensor": comparison.tensor_names[int(normalized_index.cpu().item())],
+        "max_relative_l2_error": float(maximum_relative_l2.cpu().item()),
+        "max_relative_l2_error_tensor": comparison.tensor_names[int(relative_l2_index.cpu().item())],
     }
-    if not result["passed"]:
+    if fail_on_error and not result["passed"]:
         raise RuntimeError(f"Qwen common/MegaMoe {name} comparison failed: {result}.")
     return result
 
@@ -607,6 +639,7 @@ def _measure_backend(
     for _ in range(args.warmup_steps - 1):
         warmup_loss, warmup_latency = _timed_step(workload)
         del warmup_loss, warmup_latency
+    torch.npu.reset_peak_memory_stats(workload.device)
     latencies = []
     losses = []
     for _ in range(args.measured_steps):
@@ -620,10 +653,13 @@ def _measure_backend(
             managers[id(manager)] = manager
     state = shmem.debug_state() if managers else {}
     return {
+        "peak_allocated_bytes": _rank_max(torch.npu.max_memory_allocated(workload.device), workload.device),
+        "peak_reserved_bytes": _rank_max(torch.npu.max_memory_reserved(workload.device), workload.device),
         "shmem_heap_bytes": state.get("config", {}).get("heap_size_bytes", 0),
         "heap_growth": [record for manager in managers.values() for record in manager.growth_records],
         "validation": validation,
         "first_optimizer_step_ms": first_step_ms,
+        "first_step_includes_gradient_capture": True,
         "steady_state_optimizer_step_ms": {
             "median": statistics.median(latencies),
             "minimum": min(latencies),
@@ -642,9 +678,13 @@ def _write_result(
     backends: dict[str, dict[str, Any]],
 ) -> None:
     """Write common-versus-MegaMoe accuracy and performance from rank zero."""
-    common_median = backends["common"]["steady_state_optimizer_step_ms"]["median"]
-    mega_median = backends["mega_moe"]["steady_state_optimizer_step_ms"]["median"]
-    ratio = mega_median / common_median
+    performance = {"order": list(backends), "metric": "rank-max complete optimizer-step milliseconds"}
+    if set(backends) == {"common", "mega_moe"}:
+        common_median = backends["common"]["steady_state_optimizer_step_ms"]["median"]
+        mega_median = backends["mega_moe"]["steady_state_optimizer_step_ms"]["median"]
+        ratio = mega_median / common_median
+        performance.update(common_median_ms=common_median, mega_moe_median_ms=mega_median,
+                           mega_over_common=ratio, mega_reduction_percent=(1.0 - ratio) * 100.0)
     if rank == 0:
         result = {
             "topology": {"world_size": _WORLD_SIZE, "tp": 1, "ep": config.ep_size},
@@ -672,19 +712,13 @@ def _write_result(
             "measured_steps": args.measured_steps,
             "comparison": {
                 "accuracy": accuracy,
-                "performance": {
-                    "order": ["common", "mega_moe"],
-                    "metric": "rank-max complete optimizer-step milliseconds",
-                    "common_median_ms": common_median,
-                    "mega_moe_median_ms": mega_median,
-                    "mega_over_common": ratio,
-                    "mega_reduction_percent": (1.0 - ratio) * 100.0,
-                },
+                "performance": performance,
             },
             "backends": backends,
             "runtime": {
                 "torch": torch.__version__,
                 "torch_npu": torch_npu.__version__,
+                "package_path": str(Path(__file__).resolve()),
             },
         }
         path = Path(args.output)
@@ -779,15 +813,189 @@ def _prepare_benchmark(argv: list[str] | None) -> _BenchmarkContext:
     return _BenchmarkContext(args, rank, world_size, device, config)
 
 
+def _selected_backends(args: argparse.Namespace) -> tuple[str, ...]:
+    """Resolve legacy comparison, AST validation, or fresh-process timing."""
+    if args.validation_steps:
+        return "mega_moe", "ast"
+    return ("common", "mega_moe") if args.backend == "comparison" else (args.backend,)
+
+
+def _flatten_optimizer_state(value: Any, device: torch.device, prefix: str = "") -> tuple[dict, dict]:
+    """Separate optimizer tensor/numeric leaves from structural metadata."""
+    tensors, metadata = {}, {}
+    if isinstance(value, dict):
+        children = value.items()
+    elif isinstance(value, (list, tuple)):
+        children = enumerate(value)
+    else:
+        if isinstance(value, torch.Tensor):
+            tensors[prefix] = _local_tensor(value).detach().to(device)
+        elif isinstance(value, (int, float)):
+            tensors[prefix] = torch.tensor(value, dtype=torch.float32, device=device)
+        else:
+            metadata[prefix] = value
+        return tensors, metadata
+    for key, child in children:
+        child_tensors, child_metadata = _flatten_optimizer_state(child, device, f"{prefix}/{key}")
+        tensors.update(child_tensors)
+        metadata.update(child_metadata)
+    return tensors, metadata
+
+
+@dataclass
+class _RouteCapture:
+    """Retain learned routes only during numerical validation."""
+
+    name: str
+    tensors: dict[str, torch.Tensor]
+
+    def __call__(self, _module: torch.nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        """Capture detached routing inputs before the expert executor."""
+        self.tensors[f"{self.name}.ids"] = inputs[1].detach().clone()
+        self.tensors[f"{self.name}.weights"] = inputs[2].detach().clone()
+
+
+def _execution_identity(model: QwenMoeModel) -> list[dict[str, Any]]:
+    """Read execution metadata outside the timed region.
+
+    The example observes the resource group because no public diagnostics API
+    currently exposes its compiled plan or workspace capacity.
+    """
+    layers = []
+    for layer in model.layers:
+        if isinstance(layer.mlp.experts, MegaMoeExperts):
+            resources = layer.mlp.experts._resource_group.resources  # pylint: disable=protected-access
+            plan = resources.frontend_plan
+            layers.append({"program_fingerprint": plan.recipe.fingerprint if plan is not None else None,
+                           "capacity": resources.workspace.capacity_floor,
+                           "heap_epoch": resources.heap_manager.epoch})
+    return layers
+
+
+def _write_rank_identity(context: _BenchmarkContext) -> None:
+    """Verify the activated payload and retain per-rank semantic identity."""
+    manifest = verify_moe_native()
+    data = {"rank": context.rank, "build_fingerprint": manifest["build_fingerprint"],
+            "backends": {name: _execution_identity(model) for name, model in context.models.items()}}
+    path = Path(context.args.output).with_suffix(f".rank{context.rank}.identity.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _compare_step_state(workloads: dict[str, _Workload], device: torch.device,
+                        *, fail_on_error: bool = True) -> dict[str, Any]:
+    """Compare independent main parameters, counters and AdamW moments."""
+    native, native_meta = _flatten_optimizer_state(workloads["mega_moe"].optimizer.state_dict(), device)
+    ast, ast_meta = _flatten_optimizer_state(workloads["ast"].optimizer.state_dict(), device)
+    if not _all_ranks_true(native_meta == ast_meta, device):
+        raise RuntimeError("native/AST optimizer state structure differs.")
+    result = _compare_tensor_maps("optimizer state", native, ast, device, rtol=_RTOL, atol=1e-8,
+                                 fail_on_error=fail_on_error)
+    for group, names in (("main_parameters", [key for key in native if "/fp32_from_fp16_params/" in key]),
+                         ("moments_and_settings", [key for key in native if "/fp32_from_fp16_params/" not in key])):
+        if names:
+            result[group] = _compare_tensor_maps(group, {key: native[key] for key in names},
+                                                {key: ast[key] for key in names}, device, rtol=_RTOL, atol=1e-8,
+                                                fail_on_error=False)
+    return result
+
+
+def _trajectory_step(workloads: dict[str, _Workload], device: torch.device,
+                     routes: dict[str, dict[str, torch.Tensor]]) -> dict[str, Any]:
+    """Advance both optimizers once without resynchronizing either state."""
+    native_loss, native_logits, native_gradients = _optimizer_step(workloads["mega_moe"], capture_gradients=True)
+    ast_loss, ast_logits, ast_gradients = _optimizer_step(workloads["ast"], capture_gradients=True)
+    result = {
+        "losses": {"mega_moe": float(native_loss.cpu().item()), "ast": float(ast_loss.cpu().item())},
+        "forward": _compare_tensor_maps("forward", {"loss": native_loss, "logits": native_logits},
+                                        {"loss": ast_loss, "logits": ast_logits}, device, rtol=_RTOL, atol=_ATOL,
+                                        fail_on_error=False),
+        "gradients": _compare_tensor_maps("gradients", native_gradients, ast_gradients,
+                                          device, rtol=_RTOL, atol=_ATOL, fail_on_error=False),
+        "updated_parameters": _compare_tensor_maps(
+            "updated parameters", _canonical_tensors(workloads["mega_moe"].model, gradients=False),
+            _canonical_tensors(workloads["ast"].model, gradients=False), device, rtol=_RTOL, atol=_ATOL,
+            fail_on_error=False),
+        "routes": _compare_tensor_maps("routes", routes["mega_moe"], routes["ast"], device, rtol=0.0, atol=0.0,
+                                       fail_on_error=False),
+        "optimizer_state": _compare_step_state(workloads, device, fail_on_error=False),
+    }
+    return result
+
+
+def _trajectory_loss_decreased(data: dict[str, Any], device: torch.device) -> bool:
+    """Check fixed-batch learning separately from native/AST numerical parity."""
+    first, last = data["steps"][0]["losses"], data["steps"][-1]["losses"]
+    return _all_ranks_true(all(last[name] < first[name] for name in first), device)
+
+
+def _check_trajectory_step(step: dict[str, Any], number: int, fingerprint: list[str] | None) -> list[str]:
+    """Reject failed metrics after the complete diagnostic row is persisted."""
+    current = [layer["program_fingerprint"] for layer in step["execution"]]
+    if not all(current) or (fingerprint is not None and current != fingerprint):
+        raise RuntimeError("AST program missing or recompiled during training.")
+    failed = {name: value for name, value in step.items()
+              if isinstance(value, dict) and value.get("passed") is False}
+    if failed:
+        raise RuntimeError(f"Qwen independent training comparison failed at step {number}: {failed}.")
+    return current
+
+
+def _validate_trajectory(context: _BenchmarkContext, workloads: dict[str, _Workload]) -> None:
+    """Archive complete independent native/AST synthetic training trajectories."""
+    routes = {name: {} for name in workloads}
+    hooks = []
+    for name, workload in workloads.items():
+        for index, layer in enumerate(workload.model.layers):
+            hooks.append(layer.mlp.experts.register_forward_pre_hook(_RouteCapture(str(index), routes[name])))
+    initial = _compare_tensor_maps(
+        "initial parameters", _canonical_tensors(context.models["mega_moe"], gradients=False),
+        _canonical_tensors(context.models["ast"], gradients=False), context.device, rtol=0.0, atol=0.0)
+    data = {"rank": context.rank, "scope": "two-layer random-weight Qwen synthetic fixed-batch training",
+            "independent_optimizer_states": True, "weight_resynchronization": False,
+            "model_config": asdict(context.config),
+            "seed": context.args.seed, "dispatch_mode": context.args.dispatch_mode,
+            "learning_rate": context.args.learning_rate, "initial_parameters": initial,
+            "requested_steps": context.args.validation_steps, "steps": [], "passed": False}
+    path = Path(context.args.output).with_suffix(f".rank{context.rank}.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    index = 0
+    try:
+        fingerprint = None
+        for index in range(context.args.validation_steps):
+            step = _trajectory_step(workloads, context.device, routes)
+            step["step"] = index + 1
+            step["execution"] = _execution_identity(context.models["ast"])
+            data["steps"].append(step)
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            fingerprint = _check_trajectory_step(step, index + 1, fingerprint)
+            if context.rank == 0:
+                print(json.dumps({"step": index + 1, "losses": step["losses"]}), flush=True)
+        data["loss_decreased_on_all_ranks"] = _trajectory_loss_decreased(data, context.device)
+        if context.args.validation_steps > 1 and not data["loss_decreased_on_all_ranks"]:
+            raise RuntimeError("Synthetic fixed-batch training did not reduce loss on every rank.")
+        data["passed"] = True
+        _write_rank_identity(context)
+    except Exception as error:
+        data["failure"] = {"step": index + 1, "type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        for hook in hooks:
+            hook.remove()
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
 def _build_benchmark_workloads(context: _BenchmarkContext) -> dict[str, _Workload]:
     """Construct deterministic common and MegaMoe workloads."""
+    if "ast" in _selected_backends(context.args):
+        verify_moe_native()
     input_ids, labels = _build_batch(
         context.config,
         context.rank,
         context.args.seed,
         context.device,
     )
-    for backend in ("common", "mega_moe"):
+    for backend in _selected_backends(context.args):
         context.models[backend] = _build_backend_model(
             context.config,
             context.device,
@@ -814,10 +1022,17 @@ def _measure_backends(
 ) -> dict[str, dict[str, Any]]:
     """Measure both backends after their compared first steps."""
     measurements = {}
-    for backend in ("common", "mega_moe"):
+    for backend in workloads:
         validation, latency_ms = first_steps[backend]
         measurements[backend] = _measure_backend(workloads[backend], validation, latency_ms, args)
     return measurements
+
+
+def _single_backend_first_step(workload: _Workload) -> tuple[dict[str, Any], float]:
+    """Release validation logits and gradient snapshots before steady timing."""
+    validation, latency, loss, logits, gradients = _validate_first_step(workload)
+    del loss, logits, gradients
+    return validation, latency
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -832,12 +1047,18 @@ def main(argv: list[str] | None = None) -> int:
     context = _prepare_benchmark(argv)
     try:
         workloads = _build_benchmark_workloads(context)
-        accuracy, first_steps = _compare_first_step_accuracy(
-            context.models,
-            workloads,
-            context.device,
-        )
+        if context.args.validation_steps:
+            _validate_trajectory(context, workloads)
+            return 0
+        if context.args.backend == "comparison":
+            accuracy, first_steps = _compare_first_step_accuracy(context.models, workloads, context.device)
+        else:
+            accuracy, first_steps = {}, {}
+            for backend, workload in workloads.items():
+                first_steps[backend] = _single_backend_first_step(workload)
         backends = _measure_backends(workloads, first_steps, context.args)
+        if context.args.backend != "comparison":
+            _write_rank_identity(context)
         _write_result(
             context.args,
             context.config,

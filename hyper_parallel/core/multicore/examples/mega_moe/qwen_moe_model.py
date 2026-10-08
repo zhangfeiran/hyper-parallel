@@ -34,6 +34,7 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb
 from hyper_parallel.components.modules import RMSNorm, SwiGLUMLP
 from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore.frontend.program import Program
 from hyper_parallel.core.multicore.modules.mega_moe.spec import _resolve_capacity_factors
 from hyper_parallel.models.qwen3_moe.adapter.attention import (
     run_qwen3_moe_flash_attention,
@@ -159,7 +160,12 @@ class QwenAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Run fused causal grouped-query attention."""
+        """Run fused causal grouped-query attention.
+
+        Args:
+            hidden_states: Batch of decoder activations.
+            position_ids: Token positions used by rotary embeddings.
+        """
         batch_size, sequence_length, _ = hidden_states.shape
         query = (
             self.q_proj(hidden_states)
@@ -229,6 +235,7 @@ class QwenMoeBlock(nn.Module):
         self,
         config: QwenMoeConfig,
         ep_group: Any | None,
+        program: Program | None = None,
     ) -> None:
         """Initialize the router, routed experts, and shared expert."""
         super().__init__()
@@ -245,6 +252,7 @@ class QwenMoeBlock(nn.Module):
             ep_group=ep_group,
             dispatch_mode=config.dispatch_mode,
             capacity_growth_factor=config.capacity_growth_factor,
+            program=program,
         )
         shared_source = nn.Module()
         shared_source.gate_proj = nn.Linear(config.hidden_size, config.shared_expert_intermediate_size, bias=False)
@@ -253,7 +261,11 @@ class QwenMoeBlock(nn.Module):
         self.shared_expert = SwiGLUMLP(module=shared_source)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run learned routed experts and the always-active shared expert."""
+        """Run learned routed experts and the always-active shared expert.
+
+        Args:
+            hidden_states: Batch of normalized decoder activations.
+        """
         hidden_shape = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, hidden_shape[-1])
         topk_weights, topk_ids = _topk_route(
@@ -283,6 +295,7 @@ class QwenDecoderLayer(nn.Module):
         self,
         config: QwenMoeConfig,
         ep_group: Any | None,
+        program: Program | None = None,
     ) -> None:
         """Initialize one attention and MoE decoder layer."""
         super().__init__()
@@ -292,14 +305,19 @@ class QwenDecoderLayer(nn.Module):
             config.rms_norm_eps,
         )
         self.self_attn = QwenAttention(config)
-        self.mlp = QwenMoeBlock(config, ep_group)
+        self.mlp = QwenMoeBlock(config, ep_group, program)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Run residual attention followed by residual MoE."""
+        """Run residual attention followed by residual MoE.
+
+        Args:
+            hidden_states: Batch of decoder activations.
+            position_ids: Token positions used by the attention layer.
+        """
         hidden_states = hidden_states + self.self_attn(
             self.input_layernorm(hidden_states),
             position_ids,
@@ -315,13 +333,20 @@ class QwenMoeModel(nn.Module):
         config: QwenMoeConfig,
         *,
         ep_group: Any | None = None,
+        program: Program | None = None,
     ) -> None:
-        """Initialize all decoder layers and their shared execution group."""
+        """Initialize all decoder layers and their shared execution group.
+
+        Args:
+            config: Fixed synthetic model shape and expert topology.
+            ep_group: Process group used by routed experts.
+            program: Optional AST program passed to every routed-expert module.
+        """
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            QwenDecoderLayer(config, ep_group)
+            QwenDecoderLayer(config, ep_group, program)
             for _ in range(config.num_layers)
         )
         MegaMoeExperts.share_execution_resources(
@@ -335,7 +360,12 @@ class QwenMoeModel(nn.Module):
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
-        """Return token logits and optional next-token loss."""
+        """Return token logits and optional next-token loss.
+
+        Args:
+            input_ids: Rank-local token identifiers.
+            labels: Optional token labels shifted internally for next-token loss.
+        """
         hidden_states = self.embed_tokens(input_ids)
         position_ids = torch.arange(
             hidden_states.shape[1],
