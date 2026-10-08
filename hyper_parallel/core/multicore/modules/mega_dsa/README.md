@@ -844,6 +844,70 @@ python -m hyper_parallel.core.multicore.examples.mega_dsa_mixed_indexer_validate
 
 This runs the same stock bitwise, signed-weight, tie, all-row contract and
 long-history LD checks as the two-launch validator, across 1/2/7/19 groups
-and three complete invocations with serial scratch reuse. LI→SFA task
-alternation, communication pressure, fused backward and multi-card CP remain
-separate validation gates.
+and three complete invocations with serial scratch reuse. Cross-operator
+alternation is exercised by the fused forward probe below. Communication
+pressure, fused backward and multi-card CP remain separate validation gates.
+
+
+### LI main/merge and SFA in one kernel
+
+The [fused forward probe](fused_forward.py) executes the complete chain in
+one native `HyperDsaFusedForward` mixed AICore kernel. The same compute groups
+traverse 20 logical LI partitions, merge their retained Top-K partials, then
+traverse 20 logical SFA partitions. SFA consumes the final sequence-local
+indices directly. There is no host launch between these phases. One reserved
+Vector releases each phase after the Cube and both Vectors in every compute
+group have completed their work and published arrival. Its whole mixed team
+remains resident through all three closures.
+
+The host adapter uses CANN's `OpTilingContextBuilder` to invoke both existing
+locked tilers with their original IR input and attribute order. The source
+assembler exports their original tiling declarations for CANN to generate
+the composite device structure; math, selection order and workspace budgets
+remain those of the existing callable tiles. Only the fused operator's two
+weight-dtype templates are registered. The optional block-table input is
+absent in both child contexts. Lengths describe complete positive CP1 packed
+sequences; the probe does not accept sharded Q/KV.
+
+Support is BF16 absorbed Q/KV with H32/H64, C512, RoPE64, LI H64/D128,
+BF16 or FP32 already-scaled indexer weights, causal TND and K2048 on 910B3.
+Compressed KV is shared between SFA K and V. The native boundary validates
+shapes, dtypes, contiguous single-device storage and independent mutable
+buffers. The raw probe requires detached states and preserves the supplied
+attention scale. It returns owned indices, values, attention and FP32
+maximum/sum. Optional LI scratch can be reused only after a complete
+invocation on the same stream or with explicit event dependencies.
+
+Each invocation owns fresh zeroed trace storage `[3,20,64]`. The CPU trace
+decoder checks epochs 1/2/3, every compute member's arrival and logical tasks,
+the reserved team's entry/release/exit and exact arrival count, matching LI
+LD ownership across main/merge, and no stale LI evidence in SFA. The caller
+must explicitly take CPU snapshots; the forward path never transfers traces
+to the host.
+
+```bash
+python -m hyper_parallel.core.multicore.examples.mega_dsa_fused_forward_validate \
+  --output fused_dsa_forward_report.json --long-history
+```
+
+The validator covers H32/H64 and 1/2/7/19 compute groups, repeats each complete
+invocation three times with serial LI scratch reuse, and checks every output
+against a separately executed stock LI→SFA chain with zero numerical
+tolerance. Packed lengths 2176/2240 additionally require nonzero logical LD
+merge participation. Signed weights, all ties, concentrated scores and random
+BF16/FP32 weights retain the indexer's analytic and all-row legality checks.
+
+The 910B3/CANN 9.1 validation covered 504 complete fused invocations across
+short and long matrices, including a fresh-process replay through the ST
+launcher. All five outputs matched the independent stock chain with zero
+numerical tolerance; every long invocation executed nine logical LD merges.
+Existing LI/SFA forward regressions passed. The separate backward regression
+retained its incomplete FP32 elementwise acceptance: 36/64 autograd checks
+passed at rtol=0.02, atol=2e-5, matching the stock shared-KV result. Native
+stock-gradient, retained-graph and lifecycle checks passed, but the backward
+ST still returns failure. The fusion gate does not clear that failure.
+
+This is a CP1 forward and cross-operator scheduling gate. The existing SFA
+backward probe remains separately scheduled. Connecting native CP transport,
+owner gradient return, selected-set KL, fused backward and full-model training
+acceptance remains required before claiming a complete MegaDSA backend.

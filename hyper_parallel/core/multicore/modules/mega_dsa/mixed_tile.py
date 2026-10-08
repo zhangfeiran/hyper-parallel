@@ -97,3 +97,31 @@ def validate_mixed_trace(trace: torch.Tensor, schedule: MixedSfaSchedule) -> dic
                                  f"record={tuple(row[offset + 1:offset + 4])}, expected={expected}")
     return {"logical_tasks": _PHYSICAL_GROUPS * schedule.rounds,
             "compute_groups": schedule.compute_groups, "members_per_group": 3}
+
+
+def validate_device_phase_closure(traces: tuple[torch.Tensor, ...], schedule: MixedSfaSchedule) -> tuple:
+    """Require ordered arrivals/releases in explicit CPU phase snapshots without mutating them.
+
+    The returned copies have the reserved progress row cleared so the logical
+    task decoder can independently check compute participation and idle groups.
+    Fresh phase records use epochs starting at one within each invocation.
+    """
+    if not traces or schedule.rounds != 1:
+        raise ValueError("device phase closure requires nonempty phase snapshots with rounds=1")
+    snapshots = []
+    for epoch, trace in enumerate(traces, start=1):
+        if trace.device.type != "cpu" or trace.dtype != torch.int64 or trace.shape != (20, 64):
+            raise ValueError("device phase closure requires an explicit CPU int64 [20,64] snapshot")
+        copy = trace.clone()
+        progress = copy[schedule.compute_groups]
+        expected = torch.zeros_like(progress)
+        expected[[6, 21, 22, 24, 38]] = epoch
+        expected[25] = 3 * schedule.compute_groups
+        if not torch.equal(progress, expected):
+            raise ValueError("reserved progress vector did not certify every member's phase closure")
+        for group in range(schedule.compute_groups):
+            if any(int(copy[group, offset + 6]) != epoch for offset in (0, 16, 32)):
+                raise ValueError(f"physical group {group} has an incomplete device phase arrival")
+        copy[schedule.compute_groups].zero_()
+        snapshots.append(copy)
+    return tuple(snapshots)

@@ -20,6 +20,7 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import (
     MixedSfaSchedule,
+    validate_device_phase_closure,
     validate_mixed_trace,
 )
 from hyper_parallel.core.multicore.torch.ops import _load_native
@@ -147,22 +148,7 @@ def validate_fused_indexer_traces(traces: tuple[torch.Tensor, torch.Tensor],
     """Require every compute arrival and the reserved vector's release in both CPU snapshots."""
     if len(traces) != 2 or schedule.rounds != 1:
         raise ValueError("fused LI evidence requires two phase snapshots with rounds=1")
-    snapshots = []
-    for epoch, trace in enumerate(traces, start=1):
-        if trace.device.type != "cpu" or trace.dtype != torch.int64 or trace.shape != (20, 64):
-            raise ValueError("fused LI trace requires an explicit CPU int64 [20,64] snapshot")
-        copy = trace.clone()
-        progress = copy[schedule.compute_groups]
-        expected = torch.zeros_like(progress)
-        expected[[6, 21, 22, 24, 38]] = epoch
-        expected[25] = 3 * schedule.compute_groups
-        if not torch.equal(progress, expected):
-            raise ValueError("reserved LI progress vector did not certify every member's phase closure")
-        for group in range(schedule.compute_groups):
-            if any(int(copy[group, offset + 6]) != epoch for offset in (0, 16, 32)):
-                raise ValueError(f"physical group {group} has an incomplete fused LI arrival")
-        copy[schedule.compute_groups].zero_()
-        snapshots.append(copy)
+    snapshots = validate_device_phase_closure(traces, schedule)
     evidence = validate_mixed_indexer_traces(tuple(snapshots), schedule, require_ld=require_ld)
     evidence.update(device_phase_closure=True, progress_group=schedule.compute_groups,
                     arrivals_per_phase=3 * schedule.compute_groups)

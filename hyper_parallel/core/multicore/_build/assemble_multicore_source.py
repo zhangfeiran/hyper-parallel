@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -231,7 +232,8 @@ def _compose_hyper_parallel_ops(
         shutil.copy2(upstream_kernel / filename, mixed_root / "op_kernel" / filename)
     _compose_mixed_indexer(source_root, transformer_copy)
     _compose_mixed_grad(source_root, transformer_copy)
-    for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad"):
+    _compose_fused_forward(source_root, transformer_copy)
+    for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad", "hyper_dsa_fused_forward"):
         runtime = source_root / name / "op_kernel" / "runtime"
         runtime.mkdir()
         shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_mixed_group.h", runtime / "dsa_mixed_group.h")
@@ -273,6 +275,40 @@ def _compose_mixed_grad(source_root: Path, transformer_copy: Path) -> None:
     shutil.copytree(upstream / "basic_modules", mixed_root / "basic_modules")
 
 
+def _export_tiling_declarations(source: Path, destination: Path) -> None:
+    """Copy locked tiling schemas without unrelated host classes or constants."""
+    text = source.read_text(encoding="utf-8")
+    blocks = re.findall(r"BEGIN_TILING_DATA_DEF\([^\n]+\).*?REGISTER_TILING_DATA_CLASS\([^\n]+\)", text, re.DOTALL)
+    if not blocks:
+        raise ValueError(f"No locked tiling schemas in {source}")
+    license_end = text.index("*/") + 2
+    destination.write_text(text[:license_end] + '\n#include "register/tilingdata_base.h"\n'
+                           + "namespace optiling {\n" + "\n\n".join(blocks) + "\n}\n", encoding="utf-8")
+
+
+def _export_sfa_template_modes(source: Path, destination: Path) -> None:
+    """Export locked mode constants without importing another operator's template registration."""
+    text = source.read_text(encoding="utf-8")
+    declarations = re.findall(r"^#define (?:C_TEMPLATE|V_TEMPLATE) [01]$", text, re.MULTILINE)
+    if len(declarations) != 2:
+        raise ValueError(f"Missing locked SFA template modes in {source}")
+    destination.write_text(text[:text.index("*/") + 2] + "\n" + "\n".join(declarations) + "\n", encoding="utf-8")
+
+
+def _compose_fused_forward(source_root: Path, transformer_copy: Path) -> None:
+    """Compose both locked tile closures and their generated native tiling schemas."""
+    root = source_root / "hyper_dsa_fused_forward"
+    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_fused_forward", root)
+    for short, operator in (("li", "lightning_indexer"), ("sfa", "sparse_flash_attention")):
+        upstream = transformer_copy / "attention" / operator
+        shutil.copytree(upstream / "op_kernel", root / "op_kernel" / short)
+        _export_tiling_declarations(upstream / "op_host" / f"{operator}_tiling.h",
+                                    root / "op_host" / f"{short}_tiling_data.h")
+    _export_sfa_template_modes(
+        root / "op_kernel" / "sfa" / "sparse_flash_attention_template_tiling_key.h",
+        root / "op_kernel" / "sfa_template_modes.h")
+
+
 def _require_assembled_files(source_root: Path) -> None:
     """Reject incomplete source closures before invoking the CANN toolchain."""
     required_paths = (
@@ -283,6 +319,7 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe_grad" / "op_host" / "hyper_mega_moe_grad_def.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "hyper_mega_moe_grad.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
+        source_root / "hyper_dsa_fused_forward" / "op_kernel" / "hyper_dsa_fused_forward.cpp",
         source_root / "shmem" / "data_plane" / "rma.h",
         source_root / "shmem" / "data_plane" / "sync.h",
         source_root / "hyper_dsa_mixed_tile" / "op_kernel" / "hyper_dsa_mixed_tile.cpp",
