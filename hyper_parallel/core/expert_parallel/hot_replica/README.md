@@ -414,6 +414,13 @@ accepts only a strict reduction of the same phase score beyond `minimum_gain_ms`
 may increase within the existing capacity limit. The B slot budget, lossless
 routing and push dynamic growth with a theoretical upper bound are preserved.
 
+Calibrated CPU refinement keeps invocation-local rank scores and source totals.
+A quota trial recomputes only the original owner and guest target, retaining the
+same per-rank home/guest accumulation order and separate forward/backward maxima.
+Removing a guest edge updates both endpoints' transfer counts before the next
+edge is considered. Scores and interpolation caches are discarded after each
+call; no route or weight state is shared between invocations.
+
 Routing uploads invocation-owned runs and dispatch counts in one aligned buffer.
 For a globally replica-free plan it maps logical IDs directly to home physical
 slots, including holes reserved by B. CPU plan derivatives are cached only on
