@@ -573,3 +573,73 @@ end-to-end trainer backend plumbing and
 DP/PP/AMP accumulation validation, and trained-model index traces with memory
 lifecycle measurements. Follow those gates before SHMEM coexistence (P1) or
 mixed-team extraction (P2).
+
+## Explicit CP correctness baseline
+
+[`cp_reference.py`](cp_reference.py) adds `DsaCpLayout` and
+`CannDsaCpReference`. This is an explicitly selected development baseline for
+CP=1/2/4, independent of the planned native fused worker. It gathers complete
+Q **and** KV because the installed right-down CANN mask cannot represent
+partial Q's global query offsets. Each rank evaluates full, globally ordered
+packed attention/indexer/KL and selects its original local query rows. Local
+sequence lengths are never substituted for global causal positions.
+
+`DsaCpLayout` validates ordered process-group membership, global metadata,
+invocation identity and complete owner-local Q/KV coverage during collective
+construction. Local Q and KV may have different storage orders; uneven shards
+use padding which is removed by a prepared global permutation. Host metadata
+and device permutations are prepared outside execution. Communication uses
+one packed differentiable all-gather for the declared main/indexer fields and
+one reduce-scatter in backward. Remote gradient contributions are summed in
+FP32 before conversion to the owner input dtype; this cannot recover rounding
+already performed inside each native BF16 backward. FP64 is preserved for the
+CPU exchange gradcheck.
+
+The multi-output autograd boundary preserves absent main teacher gradients
+in KL-only backward. Shared compressed K/V still receives the native dK+dV
+sum once. Full-query KL is replicated on every rank, so each returned KL
+contribution is divided by CP size. Sum **detached** contributions for reporting;
+backpropagate each rank's own scalar. `DsaLossNormalization` retains its explicit
+downstream reducer divisor. Do not insert a differentiable scalar all-reduce
+or apply an additional auxiliary scale inside this boundary. Projection-input
+detach and the model's original auxiliary gradient scale remain caller-owned.
+
+All ranks must use the same prepared field schema, selection, loss coefficient,
+normalization, requires-grad masks and forward/backward schedule. Construction
+performs metadata object collectives; execution does not read tensor contents
+on the host. External selections require identical complete CPU snapshots on
+all ranks, prepared outside execution; generated selections use the native
+indexer. Existing cardinality restrictions apply to both paths.
+
+After activating the validated enhance payload and editable checkout, run the
+validator through the idle gate (example for four cards):
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NPU_WAIT_VISIBLE_DEVICES=0,1,2,3 \
+NPU_WAIT_NUM_CARDS=4 NPU_WAIT_POLL_SECONDS=60 bash ~/doc/npu_wait_and_run.sh \
+  python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  -m hyper_parallel.core.multicore.examples.mega_dsa_cp_validate \
+  --output-dir /tmp/mega_dsa_cp4
+```
+
+The [validator](../../examples/mega_dsa_cp_validate.py) writes per-rank evidence
+for short packed lengths `(3,10)`: contiguous, strided and zigzag owners,
+independent query/key orders, all seven input gradients, native TopK and
+prepared external selections, KL-only gradient absence, zero coefficient,
+non-reentrant checkpoint and retained-graph backward. Retained backward checks
+each incoming gradient against the first using the declared tolerance, then
+checks exact accumulation of the two actual incoming gradients; it does not
+assume bitwise repeatability of native SFA reductions. CP parity uses declared
+pointwise `rtol=0.02, atol=2e-5` against identical-state unsharded native execution.
+CPU FP32 comparisons are measurements, not a new full-model acceptance gate.
+The lightweight [ST launcher](../../../../../tests/torch/multicore/test_mega_dsa_cp.py)
+contains CP=2/4 cases; it requires the caller's activated enhance payload.
+
+This baseline does not implement SHMEM, selected-key communication, mixed
+AIC/AIV worker groups, fused SFA/indexer/KL launch, model CP/TP integration or a
+performance optimization. It does not change the original BF16 model's failed
+22/35 acceptance or complete P0/P1/P2/P3. The next native work must establish
+shared-root byte budgets and leases, then extract callable mixed-worker tiles
+with explicit global causal offsets and verify full backward against this CP
+baseline. Long-history sparse SFA/KL gradients and complete training steps
+remain separate validation gates.
