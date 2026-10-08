@@ -21,6 +21,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from hyper_parallel.core.multicore.backends.launchers import generated_files as launcher_files, launcher_manifest
 from hyper_parallel.core.multicore.backends.schema import (
     cpp_calls,
     cpp_schema,
@@ -102,6 +103,10 @@ def emit_plan(plan: KernelPlan | MoeKernelPlan | MhcKernelPlan, ir: ProgramIR) -
     files["workers/manifest.json"] = _json(worker_manifest(family))
     files.update({f"workers/{path.name}": text.encode() for path, text in generated_files().items()
                   if path.name.startswith(family + "_")})
+    files["launchers/manifest.json"] = _json(launcher_manifest(family))
+    names = set(bindings)
+    files.update({f"launchers/{path.name}": text.encode() for path, text in launcher_files().items()
+                  if path.name == "launcher_types.hpp" or any(path.name.startswith(name + "_") for name in names)})
     return BackendEmission(plan, definition_key, plan_key,
                            tuple(EmittedFile(name, content) for name, content in sorted(files.items())))
 
@@ -111,7 +116,8 @@ def _definition(ir, family):
     for operation in semantic["operations"]:
         operation.pop("source")
         operation.pop("call_chain")
-    inputs = ("backends/schema.py", "backends/ascend.py", "backends/workers.py", "runtime/bindings.py",
+    inputs = ("backends/schema.py", "backends/ascend.py", "backends/workers.py", "backends/contexts.py",
+              "backends/launchers.py", "runtime/bindings.py",
               "runtime/native_calls.json", "runtime/worker_calls.json")
     return {"generator_version": 1, "target": "ascend", "semantic": semantic,
             "abi": family_abi(family).export_manifest(),

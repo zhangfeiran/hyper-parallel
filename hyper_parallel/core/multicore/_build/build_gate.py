@@ -33,6 +33,7 @@ import torch
 from hyper_parallel.core.multicore._build.prepare_dependencies import (
     verify_git_dependency,
 )
+from hyper_parallel.core.multicore.backends.launchers import install_launcher_glue
 from hyper_parallel.core.multicore.backends.schema import install_cpp_schema
 from hyper_parallel.core.multicore.backends.workers import install_worker_glue
 from hyper_parallel.core.multicore.runtime.abi import family_abi
@@ -85,6 +86,8 @@ def _assemble(repository, ops_nn, work):
         upstream / "index/linear_index/op_host/op_api",
         source / "hyper_mega_gate_grad/op_host/op_api/linear_index",
     )
+    shutil.copytree(pinned / _MULTICORE / "torch/csrc", work / "torch/csrc")
+    install_launcher_glue(work / "torch/csrc", "gate")
     return pinned, source
 
 
@@ -117,13 +120,14 @@ def _validate_libraries(payload):
 def _write_manifest(payload, work, soc, cann):
     abi = family_abi("gate")
     inputs = {}
-    for directory in (work / "pinned", work / "source", _CMAKE):
+    for directory in (work / "pinned", work / "source", work / "torch", _CMAKE):
         for path in sorted(directory.rglob("*")):
             if path.is_file():
                 inputs[f"{directory.name}/{path.relative_to(directory)}"] = _hash_file(path)
     inputs["build_gate.py"] = _hash_file(Path(__file__))
     inputs["families.json"] = _hash_file(_ROOT / _MULTICORE / "runtime/baselines/families.json")
-    for relative in ("backends/schema.py", "backends/workers.py",
+    for relative in ("backends/schema.py", "backends/workers.py", "backends/contexts.py",
+                     "backends/launchers.py",
                      "runtime/native_calls.json", "runtime/worker_calls.json"):
         inputs[relative] = _hash_file(_ROOT / _MULTICORE / relative)
     identity = {
@@ -188,6 +192,7 @@ def main() -> None:
     _run_build(_CMAKE / "torch", work / "torch-build", [
         "-DCMAKE_BUILD_TYPE=Release", f"-DPython3_EXECUTABLE={sys.executable}",
         f"-DHP_GATE_PINNED_ROOT={pinned}", f"-DHP_MULTICORE_VENDOR_ROOT={vendor}",
+        f"-DHP_GATE_TORCH_SOURCE_ROOT={work / 'torch'}",
         f"-DCMAKE_INSTALL_PREFIX={payload / 'framework/torch'}",
     ], args.jobs)
     subprocess.run(["cmake", "--install", str(work / "torch-build")], check=True)

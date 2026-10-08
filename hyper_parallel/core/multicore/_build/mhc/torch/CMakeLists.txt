@@ -21,6 +21,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(HP_MHC_COMPONENT ${HP_MHC_PINNED_ROOT}/hyper_parallel/core/multicore)
 include(${HP_MHC_COMPONENT}/cmake/hardening.cmake)
+if(NOT HP_MHC_TORCH_SOURCE_ROOT)
+    set(HP_MHC_TORCH_SOURCE_ROOT ${HP_MHC_COMPONENT}/torch)
+endif()
 
 if(NOT HP_MULTICORE_VENDOR_ROOT OR
     NOT EXISTS "${HP_MULTICORE_VENDOR_ROOT}/op_api/include")
@@ -96,8 +99,8 @@ foreach(required_path IN ITEMS
 endforeach()
 
 add_library(hyper_parallel_mega_mhc_torch SHARED
-    ${HP_MHC_COMPONENT}/torch/csrc/registration_mhc.cpp
-    ${HP_MHC_COMPONENT}/torch/csrc/mega_mhc.cpp)
+    ${HP_MHC_TORCH_SOURCE_ROOT}/csrc/registration_mhc.cpp
+    ${HP_MHC_TORCH_SOURCE_ROOT}/csrc/mega_mhc.cpp)
 target_compile_definitions(hyper_parallel_mega_mhc_torch PRIVATE
     _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI})
 target_include_directories(hyper_parallel_mega_mhc_torch PRIVATE

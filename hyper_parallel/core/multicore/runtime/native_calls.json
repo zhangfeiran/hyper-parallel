@@ -73,6 +73,72 @@
         }
       ],
       "family": "gate",
+      "launcher": {
+        "bridge": "npu_extension",
+        "cpp_name": "MegaGateRoute",
+        "native_arguments": [
+          "logits",
+          "text_bias",
+          "vision_bias",
+          "image_mask",
+          "runtime_config",
+          "profile_buffer",
+          "routing_weights",
+          "expert_indices",
+          "route_scores",
+          "selected_scores",
+          "normalization_denominator",
+          "top_k",
+          "routed_scaling_factor",
+          "use_vision_bias"
+        ],
+        "owned_outputs": [
+          {
+            "expression": "at::empty({logits.size(0), top_k}, logits.options())",
+            "name": "routing_weights"
+          },
+          {
+            "expression": "at::empty({logits.size(0), top_k}, logits.options().dtype(at::kLong))",
+            "name": "expert_indices"
+          },
+          {
+            "expression": "at::empty({logits.size(0), logits.size(1)}, logits.options())",
+            "name": "route_scores"
+          },
+          {
+            "expression": "at::empty({logits.size(0), top_k}, logits.options())",
+            "name": "selected_scores"
+          },
+          {
+            "expression": "at::empty({logits.size(0), 1}, logits.options())",
+            "name": "normalization_denominator"
+          }
+        ],
+        "registration": "mega_gate_registration.cpp",
+        "return_arguments": [
+          "routing_weights",
+          "expert_indices",
+          "route_scores",
+          "selected_scores",
+          "normalization_denominator"
+        ],
+        "source": "mega_gate.cpp",
+        "symbol": "aclnnHyperMegaGateRoute",
+        "validation": {
+          "arguments": [
+            "logits",
+            "text_bias",
+            "vision_bias",
+            "image_mask",
+            "runtime_config",
+            "profile_buffer",
+            "top_k",
+            "routed_scaling_factor",
+            "use_vision_bias"
+          ],
+          "function": "CheckRouteInputs"
+        }
+      },
       "returns": [
         "Tensor",
         "Tensor",
@@ -146,6 +212,53 @@
         }
       ],
       "family": "gate",
+      "launcher": {
+        "bridge": "npu_extension",
+        "cpp_name": "MegaGateRouteGrad",
+        "native_arguments": [
+          "logits",
+          "route_scores",
+          "selected_scores",
+          "normalization_denominator",
+          "expert_indices",
+          "grad_routing_weights",
+          "direct_grad_logits",
+          "runtime_config",
+          "profile_buffer",
+          "grad_logits",
+          "top_k",
+          "routed_scaling_factor",
+          "has_direct_grad"
+        ],
+        "owned_outputs": [
+          {
+            "expression": "at::empty_like(logits)",
+            "name": "grad_logits"
+          }
+        ],
+        "registration": "mega_gate_registration.cpp",
+        "return_arguments": [
+          "grad_logits"
+        ],
+        "source": "mega_gate.cpp",
+        "symbol": "aclnnHyperMegaGateRouteGrad",
+        "validation": {
+          "arguments": [
+            "logits",
+            "route_scores",
+            "selected_scores",
+            "normalization_denominator",
+            "expert_indices",
+            "grad_routing_weights",
+            "direct_grad_logits",
+            "runtime_config",
+            "profile_buffer",
+            "top_k",
+            "routed_scaling_factor"
+          ],
+          "function": "CheckRouteGradInputs"
+        }
+      },
       "returns": [
         "Tensor"
       ],
@@ -290,6 +403,57 @@
         }
       ],
       "family": "mhc",
+      "launcher": {
+        "bridge": "npu_extension",
+        "cpp_name": "mega_mhc",
+        "native_arguments": [
+          "previous_output",
+          "residual",
+          "previous_pre_mix",
+          "previous_post_mix",
+          "previous_residual_mix",
+          "phi",
+          "alpha",
+          "bias",
+          "norm_weight",
+          "runtime_config",
+          "all_event_counters",
+          "profile_buffer",
+          "new_residual",
+          "next_pre_mix",
+          "next_post_mix",
+          "next_residual_mix",
+          "block_input",
+          "hc_before_norm",
+          "inv_rms",
+          "sum_out",
+          "norm_out",
+          "mixed_input",
+          "rms_rstd",
+          "hc_eps",
+          "norm_eps",
+          "num_iters",
+          "need_backward"
+        ],
+        "owned_outputs": [],
+        "registration": "registration_mhc.cpp",
+        "return_arguments": [
+          "new_residual",
+          "next_pre_mix",
+          "next_post_mix",
+          "next_residual_mix",
+          "block_input",
+          "hc_before_norm",
+          "inv_rms",
+          "sum_out",
+          "norm_out",
+          "mixed_input",
+          "rms_rstd"
+        ],
+        "source": "mega_mhc.cpp",
+        "symbol": "aclnnHyperMegaMhc",
+        "validation": null
+      },
       "returns": [
         "Tensor",
         "Tensor",
@@ -479,6 +643,62 @@
         }
       ],
       "family": "mhc",
+      "launcher": {
+        "bridge": "npu_extension",
+        "cpp_name": "mega_mhc_grad",
+        "native_arguments": [
+          "grad_hin_placeholder",
+          "grad_h_post",
+          "grad_h_res",
+          "x",
+          "phi",
+          "alpha",
+          "bias",
+          "previous_pre",
+          "hc_before_norm",
+          "inv_rms",
+          "sum_out",
+          "norm_out",
+          "grad_current_pre",
+          "mixed_input",
+          "rms_rstd",
+          "norm_weight",
+          "direct_grad_x",
+          "previous_residual",
+          "previous_output",
+          "previous_post",
+          "previous_residual_mix",
+          "runtime_config",
+          "all_event_counters",
+          "profile_buffer",
+          "grad_residual",
+          "grad_phi",
+          "grad_alpha",
+          "grad_bias",
+          "grad_previous_output",
+          "grad_previous_pre",
+          "grad_previous_post",
+          "grad_previous_residual",
+          "grad_norm_weight",
+          "hc_eps"
+        ],
+        "owned_outputs": [],
+        "registration": "registration_mhc.cpp",
+        "return_arguments": [
+          "grad_residual",
+          "grad_phi",
+          "grad_alpha",
+          "grad_bias",
+          "grad_previous_output",
+          "grad_previous_pre",
+          "grad_previous_post",
+          "grad_previous_residual",
+          "grad_norm_weight"
+        ],
+        "source": "mega_mhc.cpp",
+        "symbol": "aclnnHyperMegaMhcGrad",
+        "validation": null
+      },
       "returns": [
         "Tensor",
         "Tensor",
@@ -636,6 +856,52 @@
         }
       ],
       "family": "moe",
+      "launcher": {
+        "bridge": "cached_op_api",
+        "cpp_name": "mega_moe",
+        "native_arguments": [
+          "dispatch_target",
+          "dispatch_target_off",
+          "dispatch_src",
+          "dispatch_src_off",
+          "dispatch_size",
+          "up_proj_weight",
+          "up_proj_glist",
+          "up_proj_y",
+          "swiglu_out",
+          "down_proj_weight",
+          "down_proj_glist",
+          "down_proj_y",
+          "combine_target",
+          "combine_target_off",
+          "combine_src_off",
+          "combine_size",
+          "gmm_workspace",
+          "up_proj_tiling",
+          "swiglu_tiling",
+          "down_proj_tiling",
+          "runtime_config",
+          "all_event_counters",
+          "profile_buffer",
+          "rank_id",
+          "ep",
+          "expert_num",
+          "hidden_size",
+          "seq_size"
+        ],
+        "owned_outputs": [],
+        "registration": "registration.cpp",
+        "return_arguments": [
+          "dispatch_target",
+          "up_proj_y",
+          "swiglu_out",
+          "down_proj_y",
+          "combine_target"
+        ],
+        "source": "mega_moe.cpp",
+        "symbol": "aclnnHyperMegaMoe",
+        "validation": null
+      },
       "returns": [
         "Tensor",
         "Tensor",
@@ -824,6 +1090,62 @@
         }
       ],
       "family": "moe",
+      "launcher": {
+        "bridge": "cached_op_api",
+        "cpp_name": "mega_moe_grad",
+        "native_arguments": [
+          "dispatch_target",
+          "dispatch_target_off",
+          "dy",
+          "dispatch_src_off",
+          "dispatch_size",
+          "hidden",
+          "hidden_dw",
+          "w2",
+          "act_grad_y",
+          "gate",
+          "grad_gate",
+          "w1",
+          "gate_dx",
+          "grad_x",
+          "combine_target_off",
+          "combine_src_off",
+          "combine_size",
+          "permute_out",
+          "gate_dw",
+          "group_list",
+          "act_grad_tiling",
+          "gate_grad_tiling",
+          "w1_grad_tiling",
+          "w2_grad_tiling",
+          "swiglu_grad_tiling",
+          "gmm_workspace",
+          "swiglu_grad_workspace",
+          "runtime_config",
+          "all_event_counters",
+          "profile_buffer",
+          "rank_id",
+          "ep",
+          "expert_num",
+          "hidden_size",
+          "seq_size"
+        ],
+        "owned_outputs": [],
+        "registration": "registration.cpp",
+        "return_arguments": [
+          "dispatch_target",
+          "hidden_dw",
+          "act_grad_y",
+          "grad_gate",
+          "gate_dx",
+          "grad_x",
+          "permute_out",
+          "gate_dw"
+        ],
+        "source": "mega_moe_grad.cpp",
+        "symbol": "aclnnHyperMegaMoeGrad",
+        "validation": null
+      },
       "returns": [
         "Tensor",
         "Tensor",

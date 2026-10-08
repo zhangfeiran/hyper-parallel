@@ -22,6 +22,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 from dataclasses import fields
 from importlib.metadata import version
 from pathlib import Path
@@ -50,9 +51,17 @@ def _sources():
             if path.is_file():
                 sources[str(path.relative_to(_COMPONENT))] = _hash(path)
     for relative in ("build.sh", "_build/dependencies.lock.json", "_build/write_moe_manifest.py",
-                     "backends/schema.py", "backends/workers.py", "runtime/native_calls.json",
+                     "backends/schema.py", "backends/workers.py", "backends/contexts.py", "backends/launchers.py",
+                     "runtime/native_calls.json",
                      "runtime/worker_calls.json", "_build/assemble_multicore_source.py"):
         sources[relative] = _hash(_COMPONENT / relative)
+    tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    stage = _REPO / "build/native/work/multicore/framework" / tag / "torch-stage"
+    if not (stage / "torch/csrc/generated/launcher_types.hpp").is_file():
+        raise ValueError("Generated MoE adapter sources must be assembled before sealing")
+    for path in sorted(stage.rglob("*")):
+        if path.is_file():
+            sources[f"assembled_torch/{path.relative_to(stage)}"] = _hash(path)
     return sources
 
 

@@ -22,7 +22,7 @@ import re
 import textwrap
 from pathlib import Path
 
-from hyper_parallel.core.multicore.backends import workers
+from hyper_parallel.core.multicore.backends import launchers, workers
 from hyper_parallel.core.multicore.runtime.abi import family_abi
 
 CORE = Path(__file__).resolve().parents[1]
@@ -157,6 +157,7 @@ def generated_files() -> dict[Path, str]:
     files[Path("runtime/generated/native_calls.py")] = python_calls()
     files[Path("ops/runtime/generated/native_calls.hpp")] = cpp_calls()
     files.update(workers.generated_files())
+    files.update(launchers.generated_files())
     return files
 
 

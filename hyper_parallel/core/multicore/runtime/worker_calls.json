@@ -263,7 +263,56 @@
         "rmsRstd",
         "userWorkspace",
         "tiling"
-      ]
+      ],
+      "contexts": {
+        "post": {
+          "method": "ExecuteMhcPost",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "TPipe pipe;\n      MhcPost::MhcPostKernel<DTYPE_RESIDUAL, 1> post(&pipe, &postTiling);\n      post.InitTask(input_list[1], input_list[4], input_list[0], input_list[3], input_list[12], nullptr,\n                    taskDesc.task_index);",
+            "finish": "pipe.Destroy();"
+          }
+        },
+        "norm_cast": {
+          "method": "ExecuteMhcNormCast",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "TPipe pipe;\n      MhcPreSinkhornStage1<DTYPE_RESIDUAL> stage1;\n      stage1.Init(input_list[12], input_list[5], addresses.invRms, addresses.hcBeforeNorm, input_list[WORKSPACE_IDX],\n                  tiling, &pipe);\n      stage1.SetNormCastTaskContext(slotWorkspace, tile.offset, tile.count);",
+            "finish": "pipe.Destroy();"
+          }
+        },
+        "projection": {
+          "method": "ExecuteMhcProjection",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "TPipe pipe;\n      MhcPreSinkhornStage1<DTYPE_RESIDUAL> stage1;\n      stage1.cubeCompute_.mm1_.Init(&tiling->mm1TilingData, &pipe);\n      stage1.cubeCompute_.mm1_.SetSubBlockIdx(0);\n      stage1.Init(input_list[12], input_list[5], addresses.invRms, addresses.hcBeforeNorm, input_list[WORKSPACE_IDX],\n                  tiling, &pipe);",
+            "finish": "pipe.Destroy();"
+          }
+        },
+        "input_mix": {
+          "method": "ExecuteMhcInputMix",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "TPipe pipe;\n      MhcPreSinkhornStage2<DTYPE_RESIDUAL> stage2;\n      stage2.Init(input_list[12], input_list[6], input_list[7], addresses.mixedInput, input_list[14], input_list[15],\n                  input_list[13], addresses.hcBeforeNorm, addresses.invRms, addresses.sumOut, addresses.normOut,\n                  input_list[WORKSPACE_IDX], tiling, &pipe);\n      stage2.SetTaskContext(input_list[2], taskDesc.task_index, taskDesc.task_split_num, taskDesc.task_split_value);",
+            "finish": "pipe.Destroy();"
+          }
+        },
+        "mapping": {
+          "method": "ExecuteMhcMapping",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "TPipe pipe;\n      MhcPreSinkhornStage2<DTYPE_RESIDUAL> stage2;\n      stage2.Init(input_list[12], input_list[6], input_list[7], addresses.mixedInput, input_list[14], input_list[15],\n                  input_list[13], addresses.hcBeforeNorm, addresses.invRms, addresses.sumOut, addresses.normOut,\n                  input_list[WORKSPACE_IDX], tiling, &pipe);\n      stage2.SetTaskContext(input_list[2], taskDesc.task_index, taskDesc.task_split_num, taskDesc.task_split_value);",
+            "finish": "pipe.Destroy();"
+          }
+        },
+        "rms_norm": {
+          "method": "ExecuteRmsNorm",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "RmsNorm::KernelRmsNorm<DTYPE_RESIDUAL, DTYPE_RESIDUAL> rmsNorm;\n      rmsNorm.InitTask(addresses.mixedInput, input_list[8], input_list[16], addresses.rmsRstd, &rmsTiling,\n                       input_list[WORKSPACE_IDX], taskDesc.task_index, taskDesc.task_split_num);"
+          }
+        }
+      }
     },
     "mhc_backward": {
       "family": "mhc",
@@ -349,7 +398,55 @@
         "gradNormWeight",
         "userWorkspace",
         "tiling"
-      ]
+      ],
+      "contexts": {
+        "rms_grad": {
+          "method": "ExecuteRmsNormGrad",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "RmsNormGradSplitNHighPrecision<DTYPE_X, DTYPE_NORM_WEIGHT> rmsGrad;\n      rmsGrad.InitTask(input_list[0] + activationOffset, input_list[13] + activationOffset, input_list[14] + rstdOffset,\n                       input_list[15], addresses.gradHin + activationOffset, input_list[32], &rmsTiling,\n                       input_list[WORKSPACE_IDX]);",
+            "finish": "rmsGrad.DestroyTaskPipe();"
+          }
+        },
+        "prepare": {
+          "method": "ExecuteMhcGradPrevAAndMapping",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "TPipe pipe;\n      MhcPreGradKernel<DTYPE_X, DTYPE_PHI, false> preGrad;\n      InitMhcPreGradTask(preGrad, pipe, tiling, addresses);",
+            "finish": "pipe.Destroy();"
+          }
+        },
+        "pre_init": {
+          "method": "InitMhcPreGradTask",
+          "ownership": "borrowed_pipe_and_instance",
+          "phases": {
+            "init": "preGrad.InitShiftedTask(input_list[3], input_list[4], input_list[7], input_list[12], input_list[29],\n                            addresses.gradHin, input_list[1], input_list[2], input_list[5], input_list[6],\n                            input_list[8], input_list[9], input_list[10], input_list[11], addresses.gradXFromPre,\n                            input_list[25], input_list[26], input_list[27], addresses.gradRsqrt,\n                            input_list[WORKSPACE_IDX], tiling, &pipe);"
+          }
+        },
+        "phi_rms": {
+          "method": "ExecuteMhcPreGrad",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "TPipe pipe;\n    MhcPreGradKernel<DTYPE_X, DTYPE_PHI, false> preGrad;\n    if ASCEND_IS_AIC {\n      preGrad.mm1_.SetSubBlockIdx(0);\n      preGrad.mm1_.Init(&tiling->mm1TilingData, &pipe);\n      preGrad.mm2_.SetSubBlockIdx(0);\n      preGrad.mm2_.Init(&tiling->mm2TilingData, &pipe);\n    }\n    InitMhcPreGradTask(preGrad, pipe, tiling, addresses);",
+            "finish": "pipe.Destroy();"
+          }
+        },
+        "prev_x_pre": {
+          "method": "ExecuteMhcGradPrevXAndPost",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "TPipe pipe;\n\n      MhcPreGradKernel<DTYPE_X, DTYPE_PHI, false> preGrad;\n      InitMhcPreGradTask(preGrad, pipe, tiling, addresses);"
+          }
+        },
+        "prev_x_post": {
+          "method": "ExecuteMhcGradPrevXAndPost",
+          "ownership": "callback_local",
+          "phases": {
+            "init": "KernelMhcPostBackward<DTYPE_X> postGrad;\n      postGrad.InitAddTask(addresses.gradXFromPre, input_list[16], input_list[17], input_list[20], input_list[18],\n                           input_list[19], input_list[24], input_list[31], input_list[28], input_list[30], postTiling,\n                           &pipe, tile.offset, tile.count);",
+            "finish": "pipe.Destroy();"
+          }
+        }
+      }
     },
     "moe_forward": {
       "family": "moe",

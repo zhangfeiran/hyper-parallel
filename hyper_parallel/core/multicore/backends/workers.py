@@ -20,6 +20,7 @@ import json
 import re
 from pathlib import Path
 
+from hyper_parallel.core.multicore.backends import contexts
 from hyper_parallel.core.multicore.runtime.abi import family_abi
 
 CORE = Path(__file__).resolve().parents[1]
@@ -127,11 +128,13 @@ def _fragments(worker):
 
 def generated_files() -> dict[Path, str]:
     """Emit deterministic fragments included directly by existing native worker classes."""
-    return {
+    files = {
         Path(f"ops/runtime/generated/{name}_{kind}.inc"): _HEADER + text
         for name, worker in _contracts().items()
         for kind, text in _fragments(worker).items()
     }
+    files.update(contexts.generated_files())
+    return files
 
 
 def _tokens(text):
@@ -226,7 +229,7 @@ def install_worker_glue(operator: Path, family: str, direction: str) -> None:
         if relative.name.startswith(name + "_"):
             (runtime / relative.name).write_text(content)
     path = kernel / Path(worker["source"]).name
-    path.write_text(adapt_native_worker(path.read_text(), name))
+    path.write_text(contexts.adapt_contexts(adapt_native_worker(path.read_text(), name), name))
     if worker["mode"] == "task_dag":
         path = kernel / Path(worker["entry_source"]).name
         path.write_text(adapt_native_entry(path.read_text(), name))

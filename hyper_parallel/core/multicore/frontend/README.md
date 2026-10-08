@@ -471,9 +471,9 @@ order and const/mutable ownership; existing native Torch adapters still enqueue
 the family operators.
 
 This delivers the first P5 increment. Worker dispatch and address-table generation
-are described below. Native context initialization factories, replacement of family
-native host adapters, general buffer planning and compiled binary/materialized-device
-caches remain subsequent work. New arbitrary primitive
+are described below. Later sections cover numerical launcher and MHC context generation. General
+context factories, lower-level CANN host generation, general buffer planning and
+compiled binary/materialized-device caches remain subsequent work. New arbitrary primitive
 combinations still need supported numerical implementations and lowering recipes.
 
 ## P5 generated native worker glue
@@ -507,3 +507,39 @@ originals, exercising valid/unknown tasks and stage IDs, and execute all four
 TaskDAG address tables with distinct addresses. Drift tests reject changed native
 callbacks, slot constants, context members and input mappings. Device acceptance
 uses rebuilt payloads for Gate/MHC/MoE and the existing numerical/lifecycle gates.
+
+## P5 generated launchers and MHC contexts
+
+The shared `native_calls.json` also defines each numerical entry's native symbol,
+bridge choice, owned outputs, returned argument aliases and complete ACLNN argument
+order. `backends.launchers` generates all six NPU/Meta definitions and numerical
+dispatcher schemas. An independent snapshot admits the original C++ parameter
+types/mutation, bridge argument order, return order and registered schema before
+replacement. Other operator registrations and public model interfaces are retained.
+
+Gate keeps its original input validation helpers and allocates its five forward
+outputs or single gradient output from the declared shape/dtype recipes. MHC/MoE
+return their original caller-owned Tensor references. Native enqueue and workspace
+allocation stay on the selected existing extension or cached-op-api bridge.
+
+Builders compile generated definitions from isolated adapter source copies.
+Gate/MHC seal those actual copied/adapted sources; MoE also seals the staged Torch
+adapter and hardening sources. `Program.compile()` includes launcher sources, the
+shared return-type header and a launcher ownership manifest in its source bundle.
+
+For MHC, twelve fixed context recipes generate local constructor/Init blocks and
+explicit cleanup fragments, including the borrowed backward pre-gradient Init
+helper. Their original scope, guards, numerical Process calls, synchronization,
+pipe Reset and Destroy order are preserved and checked against independent source
+tokens. Gate/MoE keep their existing primitive-local setup recipes.
+
+CPU acceptance compiles the generated entries with real Torch headers, registers
+them in a fresh real dispatcher and executes all six Meta operators. Only the
+device enqueue bridge is stubbed for this test; it must receive no calls. The
+test checks actual returned aliases, Gate shapes/dtypes and invalid-input rejection.
+Device acceptance uses the rebuilt native adapters and existing component gates.
+
+This completes shared generation of the numerical Torch launcher definitions for
+the three supported families. General selectable primitive context factories,
+Gate/MoE setup generation, lower-level CANN host/tiling generation, general buffer
+planning and binary/materialized-device caches remain subsequent increments.

@@ -460,6 +460,7 @@ function calculate_vendor_fingerprint() {
                 hyper_parallel/core/multicore/_build/assemble_multicore_source.py \
                 hyper_parallel/core/multicore/_build/merge_multicore_vendors.py \
                 hyper_parallel/core/multicore/backends/workers.py \
+                hyper_parallel/core/multicore/backends/contexts.py \
                 hyper_parallel/core/multicore/runtime/worker_calls.json \
                 hyper_parallel/core/multicore/cmake/hardening.cmake \
                 hyper_parallel/core/multicore/shmem/_build/shmem_sdk.sh
@@ -567,7 +568,14 @@ export HP_MULTICORE_VENDOR_ROOT="${VENDOR_ROOT}"
 export CANN_VENDOR_LIBDIR="${VENDOR_ROOT}/op_api/lib"
 BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 CURRENT_REASON_CODE="TORCH_ADAPTER_BUILD_FAILED"
-TORCH_SOURCE="${PROJECT_ROOT}/hyper_parallel/core/multicore/torch"
+TORCH_SOURCE="${FRAMEWORK_WORK_ROOT}/torch-stage/torch"
+rm -rf "${FRAMEWORK_WORK_ROOT}/torch-stage"
+mkdir -p "${FRAMEWORK_WORK_ROOT}/torch-stage/cmake"
+cp "${PROJECT_ROOT}/hyper_parallel/core/multicore/cmake/hardening.cmake" \
+    "${FRAMEWORK_WORK_ROOT}/torch-stage/cmake/hardening.cmake"
+cp -a "${PROJECT_ROOT}/hyper_parallel/core/multicore/torch" "${TORCH_SOURCE}"
+"${PYTHON_BIN}" -m hyper_parallel.core.multicore.backends.launchers \
+    --install-root "${TORCH_SOURCE}/csrc" --family moe
 TORCH_CACHE_KEY=$("${PYTHON_BIN}" -c '
 import hashlib
 from importlib.metadata import version
