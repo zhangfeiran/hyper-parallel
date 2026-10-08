@@ -33,16 +33,21 @@ void check_states(const at::Tensor& query, const at::Tensor& key, const at::Tens
               "mixed LI weights must be BF16 or FP32 [T,64]");
 }
 
+void check_trace(const at::Tensor& config, const at::Tensor& trace, int64_t phase) {
+  TORCH_CHECK(config.sizes() == at::IntArrayRef({4}) && config.scalar_type() == at::kLong &&
+              ((phase == 2 && trace.sizes() == at::IntArrayRef({2, 20, 64})) ||
+               (phase != 2 && trace.sizes() == at::IntArrayRef({20, 64}))) && trace.scalar_type() == at::kLong,
+              "mixed LI expects int64 config[4] and trace[20,64], or fused trace[2,20,64]");
+}
+
 void check_runtime(const at::Tensor& query, const at::Tensor& actualQuery, const at::Tensor& actualKv,
                    const at::Tensor& config, const at::Tensor& trace, const at::Tensor& retained,
-                   const at::Tensor& indices, const at::Tensor& values) {
+                   const at::Tensor& indices, const at::Tensor& values, int64_t phase) {
   const auto tokens = query.size(0);
   TORCH_CHECK(actualQuery.dim() == 1 && actualQuery.numel() > 0 && actualKv.sizes() == actualQuery.sizes() &&
               actualQuery.scalar_type() == at::kInt && actualKv.scalar_type() == at::kInt,
               "mixed LI cumulative lengths must be nonempty int32 vectors of equal size");
-  TORCH_CHECK(config.sizes() == at::IntArrayRef({4}) && config.scalar_type() == at::kLong &&
-              trace.sizes() == at::IntArrayRef({20, 64}) && trace.scalar_type() == at::kLong,
-              "mixed LI expects int64 config[4] and trace[20,64]");
+  check_trace(config, trace, phase);
   TORCH_CHECK(retained.dim() == 1 && retained.numel() >= kRetainedBytes && retained.scalar_type() == at::kByte,
               "mixed LI retained uint8 workspace requires at least 47226880 bytes");
   TORCH_CHECK(indices.sizes() == at::IntArrayRef({tokens, 1, 2048}) && indices.scalar_type() == at::kInt &&
@@ -62,8 +67,8 @@ Result dsa_mixed_indexer_npu(
     TORCH_CHECK(!tensor->requires_grad(), "mixed LI probe has no backward; detach inputs explicitly");
   }
   check_states(query, key, weights);
-  check_runtime(query, actualQuery, actualKv, config, trace, retained, indices, values);
-  TORCH_CHECK(mergePhase == 0 || mergePhase == 1, "mixed LI phase must be main=0 or merge=1");
+  check_runtime(query, actualQuery, actualKv, config, trace, retained, indices, values, mergePhase);
+  TORCH_CHECK(mergePhase >= 0 && mergePhase <= 2, "mixed LI phase must be main=0, merge=1 or fused=2");
   for (const auto* output : {&trace, &retained, &indices, &values}) {
     for (const auto* tensor : tensors) {
       TORCH_CHECK(output == tensor || !output->is_alias_of(*tensor),

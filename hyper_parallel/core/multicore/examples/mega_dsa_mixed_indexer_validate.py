@@ -28,6 +28,8 @@ from hyper_parallel.core.multicore.modules.mega_dsa.cann_reference import CannDs
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_indexer import (
     mixed_indexer_forward_probe,
+    mixed_indexer_fused_forward_probe,
+    validate_fused_indexer_traces,
     validate_mixed_indexer_traces,
 )
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import (
@@ -96,17 +98,19 @@ def _analytic(raw: torch.Tensor, meta: DsaBatchMeta, case: str) -> bool | None:
 
 
 def _run_case(meta: DsaBatchMeta, layout: CannDsaLayout, states: tuple,
-              schedule: MixedSfaSchedule, baseline: tuple, case: str) -> dict:
+              schedule: MixedSfaSchedule, baseline: tuple, case: str, fused: bool) -> dict:
     # Repeating complete pairs tests scratch reuse without destroying live merge state.
     retained = None
     repeats = []
+    forward = mixed_indexer_fused_forward_probe if fused else mixed_indexer_forward_probe
+    validate = validate_fused_indexer_traces if fused else validate_mixed_indexer_traces
     for repeat in range(3):
-        indices, values, traces, retained = mixed_indexer_forward_probe(
+        indices, values, traces, retained = forward(
             *states, layout.length_tensor, schedule, retained)
         torch.npu.synchronize()
         snapshots = tuple(trace.cpu() for trace in traces)
         lengths = tuple(end - start for start, end in zip(meta.global_cu_seqlens, meta.global_cu_seqlens[1:]))
-        evidence = validate_mixed_indexer_traces(snapshots, schedule, require_ld=max(lengths) > _K)
+        evidence = validate(snapshots, schedule, require_ld=max(lengths) > _K)
         actual = (indices.cpu(), values.cpu())
         torch.testing.assert_close(actual[0], baseline[0], rtol=0, atol=0)
         torch.testing.assert_close(actual[1], baseline[1], rtol=0, atol=0)
@@ -116,10 +120,10 @@ def _run_case(meta: DsaBatchMeta, layout: CannDsaLayout, states: tuple,
                         "stock_values_storage_bits_equal": True,
                         "raw_contract": _contract(actual[0], meta),
                         "analytic_all_row_winners": _analytic(actual[0], meta, case)})
-    return {"groups": schedule.compute_groups, "repeats": repeats}
+    return {"groups": schedule.compute_groups, "device_phase_closure": fused, "repeats": repeats}
 
 
-def run_validation(report: dict, *, long_history: bool) -> None:
+def run_validation(report: dict, *, long_history: bool, fused: bool = False) -> None:
     """Require stock bitwise parity and all-row legal Top-K across group schedules."""
     torch.npu.set_device(0)
     device = torch.device("npu:0")
@@ -142,7 +146,7 @@ def run_validation(report: dict, *, long_history: bool) -> None:
         baseline = tuple(tensor.cpu() for tensor in baseline)
         for groups in (1, 2, 7, 19):
             report["stage"] = {"lengths": lengths, "case": case, "groups": groups}
-            result = _run_case(meta, layout, states, MixedSfaSchedule(groups), baseline, case)
+            result = _run_case(meta, layout, states, MixedSfaSchedule(groups), baseline, case, fused)
             result.update(lengths=lengths, fixture=case)
             report["cases"].append(result)
     report.update(status="passed", stage="complete", case_count=len(report["cases"]))
@@ -153,11 +157,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--long-history", action="store_true")
+    parser.add_argument("--fused", action="store_true")
     args = parser.parse_args()
-    report = {"status": "running", "scope": "CP1 two-phase mixed LI forward probe",
+    report = {"status": "running", "scope": "CP1 mixed LI forward probe", "device_phase_closure": args.fused,
               "backward": False, "communication_progress": False, "performance_measurement": False}
     try:
-        run_validation(report, long_history=args.long_history)
+        run_validation(report, long_history=args.long_history, fused=args.fused)
     except Exception as error:
         report.update(status="error", error=repr(error), traceback=traceback.format_exc())
         raise

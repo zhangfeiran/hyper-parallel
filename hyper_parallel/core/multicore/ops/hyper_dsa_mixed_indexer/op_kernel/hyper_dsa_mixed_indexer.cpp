@@ -34,10 +34,66 @@ using AscendC::TPipe;
 using namespace DsaMixed;  // NOLINT(build/namespaces)
 
 namespace {
+__aicore__ inline uint32_t PhysicalGroup() {
+  uint32_t group = GetBlockIdx();
+  if ASCEND_IS_AIV {
+    group /= 2;
+  }
+  return group;
+}
+
 __aicore__ inline bool ValidConfig(GlobalTensor<int64_t> &config, uint32_t groups, uint32_t physicalCount) {
   return config.GetValue(0) == kMixedMagic && config.GetValue(1) == 1 &&
          groups > 0 && groups < physicalCount && config.GetValue(3) == 1;
 }
+template<typename TileType>
+__aicore__ inline void RunPhase(
+    __gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
+    __gm__ uint8_t *actualQuery, __gm__ uint8_t *actualKv, __gm__ uint8_t *blockTable,
+    __gm__ uint8_t *indices, __gm__ uint8_t *values, __gm__ uint8_t *retained, const LITilingData *data,
+    GlobalTensor<int64_t> &trace, uint32_t group, uint32_t groups, uint32_t physicalCount, bool mergePhase) {
+  uint32_t count = 0;
+  uint32_t checksum = 0;
+  uint32_t ldCount = 0;
+  for (uint32_t logical = group; logical < physicalCount; logical += groups) {
+    const uint32_t ticket = Dispatch(trace, group * kGroupWords, logical);
+    {
+      TPipe pipe;
+      LIKernel::LightningIndexerKernel<TileType> tile;
+      tile.Init(query, key, weights, actualQuery, actualKv, blockTable, indices, values,
+                retained, data, &pipe, ticket, physicalCount, group, physicalCount, mergePhase);
+      ldCount += tile.IsLdPartition() ? 1 : 0;
+      tile.ProcessPhase(mergePhase);
+    }
+    ++count;
+    checksum += ticket + 1;
+    uint32_t member = 0;
+    if ASCEND_IS_AIV {
+      member = 1 + GetSubBlockIdx();
+    }
+    trace.SetValue(group * kGroupWords + member * kMemberWords + 4, ldCount);
+    Complete(trace, group * kGroupWords, count, checksum, ticket);
+  }
+}
+
+__aicore__ inline void ClosePhase(GlobalTensor<int64_t> &trace, uint32_t groups, int64_t epoch) {
+  // Keep the complete reserved mixed team resident until its progress vector releases the phase.
+  TPipe pipe;
+  uint32_t member = 0;
+  if ASCEND_IS_AIV {
+    member = 1 + GetSubBlockIdx();
+    if (GetSubBlockIdx() == 0) {
+      CoordinatePhase(trace, groups, epoch);
+    } else {
+      WaitPhase(trace, groups, epoch);
+    }
+  } else {
+    WaitPhase(trace, groups, epoch);
+  }
+  const uint32_t offset = groups * kGroupWords + member * kMemberWords;
+  PublishControl(trace, offset + kArrivalWord, epoch);
+}
+
 }  // namespace
 
 
@@ -59,39 +115,28 @@ __global__ __aicore__ void hyper_dsa_mixed_indexer(
   if (!ValidConfig(config, groups, physicalCount)) {
     return;
   }
-  uint32_t group = GetBlockIdx();
-  if ASCEND_IS_AIV {
-    group /= 2;
-  }
-  if (group >= groups) {
+  const uint32_t group = PhysicalGroup();
+  GET_TILING_DATA_WITH_STRUCT(LITilingData, tilingData, tiling);
+  const bool fused = tilingData.mergePhase == 2;
+  if (group > groups || (group == groups && !fused)) {
     return;
   }
-  GlobalTensor<int64_t> trace;
-  trace.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(groupTrace), physicalCount * kGroupWords);
-  GET_TILING_DATA_WITH_STRUCT(LITilingData, tilingData, tiling);
-  const bool mergePhase = tilingData.mergePhase != 0;
-  uint32_t count = 0;
-  uint32_t checksum = 0;
-  uint32_t ldCount = 0;
-  for (uint32_t logical = group; logical < physicalCount; logical += groups) {
-    const uint32_t ticket = Dispatch(trace, group * kGroupWords, logical);
-    {
-      TPipe pipe;
-      using TileType = LICommon::LIType<bfloat16_t, bfloat16_t, int32_t, false,
-          LICommon::LI_LAYOUT::TND, LICommon::LI_LAYOUT::TND, DT_W_FLAG>;
-      LIKernel::LightningIndexerKernel<TileType> tile;
-      tile.Init(query, key, weights, actualQuery, actualKv, blockTable, indices, values,
-                retained, &tilingData, &pipe, ticket, physicalCount, group, physicalCount, mergePhase);
-      ldCount += tile.IsLdPartition() ? 1 : 0;
-      tile.ProcessPhase(mergePhase);
+  const uint32_t phases = fused ? 2 : 1;
+  for (uint32_t phase = 0; phase < phases; ++phase) {
+    GlobalTensor<int64_t> trace;
+    auto *phaseTrace = reinterpret_cast<__gm__ int64_t *>(groupTrace) + phase * physicalCount * kGroupWords;
+    trace.SetGlobalBuffer(phaseTrace, physicalCount * kGroupWords);
+    if (group == groups) {
+      ClosePhase(trace, groups, phase + 1);
+      continue;
     }
-    ++count;
-    checksum += ticket + 1;
-    uint32_t member = 0;
-    if ASCEND_IS_AIV {
-      member = 1 + GetSubBlockIdx();
+    const bool mergePhase = fused ? phase == 1 : tilingData.mergePhase != 0;
+    using TileType = LICommon::LIType<bfloat16_t, bfloat16_t, int32_t, false,
+        LICommon::LI_LAYOUT::TND, LICommon::LI_LAYOUT::TND, DT_W_FLAG>;
+    RunPhase<TileType>(query, key, weights, actualQuery, actualKv, blockTable, indices, values,
+                       retained, &tilingData, trace, group, groups, physicalCount, mergePhase);
+    if (fused) {
+      ArriveAndWait(trace, group, groups, phase + 1);
     }
-    trace.SetValue(group * kGroupWords + member * kMemberWords + 4, ldCount);
-    Complete(trace, group * kGroupWords, count, checksum, ticket);
   }
 }

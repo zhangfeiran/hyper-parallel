@@ -98,3 +98,88 @@ class TestMixedIndexerProbe(unittest.TestCase):
         missing[0, [4, 20, 36]] = 0
         with self.assertRaisesRegex(ValueError, "did not execute"):
             mixed_indexer.validate_mixed_indexer_traces((missing, missing.clone()), schedule, require_ld=True)
+
+
+class TestFusedIndexerProbe(unittest.TestCase):
+    """Check ABI admission, owned phase records and independent progress evidence."""
+
+    @staticmethod
+    def _traces(schedule):
+        traces = []
+        for epoch in (1, 2):
+            trace = torch.zeros(20, 64, dtype=torch.int64)
+            for group in range(schedule.compute_groups):
+                tasks = tuple(range(group, 20, schedule.compute_groups))
+                trace[group, 0] = tasks[-1]
+                for offset in (0, 16, 32):
+                    trace[group, offset + 1:offset + 5] = torch.tensor(
+                        [len(tasks), sum(task + 1 for task in tasks), tasks[-1], 1])
+                    trace[group, offset + 6] = epoch
+            trace[schedule.compute_groups, [6, 21, 22, 24, 38]] = epoch
+            trace[schedule.compute_groups, 25] = 3 * schedule.compute_groups
+            traces.append(trace)
+        return tuple(traces)
+
+    def test_arrival_and_reserved_release_are_required(self):
+        """Reject incomplete arrivals, false release counts and additional idle-group work."""
+        schedule = MixedSfaSchedule(7)
+        traces = self._traces(schedule)
+        original = tuple(trace.clone() for trace in traces)
+        evidence = mixed_indexer.validate_fused_indexer_traces(traces, schedule, require_ld=True)
+        self.assertEqual(evidence["progress_group"], 7)
+        self.assertEqual(evidence["arrivals_per_phase"], 21)
+        for actual, expected in zip(traces, original):
+            torch.testing.assert_close(actual, expected)
+        for phase, row, word, value in ((0, 3, 22, 0), (1, 7, 24, 1), (0, 7, 25, 20),
+                                        (1, 7, 38, 0), (1, 7, 0, 3), (0, 8, 1, 1)):
+            broken = tuple(trace.clone() for trace in traces)
+            broken[phase][row, word] = value
+            with self.subTest(phase=phase, row=row, word=word), self.assertRaises(ValueError):
+                mixed_indexer.validate_fused_indexer_traces(broken, schedule, require_ld=True)
+
+    def test_old_payload_is_rejected_before_allocation(self):
+        """Phase 2 must never reach a payload that only implements host phase closure."""
+        with patch.object(mixed_indexer, "_load_native"), \
+                patch.object(torch.ops.hyper_parallel, "dsa_mixed_indexer_version", return_value=1, create=True), \
+                patch.object(torch.ops.hyper_parallel, "dsa_mixed_indexer_out", create=True) as launch:
+            with self.assertRaisesRegex(RuntimeError, "ABI 2"):
+                mixed_indexer.mixed_indexer_fused_forward_probe(None, None, None, None, MixedSfaSchedule(1))
+            launch.assert_not_called()
+
+    def test_single_launch_reuse_has_fresh_phase_records(self):
+        """Reuse only retained scratch; each invocation starts with independent zeroed arrivals."""
+        query = torch.empty(1, 64, 128, dtype=torch.bfloat16)
+        retained = torch.empty(64, dtype=torch.uint8)
+        observed = []
+
+        def _execute(*args):
+            trace, scratch, phase = args[-5], args[-4], args[-3]
+            indices, values = args[-2], args[-1]
+            self.assertIs(scratch, retained)
+            self.assertEqual(phase, 2)
+            self.assertEqual(trace.shape, (2, 20, 64))
+            self.assertFalse(bool(trace.any()))
+            trace.fill_(17)
+            indices.fill_(0)
+            values.fill_(3)
+            observed.append(trace)
+
+        with patch.object(mixed_indexer, "_load_native"), \
+                patch.object(torch.ops.hyper_parallel, "dsa_mixed_indexer_version", return_value=2, create=True), \
+                patch.object(torch.ops.hyper_parallel, "dsa_mixed_indexer_out", side_effect=_execute,
+                             create=True) as op:
+            first = mixed_indexer.mixed_indexer_fused_forward_probe(query, None, None, None,
+                                                                  MixedSfaSchedule(1), retained)
+            second = mixed_indexer.mixed_indexer_fused_forward_probe(query, None, None, None,
+                                                                   MixedSfaSchedule(19), retained)
+        self.assertEqual(op.call_count, 2)
+        self.assertNotEqual(observed[0].data_ptr(), observed[1].data_ptr())
+        self.assertNotEqual(first[0].data_ptr(), second[0].data_ptr())
+        self.assertEqual(first[2][1][0, 0].item(), 17)
+
+    def test_fused_repeats_reject_before_native(self):
+        """Retained partials require a fresh complete invocation per traversal."""
+        with patch.object(mixed_indexer, "_load_native") as load:
+            with self.assertRaisesRegex(ValueError, "complete invocations"):
+                mixed_indexer.mixed_indexer_fused_forward_probe(None, None, None, None, MixedSfaSchedule(1, 2))
+            load.assert_not_called()

@@ -264,7 +264,7 @@
  struct LICompileInfo {};
 --- a/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
 +++ b/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
-@@ -979,12 +979,31 @@
+@@ -979,12 +979,32 @@
      uint32_t aivNum = ascendcPlatform.GetCoreNumAiv();
      uint32_t aicNum = ascendcPlatform.GetCoreNumAic();
      uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(aivNum, aicNum, aivNum);
@@ -276,8 +276,9 @@
 +        tilingInfo->inputQLayout != DataLayout::TND || tilingInfo->inputKLayout != DataLayout::TND ||
 +        tilingInfo->sparseCount != 2048 || tilingInfo->sparseMode != 3 || tilingInfo->gSize != 64 ||
 +        config == nullptr || config->GetStorageShape().GetShapeSize() != 4 ||
-+        trace == nullptr || trace->GetStorageShape().GetShapeSize() != 1280 || retained == nullptr ||
-+        phase == nullptr || (*phase != 0 && *phase != 1)) {
++        trace == nullptr ||
++        trace->GetStorageShape().GetShapeSize() != (phase != nullptr && *phase == 2 ? 2560 : 1280) || retained == nullptr ||
++        phase == nullptr || (*phase < 0 || *phase > 2)) {
 +        OP_LOGE(context_->GetNodeName(),
 +                "Mixed LI requires 20/40 cores, BF16 TND H64/K2048 and valid runtime metadata");
 +        return ge::GRAPH_FAILED;
@@ -298,7 +299,7 @@
  
      // -------------set tilingdata-----------------
      tilingData_.set_bSize(tilingInfo->bSize);
-@@ -998,6 +1017,7 @@
+@@ -998,6 +1018,7 @@
      tilingData_.set_preTokens(tilingInfo->preTokens);
      tilingData_.set_nextTokens(tilingInfo->nextTokens);
      tilingData_.set_returnValue(tilingInfo->returnValue);
@@ -306,7 +307,7 @@
      tilingData_.set_usedCoreNum(blockDim);
      tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
      context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
-@@ -1035,7 +1055,7 @@
+@@ -1035,7 +1056,7 @@
  }
  
  // --------------------------Tiling函数及TilingPrepare函数注册--------

@@ -24,6 +24,8 @@ constexpr uint32_t kDispatchFlag = 13;
 constexpr uint32_t kCompleteFlag = 14;
 constexpr uint32_t kGroupWords = 64;
 constexpr uint32_t kMemberWords = 16;
+constexpr uint32_t kArrivalWord = 6;
+constexpr uint32_t kReleaseWord = kMemberWords + 8;
 
 __aicore__ inline void FlushLine(GlobalTensor<int64_t> &tensor, uint32_t offset) {
   DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(tensor[offset]);
@@ -64,6 +66,54 @@ __aicore__ inline void Complete(GlobalTensor<int64_t> &trace, uint32_t row,
   } else {
     CrossCoreWaitFlag(kCompleteFlag);
   }
+}
+
+__aicore__ inline int64_t ReadVisible(GlobalTensor<int64_t> &trace, uint32_t offset) {
+  FlushLine(trace, offset);
+  PipeBarrier<PIPE_ALL>();
+  volatile __gm__ int64_t *address = trace.GetPhyAddr(offset);
+  return *address;
+}
+
+__aicore__ inline void PublishControl(GlobalTensor<int64_t> &trace, uint32_t offset, int64_t value) {
+  // Other physical groups observe this store inside the same kernel, before kernel completion.
+  volatile __gm__ int64_t *address = trace.GetPhyAddr(offset);
+  *address = value;
+  FlushLine(trace, offset);
+  PipeBarrier<PIPE_ALL>();
+}
+
+// A reserved vector remains runnable while every compute member waits for phase closure.
+__aicore__ inline void CoordinatePhase(GlobalTensor<int64_t> &trace, uint32_t groups, int64_t epoch) {
+  const uint32_t row = groups * kGroupWords + kMemberWords;
+  PublishControl(trace, row + 5, epoch);
+  for (uint32_t group = 0; group < groups; ++group) {
+    for (uint32_t member = 0; member < 3; ++member) {
+      const uint32_t offset = group * kGroupWords + member * kMemberWords + kArrivalWord;
+      while (ReadVisible(trace, offset) != epoch) {}
+    }
+  }
+  PublishControl(trace, row + 9, groups * 3);
+  PublishControl(trace, row + 8, epoch);
+}
+
+__aicore__ inline void WaitPhase(GlobalTensor<int64_t> &trace, uint32_t groups, int64_t epoch) {
+  const uint32_t release = groups * kGroupWords + kReleaseWord;
+  while (ReadVisible(trace, release) != epoch) {}
+  PipeBarrier<PIPE_ALL>();
+}
+
+__aicore__ inline void ArriveAndWait(GlobalTensor<int64_t> &trace, uint32_t group,
+                                    uint32_t groups, int64_t epoch) {
+  uint32_t member = 0;
+  if ASCEND_IS_AIV {
+    member = 1 + GetSubBlockIdx();
+  }
+  // Complete every tile's DMA before announcing that its retained partials can be consumed.
+  PipeBarrier<PIPE_ALL>();
+  const uint32_t offset = group * kGroupWords + member * kMemberWords + kArrivalWord;
+  PublishControl(trace, offset, epoch);
+  WaitPhase(trace, groups, epoch);
 }
 }  // namespace DsaMixed
 #endif  // HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_DSA_MIXED_GROUP_H_

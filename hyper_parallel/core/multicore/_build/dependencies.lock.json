@@ -68,7 +68,7 @@
           },
           {
             "path": "hyper_parallel/core/multicore/ops/lightning_indexer_mixed.patch",
-            "sha256": "be66db007e38bab84f128b4a6ddbfffc5e96d4e077a69e2f5506ff15e34f5ae8",
+            "sha256": "844cfa49e53fbbb151836cf0f61afafe1abc8f3efe3d94ed40fc4de7aa9e102d",
             "purpose": "retain logical LI partial Top-K across reusable mixed groups and separate main/LD merge kernel phases"
           },
           {

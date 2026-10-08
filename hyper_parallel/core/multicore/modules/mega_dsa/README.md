@@ -813,3 +813,37 @@ history must execute at least one LD merge. There is no relaxed tie threshold.
 P2 still requires complete backward, alternating callable task types and
 communication pressure validation. CP fused execution and full training
 acceptance remain separate from this single-card forward probe.
+
+### LI device phase closure
+
+The ABI 2 [fused LI probe](mixed_indexer.py) runs main and LD merge in one
+native launch. Each compute group's Cube and both Vectors complete their DMA
+and publish an arrival in their own cache line. One Vector in the immediately
+following reserved group polls all arrivals and publishes the phase release.
+Merge consumes the retained logical partials only after this release. The
+reserved group's Cube and second Vector wait for release, keeping the full
+mixed team resident through phase closure; other reserved groups remain
+idle. Release belongs to the progress Vector's own cache line. This provides
+a device completion boundary for a future LI→SFA
+task chain. It does not transfer data between ranks.
+
+Each invocation owns freshly zeroed int64 phase records `[2,20,64]`, even
+when its retained scratch is reused. Main uses epoch 1 and merge epoch 2 in
+separate records; no persistent event array is reused across invocations.
+The validator requires all three members' arrival, the progress Vector's
+exact release epoch and arrival count, its entry and all reserved members'
+exit records, the existing task/LD evidence, and
+zero compute evidence from every other reserved group. Old payloads reject
+the fused probe before allocation. The existing two-launch probe accepts
+ABI 1 or 2 and remains the host reference path.
+
+```bash
+python -m hyper_parallel.core.multicore.examples.mega_dsa_mixed_indexer_validate \
+  --output fused_li_report.json --long-history --fused
+```
+
+This runs the same stock bitwise, signed-weight, tie, all-row contract and
+long-history LD checks as the two-launch validator, across 1/2/7/19 groups
+and three complete invocations with serial scratch reuse. LI→SFA task
+alternation, communication pressure, fused backward and multi-card CP remain
+separate validation gates.

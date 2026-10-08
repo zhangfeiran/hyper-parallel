@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Experimental two-phase LI with retained logical partials and no autograd."""
+"""Experimental LI with retained logical partials and host or device phase closure."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def mixed_indexer_forward_probe(query: torch.Tensor, key: torch.Tensor, weights:
     if schedule.rounds != 1:
         raise ValueError("mixed LI requires rounds=1; repeat complete main/merge pairs instead")
     _load_native()
-    if torch.ops.hyper_parallel.dsa_mixed_indexer_version() != 1:
+    if torch.ops.hyper_parallel.dsa_mixed_indexer_version() not in (1, 2):
         raise RuntimeError("mixed LI adapter ABI mismatch; rebuild this checkout's payload")
     device = query.device
     if retained is None:
@@ -106,3 +106,64 @@ def mixed_indexer_forward_probe(query: torch.Tensor, key: torch.Tensor, weights:
             query, key, weights, cumulative_lengths, cumulative_lengths,
             config, trace, retained, phase, indices, values)
     return indices, values, traces, retained
+
+
+def mixed_indexer_fused_forward_probe(query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor,
+                                      cumulative_lengths: torch.Tensor, schedule: MixedSfaSchedule,
+                                      retained: torch.Tensor | None = None) -> tuple:
+    """Run main and LD merge in one launch with a reserved vector coordinating phase closure.
+
+    Inputs and retained scratch follow ``mixed_indexer_forward_probe``. All
+    compute members publish arrival after completing their DMA; the reserved
+    vector releases merge only after every arrival is visible. Each invocation
+    starts with fresh zeroed phase records, including when scratch is reused.
+    This CP1 indexer probe has no autograd or SHMEM communication.
+
+    Returns:
+        Indices, BF16 values, two views of the owned phase trace and retained
+        scratch. Native ABI version 2 is required before any allocation.
+    """
+    if schedule.rounds != 1:
+        raise ValueError("fused LI requires rounds=1; repeat complete invocations instead")
+    _load_native()
+    if torch.ops.hyper_parallel.dsa_mixed_indexer_version() != 2:
+        raise RuntimeError("fused LI requires adapter ABI 2; rebuild this checkout's payload")
+    device = query.device
+    if retained is None:
+        retained = torch.empty(MIXED_INDEXER_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+    config = schedule.runtime_config(device)
+    trace = torch.zeros((2, 20, 64), dtype=torch.int64, device=device)
+    shape = (query.shape[0], 1, 2048)
+    indices = torch.full(shape, -2, dtype=torch.int32, device=device)
+    values = torch.full(shape, float("nan"), dtype=torch.bfloat16, device=device)
+    torch.ops.hyper_parallel.dsa_mixed_indexer_out(
+        query, key, weights, cumulative_lengths, cumulative_lengths,
+        config, trace, retained, 2, indices, values)
+    return indices, values, tuple(trace.unbind()), retained
+
+
+def validate_fused_indexer_traces(traces: tuple[torch.Tensor, torch.Tensor],
+                                 schedule: MixedSfaSchedule, *, require_ld: bool) -> dict:
+    """Require every compute arrival and the reserved vector's release in both CPU snapshots."""
+    if len(traces) != 2 or schedule.rounds != 1:
+        raise ValueError("fused LI evidence requires two phase snapshots with rounds=1")
+    snapshots = []
+    for epoch, trace in enumerate(traces, start=1):
+        if trace.device.type != "cpu" or trace.dtype != torch.int64 or trace.shape != (20, 64):
+            raise ValueError("fused LI trace requires an explicit CPU int64 [20,64] snapshot")
+        copy = trace.clone()
+        progress = copy[schedule.compute_groups]
+        expected = torch.zeros_like(progress)
+        expected[[6, 21, 22, 24, 38]] = epoch
+        expected[25] = 3 * schedule.compute_groups
+        if not torch.equal(progress, expected):
+            raise ValueError("reserved LI progress vector did not certify every member's phase closure")
+        for group in range(schedule.compute_groups):
+            if any(int(copy[group, offset + 6]) != epoch for offset in (0, 16, 32)):
+                raise ValueError(f"physical group {group} has an incomplete fused LI arrival")
+        copy[schedule.compute_groups].zero_()
+        snapshots.append(copy)
+    evidence = validate_mixed_indexer_traces(tuple(snapshots), schedule, require_ld=require_ld)
+    evidence.update(device_phase_closure=True, progress_group=schedule.compute_groups,
+                    arrivals_per_phase=3 * schedule.compute_groups)
+    return evidence

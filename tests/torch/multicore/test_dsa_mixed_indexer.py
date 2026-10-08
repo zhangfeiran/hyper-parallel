@@ -33,3 +33,18 @@ def test_dsa_mixed_indexer(tmp_path):
         raise
     finally:
         (tmp_path / "mixed_li_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="onecard", essential_mark="essential")
+def test_dsa_fused_indexer(tmp_path):
+    """Verify single-launch LI phase closure and exact long-history Top-K on one 910B3."""
+    report = {"status": "running", "scope": "CP1 fused LI forward", "backward": False}
+    try:
+        worker = importlib.import_module("hyper_parallel.core.multicore.examples.mega_dsa_mixed_indexer_validate")
+        worker.run_validation(report, long_history=True, fused=True)
+    except Exception as error:
+        report.update(status="error", error=repr(error))
+        raise
+    finally:
+        (tmp_path / "fused_li_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

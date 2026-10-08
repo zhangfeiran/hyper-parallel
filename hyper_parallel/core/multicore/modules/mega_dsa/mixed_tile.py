@@ -31,9 +31,10 @@ _MEMBER_WORDS = 16
 class MixedSfaSchedule:
     """Schedule complete logical SFA partitions on reusable 1 AIC / 2 AIV groups.
 
-    This is an experimental forward-only CP1 probe. Idle physical groups are
-    reserved but do not yet run communication progress. The schedule neither
-    claims a fused DSA backend nor installs an autograd fallback.
+    This experimental CP1 schedule keeps at least one complete physical group
+    outside the compute team. A specific adapter may use one reserved Vector
+    for device phase closure; cross-rank communication remains a separate
+    protocol. The schedule does not install an autograd backend or fallback.
 
     Args:
         compute_groups: Number of physical groups, from 1 through 19. One
