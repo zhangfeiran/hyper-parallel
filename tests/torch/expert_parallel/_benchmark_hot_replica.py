@@ -34,6 +34,7 @@ from hyper_parallel.core.multicore.profiler import mega_kernel_profile
 from tests.common.port_utils import allocate_port
 from tests.torch.expert_parallel.hot_replica_checks import execution_identity, file_identity, saved_route
 from tests.torch.expert_parallel.hot_replica_measurements import HostMeasurements, memory_snapshot
+from tests.torch.expert_parallel.hot_replica_residency import audit_residency
 
 
 def _routes(tokens, top_k, experts, device):
@@ -116,7 +117,7 @@ def _host_breakdown(module, optimizer, values, ids, probabilities, gradient):
         values.grad = None
         dist.barrier()
         torch.npu.synchronize()
-        with HostMeasurements(device_intervals=False) as host:
+        with HostMeasurements(device_intervals=False, prefetch_details=True) as host:
             output = module(values, ids, probabilities)
             output.backward(gradient)
             optimizer.step()
@@ -124,6 +125,44 @@ def _host_breakdown(module, optimizer, values, ids, probabilities, gradient):
         records.append(host.records)
     return {"samples": records, "scope": "Untimed host-only inclusive spans; no Torch/internal profiler or "
                                          "per-stage device events. Spans nest and must not be summed as step latency."}
+
+
+def _make_module(args, calibration, device, size):
+    return MegaMoeExperts(local_num_tokens=args.tokens, hidden_size=args.hidden,
+                          intermediate_size=args.intermediate, num_experts=size * 6, top_k=args.top_k,
+                          ep_size=size, ep_group=dist.group.WORLD, dispatch_mode=args.backend,
+                          replica_slots_per_rank=args.budget, replica_transport=args.replica_transport,
+                          replica_planner=args.replica_planner, replica_cost_model=calibration).to(
+                              device=device, dtype=torch.bfloat16)
+
+
+def _residency_audit(args, calibration, device, size, values, routes, probabilities, gradient):
+    modules = tuple(_make_module(args, calibration, device, size) for _ in range(2))
+    MegaMoeExperts.share_execution_resources(modules)
+    try:
+        return audit_residency(modules, values, routes, probabilities, gradient)
+    finally:
+        for module in modules:
+            module.close()
+
+
+def _warm_pattern(args, module, optimizer, values, ids_list, probabilities, gradient, calibration):
+    for index in range(args.warmup):
+        _measure(module, optimizer, values, ids_list[index % len(ids_list)], probabilities, gradient)
+    torch.npu.reset_peak_memory_stats()
+    before = memory_snapshot(module, values)
+    samples = [_measure(module, optimizer, values, ids_list[index % len(ids_list)], probabilities, gradient)
+               for index in range(args.iterations)]
+    after = memory_snapshot(module, values)
+    if before["capacity"] != after["capacity"] or before["heap_epoch"] != after["heap_epoch"]:
+        raise AssertionError("Warm timing included a heap growth")
+    plans = [_measure(module, optimizer, values, ids, probabilities, gradient, inspect=True, cost_model=calibration)
+             for ids in ids_list]
+    return {"samples": samples, "median_ms": statistics.median(row["rank_max_step_ms"] for row in samples),
+            "memory_before": before, "memory_after": after,
+            "torch_peak_plus_constant_heap": after["torch_peak_allocated"] + after["shmem_heap_reserved"],
+            "torch_reserved_peak_plus_constant_heap": after["torch_peak_reserved"] + after["shmem_heap_reserved"],
+            "plans": plans}
 
 
 def run(args: argparse.Namespace) -> None:
@@ -143,12 +182,7 @@ def run(args: argparse.Namespace) -> None:
         calibration = ExpertReplicaCostModel(**json.loads(Path(args.cost_model).read_text(encoding="utf-8"))["model"])
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
     torch.manual_seed(917 + rank)
-    module = MegaMoeExperts(local_num_tokens=args.tokens, hidden_size=args.hidden,
-                            intermediate_size=args.intermediate, num_experts=size * 6, top_k=args.top_k,
-                            ep_size=size, ep_group=dist.group.WORLD, dispatch_mode=args.backend,
-                            replica_slots_per_rank=args.budget, replica_transport=args.replica_transport,
-                            replica_planner=args.replica_planner, replica_cost_model=calibration).to(
-                                device=device, dtype=torch.bfloat16)
+    module = _make_module(args, calibration, device, size)
     values = torch.randn(args.tokens, args.hidden, device=device, dtype=torch.bfloat16).requires_grad_()
     probabilities = torch.full((args.tokens, args.top_k), 1 / args.top_k, device=device)
     gradient = torch.randn_like(values) / args.tokens
@@ -162,22 +196,8 @@ def run(args: argparse.Namespace) -> None:
                          "memory": memory_snapshot(module, values)})
         results = {}
         for pattern, ids_list in routes.items():
-            for index in range(args.warmup):
-                _measure(module, optimizer, values, ids_list[index % len(ids_list)], probabilities, gradient)
-            torch.npu.reset_peak_memory_stats()
-            before = memory_snapshot(module, values)
-            samples = [_measure(module, optimizer, values, ids_list[index % len(ids_list)], probabilities, gradient)
-                       for index in range(args.iterations)]
-            after = memory_snapshot(module, values)
-            if before["capacity"] != after["capacity"] or before["heap_epoch"] != after["heap_epoch"]:
-                raise AssertionError("Warm timing included a heap growth")
-            plans = [_measure(module, optimizer, values, ids, probabilities, gradient,
-                               inspect=True, cost_model=calibration) for ids in ids_list]
-            results[pattern] = {"samples": samples, "median_ms": statistics.median(
-                row["rank_max_step_ms"] for row in samples), "memory_before": before, "memory_after": after,
-                "torch_peak_plus_constant_heap": after["torch_peak_allocated"] + after["shmem_heap_reserved"],
-                "torch_reserved_peak_plus_constant_heap": after["torch_peak_reserved"] + after["shmem_heap_reserved"],
-                "plans": plans}
+            results[pattern] = _warm_pattern(args, module, optimizer, values, ids_list,
+                                             probabilities, gradient, calibration)
         diagnostic = None
         if args.diagnose:
             diagnostic = _diagnose(module, optimizer, values, routes[args.diagnose_pattern][0], probabilities, gradient,
@@ -187,6 +207,8 @@ def run(args: argparse.Namespace) -> None:
             host_breakdown = {pattern: _host_breakdown(module, optimizer, values, routes[pattern][0],
                                                        probabilities, gradient)
                               for pattern in ("balanced", "home_hot")}
+        residency = None if not args.residency_audit else _residency_audit(
+            args, calibration, device, size, values, routes, probabilities, gradient)
         vendor, adapter = get_multicore_paths()
         identity = execution_identity()
         identity.update(torch_npu=torch_npu.__version__, configuration=vars(args),
@@ -195,6 +217,7 @@ def run(args: argparse.Namespace) -> None:
                         transport_abi=torch.ops.hyper_parallel.mega_moe_transport_version())
         (directory / "result.json").write_text(json.dumps({"identity": identity, "cold": cold, "warm": results,
                                                           "diagnostic": diagnostic, "host_breakdown": host_breakdown,
+                                                          "residency": residency,
                                                           "calibration":
                                                           None if calibration is None else asdict(calibration)},
                                                          indent=2) + "\n", encoding="utf-8")
@@ -219,6 +242,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--cost-model")
     parser.add_argument("--host-breakdown", action="store_true")
+    parser.add_argument("--residency-audit", action="store_true")
     parser.add_argument("--diagnose", action="store_true")
     parser.add_argument("--diagnose-pattern", choices=("balanced", "home_hot"), default="home_hot")
     parser.add_argument("--result-dir", required=True)

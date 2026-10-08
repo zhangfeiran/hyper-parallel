@@ -309,6 +309,8 @@ def _signal_stress(provider, mesh, hidden, intermediate, budget):
     rank, size = dist.get_rank(), mesh.size()
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
     streams = [torch.npu.Stream(), torch.npu.Stream()]
+    # Check ready publication beyond the exact integer range of FP32.
+    initial_epoch = provider.epoch = 2**24 + 17
     snapshots = []
     for step in range(12):
         owner = step % size
@@ -348,7 +350,7 @@ def _signal_stress(provider, mesh, hidden, intermediate, budget):
             torch.testing.assert_close(actual, torch.full_like(actual, value), rtol=0, atol=0)
         for actual, value in zip(gradients, expected):
             torch.testing.assert_close(actual, value, rtol=0, atol=0)
-    return {"iterations": 12, "streams": 2, "owners": size}
+    return {"iterations": 12, "streams": 2, "owners": size, "initial_epoch": initial_epoch}
 
 
 def _kernel_wait_stress(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,

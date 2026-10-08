@@ -304,6 +304,7 @@ torchrun --standalone --nproc-per-node=4 tests/torch/expert_parallel/_test_hot_r
 比较失败会在清理前以集合方式报告，避免其他 rank 被滞留。
 
 信号测试在检查结果前，还会在两个 NPU stream 上轮换 owner 十二次，每轮都延迟一个 rank。
+该测试从 `2**24 + 17` 的 epoch 开始，检查超过 FP32 精确整数范围时的 int32 ready 发布。
 CPU 协议测试覆盖任意 rank 的推进顺序和提前入队的大量调用。
 Worker 接受 `--benchmark-iterations`，用于在固定热点路由上测量预热后的前向、反向与 SGD。
 性能对照需要新进程配对运行及进程归属审计，与精度结果分开记录。
@@ -611,9 +612,33 @@ Profiling 独立构造镜像；B=0 返回原有基础 runtime。
 该模式不启用 Torch/内部 profiling，不插入逐阶段设备 event，也不单独同步各区间。
 它报告 runtime 基础/镜像大小及观测到的缓存命中。
 
+预取区间还细分为池租约与清零、credit 发布/等待下发、source 连续化、epoch tensor 构造、
+copy stream 分叉/汇合、权重/ready put 和 ACK。
+权重 put 记录下发的字节数，ready put 单独统计。
+这些嵌套区间仍包含前序设备排队；小 epoch tensor 的构造耗时不能解释为几个字节的传输耗时。
+
 Host 区间仍可能包含已排队设备工作的提交等待，也可能嵌套，
 性能判断仍以完整步 ABBA 为准。
 `replica_runtime_image_bytes` 是与其他 Torch 内存统计重叠的子项，不能再次加到已记录峰值中。
+
+添加 `--residency-audit`，可在正式计时结束后执行独立的权重驻留机会审计：
+两个参数独立、共享执行资源的模块先预热到稳定容量，随后运行同版本 micro-batch、
+跨层覆盖、真实 optimizer 更新和热点轮换，并按各自保存的 plan 逆序反向。
+
+审计仅保存调用方明确提供的诊断层身份、权重代际、专家、layout 和 heap generation。
+它按投影记录潜在命中字节及失效原因，并区分 host 已观察到完成和现有串行租约建立的有序依赖。
+所有实际权重拷贝仍执行，guest dW 仍计算并归还；这些统计不是已实现的生产缓存命中或性能收益。
+原 benchmark 每步执行 optimizer 更新，不能把相邻步相同的专家放置直接视为有效权重驻留。
+
+例如：
+
+```bash
+torchrun --standalone --nproc-per-node=4 tests/torch/expert_parallel/_benchmark_hot_replica.py \
+  --backend push --budget 1 --replica-transport shmem_signal_sdma_projection \
+  --host-breakdown --residency-audit --result-dir /tmp/replica-residency-audit
+```
+
+权重驻留缓存、双方命中协议和历史放置偏好仍未实现。
 
 `tests/torch/expert_parallel/test_hot_replica.py` 中的四 rank 启动入口
 `test_push_static_runtime_streams` 和 `test_pull_static_runtime_streams`
