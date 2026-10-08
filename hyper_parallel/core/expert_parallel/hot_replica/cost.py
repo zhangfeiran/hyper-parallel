@@ -142,39 +142,91 @@ class ExpertReplicaCostModel:
         return _phase_score(_rank_costs(self, copies, plan.logical_counts, plan.config))
 
 
+class _QuotaCostState:
+    """Invocation-local scores; a quota trial changes only its owner and target."""
+
+    def __init__(self, model: ExpertReplicaCostModel, copies: list[dict[int, int]],
+                 counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig,
+                 durations: dict[int, tuple[float, float]] | None = None) -> None:
+        """Initialize scores and invariants for one quota-refinement invocation.
+
+        Args:
+            model: Matching offline execution-cost calibration.
+            copies: Working quotas mutated by the refinement caller.
+            counts: Immutable per-source logical-expert counts.
+            config: Expert topology and guest budget.
+            durations: Optional shared interpolation cache for this invocation.
+        """
+        self.model = model
+        self.copies = copies
+        self.counts = counts
+        self.home = config.home_experts
+        self.durations = {} if durations is None else durations
+        self.source_totals = [sum(row) for row in counts]
+        self.transfers = [0] * config.ep_size
+        for target, experts in enumerate(copies):
+            for expert, rows in experts.items():
+                owner = expert // self.home
+                if rows and owner != target:
+                    self.transfers[target] += 1
+                    self.transfers[owner] += 1
+        self.costs = [self._rank_cost(rank, self.transfers[rank]) for rank in range(config.ep_size)]
+
+    def _rank_cost(self, rank: int, transfers: int) -> tuple[float, float]:
+        """Keep the original home/guest accumulation order, without float deltas."""
+        experts = self.copies[rank]
+        forward, backward = [0.0, 0.0], [0.0, 0.0]
+        local = 0
+        for expert, rows in experts.items():
+            guest = int(expert // self.home != rank)
+            if rows not in self.durations:
+                self.durations[rows] = self.model.compute_ms(rows), self.model.compute_ms(rows, backward=True)
+            forward[guest] += self.durations[rows][0]
+            backward[guest] += self.durations[rows][1]
+            local += min(self.counts[rank][expert], rows)
+        # Without measured link concurrency or queue-prefix windows, neither
+        # full duplex nor whole-home compute can hide these transfers safely.
+        ready = transfers * self.model.weight_ms
+        remote_rows = self.source_totals[rank] + sum(experts.values()) - 2 * local
+        token_phase = remote_rows * self.model.token_ms_per_row / 2
+        return (sum(forward) + ready + token_phase,
+                sum(backward) + ready + transfers * self.model.gradient_ms + token_phase)
+
+    def trial_score(self, owner: int, target: int, expert: int) -> float:
+        """Refresh the two changed ranks against the accepted edge counts.
+
+        Args:
+            owner: Original expert owner whose home quota was changed.
+            target: Guest rank whose quota was changed on an accepted active edge.
+            expert: Logical expert shared by these ranks.
+
+        Returns:
+            Separate forward/backward rank maxima for the trial quotas.
+        """
+        removed = int(not self.copies[target][expert])
+        for rank in (owner, target):
+            self.costs[rank] = self._rank_cost(rank, self.transfers[rank] - removed)
+        return _phase_score(self.costs)
+
+    def accept(self, owner: int, target: int, expert: int) -> None:
+        """Restore scores for the chosen quota before considering another edge.
+
+        Args:
+            owner: Original expert owner with its chosen home quota restored.
+            target: Guest rank with its chosen quota restored, including a zero quota.
+            expert: Logical expert whose edge may now be removed.
+        """
+        removed = int(not self.copies[target][expert])
+        for rank in (owner, target):
+            self.transfers[rank] -= removed
+            self.costs[rank] = self._rank_cost(rank, self.transfers[rank])
+
+
 def _rank_costs(model: ExpertReplicaCostModel, copies: list[dict[int, int]],
                 counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig,
                 durations: dict[int, tuple[float, float]] | None = None) -> list[tuple[float, float]]:
     """Return exposed F/B costs, charging owner fan-out and guest fan-in separately."""
-    if durations is None:
-        durations = {}
-    incoming, outgoing = [0] * config.ep_size, [0] * config.ep_size
-    for target, experts in enumerate(copies):
-        for expert, rows in experts.items():
-            owner = expert // config.home_experts
-            if rows and owner != target:
-                incoming[target] += 1
-                outgoing[owner] += 1
-    costs = []
-    for rank, experts in enumerate(copies):
-        forward, backward = [0.0, 0.0], [0.0, 0.0]
-        local = 0
-        for expert, rows in experts.items():
-            guest = int(expert // config.home_experts != rank)
-            if rows not in durations:
-                durations[rows] = model.compute_ms(rows), model.compute_ms(rows, backward=True)
-            forward[guest] += durations[rows][0]
-            backward[guest] += durations[rows][1]
-            local += min(counts[rank][expert], rows)
-        # Without measured link concurrency or queue-prefix windows, neither
-        # full duplex nor whole-home compute can hide these transfers safely.
-        transfers = incoming[rank] + outgoing[rank]
-        ready = transfers * model.weight_ms
-        remote_rows = sum(counts[rank]) + sum(experts.values()) - 2 * local
-        token_phase = remote_rows * model.token_ms_per_row / 2
-        costs.append((sum(forward) + ready + token_phase,
-                      sum(backward) + ready + transfers * model.gradient_ms + token_phase))
-    return costs
+    return _QuotaCostState(model, copies, counts, config, durations).costs
 
 
 def _phase_score(costs: list[tuple[float, float]]) -> float:
@@ -182,9 +234,43 @@ def _phase_score(costs: list[tuple[float, float]]) -> float:
     return max(forward for forward, _ in costs) + max(backward for _, backward in costs)
 
 
+def _refine_edge(target: int, expert: int, limit: int, knots: list[int], costs: _QuotaCostState) -> bool:
+    """Compare the original bounded candidates for one existing guest edge."""
+    copies = costs.copies
+    current = copies[target].get(expert, 0)
+    if not current:
+        return False
+    owner = expert // costs.home
+    total = current + copies[owner][expert]
+    loads = [sum(row.values()) for row in copies]
+    lower = max(0, total + loads[owner] - copies[owner][expert] - limit)
+    upper = min(total, limit - loads[target] + current)
+    quotas = {current, lower, upper, total // 2}
+    quotas.update(value for point in knots for value in (point, total - point))
+    best, best_cost = current, _phase_score(costs.costs)
+    for quota in sorted(value for value in quotas if lower <= value <= upper and value != current):
+        copies[target][expert], copies[owner][expert] = quota, total - quota
+        cost = costs.trial_score(owner, target, expert)
+        if cost + costs.model.minimum_gain_ms < best_cost:
+            best, best_cost = quota, cost
+    copies[target][expert], copies[owner][expert] = best, total - best
+    costs.accept(owner, target, expert)
+    if not best:
+        del copies[target][expert]
+    return best != current
+
+
 def refine_replica_quotas(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
                           config: ExpertReplicaConfig, limit: int, model: ExpertReplicaCostModel) -> None:
-    """Compare bounded candidates on existing edges; accept only strict worst-rank gains."""
+    """Compare bounded candidates on existing edges; accept only strict worst-rank gains.
+
+    Args:
+        copies: Mutable per-rank logical-expert row quotas, updated in place.
+        counts: Exact per-source logical-expert counts.
+        config: Expert topology and per-rank guest budget.
+        limit: Maximum permissible destination row count.
+        model: Matching offline execution-cost calibration.
+    """
     if model.ep_size != config.ep_size:
         raise ValueError("Replica cost model EP size does not match the plan")
     largest = max(sum(row[expert] for row in counts) for expert in range(config.num_experts))
@@ -193,32 +279,15 @@ def refine_replica_quotas(copies: list[dict[int, int]], counts: tuple[tuple[int,
     home = config.home_experts
     edges = sorted((target, expert) for target, row in enumerate(copies)
                    for expert, rows in row.items() if expert // home != target and rows)
+    if not edges:
+        return
     knots = sorted(set(model.row_knots[0] + model.row_knots[1]))
-    durations = {}
+    costs = _QuotaCostState(model, copies, counts, config)
     # Two deterministic sweeps bound Python work; candidate count depends on
     # calibration knots and existing edges, not the number of routed tokens.
     for _ in range(2):
         changed = False
         for target, expert in edges:
-            current = copies[target].get(expert, 0)
-            if not current:
-                continue
-            owner = expert // home
-            total = current + copies[owner][expert]
-            loads = [sum(row.values()) for row in copies]
-            lower = max(0, total + loads[owner] - copies[owner][expert] - limit)
-            upper = min(total, limit - loads[target] + current)
-            quotas = {current, lower, upper, total // 2}
-            quotas.update(value for point in knots for value in (point, total - point))
-            best, best_cost = current, _phase_score(_rank_costs(model, copies, counts, config, durations))
-            for quota in sorted(value for value in quotas if lower <= value <= upper and value != current):
-                copies[target][expert], copies[owner][expert] = quota, total - quota
-                cost = _phase_score(_rank_costs(model, copies, counts, config, durations))
-                if cost + model.minimum_gain_ms < best_cost:
-                    best, best_cost = quota, cost
-            copies[target][expert], copies[owner][expert] = best, total - best
-            if not best:
-                del copies[target][expert]
-            changed |= best != current
+            changed |= _refine_edge(target, expert, limit, knots, costs)
         if not changed:
             return
