@@ -18,7 +18,8 @@ if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
 elseif(ASCEND_COMPUTE_UNIT STREQUAL "ascend910_93")
     set(KERNEL_COMPUTE_UNIT ascend910_9391)
 else()
-    message(FATAL_ERROR "Unsupported HyperMegaMoe compute unit: ${ASCEND_COMPUTE_UNIT}")
+    message(FATAL_ERROR
+        "Unsupported HyperMegaMoe compute unit: ${ASCEND_COMPUTE_UNIT}")
 endif()
 
 npu_op_kernel_library(ascendc_kernels
@@ -46,6 +47,19 @@ npu_op_kernel_sources(ascendc_kernels
     KERNEL_FILE hyper_mega_moe_grad.cpp
     COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
 )
+
+if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
+    npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE HyperDsaMixedTile
+        KERNEL_DIR ./hyper_dsa_mixed_tile/op_kernel
+        KERNEL_FILE hyper_dsa_mixed_tile.cpp
+        COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+    )
+    npu_op_kernel_options(ascendc_kernels OP_TYPE HyperDsaMixedTile OPTIONS
+        --cce-auto-sync=off -Wno-deprecated-declarations
+        -mllvm -cce-vf-remove-membar=false
+        -mllvm -cce-aicore-hoist-movemask=false)
+endif()
 
 npu_op_package_add(${package_name}
     LIBRARY ascendc_kernels

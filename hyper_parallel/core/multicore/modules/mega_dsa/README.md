@@ -659,3 +659,56 @@ The workspace supplies storage for future native tiles. Publication is detached
 and enqueue-only; ready/ACK, gradient routing and native DSA computation remain
 separate implementation work. Caller-owned saved activations must be republished
 under a fresh backward lease rather than retained as views of reusable scratch.
+
+## P2 mixed SFA probe
+
+The experimental [mixed schedule](mixed_tile.py) invokes the locked 910B SFA
+implementation inside one persistent `HyperDsaMixedTile` launch. A physical
+team has one AIC and its two AIV partners. Its cube publishes a logical
+partition ticket with a local pipeline barrier before cross-core flag 13.
+Both vectors invalidate the ticket cache line and consume a volatile GM load
+after the flag. Flag 14
+joins both vectors after tile completion before the cube reuses its scratch.
+The upstream SFA reserves flags 3 through 12 for its internal pipeline; the
+wrapper uses separate IDs and separate member cache lines.
+
+Logical query partition IDs are independent of physical scratch group IDs.
+Each tile creates and destroys its own `TPipe`; the TND adapter removes global
+output initialization and its `SyncAll`. The adapter retains the locked SFA
+arithmetic and host tiling. The ACLNN probe bridge uses L0 Contiguous and
+ViewCopy to restore logical input/output views from flat Torch storage; these
+extra transfers are outside any performance claim. It is hash-verified and applied to an exported
+source copy; dependency checkouts remain unchanged.
+
+This probe supports BF16, TND, CP1, C=512, Dr=64, H=32/64, Nkv=1, K=2048,
+complete ordered packed Q/K, external complete causal selections, and 910B3.
+Prepare the selection using the P0 reference contract. Device-produced
+selection correctness remains a separate gate. Mutable output/stat/trace
+buffers must have independent storage. Inputs with gradients are rejected;
+this forward probe has no autograd backend. Invalid device configuration
+leaves the NaN-initialized probe outputs and member records incomplete rather
+than entering a mismatched team wait.
+
+The compute group count is 1 through 19; at least one physical group remains
+reserved. Reserved groups currently exit: no communication progress worker is
+implemented. Repeated rounds overwrite the same output and stress local
+scratch and event reuse; they are not multiple training steps.
+
+After activating the native payload as described in [build](../../docs/build.md), run:
+
+```bash
+python -m hyper_parallel.core.multicore.examples.mega_dsa_mixed_tile_validate \
+  --output mixed_sfa_report.json --long-history
+```
+
+The validator covers 1/2/7/19 groups, one/three traversals, H32/H64, packed
+(3,10)/(19,29,33), and optional length 513 crossing the sparse KV tile boundary.
+It compares output/max/sum to stock native CP1 at rtol=0.02, atol=2e-5 and
+output/LSE to the CPU FP32 oracle at rtol=0.02, atol=0.002. Every group member
+must independently report the declared count, checksum and final logical ID;
+reserved groups must have no compute evidence. Outputs start as NaN to expose
+incomplete partition coverage.
+
+P2 remains incomplete until LI, complete backward, alternating task types and
+communication pressure pass. This probe does not establish multi-card fused
+DSA, model CP integration, training acceptance or performance improvement.

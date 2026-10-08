@@ -60,6 +60,11 @@
             "path": "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch",
             "sha256": "9311b39fc5b152935662cb665ea1ddb8a353ea6706aa8b3dacfd0d2d3ef72837",
             "purpose": "expose the selected grouped-matmul path as an inline building block"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_mixed.patch",
+            "sha256": "8e75d06766f4dcbb94b06dc01d8e6212af3a74bc97361d57eb07f4c6ad82a0b4",
+            "purpose": "separate logical SFA partitions from physical mixed-group scratch and remove global output initialization for TND callable tiles"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"

@@ -15,9 +15,11 @@
 
 set(FWD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe/op_host)
 set(BWD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_grad/op_host)
-set(CANN_OP_COMMON_INCLUDE
-    ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/op_common
+set(DSA_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_mixed_tile/op_host)
+set(CANN_ARCH_INCLUDE
+    ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include
 )
+set(CANN_OP_COMMON_INCLUDE ${CANN_ARCH_INCLUDE}/op_common)
 set(CANN_OP_HOST_INCLUDE ${CANN_OP_COMMON_INCLUDE}/op_host)
 set(CANN_ACLNN_INCLUDE
     ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/aclnn
@@ -30,12 +32,15 @@ set(CANN_ARCH_LIBRARY
 )
 
 set(OP_SCHEMA_SOURCES
+    ${DSA_HOST}/sparse_flash_attention_def.cpp
+    ${DSA_HOST}/sparse_flash_attention_infershape.cpp
     ${FWD_HOST}/hyper_mega_moe_def.cpp
     ${FWD_HOST}/hyper_mega_moe_infershape.cpp
     ${BWD_HOST}/hyper_mega_moe_grad_def.cpp
     ${BWD_HOST}/hyper_mega_moe_grad_infershape.cpp
 )
 set(OP_TILING_SOURCES
+    ${DSA_HOST}/sparse_flash_attention_tiling.cpp
     ${FWD_HOST}/hyper_mega_moe_tiling.cpp
     ${BWD_HOST}/hyper_mega_moe_grad_tiling.cpp
 )
@@ -51,6 +56,7 @@ npu_op_code_gen(
 )
 
 set(ACLNN_SOURCES
+    ${DSA_HOST}/op_api/aclnn_hyper_dsa_mixed_tile.cpp
     ${FWD_HOST}/op_api/aclnn_hyper_mega_moe.cpp
     ${FWD_HOST}/op_api/hyper_mega_moe.cpp
     ${BWD_HOST}/op_api/aclnn_hyper_mega_moe_grad.cpp
@@ -60,6 +66,7 @@ npu_op_library(cust_opapi ACLNN ${ACLNN_SOURCES})
 target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)
 target_include_directories(cust_opapi PRIVATE
     ${FWD_HOST}/op_api
+    ${DSA_HOST}/op_api
     ${BWD_HOST}/op_api
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
@@ -70,9 +77,11 @@ target_link_directories(cust_opapi PRIVATE ${CANN_ARCH_LIBRARY})
 target_link_libraries(cust_opapi PRIVATE opapi_math)
 hp_enable_elf_hardening(cust_opapi)
 
-file(GLOB GROUP_PROTO_SOURCES ${ASCEND_AUTOGEN_PATH}/group_op_proto/*.cc)
+file(GLOB GROUP_PROTO_SOURCES
+    ${ASCEND_AUTOGEN_PATH}/group_op_proto/*.cc)
 file(GLOB OP_PROTO_SOURCES ${ASCEND_AUTOGEN_PATH}/op_proto.cc)
-set_source_files_properties(${GROUP_PROTO_SOURCES} ${OP_PROTO_SOURCES} PROPERTIES GENERATED TRUE)
+set_source_files_properties(${GROUP_PROTO_SOURCES} ${OP_PROTO_SOURCES}
+    PROPERTIES GENERATED TRUE)
 npu_op_library(cust_op_proto GRAPH
     ${OP_SCHEMA_SOURCES}
     ${GROUP_PROTO_SOURCES}
@@ -81,6 +90,7 @@ npu_op_library(cust_op_proto GRAPH
 target_compile_options(cust_op_proto PRIVATE -fvisibility=hidden)
 target_include_directories(cust_op_proto PRIVATE
     ${FWD_HOST}
+    ${DSA_HOST}
     ${BWD_HOST}
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
@@ -97,6 +107,7 @@ npu_op_library(cust_optiling TILING
 target_compile_options(cust_optiling PRIVATE -fvisibility=hidden)
 target_include_directories(cust_optiling PRIVATE
     ${FWD_HOST}
+    ${DSA_HOST}
     ${BWD_HOST}
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
@@ -111,6 +122,7 @@ npu_op_package_add(${package_name}
 npu_op_package_add(${package_name}
     TYPE ACLNN
     FILES
+        ${DSA_HOST}/op_api/aclnn_hyper_dsa_mixed_tile.h
         ${FWD_HOST}/op_api/aclnn_hyper_mega_moe.h
         ${BWD_HOST}/op_api/aclnn_hyper_mega_moe_grad.h
 )

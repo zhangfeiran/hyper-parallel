@@ -20,16 +20,15 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+from pathlib import Path
 from typing import Any
 
 from prepare_dependencies import verify_git_dependency
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _LOCK_PATH = Path(__file__).with_name("dependencies.lock.json")
@@ -39,7 +38,12 @@ _OPS_NN_PATHS = (
     "activation/swi_glu/op_kernel",
     "activation/swi_glu_grad/op_kernel",
 )
-_OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
+_OPS_TRANSFORMER_PATHS = (
+    "gmm/grouped_matmul/op_kernel",
+    "attention/sparse_flash_attention/op_kernel",
+    "attention/sparse_flash_attention/op_host",
+    "common/include/err",
+)
 _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad")
 
 
@@ -206,6 +210,18 @@ def _compose_hyper_parallel_ops(
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad",
     )
 
+    mixed_root = source_root / "hyper_dsa_mixed_tile"
+    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_mixed_tile", mixed_root)
+    shutil.copytree(transformer_copy / "common" / "include" / "err", mixed_root / "op_host" / "err")
+    upstream_host = transformer_copy / "attention" / "sparse_flash_attention" / "op_host"
+    for filename in ("sparse_flash_attention_def.cpp", "sparse_flash_attention_tiling.cpp",
+                     "sparse_flash_attention_tiling.h", "sparse_flash_attention_infershape.cpp"):
+        shutil.copy2(upstream_host / filename, mixed_root / "op_host" / filename)
+    upstream_kernel = transformer_copy / "attention" / "sparse_flash_attention" / "op_kernel"
+    shutil.copytree(upstream_kernel / "arch22", mixed_root / "op_kernel" / "arch22")
+    for filename in ("sparse_flash_attention_common.h", "sparse_flash_attention_template_tiling_key.h"):
+        shutil.copy2(upstream_kernel / filename, mixed_root / "op_kernel" / filename)
+
 
 def _require_assembled_files(source_root: Path) -> None:
     """Reject incomplete source closures before invoking the CANN toolchain."""
@@ -219,6 +235,9 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
         source_root / "shmem" / "data_plane" / "rma.h",
         source_root / "shmem" / "data_plane" / "sync.h",
+        source_root / "hyper_dsa_mixed_tile" / "op_kernel" / "hyper_dsa_mixed_tile.cpp",
+        source_root / "hyper_dsa_mixed_tile" / "op_kernel" / "arch22" / "sparse_flash_attention_kernel_mla.h",
+
     )
     missing = [str(path) for path in required_paths if not path.is_file()]
     if missing:

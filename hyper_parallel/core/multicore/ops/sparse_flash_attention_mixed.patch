@@ -1,0 +1,266 @@
+--- a/attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h
++++ b/attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h
+@@ -68,7 +68,8 @@
+                                 __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
+                                 __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+                                 __gm__ uint8_t *workspace, const SparseFlashAttentionTilingDataMla *__restrict tiling,
+-				                __gm__ uint8_t *gmTiling, TPipe *tPipe);
++				                __gm__ uint8_t *gmTiling, TPipe *tPipe, uint32_t logicalId, uint32_t logicalCount,
++                                uint32_t scratchId, uint32_t scratchCount);
+ 
+     __aicore__ inline void Process();
+ 
+@@ -122,6 +123,7 @@
+     uint32_t tmpBlockIdx = 0U;
+     uint32_t aiCoreIdx = 0U;
+     uint32_t usedCoreNum = 0U;
++    uint32_t logicalCoreCount = 0U;
+ 
+     __gm__ uint8_t *keyPtr = nullptr;
+     __gm__ uint8_t *valuePtr = nullptr;
+@@ -169,7 +171,6 @@
+     __aicore__ inline void InitCalcParamsEach();
+     __aicore__ inline void InitBuffers();
+     __aicore__ inline void InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths);
+-    __aicore__ inline void InitOutputSingleCore();
+     // ================================Process functions================================
+     __aicore__ inline void ProcessBalance();
+     __aicore__ inline void PreloadPipeline(uint32_t loop, uint64_t s2Start, uint64_t s2LoopIdx,
+@@ -292,33 +293,6 @@
+ }
+ 
+ template <typename SFAT>
+-__aicore__ inline void SparseFlashAttentionMla<SFAT>::InitOutputSingleCore()
+-{
+-    uint32_t coreNum = GetBlockNum();
+-    if (coreNum != 0) {
+-        uint64_t totalOutputSize = constInfo.batchSize * constInfo.qHeadNum * constInfo.qSeqSize * constInfo.headDim;
+-        uint64_t singleCoreSize = (totalOutputSize + (2 * coreNum) - 1) / (2 * coreNum);  // 2 means c:v = 1:2
+-        uint64_t tailSize = totalOutputSize - tmpBlockIdx * singleCoreSize;
+-        uint64_t singleInitOutputSize = tailSize < singleCoreSize ? tailSize : singleCoreSize;
+-        if (tmpBlockIdx * singleCoreSize < totalOutputSize && singleInitOutputSize > 0) {
+-            matmul::InitOutput<OUT_T>(attentionOutGm[tmpBlockIdx * singleCoreSize], singleInitOutputSize, 0);
+-        }
+-        if (constInfo.returnSoftmaxLse) {
+-            uint64_t totalReturnSoftmaxSize = constInfo.batchSize * constInfo.kvHeadNum * constInfo.qSeqSize * constInfo.gSize;
+-            uint64_t singleCoreReturnSoftmaxSize = (totalReturnSoftmaxSize + (2 * coreNum) - 1) / (2 * coreNum);
+-            uint64_t tailReturnSoftmaxSize = totalReturnSoftmaxSize - tmpBlockIdx * singleCoreReturnSoftmaxSize;
+-            uint64_t singleInitReturnSoftmaxSize = tailReturnSoftmaxSize < singleCoreReturnSoftmaxSize ?
+-                                                   tailReturnSoftmaxSize : singleCoreReturnSoftmaxSize;
+-            if (tmpBlockIdx * singleCoreReturnSoftmaxSize < totalReturnSoftmaxSize && singleInitReturnSoftmaxSize > 0) {
+-                matmul::InitOutput<T>(softmaxSumGm[tmpBlockIdx * singleCoreReturnSoftmaxSize], singleInitReturnSoftmaxSize, 0);
+-                matmul::InitOutput<T>(softmaxMaxGm[tmpBlockIdx * singleCoreReturnSoftmaxSize], singleInitReturnSoftmaxSize, 0);
+-            }
+-        }
+-        SyncAll();
+-    }
+-}
+-
+-template <typename SFAT>
+ __aicore__ inline void SparseFlashAttentionMla<SFAT>::GetActualSeqLen(uint32_t bIdx, uint32_t s1Idx)
+ {
+     tempLoopInfo.curActualSeqLenOri = GetActualSeqLenKV(bIdx);
+@@ -413,14 +387,15 @@
+                        __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
+                        __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, 
+                        __gm__ uint8_t *workspace, const SparseFlashAttentionTilingDataMla *__restrict tiling,
+-                       __gm__ uint8_t *gmTiling, TPipe *tPipe)
+-{
++                       __gm__ uint8_t *gmTiling, TPipe *tPipe, uint32_t logicalId, uint32_t logicalCount,
++                       uint32_t scratchId, uint32_t scratchCount)
++{
++    // Work partitioning is independent of the physical group's private scratch slot.
++    logicalCoreCount = logicalCount;
++    aiCoreIdx = logicalId;
++    tmpBlockIdx = logicalId;
+     if ASCEND_IS_AIV {
+-        tmpBlockIdx = GetBlockIdx(); // vec:0-47
+-        aiCoreIdx = tmpBlockIdx / 2;
+-    } else {
+-        tmpBlockIdx = GetBlockIdx(); // cube:0-23
+-        aiCoreIdx = tmpBlockIdx;
++        tmpBlockIdx = logicalId * 2 + GetSubBlockIdx();
+     }
+ 
+     // init tiling data
+@@ -445,12 +420,6 @@
+     attentionOutGm.SetGlobalBuffer((__gm__ OUT_T *)attentionOut);
+     softmaxMaxGm.SetGlobalBuffer((__gm__ T *)softmaxMax);
+     softmaxSumGm.SetGlobalBuffer((__gm__ T *)softmaxSum);
+-    if ASCEND_IS_AIV {
+-        if (constInfo.needInit && LAYOUT_T != SFA_LAYOUT::TND) {
+-            InitOutputSingleCore();
+-        }
+-    }
+-
+     if constexpr (PAGE_ATTENTION) {
+         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
+     }
+@@ -462,26 +431,26 @@
+     uint64_t offset = 0;
+     mm1ResGm.SetGlobalBuffer(
+         (__gm__ MM1_OUT_T *)(workspace + offset +
+-                             aiCoreIdx * dbWorkspaceRatio * constInfo.mmResUbSize * sizeof(MM1_OUT_T)));
+-    offset += GetBlockNum() * dbWorkspaceRatio * constInfo.mmResUbSize * sizeof(MM1_OUT_T);
++                             scratchId * dbWorkspaceRatio * constInfo.mmResUbSize * sizeof(MM1_OUT_T)));
++    offset += scratchCount * dbWorkspaceRatio * constInfo.mmResUbSize * sizeof(MM1_OUT_T);
+ 
+     vec1ResGm.SetGlobalBuffer(
+-        (__gm__ KV_T *)(workspace + offset + aiCoreIdx * dbWorkspaceRatio * constInfo.mmResUbSize * sizeof(KV_T)));
+-    offset += GetBlockNum() * dbWorkspaceRatio * constInfo.mmResUbSize * sizeof(KV_T);
++        (__gm__ KV_T *)(workspace + offset + scratchId * dbWorkspaceRatio * constInfo.mmResUbSize * sizeof(KV_T)));
++    offset += scratchCount * dbWorkspaceRatio * constInfo.mmResUbSize * sizeof(KV_T);
+ 
+     mm2ResGm.SetGlobalBuffer(
+         (__gm__ MM2_OUT_T *)(workspace + offset +
+-                             aiCoreIdx * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(MM2_OUT_T)));
+-    offset += GetBlockNum() * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(MM2_OUT_T);
++                             scratchId * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(MM2_OUT_T)));
++    offset += scratchCount * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(MM2_OUT_T);
+     mm2ResInt32Gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(mm2ResGm.GetPhyAddr(0)));
+ 
+     if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
+         // s2  d+rope bufNum
+-        kvMergeGm_.SetGlobalBuffer((__gm__ KV_T *)(workspace + offset + aiCoreIdx * 512 * 576 * 4 * sizeof(KV_T)));
+-        offset += GetBlockNum() * 512 * 576 * 4 * sizeof(KV_T);
++        kvMergeGm_.SetGlobalBuffer((__gm__ KV_T *)(workspace + offset + scratchId * 512 * 576 * 4 * sizeof(KV_T)));
++        offset += scratchCount * 512 * 576 * 4 * sizeof(KV_T);
+ 
+         kvValidSizeGm_.SetGlobalBuffer(
+-            (__gm__ int32_t *)(workspace + offset + (aiCoreIdx * 2) * 128 * 4 * sizeof(int32_t)));
++            (__gm__ int32_t *)(workspace + offset + (scratchId * 2) * 128 * 4 * sizeof(int32_t)));
+     }
+ 
+     if constexpr (FLASH_DECODE) {
+@@ -522,7 +491,7 @@
+     uint32_t actBatchS2 = 1;
+     uint32_t totalBaseNum = 0;
+ 	uint32_t s1GBaseSize = constInfo.gSize;
+-	uint32_t coreNum = GetBlockNum();
++	uint32_t coreNum = logicalCoreCount;
+     uint32_t currCoreIdx = aiCoreIdx;
+     uint32_t actBatchS1 = 1;
+     for (uint32_t bIdx = 0; bIdx < constInfo.batchSize; bIdx++) {
+--- a/attention/sparse_flash_attention/op_host/sparse_flash_attention_def.cpp
++++ b/attention/sparse_flash_attention/op_host/sparse_flash_attention_def.cpp
+@@ -16,9 +16,9 @@
+ #include "register/op_def_registry.h"
+ 
+ namespace ops {
+-class SparseFlashAttention : public OpDef {
++class HyperDsaMixedTile : public OpDef {
+ public:
+-    explicit SparseFlashAttention(const char *name) : OpDef(name)
++    explicit HyperDsaMixedTile(const char *name) : OpDef(name)
+     {
+         this->Input("query")
+             .ParamType(REQUIRED)
+@@ -65,6 +65,16 @@
+             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
+             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+             .AutoContiguous();
++        this->Input("runtime_config")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT64, ge::DT_INT64})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
++        this->Input("group_trace")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT64, ge::DT_INT64})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
+         this->Output("attention_out")
+             .ParamType(REQUIRED)
+             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
+@@ -92,11 +102,12 @@
+             .DynamicRankSupportFlag(true)
+             .DynamicShapeSupportFlag(true)
+             .NeedCheckSupportFlag(false)
+-            .PrecisionReduceFlag(true);
++            .PrecisionReduceFlag(true)
++            .ExtendCfgInfo("prebuildPattern.value", "Opaque")
++            .ExtendCfgInfo("coreType.value", "AiCore")
++            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
+         this->AICore().AddConfig("ascend910b", aicore_config);
+-        this->AICore().AddConfig("ascend910_93", aicore_config);
+-        this->AICore().AddConfig("ascend950", aicore_config);
+     }
+ };
+-OP_ADD(SparseFlashAttention);
++OP_ADD(HyperDsaMixedTile);
+ } // namespace ops
+--- a/attention/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp
++++ b/attention/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp
+@@ -2136,7 +2136,37 @@
+     return ge::GRAPH_SUCCESS;
+ }
+ 
+-IMPL_OP_OPTILING(SparseFlashAttention)
+-    .Tiling(TilingSparseFlashAttention)
++// This callable path has no global initializer or flash-decode reduction.
++ge::graphStatus TilingHyperDsaMixedTile(gert::TilingContext *context)
++{
++    auto attrs = context->GetAttrs();
++    if (attrs == nullptr || context->GetInputDesc(0) == nullptr ||
++        context->GetInputDesc(0)->GetDataType() != ge::DT_BF16) {
++        return ge::GRAPH_FAILED;
++    }
++    const auto *qLayout = attrs->GetAttrPointer<char>(LAYOUT_QUERY_ATTR_INDEX);
++    const auto *kvLayout = attrs->GetAttrPointer<char>(LAYOUT_KV_ATTR_INDEX);
++    const auto *blockSize = attrs->GetAttrPointer<int64_t>(SPARSE_BLOCK_SIZE_ATTR_INDEX);
++    const auto *mode = attrs->GetAttrPointer<int64_t>(SPARSE_MODE_ATTR_INDEX);
++    if (qLayout == nullptr || kvLayout == nullptr || blockSize == nullptr || mode == nullptr ||
++        std::string(qLayout) != "TND" || std::string(kvLayout) != "TND" || *blockSize != 1 || *mode != 3) {
++        return ge::GRAPH_FAILED;
++    }
++    const auto *config = context->GetRequiredInputShape(9);
++    const auto *trace = context->GetRequiredInputShape(10);
++    // CANN coalesces integer buffer axes; the Torch bridge checks logical shape and independent contiguous storage.
++    if (config == nullptr || trace == nullptr || config->GetStorageShape().GetShapeSize() != 4 ||
++        config->GetStorageShape().GetDimNum() != 1 || trace->GetStorageShape().GetShapeSize() != 1280) {
++        return ge::GRAPH_FAILED;
++    }
++    platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
++    if (platform.GetCoreNumAic() != 20 || platform.GetCoreNumAiv() != 40) {
++        return ge::GRAPH_FAILED;
++    }
++    return TilingSparseFlashAttention(context);
++}
++
++IMPL_OP_OPTILING(HyperDsaMixedTile)
++    .Tiling(TilingHyperDsaMixedTile)
+     .TilingParse<SparseFlashAttentionCompileInfo>(TilingPrepareForSparseFlashAttention);
+ } // namespace optiling
+--- a/attention/sparse_flash_attention/op_host/sparse_flash_attention_infershape.cpp
++++ b/attention/sparse_flash_attention/op_host/sparse_flash_attention_infershape.cpp
+@@ -123,7 +123,7 @@
+     return ge::GRAPH_SUCCESS;
+ }
+ 
+-IMPL_OP_INFERSHAPE(SparseFlashAttention)
++IMPL_OP_INFERSHAPE(HyperDsaMixedTile)
+     .InferShape(InferShapeSparseFlashAttention)
+     .InferDataType(InferDataTypeSparseFlashAttention);
+ } // namespace ops
+--- a/attention/sparse_flash_attention/op_host/sparse_flash_attention_tiling.h
++++ b/attention/sparse_flash_attention/op_host/sparse_flash_attention_tiling.h
+@@ -203,7 +203,7 @@
+ TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSingleCoreTensorSizeMla, singleCoreTensorSize);
+ TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionInnerSplitParams, innerSplitParams);
+ END_TILING_DATA_DEF
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttention, SparseFlashAttentionTilingDataMla)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedTile, SparseFlashAttentionTilingDataMla)
+ 
+ template <typename T> inline T Align(T num, T rnd)
+ {
+--- a/attention/sparse_flash_attention/op_kernel/sparse_flash_attention_template_tiling_key.h
++++ b/attention/sparse_flash_attention/op_kernel/sparse_flash_attention_template_tiling_key.h
+@@ -28,7 +28,7 @@
+ #define V_TEMPLATE 1
+ 
+ // 模板参数支持的范围定义
+-ASCENDC_TPL_ARGS_DECL(SparseFlashAttention, // 算子OpType
++ASCENDC_TPL_ARGS_DECL(HyperDsaMixedTile, // 算子OpType
+ ASCENDC_TPL_BOOL_DECL(FLASH_DECODE, 0, 1),
+ ASCENDC_TPL_BOOL_DECL(PAGE_ATTENTION, 0, 1),
+ ASCENDC_TPL_UINT_DECL(LAYOUT_T, ASCENDC_TPL_4_BW, ASCENDC_TPL_UI_LIST, SFA_LAYOUT_BSND, SFA_LAYOUT_TND),

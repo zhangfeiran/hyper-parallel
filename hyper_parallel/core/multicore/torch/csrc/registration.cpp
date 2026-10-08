@@ -12,6 +12,11 @@
 #include <torch/library.h>
 
 TORCH_LIBRARY(hyper_parallel, m) {
+  m.def("dsa_mixed_tile_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_mixed_tile_out(Tensor query, Tensor key, Tensor value, Tensor indices, "
+        "Tensor actual_query, Tensor actual_kv, Tensor query_rope, Tensor key_rope, Tensor config, "
+        "Tensor(a!) trace, float scale, Tensor(b!) out, Tensor(c!) maximum, Tensor(d!) sum) "
+        "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!))");
   m.def("moe_token_permute_out(Tensor tokens, Tensor indices, Tensor(a!) output, Tensor(b!) mapping) "
         "-> (Tensor(a!), Tensor(b!))");
   m.def(

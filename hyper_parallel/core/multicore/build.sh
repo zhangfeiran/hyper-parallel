@@ -213,7 +213,10 @@ function validate_multicore_vendor() {
     local -a libraries=()
     local -a artifacts=()
     local -a validation_socs=()
+    local -a validation_ops=()
     local -a required_symbols=(
+        aclnnHyperDsaMixedTile
+        aclnnHyperDsaMixedTileGetWorkspaceSize
         aclnnHyperMegaMoe
         aclnnHyperMegaMoeGetWorkspaceSize
         aclnnHyperMegaMoeGrad
@@ -251,7 +254,11 @@ function validate_multicore_vendor() {
 
     IFS=',' read -r -a validation_socs <<< "${soc_list}"
     for soc in "${validation_socs[@]}"; do
-        for op_name in hyper_mega_moe hyper_mega_moe_grad; do
+        validation_ops=(hyper_mega_moe hyper_mega_moe_grad)
+        if [[ "${soc}" == "ascend910b" ]]; then
+            validation_ops+=(hyper_dsa_mixed_tile)
+        fi
+        for op_name in "${validation_ops[@]}"; do
             mapfile -t artifacts < <(
                 find "${vendor_root}/op_impl/ai_core/tbe/kernel/${soc}/${op_name}" \
                     -maxdepth 1 -type f -name '*.o' -print 2>/dev/null
@@ -281,7 +288,11 @@ function validate_multicore_vendor() {
         require_nonempty_artifact \
             "${vendor_root}/op_impl/ai_core/tbe/kernel/config/${soc}/binary_info_config.json" \
             "${soc} binary index"
-        for op_name in hyper_mega_moe hyper_mega_moe_grad; do
+        validation_ops=(hyper_mega_moe hyper_mega_moe_grad)
+        if [[ "${soc}" == "ascend910b" ]]; then
+            validation_ops+=(hyper_dsa_mixed_tile)
+        fi
+        for op_name in "${validation_ops[@]}"; do
             require_nonempty_artifact \
                 "${vendor_root}/op_impl/ai_core/tbe/kernel/config/${soc}/${op_name}.json" \
                 "${soc} ${op_name} binary config"
