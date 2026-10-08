@@ -1099,5 +1099,29 @@ contiguous/strided/zigzag/empty owners, external holes/packed violations,
 all-empty selected sets, owner-zero sets and groups 1/2/7/19. All eleven
 previously accepted DSA device objects retained their hashes. The CPU multicore
 regression passed 300 tests and 985 subtests. These results certify forward
-and the admission/guard contracts; padded backward and device autograd remain
-unaccepted pending the selected-count correction.
+and the admission/guard contracts; padded backward and its device autograd
+remain unaccepted pending the selected-count correction.
+
+
+For the existing complete-cardinality count contract, the external core now has
+real [CP1/CP2/CP4 ST launchers](../../../../../tests/torch/multicore/test_mega_dsa_core_cp.py).
+The validator can explicitly choose `--selection-fixture complete --backward`.
+This keeps the unresolved additional-padding requirement visible; choosing a
+fixture does not change selection admission or native execution support.
+
+The complete-selection ST passed 72 invocations per rank, 504 rank
+forward/backward invocations in total, including 112 long-history invocations.
+Every FP32 owner result matched independent ordered peer aggregation bitwise;
+all five native gradients passed the original three-launch pointwise threshold
+(rtol=0.02, atol=2e-5). Fourteen per-rank lifecycle tests covered zigzag/empty
+owners, raw/autograd parity, retained graphs, delayed backward after another
+publication, non-reentrant checkpoint and cross-stream backward. Native max/sum
+remain nondifferentiable. The activated native payload was unchanged.
+
+Small-case gradients also retain independent FP32 oracle measurements. The
+largest gradient relative L2 was 0.0033812034965602666. Out of 1568 measured
+four-gradient pointwise checks, 720 failed the recorded rtol=0.02, atol=2e-5;
+these are not hidden by native parity. Neither this validation nor CPU analysis
+of a proposed valid-prefix search establishes padded/empty-selection backward,
+full-model acceptance, second-order derivatives, KL/indexer gradients or
+performance. The public additional-padding training guard remains active.
