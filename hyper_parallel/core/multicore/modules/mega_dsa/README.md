@@ -1,9 +1,10 @@
 # megaDSA development baseline
 
-This package implements the P0 foundations of the 2026-10-07 megaDSA plan:
-logical metadata, a small CPU numerical oracle, and an explicit single-card
-enhance reference boundary. No `MegaDsaCore` device runtime, SHMEM consumer,
-mixed-worker adapter, or production fallback is enabled yet.
+This package follows the 2026-10-07 megaDSA plan. It includes logical metadata,
+CPU numerical oracles, single-card and CP CANN reference boundaries, a frozen
+shared-root DSA workspace, and experimental callable mixed SFA/LI forward
+probes. A production `MegaDsaCore` fused training backend and automatic
+fallback policy remain unimplemented.
 
 ## Implemented contracts
 
@@ -709,6 +710,54 @@ must independently report the declared count, checksum and final logical ID;
 reserved groups must have no compute evidence. Outputs start as NaN to expose
 incomplete partition coverage.
 
-P2 remains incomplete until LI, complete backward, alternating task types and
+P2 remains incomplete until complete backward, alternating task types and
 communication pressure pass. This probe does not establish multi-card fused
 DSA, model CP integration, training acceptance or performance improvement.
+
+## P2 mixed LI probe
+
+The experimental [LI adapter](mixed_indexer.py) preserves the locked 910B
+weighted ReLU, signed merge-weight and exact global Top-K calculations. The
+[mixed LI patch](../../ops/lightning_indexer_mixed.patch) introduces explicit
+logical partition IDs and physical scratch IDs. Cube and both vectors reuse
+physical MM double buffers; each logical partition retains its partial Top-K
+lists and LD parameters in a separate, caller-owned uint8 arena. At H64/K2048,
+the pinned arena budget is 47,226,880 bytes (45 MiB plus 40 KiB). Dependency
+checkouts remain unchanged; the lock verifies the patch before source assembly.
+
+Main and LD merge execute as two kernels on the same stream. The main kernel
+publishes every logical partition's partials before the merge kernel runs.
+Merge initialization preserves those partials and parameters. This replaces
+the original full-chip `SyncAll()` boundary without requiring idle physical
+groups to join a barrier. It is a host-scheduled completion boundary; the two
+phases are not a single fused kernel or a communication progress worker.
+
+Initial support is 910B3, BF16 query/key, BF16 or FP32 already-scaled weights,
+H_index=64, D_index=128, Nkv=1, K=2048, full ordered CP1 packed TND with positive
+sequence lengths and causal mode 3. Prepare cumulative lengths through the
+P0 `CannDsaLayout` contract. The native boundary checks shape, dtype,
+contiguity, workspace capacity and independent mutable storage. All inputs
+must be detached. The probe has no autograd path. Each call retains independent
+indices, values and phase traces; optional scratch reuse is serial on one
+stream, or requires caller-established cross-stream events.
+
+After [building and activating the payload](../../docs/build.md), run:
+
+```bash
+python -m hyper_parallel.core.multicore.examples.mega_dsa_mixed_indexer_validate \
+  --output mixed_li_report.json --long-history
+```
+
+The validator runs 1/2/7/19 groups and repeats each complete main/merge pair
+three times. It covers short packed sequences and optional packed lengths
+2176/2240 with increasing, signed decreasing, concentrated, all-tied and random
+signed scores. It checks every index row for causal legality, uniqueness,
+full cardinality and trailing padding; compares indices including order and
+BF16 values bitwise to stock CP1; and checks all-row analytic winners for the
+ordered/concentrated fixtures. Both phases must independently certify Cube
+and both Vector task completion and agree on logical LD ownership. Long
+history must execute at least one LD merge. There is no relaxed tie threshold.
+
+P2 still requires complete backward, alternating callable task types and
+communication pressure validation. CP fused execution and full training
+acceptance remain separate from this single-card forward probe.

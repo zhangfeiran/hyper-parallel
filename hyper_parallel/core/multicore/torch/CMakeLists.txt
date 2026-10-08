@@ -82,6 +82,7 @@ endforeach()
 add_library(hyper_parallel_mega_moe_torch SHARED
     csrc/registration.cpp
     csrc/dsa_mixed_tile.cpp
+    csrc/dsa_mixed_indexer.cpp
     csrc/mega_moe.cpp
     csrc/mega_moe_grad.cpp
     csrc/moe_token_permute_grad.cpp

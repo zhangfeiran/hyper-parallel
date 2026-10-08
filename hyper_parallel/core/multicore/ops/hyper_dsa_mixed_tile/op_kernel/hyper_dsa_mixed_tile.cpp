@@ -14,6 +14,7 @@
  */
 // CANN compiles its umbrella and template headers from the SDK/assembled include roots.
 #include "kernel_operator.h"  // NOLINT(build/include_subdir)
+#include "runtime/dsa_mixed_group.h"
 #include "sparse_flash_attention_template_tiling_key.h"  // NOLINT(build/include_subdir)
 #include "arch22/sparse_flash_attention_kernel_mla.h"
 
@@ -30,54 +31,8 @@ using AscendC::GlobalTensor;
 using AscendC::PipeBarrier;
 using AscendC::TPipe;
 
-namespace {
-constexpr int64_t kMixedMagic = 0x48504453414D4958;
-constexpr uint32_t kDispatchFlag = 13;
-constexpr uint32_t kCompleteFlag = 14;
-constexpr uint32_t kGroupWords = 64;
-constexpr uint32_t kMemberWords = 16;
+using namespace DsaMixed;  // NOLINT(build/namespaces)
 
-__aicore__ inline void FlushLine(GlobalTensor<int64_t> &tensor, uint32_t offset) {
-  DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(tensor[offset]);
-}
-
-// Each role owns a separate cache line; a cube ticket is visible only after dispatch.
-__aicore__ inline uint32_t Dispatch(GlobalTensor<int64_t> &trace, uint32_t row, uint32_t logical) {
-  if ASCEND_IS_AIC {
-    trace.SetValue(row, logical);
-    FlushLine(trace, row);
-    // The ticket is a scalar GM store; FIX notification alone does not order its publication.
-    PipeBarrier<PIPE_ALL>();
-    CrossCoreSetFlag<2, PIPE_FIX>(kDispatchFlag);
-    return logical;
-  } else {
-    CrossCoreWaitFlag(kDispatchFlag);
-    FlushLine(trace, row);
-    PipeBarrier<PIPE_ALL>();
-    volatile __gm__ int64_t *ticket = trace.GetPhyAddr(row);
-    return static_cast<uint32_t>(*ticket);
-  }
-}
-
-__aicore__ inline void Complete(GlobalTensor<int64_t> &trace, uint32_t row,
-                               uint32_t count, uint32_t checksum, uint32_t logical) {
-  uint32_t member = 0;
-  if ASCEND_IS_AIV {
-    member = 1 + GetSubBlockIdx();
-  }
-  const uint32_t offset = row + member * kMemberWords;
-  trace.SetValue(offset + 1, count);
-  trace.SetValue(offset + 2, checksum);
-  trace.SetValue(offset + 3, logical);
-  FlushLine(trace, offset);
-  PipeBarrier<PIPE_ALL>();
-  if ASCEND_IS_AIV {
-    CrossCoreSetFlag<2, PIPE_MTE3>(kCompleteFlag);
-  } else {
-    CrossCoreWaitFlag(kCompleteFlag);
-  }
-}
-}  // namespace
 
 template<int FLASH_DECODE, int PAGE_ATTENTION, int LAYOUT_T, int KV_LAYOUT_T, int TEMPLATE_MODE, int IS_SPLIT_G>
 __global__ __aicore__ void hyper_dsa_mixed_tile(

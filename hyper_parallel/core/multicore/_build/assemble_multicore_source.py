@@ -42,7 +42,10 @@ _OPS_TRANSFORMER_PATHS = (
     "gmm/grouped_matmul/op_kernel",
     "attention/sparse_flash_attention/op_kernel",
     "attention/sparse_flash_attention/op_host",
+    "attention/lightning_indexer/op_kernel",
+    "attention/lightning_indexer/op_host",
     "common/include/err",
+    "common/include/op_host/tiling_util.h",
 )
 _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad")
 
@@ -221,6 +224,28 @@ def _compose_hyper_parallel_ops(
     shutil.copytree(upstream_kernel / "arch22", mixed_root / "op_kernel" / "arch22")
     for filename in ("sparse_flash_attention_common.h", "sparse_flash_attention_template_tiling_key.h"):
         shutil.copy2(upstream_kernel / filename, mixed_root / "op_kernel" / filename)
+    _compose_mixed_indexer(source_root, transformer_copy)
+    for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer"):
+        runtime = source_root / name / "op_kernel" / "runtime"
+        runtime.mkdir()
+        shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_mixed_group.h", runtime / "dsa_mixed_group.h")
+
+
+def _compose_mixed_indexer(source_root: Path, transformer_copy: Path) -> None:
+    """Keep retained logical LI partials separate from reusable physical scratch."""
+    mixed_root = source_root / "hyper_dsa_mixed_indexer"
+    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_mixed_indexer", mixed_root)
+    shutil.copytree(transformer_copy / "common" / "include" / "err", mixed_root / "op_host" / "err")
+    upstream = transformer_copy / "attention" / "lightning_indexer"
+    (mixed_root / "op_host" / "op_host").mkdir()
+    shutil.copy2(transformer_copy / "common" / "include" / "op_host" / "tiling_util.h",
+                 mixed_root / "op_host" / "op_host" / "tiling_util.h")
+    for filename in ("lightning_indexer_def.cpp", "lightning_indexer_tiling.cpp",
+                     "lightning_indexer_tiling.h", "lightning_indexer_infershape.cpp"):
+        shutil.copy2(upstream / "op_host" / filename, mixed_root / "op_host" / filename)
+    shutil.copytree(upstream / "op_kernel" / "arch22", mixed_root / "op_kernel" / "arch22")
+    for filename in ("lightning_indexer_common.h", "lightning_indexer_template_tiling_key.h"):
+        shutil.copy2(upstream / "op_kernel" / filename, mixed_root / "op_kernel" / filename)
 
 
 def _require_assembled_files(source_root: Path) -> None:
@@ -237,7 +262,8 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "shmem" / "data_plane" / "sync.h",
         source_root / "hyper_dsa_mixed_tile" / "op_kernel" / "hyper_dsa_mixed_tile.cpp",
         source_root / "hyper_dsa_mixed_tile" / "op_kernel" / "arch22" / "sparse_flash_attention_kernel_mla.h",
-
+        source_root / "hyper_dsa_mixed_indexer" / "op_kernel" / "arch22" / "lightning_indexer_kernel.h",
+        source_root / "hyper_dsa_mixed_indexer" / "op_kernel" / "runtime" / "dsa_mixed_group.h",
     )
     missing = [str(path) for path in required_paths if not path.is_file()]
     if missing:

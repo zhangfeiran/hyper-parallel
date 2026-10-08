@@ -16,6 +16,7 @@
 set(FWD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe/op_host)
 set(BWD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_grad/op_host)
 set(DSA_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_mixed_tile/op_host)
+set(LI_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_mixed_indexer/op_host)
 set(CANN_ARCH_INCLUDE
     ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include
 )
@@ -32,6 +33,8 @@ set(CANN_ARCH_LIBRARY
 )
 
 set(OP_SCHEMA_SOURCES
+    ${LI_HOST}/lightning_indexer_def.cpp
+    ${LI_HOST}/lightning_indexer_infershape.cpp
     ${DSA_HOST}/sparse_flash_attention_def.cpp
     ${DSA_HOST}/sparse_flash_attention_infershape.cpp
     ${FWD_HOST}/hyper_mega_moe_def.cpp
@@ -40,6 +43,7 @@ set(OP_SCHEMA_SOURCES
     ${BWD_HOST}/hyper_mega_moe_grad_infershape.cpp
 )
 set(OP_TILING_SOURCES
+    ${LI_HOST}/lightning_indexer_tiling.cpp
     ${DSA_HOST}/sparse_flash_attention_tiling.cpp
     ${FWD_HOST}/hyper_mega_moe_tiling.cpp
     ${BWD_HOST}/hyper_mega_moe_grad_tiling.cpp
@@ -56,6 +60,7 @@ npu_op_code_gen(
 )
 
 set(ACLNN_SOURCES
+    ${LI_HOST}/op_api/aclnn_hyper_dsa_mixed_indexer.cpp
     ${DSA_HOST}/op_api/aclnn_hyper_dsa_mixed_tile.cpp
     ${FWD_HOST}/op_api/aclnn_hyper_mega_moe.cpp
     ${FWD_HOST}/op_api/hyper_mega_moe.cpp
@@ -67,6 +72,7 @@ target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)
 target_include_directories(cust_opapi PRIVATE
     ${FWD_HOST}/op_api
     ${DSA_HOST}/op_api
+    ${LI_HOST}/op_api
     ${BWD_HOST}/op_api
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
@@ -91,6 +97,7 @@ target_compile_options(cust_op_proto PRIVATE -fvisibility=hidden)
 target_include_directories(cust_op_proto PRIVATE
     ${FWD_HOST}
     ${DSA_HOST}
+    ${LI_HOST}
     ${BWD_HOST}
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
@@ -108,6 +115,7 @@ target_compile_options(cust_optiling PRIVATE -fvisibility=hidden)
 target_include_directories(cust_optiling PRIVATE
     ${FWD_HOST}
     ${DSA_HOST}
+    ${LI_HOST}
     ${BWD_HOST}
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
@@ -122,6 +130,7 @@ npu_op_package_add(${package_name}
 npu_op_package_add(${package_name}
     TYPE ACLNN
     FILES
+        ${LI_HOST}/op_api/aclnn_hyper_dsa_mixed_indexer.h
         ${DSA_HOST}/op_api/aclnn_hyper_dsa_mixed_tile.h
         ${FWD_HOST}/op_api/aclnn_hyper_mega_moe.h
         ${BWD_HOST}/op_api/aclnn_hyper_mega_moe_grad.h

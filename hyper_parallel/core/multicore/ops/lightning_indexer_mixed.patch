@@ -1,0 +1,317 @@
+--- a/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_kernel.h
++++ b/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_kernel.h
+@@ -57,8 +57,11 @@
+     __aicore__ inline void Init(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
+                                 __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
+                                 __gm__ uint8_t *blockTable, __gm__ uint8_t *sparseIndices, __gm__ uint8_t *sparseValues,
+-                                __gm__ uint8_t *workspace, const LITilingData *__restrict tiling, TPipe *tPipe);
+-    __aicore__ inline void Process();
++                                __gm__ uint8_t *workspace, const LITilingData *__restrict tiling, TPipe *tPipe,
++                                uint32_t logicalId, uint32_t logicalCount,
++                                uint32_t scratchId, uint32_t scratchCount, bool mergePhase);
++    __aicore__ inline void ProcessPhase(bool mergePhase);
++    __aicore__ inline bool IsLdPartition() const { return splitCoreInfo.isLD && aiCoreIdx < usedCoreNum; }
+ 
+     // =================================类型定义区=================================
+     static constexpr bool DT_W_FLAG = LIT::weightsTypeFlag;
+@@ -141,7 +144,6 @@
+     __aicore__ inline void ProcessMain();
+     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx, LICommon::RunInfo &runInfo);
+     __aicore__ inline void ProcessDecode();
+-    __aicore__ inline void ProcessInvalid();
+     // ================================Params Calc=====================================
+     __aicore__ inline void CalcGS1LoopParams(uint32_t bN2Idx);
+     __aicore__ inline void GetBN2Idx(uint32_t bN2Idx);
+@@ -400,15 +402,12 @@
+                                             __gm__ uint8_t *blockTable, __gm__ uint8_t *sparseIndices,
+                                             __gm__ uint8_t *sparseValues,
+                                             __gm__ uint8_t *workspace, const LITilingData *__restrict tiling,
+-                                            TPipe *tPipe)
+-{
+-    if ASCEND_IS_AIV {
+-        tmpBlockIdx = GetBlockIdx(); // vec:0-47
+-        aiCoreIdx = tmpBlockIdx / 2;
+-    } else {
+-        tmpBlockIdx = GetBlockIdx(); // cube:0-23
+-        aiCoreIdx = tmpBlockIdx;
+-    }
++                                            TPipe *tPipe, uint32_t logicalId, uint32_t logicalCount,
++                                            uint32_t scratchId, uint32_t scratchCount, bool mergePhase)
++{
++    aiCoreIdx = logicalId;
++    tmpBlockIdx = logicalId;
++    if ASCEND_IS_AIV { tmpBlockIdx = logicalId * 2 + GetSubBlockIdx(); }
+ 
+     InitTilingData(tiling);
+     InitActualSeqLen(actualSeqLengthsQ, actualSeqLengths);
+@@ -424,22 +423,22 @@
+ 
+     // mm1开DoubleBuffer
+     uint64_t singleCoreMm1ResSize = WS_DOUBLE * constInfo.mBaseSizeAlign * constInfo.s2BaseSize * sizeof(MM1_OUT_T);
+-    mm1ResGm.SetGlobalBuffer((__gm__ MM1_OUT_T *)(workspace + offset + aiCoreIdx * singleCoreMm1ResSize));
+-    offset += GetBlockNum() * singleCoreMm1ResSize;
++    mm1ResGm.SetGlobalBuffer((__gm__ MM1_OUT_T *)(workspace + offset + scratchId * singleCoreMm1ResSize));
++    offset += scratchCount * singleCoreMm1ResSize;
+ 
+     // ld流程需要ws大小: [aicnum, 2, CeilDiv(constInfo.mBaseSize, constInfo.gSize), topkOut_*2]
+     // (aic, 8, 2, 2, 2048)
+     // (aic, s1_cube, 头尾, idx/value, K)
+     vec1ResGm.SetGlobalBuffer((__gm__ float *)(workspace + offset));
+-    offset += GetBlockNum() * constInfo.s1BaseSize * WS_DOUBLE * WS_DOUBLE * BASE_TOPK * sizeof(float);
++    offset += logicalCount * constInfo.s1BaseSize * WS_DOUBLE * WS_DOUBLE * BASE_TOPK * sizeof(float);
+ 
+     // (aic, 8, 2, 16)
+     // (aic, s1_cube, 头尾，16ele)
+     vec1ParamGm.SetGlobalBuffer((__gm__ int64_t *)(workspace + offset));
+-    offset += GetBlockNum() * constInfo.s1BaseSize * WS_DOUBLE * LD_PARAM_NUM * sizeof(int64_t);
++    offset += logicalCount * constInfo.s1BaseSize * WS_DOUBLE * LD_PARAM_NUM * sizeof(int64_t);
+ 
+     if ASCEND_IS_AIV {
+-        vectorService.InitParams(constInfo, tiling);
++        vectorService.InitParams(constInfo, tiling, tmpBlockIdx);
+         indiceOutGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
+         valueOutGm.SetGlobalBuffer((__gm__ K_T *)sparseValues);
+         weightsGm.SetGlobalBuffer((__gm__ W_T *)weights);
+@@ -453,7 +452,8 @@
+         keyGm.SetGlobalBuffer((__gm__ K_T *)key);
+         matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm, mm1ResGm);
+     }
+-    InitBuffers();
++    // Merge must preserve every logical partition's published LD parameters.
++    if (!mergePhase) { InitBuffers(); }
+ }
+ 
+ template <typename LIT>
+@@ -566,50 +566,13 @@
+ }
+ 
+ template <typename LIT>
+-__aicore__ inline void LightningIndexerKernel<LIT>::Process()
+-{
+-    if (usedCoreNum == 0) {
+-        // 没有计算任务，直接清理输出
+-        ProcessInvalid();
+-        return;
+-    }
+-    ProcessMain();
+-    ProcessDecode();
+-}
+-
+-template <typename LIT>
+-__aicore__ inline void LightningIndexerKernel<LIT>::ProcessInvalid()
+-{
+-    if ASCEND_IS_AIV {
+-        uint32_t aivCoreNum = GetBlockNum() * 2; // 2 means c:v = 1:2
+-        uint64_t totalOutputSize =
+-            constInfo.batchSize * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount;
+-        uint64_t singleCoreSize =
+-            LICommon::Align((totalOutputSize + aivCoreNum - 1) / aivCoreNum, GM_ALIGN_BYTES / sizeof(OUT_T));
+-        uint64_t baseSize = tmpBlockIdx * singleCoreSize;
+-        if (baseSize < totalOutputSize) {
+-            uint64_t dealSize =
+-                (baseSize + singleCoreSize <= totalOutputSize) ? singleCoreSize : totalOutputSize - baseSize;
+-            GlobalTensor<OUT_T> output = indiceOutGm[baseSize];
+-            AscendC::InitGlobalMemory(output, dealSize, constInfo.INVALID_IDX);
+-            if (constInfo.returnValue) {
+-                event_t eventIDMTE3ToV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
+-                SetFlag<HardEvent::MTE3_V>(eventIDMTE3ToV);
+-                WaitFlag<HardEvent::MTE3_V>(eventIDMTE3ToV);
+-
+-                GlobalTensor<uint16_t> valueOutGmTmp;
+-                valueOutGmTmp.SetGlobalBuffer((__gm__ uint16_t *)valueOutGm.GetPhyAddr());
+-                GlobalTensor<uint16_t> valueOut = valueOutGmTmp[baseSize];
+-
+-                uint16_t negInf = 0;
+-                if constexpr(std::is_same<K_T, float16_t>::value) {
+-                    negInf = 0xFC00;
+-                } else {
+-                    negInf = 0xFF80;
+-                }
+-                AscendC::InitGlobalMemory(valueOut, dealSize, negInf);
+-            }
+-        }
++__aicore__ inline void LightningIndexerKernel<LIT>::ProcessPhase(bool mergePhase)
++{
++    if (usedCoreNum == 0) { return; }
++    if (mergePhase) {
++        ProcessDecode();
++    } else {
++        ProcessMain();
+     }
+ }
+ 
+@@ -682,8 +645,8 @@
+     if ASCEND_IS_AIV {
+         vectorService.InitLDBuffers(pipe);
+         ICachePreLoad(LD_PREFETCH_LEN);
+-        SyncAll();
+-        if (splitCoreInfo.isLD) {
++        // The preceding main kernel completes all retained partials on this stream.
++        if (IsLdPartition()) {
+             vectorService.ProcessLD();
+         }
+     }
+--- a/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_service_vector.h
++++ b/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_service_vector.h
+@@ -65,7 +65,7 @@
+     __aicore__ inline void ProcessLD();
+     __aicore__ inline void InitBuffers(TPipe *pipe);
+     __aicore__ inline void InitParams(const struct LICommon::ConstInfo &constInfo,
+-                                      const LITilingData *__restrict tilingData);
++                                      const LITilingData *__restrict tilingData, uint32_t logicalBlockId);
+     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<float> vec1ResGm,
+                                                 GlobalTensor<int64_t> vec1ParamGm, GlobalTensor<W_T> weightsGm,
+                                                 GlobalTensor<int32_t> indiceOutGm, GlobalTensor<K_T> valueOutGm);
+@@ -183,7 +183,7 @@
+ 
+ template <typename LIT>
+ __aicore__ inline void LightningIndexerServiceVector<LIT>::InitParams(const struct LICommon::ConstInfo &constInfo,
+-                                                 const LITilingData *__restrict tilingData)
++                                                 const LITilingData *__restrict tilingData, uint32_t logicalBlockId)
+ {
+     this->constInfo_ = constInfo;
+     blockS2StartIdx_ = 0;
+@@ -197,7 +197,7 @@
+     // group ub 切分因子当前按照UB空间强制为16
+     groupInner_ = 16;
+ 
+-    blockId_ = GetBlockIdx();
++    blockId_ = logicalBlockId;
+ }
+ 
+ template <typename LIT>
+--- a/attention/lightning_indexer/op_kernel/lightning_indexer_template_tiling_key.h
++++ b/attention/lightning_indexer/op_kernel/lightning_indexer_template_tiling_key.h
+@@ -30,7 +30,7 @@
+ #define ASCENDC_TPL_4_BW 4
+ 
+ // 模板参数支持的范围定义
+-ASCENDC_TPL_ARGS_DECL(LightningIndexer, // 算子OpType
++ASCENDC_TPL_ARGS_DECL(HyperDsaMixedIndexer, // 算子OpType
+                       ASCENDC_TPL_DTYPE_DECL(DT_Q, LI_TPL_FP16, LI_TPL_BF16),
+                       ASCENDC_TPL_DTYPE_DECL(DT_K, LI_TPL_FP16, LI_TPL_BF16),
+                       ASCENDC_TPL_DTYPE_DECL(DT_OUT, LI_TPL_INT32), ASCENDC_TPL_BOOL_DECL(PAGE_ATTENTION, 0, 1),
+--- a/attention/lightning_indexer/op_host/lightning_indexer_def.cpp
++++ b/attention/lightning_indexer/op_host/lightning_indexer_def.cpp
+@@ -16,9 +16,9 @@
+ #include "register/op_def_registry.h"
+ 
+ namespace ops {
+-class LightningIndexer : public OpDef {
++class HyperDsaMixedIndexer : public OpDef {
+ public:
+-    explicit LightningIndexer(const char *name) : OpDef(name)
++    explicit HyperDsaMixedIndexer(const char *name) : OpDef(name)
+     {
+         this->Input("query")
+             .ParamType(REQUIRED)
+@@ -50,6 +50,12 @@
+             .DataTypeList({ge::DT_INT32})
+             .FormatList({ge::FORMAT_ND})
+             .AutoContiguous();
++        this->Input("runtime_config").ParamType(REQUIRED).DataTypeList({ge::DT_INT64})
++            .FormatList({ge::FORMAT_ND});
++        this->Input("group_trace").ParamType(REQUIRED).DataTypeList({ge::DT_INT64})
++            .FormatList({ge::FORMAT_ND});
++        this->Input("tile_workspace").ParamType(REQUIRED).DataTypeList({ge::DT_UINT8})
++            .FormatList({ge::FORMAT_ND});
+         this->Output("sparse_indices")
+             .ParamType(REQUIRED)
+             .DataTypeList({ge::DT_INT32})
+@@ -65,6 +71,7 @@
+         this->Attr("pre_tokens").AttrType(OPTIONAL).Int(INT64_MAX);
+         this->Attr("next_tokens").AttrType(OPTIONAL).Int(INT64_MAX);
+         this->Attr("return_values").AttrType(OPTIONAL).Bool(false);
++        this->Attr("merge_phase").AttrType(REQUIRED).Int();
+         OpAICoreConfig aicore_config;
+         aicore_config.DynamicCompileStaticFlag(true)
+             .DynamicFormatFlag(true)
+@@ -73,9 +80,7 @@
+             .NeedCheckSupportFlag(false)
+             .PrecisionReduceFlag(true);
+         this->AICore().AddConfig("ascend910b", aicore_config);
+-        this->AICore().AddConfig("ascend910_93", aicore_config);
+-        this->AICore().AddConfig("ascend950", aicore_config);
+     }
+ };
+-OP_ADD(LightningIndexer);
++OP_ADD(HyperDsaMixedIndexer);
+ } // namespace ops
+\ No newline at end of file
+--- a/attention/lightning_indexer/op_host/lightning_indexer_infershape.cpp
++++ b/attention/lightning_indexer/op_host/lightning_indexer_infershape.cpp
+@@ -106,7 +106,7 @@
+     return GRAPH_SUCCESS;
+ }
+ 
+-IMPL_OP_INFERSHAPE(LightningIndexer)
++IMPL_OP_INFERSHAPE(HyperDsaMixedIndexer)
+     .InferShape(InferShapeLightningIndexer)
+     .InferDataType(InferDataTypeLightningIndexer);
+ } // namespace ops
+--- a/attention/lightning_indexer/op_host/lightning_indexer_tiling.h
++++ b/attention/lightning_indexer/op_host/lightning_indexer_tiling.h
+@@ -96,8 +96,9 @@
+ TILING_DATA_FIELD_DEF(int64_t, preTokens)
+ TILING_DATA_FIELD_DEF(int64_t, nextTokens)
+ TILING_DATA_FIELD_DEF(uint32_t, returnValue)
++TILING_DATA_FIELD_DEF(uint32_t, mergePhase)
+ END_TILING_DATA_DEF
+-REGISTER_TILING_DATA_CLASS(LightningIndexer, LITilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedIndexer, LITilingData)
+ 
+ // -----------算子CompileInfo定义-------------------
+ struct LICompileInfo {};
+--- a/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
++++ b/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
+@@ -979,12 +979,31 @@
+     uint32_t aivNum = ascendcPlatform.GetCoreNumAiv();
+     uint32_t aicNum = ascendcPlatform.GetCoreNumAic();
+     uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(aivNum, aicNum, aivNum);
++    const auto *config = context_->GetRequiredInputShape(6);
++    const auto *trace = context_->GetRequiredInputShape(7);
++    const auto *retained = context_->GetRequiredInputShape(8);
++    const auto *phase = context_->GetAttrs()->GetInt(7);
++    if (aicNum != 20 || aivNum != 40 || tilingInfo->inputQType != ge::DT_BF16 ||
++        tilingInfo->inputQLayout != DataLayout::TND || tilingInfo->inputKLayout != DataLayout::TND ||
++        tilingInfo->sparseCount != 2048 || tilingInfo->sparseMode != 3 || tilingInfo->gSize != 64 ||
++        config == nullptr || config->GetStorageShape().GetShapeSize() != 4 ||
++        trace == nullptr || trace->GetStorageShape().GetShapeSize() != 1280 || retained == nullptr ||
++        phase == nullptr || (*phase != 0 && *phase != 1)) {
++        OP_LOGE(context_->GetNodeName(),
++                "Mixed LI requires 20/40 cores, BF16 TND H64/K2048 and valid runtime metadata");
++        return ge::GRAPH_FAILED;
++    }
++    const uint64_t required = LiCalcWorkspaceSize(ascendcPlatform, tilingInfo->s2Size, aicNum) -
++                              ascendcPlatform.GetLibApiWorkSpaceSize();
++    if (retained->GetStorageShape().GetShapeSize() < static_cast<int64_t>(required)) {
++        OP_LOGE(context_->GetNodeName(), "Mixed LI retained workspace is too small");
++        return ge::GRAPH_FAILED;
++    }
+     context_->SetBlockDim(blockDim);
+ 
+     // -------------set workspacesize-----------------
+-    uint64_t workspaceSize = LiCalcWorkspaceSize(ascendcPlatform, tilingInfo->s2Size, aicNum);
+     size_t *workSpaces = context_->GetWorkspaceSizes(1);
+-    workSpaces[0] = workspaceSize;
++    workSpaces[0] = ascendcPlatform.GetLibApiWorkSpaceSize();
+ 
+     // -------------set tilingdata-----------------
+     tilingData_.set_bSize(tilingInfo->bSize);
+@@ -998,6 +1017,7 @@
+     tilingData_.set_preTokens(tilingInfo->preTokens);
+     tilingData_.set_nextTokens(tilingInfo->nextTokens);
+     tilingData_.set_returnValue(tilingInfo->returnValue);
++    tilingData_.set_mergePhase(*phase);
+     tilingData_.set_usedCoreNum(blockDim);
+     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
+     context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
+@@ -1035,7 +1055,7 @@
+ }
+ 
+ // --------------------------Tiling函数及TilingPrepare函数注册--------
+-IMPL_OP_OPTILING(LightningIndexer)
++IMPL_OP_OPTILING(HyperDsaMixedIndexer)
+     .Tiling(TilingForLightningIndexer)
+     .TilingParse<LICompileInfo>(TilingPrepareForLightningIndexer);
+ 
