@@ -48,6 +48,10 @@ from hyper_parallel.core.multicore.examples.mega_dsa_model_validate import (
     _ObservedReference,
     _StockReference,
 )
+from hyper_parallel.core.multicore.examples.mega_dsa_restore_diagnose import (
+    _restoration_diagnosis,
+    _restoration_replay,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.cann_reference import CannDsaLayout
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import (
     DsaBatchMeta,
@@ -67,14 +71,14 @@ def _project(model, hidden, embeddings):
     return main_states, index, weight
 
 
-def _restore(model, sparse, hidden_shape, weight):
+def _restore_states(model, sparse, hidden_shape, weight):
     restored = _restore_attention_projection(
         sparse.reshape(*hidden_shape[:2], model.num_heads, model.kv_lora_rank),
         weight[:, model.qk_nope_head_dim:].transpose(1, 2), num_heads=model.num_heads,
         batch_size=hidden_shape[0], seq_length=hidden_shape[1], kv_lora_rank=model.kv_lora_rank,
         value_head_dim=model.v_head_dim,
     )
-    return model.o_proj(restored)
+    return restored, model.o_proj(restored)
 
 
 def _snapshot(values):
@@ -101,16 +105,20 @@ def _measure_projection(model, hidden, embeddings, backend, *, auxiliary_scale):
     loss = backend.kl_loss(*index, main_states, selection, stats,
                            normalization=DsaLossNormalization(backend.layout.batch_meta.global_valid_queries),
                            loss_coeff=model.dsa_loss_coeff)
-    output = _restore(model, sparse, hidden.shape, weight)
+    restored, output = _restore_states(model, sparse, hidden.shape, weight)
     objective = output.float().square().mean() * 13 + loss * auxiliary_scale
-    targets = (*main_states, *index, sparse, hidden, *model.parameters())
+    targets = (*main_states, *index, sparse, restored, output, hidden, *model.parameters())
     gradients = torch.autograd.grad(objective, targets, retain_graph=True, allow_unused=True)
     boundary = gradients[:7]
     return {
         "states": _snapshot((*main_states, *index)), "cotangents": _snapshot(boundary),
         "sparse_cotangent": gradients[7].detach().float().cpu(),
+        "restoration": {"sparse_input": sparse.detach().float().cpu(), "hidden_shape": list(hidden.shape),
+                        "restored_input": restored.detach().float().cpu(),
+                        "restored_cotangent": gradients[8].detach().float().cpu(),
+                        "output_cotangent": gradients[9].detach().float().cpu()},
         "full": {"output": output.detach().float().cpu(), "kl_loss": loss.detach().float().cpu(),
-                 **_named_gradients(("hidden", *dict(model.named_parameters())), gradients[8:])},
+                 **_named_gradients(("hidden", *dict(model.named_parameters())), gradients[10:])},
         "main_projection_vjp": _projection_vjp(main_states, boundary[:4], hidden, model),
         "index_projection_vjp": _projection_vjp(index, boundary[4:], hidden, model),
         "indices": selection.to_global_indices().detach().cpu(),
@@ -156,6 +164,41 @@ def _cpu_projection(template, hidden, embeddings, meta, indices, cotangents):
     return main_vjp, index_vjp, full
 
 
+def _hidden_error_controls(template, hidden, embeddings, meta, native, cpu, operator_oracle):
+    """Measure cumulative FP32 replays against the FP32 absorbed hidden gradient.
+
+    These controls change several precision boundaries and are not additive
+    error attribution or a production implementation. Index/KL is detached
+    from the hidden path, so the controls only compare the main objective.
+    """
+    model = copy.deepcopy(template).float()
+    hidden = hidden.float().requires_grad_()
+    with patch("hyper_parallel.components.functional.rotary_embedding.torch_npu.npu_rotary_mul",
+               side_effect=_rotary_mul_oracle):
+        states, _, weight = _project(model, hidden, tuple(value.float() for value in embeddings))
+    backend = _OracleDsaReference(meta, attention_scale=model.scaling, indices=native["indices"])
+    restoration = _restoration_replay(model, native["restoration"], "combined")
+    restored_vjp = _operator_replay(native["states"], restoration["input_cotangent"], backend,
+                                    native["indices"], auxiliary_scale=7)
+    sparse = operator_oracle["output"].detach().requires_grad_()
+    _, output = _restore_states(model, sparse, hidden.shape, weight)
+    downstream_cotangent = torch.autograd.grad(output.square().mean() * 13, sparse)[0]
+    downstream = _operator_replay(native["states"], downstream_cotangent, backend,
+                                 native["indices"], auxiliary_scale=7)
+    controls = {
+        "fp32_projection_jacobian_native_cotangents": native["cotangents"][:4],
+        "fp32_projection_and_sparse_vjp": tuple(operator_oracle[name] for name in _MAIN),
+        "fp32_projection_sparse_and_restoration_vjp": tuple(restored_vjp[name] for name in _MAIN),
+        "fp32_downstream_on_bf16_projected_states": tuple(downstream[name] for name in _MAIN),
+    }
+    expected = cpu["full"]["hidden"]
+    result = {"native_full_hidden": _metrics(native["full"]["hidden"], expected)}
+    for name, cotangents in controls.items():
+        gradient = torch.autograd.grad(states, hidden, grad_outputs=cotangents, retain_graph=True)[0]
+        result[name] = _metrics(gradient, expected)
+    return result
+
+
 def _relu_crossings(native_states, fp32_states, meta):
     total = meta.global_valid_queries
     native = torch.einsum("thi,si->ths", native_states[4], native_states[5])
@@ -176,6 +219,7 @@ def _save_snapshot(directory, seed, template, hidden, embeddings, native):
     torch.save({"seed": seed, "model_state_dict": template.state_dict(), "hidden": hidden,
                 "position_embeddings": embeddings, "states": native["states"],
                 "cotangents": native["cotangents"], "sparse_cotangent": native["sparse_cotangent"],
+                "restoration": native["restoration"], "hidden_gradient": native["full"]["hidden"],
                 "indices": native["indices"]}, path)
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "scope": "explicit offline CPU capture; random model weights, inputs, projected states and cotangents"}
@@ -209,6 +253,8 @@ def _diagnose_seed(seed, device, meta, snapshot_dir):
         "projected_state_bf16_vs_fp32": state_metrics,
         "main_projection_fixed_cotangent_vjp": _pair_metrics(native["main_projection_vjp"], main_vjp),
         "index_projection_fixed_cotangent_vjp": _pair_metrics(native["index_projection_vjp"], index_vjp),
+        "restoration_fixed_cotangent_vjp": _restoration_diagnosis(template, native, device, _pair_metrics),
+        "hidden_precision_controls": _hidden_error_controls(template, hidden, embeddings, meta, native, cpu, oracle),
         "cpu_absorbed_vs_unabsorbed": _pair_metrics(cpu["full"], unabsorbed),
         "native_vs_fp32_absorbed": _pair_metrics(native["full"], cpu["full"]),
         "projection_relu_crossings": _relu_crossings(values, cpu["states"], meta),
@@ -246,7 +292,9 @@ def main() -> None:
               "seeds": args.seeds, "dtype": "bfloat16", "sequence_lengths": [3, 5], "grad_aux": 7,
               "scope": "random HP fixture; CP=TP=1; exact projected inputs and fixed cotangents; "
                        "diagnostic pointwise stock calibration does not replace frozen model acceptance",
-              "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+              "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "restoration_source_sha256": hashlib.sha256(
+                  Path(__file__).with_name("mega_dsa_restore_diagnose.py").read_bytes()).hexdigest()}
     try:
         run_diagnosis(report, args.seeds, snapshot_dir=args.snapshot_dir)
     except Exception as error:

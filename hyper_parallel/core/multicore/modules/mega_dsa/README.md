@@ -431,6 +431,58 @@ SHA256 identities in the report. The default seeds are 20261027 and 20261028;
 `--seeds` selects other diagnostic fixtures. Neither these short histories nor
 their snapshots provide trained-model locality or long-context Top-K evidence.
 
+### Output restoration and hidden-gradient controls
+
+The layer diagnostic also captures sparse output, restored per-head values,
+their cotangents and the final model-output cotangent. Restoration snapshots
+remain detached CPU values and retain the original quantized model weights.
+`mega_dsa_restore_diagnose.py` replays value up-projection, `o_proj`, and their
+composition separately with identical captured inputs and fixed cotangents.
+It records BF16 NPU versus FP32 CPU measurements and gradient availability.
+The combined replay is compared with the original sparse cotangent, direct
+W_UV gradient and `o_proj` gradient. Its W_UK slice must remain zero, since
+key absorption belongs to the main projection graph rather than restoration.
+
+Hidden-gradient controls then use an FP32 projection Jacobian with captured
+native cotangents, FP32 sparse VJPs, FP32 restoration VJPs, and a complete FP32
+downstream computation on the captured BF16 projected states. Each control is
+measured against the full FP32 absorbed model's hidden gradient. The controls
+change several precision boundaries and combine states/Jacobians from
+different paths; their errors are not additive component attribution or
+gradients of a proposed production model. KL inputs remain detached from the
+hidden path. These controls do not change model calibration or acceptance.
+
+CPU tests independently expand the value formula per head, check restoration
+parameter reachability and the zero key-gradient slice, and verify separate
+restoration VJPs compose correctly. With all stages in FP32, the hidden controls
+must recover the same full-model hidden gradient. Snapshots additionally store
+the actual hidden gradient and restoration capture for offline replay.
+
+The CANN 9.1 restoration run used the two existing holdouts and a new
+independent seed, 20261038. All three staged model captures and combined
+restoration VJPs matched their original boundary measurements exactly, including
+the sparse cotangent, W_UV and `o_proj` gradients. The restoration W_UK slice
+was exactly zero. Identical-state SFA/KL comparisons passed pointwise stock
+calibration for all three seeds. These are diagnostic consistency checks, not
+frozen model acceptance for the new seed.
+
+With fixed identical inputs and cotangents, value/output input-VJP relative L2
+was approximately 0.00163--0.00167, and the combined restoration input VJP was
+0.00233--0.00234. The full native hidden gradient and the FP32 downstream
+control on BF16 projected states had the following relative L2 against the
+FP32 absorbed hidden gradient:
+
+| Seed | Native full hidden | FP32 downstream on BF16 projected states |
+| --- | --- | --- |
+| 20261027 | 0.00551 | 0.00223 |
+| 20261028 | 0.00464 | 0.00245 |
+| 20261038 | 0.00455 | 0.00256 |
+
+Intermediate controls did not monotonically reduce maximum absolute error.
+These results support composition/rounding sensitivity across several
+boundaries; they do not identify one defective operator or justify dropping
+the max-absolute criterion. The original 22/35 model result remains failed.
+
 The candidate-count boundary remains restricted; general underfilled/empty
 device semantics remain unavailable. P0 still needs model BF16 calibration
 that generalizes to held-out inputs, parameter-gradient device acceptance,
