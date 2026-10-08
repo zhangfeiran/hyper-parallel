@@ -13,6 +13,12 @@
 
 namespace {
 void register_dsa_probes(torch::Library& m) {
+  m.def("dsa_mixed_grad_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_mixed_grad_out(Tensor query, Tensor key, Tensor value, Tensor indices, Tensor grad_out, "
+        "Tensor out, Tensor maximum, Tensor sum, Tensor actual_query, Tensor actual_kv, Tensor query_rope, "
+        "Tensor key_rope, Tensor config, Tensor(a!) trace, Tensor(b!) retained, float scale, int phase, "
+        "Tensor(c!) grad_query, Tensor(d!) grad_key, Tensor(e!) grad_value, Tensor(f!) grad_query_rope, "
+        "Tensor(g!) grad_key_rope) -> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
   m.def("dsa_mixed_indexer_version() -> int", []() -> int64_t { return 1; });
   m.def("dsa_mixed_indexer_out(Tensor query, Tensor key, Tensor weights, Tensor actual_query, "
         "Tensor actual_kv, Tensor config, Tensor(a!) trace, Tensor(b!) retained, int merge_phase, "

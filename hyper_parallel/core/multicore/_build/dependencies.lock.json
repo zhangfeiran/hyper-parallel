@@ -70,6 +70,11 @@
             "path": "hyper_parallel/core/multicore/ops/lightning_indexer_mixed.patch",
             "sha256": "be66db007e38bab84f128b4a6ddbfffc5e96d4e077a69e2f5506ff15e34f5ae8",
             "purpose": "retain logical LI partial Top-K across reusable mixed groups and separate main/LD merge kernel phases"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_grad_mixed.patch",
+            "sha256": "10ba8bb736dcad894d9bfd84cf1ab76e96e76b13a99e1fcdf867ba34bcd0023b",
+            "purpose": "separate SFA gradient initialization, physical mixed scratch and logical query/post partitions across three retained-workspace phases"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"

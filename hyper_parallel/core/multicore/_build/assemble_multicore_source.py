@@ -44,8 +44,13 @@ _OPS_TRANSFORMER_PATHS = (
     "attention/sparse_flash_attention/op_host",
     "attention/lightning_indexer/op_kernel",
     "attention/lightning_indexer/op_host",
+    "attention/sparse_flash_attention_grad/op_kernel",
+    "attention/sparse_flash_attention_grad/op_host",
+    "attention/sparse_flash_attention_grad/basic_modules",
     "common/include/err",
     "common/include/op_host/tiling_util.h",
+    "common/include/op_host/tiling_base.h",
+    "common/include/op_host/tiling_type.h",
 )
 _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad")
 
@@ -225,7 +230,8 @@ def _compose_hyper_parallel_ops(
     for filename in ("sparse_flash_attention_common.h", "sparse_flash_attention_template_tiling_key.h"):
         shutil.copy2(upstream_kernel / filename, mixed_root / "op_kernel" / filename)
     _compose_mixed_indexer(source_root, transformer_copy)
-    for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer"):
+    _compose_mixed_grad(source_root, transformer_copy)
+    for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad"):
         runtime = source_root / name / "op_kernel" / "runtime"
         runtime.mkdir()
         shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_mixed_group.h", runtime / "dsa_mixed_group.h")
@@ -246,6 +252,25 @@ def _compose_mixed_indexer(source_root: Path, transformer_copy: Path) -> None:
     shutil.copytree(upstream / "op_kernel" / "arch22", mixed_root / "op_kernel" / "arch22")
     for filename in ("lightning_indexer_common.h", "lightning_indexer_template_tiling_key.h"):
         shutil.copy2(upstream / "op_kernel" / filename, mixed_root / "op_kernel" / filename)
+
+
+def _compose_mixed_grad(source_root: Path, transformer_copy: Path) -> None:
+    """Retain the locked gradient math with separately ordered initialization and post."""
+    mixed_root = source_root / "hyper_dsa_mixed_grad"
+    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_mixed_grad", mixed_root)
+    shutil.copytree(transformer_copy / "common" / "include" / "err", mixed_root / "op_host" / "err")
+    (mixed_root / "op_host" / "op_host").mkdir()
+    for name in ("tiling_base.h", "tiling_type.h"):
+        shutil.copy2(transformer_copy / "common" / "include" / "op_host" / name,
+                     mixed_root / "op_host" / "op_host" / name)
+    upstream = transformer_copy / "attention" / "sparse_flash_attention_grad"
+    for name in ("sparse_flash_attention_grad_def.cpp", "sparse_flash_attention_grad_tiling_common.cpp",
+                 "sparse_flash_attention_grad_tiling_common.h", "sparse_flash_attention_grad_tiling.h",
+                 "sparse_flash_attention_grad_infershape.cpp"):
+        shutil.copy2(upstream / "op_host" / name, mixed_root / "op_host" / name)
+    shutil.copytree(upstream / "op_host" / "arch22", mixed_root / "op_host" / "arch22")
+    shutil.copytree(upstream / "op_kernel" / "arch22", mixed_root / "op_kernel" / "arch22")
+    shutil.copytree(upstream / "basic_modules", mixed_root / "basic_modules")
 
 
 def _require_assembled_files(source_root: Path) -> None:

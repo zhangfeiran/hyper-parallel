@@ -50,6 +50,16 @@ npu_op_kernel_sources(ascendc_kernels
 
 if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
     npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE HyperDsaMixedGrad
+        KERNEL_DIR ./hyper_dsa_mixed_grad/op_kernel
+        KERNEL_FILE hyper_dsa_mixed_grad.cpp
+        COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+    )
+    npu_op_kernel_options(ascendc_kernels OP_TYPE HyperDsaMixedGrad OPTIONS
+        --cce-auto-sync=off -Wno-deprecated-declarations
+        -mllvm -cce-vf-remove-membar=false
+        -mllvm -cce-aicore-hoist-movemask=false)
+    npu_op_kernel_sources(ascendc_kernels
         OP_TYPE HyperDsaMixedIndexer
         KERNEL_DIR ./hyper_dsa_mixed_indexer/op_kernel
         KERNEL_FILE hyper_dsa_mixed_indexer.cpp

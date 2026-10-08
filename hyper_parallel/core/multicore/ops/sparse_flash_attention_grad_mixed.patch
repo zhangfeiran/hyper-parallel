@@ -1,0 +1,581 @@
+--- a/attention/sparse_flash_attention_grad/op_kernel/arch22/sparse_flash_attention_grad_bs1_basic.h
++++ b/attention/sparse_flash_attention_grad/op_kernel/arch22/sparse_flash_attention_grad_bs1_basic.h
+@@ -40,16 +40,12 @@
+                                    GM_ADDR topk_indices, GM_ADDR actual_seq_qlen, GM_ADDR actual_seq_kvlen,
+                                    GM_ADDR query_rope, GM_ADDR key_rope,
+                                    GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR dq_rope, GM_ADDR dk_rope, 
+-                                   GM_ADDR workspace, const TILING_CLASS *__restrict tilingData);
++                                   GM_ADDR workspace, const TILING_CLASS *__restrict tilingData,
++                                   uint32_t logicalId, uint32_t physicalId, uint32_t phase);
+ 
+ private:
+-    __aicore__ inline void Init(const TILING_CLASS *__restrict tilingData);
+-    __aicore__ inline void ProcessDeterministic(GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR attention_out,
+-                                                GM_ADDR attention_out_grad, GM_ADDR softmax_max, GM_ADDR softmax_sum,
+-                                                GM_ADDR topk_indices, GM_ADDR actual_seq_qlen, GM_ADDR actual_seq_kvlen,
+-                                                GM_ADDR query_rope, GM_ADDR key_rope,
+-                                                GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR dq_rope, GM_ADDR dk_rope,
+-                                                GM_ADDR workspace, const TILING_CLASS *__restrict tilingData);
++    __aicore__ inline void Init(const TILING_CLASS *__restrict tilingData, uint32_t logicalId);
++
+     __aicore__ inline void ProcessNonDeterministic(GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR attention_out,
+                                                    GM_ADDR attention_out_grad, GM_ADDR softmax_max, GM_ADDR softmax_sum,
+                                                    GM_ADDR topk_indices, GM_ADDR actual_seq_qlen, GM_ADDR actual_seq_kvlen,
+@@ -73,6 +69,7 @@
+         const GM_ADDR actual_seq_kvlen);
+ 
+     uint32_t cubeBlockIdx;
++    uint32_t scratchIdx = 0;
+     uint32_t subBlockIdx;
+     uint32_t formerCoreNum;
+     uint32_t processBS1ByCore;
+@@ -175,7 +172,7 @@
+ };
+ 
+ template <typename SFAGT>
+-__aicore__ inline void SelectedAttentionGradBasic<SFAGT>::Init(const TILING_CLASS *__restrict tilingData)
++__aicore__ inline void SelectedAttentionGradBasic<SFAGT>::Init(const TILING_CLASS *__restrict tilingData, uint32_t logicalId)
+ {
+     dimB = tilingData->opInfo.B;
+     dimS1 = tilingData->opInfo.S1;
+@@ -199,11 +196,11 @@
+     }
+ 
+     if ASCEND_IS_AIC {
+-        cubeBlockIdx = GetBlockIdx();
++        cubeBlockIdx = logicalId;
+     }
+     if ASCEND_IS_AIV {
+-        cubeBlockIdx = GetBlockIdx() / 2;
+-        subBlockIdx = GetBlockIdx() % 2;
++        cubeBlockIdx = logicalId;
++        subBlockIdx = GetSubBlockIdx();
+     }
+ 
+     formerCoreNum = tilingData->opInfo.formerCoreNum;
+@@ -231,23 +228,37 @@
+     GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR attention_out, GM_ADDR attention_out_grad, GM_ADDR softmax_max,
+     GM_ADDR softmax_sum, GM_ADDR topk_indices, GM_ADDR actual_seq_qlen, GM_ADDR actual_seq_kvlen,
+     GM_ADDR query_rope, GM_ADDR key_rope, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR dq_rope, GM_ADDR dk_rope,
+-    GM_ADDR workspace, const TILING_CLASS *__restrict tilingData)
+-{
+-    Init(tilingData);
++    GM_ADDR workspace, const TILING_CLASS *__restrict tilingData,
++    uint32_t logicalId, uint32_t physicalId, uint32_t phase)
++{
++    Init(tilingData, logicalId);
++    scratchIdx = physicalId;
+     topkIndicesGm.SetGlobalBuffer((__gm__ int32_t *)topk_indices);
+-    if constexpr (IS_BSND == false) {
+-        validT1 = ((__gm__ int32_t *)actual_seq_qlen)[dimB - 1];
+-    }
+-
+-    if constexpr (IS_DETERMINISTIC) {
+-        ProcessDeterministic(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum,
+-                             topk_indices, actual_seq_qlen, actual_seq_kvlen, query_rope, key_rope,
+-                             dq, dk, dv, dq_rope, dk_rope, workspace, tilingData);
+-    } else {
+-        ProcessNonDeterministic(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum,
+-                                topk_indices, actual_seq_qlen, actual_seq_kvlen, query_rope, key_rope,
+-                                dq, dk, dv, dq_rope, dk_rope, workspace, tilingData);
+-    }
++    validT1 = ((__gm__ int32_t *)actual_seq_qlen)[dimB - 1];
++    if (phase == 0) {
++        if ASCEND_IS_AIV {
++            TPipe pipe;
++            VecOp<SFAGT> vector;
++            vector.Init(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum,
++                        topk_indices, actual_seq_qlen, actual_seq_kvlen, key_rope,
++                        dq, dk, dv, workspace, tilingData, &pipe, logicalId, 0, true);
++        }
++        return;
++    }
++    if (phase == 2) {
++        if ASCEND_IS_AIV {
++            TPipe pipe;
++            SparseFlashAttentionGradPost<T1, TILING_CLASS, true, 3, 0, HAS_ROPE> post;
++            post.Init(dq, dk, dv, actual_seq_qlen, actual_seq_kvlen, dq_rope, dk_rope,
++                      workspace, tilingData, &pipe, logicalId * 2 + GetSubBlockIdx());
++            post.Process();
++        }
++        return;
++    }
++    if (logicalId >= usedCoreNum) { return; }
++    ProcessNonDeterministic(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum,
++                            topk_indices, actual_seq_qlen, actual_seq_kvlen, query_rope, key_rope,
++                            dq, dk, dv, dq_rope, dk_rope, workspace, tilingData);
+ }
+ 
+ template <typename SFAGT>
+@@ -266,7 +277,7 @@
+         TPipe pipeCube;
+         CubeOp<SFAGT> cubeOp;
+         cubeOp.Init(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum, topk_indices,
+-                    actual_seq_qlen, actual_seq_kvlen, query_rope, key_rope, dq, dk, dv, workspace, tilingData, &pipeCube);
++                    actual_seq_qlen, actual_seq_kvlen, query_rope, key_rope, dq, dk, dv, workspace, tilingData, &pipeCube, scratchIdx);
+         AllocEventID();
+         int64_t task = 0;
+         bool changeS1 = false;
+@@ -314,8 +325,7 @@
+         TPipe pipeVec;
+         VecOp<SFAGT> vecOp;
+         vecOp.Init(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum, topk_indices,
+-                   actual_seq_qlen, actual_seq_kvlen, key_rope, dq, dk, dv, workspace, tilingData, &pipeVec);
+-        SyncAll();
++                   actual_seq_qlen, actual_seq_kvlen, key_rope, dq, dk, dv, workspace, tilingData, &pipeVec, cubeBlockIdx, scratchIdx, false);
+         tmpScatterRunInfo[0].changeS1 = false;
+         tmpScatterRunInfo[1].changeS1 = false;
+         scatterRunInfo.changeS1 = false;
+@@ -405,209 +415,8 @@
+         WAIT_FLAG(V, MTE2, scatterTmpVMte2WaitV);
+         WAIT_FLAG(V, MTE2, scatterTmpKMte2WaitVPong);
+         WAIT_FLAG(V, MTE2, scatterTmpVMte2WaitVPong);
+-        SyncAll();
+         pipeVec.Destroy();
+ 
+-        TPipe pipeCast;
+-        if constexpr (KV_MERGE) {
+-            SparseFlashAttentionGradPost<T1, TILING_CLASS, false, 3, 0, HAS_ROPE> opCast;
+-            opCast.Init(dq, dk, dv, actual_seq_qlen, actual_seq_kvlen, dq_rope, dk_rope, workspace, tilingData, &pipeCast);
+-            opCast.Process();
+-        } else {
+-            SparseFlashAttentionGradPost<T1, TILING_CLASS, true, 3, 0, HAS_ROPE> opCast;
+-            opCast.Init(dq, dk, dv, actual_seq_qlen, actual_seq_kvlen, dq_rope, dk_rope, workspace, tilingData, &pipeCast);
+-            opCast.Process();
+-        }
+-    }
+-}
+-
+-template <typename SFAGT>
+-__aicore__ inline void SelectedAttentionGradBasic<SFAGT>::ProcessDeterministic(
+-    GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR attention_out, GM_ADDR attention_out_grad, GM_ADDR softmax_max,
+-    GM_ADDR softmax_sum, GM_ADDR topk_indices, GM_ADDR actual_seq_qlen, GM_ADDR actual_seq_kvlen,
+-    GM_ADDR query_rope, GM_ADDR key_rope, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR dq_rope, GM_ADDR dk_rope,
+-    GM_ADDR workspace, const TILING_CLASS *__restrict tilingData)
+-{
+-    // AIC Process
+-    if ASCEND_IS_AIC {
+-        TPipe pipeCube;
+-        CubeOp<SFAGT> cubeOp;
+-        cubeOp.Init(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum, topk_indices,
+-                    actual_seq_qlen, actual_seq_kvlen, query_rope, key_rope, dq, dk, dv, workspace, tilingData, &pipeCube);
+-        AllocEventID();
+-        int64_t task = 0;
+-        bool changeS1 = false;
+-        for (int32_t i = 0; i < processBS1ByCore; i++) {
+-            scatterTaskId = i % PING_PONG_BUFFER;
+-            int32_t t1Index = cubeBlockIdx + usedCoreNum * i;
+-            if (!IS_BSND && t1Index >= validT1) {
+-                break;
+-            }
+-            GetTndSeqLen(actual_seq_qlen, actual_seq_kvlen, t1Index, bIndex);
+-            for (n2Index = 0; n2Index < dimN2; n2Index++) {
+-                isLastBlockSelected = false;
+-                GetActualSelCount(t1Index, n2Index, actualSelectedBlockCount);
+-                for (blkCntOffset = 0; blkCntOffset < actualSelectedBlockCount; blkCntOffset += selectedCountOffset) {
+-                    UpdateGmOffset(task, true);
+-                    CubeCompute(cubeOp);
+-                    if (changeS1) {
+-                        CrossCoreSetFlag<0, PIPE_FIX>(SCATTER_CUBE_SYNC_FLAG);
+-                        CrossCoreWaitFlag<0, PIPE_FIX>(SCATTER_CUBE_SYNC_FLAG);
+-                        CrossCoreSetFlag<2, PIPE_FIX>(SCATTER_SYNC_FLAG);
+-                        changeS1 = false;
+-                    }
+-                    task++;
+-                }
+-                if (unlikely(actualSelectedBlockCount == 0)) {
+-                    if (runInfo[1 - mmPingPongIdx].valid) {
+-                        int64_t taskMod1 = runInfo[1 - mmPingPongIdx].task & 1;
+-                        CrossCoreWaitFlag<2, PIPE_MTE2>(taskMod1 == 0 ? CUBE_WAIT_VEC_PING : CUBE_WAIT_VEC_PONG);
+-                        runInfo[1 - mmPingPongIdx].noReload = true;
+-                        cubeOp.cube345Process(runInfo[1 - mmPingPongIdx], lastblkCntOffset, 1 - mmPingPongIdx);
+-                        runInfo[1 - mmPingPongIdx].noReload = false;
+-                        runInfo[1 - mmPingPongIdx].valid = false;
+-                        CrossCoreSetFlag<0, PIPE_FIX>(SCATTER_CUBE_SYNC_FLAG);
+-                        CrossCoreWaitFlag<0, PIPE_FIX>(SCATTER_CUBE_SYNC_FLAG);
+-                        CrossCoreSetFlag<2, PIPE_FIX>(SCATTER_SYNC_FLAG);
+-                    }
+-                    CrossCoreSetFlag<0, PIPE_FIX>(SCATTER_CUBE_SYNC_FLAG);
+-                    CrossCoreWaitFlag<0, PIPE_FIX>(SCATTER_CUBE_SYNC_FLAG);
+-                    CrossCoreSetFlag<2, PIPE_FIX>(SCATTER_SYNC_FLAG);
+-                    changeS1 = false;
+-                }
+-            }
+-            if (likely(actualSelectedBlockCount != 0)) {
+-                changeS1 = true;
+-            }
+-        }
+-
+-        if (cubeBlockIdx < usedCoreNum && task > 0) {
+-            int64_t taskMod = runInfo[1 - mmPingPongIdx].task & 1;
+-            CrossCoreWaitFlag<2, PIPE_MTE2>(taskMod == 0 ? CUBE_WAIT_VEC_PING : CUBE_WAIT_VEC_PONG);
+-            runInfo[1 - mmPingPongIdx].noReload = true;
+-            cubeOp.cube345Process(runInfo[1 - mmPingPongIdx], lastblkCntOffset, 1 - mmPingPongIdx);
+-            runInfo[1 - mmPingPongIdx].noReload = false;
+-            CrossCoreSetFlag<0, PIPE_FIX>(SCATTER_CUBE_SYNC_FLAG);
+-            CrossCoreWaitFlag<0, PIPE_FIX>(SCATTER_CUBE_SYNC_FLAG);
+-            CrossCoreSetFlag<2, PIPE_FIX>(SCATTER_SYNC_FLAG);
+-        }
+-
+-        if (processBS1ByCore < tilingData->opInfo.formerCoreProcessNNum) {
+-            CrossCoreSetFlag<0, PIPE_FIX>(SCATTER_CUBE_SYNC_FLAG);
+-            CrossCoreWaitFlag<0, PIPE_FIX>(SCATTER_CUBE_SYNC_FLAG);
+-            CrossCoreSetFlag<2, PIPE_FIX>(SCATTER_SYNC_FLAG);
+-        }
+-        FreeEventID();
+-    }
+-
+-    // AIV Process
+-    if ASCEND_IS_AIV {
+-        TPipe pipeVec;
+-        VecOp<SFAGT> vecOp;
+-        vecOp.Init(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum, topk_indices,
+-                   actual_seq_qlen, actual_seq_kvlen, key_rope, dq, dk, dv, workspace, tilingData, &pipeVec);
+-        SyncAll();
+-        bool isCruS1Empty = false;
+-        tmpScatterRunInfoDet.changeS1 = false;
+-        scatterRunInfo.changeS1 = false;
+-        int64_t task = 0;
+-
+-        for (int32_t i = 0; i < processBS1ByCore; i++) {
+-            scatterTaskId = i % PING_PONG_BUFFER;
+-            int32_t t1Index = cubeBlockIdx + usedCoreNum * i;
+-            if (!IS_BSND && t1Index >= validT1) {
+-                break;
+-            }
+-            GetTndSeqLen(actual_seq_qlen, actual_seq_kvlen, t1Index, bIndex);
+-            for (n2Index = 0; n2Index < dimN2; n2Index++) {
+-                isLastBlockSelected = false;
+-                GetActualSelCount(t1Index, n2Index, actualSelectedBlockCount);
+-                for (blkCntOffset = 0; blkCntOffset < actualSelectedBlockCount; blkCntOffset += selectedCountOffset) {
+-                    isValidBegin = true;
+-                    UpdateGmOffset(task, true);
+-                    VecCompute(vecOp, actual_seq_qlen, actual_seq_kvlen);
+-                    task++;
+-                }
+-                if (unlikely(actualSelectedBlockCount == 0)) {
+-                    if (scatterRunInfo.changeS1) {
+-                        CrossCoreWaitFlag<2, PIPE_MTE2>(SCATTER_SYNC_FLAG);
+-                        ScatterAddByS1(vecOp, actual_seq_qlen, actual_seq_kvlen);
+-                        scatterRunInfo.changeS1 = false;
+-                    }
+-                    if (runInfo[1 - mmPingPongIdx].valid) {
+-                        int64_t taskMod1 = runInfo[1 - mmPingPongIdx].task & 1;
+-                        CrossCoreWaitFlag(taskMod1 == 0 ? VEC_WAIT_CUBE_PING : VEC_WAIT_CUBE_PONG);
+-                        vecOp.Process(runInfo[1 - mmPingPongIdx]);
+-                        runInfo[1 - mmPingPongIdx].valid = false;
+-                        CrossCoreSetFlag<2, PIPE_MTE3>(taskMod1 == 0 ? CUBE_WAIT_VEC_PING : CUBE_WAIT_VEC_PONG);
+-                    }
+-                    if (tmpScatterRunInfoDet.changeS1) {
+-                        scatterRunInfo = tmpScatterRunInfoDet;
+-                        tmpScatterRunInfoDet.changeS1 = false;
+-                    }
+-                    UpdateGmOffset(task, false);
+-
+-                    if (!isValidBegin) {
+-                        scatterRunInfo = runInfo[mmPingPongIdx];
+-                        CrossCoreWaitFlag<2, PIPE_MTE2>(SCATTER_SYNC_FLAG);
+-                        ScatterAddByS1(vecOp, actual_seq_qlen, actual_seq_kvlen);
+-                    } else {
+-                        tmpScatterRunInfoDet = runInfo[mmPingPongIdx];
+-                        isCruS1Empty = true;
+-                    }
+-                }
+-            }
+-            tmpScatterRunInfoDet = isCruS1Empty ? tmpScatterRunInfoDet : runInfo[1 - mmPingPongIdx];
+-            tmpScatterRunInfoDet.changeS1 = true;
+-            isCruS1Empty = false;
+-        }
+-        if (cubeBlockIdx < usedCoreNum && task > 0) {
+-            if (scatterRunInfo.changeS1) {
+-                CrossCoreWaitFlag<2, PIPE_MTE2>(SCATTER_SYNC_FLAG);
+-                ScatterAddByS1(vecOp, actual_seq_qlen, actual_seq_kvlen);
+-                scatterRunInfo.changeS1 = false;
+-            }
+-
+-            int64_t taskMod1 = runInfo[1 - mmPingPongIdx].task & 1;
+-            CrossCoreWaitFlag(taskMod1 == 0 ? VEC_WAIT_CUBE_PING : VEC_WAIT_CUBE_PONG);
+-            vecOp.Process(runInfo[1 - mmPingPongIdx]);
+-            CrossCoreSetFlag<2, PIPE_MTE3>(taskMod1 == 0 ? CUBE_WAIT_VEC_PING : CUBE_WAIT_VEC_PONG);
+-
+-            CrossCoreWaitFlag<2, PIPE_MTE2>(SCATTER_SYNC_FLAG);
+-            scatterRunInfo = runInfo[1 - mmPingPongIdx];
+-            ScatterAddByS1(vecOp, actual_seq_qlen, actual_seq_kvlen);
+-        }
+-
+-        if (processBS1ByCore < tilingData->opInfo.formerCoreProcessNNum && cubeBlockIdx < usedCoreNum) {
+-            CrossCoreWaitFlag<2, PIPE_MTE2>(SCATTER_SYNC_FLAG);
+-            int64_t scatterSyncPhaseBegin = (task > 0 ? runInfo[1 - mmPingPongIdx].s1End :
+-                totalS1) * dimN2;
+-            int64_t scatterSyncPhaseEnd = totalS1 * dimN2;
+-            for (int64_t i = scatterSyncPhaseBegin; i < scatterSyncPhaseEnd; i++) {
+-                CrossCoreSetFlag<0, PIPE_MTE3>(SCATTER_VECTOR_SYNC_FLAG);
+-                CrossCoreWaitFlag<0, PIPE_MTE3>(SCATTER_VECTOR_SYNC_FLAG);
+-            }
+-        }
+-        if (cubeBlockIdx >= usedCoreNum) {
+-            CrossCoreWaitFlag<2, PIPE_MTE2>(SCATTER_SYNC_FLAG);
+-            for (int64_t i = 0; i < totalS1 * dimN2; i++) {
+-                CrossCoreSetFlag<0, PIPE_MTE3>(SCATTER_VECTOR_SYNC_FLAG);
+-                CrossCoreWaitFlag<0, PIPE_MTE3>(SCATTER_VECTOR_SYNC_FLAG);
+-            }
+-        }
+-        SyncAll();
+-        pipeVec.Destroy();
+-
+-        TPipe pipeCast;
+-        if constexpr (KV_MERGE) {
+-            SparseFlashAttentionGradPost<T1, TILING_CLASS, false, 3, 0, HAS_ROPE> opCast;
+-            opCast.Init(dq, dk, dv, actual_seq_qlen, actual_seq_kvlen, dq_rope, dk_rope, workspace, tilingData, &pipeCast);
+-            opCast.Process();
+-        } else {
+-            SparseFlashAttentionGradPost<T1, TILING_CLASS, true, 3, 0, HAS_ROPE> opCast;
+-            opCast.Init(dq, dk, dv, actual_seq_qlen, actual_seq_kvlen, dq_rope, dk_rope, workspace, tilingData, &pipeCast);
+-            opCast.Process();
+-        }
+     }
+ }
+ 
+--- a/attention/sparse_flash_attention_grad/basic_modules/sparse_flash_attention_grad_vec_op.h
++++ b/attention/sparse_flash_attention_grad/basic_modules/sparse_flash_attention_grad_vec_op.h
+@@ -46,7 +46,8 @@
+                                 GM_ADDR topk_indices, GM_ADDR actual_seq_qlen, GM_ADDR actual_seq_kvlen,
+                                 GM_ADDR key_rope,
+                                 GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace,
+-                                const TILING_CLASS *__restrict ordTilingData, TPipe *pipe);
++                                const TILING_CLASS *__restrict ordTilingData, TPipe *pipe,
++                                uint32_t logicalId, uint32_t physicalId, bool initialize);
+     __aicore__ inline void Process(const RunInfo &runInfo);
+     __aicore__ inline void GatherKV(const int64_t n2Index, uint64_t currentS1Offset, const RunInfo &runInfo);
+     __aicore__ inline void ScatterAddUnDeter(const RunInfo &runInfo);
+@@ -216,12 +217,15 @@
+                                           GM_ADDR topk_indices, GM_ADDR actual_seq_qlen, GM_ADDR actual_seq_kvlen,
+                                           GM_ADDR key_rope,
+                                           GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace,
+-                                          const TILING_CLASS *__restrict ordTilingData, TPipe *pipe)
++                                          const TILING_CLASS *__restrict ordTilingData, TPipe *pipe,
++                                          uint32_t logicalId, uint32_t physicalId, bool initialize)
+ {
+     InitParams(ordTilingData, actual_seq_qlen, actual_seq_kvlen);
++    cubeBlockIdx = physicalId;
++    vecBlockIdx = logicalId * 2 + GetSubBlockIdx();
+     InitGMBuffer(key, value, dv, attention_out, attention_out_grad, softmax_max, softmax_sum, topk_indices, key_rope, workspace);
+     InitUB(pipe);
+-    AtomicClean();
++    if (initialize) { AtomicClean(); }
+ }
+ 
+ template <typename SFAGT>
+--- a/attention/sparse_flash_attention_grad/basic_modules/sparse_flash_attention_grad_cube_op.h
++++ b/attention/sparse_flash_attention_grad/basic_modules/sparse_flash_attention_grad_cube_op.h
+@@ -34,7 +34,7 @@
+                                 GM_ADDR attention_out_grad, GM_ADDR softmax_max, GM_ADDR softmax_sum,
+                                 GM_ADDR topk_indices, GM_ADDR actual_seq_qlen, GM_ADDR actual_seq_kvlen,
+                                 GM_ADDR query_rope, GM_ADDR key_rope, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace,
+-                                const TILING_CLASS *__restrict tilingData, TPipe *pipe);
++                                const TILING_CLASS *__restrict tilingData, TPipe *pipe, uint32_t physicalId);
+ 
+     __aicore__ inline __attribute__((always_inline)) void preloadQueryAndDy(const RunInfo &runInfo);
+ 
+@@ -289,7 +289,7 @@
+                                            GM_ADDR attention_out_grad, GM_ADDR softmax_max, GM_ADDR softmax_sum,
+                                            GM_ADDR topk_indices, GM_ADDR actual_seq_qlen, GM_ADDR actual_seq_kvlen,
+                                            GM_ADDR query_rope, GM_ADDR key_rope, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace,
+-                                           const TILING_CLASS *__restrict tilingData, TPipe *pipe)
++                                           const TILING_CLASS *__restrict tilingData, TPipe *pipe, uint32_t physicalId)
+ {
+     dimG = tilingData->opInfo.G;
+     dimN2 = tilingData->opInfo.N2;
+@@ -319,6 +319,7 @@
+     uint64_t config = 0x1;
+     AscendC::SetNdParaImpl(config);
+ 
++    cBlockIdx = physicalId;
+     InitGMBuffer(query, key, value, attention_out, attention_out_grad, softmax_max, softmax_sum, topk_indices,
+                  query_rope, key_rope, workspace);
+     InitLocalTensor();
+@@ -378,7 +379,6 @@
+     topkIndicesGm.SetGlobalBuffer((__gm__ int32_t *)topk_indices);
+ 
+     int64_t usedWorkspaceLen = 0;
+-    cBlockIdx = GetBlockIdx();
+     // select
+     int64_t selectedKAddr = usedWorkspaceLen / sizeof(T1) + cBlockIdx * selectedKWorkspaceLen / sizeof(T1);
+     usedWorkspaceLen += selectedKWorkspaceLen * usedCoreNum;
+--- a/attention/sparse_flash_attention_grad/op_kernel/arch22/sparse_flash_attention_grad_post.h
++++ b/attention/sparse_flash_attention_grad/op_kernel/arch22/sparse_flash_attention_grad_post.h
+@@ -25,7 +25,7 @@
+     __aicore__ inline void Init(__gm__ uint8_t *dq, __gm__ uint8_t *dk, __gm__ uint8_t *dv,
+                                 __gm__ uint8_t *actual_seq_qlen, __gm__ uint8_t *actual_seq_kvlen,
+                                 __gm__ uint8_t *dq_rope, __gm__ uint8_t *dk_rope,
+-                                __gm__ uint8_t *workspace, const TILING_TYPE *__restrict ordTilingData, TPipe *pipe_in);
++                                __gm__ uint8_t *workspace, const TILING_TYPE *__restrict ordTilingData, TPipe *pipe_in, uint32_t logicalVectorId);
+     __aicore__ inline void Process();
+     __aicore__ inline void InitIndex(uint64_t startIdx, int64_t curG, int64_t &curS, int64_t headDim,
+                                      int64_t headDimAlign, GM_ADDR seqS);
+@@ -129,9 +129,9 @@
+     __gm__ uint8_t *dq, __gm__ uint8_t *dk, __gm__ uint8_t *dv, __gm__ uint8_t *actual_seq_qlen,
+     __gm__ uint8_t *actual_seq_kvlen, __gm__ uint8_t *dq_rope, __gm__ uint8_t *dk_rope,
+     __gm__ uint8_t *workspace, const TILING_TYPE *__restrict ordTilingData,
+-    TPipe *pipe_in)
++    TPipe *pipe_in, uint32_t logicalVectorId)
+ {
+-    cBlockIdx = GetBlockIdx();
++    cBlockIdx = logicalVectorId;
+ 
+     tilingData = ordTilingData;
+     pipe = pipe_in;
+--- a/attention/sparse_flash_attention_grad/op_host/sparse_flash_attention_grad_def.cpp
++++ b/attention/sparse_flash_attention_grad/op_host/sparse_flash_attention_grad_def.cpp
+@@ -17,9 +17,9 @@
+ 
+ namespace ops {
+ 
+-class SparseFlashAttentionGrad : public OpDef {
++class HyperDsaMixedGrad : public OpDef {
+ public:
+-    explicit SparseFlashAttentionGrad(const char *name) : OpDef(name)
++    explicit HyperDsaMixedGrad(const char *name) : OpDef(name)
+     {
+         this->Input("query")
+             .ParamType(REQUIRED)
+@@ -103,6 +103,12 @@
+             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+             .AutoContiguous();
+ 
++        this->Input("runtime_config").ParamType(REQUIRED).DataTypeList({ge::DT_INT64})
++            .FormatList({ge::FORMAT_ND});
++        this->Input("group_trace").ParamType(REQUIRED).DataTypeList({ge::DT_INT64})
++            .FormatList({ge::FORMAT_ND});
++        this->Input("tile_workspace").ParamType(REQUIRED).DataTypeList({ge::DT_UINT8})
++            .FormatList({ge::FORMAT_ND});
+         this->Output("d_query")
+             .ParamType(REQUIRED)
+             .DataType({ge::DT_BF16, ge::DT_FLOAT16})
+@@ -141,6 +147,7 @@
+         this->Attr("next_tokens").AttrType(OPTIONAL).Int(2147483647);
+         this->Attr("deterministic").AttrType(OPTIONAL).Bool(false);
+ 
++        this->Attr("phase").AttrType(REQUIRED).Int();
+         OpAICoreConfig aicore_config;
+         aicore_config.DynamicCompileStaticFlag(true)
+             .DynamicFormatFlag(true)
+@@ -153,11 +160,9 @@
+             .ExtendCfgInfo("jitCompile.flag", "static_false,dynamic_false");
+ 
+         this->AICore().AddConfig("ascend910b", aicore_config);
+-        this->AICore().AddConfig("ascend910_93", aicore_config);
+-        this->AICore().AddConfig("ascend950", aicore_config);
+     }
+ };
+ 
+-OP_ADD(SparseFlashAttentionGrad);
++OP_ADD(HyperDsaMixedGrad);
+ 
+ } // namespace ops
+--- a/attention/sparse_flash_attention_grad/op_host/sparse_flash_attention_grad_infershape.cpp
++++ b/attention/sparse_flash_attention_grad/op_host/sparse_flash_attention_grad_infershape.cpp
+@@ -125,7 +125,7 @@
+     return GRAPH_SUCCESS;
+ }
+ 
+-IMPL_OP_INFERSHAPE(SparseFlashAttentionGrad)
++IMPL_OP_INFERSHAPE(HyperDsaMixedGrad)
+     .InferShape(InferShape4SparseFlashAttentionGrad)
+     .InferDataType(InferDataType4SparseFlashAttentionGrad);
+ } // namespace sfag
+--- a/attention/sparse_flash_attention_grad/op_host/sparse_flash_attention_grad_tiling.h
++++ b/attention/sparse_flash_attention_grad/op_host/sparse_flash_attention_grad_tiling.h
+@@ -140,40 +140,41 @@
+ TILING_DATA_FIELD_DEF_STRUCT(SfagPostParams, postTilingData);
+ TILING_DATA_FIELD_DEF_STRUCT(SoftMaxTiling, softmaxTilingData);
+ TILING_DATA_FIELD_DEF_STRUCT(SoftMaxTiling, softmaxGradTilingData);
++TILING_DATA_FIELD_DEF(uint32_t, mixedPhase);
+ END_TILING_DATA_DEF;
+ //======================== basic template tiling data def end ========================//
+ 
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad, SparseFlashAttentionGradEmptyTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_100000, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_100001, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_100010, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_100011, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_100100, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_100101, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_100110, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_100111, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_101000, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_101001, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_101010, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_101011, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_101100, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_101101, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_101110, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_101111, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_110000, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_110001, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_110010, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_110011, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_110100, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_110101, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_110110, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_110111, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_111000, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_111001, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_111010, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_111011, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_111100, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_111101, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_111110, SparseFlashAttentionGradBasicTilingData)
+-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGrad_111111, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_100000, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_100001, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_100010, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_100011, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_100100, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_100101, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_100110, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_100111, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_101000, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_101001, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_101010, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_101011, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_101100, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_101101, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_101110, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_101111, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_110000, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_110001, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_110010, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_110011, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_110100, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_110101, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_110110, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_110111, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_111000, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_111001, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_111010, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_111011, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_111100, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_111101, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_111110, SparseFlashAttentionGradBasicTilingData)
++REGISTER_TILING_DATA_CLASS(HyperDsaMixedGrad_111111, SparseFlashAttentionGradBasicTilingData)
+ } // namespace optiling
+--- a/attention/sparse_flash_attention_grad/op_host/arch22/sparse_flash_attention_grad_tiling_bs1_basic.cpp
++++ b/attention/sparse_flash_attention_grad/op_host/arch22/sparse_flash_attention_grad_tiling_bs1_basic.cpp
+@@ -14,7 +14,6 @@
+  */
+ 
+ #include "sparse_flash_attention_grad_tiling_bs1_basic.h"
+-#include "op_host/tiling_templates_registry.h"
+ #include <algorithm>
+ 
+ namespace optiling {
+@@ -659,7 +658,6 @@
+     return ge::GRAPH_SUCCESS;
+ }
+ 
+-REGISTER_TILING_TEMPLATE_WITH_ARCH(SparseFlashAttentionGrad, SparseFlashAttentionGradBasicTiling, std::vector<int32_t>({static_cast<int32_t>(NpuArch::DAV_2201)}), 1);
+ 
+ } // namespace sfag
+ } // namespace optiling
