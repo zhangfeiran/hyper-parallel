@@ -34,6 +34,7 @@ from hyper_parallel.core.multicore._build.prepare_dependencies import (
     _git_archive_sha256,
     verify_git_dependency,
 )
+from hyper_parallel.core.multicore.backends.schema import install_cpp_schema
 from hyper_parallel.core.multicore.runtime.abi import family_abi
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -115,6 +116,7 @@ def _assemble(repository, ops_nn, ops_mhc, work):
         operator = source / name
         shutil.copytree(pinned / _MULTICORE / "ops" / name, operator)
         shutil.copytree(pinned / _MULTICORE / "ops/runtime", operator / "op_kernel/runtime")
+        install_cpp_schema(operator / "op_kernel/runtime", "mhc")
         shutil.copytree(nn / "norm" / norm / "op_kernel", operator / "op_kernel" / norm)
         shutil.copytree(mhc / "mhc" / post / "op_kernel/arch22", operator / "op_kernel" / post)
         shutil.copytree(mhc / "mhc" / pre / "op_kernel", operator / "op_kernel" / pre)

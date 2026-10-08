@@ -20,8 +20,8 @@ Out-of-tree PyTorch operator registration for MoE-FFN operators.
 Registers into the ``hyper_parallel`` PyTorch namespace — does NOT modify
 op-plugin or any PyTorch source. The operators are accessible via:
 
-    torch.ops.hyper_parallel.mega_moe(...)
-    torch.ops.hyper_parallel.mega_moe_grad(...)
+    native_calls.mega_moe(...)
+    native_calls.mega_moe_grad(...)
 
 Or via the Python wrappers in this module:
 
@@ -43,6 +43,7 @@ from hyper_parallel.core.multicore._loader import (
     get_multicore_paths,
     preload_vendor_library,
 )
+from hyper_parallel.core.multicore.runtime.generated import native_calls
 
 
 @lru_cache(maxsize=1)
@@ -179,7 +180,7 @@ def mega_moe(
         Topology / shape attributes.
     """
     _load_native()
-    torch.ops.hyper_parallel.mega_moe(
+    native_calls.mega_moe(
         dispatch_target,
         dispatch_target_off,
         dispatch_src,
@@ -260,7 +261,7 @@ def mega_moe_grad(
             their registered schema order.
     """
     _load_native()
-    torch.ops.hyper_parallel.mega_moe_grad(
+    native_calls.mega_moe_grad(
         dispatch_target,
         dispatch_target_off,
         dy,
@@ -365,7 +366,7 @@ def mega_moe_with_profile_buffer(
         Topology / shape attributes.
     """
     _load_native()
-    torch.ops.hyper_parallel.mega_moe(
+    native_calls.mega_moe(
         dispatch_target,
         dispatch_target_off,
         dispatch_src,
@@ -446,7 +447,7 @@ def mega_moe_grad_with_profile_buffer(
             retain their registered schema order.
     """
     _load_native()
-    torch.ops.hyper_parallel.mega_moe_grad(
+    native_calls.mega_moe_grad(
         dispatch_target,
         dispatch_target_off,
         dy,

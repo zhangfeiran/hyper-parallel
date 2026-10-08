@@ -1,0 +1,841 @@
+{
+  "common_enums": {
+    "DynamicType": {
+      "DYNAMIC_DSV3_MOE": 101,
+      "DYNAMIC_EMPTY": 0
+    },
+    "EventType": {
+      "EVENT_EMPTY": 900,
+      "EVENT_END_OF_TASK_GRAPH": 910,
+      "EVENT_INVALID": 999,
+      "EVENT_LAUNCH_DEPENDENT_TASKS": 903,
+      "EVENT_LAUNCH_MASSIVE_TASKS": 902,
+      "EVENT_LAUNCH_TASKS": 901,
+      "EVENT_TERMINATION": 911
+    },
+    "TaskAiCoreType": {
+      "TASK_AICORE_CUBE": 1,
+      "TASK_AICORE_INVALID": 0,
+      "TASK_AICORE_MIX": 3,
+      "TASK_AICORE_VECTOR": 2
+    }
+  },
+  "cpp_field_types": {
+    "DynamicDataC.dynamic_max_seq_len": "uint32"
+  },
+  "entries": {
+    "mega_gate_route": {
+      "arguments": [
+        {
+          "name": "logits",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "text_bias",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "vision_bias",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "image_mask",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "runtime_config",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "profile_buffer",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "top_k",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "routed_scaling_factor",
+          "type": "float",
+          "write": false
+        },
+        {
+          "name": "use_vision_bias",
+          "type": "bool",
+          "write": false
+        }
+      ],
+      "family": "gate",
+      "returns": [
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor"
+      ],
+      "schema": "mega_gate_route(Tensor logits, Tensor text_bias, Tensor vision_bias, Tensor image_mask, Tensor runtime_config, Tensor profile_buffer, int top_k, float routed_scaling_factor, bool use_vision_bias) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+    },
+    "mega_gate_route_grad": {
+      "arguments": [
+        {
+          "name": "logits",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "route_scores",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "selected_scores",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "normalization_denominator",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "expert_indices",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "grad_routing_weights",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "direct_grad_logits",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "runtime_config",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "profile_buffer",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "top_k",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "routed_scaling_factor",
+          "type": "float",
+          "write": false
+        },
+        {
+          "name": "has_direct_grad",
+          "type": "bool",
+          "write": false
+        }
+      ],
+      "family": "gate",
+      "returns": [
+        "Tensor"
+      ],
+      "schema": "mega_gate_route_grad(Tensor logits, Tensor route_scores, Tensor selected_scores, Tensor normalization_denominator, Tensor expert_indices, Tensor grad_routing_weights, Tensor direct_grad_logits, Tensor runtime_config, Tensor profile_buffer, int top_k, float routed_scaling_factor, bool has_direct_grad) -> Tensor"
+    },
+    "mega_mhc": {
+      "arguments": [
+        {
+          "name": "previous_output",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "residual",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "previous_pre_mix",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "previous_post_mix",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "previous_residual_mix",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "phi",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "alpha",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "bias",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "norm_weight",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "runtime_config",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "all_event_counters",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "profile_buffer",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "new_residual",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "next_pre_mix",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "next_post_mix",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "next_residual_mix",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "block_input",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "hc_before_norm",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "inv_rms",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "sum_out",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "norm_out",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "mixed_input",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "rms_rstd",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "hc_eps",
+          "type": "float",
+          "write": false
+        },
+        {
+          "name": "norm_eps",
+          "type": "float",
+          "write": false
+        },
+        {
+          "name": "num_iters",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "need_backward",
+          "type": "bool",
+          "write": false
+        }
+      ],
+      "family": "mhc",
+      "returns": [
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor"
+      ],
+      "schema": "mega_mhc(Tensor previous_output, Tensor residual, Tensor previous_pre_mix, Tensor previous_post_mix, Tensor previous_residual_mix, Tensor phi, Tensor alpha, Tensor bias, Tensor norm_weight, Tensor runtime_config, Tensor all_event_counters, Tensor profile_buffer, Tensor(a!) new_residual, Tensor(b!) next_pre_mix, Tensor(c!) next_post_mix, Tensor(d!) next_residual_mix, Tensor(e!) block_input, Tensor(f!) hc_before_norm, Tensor(g!) inv_rms, Tensor(h!) sum_out, Tensor(i!) norm_out, Tensor(j!) mixed_input, Tensor(k!) rms_rstd, float hc_eps, float norm_eps, int num_iters, bool need_backward) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), Tensor(i!), Tensor(j!), Tensor(k!))"
+    },
+    "mega_mhc_grad": {
+      "arguments": [
+        {
+          "name": "grad_hin_placeholder",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "grad_h_post",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "grad_h_res",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "x",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "phi",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "alpha",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "bias",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "previous_pre",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "hc_before_norm",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "inv_rms",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "sum_out",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "norm_out",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "grad_current_pre",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "mixed_input",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "rms_rstd",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "norm_weight",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "direct_grad_x",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "previous_residual",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "previous_output",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "previous_post",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "previous_residual_mix",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "runtime_config",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "all_event_counters",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "profile_buffer",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "grad_residual",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "grad_phi",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "grad_alpha",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "grad_bias",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "grad_previous_output",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "grad_previous_pre",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "grad_previous_post",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "grad_previous_residual",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "grad_norm_weight",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "hc_eps",
+          "type": "float",
+          "write": false
+        }
+      ],
+      "family": "mhc",
+      "returns": [
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor"
+      ],
+      "schema": "mega_mhc_grad(Tensor grad_hin_placeholder, Tensor grad_h_post, Tensor grad_h_res, Tensor x, Tensor phi, Tensor alpha, Tensor bias, Tensor previous_pre, Tensor hc_before_norm, Tensor inv_rms, Tensor sum_out, Tensor norm_out, Tensor grad_current_pre, Tensor mixed_input, Tensor rms_rstd, Tensor norm_weight, Tensor direct_grad_x, Tensor previous_residual, Tensor previous_output, Tensor previous_post, Tensor previous_residual_mix, Tensor runtime_config, Tensor all_event_counters, Tensor profile_buffer, Tensor(a!) grad_residual, Tensor(b!) grad_phi, Tensor(c!) grad_alpha, Tensor(d!) grad_bias, Tensor(e!) grad_previous_output, Tensor(f!) grad_previous_pre, Tensor(g!) grad_previous_post, Tensor(h!) grad_previous_residual, Tensor(i!) grad_norm_weight, float hc_eps) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), Tensor(i!))"
+    },
+    "mega_moe": {
+      "arguments": [
+        {
+          "name": "dispatch_target",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "dispatch_target_off",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "dispatch_src",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "dispatch_src_off",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "dispatch_size",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "up_proj_weight",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "up_proj_glist",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "up_proj_y",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "swiglu_out",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "down_proj_weight",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "down_proj_glist",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "down_proj_y",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "combine_target",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "combine_target_off",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "combine_src_off",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "combine_size",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "gmm_workspace",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "up_proj_tiling",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "swiglu_tiling",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "down_proj_tiling",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "runtime_config",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "all_event_counters",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "profile_buffer",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "rank_id",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "ep",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "expert_num",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "hidden_size",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "seq_size",
+          "type": "int",
+          "write": false
+        }
+      ],
+      "family": "moe",
+      "returns": [
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor"
+      ],
+      "schema": "mega_moe(Tensor(a!) dispatch_target, Tensor dispatch_target_off, Tensor dispatch_src, Tensor dispatch_src_off, Tensor dispatch_size, Tensor up_proj_weight, Tensor up_proj_glist, Tensor(b!) up_proj_y, Tensor(c!) swiglu_out, Tensor down_proj_weight, Tensor down_proj_glist, Tensor(d!) down_proj_y, Tensor(e!) combine_target, Tensor combine_target_off, Tensor combine_src_off, Tensor combine_size, Tensor gmm_workspace, Tensor up_proj_tiling, Tensor swiglu_tiling, Tensor down_proj_tiling, Tensor runtime_config, Tensor all_event_counters, Tensor profile_buffer, int rank_id, int ep, int expert_num, int hidden_size, int seq_size) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!))"
+    },
+    "mega_moe_grad": {
+      "arguments": [
+        {
+          "name": "dispatch_target",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "dispatch_target_off",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "dy",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "dispatch_src_off",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "dispatch_size",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "hidden",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "hidden_dw",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "w2",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "act_grad_y",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "gate",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "grad_gate",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "w1",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "gate_dx",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "grad_x",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "combine_target_off",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "combine_src_off",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "combine_size",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "permute_out",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "gate_dw",
+          "type": "Tensor",
+          "write": true
+        },
+        {
+          "name": "group_list",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "act_grad_tiling",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "gate_grad_tiling",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "w1_grad_tiling",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "w2_grad_tiling",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "swiglu_grad_tiling",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "gmm_workspace",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "swiglu_grad_workspace",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "runtime_config",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "all_event_counters",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "profile_buffer",
+          "type": "Tensor",
+          "write": false
+        },
+        {
+          "name": "rank_id",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "ep",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "expert_num",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "hidden_size",
+          "type": "int",
+          "write": false
+        },
+        {
+          "name": "seq_size",
+          "type": "int",
+          "write": false
+        }
+      ],
+      "family": "moe",
+      "returns": [
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor",
+        "Tensor"
+      ],
+      "schema": "mega_moe_grad(Tensor(a!) dispatch_target, Tensor dispatch_target_off, Tensor dy, Tensor dispatch_src_off, Tensor dispatch_size, Tensor hidden, Tensor(b!) hidden_dw, Tensor w2, Tensor(c!) act_grad_y, Tensor gate, Tensor(d!) grad_gate, Tensor w1, Tensor(a!) gate_dx, Tensor(f!) grad_x, Tensor combine_target_off, Tensor combine_src_off, Tensor combine_size, Tensor(g!) permute_out, Tensor(h!) gate_dw, Tensor group_list, Tensor act_grad_tiling, Tensor gate_grad_tiling, Tensor w1_grad_tiling, Tensor w2_grad_tiling, Tensor swiglu_grad_tiling, Tensor gmm_workspace, Tensor swiglu_grad_workspace, Tensor runtime_config, Tensor all_event_counters, Tensor profile_buffer, int rank_id, int ep, int expert_num, int hidden_size, int seq_size) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!), Tensor(f!), Tensor(g!), Tensor(h!))"
+    }
+  },
+  "version": 1
+}

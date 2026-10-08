@@ -400,3 +400,77 @@ and profile coverage. The CPU primitive references expose the native BF16
 mixed-input cache boundary explicitly; the independent acceptance oracle retains
 its original mathematical reference. Device admission applies to the validated
 shapes/topology, without a performance or full-model convergence claim.
+
+## P5 shared schema and source emission
+
+`Program.compile(...)` uses the same backend emission entry for Gate, MoE and
+MHC. Existing `plan(...)`, materialization and model call signatures retain their
+family-specific behavior. Compilation currently emits sources and complete
+schedule artifacts; its manifest explicitly reports `status="source_only"`.
+It does not claim that a generated source bundle is a compiled device binary.
+
+```python
+from pathlib import Path
+from hyper_parallel.core.multicore.frontend.examples.gate_route import _route
+from hyper_parallel.core.multicore.runtime.cache import EmissionCache
+
+emission = _route.compile({"T": 41, "E": 16}, k=3, scale=2.5)
+path = EmissionCache(Path("build/native/frontend-cache")).store(emission)
+print(emission.export_manifest())
+```
+
+The bundle includes Python/C++ wire declarations, Python/C++ typed call wrappers,
+the selected native binding schema, normal/profiled forward/backward images,
+optional MoE no-replica backward, the static plan and its semantic source map.
+The following identities have different lifetimes:
+
+- `definition_key` covers normalized semantic IR, constexprs, family ABI/native
+  source closure and actual generator inputs. Runtime row counts and tensor
+  pointers do not enter this key.
+- `plan_key` adds static shapes/capacities, topology/rank and serialized schedule
+  images. Dynamic routing counts and process-group objects remain outside it.
+- `artifact_key` also covers exact generated files and source locations. This
+  prevents a bundle from reusing the wrong source map when native semantics match.
+
+`EmissionCache` stores source-only bundles atomically and verifies metadata and
+all file hashes before reuse. It rejects missing, escaping, corrupted or extra
+files. Invocation-owned pointers, epochs, caches, counters and workspace leases
+continue through existing family resources; the disk cache never stores them.
+
+Wire declarations derive from `runtime/baselines/families.json`. Common enums,
+six native call signatures and preserved native field representations live in
+`runtime/native_calls.json`. The generated Python ctypes structures and native
+C++ types assert every size/offset from those shared contracts. MoE keeps its
+completion/protocol fields and dynamic scratch; Gate/MHC keep their original
+reserved header fields and family-local task IDs. The original native unsigned
+representation of `DynamicData.dynamic_max_seq_len` is recorded explicitly,
+preserving its existing C++ contract alongside the original signed ctypes view.
+
+Regenerate or check the checked-in outputs with:
+
+```bash
+python -m hyper_parallel.core.multicore.backends.schema
+python -m hyper_parallel.core.multicore.backends.schema --check
+python -m pytest -q tests/ut/core/multicore/backends/test_codegen.py
+```
+
+The live scheduler consumes generated MoE Python types. MoE workers include
+generated C++ declarations; Gate/MHC builders install corresponding declarations
+in verified isolated source exports. The MoE manifest still checks all pinned
+native sources. Its sole header adaptation must equal the deterministic
+transformation of the verified original Git object; unrelated native drift is
+rejected. The transformation replaces wire declarations, formats C++ and
+shortens descriptor-reader local names while preserving accessor behavior.
+
+All six runtime forward/backward calls use the generated Python launch wrappers.
+They validate the actual loaded dispatcher schema once, including argument names,
+types, result order and mutable alias annotations. Existing autograd, stream,
+SHMEM, tiling and allocator ownership remains with the family implementation.
+Generated C++ forwarding wrappers are instantiated in CPU tests for argument
+order and const/mutable ownership; existing native Torch adapters still enqueue
+the family operators.
+
+This delivers the first P5 increment. Automatic worker switches/context factories,
+replacement of family native host adapters, general buffer planning and compiled
+binary/materialized-device caches remain subsequent work. New arbitrary primitive
+combinations still need supported numerical implementations and lowering recipes.

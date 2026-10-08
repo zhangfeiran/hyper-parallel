@@ -28,6 +28,7 @@ from pathlib import Path
 
 import torch
 
+from hyper_parallel.core.multicore.backends.schema import adapt_cpp_schema
 from hyper_parallel.core.multicore.runtime.abi import NativeManifest, family_abi
 
 _REPO = Path(__file__).resolve().parents[4]
@@ -42,15 +43,26 @@ def _sources():
     baseline = json.loads((_COMPONENT / "runtime/baselines/families.json").read_text())["families"]["moe"]
     for relative, expected in baseline["source_hashes"].items():
         if "/ops/" in relative and _hash(_REPO / relative) != expected:
-            raise ValueError(f"MoE pinned native source mismatch: {relative}")
+            _verify_generated_header(relative, expected, baseline["source_revision"])
     sources = {}
     for directory in ("ops", "torch/csrc", "cmake", "shmem/ccsrc", "shmem/cmake"):
         for path in sorted((_COMPONENT / directory).rglob("*")):
             if path.is_file():
                 sources[str(path.relative_to(_COMPONENT))] = _hash(path)
-    for relative in ("build.sh", "_build/dependencies.lock.json", "_build/write_moe_manifest.py"):
+    for relative in ("build.sh", "_build/dependencies.lock.json", "_build/write_moe_manifest.py",
+                     "backends/schema.py", "runtime/native_calls.json"):
         sources[relative] = _hash(_COMPONENT / relative)
     return sources
+
+
+def _verify_generated_header(relative, expected, revision):
+    if relative != "hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp":
+        raise ValueError(f"MoE pinned native source mismatch: {relative}")
+    original = subprocess.check_output(["git", "show", f"{revision}:{relative}"], cwd=_REPO)
+    if hashlib.sha256(original).hexdigest() != expected:
+        raise ValueError("MoE original header source identity mismatch")
+    if adapt_cpp_schema(original.decode(), "moe") != (_REPO / relative).read_text():
+        raise ValueError("MoE generated header adapter mismatch")
 
 
 def write_manifest(multicore: Path, shmem: Path, socs: str) -> None:

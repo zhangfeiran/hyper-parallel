@@ -30,6 +30,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from hyper_parallel.core.multicore.runtime.abi import NativeManifest, family_abi
+from hyper_parallel.core.multicore.runtime.generated import native_calls
 
 if TYPE_CHECKING:
     from hyper_parallel.core.multicore.runtime.plan import KernelPlan, RuntimeImage
@@ -213,7 +214,7 @@ class GateExecutable:
         stream = torch.npu.current_stream(self.device)
         for tensor in (logits, bias):
             tensor.record_stream(stream)
-        outputs = torch.ops.hyper_parallel.mega_gate_route(
+        outputs = native_calls.mega_gate_route(
             logits, bias, bias, self.image_mask, config, buffer, self.plan.top_k, self.plan.scale, False,
         )
         self._complete(False, profile, buffer)
@@ -232,7 +233,7 @@ class GateExecutable:
         stream = torch.npu.current_stream(self.device)
         for tensor in (*saved, grad_weights):
             tensor.record_stream(stream)
-        result = torch.ops.hyper_parallel.mega_gate_route_grad(
+        result = native_calls.mega_gate_route_grad(
             logits, scores, selected, denominator, indices, grad_weights.contiguous(), logits,
             config, buffer, self.plan.top_k, self.plan.scale, False,
         )

@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping
 
 import torch
 
+from hyper_parallel.core.multicore.backends.ascend import BackendEmission, emit_plan
 from hyper_parallel.core.multicore.compiler.mhc import match_mhc_region
 from hyper_parallel.core.multicore.compiler.moe import match_moe_region
 from hyper_parallel.core.multicore.compiler.pipeline import compile_worker_pipeline
@@ -157,6 +158,21 @@ class Program:
         if isinstance(self.schedule, TaskDAG):
             return self._task_dag_plan(ir, signature, topology)
         return compile_worker_pipeline(ir, self.schedule, dict(signature or {}), topology or HardwareSpec())
+
+    def compile(self, signature: Mapping[str, int] | MegaMoeSpec | MhcSpec | None = None,
+                topology: HardwareSpec | None = None, **constants: object) -> BackendEmission:
+        """Generate schema, typed bindings, schedule images and source maps through one backend.
+
+        Args:
+            signature: Symbolic dimensions or a bound native family specification.
+            topology: Physical worker availability for Gate row ownership.
+            **constants: Declared constexpr specializations.
+
+        Returns:
+            Source-only emission with separate definition, static plan and artifact identities.
+        """
+        plan = self.plan(signature, topology, **constants)
+        return emit_plan(plan, self.lower(**constants))
 
     def _task_dag_plan(self, ir, signature, topology):
         if self.schedule.policy == "shifted_mhc_v1":

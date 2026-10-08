@@ -12,23 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Family-local MHC task kinds; the current MoE scheduler enums remain independent."""
-
-from enum import Enum
-
-from hyper_parallel.core.multicore.runtime.generated.mhc_abi import TaskType
-
-MhcTaskType = TaskType
-FAST_DEPENDENCY_POLL_INTERVAL_US = 5
-
-
-class MhcOpType(Enum):
-    """Legacy MHC graph categories, separate from global scheduler operation kinds."""
-
-    MHC_POST = "mhc_post"
-    MHC_NORM_CAST = "mhc_norm_cast"
-    MHC_PROJECTION = "mhc_projection"
-    MHC_MAPPING = "mhc_mapping"
-    MHC_INPUT_MIX = "mhc_input_mix"
-    MHC_PIPELINE = "mhc_pipeline"
-    RMS_NORM = "rms_norm"
+"""Generated native family definitions; regenerate with backends.schema."""

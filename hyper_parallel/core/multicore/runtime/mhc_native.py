@@ -30,6 +30,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from hyper_parallel.core.multicore.runtime.abi import NativeManifest, family_abi
+from hyper_parallel.core.multicore.runtime.generated import native_calls
 
 if TYPE_CHECKING:
     from hyper_parallel.core.multicore.runtime.mhc import MhcKernelPlan, MhcRuntimeImage
@@ -223,7 +224,7 @@ class MhcExecutable:
                   matrix.reshape(1, rows, 4, 4).contiguous(), phi, alpha, bias, weight)
         outputs = _allocate_forward(residual, rows, hidden)
         _record(values)
-        torch.ops.hyper_parallel.mega_mhc(*values, config, counters, buffer, *outputs,
+        native_calls.mega_mhc(*values, config, counters, buffer, *outputs,
                                           self.plan.recipe.hc_eps, self.plan.recipe.norm_eps,
                                           self.plan.recipe.num_iters, need_cache)
         self._complete(image, "forward", buffer, profile)
@@ -250,7 +251,7 @@ class MhcExecutable:
             values[17], phi, alpha, bias, values[18], values[7], values[19], values[20]))
         outputs += (torch.empty_like(weight, dtype=torch.float32),)
         _record(values)
-        torch.ops.hyper_parallel.mega_mhc_grad(*values, config, counters, buffer, *outputs, self.plan.recipe.hc_eps)
+        native_calls.mega_mhc_grad(*values, config, counters, buffer, *outputs, self.plan.recipe.hc_eps)
         self._complete(image, "backward", buffer, profile)
         return (outputs[0].reshape(*shape, 4, hidden), outputs[4].reshape(*shape, hidden),
                 outputs[5].reshape(pre.shape), outputs[6].reshape(post.shape), outputs[7].reshape(matrix.shape),

@@ -33,6 +33,7 @@ import torch
 from hyper_parallel.core.multicore._build.prepare_dependencies import (
     verify_git_dependency,
 )
+from hyper_parallel.core.multicore.backends.schema import install_cpp_schema
 from hyper_parallel.core.multicore.runtime.abi import family_abi
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -75,6 +76,7 @@ def _assemble(repository, ops_nn, work):
     for name in ("hyper_mega_gate", "hyper_mega_gate_grad"):
         shutil.copytree(pinned / _MULTICORE / "ops" / name, source / name)
         shutil.copytree(pinned / _MULTICORE / "ops/runtime", source / name / "op_kernel/runtime")
+        install_cpp_schema(source / name / "op_kernel/runtime", "gate")
     upstream = work / "upstream"
     _export(ops_nn, dependency["commit"], ["index/linear_index/op_host/op_api"], upstream)
     shutil.copytree(

@@ -21,8 +21,18 @@ Combines:
 """
 import ctypes
 from dataclasses import dataclass
-from enum import IntEnum
-from typing import Any
+
+from hyper_parallel.core.multicore.runtime.generated import moe_abi
+
+DynamicDataC = moe_abi.DynamicDataC
+DynamicType = moe_abi.DynamicType
+EventDescC = moe_abi.EventDescC
+EventType = moe_abi.EventType
+RuntimeConfigC = moe_abi.RuntimeConfigC
+TaskAiCoreType = moe_abi.TaskAiCoreType
+TaskDescC = moe_abi.TaskDescC
+TaskType = moe_abi.TaskType
+TensorDescC = moe_abi.TensorDescC
 
 # ── Constants (match runtime_head.hpp exactly) ────────────────────────────────
 MAX_TENSOR_DIMS      = 4
@@ -58,142 +68,6 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
     final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
     required = final_event + ATOMIC_ADD_VALUE_LEN
     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
-
-
-# ── Enums ─────────────────────────────────────────────────────────────────────
-class TaskAiCoreType(IntEnum):
-    """Worker core categories encoded in RuntimeConfig."""
-
-    TASK_AICORE_INVALID = 0
-    TASK_AICORE_CUBE    = 1
-    TASK_AICORE_VECTOR  = 2
-    TASK_AICORE_MIX     = 3
-
-
-class TaskType(IntEnum):
-    """Task operation kinds understood by the Device scheduler."""
-
-    TASK_TERMINATE            = 0
-    TASK_BEGIN_TASK_GRAPH     = 10
-    TASK_ADD_CUSTOM           = 101
-    TASK_SWI_GLU              = 102
-    TASK_MATMUL               = 103
-    TASK_GROUPED_MATMUL       = 104
-    TASK_SHMEM_PUT_MEM_SIGNAL = 105
-    TASK_SHMEM_GET_MEM = 107
-    TASK_SWI_GLU_GRAD         = 106
-
-
-class EventType(IntEnum):
-    """Dependency and trigger event operations used by scheduled tasks."""
-
-    EVENT_EMPTY                  = 900
-    EVENT_LAUNCH_TASKS           = 901
-    EVENT_LAUNCH_MASSIVE_TASKS   = 902
-    EVENT_LAUNCH_DEPENDENT_TASKS = 903
-    EVENT_END_OF_TASK_GRAPH      = 910
-    EVENT_TERMINATION            = 911
-    EVENT_INVALID                = 999
-
-
-class DynamicType(IntEnum):
-    """Runtime dynamic-data operations applied before task execution."""
-
-    DYNAMIC_EMPTY        = 0
-    DYNAMIC_DSV3_MOE = 101
-
-
-# ── ctypes Structures (mirror runtime_head.hpp) ───────────────────────────────
-
-class TensorDescC(ctypes.Structure):
-    """Serialized tensor address and shape descriptor."""
-
-    _fields_ = [
-        ("tensor_type",     ctypes.c_uint32),
-        ("num_dims",        ctypes.c_uint32),
-        ("dim",             ctypes.c_uint32 * MAX_TENSOR_DIMS),
-        ("stride",          ctypes.c_uint32 * MAX_TENSOR_DIMS),
-        ("data_type",       ctypes.c_uint32),
-        ("input_position",  ctypes.c_uint32),
-        ("base_ptr_offset", ctypes.c_uint32),
-        ("transpose_flag",  ctypes.c_uint32),
-        ("dynamic_shape",   ctypes.c_uint32),
-        ("dynamic_dim",     ctypes.c_uint32),
-    ]
-
-
-class TaskDescC(ctypes.Structure):
-    """Serialized task descriptor shared by Host and Device schedulers."""
-    _fields_ = [
-        ("task_type",            ctypes.c_uint32),
-        ("task_aicore_type",     ctypes.c_uint32),
-        ("num_inputs",           ctypes.c_uint32),
-        ("num_outputs",          ctypes.c_uint32),
-        ("trigger_event",        ctypes.c_uint32),
-        ("dependent_event",      ctypes.c_uint32),
-        ("inputs",               TensorDescC * MAX_INPUTS_PER_TASK),
-        ("outputs",              TensorDescC * MAX_OUTPUTS_PER_TASK),
-        ("tiling_data_position", ctypes.c_uint32),
-        ("tiling_data_offset",   ctypes.c_uint32),
-        ("task_index",           ctypes.c_uint32),
-        ("task_split_num",       ctypes.c_uint32),
-        ("task_split_value",     ctypes.c_uint32),
-        ("extra_value_0",        ctypes.c_uint32),
-        ("extra_value_1",        ctypes.c_uint32),
-        ("extra_value_2",        ctypes.c_uint32),
-        ("profile_desc_id",      ctypes.c_uint32),
-        ("profile_owner_id",     ctypes.c_uint32),
-    ]
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize optional profiling metadata to explicit invalid sentinels."""
-        has_profile_desc = len(args) >= len(self._fields_) - 1 or "profile_desc_id" in kwargs
-        has_profile_owner = len(args) >= len(self._fields_) or "profile_owner_id" in kwargs
-        super().__init__(*args, **kwargs)
-        if not has_profile_desc:
-            self.profile_desc_id = INVALID_PROFILE_DESC_ID
-        if not has_profile_owner:
-            self.profile_owner_id = INVALID_PROFILE_OWNER_ID
-
-
-class EventDescC(ctypes.Structure):
-    """Serialized event operation descriptor."""
-
-    _fields_ = [
-        ("event_type",    ctypes.c_uint32),
-        ("num_triggers",  ctypes.c_uint32),
-        ("first_task_id", ctypes.c_uint32),
-        ("last_task_id",  ctypes.c_uint32),
-    ]
-
-
-class DynamicDataC(ctypes.Structure):
-    """Serialized dynamic-data update descriptor."""
-
-    _fields_ = [
-        ("dynamic_type",           ctypes.c_uint32),
-        ("dynamic_input_position", ctypes.c_uint32),
-        ("dynamic_group_size",     ctypes.c_uint32),
-        ("dynamic_max_seq_len",    ctypes.c_int32),
-    ]
-
-
-class RuntimeConfigC(ctypes.Structure):
-    """Common 64-byte header; allocated subclasses append graph-sized arrays."""
-
-    _fields_ = [
-        ("task_num", ctypes.c_uint32),
-        ("num_workers", ctypes.c_uint32),
-        ("task_capacity", ctypes.c_uint32),
-        ("event_capacity", ctypes.c_uint32),
-        ("ready_event", ctypes.c_uint32),
-        ("cycle_profiling_enabled", ctypes.c_uint32),
-        ("aic_profile_record_capacity", ctypes.c_uint32),
-        ("aiv_profile_record_capacity", ctypes.c_uint32),
-        ("completion_event", ctypes.c_uint32),
-        ("protocol_version", ctypes.c_uint32),
-        ("_padding", ctypes.c_uint32 * 6),
-    ]
 
 
 class TilingDataC(ctypes.Structure):
@@ -316,7 +190,11 @@ class TaskSplitValue:
 
 
 def init_task_split_value(tsv: TaskSplitValue) -> None:
-    """Reset per-rank runtime counters to zero."""
+    """Reset per-rank runtime counters to zero.
+
+    Args:
+        tsv: Mutable topology and graph-fill counter state.
+    """
     tsv.pre_pre_event_num   = 0
     tsv.pre_event_num       = 0
     tsv.pre_task_num        = 0

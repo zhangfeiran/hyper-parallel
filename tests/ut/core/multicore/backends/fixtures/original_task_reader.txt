@@ -1,0 +1,96 @@
+/**
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+// Original reader from fixed MoE source befaa01069e997d511987feec82464c5f4549b95.
+__aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData, uint32_t index_size) {
+  uint32_t tensor_desc_size = UINT32_T_SIZE * 8 + UINT32_T_SIZE * MAX_TENSOR_DIMS * 2;
+  uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size +
+                            MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
+  uint32_t size = getAllTasksOffset(tiling) + index_size * task_desc_size;
+
+  tilingData->task_type = (*(__gm__ TaskType *)(tiling + size));
+  tilingData->task_aicore_type = (*(__gm__ TaskAiCoreType *)(tiling + size + UINT32_T_SIZE));
+  tilingData->num_inputs = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE * 2));
+  tilingData->num_outputs = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE * 3));
+  tilingData->trigger_event = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE * 4));
+  tilingData->dependent_event = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE * 5));
+  uint32_t start_size = size + UINT32_T_SIZE * 6;
+  for (uint32_t i = 0; i < MAX_INPUTS_PER_TASK; i++) {
+    (tilingData->inputs)[i].tensor_type = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->inputs)[i].num_dims = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    for (uint32_t j = 0; j < MAX_TENSOR_DIMS; j++) {
+      (tilingData->inputs)[i].dim[j] = (*(__gm__ uint32_t *)(tiling + start_size));
+      start_size = start_size + UINT32_T_SIZE;
+    }
+    for (uint32_t j = 0; j < MAX_TENSOR_DIMS; j++) {
+      (tilingData->inputs)[i].stride[j] = (*(__gm__ uint32_t *)(tiling + start_size));
+      start_size = start_size + UINT32_T_SIZE;
+    }
+    (tilingData->inputs)[i].data_type = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->inputs)[i].input_position = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->inputs)[i].base_ptr_offset = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->inputs)[i].transpose_flag = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->inputs)[i].dynamic_shape = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->inputs)[i].dynamic_dim = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+  }
+  for (uint32_t i = 0; i < MAX_OUTPUTS_PER_TASK; i++) {
+    (tilingData->outputs)[i].tensor_type = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->outputs)[i].num_dims = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    for (uint32_t j = 0; j < MAX_TENSOR_DIMS; j++) {
+      (tilingData->outputs)[i].dim[j] = (*(__gm__ uint32_t *)(tiling + start_size));
+      start_size = start_size + UINT32_T_SIZE;
+    }
+    for (uint32_t j = 0; j < MAX_TENSOR_DIMS; j++) {
+      (tilingData->outputs)[i].stride[j] = (*(__gm__ uint32_t *)(tiling + start_size));
+      start_size = start_size + UINT32_T_SIZE;
+    }
+    (tilingData->outputs)[i].data_type = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->outputs)[i].input_position = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->outputs)[i].base_ptr_offset = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->outputs)[i].transpose_flag = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->outputs)[i].dynamic_shape = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+    (tilingData->outputs)[i].dynamic_dim = (*(__gm__ uint32_t *)(tiling + start_size));
+    start_size = start_size + UINT32_T_SIZE;
+  }
+  tilingData->tiling_data_position = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size = start_size + UINT32_T_SIZE;
+  tilingData->tiling_data_offset = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size = start_size + UINT32_T_SIZE;
+  tilingData->task_index = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size = start_size + UINT32_T_SIZE;
+  tilingData->task_split_num = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size = start_size + UINT32_T_SIZE;
+  tilingData->task_split_value = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size += UINT32_T_SIZE;
+  tilingData->extra_value_0 = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size += UINT32_T_SIZE;
+  tilingData->extra_value_1 = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size += UINT32_T_SIZE;
+  tilingData->extra_value_2 = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size += UINT32_T_SIZE;
+  tilingData->profile_desc_id = (*(__gm__ uint32_t *)(tiling + start_size));
+  start_size += UINT32_T_SIZE;
+  tilingData->profile_owner_id = (*(__gm__ uint32_t *)(tiling + start_size));
+}
