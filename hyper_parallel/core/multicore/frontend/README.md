@@ -540,6 +540,34 @@ test checks actual returned aliases, Gate shapes/dtypes and invalid-input reject
 Device acceptance uses the rebuilt native adapters and existing component gates.
 
 This completes shared generation of the numerical Torch launcher definitions for
-the three supported families. General selectable primitive context factories,
-Gate/MoE setup generation, lower-level CANN host/tiling generation, general buffer
-planning and binary/materialized-device caches remain subsequent increments.
+the three supported families. The Gate setup generation increment is described
+below. General selectable primitive context factories, MoE setup generation,
+lower-level CANN host/tiling generation, general buffer planning and
+binary/materialized-device caches remain subsequent work.
+
+## P5 generated Gate stage contexts
+
+Gate's worker-owned forward/backward pipeline binding state and its stage-local
+TPipe, queues and UB buffers also use the shared context recipe generator.
+Twenty-five fixed recipes emit forty-three initialization/cleanup fragments in
+the original worker and pipeline-header scopes. This covers all eighteen stage
+setup methods, worker/pipeline Init bindings, backward row partitioning and the
+two shared MTE3 write-completion helpers.
+
+Context contracts explicitly identify sibling source files and ownership.
+The installer admits every selected worker/header recipe before writing any
+context-adapted source. It rejects invalid source paths, ownership and phases,
+changed UB allocation expressions and changed synchronization/cleanup. Numerical
+stage math, copy/queue operations, guards and top-k branches retain their original
+order. Each stage still constructs its own pipe; cleanup waits for MTE3 completion
+before Destroy. The generated code introduces no worker-wide pipe reuse.
+
+CPU tests compare full expanded source tokens against independent pinned Gate
+worker/header snapshots. They also compile all eighteen setup/finish recipes
+against a recording Ascend interface, checking exact queue/buffer byte counts
+across three batch/alignment shapes and constructor, body, completion and explicit
+destruction order. Native acceptance compiles the actual generated contexts and
+uses the existing Gate numerical/lifecycle gates, plus MHC/MoE regression.
+
+These are fixed supported Gate/MHC context recipes. General selectable primitive
+factories and MoE primitive-local setup generation remain subsequent work.

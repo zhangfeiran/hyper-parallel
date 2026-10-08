@@ -229,7 +229,8 @@ def install_worker_glue(operator: Path, family: str, direction: str) -> None:
         if relative.name.startswith(name + "_"):
             (runtime / relative.name).write_text(content)
     path = kernel / Path(worker["source"]).name
-    path.write_text(contexts.adapt_contexts(adapt_native_worker(path.read_text(), name), name))
+    path.write_text(adapt_native_worker(path.read_text(), name))
     if worker["mode"] == "task_dag":
         path = kernel / Path(worker["entry_source"]).name
         path.write_text(adapt_native_entry(path.read_text(), name))
+    contexts.install_context_glue(kernel, name)

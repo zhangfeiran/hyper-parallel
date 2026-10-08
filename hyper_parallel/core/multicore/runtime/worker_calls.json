@@ -81,8 +81,133 @@
       ],
       "context_owner": "worker",
       "pipe_lifetime": "stage_call",
-      "context_initialization": "existing_family_Init_and_stage_methods",
-      "context_destruction": "existing_FinishStage"
+      "context_initialization": "generated_worker_bindings_and_stage_local_UB_setup",
+      "context_destruction": "generated_stage_finish_and_MTE3_completion_before_Destroy",
+      "contexts": {
+        "worker_bindings": {
+          "source": "hyper_mega_gate_route.cpp",
+          "method": "Init",
+          "ownership": "worker_owned",
+          "phases": {
+            "init": "MulticoreRuntime::AivPipelineWorkerBase<RoutePipelineWorker>::Init(worker_id, runtime_config, profile_buffer);\n    route_.Init(logits, text_bias, vision_bias, image_mask, tiling_data.useVisionBias != 0, routing_weights,\n                expert_indices, route_scores, selected_scores, normalization_denominator, user_workspace,\n                tiling_data.expertCount, tiling_data.topK,\n                tiling_data.routedScalingFactor, tiling_data.batchRows, tiling_data.expertAlign, tiling_data.kAlign,\n                tiling_data.sharedTmpBytes, tiling_data.scoreAOffset, tiling_data.topkValuesOffset,\n                tiling_data.indicesI32Offset, tiling_data.rowSumOffset, &tiling_data.topkTiling, first_row, row_count);"
+          }
+        },
+        "pipeline_bindings": {
+          "source": "route_pipeline.h",
+          "method": "Init",
+          "ownership": "worker_owned",
+          "phases": {
+            "init": "logits_ = logits;\n    text_bias_ = text_bias;\n    vision_bias_ = vision_bias;\n    image_mask_ = image_mask;\n    use_vision_bias_ = use_vision_bias;\n    routing_weights_ = routing_weights;\n    expert_indices_ = expert_indices;\n    route_scores_ = route_scores;\n    selected_scores_ = selected_scores;\n    normalization_denominator_ = normalization_denominator;\n    score_a_ = reinterpret_cast<__gm__ float *>(user_workspace + score_a_offset);\n    topk_values_ = reinterpret_cast<__gm__ float *>(user_workspace + topk_values_offset);\n    indices_i32_ = reinterpret_cast<__gm__ int32_t *>(user_workspace + indices_i32_offset);\n    row_sum_ = reinterpret_cast<__gm__ float *>(user_workspace + row_sum_offset);\n    expert_count_ = expert_count;\n    top_k_ = top_k;\n    routed_scaling_factor_ = routed_scaling_factor;\n    batch_rows_ = batch_rows;\n    expert_align_ = expert_align;\n    k_align_ = k_align;\n    shared_tmp_bytes_ = shared_tmp_bytes;\n    topk_tiling_ = topk_tiling;\n    first_row_ = first_row;\n    row_count_ = row_count;"
+          }
+        },
+        "softplus": {
+          "source": "route_pipeline.h",
+          "method": "Softplus",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    TBuf<TPosition::VECCALC> exp_buffer;\n    TBuf<TPosition::VECCALC> temp_buffer;\n    TBuf<TPosition::VECCALC> high_mask_buffer;\n    TBuf<TPosition::VECCALC> log1p_mask_buffer;\n    const uint32_t score_count = batch_rows_ * expert_align_;\n    const uint32_t mask_bytes = ((score_count + 255) / 256) * 32;\n    pipe.InitBuffer(input_queue, 1, score_count * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, score_count * sizeof(float));\n    pipe.InitBuffer(exp_buffer, score_count * sizeof(float));\n    pipe.InitBuffer(temp_buffer, score_count * sizeof(float));\n    pipe.InitBuffer(high_mask_buffer, mask_bytes);\n    pipe.InitBuffer(log1p_mask_buffer, mask_bytes);",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "sqrt_score": {
+          "source": "route_pipeline.h",
+          "method": "SqrtScore",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    const uint32_t count = batch_rows_ * expert_align_;\n    pipe.InitBuffer(input_queue, 1, count * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, count * sizeof(float));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "add_text_bias": {
+          "source": "route_pipeline.h",
+          "method": "AddTextBias",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    TBuf<TPosition::VECCALC> bias_buffer;\n    const uint32_t count = batch_rows_ * expert_align_;\n    pipe.InitBuffer(input_queue, 1, count * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, count * sizeof(float));\n    pipe.InitBuffer(bias_buffer, expert_align_ * sizeof(float));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "add_vision_bias": {
+          "source": "route_pipeline.h",
+          "method": "AddVisionBias",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECIN, 1> text_bias_queue;\n    TQue<QuePosition::VECIN, 1> vision_bias_queue;\n    TQue<QuePosition::VECIN, 1> mask_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    const uint32_t count = batch_rows_ * expert_align_;\n    const uint32_t mask_bytes = ((batch_rows_ + 31) / 32) * 32;\n    pipe.InitBuffer(input_queue, 1, count * sizeof(float));\n    pipe.InitBuffer(text_bias_queue, 1, expert_align_ * sizeof(float));\n    pipe.InitBuffer(vision_bias_queue, 1, expert_align_ * sizeof(float));\n    pipe.InitBuffer(mask_queue, 1, mask_bytes);\n    pipe.InitBuffer(output_queue, 1, count * sizeof(float));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "top_k_score": {
+          "source": "route_pipeline.h",
+          "method": "TopKScore",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> value_queue;\n    TQue<QuePosition::VECOUT, 1> index_queue;\n    TBuf<TPosition::VECCALC> one_dim_buffer;\n    pipe.InitBuffer(input_queue, 1, batch_rows_ * expert_align_ * sizeof(float));\n    pipe.InitBuffer(one_dim_buffer, expert_align_ * sizeof(int32_t));\n    pipe.InitBuffer(value_queue, 1, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(index_queue, 1, batch_rows_ * k_align_ * sizeof(int32_t));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "gather_score": {
+          "source": "route_pipeline.h",
+          "method": "GatherScore",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> score_queue;\n    TQue<QuePosition::VECIN, 1> index_queue;\n    TQue<QuePosition::VECOUT, 1> gather_queue;\n    TBuf<TPosition::VECCALC> row_index_buffer;\n    TBuf<TPosition::VECCALC> row_base_buffer;\n    TBuf<TPosition::VECCALC> offset_fp32_buffer;\n    TBuf<TPosition::VECCALC> offset_buffer;\n    TBuf<TPosition::VECCALC> mask_row_buffer;\n    TBuf<TPosition::VECCALC> mask_buffer;\n    TBuf<TPosition::VECCALC> shared_tmp_buffer;\n    pipe.InitBuffer(score_queue, 1, batch_rows_ * expert_align_ * sizeof(float));\n    pipe.InitBuffer(index_queue, 1, batch_rows_ * k_align_ * sizeof(int32_t));\n    pipe.InitBuffer(row_index_buffer, ((batch_rows_ + 7) / 8) * 8 * sizeof(float));\n    pipe.InitBuffer(row_base_buffer, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(offset_fp32_buffer, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(offset_buffer, batch_rows_ * k_align_ * sizeof(int32_t));\n    pipe.InitBuffer(gather_queue, 1, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(mask_row_buffer, k_align_ * sizeof(float));\n    pipe.InitBuffer(mask_buffer, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(shared_tmp_buffer, shared_tmp_bytes_);",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "reduce_selected": {
+          "source": "route_pipeline.h",
+          "method": "ReduceSelected",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> sum_queue;\n    TBuf<TPosition::VECCALC> shared_tmp_buffer;\n    pipe.InitBuffer(input_queue, 1, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(sum_queue, 1, ((batch_rows_ + 7) / 8) * 8 * sizeof(float));\n    pipe.InitBuffer(shared_tmp_buffer, shared_tmp_bytes_);",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "add_epsilon": {
+          "source": "route_pipeline.h",
+          "method": "AddEpsilon",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    const uint32_t row_align = 8;\n    pipe.InitBuffer(input_queue, 1, batch_rows_ * row_align * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, batch_rows_ * row_align * sizeof(float));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "divide_selected": {
+          "source": "route_pipeline.h",
+          "method": "DivideSelected",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> weight_queue;\n    TQue<QuePosition::VECIN, 1> denominator_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    TBuf<TPosition::VECCALC> broadcast_buffer;\n    TBuf<TPosition::VECCALC> shared_tmp_buffer;\n    pipe.InitBuffer(weight_queue, 1, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(denominator_queue, 1, ((batch_rows_ + 7) / 8) * 8 * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(broadcast_buffer, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(shared_tmp_buffer, shared_tmp_bytes_);",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "scale_selected": {
+          "source": "route_pipeline.h",
+          "method": "ScaleSelected",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    pipe.InitBuffer(input_queue, 1, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, batch_rows_ * k_align_ * sizeof(float));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "cast_indices": {
+          "source": "route_pipeline.h",
+          "method": "CastIndices",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    pipe.InitBuffer(input_queue, 1, batch_rows_ * k_align_ * sizeof(int32_t));\n    pipe.InitBuffer(output_queue, 1, batch_rows_ * k_align_ * sizeof(int64_t));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "write_completion": {
+          "source": "route_pipeline.h",
+          "method": "FinishStage",
+          "ownership": "borrowed_pipe",
+          "phases": {
+            "finish": "const event_t gm_write_complete = static_cast<event_t>(pipe.FetchEventID(HardEvent::MTE3_S));\n    SetFlag<HardEvent::MTE3_S>(gm_write_complete);\n    WaitFlag<HardEvent::MTE3_S>(gm_write_complete);\n    pipe.Destroy();"
+          }
+        }
+      }
     },
     "gate_backward": {
       "family": "gate",
@@ -175,8 +300,105 @@
       ],
       "context_owner": "worker",
       "pipe_lifetime": "stage_call",
-      "context_initialization": "existing_family_Init_and_stage_methods",
-      "context_destruction": "existing_FinishStage"
+      "context_initialization": "generated_worker_bindings_and_stage_local_UB_setup",
+      "context_destruction": "generated_stage_finish_and_MTE3_completion_before_Destroy",
+      "contexts": {
+        "worker_bindings": {
+          "source": "hyper_mega_gate_route_grad.cpp",
+          "method": "Init",
+          "ownership": "worker_owned",
+          "phases": {
+            "init": "MulticoreRuntime::AivPipelineWorkerBase<RouteGradWorker>::Init(worker_id, runtime_config, profile_buffer);\n    top_k_ = tiling.topK;\n    pipeline_.Init(worker_id, selected_scores, denominator, grad_weights, selected_score_grad,\n                   zero_score_grad, workspace, tiling);"
+          }
+        },
+        "row_partition": {
+          "source": "route_grad_pipeline.h",
+          "method": "InitRows",
+          "ownership": "worker_owned",
+          "phases": {
+            "init": "first_row_ = static_cast<uint64_t>(worker_id) * rows_per_worker;\n    const uint64_t remaining = static_cast<uint64_t>(token_count) - first_row_;\n    row_count_ = static_cast<uint32_t>(remaining < rows_per_worker ? remaining : rows_per_worker);\n    batch_rows_ = batch_rows;"
+          }
+        },
+        "write_completion": {
+          "source": "route_grad_pipeline.h",
+          "method": "FinishStage",
+          "ownership": "borrowed_pipe",
+          "phases": {
+            "finish": "const event_t gm_write_complete = static_cast<event_t>(pipe.FetchEventID(HardEvent::MTE3_S));\n    SetFlag<HardEvent::MTE3_S>(gm_write_complete);\n    WaitFlag<HardEvent::MTE3_S>(gm_write_complete);\n    pipe.Destroy();"
+          }
+        },
+        "pipeline_bindings": {
+          "source": "route_grad_pipeline.h",
+          "method": "Init",
+          "ownership": "worker_owned",
+          "phases": {
+            "init": "selected_scores_ = selected_scores;\n    denominator_ = denominator;\n    grad_weights_ = grad_weights;\n    selected_score_grad_ = selected_score_grad;\n    zero_score_grad_ = zero_score_grad;\n    auto *base = reinterpret_cast<__gm__ uint8_t *>(workspace);\n    k0_ = reinterpret_cast<__gm__ float *>(base + tiling.kSlot0Offset);\n    k1_ = reinterpret_cast<__gm__ float *>(base + tiling.kSlot1Offset);\n    k2_ = reinterpret_cast<__gm__ float *>(base + tiling.kSlot2Offset);\n    k3_ = reinterpret_cast<__gm__ float *>(base + tiling.kSlot3Offset);\n    k4_ = reinterpret_cast<__gm__ float *>(base + tiling.kSlot4Offset);\n    cross_term_ = reinterpret_cast<__gm__ float *>(base + tiling.crossTermOffset);\n    direct_term_ = reinterpret_cast<__gm__ float *>(base + tiling.directTermOffset);\n    broadcast_row_sum_ = reinterpret_cast<__gm__ float *>(base + tiling.broadcastRowSumOffset);\n    row_sum_ = reinterpret_cast<__gm__ float *>(base + tiling.rowSumOffset);\n    expert_count_ = tiling.expertCount;\n    top_k_ = tiling.topK;\n    expert_align_ = tiling.expertAlign;\n    k_align_ = tiling.kAlign;\n    shared_tmp_bytes_ = tiling.sharedTmpBytes;\n    scaling_ = tiling.routedScalingFactor;\n    InitRows(worker_id, tiling.tokenCount, tiling.rowsPerWorker, tiling.batchRows);"
+          }
+        },
+        "reduce_cross_term": {
+          "source": "route_grad_pipeline.h",
+          "method": "ReduceCrossTerm",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    TBuf<TPosition::VECCALC> shared_buffer;\n    const uint32_t row_alignment = 8;\n    pipe.InitBuffer(input_queue, 1, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, batch_rows_ * row_alignment * sizeof(float));\n    pipe.InitBuffer(shared_buffer, shared_tmp_bytes_);",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "zeros_like": {
+          "source": "route_grad_pipeline.h",
+          "method": "ZerosLike",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    pipe.InitBuffer(output_queue, 1, batch_rows_ * expert_align_ * sizeof(float));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "run_unary_muls": {
+          "source": "route_grad_pipeline.h",
+          "method": "RunUnaryMuls",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    const uint32_t count = batch_rows_ * k_align_;\n    pipe.InitBuffer(input_queue, 1, count * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, count * sizeof(float));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "run_unary_neg": {
+          "source": "route_grad_pipeline.h",
+          "method": "RunUnaryNeg",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    const uint32_t count = batch_rows_ * k_align_;\n    pipe.InitBuffer(input_queue, 1, count * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, count * sizeof(float));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "run_broadcast": {
+          "source": "route_grad_pipeline.h",
+          "method": "RunBroadcast",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> input_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    TBuf<TPosition::VECCALC> shared_buffer;\n    const uint32_t row_alignment = 8;\n    pipe.InitBuffer(input_queue, 1, batch_rows_ * row_alignment * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, batch_rows_ * k_align_ * sizeof(float));\n    pipe.InitBuffer(shared_buffer, shared_tmp_bytes_);",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "run_binary": {
+          "source": "route_grad_pipeline.h",
+          "method": "RunBinary",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> left_queue;\n    TQue<QuePosition::VECIN, 1> right_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    const uint32_t count = batch_rows_ * k_align_;\n    pipe.InitBuffer(left_queue, 1, count * sizeof(float));\n    pipe.InitBuffer(right_queue, 1, count * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, count * sizeof(float));",
+            "finish": "FinishStage(pipe);"
+          }
+        },
+        "run_add": {
+          "source": "route_grad_pipeline.h",
+          "method": "RunAdd",
+          "ownership": "stage_local",
+          "phases": {
+            "init": "TPipe pipe;\n    TQue<QuePosition::VECIN, 1> left_queue;\n    TQue<QuePosition::VECIN, 1> right_queue;\n    TQue<QuePosition::VECOUT, 1> output_queue;\n    const uint32_t count = batch_rows_ * k_align_;\n    pipe.InitBuffer(left_queue, 1, count * sizeof(float));\n    pipe.InitBuffer(right_queue, 1, count * sizeof(float));\n    pipe.InitBuffer(output_queue, 1, count * sizeof(float));",
+            "finish": "FinishStage(pipe);"
+          }
+        }
+      }
     },
     "mhc_forward": {
       "family": "mhc",
