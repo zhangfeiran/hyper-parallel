@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 
 _lock = threading.RLock()
 _users = 0
+_registry_token: Any | None = None
+_heap_generation = 0
 _root_group: Any | None = None
 _root_uses_distributed: bool | None = None
 _root_size: int | None = None
@@ -84,7 +86,7 @@ def _subgroup_unique_id(native: Any, dist: Any, group: Any, rank: int, ranks: tu
     if rank == 0:
         try:
             payload[0] = native._get_unique_id()  # pylint: disable=protected-access
-        except Exception as error:  # All group members must observe a root bootstrap failure.
+        except Exception as error:  # noqa: BLE001  # Converge every bootstrap error on all group members.
             root_error = error
             payload[1] = f"{type(error).__name__}: {error}"
     dist.broadcast_object_list(payload, src=ranks[0], group=group)
@@ -95,8 +97,12 @@ def _subgroup_unique_id(native: Any, dist: Any, group: Any, rank: int, ranks: tu
     return payload[0]
 
 
-def _validate_active_root(selected_group: Any, dist: Any, heap_size_bytes: int | None) -> None:
+def _validate_active_root(
+    selected_group: Any, dist: Any, heap_size_bytes: int | None, registry: Any | None = None,
+) -> None:
     """Check that another owner can join the currently initialized root."""
+    if registry is not _registry_token:
+        raise RuntimeError("managed SHMEM root requires registered consumers; legacy owners cannot join")
     if heap_size_bytes is not None:
         config = _load_native()._debug_state()["config"]  # pylint: disable=protected-access
         if config["heap_size_bytes"] < heap_size_bytes:
@@ -112,7 +118,9 @@ def _validate_active_root(selected_group: Any, dist: Any, heap_size_bytes: int |
             )
 
 
-def acquire(root_group: ProcessGroup | None = None, *, heap_size_bytes: int | None = None) -> None:
+def acquire(
+    root_group: ProcessGroup | None = None, *, heap_size_bytes: int | None = None, _registry: Any | None = None,
+) -> None:
     """Acquire one reference to the Root-only process SHMEM Runtime.
 
     The first reference initializes the Native Runtime. Later references with the same ordered group membership
@@ -130,7 +138,7 @@ def acquire(root_group: ProcessGroup | None = None, *, heap_size_bytes: int | No
             shutdown failed.
     """
     global _users, _root_group, _root_uses_distributed, _root_size  # pylint: disable=global-statement
-    global _root_ranks  # pylint: disable=global-statement
+    global _root_ranks, _registry_token, _heap_generation  # pylint: disable=global-statement
 
     with _lock:
         if heap_size_bytes is not None and (isinstance(heap_size_bytes, bool)
@@ -149,7 +157,7 @@ def acquire(root_group: ProcessGroup | None = None, *, heap_size_bytes: int | No
             selected_group = None
 
         if _users > 0:
-            _validate_active_root(selected_group, dist, heap_size_bytes)
+            _validate_active_root(selected_group, dist, heap_size_bytes, _registry)
             _users += 1
             return
 
@@ -177,6 +185,8 @@ def acquire(root_group: ProcessGroup | None = None, *, heap_size_bytes: int | No
         _root_size = root_size
         _root_ranks = root_ranks
         _users = 1
+        _registry_token = _registry
+        _heap_generation += 1
 
 
 def _runtime_access(function):
@@ -187,6 +197,8 @@ def _runtime_access(function):
         with _lock:
             if _shutdown_failed:
                 raise RuntimeError("SHMEM Runtime is unsafe after a shutdown or reconfiguration failure")
+            if _registry_token is not None:
+                _registry_token.validate_submission(function.__name__)
             return function(*args, **kwargs)
     return guarded
 
@@ -206,7 +218,7 @@ def _reconfiguration_stage(operation: Any) -> float:
     error = None
     try:
         operation()
-    except Exception as exception:
+    except Exception as exception:  # noqa: BLE001  # Converge all stage failures before the next collective.
         error = f"{type(exception).__name__}: {exception}"
     errors = [error]
     if _root_uses_distributed:
@@ -231,7 +243,10 @@ def _reinitialize(heap_size_bytes: int) -> dict[str, float]:
     The managed coordinator holds ``_reconfiguration`` and has collectively
     validated all owners, freed every allocation and synchronized the device.
     """
+    global _heap_generation  # pylint: disable=global-statement
     with _lock:
+        if _registry_token is not None:
+            raise RuntimeError("cross-consumer SHMEM heap rebuild is disabled for the frozen shared root")
         if _users <= 0 or _shutdown_failed:
             raise RuntimeError("SHMEM reconfiguration requires a healthy active Runtime")
         if isinstance(heap_size_bytes, bool) or not isinstance(heap_size_bytes, int) or heap_size_bytes <= 0:
@@ -253,10 +268,11 @@ def _reinitialize(heap_size_bytes: int) -> dict[str, float]:
         except Exception:
             _invalidate_runtime()
             raise
+        _heap_generation += 1
         return timings
 
 
-def release() -> None:
+def release(*, _registry: Any | None = None) -> None:
     """Release one SHMEM Runtime reference and shut down the last reference.
 
     The last consumer must free every symmetric Allocation and stop all SHMEM work before calling this function. All
@@ -268,9 +284,11 @@ def release() -> None:
             shutdown fails.
     """
     global _users, _shutdown_failed, _root_group, _root_uses_distributed, _root_size  # pylint: disable=global-statement
-    global _root_ranks  # pylint: disable=global-statement
+    global _root_ranks, _registry_token  # pylint: disable=global-statement
 
     with _lock:
+        if _registry is not _registry_token:
+            raise RuntimeError("only the managed shared root can release its native reference")
         if _users <= 0:
             raise RuntimeError("SHMEM Runtime has no active reference to release")
         if _shutdown_failed:
@@ -299,4 +317,5 @@ def release() -> None:
             _root_uses_distributed = None
             _root_size = None
             _root_ranks = None
+            _registry_token = None
         _shutdown_failed = False

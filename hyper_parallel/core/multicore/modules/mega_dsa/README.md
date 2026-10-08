@@ -643,3 +643,19 @@ shared-root byte budgets and leases, then extract callable mixed-worker tiles
 with explicit global causal offsets and verify full backward against this CP
 baseline. Long-history sparse SFA/KL gradients and complete training steps
 remain separate validation gates.
+
+## Shared-root resource implementation
+
+[Shared SHMEM root](../../docs/shared_shmem_root.md) adds frozen byte budgets,
+consumer-owned allocation accounting, a root-wide serial lease and monotonic
+heap generation. `MegaMoeExperts.bind_shmem_root` preserves the MoE-specific
+buffer layout; [workspace.py](workspace.py) adds DSA owner publication, staging,
+FP32 peer-exclusive gradient stripes and isolated events in one symmetric arena.
+Declare all consumers before binding, use identical ordered CP/EP/root members,
+and close every bound consumer before closing the root. Growth-capable push
+configurations are rejected during planning; pull and full-bound push are fixed.
+
+The workspace supplies storage for future native tiles. Publication is detached
+and enqueue-only; ready/ACK, gradient routing and native DSA computation remain
+separate implementation work. Caller-owned saved activations must be republished
+under a fresh backward lease rather than retained as views of reusable scratch.

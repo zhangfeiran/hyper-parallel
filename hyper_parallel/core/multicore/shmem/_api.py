@@ -32,6 +32,7 @@ import operator
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from . import _lifecycle
 from ._debug import _log_allocation_site
 from ._lifecycle import _host_barrier, _runtime_access
 from ._runtime import _load_native, _torch_modules
@@ -101,11 +102,16 @@ def empty(
     torch, _ = _torch_modules()
     shape = _normalize_size(size)
     effective_dtype = torch.get_default_dtype() if dtype is None else dtype
+    registry = _lifecycle._registry_token
+    normalized_alignment = _normalize_alignment(alignment)
+    bill = registry.allocation_requested(shape, effective_dtype, normalized_alignment) if registry is not None else 0
     tensor = _load_native()._empty(  # pylint: disable=protected-access
         shape,
         effective_dtype,
-        _normalize_alignment(alignment),
+        normalized_alignment,
     )
+    if registry is not None:
+        registry.allocation_created(tensor, bill)
     _log_allocation_site(tensor)
     return tensor
 
@@ -133,7 +139,11 @@ def free(tensor: torch.Tensor) -> None:
         supported. A SHMEM reference must remain active through this call, and the final ``shmem.release()`` must not
         run concurrently with it.
     """
+    registry = _lifecycle._registry_token
+    record = registry.allocation_freeing(tensor) if registry is not None else None
     _load_native()._free(tensor)  # pylint: disable=protected-access
+    if registry is not None:
+        registry.allocation_freed(record)
 
 
 @_runtime_access

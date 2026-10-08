@@ -25,9 +25,14 @@ from typing import Any
 
 import torch
 
-from hyper_parallel.core.expert_parallel.hot_replica.one_sided import OneSidedReplicaTransport
+from hyper_parallel.core.expert_parallel.hot_replica.one_sided import (
+    OneSidedReplicaTransport,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    SIGNAL_TRANSPORT_MODES, SignalReplicaTransport, signal_storage_bytes, signal_transport_options,
+    SIGNAL_TRANSPORT_MODES,
+    SignalReplicaTransport,
+    signal_storage_bytes,
+    signal_transport_options,
 )
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.scheduler.config import (
@@ -35,6 +40,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
     event_workspace_bytes,
     mega_moe_event_capacity,
 )
+from hyper_parallel.core.multicore.shmem.consumer import ShmemConsumer
 
 from .spec import MegaMoeSpec, initial_receive_capacity
 
@@ -166,6 +172,7 @@ class MegaMoeWorkspace:
     backward_ready_initialized: bool = False
     capacity_floor: int = 0
     heap_manager: Any | None = field(default=None, repr=False)
+    root_consumer: ShmemConsumer | None = field(default=None, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
 
     def ensure(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
@@ -289,6 +296,8 @@ class MegaMoeWorkspace:
     def wait_for_reuse(self) -> None:
         """Order count exchange after the previous workspace lease."""
         with self._access(), self.lock:
+            if self.root_consumer is not None:
+                self.root_consumer.wait_for_reuse()
             if self.used:
                 torch.npu.current_stream(self.device).wait_event(self.completion_event)
 
@@ -299,6 +308,8 @@ class MegaMoeWorkspace:
                 raise RuntimeError("MegaMoe execution resources do not support concurrent calls.")
             if self.used:
                 torch.npu.current_stream().wait_event(self.completion_event)
+            if self.root_consumer is not None:
+                self.root_consumer.claim()
             self.in_use = True
 
     def release(self) -> None:
@@ -307,6 +318,8 @@ class MegaMoeWorkspace:
             if not self.in_use:
                 raise RuntimeError("MegaMoe workspace was released without an active lease.")
             self.completion_event.record(torch.npu.current_stream())
+            if self.root_consumer is not None:
+                self.root_consumer.release()
             self.in_use = False
             self.used = True
 

@@ -495,6 +495,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         )
         resources.workspace = Mock()
         resources.heap_manager = Mock(access=nullcontext)
+        resources.consumer = None
         resources._closed = False  # pylint: disable=protected-access
 
         with (

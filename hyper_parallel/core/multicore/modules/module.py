@@ -24,7 +24,6 @@ from typing import Any
 import torch
 
 
-
 class _ExecutionResourceGroup:
     """Process-owned runtime resources shared by compatible modules."""
 
@@ -45,6 +44,7 @@ class _ExecutionResourceGroup:
         self.resources = None
         self.binding = None
         self.shared = False
+        self.shmem_binding = None
 
 
 class _MulticoreResourceManager:
@@ -224,6 +224,8 @@ class MulticoreModule(torch.nn.Module):
                 raise ValueError(
                     "shared multicore modules must have identical configuration and scope."
                 )
+            if group.shmem_binding is not None:
+                raise RuntimeError("share execution resources before reserving the shared SHMEM consumer")
             if group.resources is not None or group.binding is not None or len(group.members) != 1:
                 raise RuntimeError(
                     "execution resources must be shared before first use or previous grouping."

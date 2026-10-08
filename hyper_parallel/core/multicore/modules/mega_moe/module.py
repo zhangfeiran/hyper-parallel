@@ -26,19 +26,29 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import (
+    ExpertReplicaConfig,
+    _integer,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
-from hyper_parallel.core.expert_parallel.hot_replica.device import validate_planner_backend
-from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
-from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import SIGNAL_TRANSPORT_MODES
-
+from hyper_parallel.core.expert_parallel.hot_replica.device import (
+    validate_planner_backend,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.routing import (
+    prepare_replica_route,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
+    SIGNAL_TRANSPORT_MODES,
+)
 from hyper_parallel.core.multicore import shmem
+from hyper_parallel.core.multicore.shmem.consumer import SharedShmemRoot, ShmemConsumer
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
 from .heap_manager import get_heap_manager, root_members
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
+from .shared_heap import FixedMegaMoeHeap, reserve_mega_moe_consumer
 from .spec import _COMMUNICATION_SPLIT, _resolve_capacity_factors, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace
 
@@ -115,18 +125,33 @@ class _MegaMoeExecutionResources:
         *,
         shared: bool,
         active_specifications: tuple[Any, ...],
+        shmem_binding: tuple[ShmemConsumer, torch.dtype] | None = None,
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
         _validate_resource_layout(active_specifications, tensor, self.spec)
-        self.heap_manager = get_heap_manager(self.spec, tensor, active_specifications)
-        shmem.acquire(self.spec.ep_group, heap_size_bytes=self.heap_manager.heap_bytes)
+        self.consumer = None if shmem_binding is None else shmem_binding[0]
+        if self.consumer is None:
+            self.heap_manager = get_heap_manager(self.spec, tensor, active_specifications)
+            shmem.acquire(self.spec.ep_group, heap_size_bytes=self.heap_manager.heap_bytes)
+        else:
+            if tensor.dtype != shmem_binding[1] or tensor.device != self.consumer.root.device:
+                raise ValueError("shared MoE input must match the reserved dtype and root device")
+            self.heap_manager = FixedMegaMoeHeap(self.consumer)
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
             self.workspace = MegaMoeWorkspace(shared=shared)
-            self.heap_manager.bind(self, specification)
+            if self.consumer is None:
+                self.heap_manager.bind(self, specification)
+            else:
+                self.workspace.heap_manager = self.heap_manager
+                self.workspace.root_consumer = self.consumer
+                self.workspace.capacity_floor = self.spec.receive_capacity
         except Exception:
-            shmem.release()
+            if self.consumer is None:
+                shmem.release()
+            else:
+                self.consumer.unbind()
             raise
         self._closed = False
 
@@ -136,8 +161,11 @@ class _MegaMoeExecutionResources:
             return
         with self.heap_manager.access():
             self.workspace.close()
-            shmem.release()
-            self.heap_manager.remove(self)
+            if self.consumer is None:
+                shmem.release()
+                self.heap_manager.remove(self)
+            else:
+                self.consumer.close()
             self._closed = True
 
 
@@ -224,8 +252,7 @@ class MegaMoeExperts(MulticoreModule):
             swiglu_limit=swiglu_limit,
             ep_size=ep_size,
         )
-        if swiglu_limit is not None:
-            swiglu_limit = float(swiglu_limit)
+        swiglu_limit = None if swiglu_limit is None else float(swiglu_limit)
         if replica_transport not in ("p2p", "shmem", *SIGNAL_TRANSPORT_MODES):
             raise ValueError("Unsupported replica_transport; expected p2p, shmem, shmem_signal, "
                              "shmem_signal_sdma, shmem_signal_sdma_parallel, shmem_signal_sdma_bidir "
@@ -292,9 +319,13 @@ class MegaMoeExperts(MulticoreModule):
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
+        self._initialize_expert_parameters(create_parameters)
+
+    def _initialize_expert_parameters(self, create_parameters: bool) -> None:
+        """Register owned expert parameters or caller-owned placeholders."""
         if create_parameters:
             self.gate_up_weight, self.down_weight = _create_mega_moe_parameters(
-                self.local_experts, hidden_size, intermediate_size,
+                self.local_experts, self.hidden_size, self.intermediate_size,
             )
         else:
             self.register_parameter("gate_up_weight", None)
@@ -503,6 +534,26 @@ class MegaMoeExperts(MulticoreModule):
         )
         return output.reshape(hidden_states.shape)
 
+    def bind_shmem_root(self, root: SharedShmemRoot, consumer_name: str, *, dtype: torch.dtype) -> None:
+        """Reserve this execution group's MoE layout in a shared root before first use.
+
+        Configure ``share_execution_resources`` first, then bind the resulting
+        group once. Every root consumer must be declared before any forward.
+        Pull is supported; push must preallocate its full lossless receive bound.
+        This preserves MoE buffer layouts and parameters while prohibiting heap
+        growth during coexistence. Root membership must exactly match ordered EP.
+        """
+        group = self._resource_group
+        if self._resource_closed or group.resources is not None or group.binding is not None:
+            raise RuntimeError("bind the shared SHMEM root before first use and before module close")
+        if group.shmem_binding is not None:
+            consumer, declared_dtype = group.shmem_binding
+            if consumer.root is root and consumer.specification.name == consumer_name and declared_dtype == dtype:
+                return
+            raise RuntimeError("execution group already has a different shared SHMEM binding")
+        consumer = reserve_mega_moe_consumer(root, consumer_name, group.specification, dtype)
+        group.shmem_binding = (consumer, dtype)
+
     def _create_execution_resources(
         self,
         tensor: torch.Tensor,
@@ -516,4 +567,5 @@ class MegaMoeExperts(MulticoreModule):
             tensor,
             shared=shared,
             active_specifications=active_specifications,
+            shmem_binding=self._resource_group.shmem_binding,
         )
