@@ -725,8 +725,8 @@
       ],
       "context_owner": "native_callback",
       "pipe_lifetime": "native_callback_scope",
-      "context_initialization": "existing_native_task_methods",
-      "context_destruction": "existing_native_task_methods",
+      "context_initialization": "generated_fixed_primitive_instances_and_GMM_cube_context_factory",
+      "context_destruction": "original_instance_and_entry_pipe_scope_exit",
       "entry_source": "ops/hyper_mega_moe/op_kernel/hyper_mega_moe.cpp",
       "input_array": "input_list",
       "input_addresses": [
@@ -756,7 +756,56 @@
         "tiling",
         "all_event_counters",
         "profile_buffer"
-      ]
+      ],
+      "contexts": {
+        "swiglu_bf16_double": {
+          "source": "swi_glu/swi_glu.cpp",
+          "method": "swi_glu",
+          "ownership": "callback_local",
+          "cleanup": "primitive_instance_scope_exit",
+          "phases": {
+            "init": "SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;\n      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);"
+          },
+          "occurrences": 2
+        },
+        "swiglu_half_double": {
+          "source": "swi_glu/swi_glu.cpp",
+          "method": "swi_glu",
+          "ownership": "callback_local",
+          "cleanup": "primitive_instance_scope_exit",
+          "phases": {
+            "init": "SwigluSingle<SwigluVectorBF16<half, float, half, 2>, half, half> op;\n      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);"
+          }
+        },
+        "swiglu_half_single": {
+          "source": "swi_glu/swi_glu.cpp",
+          "method": "swi_glu",
+          "ownership": "callback_local",
+          "cleanup": "primitive_instance_scope_exit",
+          "phases": {
+            "init": "SwigluSingle<SwigluVectorBF16<half, float, half, 1>, half, half> op;\n      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);"
+          }
+        },
+        "gmm_cube_factory": {
+          "source": "grouped_matmul/grouped_matmul.cpp",
+          "method": "GMM_CUBE_IMP",
+          "scope": "macro",
+          "ownership": "callback_local",
+          "cleanup": "borrowed_entry_pipe_and_instance_scope_exit",
+          "phases": {
+            "definition": "#define GMM_CUBE_IMP(processClass, transA, transB, sync, cfg)\n    do {\n        if ASCEND_IS_AIV {\n            return;\n        }\n        using matmulType = MMImplType<xType<transA>, weightType<transB>, yType, biasType, cfg>;\n        matmulType::MT mm;\n        GET_TILING_DATA_MEMBER(GMMTilingData, gmmBaseParams, gmmBaseParams_, tiling);\n        GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, mmTilingData_, tiling);\n        GET_TILING_DATA_MEMBER_ADDR(GMMTilingData, gmmArray, gmmArrayAddr_, tiling);\n        mm.SetSubBlockIdx(0);\n        mm.Init(&mmTilingData_, &tPipe);\n        GMMCompute<matmulType, sync> computeOp(mm);\n        computeOp.Init(x, weight, bias, scale, offset, antiquantScale, antiquantOffset, groupList, perTokenScale,\n                       y, user1,  &gmmBaseParams_, &mmTilingData_, &tPipe);\n        processClass<decltype(computeOp)> op(computeOp);\n        op.Init(&gmmBaseParams_, &mmTilingData_, gmmArrayAddr_, groupList, tiling);\n        op.Process();\n    } while (0)"
+          }
+        },
+        "gmm_entry": {
+          "source": "grouped_matmul/grouped_matmul.cpp",
+          "method": "grouped_matmul",
+          "ownership": "callback_local",
+          "cleanup": "entry_pipe_scope_exit",
+          "phases": {
+            "init": "TPipe tPipe;\n    AscendCUtils::SetOverflow(1);\n    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);\n    GM_ADDR user1 = GetUserWorkspace(workspace);"
+          }
+        }
+      }
     },
     "moe_backward": {
       "family": "moe",
@@ -814,8 +863,8 @@
       ],
       "context_owner": "native_callback",
       "pipe_lifetime": "native_callback_scope",
-      "context_initialization": "existing_native_task_methods",
-      "context_destruction": "existing_native_task_methods",
+      "context_initialization": "generated_fixed_primitive_instances_and_GMM_cube_context_factory",
+      "context_destruction": "original_instance_and_entry_pipe_scope_exit",
       "entry_source": "ops/hyper_mega_moe_grad/op_kernel/hyper_mega_moe_grad.cpp",
       "input_array": "input_list",
       "input_addresses": [
@@ -852,7 +901,92 @@
         "tiling",
         "all_event_counters",
         "profile_buffer"
-      ]
+      ],
+      "contexts": {
+        "swiglu_bf16_double": {
+          "source": "swi_glu/swi_glu.cpp",
+          "method": "swi_glu",
+          "ownership": "callback_local",
+          "cleanup": "primitive_instance_scope_exit",
+          "phases": {
+            "init": "SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;\n      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);"
+          },
+          "occurrences": 2
+        },
+        "swiglu_half_double": {
+          "source": "swi_glu/swi_glu.cpp",
+          "method": "swi_glu",
+          "ownership": "callback_local",
+          "cleanup": "primitive_instance_scope_exit",
+          "phases": {
+            "init": "SwigluSingle<SwigluVectorBF16<half, float, half, 2>, half, half> op;\n      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);"
+          }
+        },
+        "swiglu_half_single": {
+          "source": "swi_glu/swi_glu.cpp",
+          "method": "swi_glu",
+          "ownership": "callback_local",
+          "cleanup": "primitive_instance_scope_exit",
+          "phases": {
+            "init": "SwigluSingle<SwigluVectorBF16<half, float, half, 1>, half, half> op;\n      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);"
+          }
+        },
+        "gmm_cube_factory": {
+          "source": "grouped_matmul/grouped_matmul.cpp",
+          "method": "GMM_CUBE_IMP",
+          "scope": "macro",
+          "ownership": "callback_local",
+          "cleanup": "borrowed_entry_pipe_and_instance_scope_exit",
+          "phases": {
+            "definition": "#define GMM_CUBE_IMP(processClass, transA, transB, sync, cfg)\n    do {\n        if ASCEND_IS_AIV {\n            return;\n        }\n        using matmulType = MMImplType<xType<transA>, weightType<transB>, yType, biasType, cfg>;\n        matmulType::MT mm;\n        GET_TILING_DATA_MEMBER(GMMTilingData, gmmBaseParams, gmmBaseParams_, tiling);\n        GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, mmTilingData_, tiling);\n        GET_TILING_DATA_MEMBER_ADDR(GMMTilingData, gmmArray, gmmArrayAddr_, tiling);\n        mm.SetSubBlockIdx(0);\n        mm.Init(&mmTilingData_, &tPipe);\n        GMMCompute<matmulType, sync> computeOp(mm);\n        computeOp.Init(x, weight, bias, scale, offset, antiquantScale, antiquantOffset, groupList, perTokenScale,\n                       y, user1,  &gmmBaseParams_, &mmTilingData_, &tPipe);\n        processClass<decltype(computeOp)> op(computeOp);\n        op.Init(&gmmBaseParams_, &mmTilingData_, gmmArrayAddr_, groupList, tiling);\n        op.Process();\n    } while (0)"
+          }
+        },
+        "gmm_entry": {
+          "source": "grouped_matmul/grouped_matmul.cpp",
+          "method": "grouped_matmul",
+          "ownership": "callback_local",
+          "cleanup": "entry_pipe_scope_exit",
+          "phases": {
+            "init": "TPipe tPipe;\n    AscendCUtils::SetOverflow(1);\n    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);\n    GM_ADDR user1 = GetUserWorkspace(workspace);"
+          }
+        },
+        "swiglu_grad_bf16_double": {
+          "source": "swi_glu_grad/swi_glu_grad.cpp",
+          "method": "swi_glu_grad",
+          "ownership": "callback_local",
+          "cleanup": "primitive_instance_scope_exit",
+          "phases": {
+            "init": "SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;\n        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);"
+          }
+        },
+        "swiglu_grad_bf16_single": {
+          "source": "swi_glu_grad/swi_glu_grad.cpp",
+          "method": "swi_glu_grad",
+          "ownership": "callback_local",
+          "cleanup": "primitive_instance_scope_exit",
+          "phases": {
+            "init": "SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 1>, bfloat16_t, bfloat16_t> op;\n        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);"
+          }
+        },
+        "swiglu_grad_half_double": {
+          "source": "swi_glu_grad/swi_glu_grad.cpp",
+          "method": "swi_glu_grad",
+          "ownership": "callback_local",
+          "cleanup": "primitive_instance_scope_exit",
+          "phases": {
+            "init": "SwiGluGradSingle <SwiGluGradBF16<half, float, half, 2>, half, half> op;\n        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);"
+          }
+        },
+        "swiglu_grad_half_single": {
+          "source": "swi_glu_grad/swi_glu_grad.cpp",
+          "method": "swi_glu_grad",
+          "ownership": "callback_local",
+          "cleanup": "primitive_instance_scope_exit",
+          "phases": {
+            "init": "SwiGluGradSingle <SwiGluGradBF16<half, float, half, 1>, half, half> op;\n        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);"
+          }
+        }
+      }
     }
   }
 }

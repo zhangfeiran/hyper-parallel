@@ -195,7 +195,6 @@ def _compose_hyper_parallel_ops(
         operator_root = source_root / operator_name
         shutil.copytree(_MULTICORE_OPS / operator_name, operator_root)
         shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
-        install_worker_glue(operator_root, "moe", "backward" if operator_name.endswith("_grad") else "forward")
         shutil.copytree(
             ops_nn_copy / "activation" / "swi_glu" / "op_kernel",
             operator_root / "op_kernel" / "swi_glu",
@@ -208,6 +207,9 @@ def _compose_hyper_parallel_ops(
         ops_nn_copy / "activation" / "swi_glu_grad" / "op_kernel",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad",
     )
+    for operator_name in _HYPER_OPERATORS:
+        install_worker_glue(source_root / operator_name, "moe",
+                            "backward" if operator_name.endswith("_grad") else "forward")
 
 
 def _require_assembled_files(source_root: Path) -> None:

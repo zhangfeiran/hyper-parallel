@@ -40,7 +40,7 @@ def _hash(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _sources():
+def _sources(socs):
     baseline = json.loads((_COMPONENT / "runtime/baselines/families.json").read_text())["families"]["moe"]
     for relative, expected in baseline["source_hashes"].items():
         if "/ops/" in relative and _hash(_REPO / relative) != expected:
@@ -62,6 +62,13 @@ def _sources():
     for path in sorted(stage.rglob("*")):
         if path.is_file():
             sources[f"assembled_torch/{path.relative_to(stage)}"] = _hash(path)
+    for soc in socs.split(","):
+        native = _REPO / "build/native/work/multicore/source-assembly" / soc / "source"
+        if not (native / "hyper_mega_moe/op_kernel/worker_kernel.cpp").is_file():
+            raise ValueError(f"Native MoE sources must be assembled before sealing: {soc}")
+        for path in sorted(native.rglob("*")):
+            if path.is_file():
+                sources[f"assembled_native/{soc}/{path.relative_to(native)}"] = _hash(path)
     return sources
 
 
@@ -85,7 +92,7 @@ def write_manifest(multicore: Path, shmem: Path, socs: str) -> None:
     """
     cann = Path(os.environ["ASCEND_HOME_PATH"]).resolve()
     build = {
-        "socs": socs.split(","), "sources": _sources(), "host_arch": platform.machine(),
+        "socs": socs.split(","), "sources": _sources(socs), "host_arch": platform.machine(),
         "torch": str(torch.__version__), "torch_npu": version("torch-npu"),
         "torch_cxx11_abi": torch.compiled_with_cxx11_abi(), "python": platform.python_version(),
         "cann_root": str(cann), "cann_version": (cann / "opp/version.info").read_text(),

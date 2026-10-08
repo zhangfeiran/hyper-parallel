@@ -569,5 +569,41 @@ across three batch/alignment shapes and constructor, body, completion and explic
 destruction order. Native acceptance compiles the actual generated contexts and
 uses the existing Gate numerical/lifecycle gates, plus MHC/MoE regression.
 
-These are fixed supported Gate/MHC context recipes. General selectable primitive
-factories and MoE primitive-local setup generation remain subsequent work.
+These are fixed supported Gate/MHC context recipes. MoE primitive context
+generation is described below; general selectable primitive factories remain
+subsequent work.
+
+## P5 generated MoE primitive contexts
+
+MoE's locked adapted SwiGLU/SwiGLUGrad entries and active GMM cube factory also
+use shared context recipes. Fourteen fixed recipes generate the original
+instance/Init fragments, GMM entry-local pipe/workspace setup and the active
+GMM_CUBE_IMP macro. Recipes identify normalized relative source paths, repeated
+occurrence counts and function or macro scope. Generated nested includes resolve
+to the operator's own runtime fragments.
+
+Forward BF16 retains two identical double-buffer instance declarations even when
+the single-buffer branch is selected. Backward and half instances preserve their
+original buffer counts. Clamp arguments, dtype branches, Process calls and scope
+exit remain unchanged. GMM keeps the AIV early return, transpose/FP32-output
+selection and original matmul/compute/process objects. The entry-local TPipe is
+borrowed by those objects and remains alive until their reverse destruction.
+Numerical primitive class headers and their internal pipe/queue/UB behavior stay
+with the locked implementation.
+
+The isolated assembler exports and applies the locked dependency patches, copies
+all required sources, then installs context glue. The pinned upstream repositories
+and fusion/clamp patches are retained. MoE's native manifest seals the actual
+assembled per-SoC kernel source closure as well as the staged Torch adapter,
+generator/contract inputs and compiled libraries.
+
+CPU tests compare full dependency-source tokens after include expansion and line
+continuation normalization. Independent original/generated C++ probes cover dtype,
+buffering and clamp combinations, GMM transpose/FP32 selection, AIV early return,
+Init arguments and instance/pipe lifetime. Device acceptance uses rebuilt payloads
+and the existing numerical, lifecycle and hot-replica gates.
+
+Fixed supported worker and primitive context recipes now cover Gate, MHC and MoE.
+General selectable primitive combinations, lower-level CANN host/tiling
+generation, general buffer planning and binary/materialized-device caches remain
+subsequent work. Source-only bundle status is retained.
