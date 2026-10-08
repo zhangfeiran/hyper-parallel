@@ -33,6 +33,12 @@ class HyperDsaFusedForward : public OpDef {
     }
     this->Input("retained").ParamType(REQUIRED).DataType({ge::DT_UINT8, ge::DT_UINT8})
         .Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();
+    this->Input("arena").ParamType(OPTIONAL).DataType({ge::DT_UINT8, ge::DT_UINT8})
+        .Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();
+    for (const char *input : {"transport_meta", "requests", "transport_trace"}) {
+      this->Input(input).ParamType(OPTIONAL).DataType({ge::DT_INT64, ge::DT_INT64})
+          .Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();
+    }
     this->Output("indices").ParamType(REQUIRED).DataType({ge::DT_INT32, ge::DT_INT32})
         .Format({ge::FORMAT_ND, ge::FORMAT_ND});
     for (const char *output : {"values", "attention"}) {

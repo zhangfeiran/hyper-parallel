@@ -13,18 +13,25 @@
 
 namespace {
 void register_dsa_probes(torch::Library& m) {
-  m.def("dsa_fused_forward_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_fused_forward_version() -> int", []() -> int64_t { return 2; });
   m.def("dsa_fused_forward_out(Tensor index_query, Tensor index_key, Tensor query, Tensor compressed, "
         "Tensor query_rope, Tensor key_rope, Tensor weights, Tensor lengths, Tensor config, "
         "Tensor(a!) trace, Tensor(b!) retained, float scale, Tensor(c!) indices, Tensor(d!) values, "
         "Tensor(e!) attention, Tensor(f!) maximum, Tensor(g!) sum) "
+        "-> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
+  m.def("dsa_fused_cp_forward_out(Tensor index_query, Tensor(h!) index_key, Tensor query, Tensor(i!) compressed, "
+        "Tensor query_rope, Tensor(j!) key_rope, Tensor weights, Tensor lengths, Tensor config, "
+        "Tensor(a!) trace, Tensor(b!) retained, float scale, Tensor(c!) indices, Tensor(d!) values, "
+        "Tensor(e!) attention, Tensor(f!) maximum, Tensor(g!) sum, Tensor(k!) arena, Tensor metadata, "
+        "Tensor requests, Tensor(l!) transport_trace) "
         "-> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
   m.def("dsa_mixed_grad_version() -> int", []() -> int64_t { return 1; });
   m.def("dsa_mixed_grad_out(Tensor query, Tensor key, Tensor value, Tensor indices, Tensor grad_out, "
         "Tensor out, Tensor maximum, Tensor sum, Tensor actual_query, Tensor actual_kv, Tensor query_rope, "
         "Tensor key_rope, Tensor config, Tensor(a!) trace, Tensor(b!) retained, float scale, int phase, "
         "Tensor(c!) grad_query, Tensor(d!) grad_key, Tensor(e!) grad_value, Tensor(f!) grad_query_rope, "
-        "Tensor(g!) grad_key_rope) -> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
+        "Tensor(g!) grad_key_rope) "
+        "-> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
   m.def("dsa_mixed_indexer_version() -> int", []() -> int64_t { return 2; });
   m.def("dsa_mixed_indexer_out(Tensor query, Tensor key, Tensor weights, Tensor actual_query, "
         "Tensor actual_kv, Tensor config, Tensor(a!) trace, Tensor(b!) retained, int merge_phase, "

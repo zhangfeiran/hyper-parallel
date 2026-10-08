@@ -237,6 +237,8 @@ def _compose_hyper_parallel_ops(
         runtime = source_root / name / "op_kernel" / "runtime"
         runtime.mkdir()
         shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_mixed_group.h", runtime / "dsa_mixed_group.h")
+        if name == "hyper_dsa_fused_forward":
+            shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_transport.h", runtime / "dsa_cp_transport.h")
 
 
 def _compose_mixed_indexer(source_root: Path, transformer_copy: Path) -> None:

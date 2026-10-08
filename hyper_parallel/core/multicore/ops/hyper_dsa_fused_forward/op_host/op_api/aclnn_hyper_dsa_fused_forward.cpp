@@ -27,21 +27,16 @@ OP_TYPE_REGISTER(HyperDsaFusedForward);
 }
 using l0op::HyperDsaFusedForwardOpTypeId;
 
-extern "C" aclnnStatus aclnnHyperDsaFusedForwardGetWorkspaceSize(
-    const aclTensor *indexQuery, const aclTensor *indexKey, const aclTensor *query,
-    const aclTensor *compressed, const aclTensor *queryRope, const aclTensor *keyRope,
-    const aclTensor *weights, const aclTensor *lengths, const aclTensor *config,
-    const aclTensor *trace, const aclTensor *retained, double scale,
-    const aclTensor *indices, const aclTensor *values, const aclTensor *attention,
-    const aclTensor *maximum, const aclTensor *sum,
-    uint64_t *workspaceSize, aclOpExecutor **executor) {
+namespace {
+aclnnStatus BuildFusedExecutor(const std::array<const aclTensor *, 8> &originalInputs,
+                              const std::array<const aclTensor *, 7> &control, double scale,
+                              const std::array<const aclTensor *, 5> &destinations,
+                              uint64_t *workspaceSize, aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
-  L2_DFX_PHASE_1(aclnnHyperDsaFusedForward, DFX_IN(indexQuery, query, config), DFX_OUT(indices, attention));
   auto owner = CREATE_EXECUTOR();
   CHECK_RET(owner.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
-  std::array<const aclTensor *, 8> inputs{indexQuery, indexKey, query, compressed,
-                                         queryRope, keyRope, weights, lengths};
-  std::array<const aclTensor *, 5> outputs{indices, values, attention, maximum, sum};
+  auto inputs = originalInputs;
+  auto outputs = destinations;
   for (auto &input : inputs) {
     input = l0op::Contiguous(input, owner.get());
     CHECK_RET(input != nullptr, ACLNN_ERR_INNER_NULLPTR);
@@ -55,7 +50,8 @@ extern "C" aclnnStatus aclnnHyperDsaFusedForwardGetWorkspaceSize(
     return ADD_TO_LAUNCHER_LIST_AICORE(
         HyperDsaFusedForward,
         OP_INPUT(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5],
-                 inputs[6], inputs[7], config, trace, retained),
+                 inputs[6], inputs[7], control[0], control[1], control[2],
+                 control[3], control[4], control[5], control[6]),
         OP_OUTPUT(const_cast<aclTensor *>(outputs[0]), const_cast<aclTensor *>(outputs[1]),
                   const_cast<aclTensor *>(outputs[2]), const_cast<aclTensor *>(outputs[3]),
                   const_cast<aclTensor *>(outputs[4])),
@@ -63,17 +59,58 @@ extern "C" aclnnStatus aclnnHyperDsaFusedForwardGetWorkspaceSize(
   };
   const auto status = launch(owner.get());
   CHECK_RET(status == ACL_SUCCESS, status);
-  const std::array<const aclTensor *, 5> destinations{indices, values, attention, maximum, sum};
   for (size_t index = 0; index < outputs.size(); ++index) {
     CHECK_RET(l0op::ViewCopy(outputs[index], destinations[index], owner.get()) != nullptr, ACLNN_ERR_INNER_NULLPTR);
+  }
+  if (control[3] != nullptr) {
+    for (size_t index : {1U, 3U, 5U}) {
+      CHECK_RET(l0op::ViewCopy(inputs[index], originalInputs[index], owner.get()) != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    }
   }
   *workspaceSize = owner->GetWorkspaceSize();
   owner.ReleaseTo(executor);
   return ACLNN_SUCCESS;
 }
 
+}  // namespace
+
+extern "C" aclnnStatus aclnnHyperDsaFusedForwardGetWorkspaceSize(
+    const aclTensor *indexQuery, const aclTensor *indexKey, const aclTensor *query,
+    const aclTensor *compressed, const aclTensor *queryRope, const aclTensor *keyRope,
+    const aclTensor *weights, const aclTensor *lengths, const aclTensor *config,
+    const aclTensor *trace, const aclTensor *retained, double scale,
+    const aclTensor *indices, const aclTensor *values, const aclTensor *attention,
+    const aclTensor *maximum, const aclTensor *sum,
+    uint64_t *workspaceSize, aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaFusedForward, DFX_IN(indexQuery, query, config), DFX_OUT(indices, attention));
+  return BuildFusedExecutor({indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths},
+                            {config, trace, retained, nullptr, nullptr, nullptr, nullptr}, scale,
+                            {indices, values, attention, maximum, sum}, workspaceSize, executor);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaFusedCpForwardGetWorkspaceSize(
+    const aclTensor *indexQuery, const aclTensor *indexKey, const aclTensor *query,
+    const aclTensor *compressed, const aclTensor *queryRope, const aclTensor *keyRope,
+    const aclTensor *weights, const aclTensor *lengths, const aclTensor *config,
+    const aclTensor *trace, const aclTensor *retained, double scale,
+    const aclTensor *indices, const aclTensor *values, const aclTensor *attention,
+    const aclTensor *maximum, const aclTensor *sum,
+    const aclTensor *arena, const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace,
+    uint64_t *workspaceSize, aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaFusedCpForward, DFX_IN(indexQuery, query, config), DFX_OUT(indices, attention));
+  return BuildFusedExecutor({indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths},
+                            {config, trace, retained, arena, metadata, requests, transportTrace}, scale,
+                            {indices, values, attention, maximum, sum}, workspaceSize, executor);
+}
+
 extern "C" aclnnStatus aclnnHyperDsaFusedForward(
     void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
   L2_DFX_PHASE_2(aclnnHyperDsaFusedForward);
+  return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaFusedCpForward(
+    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+  L2_DFX_PHASE_2(aclnnHyperDsaFusedCpForward);
   return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
 }

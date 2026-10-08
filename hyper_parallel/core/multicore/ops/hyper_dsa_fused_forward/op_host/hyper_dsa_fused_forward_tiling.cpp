@@ -167,7 +167,8 @@ ge::graphStatus TilingDsaFusedForward(gert::TilingContext *context) {
   workspace[0] = sfaBytes;
   context->SetBlockDim(20);
   context->SetScheduleMode(1);
-  context->SetTilingKey(context->GetInputDesc(6)->GetDataType() == ge::DT_FLOAT ? 1 : 0);
+  const uint64_t transport = context->GetOptionalInputDesc(11) == nullptr ? 0 : 2;
+  context->SetTilingKey(transport + (context->GetInputDesc(6)->GetDataType() == ge::DT_FLOAT ? 1 : 0));
   raw->SetDataSize(data.GetDataSize());
   return ge::GRAPH_SUCCESS;
 }

@@ -57,7 +57,7 @@ def fused_dsa_forward_probe(index_states: tuple[torch.Tensor, ...], main_states:
     if schedule.rounds != 1:
         raise ValueError("fused DSA requires rounds=1; repeat complete invocations instead")
     _load_native()
-    if torch.ops.hyper_parallel.dsa_fused_forward_version() != 1:
+    if torch.ops.hyper_parallel.dsa_fused_forward_version() not in (1, 2):
         raise RuntimeError("fused DSA requires adapter ABI 1; rebuild this checkout's payload")
     query, compressed, query_rope, key_rope = main_states
     index_query, index_key, weights = index_states

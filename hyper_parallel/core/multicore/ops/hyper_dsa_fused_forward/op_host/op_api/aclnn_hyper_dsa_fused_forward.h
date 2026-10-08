@@ -29,6 +29,17 @@ ACLNN_API aclnnStatus aclnnHyperDsaFusedForwardGetWorkspaceSize(
     uint64_t *workspaceSize, aclOpExecutor **executor);
 ACLNN_API aclnnStatus aclnnHyperDsaFusedForward(
     void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
+ACLNN_API aclnnStatus aclnnHyperDsaFusedCpForwardGetWorkspaceSize(
+    const aclTensor *indexQuery, const aclTensor *indexKey, const aclTensor *query,
+    const aclTensor *compressed, const aclTensor *queryRope, const aclTensor *keyRope,
+    const aclTensor *weights, const aclTensor *lengths, const aclTensor *config,
+    const aclTensor *trace, const aclTensor *retained, double scale,
+    const aclTensor *indices, const aclTensor *values, const aclTensor *attention,
+    const aclTensor *maximum, const aclTensor *sum,
+    const aclTensor *arena, const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace,
+    uint64_t *workspaceSize, aclOpExecutor **executor);
+ACLNN_API aclnnStatus aclnnHyperDsaFusedCpForward(
+    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
 #ifdef __cplusplus
 }
 #endif

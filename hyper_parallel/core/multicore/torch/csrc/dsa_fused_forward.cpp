@@ -77,6 +77,14 @@ void check_outputs(const Tensors &tensors) {
               tensors[15]->scalar_type() == at::kFloat, "fused DSA SFA output shapes or dtypes are incompatible");
 }
 
+void check_fused_inputs(const Tensors &tensors, double scale) {
+  check_storage(tensors);
+  check_states(tensors);
+  check_runtime(tensors);
+  check_outputs(tensors);
+  TORCH_CHECK(std::isfinite(scale) && scale > 0, "fused DSA scale must be finite and positive");
+}
+
 Result fused_forward_npu(
     const at::Tensor &indexQuery, const at::Tensor &indexKey, const at::Tensor &query,
     const at::Tensor &compressed, const at::Tensor &queryRope, const at::Tensor &keyRope,
@@ -85,19 +93,68 @@ Result fused_forward_npu(
     at::Tensor &indices, at::Tensor &values, at::Tensor &attention, at::Tensor &maximum, at::Tensor &sum) {
   const Tensors tensors{&indexQuery, &indexKey, &query, &compressed, &queryRope, &keyRope, &weights,
                         &lengths, &config, &trace, &retained, &indices, &values, &attention, &maximum, &sum};
-  check_storage(tensors);
-  check_states(tensors);
-  check_runtime(tensors);
-  check_outputs(tensors);
-  TORCH_CHECK(std::isfinite(scale) && scale > 0, "fused DSA scale must be finite and positive");
+  check_fused_inputs(tensors, scale);
   static const hyper_parallel::multicore::CachedOpApi api(
       "aclnnHyperDsaFusedForward", "aclnnHyperDsaFusedForwardGetWorkspaceSize");
   hyper_parallel::multicore::execute_cached_op(api, indexQuery, indexKey, query, compressed, queryRope, keyRope,
       weights, lengths, config, trace, retained, scale, indices, values, attention, maximum, sum);
   return Result(indices, values, attention, maximum, sum, trace, retained);
 }
+void check_transport_shapes(const at::Tensor &arena, const at::Tensor &metadata,
+                            const at::Tensor &requests, const at::Tensor &transportTrace) {
+  TORCH_CHECK(arena.dim() == 1 && arena.scalar_type() == at::kByte &&
+              metadata.sizes() == at::IntArrayRef({18}) && metadata.scalar_type() == at::kLong &&
+              requests.dim() == 2 && requests.size(0) > 0 && requests.size(1) == 4 &&
+              requests.scalar_type() == at::kLong && transportTrace.sizes() == at::IntArrayRef({32}) &&
+              transportTrace.scalar_type() == at::kLong, "fused CP transport buffer ABI mismatch");
+}
+
+void check_transport(const Tensors &tensors, const at::Tensor &arena, const at::Tensor &metadata,
+                     const at::Tensor &requests, const at::Tensor &transportTrace) {
+  check_transport_shapes(arena, metadata, requests, transportTrace);
+  for (const auto *tensor : {&arena, &metadata, &requests, &transportTrace}) {
+    TORCH_CHECK(tensor->device() == tensors[0]->device() && tensor->is_contiguous() && !tensor->requires_grad(),
+                "fused CP transport requires detached contiguous buffers on the prepared NPU");
+    for (const auto *original : tensors) {
+      TORCH_CHECK(!tensor->is_alias_of(*original), "fused CP transport must own independent storage");
+    }
+  }
+  const std::array<const at::Tensor *, 4> extras{&arena, &metadata, &requests, &transportTrace};
+  for (size_t index : {0U, 3U}) {
+    for (size_t other = 0; other < extras.size(); ++other) {
+      TORCH_CHECK(index == other || !extras[index]->is_alias_of(*extras[other]),
+                  "fused CP mutable transport buffers must own independent storage");
+    }
+  }
+  for (size_t index : {1U, 3U, 5U}) {
+    for (size_t other = 0; other < tensors.size(); ++other) {
+      TORCH_CHECK(index == other || !tensors[index]->is_alias_of(*tensors[other]),
+                  "fused CP key destinations must own independent storage");
+    }
+  }
+}
+
+Result fused_cp_forward_npu(
+    const at::Tensor &indexQuery, at::Tensor &indexKey, const at::Tensor &query,
+    at::Tensor &compressed, const at::Tensor &queryRope, at::Tensor &keyRope,
+    const at::Tensor &weights, const at::Tensor &lengths, const at::Tensor &config,
+    at::Tensor &trace, at::Tensor &retained, double scale,
+    at::Tensor &indices, at::Tensor &values, at::Tensor &attention, at::Tensor &maximum, at::Tensor &sum,
+    at::Tensor &arena, const at::Tensor &metadata, const at::Tensor &requests, at::Tensor &transportTrace) {
+  const Tensors tensors{&indexQuery, &indexKey, &query, &compressed, &queryRope, &keyRope, &weights,
+                        &lengths, &config, &trace, &retained, &indices, &values, &attention, &maximum, &sum};
+  check_fused_inputs(tensors, scale);
+  check_transport(tensors, arena, metadata, requests, transportTrace);
+  static const hyper_parallel::multicore::CachedOpApi api(
+      "aclnnHyperDsaFusedCpForward", "aclnnHyperDsaFusedCpForwardGetWorkspaceSize");
+  hyper_parallel::multicore::execute_cached_op(api, indexQuery, indexKey, query, compressed, queryRope, keyRope,
+      weights, lengths, config, trace, retained, scale, indices, values, attention, maximum, sum,
+      arena, metadata, requests, transportTrace);
+  return Result(indices, values, attention, maximum, sum, trace, retained);
+}
 }  // namespace
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("dsa_fused_forward_out", &fused_forward_npu);
+  m.impl("dsa_fused_cp_forward_out", &fused_cp_forward_npu);
 }

@@ -39,13 +39,14 @@ class _OwnerGather(torch.autograd.Function):
     """Gather fields together, preserving absent teacher gradients in KL-only backward."""
 
     @staticmethod
-    def forward(ctx: Any, layout: DsaCpLayout, shapes: tuple, *tensors: torch.Tensor) -> tuple:
+    def forward(ctx: Any, layout: DsaCpLayout, shapes: tuple, orders: tuple, *tensors: torch.Tensor) -> tuple:
         """Gather owner storage once and expose independent global fields."""
         ctx.layout = layout
         ctx.shapes = shapes
+        ctx.orders = orders
         ctx.input_dtype = tensors[0].dtype
         ctx.set_materialize_grads(False)
-        packed = [tensor.index_select(0, layout.field_order(field)).flatten(1)
+        packed = [tensor.index_select(0, orders[field]).flatten(1)
                   for field, tensor in enumerate(tensors)]
         ctx.widths = tuple(tensor.shape[1] for tensor in packed)
         local = torch.cat(packed, dim=1)
@@ -85,9 +86,9 @@ class _OwnerGather(torch.autograd.Function):
                 returned.append(None)
             else:
                 local = torch.empty_like(value)
-                local.index_copy_(0, layout.field_order(field), value)
+                local.index_copy_(0, ctx.orders[field], value)
                 returned.append(local.reshape(layout.local_tokens, *shape).to(ctx.input_dtype))
-        return (None, None, *returned)
+        return (None, None, None, *returned)
 
 
 class DsaCpLayout:
@@ -176,7 +177,24 @@ class DsaCpLayout:
                 raise ValueError("CP fields must share the prepared device and floating dtype")
             if not tensor.is_floating_point() or tensor.shape != (self.local_tokens, *shape):
                 raise ValueError("CP field shape does not match the prepared complete owner shard")
-        return _OwnerGather.apply(self, shapes, *tensors)
+        orders = tuple(self.field_order(field) for field in range(len(tensors)))
+        return _OwnerGather.apply(self, shapes, orders, *tensors)
+
+    def gather_query_fields(self, tensors: tuple[torch.Tensor, ...], shapes: tuple[tuple[int, ...], ...]) -> tuple:
+        """Replicate query-owned fields without substituting the KV storage permutation.
+
+        Native causal TND tiles require complete ordered Q. Fields must share
+        one floating dtype; a different weight dtype uses a separate call in
+        the same collective order on every member. Backward retains the same
+        FP32 owner reduction as the main reference gather.
+        """
+        if not tensors or len(tensors) != len(shapes):
+            raise ValueError("query gather requires matching nonempty field and shape declarations")
+        for tensor, shape in zip(tensors, shapes):
+            if (tensor.device != self.device or tensor.dtype != tensors[0].dtype or not tensor.is_floating_point()
+                    or tensor.shape != (self.local_tokens, *shape)):
+                raise ValueError("query fields must match the prepared owner rows, floating dtype and device")
+        return _OwnerGather.apply(self, shapes, (self.query_order,) * len(tensors), *tensors)
 
     def field_order(self, field: int) -> torch.Tensor:
         """Return the prepared owner-storage permutation for a declared field."""

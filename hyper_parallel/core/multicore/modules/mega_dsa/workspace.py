@@ -114,6 +114,7 @@ class MegaDsaWorkspace:
         self.buffers: dict[str, torch.Tensor] = {}
         self.active_invocation: tuple | None = None
         self.closed = False
+        self.transport_epoch = 0
 
     def bind(self) -> None:
         """Allocate one symmetric arena after all consumers have declared their budgets."""
@@ -198,6 +199,23 @@ class MegaDsaWorkspace:
             for name, tensor in zip(names, states):
                 reordered = tensor.detach().index_select(0, invocation.owner_order)
                 self.buffers[name][:len(meta.kv_global_ids)].copy_(reordered)
+
+    def next_transport_epoch(self, invocation: DsaWorkspaceInvocation) -> int:
+        """Reserve a monotonic ready/ACK epoch inside this workspace's active lease.
+
+        The counter belongs to the arena lifetime, so constructing another
+        transport adapter cannot reuse stale device flags. Each collective
+        invocation reserves exactly once on every root member.
+        """
+        meta = invocation.batch_meta
+        expected = (meta.layer, meta.microbatch, meta.invocation, meta.layout_id, meta.heap_generation)
+        if (invocation.workspace is not self or self.active_invocation is None
+                or self.active_invocation[:5] != expected or self.root.lease_owner is not self.consumer):
+            raise RuntimeError("transport epoch requires this workspace's active invocation lease")
+        if self.transport_epoch >= 2**63 - 1:
+            raise RuntimeError("DSA transport epoch capacity exhausted; close and prepare a new root")
+        self.transport_epoch += 1
+        return self.transport_epoch
 
     def close(self) -> None:
         """Quiesce all streams and collectively free this consumer's arena once."""

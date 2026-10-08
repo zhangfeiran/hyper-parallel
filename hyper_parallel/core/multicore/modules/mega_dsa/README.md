@@ -845,8 +845,8 @@ python -m hyper_parallel.core.multicore.examples.mega_dsa_mixed_indexer_validate
 This runs the same stock bitwise, signed-weight, tie, all-row contract and
 long-history LD checks as the two-launch validator, across 1/2/7/19 groups
 and three complete invocations with serial scratch reuse. Cross-operator
-alternation is exercised by the fused forward probe below. Communication
-pressure, fused backward and multi-card CP remain separate validation gates.
+alternation and native CP communication pressure are exercised by the fused
+forward probes below. Fused backward remains a separate validation gate.
 
 
 ### LI main/merge and SFA in one kernel
@@ -864,8 +864,8 @@ The host adapter uses CANN's `OpTilingContextBuilder` to invoke both existing
 locked tilers with their original IR input and attribute order. The source
 assembler exports their original tiling declarations for CANN to generate
 the composite device structure; math, selection order and workspace budgets
-remain those of the existing callable tiles. Only the fused operator's two
-weight-dtype templates are registered. The optional block-table input is
+remain those of the existing callable tiles. The fused operator registers
+weight-dtype templates with and without CP transport. The optional block-table input is
 absent in both child contexts. Lengths describe complete positive CP1 packed
 sequences; the probe does not accept sharded Q/KV.
 
@@ -908,6 +908,74 @@ stock-gradient, retained-graph and lifecycle checks passed, but the backward
 ST still returns failure. The fusion gate does not clear that failure.
 
 This is a CP1 forward and cross-operator scheduling gate. The existing SFA
-backward probe remains separately scheduled. Connecting native CP transport,
-owner gradient return, selected-set KL, fused backward and full-model training
+backward probe remains separately scheduled. The CP transport gate is described
+below. Owner gradient return, selected-set KL, fused backward and full-model training
 acceptance remains required before claiming a complete MegaDSA backend.
+
+
+### Native CP KV pull inside fused LI/SFA forward
+
+The experimental [CP forward probe](fused_cp.py) adds real symmetric-memory
+KV transport to the same mixed kernel. It requires adapter ABI 2, one node,
+MTE-reachable peers, identical ordered CP/root membership and direct root PE
+mapping. Geometry and math support match the CP1 fused probe. Preparation
+validates global ownership and allows different, reordered Q/K storage,
+uneven shards and owners with no rows.
+
+Each invocation replicates only query-side fields through the existing CP
+gather. Index-K, shared compressed KV and K-RoPE are published into the frozen
+workspace in canonical owner-offset order. The reserved progress Vector
+publishes READY and verifies every peer's generation, layer, microbatch,
+invocation and layout signature. It pulls the complete global index-K into
+ordinary invocation-owned HBM before compute begins. Once every compute
+member has entered LI, it pulls compressed KV and K-RoPE while LI runs.
+All transfers complete before the LI-main phase releases. SFA consumes these
+owned buffers and final indices without a host launch between phases.
+
+The progress worker uses private 8 KiB UB staging with explicit MTE completion
+events; it does not consume a compute worker's tile storage. READY and
+completed-read ACK occupy separate 128-byte cache lines. Each reader publishes
+ACK only after all owner fields have been copied, and each owner waits for
+every reader before kernel completion permits source reuse. The epoch belongs
+to the workspace lifetime, survives adapter recreation and can be reserved
+only inside the invocation lease. The lease covers query collectives,
+publication, device execution and output restoration; root completion events
+order reuse across streams.
+
+The result owns local-Q outputs, global packed indices, all three global key
+buffers, three phase traces and a separate transport trace. Explicit CPU
+decoding checks exact epochs, ACK counts, local/remote byte counts and all
+compute startup records. Long-history validation requires a strict intersection
+between a completed LI compute interval and the main-KV transfer interval.
+These timestamps certify simultaneous progress; they are not a speedup
+measurement. This baseline pulls complete KV and executes replicated Q;
+sparse KV fetch and query-local native tiling remain future work.
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  --module hyper_parallel.core.multicore.examples.mega_dsa_fused_cp_validate \
+  --output-dir fused_cp_report --long-history
+
+# Framework-free launchers exercise independent two- and four-rank processes.
+python -m pytest -q tests/torch/multicore/test_mega_dsa_fused_cp.py
+```
+
+The validator compares all five local outputs against a separately executed
+stock LI/SFA chain at zero tolerance and all global key storage bits exactly.
+It covers H32/H64, BF16/FP32 signed weights, packed lengths 3/10 and 2176/2240,
+contiguous/strided/zigzag/empty owners, four compute-group counts and three
+streams. Repeated invocations change source values and logical identity;
+adapters are recreated while the same arena and monotonic epoch are retained.
+
+The final 910B3/CANN 9.1 matrix passed 108 invocations per rank at CP1/2/4,
+756 rank invocations in total. All 168 long-history rank invocations certified
+LI/main-KV interval overlap and nine logical LD merges. Each group submits
+three complete invocations on different streams before observing results;
+all retained outputs and copied key buffers still match their own source
+values exactly. CP2/CP4 passed through the formal ST launchers. Existing
+CP2/CP4 reference and CP1 fused-forward regressions passed separately; the
+eight pre-existing LI/SFA/gradient device objects retained their hashes.
+
+This is a raw detached forward probe. It does not install autograd, native CP
+owner gradient return, selected-set KL or a production model backend. The
+previous FP32 backward and BF16 model acceptance failures remain open.
