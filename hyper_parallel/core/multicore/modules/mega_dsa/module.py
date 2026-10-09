@@ -16,13 +16,14 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.multicore.modules.mega_dsa.cann_reference import CannDsaStats
+from hyper_parallel.core.multicore.modules.mega_dsa.cann_reference import CannDsaStats, _selected_kl_gradients
 from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import (
     _SAVED_ATTENTION_TOKEN,
     FusedCpSavedAttention,
@@ -32,7 +33,7 @@ from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import (
 from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp_backward import (
     FusedDsaCpBackwardProbe,
 )
-from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta
+from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta, DsaLossNormalization
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import (
     MixedSfaSchedule,
     validate_device_phase_closure,
@@ -290,3 +291,128 @@ class MegaDsaCore(torch.nn.Module):
             raise ValueError("core transport lacks ordered main-KV copy timestamps")
         return {"compute": compute, "ready_ack": True, "epoch": result.epoch,
                 "remote_main_bytes": remote * 1152, "remote_index_bytes": 0}
+
+
+class _DsaTraining(torch.autograd.Function):
+    """Save native main states and forward-computed index gradients under autograd hooks."""
+
+    @staticmethod
+    def forward(ctx: Any, module: MegaDsa, batch_meta: DsaBatchMeta, *inputs: torch.Tensor) -> tuple:
+        """Execute the admitted native producer once and keep the two objectives independent."""
+        main, index = inputs[:4], inputs[4:]
+        backend = module.core.backend
+        invocation = replace(module.core.prepared_invocation, batch_meta=batch_meta)
+        result = backend.forward(invocation, tuple(tensor.detach() for tensor in main),
+                                 tuple(tensor.detach() for tensor in index))
+        saved = result.saved
+        if module.loss_coeff == 0:
+            index_gradients = tuple(torch.zeros_like(tensor) for tensor in result.index_states)
+            loss = saved.states[0].new_zeros((), dtype=torch.float32)
+        else:
+            *index_gradients, loss = _selected_kl_gradients(
+                *result.index_states, saved.states, saved.indices,
+                CannDsaStats(saved.forward[1], saved.forward[2]), backend.native_layout, backend.scale)
+            scale = module.loss_coeff * module.normalization.local_sum_scale / backend.layout.cp_size
+            index_gradients = tuple(gradient * scale for gradient in index_gradients)
+            loss = loss * scale
+        ctx.save_for_backward(*inputs, *saved.states, saved.indices, *saved.forward, *index_gradients)
+        ctx.backend = module.core.backward_backend
+        ctx.batch_meta, ctx.versions = saved.batch_meta, saved.versions
+        ctx.geometry, ctx.token = saved.geometry, saved._token
+        ctx.output_shape = tuple(result.output.shape)
+        ctx.input_gradients = tuple(tensor.requires_grad for tensor in inputs)
+        ctx.set_materialize_grads(False)
+        if not any(ctx.input_gradients[:4]):
+            ctx.mark_non_differentiable(result.output)
+        if not any(ctx.input_gradients[4:]):
+            ctx.mark_non_differentiable(loss)
+        return result.output, loss
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor | None, grad_loss: torch.Tensor | None) -> tuple:
+        """Apply each upstream scale once; KL derivatives never enter the main teacher states."""
+        if torch.is_grad_enabled():
+            raise ValueError("MegaDsa supports first-order backward only")
+        backend = ctx.backend
+        if ctx.geometry != (backend.backend.heads, backend.backend.scale, backend.backend.schedule):
+            raise ValueError("MegaDsa backward requires unchanged forward geometry/scale/schedule")
+        tensors = ctx.saved_tensors
+        main_gradients = (None,) * 4
+        if grad_output is not None:
+            saved = FusedCpSavedAttention(ctx.batch_meta, tuple(tensors[7:11]), tensors[11], tuple(tensors[12:15]),
+                                          ctx.versions, backend.backend, ctx.geometry, ctx.token)
+            main_gradients = backend._backward_saved(
+                saved, ctx.output_shape, grad_output.detach().contiguous()).gradients
+        index_gradients = (None,) * 3
+        if grad_loss is not None:
+            layout = backend.backend.layout
+            full_gradients = tuple(gradient * grad_loss for gradient in tensors[15:18])
+            index_gradients = layout.reduce_owner_gradients(
+                full_gradients, ((64, 128), (128,), (64,)),
+                (layout.query_order, layout.key_order, layout.query_order),
+                tuple(tensor.dtype for tensor in tensors[4:7]))
+        gradients = tuple(gradient if required else None for gradient, required in zip(
+            (*main_gradients, *index_gradients), ctx.input_gradients))
+        return (None, None, *gradients)
+
+
+class MegaDsa(torch.nn.Module):
+    """Parameter-free CP training over native LI/Top-K/SFA and host-dispatched selected KL.
+
+    All members call in matching forward/backward order, with matching objective
+    and requires-grad masks. Index inputs retain gradients; hard Top-K and the
+    main objective do not update them. KL teacher states are detached. Each rank
+    returns a replicated global KL contribution divided by CP size, following
+    the existing CANN CP reference. Apply aux_loss_auto_scale once in the caller.
+    This first P4 composition preserves full KV replication and uses a separate
+    KL launch and FP32 collective owner return; it is not fused KL/sparse fetch.
+    """
+
+    def __init__(self, workspace: MegaDsaWorkspace, invocation: DsaWorkspaceInvocation, *, heads: int,
+                 attention_scale: float, schedule: MixedSfaSchedule, normalization: DsaLossNormalization,
+                 loss_coeff: float = 1.0) -> None:
+        """Declare native dimensions and the actual downstream loss reducer at preparation."""
+        super().__init__()
+        if not isinstance(normalization, DsaLossNormalization):
+            raise TypeError("MegaDsa requires explicit DsaLossNormalization")
+        if normalization.global_valid_queries != invocation.batch_meta.global_valid_queries:
+            raise ValueError("MegaDsa normalization requires the complete global query count")
+        if not math.isfinite(loss_coeff) or loss_coeff < 0:
+            raise ValueError("loss_coeff must be finite and nonnegative")
+        declaration = (normalization, float(loss_coeff))
+        if len(workspace.root.members) > 1:
+            declarations = [None] * len(workspace.root.members)
+            dist.all_gather_object(declarations, declaration, group=workspace.root.group)
+            if any(item != declaration for item in declarations):
+                raise ValueError("MegaDsa members disagree on KL normalization or loss coefficient")
+        self.core = MegaDsaCore(workspace, invocation, heads=heads, attention_scale=attention_scale, schedule=schedule)
+        self.normalization = normalization
+        self.loss_coeff = float(loss_coeff)
+        meta = invocation.batch_meta
+        queries, keys = len(meta.q_global_ids), len(meta.kv_global_ids)
+        self.input_shapes = ((queries, heads, 512), (keys, 512), (queries, heads, 64), (keys, 64),
+                             (queries, 64, 128), (keys, 128), (queries, 64))
+
+    def forward(self, query: torch.Tensor, compressed_kv: torch.Tensor, query_rope: torch.Tensor,
+                key_rope: torch.Tensor, index_query: torch.Tensor, index_key: torch.Tensor,
+                merge_weight: torch.Tensor, batch_meta: DsaBatchMeta) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return local compressed output and a normalized replicated KL contribution.
+
+        Merge weights are already scaled signed BF16 model outputs for KL;
+        FP32 weights require loss_coeff=0. All
+        other inputs are BF16 and follow independent prepared Q/K owner orders.
+        Native indexer provenance supplies complete causal Top-K; arbitrary
+        external subsets are supported by MegaDsaCore, not this stock KL path.
+        """
+        inputs = (query, compressed_kv, query_rope, key_rope, index_query, index_key, merge_weight)
+        device = self.core.backend.layout.device
+        for index, (tensor, shape) in enumerate(zip(inputs, self.input_shapes)):
+            dtypes = (torch.bfloat16, torch.float32) if index == 6 else (torch.bfloat16,)
+            if (not isinstance(tensor, torch.Tensor) or tensor.shape != shape
+                    or tensor.device != device or tensor.dtype not in dtypes):
+                raise ValueError("MegaDsa inputs must match prepared BF16 Q/K shapes and BF16/FP32 weights")
+        if self.loss_coeff != 0 and merge_weight.dtype != torch.bfloat16:
+            raise ValueError("selected KL requires BF16 merge weights; FP32 index weights require loss_coeff=0")
+        if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in inputs):
+            self.core.backward_backend.check_native_support()
+        return _DsaTraining.apply(self, batch_meta, *inputs)

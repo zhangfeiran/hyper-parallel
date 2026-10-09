@@ -1184,3 +1184,116 @@ The combined corrected-payload evidence is 1624 rank invocations, 336 long-histo
 invocations and 56 rank lifecycle checks. CPU regression passed 140 tests and
 218 subtests. These results certify the tested external-core relative-L2,
 empty-set and transport contracts; the pointwise/model limitations above remain.
+
+
+### P4 training composition: native selection plus selected KL
+
+The parameter-free [MegaDsa](module.py) combines the existing CP native
+LI/Top-K/SFA forward with native main backward and the locked enhance selected
+KL operator. It returns `(local_compressed_output, auxiliary_loss)`. The model
+still owns projections, RoPE, state dictionaries and `aux_loss_auto_scale`.
+Main H32/H64, index H64/Di128, BF16 C512/RoPE64, signed already-scaled
+BF16 merge weights with KL enabled and one-node CP are explicit initial
+dimensions. FP32 merge weights are accepted only with loss_coeff=0.
+
+The fused forward retains its owned global index Q/K/weight tensors for the
+immediate KL call. No second index-input all-gather or CPU selection admission
+is needed. Native LI supplies complete causal Top-K provenance. This training
+composition does not admit external underfilled selections into stock KL;
+`MegaDsaCore` remains the entry for external subsets and empty selected rows.
+
+KL computes and saves its three derivatives once in forward. Backward scales
+those saved derivatives by the upstream auxiliary gradient once and returns
+index Q/K/weight gradients through a shared FP32 owner reduce-scatter, restoring
+independent Q/K storage orders. Main Q/shared KV/Q-RoPE/K-RoPE use the existing
+native FP32 owner-return path. Both paths keep tensors under autograd saved
+hooks; no shared scratch or module-level last-result cache owns backward data.
+LM-only backward leaves all index gradients absent. KL-only backward leaves
+all main teacher gradients absent. A zero coefficient skips the KL operator
+and gives an exact zero auxiliary loss and index derivatives.
+
+Each rank evaluates the replicated global selected KL and returns its
+`1 / CP_size` contribution, following `CannDsaCpReference`. Explicit
+`DsaLossNormalization(global_valid_queries, reducer_divisor)` applies the
+actual downstream parameter-reducer compensation. Summing detached rank loss
+contributions gives the declared global normalized objective. Members must use
+matching objective/require-grad masks and backward schedules. The caller
+applies the existing `aux_loss_auto_scale` once, rather than deriving auxiliary
+scale from the main cotangent.
+
+```python
+from hyper_parallel.core.multicore.modules.mega_dsa.module import MegaDsa
+from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaLossNormalization
+
+attention = MegaDsa(
+    workspace, invocation, heads=32, attention_scale=model_scaling,
+    schedule=schedule,
+    normalization=DsaLossNormalization(global_valid_queries, reducer_divisor),
+    loss_coeff=loss_coeff,
+)
+out, auxiliary_loss = attention(
+    query, compressed_kv, query_rope, key_rope,
+    index_query, index_key, scaled_merge_weight, batch_meta,
+)
+```
+
+The [training validator](../../examples/mega_dsa_training_cp_validate.py) checks
+stock selection sets, original CANN bitwise output, CP1 enhance gradients and
+loss, independent FP32 main/KL
+measurements and global loss contributions. Its declared native pointwise
+threshold is rtol=0.02/atol=2e-5. Independent FP32 gradients/loss must be finite
+and have relative L2 at most 0.02 or maximum absolute error at most 2e-5;
+original pointwise results are retained separately. Fixtures cover H32/H64,
+BF16 KL weights, FP32 zero-KL weights, explicit FP32-KL rejection,
+uneven/empty owners, objective isolation, coefficients,
+upstream auxiliary scales and reducer divisors, retained graphs, checkpoint,
+delayed backward and cross-stream execution. CPU contract tests pass; The CP1/CP2/CP4 short packed training matrix passes on the validated payloads.
+Omni enhance output differences are recorded independently; the original CANN
+SFA is the bitwise output comparator. The smoke's enhance-output relative L2
+was 0.0017897501040310402, with pointwise comparison failing. The independent
+FP32 output relative L2 was 0.0016449038835654839; it also failed pointwise.
+The smoke's maximum independent seven-gradient relative L2 was
+0.003362107087384327, and KL loss relative error was 4.245591711149349e-06.
+
+This is the first P4 composition, with a separate host-dispatched KL launch
+and collective index-gradient return. KL tile fusion, device sparse
+request/count generation, sparse gradient transport, model CP/TP integration,
+full training and performance acceptance remain subsequent work.
+
+
+Selected KL requires the existing reference Omni CANN vendor in addition to
+the activated multicore vendor. Activate both `ASCEND_CUSTOM_OPP_PATH` entries
+and both op-api library directories before importing Torch/TorchNPU. The
+multicore adapter is explicitly preloaded from its own payload. The validator
+records the actual loaded op-api libraries; an absent enhance KL symbol is an
+environment failure, not a numerical result. The zero-coefficient path avoids
+the optional KL operator.
+
+
+The locked enhance KL op definition and tiling require all main/index/weight
+inputs to share BF16/FP16 dtype. LI's FP32 weight capability therefore does not
+imply FP32 KL support. `MegaDsa` rejects a nonzero-KL FP32 weight request before
+native forward, preserving the caller's precision. Supporting FP32 KL needs a
+separately validated native adapter; this composition performs no downcast.
+
+
+The P4 composition matrix passed 16 positive training scenarios and one FP32-KL
+rejection per rank on CP1/CP2/CP4: 112 positive rank scenarios, seven rejections,
+147 native fused-forward invocations and 105 native main-backward invocations.
+All 707 available seven-gradient comparisons with the CP1 enhance baseline
+passed rtol=0.02/atol=2e-5. LM-only and KL-only gradients remain absent on the
+opposite branch. Zero coefficient and zero upstream auxiliary scale produce
+exact zero index gradients. CP reducer-divisor cases, empty owners, retained
+graphs, checkpoint, delayed publication and cross-stream backward all pass.
+Both expected op-api library paths were observed in the loaded process maps.
+
+The independent FP32 seven-gradient maximum relative L2 was
+0.003572747141616831; KL loss maximum relative error was
+1.9810393961618714e-05 (maximum absolute error 2.130400389432907e-08).
+All 315 independent FP32 index Q/K/weight measurements passed the original
+pointwise threshold. FP32 output maximum relative L2 was 0.002212485804360936.
+Original pointwise comparisons still failed for 86/707 FP32 gradient measurements and 96/112
+FP32 output measurements. These remain recorded alongside native successes;
+this does not establish full pointwise or model alignment. CPU regression
+passed 149 tests and 224 subtests. Long-history complete LM+KL, truncated
+Top-K training and mixed KL tile execution remain separate validation work.

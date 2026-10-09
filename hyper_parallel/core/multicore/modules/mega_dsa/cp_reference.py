@@ -64,30 +64,8 @@ class _OwnerGather(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, *gradients: torch.Tensor | None) -> tuple:
         """Reduce active field gradients to owners while preserving absent fields."""
-        layout = ctx.layout
-        # BF16 sums lose remote contributions before the owner receives them.
-        dtype = torch.float64 if ctx.input_dtype == torch.float64 else torch.float32
-        total = layout.batch_meta.global_valid_queries
-        fields = [torch.zeros((total, width), dtype=dtype, device=layout.device) if gradient is None
-                  else gradient.to(dtype).reshape(total, width)
-                  for gradient, width in zip(gradients, ctx.widths)]
-        padded = torch.zeros((layout.cp_size * layout.padded_tokens, sum(ctx.widths)),
-                             dtype=dtype, device=layout.device)
-        padded.index_copy_(0, layout.global_order, torch.cat(fields, dim=1))
-        owned = padded.new_empty((layout.padded_tokens, padded.shape[1]))
-        if layout.cp_size == 1:
-            owned.copy_(padded)
-        else:
-            dist.reduce_scatter_tensor(owned, padded, op=dist.ReduceOp.SUM, group=layout.group)
-        returned = []
-        for field, (value, gradient, shape) in enumerate(zip(owned[:layout.local_tokens].split(ctx.widths, dim=1),
-                                                           gradients, ctx.shapes)):
-            if gradient is None:
-                returned.append(None)
-            else:
-                local = torch.empty_like(value)
-                local.index_copy_(0, ctx.orders[field], value)
-                returned.append(local.reshape(layout.local_tokens, *shape).to(ctx.input_dtype))
+        returned = ctx.layout.reduce_owner_gradients(
+            gradients, ctx.shapes, ctx.orders, (ctx.input_dtype,) * len(gradients))
         return (None, None, None, *returned)
 
 
@@ -161,6 +139,38 @@ class DsaCpLayout:
             raise ValueError("; ".join(item[1] for item in declarations if item[1] is not None))
         if any(item[0] != signature for item in declarations):
             raise ValueError("CP members disagree on global metadata/invocation")
+
+    def reduce_owner_gradients(self, gradients: tuple, shapes: tuple, orders: tuple,
+                               dtypes: tuple) -> tuple:
+        """Sum global gradients in FP32/FP64 and restore each field's owner-local storage order.
+
+        Call collectively from first-order backward. Each non-None field has
+        complete global packed rows. Static orders select Q versus KV storage;
+        absent fields stay None. Mixed BF16/FP32 inputs share one FP32 reduction.
+        """
+        dtype = torch.float64 if torch.float64 in dtypes else torch.float32
+        total = self.batch_meta.global_valid_queries
+        widths = tuple(math.prod(shape) for shape in shapes)
+        fields = [torch.zeros((total, width), dtype=dtype, device=self.device) if gradient is None
+                  else gradient.to(dtype).reshape(total, width)
+                  for gradient, width in zip(gradients, widths)]
+        padded = torch.zeros((self.cp_size * self.padded_tokens, sum(widths)), dtype=dtype, device=self.device)
+        padded.index_copy_(0, self.global_order, torch.cat(fields, dim=1))
+        owned = padded.new_empty((self.padded_tokens, padded.shape[1]))
+        if self.cp_size == 1:
+            owned.copy_(padded)
+        else:
+            dist.reduce_scatter_tensor(owned, padded, op=dist.ReduceOp.SUM, group=self.group)
+        returned = []
+        for value, gradient, shape, order, target_dtype in zip(
+                owned[:self.local_tokens].split(widths, dim=1), gradients, shapes, orders, dtypes):
+            if gradient is None:
+                returned.append(None)
+            else:
+                local = torch.empty_like(value)
+                local.index_copy_(0, order, value)
+                returned.append(local.reshape(self.local_tokens, *shape).to(target_dtype))
+        return tuple(returned)
 
     def gather_fields(self, tensors: tuple[torch.Tensor, ...], shapes: tuple[tuple[int, ...], ...]) -> tuple:
         """Gather one packed differentiable buffer for main and indexer fields.

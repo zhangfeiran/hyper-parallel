@@ -102,6 +102,7 @@ class FusedCpForwardResult:
     transport_trace: torch.Tensor
     epoch: int
     saved: FusedCpSavedAttention | None = None
+    index_states: tuple[torch.Tensor, ...] = ()
 
 
 class FusedDsaCpForwardProbe:
@@ -220,7 +221,7 @@ class FusedDsaCpForwardProbe:
         return FusedCpForwardResult(output.index_select(0, local), global_indices.index_select(0, local),
                                     values.index_select(0, local), maximum.index_select(1, local),
                                     denominator.index_select(1, local), keys, tuple(trace.unbind()),
-                                    transport_trace, epoch, saved)
+                                    transport_trace, epoch, saved, (full_iq, keys[0][:, 0], full_weights))
 
     @staticmethod
     def _transport_interval(transport: torch.Tensor) -> tuple[int, int]:

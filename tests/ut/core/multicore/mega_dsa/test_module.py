@@ -14,6 +14,7 @@
 # ============================================================================
 """External selection admission, packed compaction and CP core autograd contracts."""
 
+from contextlib import contextmanager, ExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -21,8 +22,8 @@ from unittest.mock import patch
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
-from hyper_parallel.core.multicore.modules.mega_dsa import fused_cp_backward, module
-from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta
+from hyper_parallel.core.multicore.modules.mega_dsa import fused_cp, fused_cp_backward, module
+from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta, DsaLossNormalization
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
 from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
     DsaWorkspaceSpec,
@@ -216,3 +217,162 @@ class TestMegaDsaCore(SharedRootFixture):
                     torch.testing.assert_close(value, expected)
                 self.assertFalse(stats.maximum.requires_grad)
                 self.assertFalse(stats.denominator.requires_grad)
+
+
+class TestMegaDsaTraining(SharedRootFixture):
+    """Check seven-gradient ownership, isolated objectives and hook-managed precomputed KL."""
+
+    def setUp(self) -> None:
+        """Prepare distinct Q/K orders and the locked BF16 merge-weight producer."""
+        super().setUp()
+        self.workspace = MegaDsaWorkspace(self.root, "joint-dsa", DsaWorkspaceSpec(4, 4, 4, 1))
+        self.consumers.append(self.workspace.consumer)
+        self.addCleanup(self.workspace.close)
+        self.workspace.bind()
+        self.meta = replace(DsaBatchMeta.packed((2, 2)), q_global_ids=(3, 0, 2, 1), kv_global_ids=(1, 3, 0, 2),
+                            heap_generation=self.root.generation)
+        self.invocation = self.workspace.prepare(self.meta)
+        self.model = module.MegaDsa(self.workspace, self.invocation, heads=32, attention_scale=.1,
+                                    schedule=MixedSfaSchedule(7), normalization=DsaLossNormalization(4), loss_coeff=.25)
+        self.inputs = tuple(torch.ones(shape, dtype=torch.bfloat16, requires_grad=True)
+                            for shape in self.model.input_shapes)
+        self.raw_index_gradients = tuple((torch.arange(4, dtype=tensor.dtype) + 1).reshape(
+            4, *(1 for _ in tensor.shape[1:])).expand_as(tensor).clone() * factor
+            for tensor, factor in zip(self.inputs[4:], (1, 10, 100)))
+        self.main_gradients = tuple(torch.full_like(tensor, factor)
+                                    for tensor, factor in zip(self.inputs[:4], (2, 3, 4, 5)))
+
+    def _execute(self, *args):
+        self.assertIs(self.root.lease_owner, self.workspace.consumer)
+        for index in (1, 3, 5):
+            args[index].fill_(1)
+        args[12].fill_(-1)
+        args[12][:, 0, 0] = 0
+        args[13].fill_(0)
+        args[14].copy_(args[2] * 3)
+        args[15].fill_(0)
+        args[16].fill_(1)
+
+    @contextmanager
+    def _patches(self):
+        with ExitStack() as stack:
+            for target in (fused_cp, fused_cp_backward):
+                stack.enter_context(patch.object(target, "_load_native"))
+            for name in ("dsa_fused_forward_version", "dsa_fused_grad_version"):
+                stack.enter_context(patch.object(torch.ops.hyper_parallel, name, return_value=2, create=True))
+            stack.enter_context(patch.object(torch.ops.hyper_parallel, "dsa_fused_cp_forward_out",
+                                            side_effect=self._execute, create=True))
+            kl = stack.enter_context(patch.object(module, "_selected_kl_gradients", return_value=(
+                *self.raw_index_gradients, torch.tensor(8.))))
+            backward = stack.enter_context(patch.object(self.model.core.backward_backend, "_backward_saved",
+                                                        return_value=SimpleNamespace(gradients=self.main_gradients)))
+            yield kl, backward
+
+    def _assert_index_gradients(self, actual, upstream=7):
+        for index, (value, global_gradient) in enumerate(zip(actual, self.raw_index_gradients)):
+            ids = self.meta.kv_global_ids if index == 1 else self.meta.q_global_ids
+            expected = (global_gradient * (.25 / 4 * upstream))[list(ids)]
+            torch.testing.assert_close(value, expected, rtol=0, atol=0)
+            self.assertEqual(value.dtype, self.inputs[index + 4].dtype)
+
+    def test_joint_forward_saves_one_kl_evaluation_and_returns_all_seven_gradients(self):
+        """The signed pre-scaled index inputs feed native KL once, with original owner orders."""
+        with self._patches() as (kl, backward):
+            output, loss = self.model(*self.inputs, self.meta)
+            self.assertEqual(float(loss.detach()), .5)
+            actual = torch.autograd.grad(output.sum() + loss * 7, self.inputs)
+        kl.assert_called_once()
+        backward.assert_called_once()
+        self.assertFalse(any(tensor.requires_grad for tensor in kl.call_args.args[:3]))
+        for value, expected in zip(actual[:4], self.main_gradients):
+            torch.testing.assert_close(value, expected)
+        self._assert_index_gradients(actual[4:])
+        self.assertEqual(self.model.state_dict(), {})
+
+    def test_lm_only_and_kl_only_keep_the_other_objective_gradients_absent(self):
+        """Hard selection has no LM gradient, and KL never updates the main teacher inputs."""
+        for kl_only in (False, True):
+            with self.subTest(kl_only=kl_only), self._patches() as (_kl, backward):
+                output, loss = self.model(*self.inputs, self.meta)
+                actual = torch.autograd.grad(loss * 7 if kl_only else output.sum(), self.inputs, allow_unused=True)
+                absent = actual[:4] if kl_only else actual[4:]
+                self.assertTrue(all(value is None for value in absent))
+                self.assertEqual(backward.call_count, 0 if kl_only else 1)
+                if kl_only:
+                    self._assert_index_gradients(actual[4:])
+
+    def test_zero_coefficient_skips_native_kl_and_returns_exact_zero_index_gradients(self):
+        """Zero KL retains a zero derivative path and cannot produce native NaN times zero."""
+        self.model.loss_coeff = 0
+        self.inputs = (*self.inputs[:6], self.inputs[6].detach().float().requires_grad_())
+        with self._patches() as (kl, _backward):
+            output, loss = self.model(*self.inputs, self.meta)
+            actual = torch.autograd.grad(output.sum() + loss * 7, self.inputs)
+            kl.assert_not_called()
+        self.assertEqual(float(loss.detach()), 0)
+        for value in actual[4:]:
+            self.assertEqual(int(value.count_nonzero()), 0)
+
+    @patch.object(DefaultDeviceType, "get_device_type", return_value="cpu")
+    def test_saved_hooks_checkpoint_retain_and_delayed_backward_own_kl_gradients(self, _device_type):
+        """Repeated backward reuses saved derivatives; checkpoint recomputes them without a hidden cache."""
+        with self._patches() as (kl, _backward):
+            output, loss = self.model(*self.inputs, self.meta)
+            self.workspace.buffers["source_compressed"].fill_(19)
+            first = torch.autograd.grad(output.sum() + loss * 7, self.inputs, retain_graph=True)
+            second = torch.autograd.grad(output.sum() + loss * 7, self.inputs)
+            out, aux = checkpoint(lambda *values: self.model(*values, self.meta), *self.inputs, use_reentrant=False)
+            third = torch.autograd.grad(out.sum() + aux * 7, self.inputs)
+        for actual in (first, second, third):
+            self._assert_index_gradients(actual[4:])
+        self.assertEqual(kl.call_count, 3)
+
+    def test_mutation_and_second_order_reject_instead_of_using_stale_derivatives(self):
+        """Index inputs participate in saved tensor versioning even though LM selection is detached."""
+        with self._patches():
+            output, loss = self.model(*self.inputs, self.meta)
+            with self.assertRaisesRegex(ValueError, "first-order"):
+                torch.autograd.grad(loss, self.inputs[4], create_graph=True)
+            with torch.no_grad():
+                self.inputs[6].add_(1)
+            with self.assertRaisesRegex(RuntimeError, "modified"):
+                torch.autograd.grad(output.sum() + loss, self.inputs)
+
+    def test_configuration_and_native_shape_errors_reject_before_launch(self):
+        """Global loss count, coefficient and every index dimension are explicit contracts."""
+        for normalization, coeff in ((DsaLossNormalization(3), .3), (DsaLossNormalization(4), -1)):
+            with self.subTest(normalization=normalization, coeff=coeff), self.assertRaises(ValueError):
+                module.MegaDsa(self.workspace, self.invocation, heads=32, attention_scale=.1,
+                               schedule=MixedSfaSchedule(7), normalization=normalization, loss_coeff=coeff)
+        with self._patches() as (kl, _backward), self.assertRaisesRegex(ValueError, "inputs must match"):
+            self.model(*self.inputs[:6], self.inputs[6].double(), self.meta)
+        kl.assert_not_called()
+
+    def test_frozen_objective_outputs_do_not_invent_teacher_or_selection_gradients(self):
+        """Output differentiability follows each objective's actual input branch."""
+        for freeze_index in (False, True):
+            with self.subTest(freeze_index=freeze_index), self._patches():
+                inputs = tuple(tensor.detach().clone().requires_grad_(
+                    index < 4 if freeze_index else index >= 4) for index, tensor in enumerate(self.inputs))
+                output, loss = self.model(*inputs, self.meta)
+                self.assertEqual(output.requires_grad, freeze_index)
+                self.assertEqual(loss.requires_grad, not freeze_index)
+
+    def test_fp32_kl_weight_rejects_before_forward_without_implicit_precision_conversion(self):
+        """LI supports FP32 weights, while the current selected-KL schema requires BF16."""
+        with patch.object(self.model.core.backend, "forward") as forward:
+            with self.assertRaisesRegex(ValueError, "KL requires BF16"):
+                self.model(*self.inputs[:6], self.inputs[6].detach().float().requires_grad_(), self.meta)
+            forward.assert_not_called()
+
+    def test_owner_return_keeps_fp32_weight_derivatives_and_independent_q_k_orders(self):
+        """The shared collective packs FP32 contributions before restoring each input dtype."""
+        gradients = tuple(gradient.float() * .00314159 for gradient in self.raw_index_gradients)
+        layout = self.model.core.backend.layout
+        actual = layout.reduce_owner_gradients(
+            gradients, ((64, 128), (128,), (64,)), (layout.query_order, layout.key_order, layout.query_order),
+            (torch.bfloat16, torch.bfloat16, torch.float32))
+        for field, (value, expected, dtype) in enumerate(zip(
+                actual, gradients, (torch.bfloat16, torch.bfloat16, torch.float32))):
+            rows = self.meta.kv_global_ids if field == 1 else self.meta.q_global_ids
+            torch.testing.assert_close(value, expected[list(rows)].to(dtype), rtol=0, atol=0)

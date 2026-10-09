@@ -149,6 +149,31 @@ class CannDsaSelection:
         return self._layout.sequence_to_global_indices(self._native_indices)
 
 
+def _selected_kl_gradients(
+    index_query: torch.Tensor, index_key: torch.Tensor, merge_weight: torch.Tensor,
+    main_inputs: tuple[torch.Tensor, ...], indices: torch.Tensor, stats: CannDsaStats,
+    layout: CannDsaLayout, attention_scale: float,
+) -> tuple[torch.Tensor, ...]:
+    """Evaluate the locked complete-cardinality KL schema and return owned raw derivatives."""
+    query, compressed, query_rope, key_rope = main_inputs
+    grad_query, grad_key, grad_weight, loss = (
+        _load_custom_ops().npu_sparse_lightning_indexer_grad_kl_loss_enhance(
+            query=query.detach(), key=compressed.detach()[:, None, :],
+            query_index=index_query, key_index=index_key[:, None, :], weights=merge_weight,
+            sparse_indices=indices, softmax_max=stats.maximum.detach(), softmax_sum=stats.denominator.detach(),
+            scale_value=attention_scale, query_rope=query_rope.detach(), key_rope=key_rope.detach()[:, None, :],
+            actual_seq_qlen=list(layout.cumulative_lengths), actual_seq_klen=list(layout.cumulative_lengths),
+            layout="TND", sparse_mode=3, sparse_block_size=1,
+            deterministic=torch.are_deterministic_algorithms_enabled(),
+        )
+    )
+    if grad_query.shape != index_query.shape or grad_key.shape != (index_key.shape[0], 1, index_key.shape[1]):
+        raise RuntimeError("enhance KL returned incompatible index Q/K gradient shapes")
+    if grad_weight.shape != merge_weight.shape or loss.numel() != 1:
+        raise RuntimeError("enhance KL returned incompatible weight gradient or loss shape")
+    return grad_query, grad_key[:, 0, :], grad_weight, loss.reshape(())
+
+
 class _SelectedKlFunction(torch.autograd.Function):
     """Save forward-computed indexer gradients once per invocation."""
 
@@ -159,23 +184,9 @@ class _SelectedKlFunction(torch.autograd.Function):
         layout: CannDsaLayout, attention_scale: float, loss_scale: float,
     ) -> torch.Tensor:
         """Compute selected KL and save its three indexer derivatives once."""
-        query, compressed, query_rope, key_rope = main_inputs
-        grad_query, grad_key, grad_weight, loss = (
-            _load_custom_ops().npu_sparse_lightning_indexer_grad_kl_loss_enhance(
-                query=query.detach(), key=compressed.detach()[:, None, :],
-                query_index=index_query, key_index=index_key[:, None, :], weights=merge_weight,
-                sparse_indices=indices, softmax_max=stats.maximum.detach(), softmax_sum=stats.denominator.detach(),
-                scale_value=attention_scale, query_rope=query_rope.detach(), key_rope=key_rope.detach()[:, None, :],
-                actual_seq_qlen=list(layout.cumulative_lengths), actual_seq_klen=list(layout.cumulative_lengths),
-                layout="TND", sparse_mode=3, sparse_block_size=1,
-                deterministic=torch.are_deterministic_algorithms_enabled(),
-            )
-        )
-        if grad_query.shape != index_query.shape or grad_key.shape != (index_key.shape[0], 1, index_key.shape[1]):
-            raise RuntimeError("enhance KL returned incompatible index Q/K gradient shapes")
-        if grad_weight.shape != merge_weight.shape or loss.numel() != 1:
-            raise RuntimeError("enhance KL returned incompatible weight gradient or loss shape")
-        ctx.save_for_backward(grad_query * loss_scale, grad_key[:, 0, :] * loss_scale, grad_weight * loss_scale)
+        grad_query, grad_key, grad_weight, loss = _selected_kl_gradients(
+            index_query, index_key, merge_weight, main_inputs, indices, stats, layout, attention_scale)
+        ctx.save_for_backward(grad_query * loss_scale, grad_key * loss_scale, grad_weight * loss_scale)
         return loss.reshape(()) * loss_scale
 
     @staticmethod
