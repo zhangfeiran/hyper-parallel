@@ -231,6 +231,19 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
     """Assign each logical expert's source occurrences to final copy quotas."""
     home = config.home_experts
     width = config.slots_per_rank
+    if all(expert // home == rank or not count for rank, row in enumerate(copies)
+           for expert, count in row.items()):
+        # No placement choice remains. Validated source histograms already
+        # provide exact quotas; expanding and redistributing them is redundant.
+        slots = tuple(tuple(range(rank * home, (rank + 1) * home)) + (-1,) * config.replica_slots_per_rank
+                      for rank in range(config.ep_size))
+        dispatch = tuple(tuple(value for rank in range(config.ep_size)
+                               for value in (*row[rank * home:(rank + 1) * home],
+                                             *((0,) * config.replica_slots_per_rank))) for row in counts)
+        plan = ExpertExecutionPlan(config, counts, slots, dispatch)
+        if capacity_limit is not None and max(plan.destination_loads) > capacity_limit:
+            raise ValueError("replica plan exceeds capacity_limit; use a feasible receive bound")
+        return plan
     slot_map = []
     by_expert = [[] for _ in range(config.num_experts)]
     for rank, row in enumerate(copies):
