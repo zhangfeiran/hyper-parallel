@@ -16,7 +16,7 @@
 
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -29,6 +29,21 @@ from tests.torch.expert_parallel.hot_replica_checks import deferred_ids
 
 class TestReplicaTransport(unittest.TestCase):
     """Exercise both directions with default and noncontiguous group ranks."""
+
+    def test_saved_backward_generation_reaches_only_the_provider_lease(self):
+        """Retain the forward token while rejecting caller-selected forward reuse."""
+        token, view = object(), object()
+        provider = SimpleNamespace(overlap_home=True, lease=MagicMock())
+        provider.lease.return_value.__enter__.return_value = view
+        route = SimpleNamespace(transport=provider)
+        weights = (torch.ones(1, 2, 2),)
+        with transport.prefetch_weights(weights, route, backward=True, overlap=True,
+                                        reuse_generation=token) as result:
+            self.assertIs(result, view)
+        provider.lease.assert_called_once_with(weights, route, backward=True, overlap=True, reuse_generation=token)
+        with self.assertRaisesRegex(ValueError, "saved backward context"):
+            with transport.prefetch_weights(weights, route, reuse_generation=token):
+                pass
 
     def test_weight_and_gradient_peers(self):
         """Every send/receive uses global peers while retaining the supplied group."""

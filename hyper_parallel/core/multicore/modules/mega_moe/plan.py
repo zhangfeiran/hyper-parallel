@@ -24,6 +24,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import KERNEL_GRADIENT_TRANSPORT_MODES
+
 from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics, prepare_mega_kernel_diagnostics
 from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import (
     build_config_for_rank as build_backward_config,
@@ -82,6 +84,7 @@ class MegaMoePlan:
     replica_w2_events: tuple[int, ...] = ()
     replica_w13_events: tuple[int, ...] = ()
     bwd_diagnostics_no_replica: MegaKernelDiagnostics | None = None
+    bwd_runtime_no_replica_reuse_dispatch: bool = False
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -183,7 +186,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
         spec.rank_id,
         spec.num_cube_cores,
     )
-    if overlap_w13 and spec.replica_slots_per_rank and spec.replica_transport == "shmem_signal_kernel_gradient":
+    if overlap_w13 and spec.replica_slots_per_rank and spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES:
         prepare_w13_overlap_schedule(backward_data, spec.local_experts, spec.num_cube_cores)
     return forward_graph, forward_data, backward_graph, backward_data
 
@@ -222,10 +225,13 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         Rank-local forward and backward runtime resources.
     """
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec, overlap_w13=False)
+    original_reuse = can_reuse_backward_dispatch(backward_config, spec.local_experts, spec.num_cube_cores)
     fallback = None
-    if spec.replica_slots_per_rank and spec.replica_transport == "shmem_signal_kernel_gradient":
+    if spec.replica_slots_per_rank and spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES:
         overlap_config = deepcopy(backward_config)
-        if prepare_w13_overlap_schedule(overlap_config, spec.local_experts, spec.num_cube_cores):
+        if (prepare_w13_overlap_schedule(overlap_config, spec.local_experts, spec.num_cube_cores)
+                and replica_w2_ready_events(overlap_config, spec.local_experts, spec.num_cube_cores)
+                == replica_w2_ready_events(backward_config, spec.local_experts, spec.num_cube_cores)):
             _, fallback = _prepare_diagnostics(
                 spec, forward_graph, forward_config, backward_graph, backward_config, device,
             )
@@ -246,6 +252,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
         ),
+        bwd_runtime_no_replica_reuse_dispatch=original_reuse if fallback else False,
         forward_graph=forward_graph,
         fwd_diagnostics=fwd_diagnostics,
         up_proj_tiling=_tensor_from_bytes(

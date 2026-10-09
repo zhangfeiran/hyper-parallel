@@ -41,7 +41,8 @@ def _global_peer_rank(group: object, peer: int) -> int:
 @contextmanager
 def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
                      *, backward: bool = False, provider: object = None,
-                     overlap: bool = False) -> Iterator[ReplicaPool | ReplicaPrefetch]:
+                     overlap: bool = False,
+                     reuse_generation: object | None = None) -> Iterator[ReplicaPool | ReplicaPrefetch]:
     """Borrow home weights and fill only the shared B guest slots.
 
     Ordinary pool allocations remain valid across push SHMEM heap growth.
@@ -49,10 +50,19 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
     With overlap=True, an enabled provider may defer guest readiness. Call
     wait_weights(matrix_index) before each guest projection read, or honor the
     weight_ready/projection_ready metadata in a fused kernel.
+
+    A backward may pass the opaque weight_generation saved from its own forward
+    view, after autograd checks the saved parameter versions. Every rank must use
+    the same invocation sequence. A provider accepts reuse only while that exact
+    generation remains resident; local weight-version cache decisions are unsafe.
     """
+    if reuse_generation is not None and not backward:
+        raise ValueError("Replica weights may be reused only by their saved backward context")
     provider = route.transport if provider is None else provider
     if provider is not None and callable(getattr(provider, "lease", None)):
         options = {"overlap": True} if overlap and getattr(provider, "overlap_home", False) else {}
+        if reuse_generation is not None:
+            options["reuse_generation"] = reuse_generation
         with provider.lease(weights, route, backward=backward, **options) as pool:
             yield pool
         return

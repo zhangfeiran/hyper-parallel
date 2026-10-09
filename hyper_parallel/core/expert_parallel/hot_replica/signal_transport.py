@@ -18,10 +18,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 import math
+import struct
 import threading
 from typing import Any, Iterator
 
 import torch
+
+from ._metadata import _async_device_bytes
 
 from .capacity import _integer
 from .pool import ReplicaPool, ReplicaPrefetch
@@ -37,19 +40,25 @@ SIGNAL_TRANSPORT_MODES = (
     "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel", "shmem_signal_sdma_bidir",
     "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection",
     "shmem_signal_kernel_gradient",
+    "shmem_signal_kernel_gradient_adaptive",
 )
+
+KERNEL_GRADIENT_TRANSPORT_MODES = SIGNAL_TRANSPORT_MODES[-2:]
 
 
 def signal_transport_options(mode: str) -> dict[str, bool]:
     """Resolve a signal transport mode for MegaMoe adapters."""
     if mode not in SIGNAL_TRANSPORT_MODES:
         raise ValueError(f"Unsupported signal replica transport: {mode}")
-    return {"use_sdma": mode != "shmem_signal",
-            "parallel_prefetch": mode in SIGNAL_TRANSPORT_MODES[2:],
-            "parallel_gradients": mode in SIGNAL_TRANSPORT_MODES[3:],
-            "overlap_home": mode in SIGNAL_TRANSPORT_MODES[4:],
-            "projection_ready": mode in SIGNAL_TRANSPORT_MODES[5:],
-            "kernel_gradients": mode == "shmem_signal_kernel_gradient"}
+    options = {"use_sdma": mode != "shmem_signal",
+               "parallel_prefetch": mode in SIGNAL_TRANSPORT_MODES[2:],
+               "parallel_gradients": mode in SIGNAL_TRANSPORT_MODES[3:],
+               "overlap_home": mode in SIGNAL_TRANSPORT_MODES[4:],
+               "projection_ready": mode in SIGNAL_TRANSPORT_MODES[5:],
+               "kernel_gradients": mode in KERNEL_GRADIENT_TRANSPORT_MODES}
+    if mode == "shmem_signal_kernel_gradient_adaptive":
+        options["adaptive_gradients"] = True
+    return options
 
 
 def _aligned(size: int) -> int:
@@ -87,7 +96,7 @@ class SignalReplicaTransport:
     def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int,
                  *, use_sdma: bool = False, parallel_prefetch: bool = False,
                  parallel_gradients: bool = False, overlap_home: bool = False, projection_ready: bool = False,
-                 kernel_gradients: bool = False) -> None:
+                 kernel_gradients: bool = False, adaptive_gradients: bool = False) -> None:
         """Bind externally owned, 64-byte-aligned symmetric uint8 storage.
 
         Args:
@@ -109,6 +118,8 @@ class SignalReplicaTransport:
                 Include projection_ready=True when sizing the symmetric storage.
             kernel_gradients: Let a fused consumer return both projections on its own workers.
                 Requires projection readiness and parallel gradient streams.
+            adaptive_gradients: Select kernel or parallel SDMA return from the global routing imbalance.
+                Requires kernel-gradient capability and an identical policy on every rank.
         """
         if (storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous()
                 or storage.data_ptr() % _SIGNAL_BYTES):
@@ -123,8 +134,12 @@ class SignalReplicaTransport:
             raise ValueError("Projection readiness requires home overlap")
         if kernel_gradients and not (projection_ready and parallel_gradients):
             raise ValueError("Early gradients require projection readiness and parallel gradient streams")
+        if adaptive_gradients and not kernel_gradients:
+            raise ValueError("Adaptive gradients require kernel-gradient capability")
         self._projection_ready = projection_ready
         self._kernel_gradients = kernel_gradients
+        self.adaptive_gradients = adaptive_gradients
+        self.last_kernel_gradient_matrices = ()
         self.projection_signals = None
         self.runtime = runtime
         self.overlap_home = overlap_home
@@ -142,6 +157,8 @@ class SignalReplicaTransport:
         self.epoch = 0
         self._layout = None
         self._lock = threading.Lock()
+        self._resident_generation = None
+        self._resident_ready = None
 
     @property
     def kernel_gradients(self) -> bool:
@@ -208,6 +225,8 @@ class SignalReplicaTransport:
                 self.projection_signals.zero_()
             self.runtime.host_barrier()
             self.epoch = 0
+            self._resident_generation = None
+            self._resident_ready = None
         self.epoch += 1
         return self.epoch
 
@@ -222,8 +241,16 @@ class SignalReplicaTransport:
 
     @contextmanager
     def lease(self, weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
-              *, backward: bool = False, overlap: bool = False) -> Iterator[ReplicaPool | ReplicaPrefetch]:
-        """Borrow direct execution views through all kernel and remote consumers."""
+              *, backward: bool = False, overlap: bool = False,
+              reuse_generation: object | None = None) -> Iterator[ReplicaPool | ReplicaPrefetch]:
+        """Borrow execution views, reusing only an unchanged saved forward generation.
+
+        The opaque token comes from the same autograd forward on every rank,
+        after saved parameter versions have been checked. Pool events include
+        the previous weight readers, copy joins and remote acknowledgements.
+        """
+        if reuse_generation is not None and not backward:
+            raise ValueError("Replica weights may be reused only by their saved backward context")
         if (route.plan.config.replica_slots_per_rank != self.slots
                 or route.plan.config.ep_size != self.ep_size):
             raise ValueError("Signal transport topology does not match the replica route")
@@ -232,10 +259,25 @@ class SignalReplicaTransport:
         try:
             self._bind(weights)
             with self.pool.lease(backward=backward):
-                if overlap and self.overlap_home:
+                if (backward and overlap and self.kernel_gradients and reuse_generation is not None
+                        and reuse_generation is self._resident_generation and self._resident_ready is not None
+                        and self.epoch < _MAX_EPOCH - 2):
+                    # Only a prior leased consumer can prove all ranks reuse the same weights.
+                    yield ReplicaPrefetch(self.pool, self.pool.wait_weights, None,
+                                          projection_ready=self._resident_ready,
+                                          weight_generation=self._resident_generation)
+                elif overlap and self.overlap_home:
+                    self._resident_generation = None
+                    self._resident_ready = None
                     with self._overlapped_prefetch(weights, route, backward=backward) as prefetched:
+                        if self.kernel_gradients:
+                            self._resident_generation = object()
+                            self._resident_ready = prefetched.projection_ready
+                            prefetched.weight_generation = self._resident_generation
                         yield prefetched
                 else:
+                    self._resident_generation = None
+                    self._resident_ready = None
                     self.prefetch(weights, self.pool.weights, route)
                     yield self.pool
         finally:
@@ -250,6 +292,8 @@ class SignalReplicaTransport:
         home = route.plan.config.home_experts
         incoming = [item for item in route.plan.transfers if item.target_rank == route.rank]
         outgoing = [item for item in route.plan.transfers if item.owner_rank == route.rank]
+        # Upload before credits; later copy streams inherit this producer without a host wait.
+        value = _async_device_bytes(struct.pack("<i", epoch), weights[0].device).view(torch.int32)
         for item in incoming:
             self._publish(0, route.rank, item.target_slot - home, item.owner_rank, epoch)
         # No AIV helper may be needed on a copy stream once a fused kernel occupies the device.
@@ -257,7 +301,6 @@ class SignalReplicaTransport:
             self._wait(0, item.target_rank, item.target_slot - home, epoch)
         sources = {item.owner_slot: tuple(weight[item.owner_slot].contiguous() for weight in weights)
                    for item in outgoing}
-        value = torch.tensor([epoch], dtype=torch.int32, device=weights[0].device)
 
         def _wait(matrix_index=None):
             for item in incoming:

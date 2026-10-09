@@ -77,12 +77,14 @@ class ReplicaPrefetch:
     """Invocation-owned view that separates local work from guest readiness."""
 
     def __init__(self, pool: ReplicaPool, wait: Callable[..., None], ready: tuple[int, int] | None,
-                 *, projection_ready: tuple[tuple[int, ...], int] | None = None) -> None:
+                 *, projection_ready: tuple[tuple[int, ...], int] | None = None,
+                 weight_generation: object | None = None) -> None:
         """Borrow leased tensors and expose device ready base/epoch to fused consumers."""
         self.weights = pool.weights
         self.gradients = pool.gradients
         self.weight_ready = ready
         self.projection_ready = projection_ready
+        self.weight_generation = weight_generation
         self._wait = wait
         self._waited = set()
 
