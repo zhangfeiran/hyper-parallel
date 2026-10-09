@@ -15,13 +15,17 @@
 # pylint: disable=undefined-all-variable
 """Torch-only Multicore APIs, separate from the HyperParallel root exports."""
 
-__all__ = ["HyperMegaMhc", "MegaMoeExperts", "profiler"]
+__all__ = ["HyperMegaMhc", "MegaFFN", "MegaMoeExperts", "profiler"]
 
 from importlib import import_module
 
 
 def __getattr__(name: str) -> object:
     """Load NPU business modules when requested, allowing CPU frontend imports."""
+    if name == "MegaFFN":
+        value = import_module("hyper_parallel.core.multicore.modules.mega_ffn.module").MegaFFN
+        globals()[name] = value
+        return value
     if name == "MegaMoeExperts":
         module = import_module("hyper_parallel.core.multicore.modules.mega_moe.module")
         value = module.MegaMoeExperts

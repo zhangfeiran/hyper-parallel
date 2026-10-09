@@ -21,6 +21,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from hyper_parallel.core.multicore.backends.dense import dense_artifacts
 from hyper_parallel.core.multicore.backends.launchers import generated_files as launcher_files, launcher_manifest
 from hyper_parallel.core.multicore.backends.schema import (
     cpp_calls,
@@ -31,6 +32,7 @@ from hyper_parallel.core.multicore.backends.schema import (
 from hyper_parallel.core.multicore.backends.workers import generated_files, worker_manifest
 from hyper_parallel.core.multicore.ir.program import ProgramIR
 from hyper_parallel.core.multicore.runtime.abi import family_abi
+from hyper_parallel.core.multicore.runtime.dense import DenseKernelPlan
 from hyper_parallel.core.multicore.runtime.mhc import MhcKernelPlan
 from hyper_parallel.core.multicore.runtime.moe import MoeKernelPlan
 from hyper_parallel.core.multicore.runtime.plan import KernelPlan
@@ -58,7 +60,7 @@ class EmittedFile:
 class BackendEmission:
     """Host plan and reproducible source artifacts; no device pointers or binary claim."""
 
-    plan: KernelPlan | MoeKernelPlan | MhcKernelPlan
+    plan: KernelPlan | MoeKernelPlan | MhcKernelPlan | DenseKernelPlan
     definition_key: str
     plan_key: str
     files: tuple[EmittedFile, ...]
@@ -78,13 +80,17 @@ class BackendEmission:
                 "artifacts": {file.path: _hash(file.content) for file in self.files}}
 
 
-def emit_plan(plan: KernelPlan | MoeKernelPlan | MhcKernelPlan, ir: ProgramIR) -> BackendEmission:
+def emit_plan(plan: KernelPlan | MoeKernelPlan | MhcKernelPlan | DenseKernelPlan, ir: ProgramIR) -> BackendEmission:
     """Emit each supported family through the same typed schema and artifact pipeline.
 
     Args:
         plan: Complete family-specific host schedule with original backward/finalize contracts.
         ir: Typed semantic computation defining this plan.
     """
+    if isinstance(plan, DenseKernelPlan):
+        definition_key, plan_key, files = dense_artifacts(plan)
+        return BackendEmission(plan, definition_key, plan_key,
+                               tuple(EmittedFile(name, content) for name, content in sorted(files.items())))
     family = plan.export_manifest()["family"]
     if family not in {"gate", "mhc", "moe"}:
         raise ValueError("Ascend emission requires a supported native family")

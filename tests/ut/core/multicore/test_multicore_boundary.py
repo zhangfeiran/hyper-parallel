@@ -40,9 +40,9 @@ class TestMulticoreBoundary(unittest.TestCase):
         """
         self.assertEqual(MegaMoeExperts.__name__, "MegaMoeExperts")
         self.assertIs(multicore.MegaMoeExperts, MegaMoeExperts)
-        self.assertEqual(multicore.__all__, ["HyperMegaMhc", "MegaMoeExperts", "profiler"])
+        self.assertEqual(multicore.__all__, ["HyperMegaMhc", "MegaFFN", "MegaMoeExperts", "profiler"])
         self.assertTrue(callable(multicore.profiler.mega_kernel_profile))
-        for name in ("MegaMoeExperts", "HyperMegaMhc", "MulticoreModule", "mega_moe", "mega_moe_grad"):
+        for name in ("MegaFFN", "MegaMoeExperts", "HyperMegaMhc", "MulticoreModule", "mega_moe", "mega_moe_grad"):
             self.assertNotIn(name, hyper_parallel.__all__)
             self.assertFalse(hasattr(hyper_parallel, name))
         self.assertFalse(hasattr(multicore, "unknown_business_symbol"))

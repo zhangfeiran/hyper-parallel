@@ -23,6 +23,7 @@ from collections.abc import Callable, Mapping
 import torch
 
 from hyper_parallel.core.multicore.backends.ascend import BackendEmission, emit_plan
+from hyper_parallel.core.multicore.compiler.dense import compile_dense_plan
 from hyper_parallel.core.multicore.compiler.mhc import match_mhc_region
 from hyper_parallel.core.multicore.compiler.moe import match_moe_region
 from hyper_parallel.core.multicore.compiler.pipeline import compile_worker_pipeline
@@ -55,6 +56,7 @@ from hyper_parallel.core.multicore.primitives.registry import (
     PrimitiveRegistry,
 )
 from hyper_parallel.core.multicore.runtime.mhc import MhcKernelPlan, compile_mhc_plan
+from hyper_parallel.core.multicore.runtime.dense import DenseKernelPlan, DenseSpec
 from hyper_parallel.core.multicore.runtime.mhc_spec import MhcSpec
 from hyper_parallel.core.multicore.runtime.moe import MoeKernelPlan, compile_moe_plan
 from hyper_parallel.core.multicore.runtime.plan import KernelPlan
@@ -134,14 +136,14 @@ class Program:
 
     def plan(
         self,
-        signature: Mapping[str, int] | MegaMoeSpec | MhcSpec | None = None,
+        signature: Mapping[str, int] | MegaMoeSpec | MhcSpec | DenseSpec | None = None,
         topology: HardwareSpec | None = None,
         **constants: object,
-    ) -> KernelPlan | MoeKernelPlan | MhcKernelPlan:
-        """Compile a supported Gate Route, MoE or MHC region into a host compatibility plan.
+    ) -> KernelPlan | MoeKernelPlan | MhcKernelPlan | DenseKernelPlan:
+        """Compile a supported family region or dense primitive DAG into a host plan.
 
         Args:
-            signature: Symbolic Gate dimensions or a bound MegaMoeSpec/MhcSpec for TaskDAG.
+            signature: Symbolic Gate dimensions or a bound MegaMoeSpec/MhcSpec/DenseSpec for TaskDAG.
             topology: Physical worker availability, independent of computation.
             **constants: Declared constexpr specializations, such as k, scale or limit.
 
@@ -159,7 +161,7 @@ class Program:
             return self._task_dag_plan(ir, signature, topology)
         return compile_worker_pipeline(ir, self.schedule, dict(signature or {}), topology or HardwareSpec())
 
-    def compile(self, signature: Mapping[str, int] | MegaMoeSpec | MhcSpec | None = None,
+    def compile(self, signature: Mapping[str, int] | MegaMoeSpec | MhcSpec | DenseSpec | None = None,
                 topology: HardwareSpec | None = None, **constants: object) -> BackendEmission:
         """Generate schema, typed bindings, schedule images and source maps through one backend.
 
@@ -175,6 +177,12 @@ class Program:
         return emit_plan(plan, self.lower(**constants))
 
     def _task_dag_plan(self, ir, signature, topology):
+        if self.schedule.policy == "dense_v1":
+            if not isinstance(signature, DenseSpec):
+                raise TypeError("Dense TaskDAG plans require a bound DenseSpec")
+            if topology is not None:
+                raise ValueError("Dense primitive providers determine their own native hardware topology")
+            return compile_dense_plan(ir, signature)
         if self.schedule.policy == "shifted_mhc_v1":
             if not isinstance(signature, MhcSpec):
                 raise TypeError("MHC TaskDAG plans require a bound MhcSpec")
@@ -182,7 +190,7 @@ class Program:
                 raise ValueError("MHC topology must match the specification's physical core ratio")
             return compile_mhc_plan(match_mhc_region(ir), signature)
         if self.schedule.policy != "moe_ratr_v1":
-            raise ValueError("Only moe_ratr_v1 and shifted_mhc_v1 TaskDAG policies are implemented")
+            raise ValueError("Only moe_ratr_v1, shifted_mhc_v1 and dense_v1 TaskDAG policies are implemented")
         if not isinstance(signature, MegaMoeSpec):
             raise TypeError("MoE TaskDAG plans require a bound MegaMoeSpec")
         if topology is not None and topology.available_aiv_workers != 2 * signature.num_cube_cores:

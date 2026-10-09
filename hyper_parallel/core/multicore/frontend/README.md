@@ -1,5 +1,8 @@
 # Python AST frontend and compatibility plans
 
+Dense FFN lowering, generated native forward/VJP adapters and the standard
+training replacement interface are described in [MegaFFN integration](MEGAFFN.md).
+
 This implements the semantic frontend foundation from the 2026-10-07 AST design.
 The implementation covers typed source capture, identity-based primitive schemas,
 ProgramIR, CPU reference interpretation, Gate WorkerPipeline plans and MoE/MHC TaskDAG

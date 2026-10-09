@@ -29,8 +29,10 @@ from hyper_parallel.core.multicore.ir.schedule import (
     TaskDAG,
     WorkerPipeline,
 )
+from hyper_parallel.core.multicore.runtime.dense import DenseSpec
 
 __all__ = [
+    "DenseSpec",
     "FrontendError",
     "HardwareSpec",
     "Program",
