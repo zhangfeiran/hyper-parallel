@@ -23,16 +23,25 @@ from pathlib import Path
 from hyper_parallel.core.multicore.examples.mega_dsa_training_cp_validate import run_validation
 
 
-def test_mega_dsa_training_cp() -> None:
-    """Verify native-selected LM/KL objectives and all seven owner-local derivatives."""
+def _validate(*, long_history: bool) -> None:
     with tempfile.TemporaryDirectory(prefix="mega-dsa-training-") as directory:
         path = Path(os.environ.get("HP_DSA_TRAIN_CP_OUTPUT", directory))
         report = {"status": "running", "scope": "P4 native selection plus host selected KL"}
         try:
-            run_validation(report, path)
+            run_validation(report, path, long_history=long_history)
         except Exception as error:
             report.update(status="error", error=repr(error), traceback=traceback.format_exc())
             raise
         finally:
             path.mkdir(parents=True, exist_ok=True)
             (path / f"rank{os.environ.get('RANK', '0')}.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+def test_mega_dsa_training_cp() -> None:
+    """Verify native-selected LM/KL objectives and all seven owner-local derivatives."""
+    _validate(long_history=False)
+
+
+def test_mega_dsa_training_long_cp() -> None:
+    """Verify truncated K=2048 training, packed boundaries and checkpoint owner return."""
+    _validate(long_history=True)

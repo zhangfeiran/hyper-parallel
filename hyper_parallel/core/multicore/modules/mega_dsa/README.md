@@ -1294,6 +1294,75 @@ All 315 independent FP32 index Q/K/weight measurements passed the original
 pointwise threshold. FP32 output maximum relative L2 was 0.002212485804360936.
 Original pointwise comparisons still failed for 86/707 FP32 gradient measurements and 96/112
 FP32 output measurements. These remain recorded alongside native successes;
-this does not establish full pointwise or model alignment. CPU regression
-passed 149 tests and 224 subtests. Long-history complete LM+KL, truncated
-Top-K training and mixed KL tile execution remain separate validation work.
+this does not establish full pointwise or model alignment. The short-matrix
+CPU regression passed 149 tests and 224 subtests. Long-history complete LM+KL
+and truncated TopK training are covered by the extended matrix below; mixed
+KL tile execution remains subsequent work.
+
+The training validator also provides `--long-history`. Its fixtures include
+packed lengths `(3, 2113)` and `(2176, 2240)`, giving respectively 65 and 320
+query rows with causal histories longer than K=2048. It checks the complete
+stock selected sets and bitwise BF16 TopK values, per-query selected counts,
+packed boundaries, native main/KL derivatives and all seven independent FP32
+derivatives. The extended matrix includes joint objectives, checkpoint with
+explicit reducer compensation, and KL-only with empty owners. These are
+component training checks; full-model and performance acceptance remain
+separate requirements.
+
+The [CPU training oracle](../../examples/mega_dsa_training_oracle.py)
+backpropagates bounded query chunks into shared full-KV leaves and concatenates
+independent query derivatives. It computes dense QK scores, gathers the original
+selected slots, and scatters the selected probabilities for the PV matrix
+multiply. This avoids expanded C512 KV scatter-backward on CPU while retaining
+the original selected-set objective, global KL normalization and every query
+contribution. Its score storage grows with the full key count and is bounded
+by the query chunk size; this is an offline checker, not a production backend.
+The [oracle cross-check](../../../../../tests/ut/core/multicore/mega_dsa/test_training_oracle.py)
+compares output, KL and all seven derivatives with unpartitioned expanded-KV
+FP32 autograd. It covers signed weights, unordered slots, padding and empty
+rows, packed/future masking, joint/LM-only/KL-only/zero-coefficient objectives,
+upstream auxiliary scales, reducer divisors and chunk sizes 1/3/7.
+
+Run the extended fixtures with both explicitly activated vendors and the
+device idle gate, using `--smoke` for the first H32 joint fixture:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NPU_WAIT_VISIBLE_DEVICES=0,1,2,3 \
+HCCL_IF_BASE_PORT=65120 HCCL_NPU_SOCKET_PORT_RANGE=62208-62271 \
+NPU_WAIT_NUM_CARDS=4 NPU_WAIT_POLL_SECONDS=60 bash ~/doc/npu_wait_and_run.sh \
+  python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  --module hyper_parallel.core.multicore.examples.mega_dsa_training_cp_validate \
+  --output-dir /tmp/mega_dsa_training_long_cp4 --long-history
+```
+
+Formal extended launchers are `test_mega_dsa_training_long_cp1`,
+`test_mega_dsa_training_long_cp2` and `test_mega_dsa_training_long_cp4` in the
+[training ST](../../../../../tests/torch/multicore/test_mega_dsa_training_cp.py).
+On a shared host, assign unused HCCL host and NPU port ranges to each concurrent
+group. Device idle gating does not reserve the host HCCL listening ports.
+
+The extended CP1/CP2/CP4 matrix passes on the same 910B3/CANN 9.1 native
+payload: seven rank reports, 28 training scenarios, 42 fused forwards and 21
+native main backwards. All 168 available native seven-gradient comparisons
+pass rtol=0.02/atol=2e-5. Stock selected sets, BF16 TopK values and original
+CANN output are exact, including the 65/320 genuinely truncated query rows in
+the two fixtures. Joint LM+KL, checkpoint with reducer compensation and
+KL-only gradient isolation with empty owners all pass.
+
+All 168 independent FP32 gradient measurements satisfy the existing finite
+relative-L2/maximum-absolute criterion. Maximum gradient relative L2 is
+0.0032989832834116107, and maximum output relative L2 is
+0.0024818912675734555. All 84 independent FP32 index Q/K/weight measurements
+also pass the original pointwise threshold. Original pointwise failures
+remain for 17/168 gradient measurements and 23/28 output measurements. KL loss
+maximum relative error is 1.1491664595111996e-05, with maximum absolute error
+8.149072527885437e-09. CPU regression passes 151 tests and 258 subtests.
+
+The first CP4 attempt failed during HCCL initialization because the default
+host/NPU communication ports were occupied. The isolated-port CP4 retry
+passes; that initial environment failure is preserved separately. The
+original expanded-KV long smoke also passed and remains separate from the
+intentionally interrupted slow CPU-oracle matrix. Native framework and all
+12 DSA kernel objects retain their validated hashes; no native rebuild was
+performed in this round. These are component training results, not full-model
+acceptance, KL tile fusion, CP8/CP×TP acceptance or complete-step performance.

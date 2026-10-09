@@ -33,13 +33,13 @@ from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.core.multicore.examples.mega_dsa_fused_cp_validate import _metadata, _SCALE
 from hyper_parallel.core.multicore.examples.mega_dsa_mixed_tile_validate import _reference as stock_attention
+from hyper_parallel.core.multicore.examples.mega_dsa_training_oracle import training_reference
 from hyper_parallel.core.multicore.modules.mega_dsa.cann_reference import (
     CannDsaStats, _SelectedKlFunction, _load_custom_ops,
 )
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta, DsaLossNormalization
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
 from hyper_parallel.core.multicore.modules.mega_dsa.module import MegaDsa
-from hyper_parallel.core.multicore.modules.mega_dsa.reference import selected_kl_reference, sparse_attention_reference
 from hyper_parallel.core.multicore.modules.mega_dsa.workspace import DsaWorkspaceSpec, MegaDsaWorkspace
 from hyper_parallel.core.multicore.shmem.consumer import SharedShmemRoot
 
@@ -47,9 +47,11 @@ _LENGTHS = (3, 10)
 _FIELDS = ("query", "compressed", "query_rope", "key_rope", "index_query", "index_key", "merge_weight")
 
 
-def _inputs(heads, weight_dtype):
+def _inputs(heads, weight_dtype, lengths):
     generator = torch.Generator().manual_seed(20261009 + heads)
-    shapes = ((13, heads, 512), (13, 512), (13, heads, 64), (13, 64), (13, 64, 128), (13, 128), (13, 64))
+    total = sum(lengths)
+    shapes = ((total, heads, 512), (total, 512), (total, heads, 64), (total, 64),
+              (total, 64, 128), (total, 128), (total, 64))
     tensors = tuple((torch.randn(shape, generator=generator) * .1).bfloat16() for shape in shapes)
     return (*tensors[:6], tensors[6].to(weight_dtype)), (torch.randn(shapes[0], generator=generator) * .01).bfloat16()
 
@@ -88,30 +90,33 @@ def _full_native(inputs, cotangent, result, layout, normalization, coefficient, 
     return output, loss, tuple(tensor.grad for tensor in full)
 
 
-def _cpu_reference(inputs, cotangent, indices, normalization, coefficient, mode, auxiliary):
-    full = tuple(tensor.detach().float().cpu().requires_grad_() for tensor in inputs)
-    meta = DsaBatchMeta.packed(_LENGTHS)
-    output, _ = sparse_attention_reference(*full[:4], indices, meta, attention_scale=_SCALE)
-    loss = selected_kl_reference(*full[4:], *full[:4], indices, meta, attention_scale=_SCALE,
-                                 normalization=normalization, loss_coeff=coefficient)
-    _objective(output, loss, cotangent.float().cpu(), mode, auxiliary).backward()
-    return output, loss, tuple(tensor.grad for tensor in full)
+def _selection_coverage(indices, lengths):
+    meta = DsaBatchMeta.packed(lengths)
+    counts = (indices >= 0).sum(dim=-1)
+    expected = torch.tensor([min(meta.sequence_position(token)[1] + 1, 2048)
+                             for token in meta.q_global_ids])
+    torch.testing.assert_close(counts, expected, rtol=0, atol=0)
+    truncated = sum(max(0, length - 2048) for length in lengths)
+    return {"sparse_count": 2048, "truncated_query_rows": truncated,
+            "complete_query_rows": sum(lengths) - truncated,
+            "minimum_selected_count": int(counts.min()), "maximum_selected_count": int(counts.max())}
 
 
-def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, divisor):
-    meta = _metadata(_LENGTHS, pattern, dist.get_world_size(), dist.get_rank())
+def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, divisor, lengths):
+    meta = _metadata(lengths, pattern, dist.get_world_size(), dist.get_rank())
     capacity = max(1, max(meta.token_owners.count(peer) for peer in range(dist.get_world_size())))
     root = SharedShmemRoot(device, root_group=dist.group.WORLD)
-    workspace = MegaDsaWorkspace(root, "dsa-training", DsaWorkspaceSpec(capacity, 13, capacity, dist.get_world_size()))
+    workspace = MegaDsaWorkspace(root, "dsa-training",
+                                DsaWorkspaceSpec(capacity, sum(lengths), capacity, dist.get_world_size()))
     workspace.bind()
     meta = replace(meta, heap_generation=root.generation)
     try:
         prepared = workspace.prepare(meta)
-        normalization = DsaLossNormalization(13, divisor)
+        normalization = DsaLossNormalization(sum(lengths), divisor)
         coefficient = 0. if mode == "coeff_zero" else .3
         model = MegaDsa(workspace, prepared, heads=heads, attention_scale=_SCALE, schedule=MixedSfaSchedule(7),
                         normalization=normalization, loss_coeff=coefficient)
-        cpu, cotangent = _inputs(heads, weight_dtype)
+        cpu, cotangent = _inputs(heads, weight_dtype, lengths)
         full = tuple(tensor.to(device) for tensor in cpu)
         cotangent = cotangent.to(device)
         local = tuple(tensor[list(meta.kv_global_ids if field in (1, 3, 5) else meta.q_global_ids)]
@@ -141,7 +146,8 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
                 else:
                     raise RuntimeError("FP32 selected KL must reject before native submission")
                 launch.assert_not_called()
-            report["cases"].append({"pattern": pattern, "heads": heads, "weight_dtype": str(weight_dtype),
+            report["cases"].append({"lengths": lengths, "pattern": pattern, "heads": heads,
+                                    "weight_dtype": str(weight_dtype),
                                     "mode": mode, "status": "rejected_before_native_dispatch"})
             return
         with patch.object(model.core.backend, "forward", side_effect=_forward), \
@@ -171,15 +177,19 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
         raw = forwards[1] if mode == "checkpoint" else forwards[0]
         native_layout = model.core.backend.native_layout
         indices = native_layout.sequence_to_global_indices(raw.saved.indices).cpu()
-        stock_indices, _ = torch.ops.npu.npu_lightning_indexer(
+        stock_indices, stock_values = torch.ops.npu.npu_lightning_indexer(
             full[4], full[5][:, None], full[6], actual_seq_lengths_query=native_layout.length_tensor,
             actual_seq_lengths_key=native_layout.length_tensor, layout_query="TND", layout_key="TND",
             sparse_count=2048, sparse_mode=3, return_value=True)
         torch.testing.assert_close(raw.saved.indices.cpu().sort(dim=-1).values,
                                    stock_indices.cpu().sort(dim=-1).values, rtol=0, atol=0)
+        torch.testing.assert_close(raw.values.cpu().view(torch.int16),
+                                   stock_values[list(meta.q_global_ids)].cpu().view(torch.int16), rtol=0, atol=0)
+        coverage = _selection_coverage(indices, lengths)
         baseline = _full_native(full, cotangent, raw, native_layout,
                                 normalization, coefficient, mode, auxiliary)
-        oracle = _cpu_reference(full, cotangent, indices, normalization, coefficient, mode, auxiliary)
+        oracle = training_reference(full, cotangent, indices, normalization, coefficient, mode, auxiliary, lengths,
+                                    attention_scale=_SCALE)
         gradients, oracle_gradients = {}, {}
         for field, (name, tensor, expected, reference) in enumerate(zip(_FIELDS, local, baseline[2], oracle[2])):
             rows = list(meta.kv_global_ids if field in (1, 3, 5) else meta.q_global_ids)
@@ -217,10 +227,12 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
         gradient_traces = [model.core.backward_backend.validate_trace(
             value, tuple(trace.cpu() for trace in value.phase_traces), value.transport_trace.cpu())
             for value in backwards]
-        report["cases"].append({"pattern": pattern, "heads": heads, "weight_dtype": str(weight_dtype),
+        report["cases"].append({"lengths": lengths, "pattern": pattern, "heads": heads,
+                                "weight_dtype": str(weight_dtype), "selection_coverage": coverage,
                                 "mode": mode, "auxiliary": auxiliary, "reducer_divisor": divisor,
                                 "kl_reference": "exact_zero" if coefficient == 0 else "enhance_native",
-                                "selection_stock_set_exact": True, "output_stock_exact": True,
+                                "selection_stock_set_exact": True, "selection_stock_values_exact": True,
+                                "output_stock_exact": True,
                                 "output_enhance": _metrics(output, baseline[0][list(meta.q_global_ids)]),
                                 "output_fp32": output_metric, "loss_native": _metrics(summed_loss, baseline[1]),
                                 "loss_fp32": _metrics(summed_loss, oracle[1]), "gradients_native": gradients,
@@ -231,7 +243,7 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
         root.close()
 
 
-def run_validation(report: dict, output_dir: Path, *, smoke: bool = False) -> None:
+def run_validation(report: dict, output_dir: Path, *, smoke: bool = False, long_history: bool = False) -> None:
     """Check global KL normalization and all seven owner gradients on CP1/CP2/CP4."""
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.npu.set_device(local_rank)
@@ -258,10 +270,18 @@ def run_validation(report: dict, output_dir: Path, *, smoke: bool = False) -> No
                   ("empty", 64, torch.bfloat16, "joint", 7, dist.get_world_size()),
                   ("strided", 64, torch.float32, "coeff_zero", 7, 1),
                   ("zigzag", 64, torch.float32, "fp32_rejected", 1, 1)]
+    fixtures = [(case, _LENGTHS) for case in cases]
+    if long_history:
+        fixtures = [(("strided", 32, torch.bfloat16, "joint", 7, 1), (3, 2113))]
+        if not smoke:
+            fixtures += [(("zigzag", 64, torch.bfloat16, "joint", 1, 1), (2176, 2240)),
+                         (("contiguous", 32, torch.bfloat16, "checkpoint", 7, dist.get_world_size()),
+                          (3, 2113)),
+                         (("empty", 32, torch.bfloat16, "kl_only", 7, 1), (3, 2113))]
     output_dir.mkdir(parents=True, exist_ok=True)
-    for case in cases:
-        report["stage"] = tuple(str(item) for item in case)
-        _run_case(report, torch.device(f"npu:{local_rank}"), *case)
+    for case, lengths in fixtures:
+        report["stage"] = {"lengths": lengths, "case": tuple(str(item) for item in case)}
+        _run_case(report, torch.device(f"npu:{local_rank}"), *case, lengths)
         (output_dir / f"rank{dist.get_rank()}.json").write_text(json.dumps(report, indent=2) + "\n")
     loaded = {line.split()[-1] for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
               if "libcust_opapi.so" in line}
@@ -275,10 +295,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--long-history", action="store_true",
+                        help="Verify actual truncated K=2048 training with bounded-memory FP32 query chunks.")
     args = parser.parse_args()
     report = {"status": "running", "scope": "P4 native selection plus host selected KL"}
     try:
-        run_validation(report, args.output_dir, smoke=args.smoke)
+        run_validation(report, args.output_dir, smoke=args.smoke, long_history=args.long_history)
     except Exception as error:
         report.update(status="error", error=repr(error), traceback=traceback.format_exc())
         raise
