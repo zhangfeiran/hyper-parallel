@@ -48,10 +48,13 @@ _OPS_TRANSFORMER_PATHS = (
     "attention/sparse_flash_attention_grad/op_kernel",
     "attention/sparse_flash_attention_grad/op_host",
     "attention/sparse_flash_attention_grad/basic_modules",
+    "attention/sparse_lightning_indexer_grad_kl_loss/op_kernel",
+    "attention/sparse_lightning_indexer_grad_kl_loss/op_host",
     "common/include/err",
     "common/include/op_host/tiling_util.h",
     "common/include/op_host/tiling_base.h",
     "common/include/op_host/tiling_type.h",
+    "common/include/op_host/tiling_templates_registry.h",
 )
 _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad")
 
@@ -232,10 +235,11 @@ def _compose_hyper_parallel_ops(
         shutil.copy2(upstream_kernel / filename, mixed_root / "op_kernel" / filename)
     _compose_mixed_indexer(source_root, transformer_copy)
     _compose_mixed_grad(source_root, transformer_copy)
+    _compose_mixed_kl(source_root, transformer_copy)
     _compose_fused_forward(source_root, transformer_copy)
     _compose_fused_grad(source_root, transformer_copy)
     _compose_cp_attention(source_root, transformer_copy)
-    for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad",
+    for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad", "hyper_dsa_mixed_kl",
                  "hyper_dsa_fused_forward", "hyper_dsa_fused_grad", "hyper_dsa_cp_attention"):
         runtime = source_root / name / "op_kernel" / "runtime"
         runtime.mkdir()
@@ -280,6 +284,23 @@ def _compose_mixed_grad(source_root: Path, transformer_copy: Path) -> None:
     shutil.copytree(upstream / "op_host" / "arch22", mixed_root / "op_host" / "arch22")
     shutil.copytree(upstream / "op_kernel" / "arch22", mixed_root / "op_kernel" / "arch22")
     shutil.copytree(upstream / "basic_modules", mixed_root / "basic_modules")
+
+
+def _compose_mixed_kl(source_root: Path, transformer_copy: Path) -> None:
+    """Export the pinned selected-KL closure with separated retained-workspace phases."""
+    root = source_root / "hyper_dsa_mixed_kl"
+    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_mixed_kl", root)
+    shutil.copytree(transformer_copy / "common" / "include" / "err", root / "op_host" / "err")
+    (root / "op_host" / "op_host").mkdir()
+    for name in ("tiling_base.h", "tiling_type.h", "tiling_templates_registry.h"):
+        shutil.copy2(transformer_copy / "common" / "include" / "op_host" / name,
+                     root / "op_host" / "op_host" / name)
+    upstream = transformer_copy / "attention" / "sparse_lightning_indexer_grad_kl_loss"
+    shutil.copytree(upstream / "op_host" / "arch22", root / "op_host" / "arch22")
+    shutil.copytree(upstream / "op_kernel" / "arch22", root / "op_kernel" / "arch22")
+    for name in ("sparse_lightning_indexer_grad_kl_loss_tiling_common.h",
+                 "sparse_lightning_indexer_grad_kl_loss_infershape.cpp"):
+        shutil.copy2(upstream / "op_host" / name, root / "op_host" / name)
 
 
 def _export_tiling_declarations(source: Path, destination: Path) -> None:
@@ -350,6 +371,7 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe_grad" / "op_host" / "hyper_mega_moe_grad_def.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "hyper_mega_moe_grad.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
+        source_root / "hyper_dsa_mixed_kl" / "op_kernel" / "hyper_dsa_mixed_kl.cpp",
         source_root / "hyper_dsa_fused_forward" / "op_kernel" / "hyper_dsa_fused_forward.cpp",
         source_root / "hyper_dsa_fused_grad" / "op_kernel" / "hyper_dsa_fused_grad.cpp",
         source_root / "hyper_dsa_cp_attention" / "op_kernel" / "hyper_dsa_cp_attention.cpp",

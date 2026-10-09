@@ -1296,8 +1296,9 @@ Original pointwise comparisons still failed for 86/707 FP32 gradient measurement
 FP32 output measurements. These remain recorded alongside native successes;
 this does not establish full pointwise or model alignment. The short-matrix
 CPU regression passed 149 tests and 224 subtests. Long-history complete LM+KL
-and truncated TopK training are covered by the extended matrix below; mixed
-KL tile execution remains subsequent work.
+and truncated TopK training are covered by the extended matrix below. This
+training composition retains the host KL path; standalone callable phases
+are described after that matrix.
 
 The training validator also provides `--long-history`. Its fixtures include
 packed lengths `(3, 2113)` and `(2176, 2240)`, giving respectively 65 and 320
@@ -1366,3 +1367,72 @@ intentionally interrupted slow CPU-oracle matrix. Native framework and all
 12 DSA kernel objects retain their validated hashes; no native rebuild was
 performed in this round. These are component training results, not full-model
 acceptance, KL tile fusion, CP8/CP×TP acceptance or complete-step performance.
+
+## Selected-KL callable phases
+
+The [mixed KL probe](mixed_kl.py) extracts the locked CANN selected-KL implementation
+into initialization, compute and post-processing launches. Each compute team contains
+one AIC and two AIVs. Logical query partitions and loss partials retain their own IDs
+while the team reuses its physical gather/matmul scratch. Initialization clears the
+FP32 key accumulators and logical loss partials; post-processing runs after the
+compute launch, reduces the loss and converts the accumulated index-key gradient.
+The compute tile contains no whole-chip barrier. Its internal cross-core flags are
+separate from mixed-group dispatch/completion flags.
+
+Packed cumulative lengths enter the native API as host constants through CANN's
+`aclIntArray` conversion. They come from prepared batch metadata, without a device
+readback. Every phase trace owns independent storage because host tiling inspects
+the CANN storage shape. The native API normalizes contiguous tensor views and
+restores output views using the same ACL conventions as mixed SFA.
+
+The public probe preserves the P0 BF16 selection contract. The raw native callable
+also has an FP32 merge-weight variant with a matching FP32 weight derivative; its
+standalone validation is separate from `MegaDsa` admission. Deterministic mode and
+per-phase traversal repeats are rejected. Results retain their own raw derivatives,
+scalar loss, scratch and phase traces across later submissions. No auxiliary loss
+coefficient or upstream cotangent is applied inside these phases.
+
+The [validator](../../examples/mega_dsa_mixed_kl_validate.py) compares the scalar loss
+and three raw indexer derivatives with stock CANN and an independent FP32 selected-set
+oracle. BF16 cases additionally compare the explicitly activated Omni enhance KL.
+It covers H32/H64, signed BF16/FP32 weights, packed causal padding, group counts
+1/2/7/19, and three distinct invocations retained together. `--long-history` adds
+packed lengths `(3,2113)` and `(2176,2240)` with genuine K2048 truncation. Original
+pointwise metrics are saved alongside the existing FP32 relative-L2 criterion.
+FP32 fixtures include weights outside the BF16 grid. `--weight-dtype bf16` or
+`--weight-dtype fp32` selects a focused matrix; the default checks both variants.
+
+The BF16 short/long matrix passes 48 cases. All 192 loss/index-Q/index-K/weight
+measurements pass the original pointwise threshold against each of stock CANN,
+Omni and the independent FP32 oracle. Maximum relative L2 against the oracle is
+0.0024263695767346456. The genuinely truncated fixtures contain 65 and 320 query
+rows whose causal history exceeds K2048.
+
+After a complete source rebuild and private payload activation, the FP32-weight
+short/long matrix with values outside the BF16 grid passes 48 cases and all 192
+stock/oracle pointwise measurements. Maximum relative L2 is
+8.857039325370368e-05 against stock CANN and 0.002421630389632869 against the FP32
+oracle. The subsequent short BF16/FP32 matrix passes 48 cases and all 192 comparisons
+per baseline. Every case verifies three complete phase traces, including physical
+scratch reuse and results retained across later submissions. CPU regression passes
+153 tests and 258 subtests. The 14 DSA device objects retain their verified hashes,
+including all 12 previously accepted DSA objects; the new KL variants add two objects.
+These standalone primitive results do not clear the existing full-model BF16
+composition acceptance gap or establish training speedup.
+
+Run with the private native payload, CANN and comparison vendor activated, through
+the device idle gate:
+
+```bash
+NPU_WAIT_VISIBLE_DEVICES=0 NPU_WAIT_NUM_CARDS=1 NPU_WAIT_POLL_SECONDS=60 \
+  bash ~/doc/npu_wait_and_run.sh python -m \
+  hyper_parallel.core.multicore.examples.mega_dsa_mixed_kl_validate \
+  --output /tmp/mega_dsa_mixed_kl.json --long-history
+```
+
+The [extended ST launcher](../../../../../tests/torch/multicore/test_dsa_mixed_kl.py)
+keeps framework imports in the worker. Standalone callable-phase acceptance does not
+establish KL integration into the CP task DAG. `MegaDsa` still uses its explicitly
+activated host KL reference path and keeps nonzero-KL FP32 weights outside its
+admitted training contract. Device request/count generation, sparse gradient owner
+return, CP8/CP×TP training and complete-step performance remain later requirements.

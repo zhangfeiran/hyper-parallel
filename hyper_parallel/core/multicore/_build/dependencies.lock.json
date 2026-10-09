@@ -80,6 +80,11 @@
             "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_grad_selection_count.patch",
             "sha256": "3483f016d176ecfa34e006b541b3aa5763c47ab5560f187dc4aafee29903dd95",
             "purpose": "honor the compacted valid sparse-index prefix in both gradient compute and scatter while preserving complete-cardinality fast paths"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/sparse_lightning_indexer_kl_mixed.patch",
+            "sha256": "0d8917cafe896e305e2f4b2f2f78c94499279a611ae8737b4b8362c3ec81e696",
+            "purpose": "extract selected KL initialization, mixed physical scratch and logical query/post phases with retained FP32 loss/key partials"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
