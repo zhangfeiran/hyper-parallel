@@ -41,6 +41,7 @@ class ReplicaRoute:
     group: object
     transport: object | None = None
     device_plan: DeviceExpertExecutionPlan | None = None
+    home_only: bool = False
 
 
 def stable_expert_order(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -111,6 +112,7 @@ def prepare_replica_route(
     topk_ids: torch.Tensor, config: ExpertReplicaConfig, group: object = None,
     *, target_load: int | None = None, minimum_replica_rows: int = 0,
     cost_model: ExpertReplicaCostModel | None = None, planner_backend: str = "cpu",
+    compact_home: bool = False,
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
@@ -126,6 +128,8 @@ def prepare_replica_route(
         minimum_replica_rows: Minimum useful row count for a guest copy.
         cost_model: Optional calibrated model for CPU quota refinement.
         planner_backend: CPU or device placement implementation.
+        compact_home: Keep logical IDs and counts when the global plan has no guests.
+            The caller must execute that invocation with a home-only kernel topology.
 
     Returns:
         Invocation-owned placement, physical IDs and dispatch counts.
@@ -149,6 +153,9 @@ def prepare_replica_route(
             minimum_replica_rows=minimum_replica_rows)
         device_plan.control[:1].bitwise_or_(matrix[:, -1].any().to(torch.int64))
         plan = device_plan.host_summary()
+        if compact_home and not plan.transfers:
+            return ReplicaRoute(plan, topk_ids, matrix[:, :-1].to(torch.int32).contiguous(),
+                                rank, group, device_plan=device_plan, home_only=True)
         slots, lengths = device_plan.source_runs(rank)
         remapped = _remap_replica_ids(ids, plan, slots, lengths)
         return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_plan.dispatch_counts.to(torch.int32),
@@ -165,6 +172,9 @@ def prepare_replica_route(
     )
     if max(plan.destination_loads) > upper:
         raise RuntimeError("replica planner exceeded the theoretical receive bound")
+    if compact_home and not plan.transfers:
+        return ReplicaRoute(plan, topk_ids, matrix[:, :-1].to(torch.int32).contiguous(),
+                            rank, group, home_only=True)
     slots, lengths, device_counts = _upload_route_metadata(plan, rank, ids.device)
     remapped = _remap_replica_ids(ids, plan, slots, lengths)
     return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_counts, rank, group)

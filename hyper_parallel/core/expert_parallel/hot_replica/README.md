@@ -75,6 +75,21 @@ Push 仍按 `initial_capacity_factor` 初始分配，并按 `capacity_growth_fac
 规划器根据当前容量设置目标负载，避免为已经能容纳的路由创建不必要的副本。
 Pull 继续使用按源 rank 大小分配的对称存储和 rank 本地接收临时空间。
 
+MegaMoe 的 `replica_min_rows` 默认值为 1024：在同一接收容量上界内，
+移除或合并服务行数较少的可选副本。设为零可恢复按 token 数平衡的放置策略，
+也可以根据矩阵及 token shape 校准阈值。Native 保留原有默认值零。
+容量约束要求的副本即使低于阈值也会保留，
+包括 B>=H、容量上界为 A 时的轻微不均衡路由。
+
+全局 plan 没有传输时，MegaMoe 保留逻辑专家 ID 和已聚合的逻辑计数，
+选择普通 home 专家图。该调用使用 B=0 的稠密权重 ABI 和 BF16 权重梯度，
+跳过稀疏传输及物理 ID 重映射；存在活动 guest 的 plan 继续使用 FP32 梯度累加。
+物理 workspace 和副本接收区仍为后续热点路由预留。
+两种图共享同一 workspace 租约和持久 ready 状态，
+只有 ready 区域偏移一致时才启用这一优化。
+所有 rank 根据全局 plan 选择执行路径，包括没有本地 guest 工作的 rank。
+CPU 和设备规划器均支持该路径。
+
 ## 训练与传输
 
 HCCL P2P 仅传输选中的 owner 到 guest 权重切片。
@@ -297,7 +312,8 @@ Worker 接受 `--benchmark-iterations`，用于在固定热点路由上测量预
 
 `ExpertParallel(..., replica_min_rows=N)` 和
 `MegaMoeExperts(..., replica_min_rows=N)` 使用相同的 host 规划策略。
-默认 `N=0` 保留按 token 数平衡的专家放置。
+Native 默认 `N=0`，MegaMoe 默认 `N=1024`。
+显式设置 `N=0` 可保留按 token 数平衡的专家放置。
 当阈值为正时，规划器优先将较小副本的工作返还给 home owner。
 
 如果容量约束要求部分工作仍留在远端，规划器先尝试将这些行集中到已选择的副本中，
@@ -567,12 +583,13 @@ torchrun --standalone --nproc-per-node=4 tests/torch/expert_parallel/_benchmark_
 参考实现不会接收候选校准数据。
 
 对于全局 plan 没有传输的 MegaMoe B>0 调用，
-前向和反向跳过 guest 池租约、guest 梯度清零及梯度返回。
-调用仍保存自身不可变路由，并计算 FP32 home 权重 partial。
+前向和反向跳过 guest 池租约、guest 梯度清零及梯度返回，并保存自身不可变路由。
+当普通图与物理图的持久 ready 区域偏移一致时，执行普通专家图并计算 BF16 权重梯度。
 
-Runtime 保留现有 v2 home 专家寻址标志，guest 指针为空。
+若偏移不同，则保留物理图并计算 FP32 home 权重 partial。
+此时 runtime 保留现有 v2 home 专家寻址标志，guest 指针为空；
 该标志还用于选择逐专家 GMM 寻址，不能省略。
-是否使用这一快速路径由全局传输列表决定：
+是否使用无传输路径由全局传输列表决定：
 有发送方向传输的 owner 即使没有本地 guest 工作，也必须参与。
 
 Profiling 关闭时，MegaMoe 还会在其串行 workspace 租约内复用 runtime 镜像。

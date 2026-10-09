@@ -24,7 +24,7 @@ import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaConfig, build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, prepare_replica_route
-from hyper_parallel.core.expert_parallel.hot_replica import native, planner, transport
+from hyper_parallel.core.expert_parallel.hot_replica import native, planner, routing, transport
 from hyper_parallel.core.multicore.modules.mega_moe.spec import initial_receive_capacity
 from tests.common.mark_utils import arg_mark
 
@@ -324,6 +324,40 @@ class TestHotReplica(unittest.TestCase):
             prepare_replica_route(torch.tensor([[1, 1]]), ExpertReplicaConfig(3, 1, 1))
         with self.assertRaisesRegex(ValueError, "in-range"):
             prepare_replica_route(torch.tensor([[0, 3]]), ExpertReplicaConfig(3, 1, 1))
+
+    def test_compact_home_route_preserves_global_counts_and_capacity(self):
+        """Use logical slots only when every rank can execute without a guest."""
+        ids = (torch.arange(512 * 8).reshape(512, 8) % 24).to(torch.int32)
+        payload = routing._replica_count_payload(ids.long(), 24)  # pylint: disable=protected-access
+        matrix = payload.expand(4, -1).clone()
+        for backend, budget, rank in itertools.product(("cpu", "device"), (1, 2, 6), range(4)):
+            config = ExpertReplicaConfig(24, 4, budget)
+            plan = build_expert_replica_plan(matrix[:, :-1].tolist(), budget, minimum_replica_rows=256,
+                                            capacity_limit=config.maximum_receive_rows(512, 8, alignment=1))
+            device_plan = SimpleNamespace(control=torch.zeros(1, dtype=torch.int64),
+                                          host_summary=lambda: plan, dispatch_counts=torch.tensor(plan.dispatch_counts),
+                                          source_runs=lambda _rank: routing._upload_route_metadata(  # pylint: disable=protected-access
+                                              plan, _rank, ids.device)[:2])
+            with (self.subTest(backend=backend, budget=budget, rank=rank),
+                  patch.object(routing.dist, "is_initialized", return_value=True),
+                  patch.object(routing.dist, "get_world_size", return_value=4),
+                  patch.object(routing.dist, "get_rank", return_value=rank),
+                  patch.object(routing, "_gather_replica_counts", return_value=matrix),
+                  patch.object(routing, "build_device_expert_replica_plan", return_value=device_plan),
+                  patch.object(routing, "_remap_replica_ids", wraps=routing._remap_replica_ids) as remap):
+                route = prepare_replica_route(ids, config, minimum_replica_rows=256,
+                                              compact_home=True, planner_backend=backend)
+                route.plan.validate()
+                self.assertEqual(route.home_only, not bool(plan.transfers))
+                self.assertLessEqual(max(plan.destination_loads), config.maximum_receive_rows(512, 8, alignment=1))
+                if route.home_only:
+                    self.assertIs(route.physical_ids, ids)
+                    torch.testing.assert_close(route.counts_by_source, matrix[:, :-1].to(torch.int32))
+                    remap.assert_not_called()
+                else:
+                    remap.assert_called_once()
+                    logical = torch.tensor(plan.physical_to_logical)[route.physical_ids.long()]
+                    torch.testing.assert_close(logical.to(ids.dtype), ids)
 
 
     def test_gradient_return_keeps_fp32_and_bounded_inbox(self):
