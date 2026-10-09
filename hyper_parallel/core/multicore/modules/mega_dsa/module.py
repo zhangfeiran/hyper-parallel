@@ -55,21 +55,14 @@ class MegaDsaCoreSelection:
     never share the saved native selection's storage.
     """
 
-    def __init__(self, backend: FusedDsaCpForwardProbe, indices: torch.Tensor, *, backward_ready: bool = False,
-                 _token: object = None) -> None:
+    def __init__(self, backend: FusedDsaCpForwardProbe, indices: torch.Tensor, *, _token: object = None) -> None:
         """Bind an admitted immutable selection to one collectively prepared CP layout."""
         if _token is not _CORE_SELECTION_TOKEN:
             raise ValueError("obtain a core selection from MegaDsaCore.prepare_selection")
         self._backend = backend
-        self._backward_ready = backward_ready
         with torch.inference_mode(False):
             self._indices = indices.detach().clone()
         self._version = self._indices._version
-
-    @property
-    def backward_ready(self) -> bool:
-        """Whether every owner selection matches the existing native causal-count contract."""
-        return self._backward_ready
 
     def validate(self, backend: FusedDsaCpForwardProbe) -> None:
         """Reject foreign layout admission and mutations before acquiring a workspace lease."""
@@ -166,20 +159,18 @@ class MegaDsaCore(torch.nn.Module):
         tail. Every peer observes a preparation error before the device gather.
         """
         error = None
-        backward_ready = False
         try:
-            backward_ready = self._validate_selection(global_indices)
+            self._validate_selection(global_indices)
         except ValueError as exc:
             error = str(exc)
         layout = self.backend.layout
-        declarations = [(error, backward_ready)]
+        declarations = [error]
         if layout.cp_size > 1:
             declarations = [None] * layout.cp_size
-            dist.all_gather_object(declarations, (error, backward_ready), group=layout.group)
-        errors = [item[0] for item in declarations if item[0] is not None]
+            dist.all_gather_object(declarations, error, group=layout.group)
+        errors = [item for item in declarations if item is not None]
         if errors:
             raise ValueError("; ".join(errors))
-        backward_ready = all(item[1] for item in declarations)
         local = global_indices.to(layout.device).index_select(0, layout.query_order)
         padded = torch.full((layout.padded_tokens, 2048), -1, dtype=torch.int32, device=layout.device)
         padded[:layout.local_tokens] = local
@@ -191,28 +182,22 @@ class MegaDsaCore(torch.nn.Module):
             dist.all_gather_into_tensor(gathered, padded, group=layout.group)
         full = gathered.index_select(0, layout.global_order)
         native = self.backend.native_layout.global_to_sequence_indices(full)
-        return MegaDsaCoreSelection(self.backend, native, backward_ready=backward_ready, _token=_CORE_SELECTION_TOKEN)
+        return MegaDsaCoreSelection(self.backend, native, _token=_CORE_SELECTION_TOKEN)
 
-    def _validate_selection(self, indices: torch.Tensor) -> bool:
+    def _validate_selection(self, indices: torch.Tensor) -> None:
         meta = self.backend.layout.batch_meta
         if (not isinstance(indices, torch.Tensor) or indices.device.type != "cpu" or indices.dtype != torch.int32
                 or indices.shape != (len(meta.q_global_ids), 2048)):
             raise ValueError("core preparation requires CPU int32 [local Q,2048] global packed IDs")
-        backward_ready = True
-        for query, row in zip(meta.q_global_ids, indices.tolist()):
-            sequence, position = meta.sequence_position(query)
-            legal = 0
+        for row in indices.tolist():
             seen = set()
             for token in row:
                 if token == -1:
                     continue
-                key_sequence, key_position = meta.sequence_position(token)
-                legal += int(key_sequence == sequence and key_position <= position)
+                meta.sequence_position(token)
                 if token in seen:
                     raise ValueError("external Top-K must not contain duplicate valid token IDs")
                 seen.add(token)
-            backward_ready = backward_ready and legal == min(2048, position + 1)
-        return backward_ready
 
     def _validate_invocation(self, invocation: DsaWorkspaceInvocation) -> None:
         meta, prepared = invocation.batch_meta, self.backend.layout.batch_meta
@@ -231,8 +216,8 @@ class MegaDsaCore(torch.nn.Module):
         if len(states) != 4 or any(tensor.requires_grad for tensor in states):
             raise ValueError("core raw forward requires four detached main tensors")
         _load_native()
-        if torch.ops.hyper_parallel.dsa_cp_attention_version() != 1:
-            raise RuntimeError("core CP attention requires adapter ABI 1; rebuild this checkout's payload")
+        if torch.ops.hyper_parallel.dsa_cp_attention_version() != 2:
+            raise RuntimeError("core CP attention requires adapter ABI 2; rebuild this checkout's payload")
         with torch.inference_mode(False), self.backend.workspace.lease(invocation, direction="forward"):
             return self._submit(invocation, states, selection)
 
@@ -279,8 +264,8 @@ class MegaDsaCore(torch.nn.Module):
         if not isinstance(topk_indices, MegaDsaCoreSelection):
             raise TypeError("core requires an admitted MegaDsaCoreSelection")
         if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (
-                query, compressed_kv, query_rope, key_rope)) and not topk_indices.backward_ready:
-            raise NotImplementedError("external Top-K training with extra padding awaits the native selected-count fix")
+                query, compressed_kv, query_rope, key_rope)):
+            self.backward_backend.check_native_support()
         invocation = replace(self.prepared_invocation, batch_meta=batch_meta)
         output, maximum, denominator = _CoreAttention.apply(
             self, invocation, topk_indices, query, compressed_kv, query_rope, key_rope)

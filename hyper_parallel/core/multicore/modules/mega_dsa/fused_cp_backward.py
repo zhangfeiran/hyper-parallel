@@ -67,6 +67,13 @@ class FusedDsaCpBackwardProbe:
         offsets = tuple(meta.token_local_offsets[token] for token in meta.kv_global_ids)
         self.local_owner_order = torch.tensor(offsets, dtype=torch.long, device=forward.layout.device)
 
+    @staticmethod
+    def check_native_support() -> None:
+        """Require the compact valid-prefix gradient adapter before entering a native lease."""
+        _load_native()
+        if torch.ops.hyper_parallel.dsa_fused_grad_version() != 2:
+            raise RuntimeError("fused CP backward requires adapter ABI 2; rebuild this checkout's payload")
+
     def backward(self, forward: FusedCpForwardResult, grad_output: torch.Tensor) -> FusedCpBackwardResult:
         """Return Q, shared compressed-KV, Q-RoPE and K-RoPE gradients in original local orders.
 
@@ -90,9 +97,7 @@ class FusedDsaCpBackwardProbe:
         if (grad_output.device != self.backend.layout.device or grad_output.dtype != torch.bfloat16
                 or tuple(grad_output.shape) != shape or grad_output.requires_grad):
             raise ValueError("fused CP backward requires an explicitly detached local BF16 output cotangent")
-        _load_native()
-        if torch.ops.hyper_parallel.dsa_fused_grad_version() != 1:
-            raise RuntimeError("fused CP backward requires adapter ABI 1; rebuild this checkout's payload")
+        self.check_native_support()
         invocation = self.workspace.prepare(saved.batch_meta)
         with self.workspace.lease(invocation, direction="backward"):
             return self._submit(saved, grad_output, invocation)

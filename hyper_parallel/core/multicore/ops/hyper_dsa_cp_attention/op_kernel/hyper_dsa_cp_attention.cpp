@@ -86,4 +86,26 @@ extern "C" __global__ __aicore__ void hyper_dsa_cp_attention(
     Complete(trace, group * kGroupWords, count, checksum, ticket);
   }
   ArriveAndWait(trace, group, groups, 1);
+  if ASCEND_IS_AIV {
+    // SFA represents an empty softmax with finite sentinels. Restore exact empty-set semantics
+    // only after every tile writer has finished, using disjoint vector-owned query rows.
+    TPipe pipe;
+    GlobalTensor<int32_t> selection, cumulative;
+    GlobalTensor<bfloat16_t> output;
+    GlobalTensor<float> denominator;
+    selection.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(indices));
+    cumulative.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(lengths));
+    output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(attention));
+    denominator.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(sum));
+    const uint32_t tokens = cumulative.GetValue(data.baseParams.actualLenDimsQ - 1);
+    const uint32_t heads = data.baseParams.nNumOfQInOneGroup;
+    const uint32_t slots = data.baseParams.sparseBlockCount;
+    for (uint32_t row = group * 2 + GetSubBlockIdx(); row < tokens; row += groups * 2) {
+      if (selection.GetValue(row * slots) < 0) {
+        matmul::InitOutput<bfloat16_t>(output[row * heads * 512], heads * 512, 0);
+        matmul::InitOutput<float>(denominator[row * heads], heads, 0);
+      }
+    }
+    PipeBarrier<PIPE_ALL>();
+  }
 }

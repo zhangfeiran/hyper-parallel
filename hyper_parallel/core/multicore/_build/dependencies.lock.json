@@ -75,6 +75,11 @@
             "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_grad_mixed.patch",
             "sha256": "8110811605ef4921a7a11081d0f7f1a5926c103effd26f7ea1493d7bcf38e4a9",
             "purpose": "separate SFA gradient initialization, physical mixed scratch and logical query/post partitions across three retained-workspace phases"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_grad_selection_count.patch",
+            "sha256": "3483f016d176ecfa34e006b541b3aa5763c47ab5560f187dc4aafee29903dd95",
+            "purpose": "honor the compacted valid sparse-index prefix in both gradient compute and scatter while preserving complete-cardinality fast paths"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"

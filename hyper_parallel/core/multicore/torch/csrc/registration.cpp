@@ -13,12 +13,12 @@
 
 namespace {
 void register_dsa_probes(torch::Library& m) {
-  m.def("dsa_cp_attention_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_cp_attention_version() -> int", []() -> int64_t { return 2; });
   m.def("dsa_cp_attention_out(Tensor query, Tensor(a!) compressed, Tensor query_rope, Tensor(b!) key_rope, "
         "Tensor indices, Tensor lengths, Tensor config, Tensor(c!) trace, Tensor(d!) arena, Tensor metadata, "
         "Tensor requests, Tensor(e!) transport_trace, float scale, Tensor(f!) attention, Tensor(g!) maximum, "
         "Tensor(h!) sum) -> (Tensor(f!), Tensor(g!), Tensor(h!), Tensor(c!), Tensor(e!))");
-  m.def("dsa_fused_grad_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_fused_grad_version() -> int", []() -> int64_t { return 2; });
   m.def("dsa_fused_cp_grad_out(Tensor query, Tensor key, Tensor value, Tensor indices, Tensor grad_out, "
         "Tensor out, Tensor maximum, Tensor sum, Tensor actual_query, Tensor actual_kv, Tensor query_rope, "
         "Tensor key_rope, Tensor config, Tensor(f!) trace, Tensor(g!) retained, float scale, "
@@ -39,7 +39,7 @@ void register_dsa_probes(torch::Library& m) {
         "Tensor(e!) attention, Tensor(f!) maximum, Tensor(g!) sum, Tensor(k!) arena, Tensor metadata, "
         "Tensor requests, Tensor(l!) transport_trace) "
         "-> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
-  m.def("dsa_mixed_grad_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_mixed_grad_version() -> int", []() -> int64_t { return 2; });
   m.def("dsa_mixed_grad_out(Tensor query, Tensor key, Tensor value, Tensor indices, Tensor grad_out, "
         "Tensor out, Tensor maximum, Tensor sum, Tensor actual_query, Tensor actual_kv, Tensor query_rope, "
         "Tensor key_rope, Tensor config, Tensor(a!) trace, Tensor(b!) retained, float scale, int phase, "

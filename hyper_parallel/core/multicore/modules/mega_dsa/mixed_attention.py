@@ -50,7 +50,7 @@ def mixed_sfa_grad_workspace_bytes(tokens: int, heads: int) -> int:
 def _ensure_native() -> None:
     _load_native()
     versions = (torch.ops.hyper_parallel.dsa_mixed_tile_version(), torch.ops.hyper_parallel.dsa_mixed_grad_version())
-    if versions != (1, 1):
+    if versions != (1, 2):
         raise RuntimeError("mixed SFA forward/backward ABI mismatch; rebuild this checkout's payload")
 
 
@@ -63,7 +63,7 @@ def mixed_sfa_backward_probe(states: tuple[torch.Tensor, ...], indices: torch.Te
 
     Args:
         states: Detached absorbed query, compressed K/V, query RoPE and key RoPE.
-        indices: Complete owned sequence-local native selection [T,1,2048].
+        indices: Owned sequence-local selection [T,1,2048], with every -1 compacted to the tail.
         cumulative_lengths: Prepared complete CP1 packed int32 lengths.
         config: Immutable prepared mixed-group runtime configuration.
         grad_output: BF16 compressed output gradient.

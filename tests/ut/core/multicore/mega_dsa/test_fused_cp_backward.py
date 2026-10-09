@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from hyper_parallel.core.multicore.modules.mega_dsa import fused_cp, fused_cp_backward
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta
@@ -76,7 +76,7 @@ class TestFusedCpBackward(SharedRootFixture):
             args[26].fill_(17)
 
         with patch.object(fused_cp_backward, "_load_native"), \
-                patch.object(torch.ops.hyper_parallel, "dsa_fused_grad_version", return_value=1, create=True), \
+                patch.object(torch.ops.hyper_parallel, "dsa_fused_grad_version", return_value=2, create=True), \
                 patch.object(torch.ops.hyper_parallel, "dsa_fused_cp_grad_out", side_effect=_execute, create=True):
             first = self.backend.backward(self.forward, cotangent)
             self.workspace.buffers["source_compressed"].fill_(-99)
@@ -162,7 +162,8 @@ class TestFusedCpBackward(SharedRootFixture):
                 output.sum().backward()
             backward.assert_not_called()
 
-    def test_non_reentrant_checkpoint_recomputes_without_context_tensor_side_storage(self):
+    @patch.object(DefaultDeviceType, "get_device_type", return_value="cpu")
+    def test_non_reentrant_checkpoint_recomputes_without_context_tensor_side_storage(self, _device_type):
         """Native activations use saved-tensor hooks so checkpoint can rebuild the first-order VJP."""
         backend = fused_cp_backward.FusedDsaCpAttentionProbe(self.forward_backend)
         main = tuple(tensor.clone().requires_grad_() for tensor in self.forward.saved.states)

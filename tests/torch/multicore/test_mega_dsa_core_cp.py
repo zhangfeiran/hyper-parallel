@@ -41,3 +41,24 @@ def test_mega_dsa_core_cp4() -> None:
 def test_mega_dsa_core_cp1() -> None:
     """Verify complete external selection, native backward and saved-state lifecycle on CP1."""
     torchrun_case(_WORKER, "test_mega_dsa_core_cp", num_proc=1)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard",
+          essential_mark="essential")
+def test_mega_dsa_core_cp1_padded() -> None:
+    """Verify external subsets and empty selections with independent gradients on CP1."""
+    torchrun_case(_WORKER, "test_mega_dsa_core_cp_padded", num_proc=1)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="essential")
+def test_mega_dsa_core_cp2_padded() -> None:
+    """Verify external subsets and empty selections with independent gradients on CP2."""
+    torchrun_case(_WORKER, "test_mega_dsa_core_cp_padded", num_proc=2)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="essential")
+def test_mega_dsa_core_cp4_padded() -> None:
+    """Verify external subsets and empty selections with independent gradients on CP4."""
+    torchrun_case(_WORKER, "test_mega_dsa_core_cp_padded", num_proc=4)

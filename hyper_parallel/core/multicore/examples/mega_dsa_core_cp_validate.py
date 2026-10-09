@@ -112,6 +112,19 @@ def _oracle_measurements(forward, backward, full, selected, meta, repeat):
     measurement["oracle_gradients"] = [_metrics(actual.float().cpu(), expected[rows])
                                        for actual, expected, rows in zip(backward.gradients, gradients,
                                                                          (query, key, query, key))]
+    if not bool((selected >= 0).any()):
+        measurement["empty_nonzero_counts"] = [int(tensor.detach().count_nonzero())
+                                                for tensor in (forward.output, forward.denominator,
+                                                               *backward.gradients)]
+    for metric in (measurement["oracle_forward"], *measurement["oracle_gradients"]):
+        if not metric["relative_l2"] <= .02:
+            raise RuntimeError(f"independent FP32 oracle relative L2 exceeds 0.02: {measurement}")
+    if not bool((selected >= 0).any()):
+        for tensor in (forward.output, forward.denominator, *backward.gradients):
+            if bool(tensor.detach().count_nonzero()):
+                raise RuntimeError("all-empty selection must return exact zero output, sum and gradients")
+    measurement["oracle_relative_l2_limit"] = .02
+    measurement["oracle_relative_l2_pass"] = True
     return measurement
 
 
@@ -139,8 +152,6 @@ def _run_fixture(report, lengths, heads, pattern, fixture, device, *, smoke, for
             core = MegaDsaCore(workspace, prepared, heads=heads, attention_scale=_SCALE,
                                schedule=MixedSfaSchedule(groups))
             admitted = core.prepare_selection(selected[list(meta.q_global_ids)])
-            if not forward_only and not admitted.backward_ready:
-                raise NotImplementedError("padded external backward awaits the native selected-count fix")
             for repeat in range(1 if smoke else 2):
                 report["stage"] = {"lengths": lengths, "heads": heads, "pattern": pattern,
                                    "selection": fixture, "groups": groups, "repeat": repeat}
@@ -152,18 +163,38 @@ def _run_fixture(report, lengths, heads, pattern, fixture, device, *, smoke, for
                 forward = core.raw_forward(invocation, local, admitted)
                 cotangent = _cotangent(meta, heads, repeat, device)
                 backward = None if forward_only else core.backward_backend.backward(forward, cotangent)
+                if fixture == "all_empty" and backward is not None:
+                    if any(bool(tensor.detach().count_nonzero()) for tensor in backward.gradients):
+                        raise RuntimeError("all-empty gradients must be exactly zero at every history length")
                 native = core.backend.native_layout.global_to_sequence_indices(selected.to(device))
                 baseline = forward_reference(full, native, core.backend.native_layout)
                 torch.npu.synchronize()
                 rows = core.backend.layout.local_query_ids
-                for actual, expected in zip((forward.output, forward.maximum, forward.denominator), baseline):
+                local_empty = (native[:, 0, 0].cpu() < 0).index_select(0, rows.cpu())
+                stock_empty = []
+                for index, (actual, expected) in enumerate(zip(
+                        (forward.output, forward.maximum, forward.denominator), baseline)):
                     axis = 0 if expected.ndim == 3 and expected.shape[0] != 1 else 1
-                    torch.testing.assert_close(actual.cpu(), expected.index_select(axis, rows).cpu(), rtol=0, atol=0)
+                    actual = actual.cpu()
+                    expected = expected.index_select(axis, rows).cpu()
+                    if index == 1:
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        continue
+                    nonempty_rows = (~local_empty).nonzero().flatten()
+                    torch.testing.assert_close(actual.index_select(axis, nonempty_rows),
+                                               expected.index_select(axis, nonempty_rows), rtol=0, atol=0)
+                    empty_rows = local_empty.nonzero().flatten()
+                    if bool(actual.index_select(axis, empty_rows).count_nonzero()):
+                        raise RuntimeError("empty selected rows must have exact zero output and denominator")
+                    stock_empty.append(_metrics(expected.index_select(axis, empty_rows),
+                                                torch.zeros_like(expected.index_select(axis, empty_rows))))
                 trace = core.validate_trace(forward, tuple(value.cpu() for value in forward.phase_traces),
                                             forward.transport_trace.cpu())
                 proof = _backward_proof(backward, core, forward, cotangent)
                 oracle = _oracle_measurements(forward, backward, full, selected, meta, repeat)
-                report["cases"].append({**report["stage"], "forward_stock_exact": True,
+                report["cases"].append({**report["stage"], "forward_stock_exact": not bool(local_empty.any()),
+                                        "forward_stock_nonempty_exact": True, "forward_empty_exact": True,
+                                        "stock_empty_output_sum": stock_empty,
                                         "forward_trace": trace, "backward_executed": backward is not None,
                                         **proof, **oracle})
     finally:
@@ -183,8 +214,6 @@ def _lifecycle(report, device, pattern, fixture):
         prepared = workspace.prepare(meta)
         core = MegaDsaCore(workspace, prepared, heads=32, attention_scale=_SCALE, schedule=MixedSfaSchedule(7))
         selection = core.prepare_selection(_selection(meta, fixture)[list(meta.q_global_ids)])
-        if not selection.backward_ready:
-            raise NotImplementedError("padded external lifecycle awaits the native selected-count fix")
         local = _local_main(meta, _main_states(13, 32, device))
         raw = core.raw_forward(prepared, local, selection)
         cotangent = _cotangent(meta, 32, 0, device)
@@ -212,12 +241,18 @@ def _lifecycle(report, device, pattern, fixture):
         for actual in (second_raw.gradients, first, second, third):
             for value, expected in zip(actual, first_raw.gradients):
                 torch.testing.assert_close(value.cpu(), expected.cpu(), rtol=.02, atol=2e-5)
+        if fixture == "all_empty":
+            empty_tensors = (out, stats.denominator, *first_raw.gradients, *second_raw.gradients,
+                             *first, *second, *third)
+            if any(bool(tensor.detach().count_nonzero()) for tensor in empty_tensors):
+                raise RuntimeError("all-empty lifecycle must preserve exact zero outputs, sum and gradients")
         _owner_oracle(first_raw, core.backward_backend)
         _owner_oracle(second_raw, core.backward_backend)
         report.setdefault("lifecycle", []).append(
             {"pattern": pattern, "selection": fixture, "retained_graph": True, "delayed_after_republication": True,
              "non_reentrant_checkpoint": True, "cross_stream_backward": True,
-             "four_main_gradients": True, "statistics_nondifferentiable": True})
+             "four_main_gradients": True, "statistics_nondifferentiable": True,
+             "empty_exact_zero": fixture == "all_empty"})
     finally:
         workspace.close()
         root.close()
@@ -249,7 +284,8 @@ def run_validation(report: dict, output_dir: Path, *, smoke: bool, long_history:
         (output_dir / f"rank{dist.get_rank()}.json").write_text(json.dumps(report, indent=2)+"\n", encoding="utf-8")
     if not smoke and not forward_only:
         for pattern in ("zigzag", "empty"):
-            _lifecycle(report, device, pattern, selection_fixture or "holes")
+            for fixture in ((selection_fixture,) if selection_fixture is not None else ("holes", "all_empty")):
+                _lifecycle(report, device, pattern, fixture)
     report.update(status="passed", stage="complete", case_count=len(report["cases"]))
     dist.barrier()
     dist.destroy_process_group()

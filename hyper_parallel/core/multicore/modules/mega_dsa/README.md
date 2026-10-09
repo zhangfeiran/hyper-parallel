@@ -229,7 +229,7 @@ instead of the oracle's 0.00001685. Enhance main-query gradient relative L2 was
 large errors and empty-row failures. These are unsupported native candidate
 counts, not ordinary BF16 rounding.
 
-The locked native SFA backward computes `actualSelectedBlockCount` from
+The original locked native SFA backward computes `actualSelectedBlockCount` from
 `min(selectedBlockCount, causal block count)`, without counting non-padding
 indices. KL likewise sets `s2RealSize = min(kSize, s2SparseLen)`; when the causal
 prefix fits K, `mergeKv` is false and it reads dense key storage. Its required
@@ -238,7 +238,8 @@ legal keys per row. Stable compaction does not satisfy this precondition for
 an underfilled or empty row. The development adapter now enforces this
 precondition through CPU preparation or native-indexer provenance. General
 selected sets and empty rows are rejected; supporting them on device would
-require a separate native change. The native limitation remains unchanged.
+require separate native changes. The external CP main-attention adapter below now contains a selected-count
+correction; this does not change the KL/indexer selection restriction.
 
 The same device matrix reuses the existing `aux_loss_auto_scale` and
 `set_aux_loss_scale`. Complete-history checks pass for `grad_aux=1/7` with
@@ -1060,7 +1061,7 @@ transport gates; external-Top-K production installation, selected-set KL,
 independent model acceptance and full-step performance remain incomplete.
 
 
-### External Top-K CP core: forward validated, padded backward pending
+### External Top-K CP core: compacted subsets and empty-row autograd
 
 The parameter-free [MegaDsaCore](module.py) admits caller-provided global
 packed Top-K without running LI or KL. Preparation accepts CPU int32
@@ -1077,20 +1078,34 @@ are replicated in global packed order; owner-local Q and KV permutations stay
 independent. Backward reuses the existing FP32 owner-return backend.
 
 An external subset may contain fewer legal IDs than `min(K,causal_length)`.
-The locked gradient tile currently infers its compute/scatter count from that
-expression instead of the compacted valid prefix. Additional `-1` entries can
-therefore enter its gather. Stock backward also fails the independent FP32
+The original gradient tile inferred its compute/scatter count from that
+expression instead of the compacted valid prefix, allowing additional `-1`
+entries into its gather. Stock backward also fails the independent FP32
 oracle for this fixture; native-to-native parity is insufficient proof.
-The public training entry rejects selections with this count mismatch before
-launching native code. This is a temporary incomplete capability, not the P3
-acceptance boundary: full external Top-K backward, including empty selected
-rows, still requires a reviewed and independently validated native correction.
+
+The locked [selected-count patch](../../ops/sparse_flash_attention_grad_selection_count.patch)
+now bounds both compute and scatter by the compacted valid prefix. Complete
+selections keep the final-slot fast path; underfilled selections use a binary
+search. Gradient capability versions are now 2. The public training entry checks
+this capability before forward dispatch and rejects old payloads. Prepared
+subsets and all-empty selections pass the Python training admission contract.
+CP1/CP2/CP4 device validation now covers compacted subsets, zero-count
+rows and all four main gradients under the numerical criteria below.
+KL/indexer restrictions and prior model acceptance results remain unchanged.
+
+The CP forward adapter also requires ABI 2. After all tile writers finish,
+disjoint vector-owned empty query rows receive exact zero output and denominator
+inside the same kernel. This corrects stock SFA's finite empty-softmax sentinel
+residue, without adding a host mask or another operator launch. Maximum retains
+the native opaque representation. Nonempty output/max/sum remain subject to
+bitwise stock comparison; empty output/sum follow the independent zero contract.
+The validator records stock empty-row differences separately.
 
 The [validator](../../examples/mega_dsa_core_cp_validate.py) has an explicit
 `--forward-only` mode to certify legal external forward sets without claiming
 padded backward acceptance. Small-case FP32 measurements remain visible.
 CPU tests cover admission, packed compaction, independent exports, saved-state
-hooks and the training guard. They do not establish device autograd acceptance.
+hooks and old-payload rejection. They do not establish device autograd acceptance.
 
 On 910B3/CANN 9.1, the forward-only CP1/CP2/CP4 matrix passed 88
 invocations per rank: 616 rank invocations, including 112 long-history calls.
@@ -1098,9 +1113,10 @@ Native outputs and max/sum matched stock exactly. The matrix covers H32/H64,
 contiguous/strided/zigzag/empty owners, external holes/packed violations,
 all-empty selected sets, owner-zero sets and groups 1/2/7/19. All eleven
 previously accepted DSA device objects retained their hashes. The CPU multicore
-regression passed 300 tests and 985 subtests. These results certify forward
-and the admission/guard contracts; padded backward and its device autograd
-remain unaccepted pending the selected-count correction.
+regression passed 300 tests and 985 subtests. These historical results certify forward
+and the original admission/guard contracts; padded backward and its device autograd
+were still unaccepted at that historical forward-only checkpoint. The current
+selected-count and empty-row validation results are recorded below.
 
 
 For the existing complete-cardinality count contract, the external core now has
@@ -1124,4 +1140,47 @@ four-gradient pointwise checks, 720 failed the recorded rtol=0.02, atol=2e-5;
 these are not hidden by native parity. Neither this validation nor CPU analysis
 of a proposed valid-prefix search establishes padded/empty-selection backward,
 full-model acceptance, second-order derivatives, KL/indexer gradients or
-performance. The public additional-padding training guard remains active.
+performance. ABI 2 replaces the former additional-padding guard with a native
+capability check. The current corrected payload passes the declared device
+relative-L2 and exact-zero criteria for the tested external core fixtures.
+
+The ST launchers additionally provide `test_mega_dsa_core_cp1_padded`,
+`test_mega_dsa_core_cp2_padded` and `test_mega_dsa_core_cp4_padded`. They exercise
+holes, owner-zero and all-empty sets, with both holes and all-empty lifecycle
+checks. Small cases require independent FP32 relative L2 at most 0.02 for the
+output and four main gradients, while retaining all original pointwise metrics.
+All-empty output, denominator and gradients must be exactly zero. The fixed L2
+threshold permits the observed BF16 near-zero pointwise differences; it does
+not certify the recorded pointwise failures or full-model acceptance. These new
+padded STs pass on CP1/CP2/CP4 after the selected-count correction and native
+empty-forward canonicalization.
+
+The corrected-payload complete matrix passed 504 rank forward/backward
+invocations (112 long-history) and 14 rank lifecycle checks. The padded matrix
+passed 616 rank invocations (112 long-history) and 28 rank lifecycle checks.
+It includes 56 all-empty rank invocations with exact zero output, denominator
+and four main gradients. Maximum retains the original native representation.
+Nonempty rows matched stock output/max/sum bitwise; empty output/sum deliberately
+use the independent zero contract because stock preserves finite-sentinel
+residue. FP32 owner returns matched independent ordered peer sums bitwise.
+
+Small-case independent FP32 gradient relative L2 reached at most
+0.0033812034965602666 for complete selections and 0.003920230594267788 for padded
+selections, below the declared 0.02 bound. The original pointwise criterion
+(rtol=0.02, atol=2e-5) still failed 720/1568 complete and 868/2016 padded gradient
+measurements. These failures remain visible; this is neither full pointwise
+alignment nor full-model acceptance. Long-history correctness uses the original
+three-launch gradient comparison and independent owner reduction, without a
+full FP32 attention oracle at those sizes. KL/indexer gradients, model CP/TP,
+second-order differentiation and performance remain outside this acceptance.
+
+
+An additional all-empty CP1/CP2/CP4 matrix passed 504 rank invocations,
+including 112 long-history invocations with 4416 packed tokens and H32/H64.
+All output/denominator/four-gradient values were exactly zero. Fourteen rank
+lifecycle checks independently required exact zero through retained graphs,
+delayed backward, non-reentrant checkpoint and cross-stream execution.
+The combined corrected-payload evidence is 1624 rank invocations, 336 long-history
+invocations and 56 rank lifecycle checks. CPU regression passed 140 tests and
+218 subtests. These results certify the tested external-core relative-L2,
+empty-set and transport contracts; the pointwise/model limitations above remain.

@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from hyper_parallel.components.functional.aux_loss import set_aux_loss_scale
 from hyper_parallel.components.modules.dsa_attention import DeepseekV32DSAAttention
@@ -155,7 +155,8 @@ class TestModelBoundary(unittest.TestCase):
                     else:
                         self.assertIsNotNone(gradient, name)
 
-    def test_non_reentrant_checkpoint_preserves_parameter_and_input_gradients(self):
+    @patch.object(DefaultDeviceType, "get_device_type", return_value="cpu")
+    def test_non_reentrant_checkpoint_preserves_parameter_and_input_gradients(self, _device_type):
         """Recomputation calls the boundary explicitly without losing the auxiliary edge."""
         model = self._replace().attention
         set_aux_loss_scale(torch.tensor(7.0))

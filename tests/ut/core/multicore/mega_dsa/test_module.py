@@ -19,9 +19,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
-from hyper_parallel.core.multicore.modules.mega_dsa import module
+from hyper_parallel.core.multicore.modules.mega_dsa import fused_cp_backward, module
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
 from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
@@ -97,7 +97,7 @@ class TestMegaDsaCore(SharedRootFixture):
 
     def _native_patches(self):
         return (patch.object(module, "_load_native"),
-                patch.object(torch.ops.hyper_parallel, "dsa_cp_attention_version", return_value=1, create=True),
+                patch.object(torch.ops.hyper_parallel, "dsa_cp_attention_version", return_value=2, create=True),
                 patch.object(torch.ops.hyper_parallel, "dsa_cp_attention_out", side_effect=self._execute, create=True))
 
     def test_raw_forward_owns_selection_and_publishes_only_main_sources(self):
@@ -116,6 +116,18 @@ class TestMegaDsaCore(SharedRootFixture):
         torch.testing.assert_close(first.output, self.states[0] * 3)
         torch.testing.assert_close(first.saved.states[1][:, 0], torch.arange(4).bfloat16())
 
+    def test_old_forward_payload_rejects_before_workspace_lease(self):
+        """An old forward adapter cannot silently retain finite empty-set sentinels."""
+        selection = self.core.prepare_selection(torch.full_like(self.indices, -1))
+        with patch.object(module, "_load_native"), \
+                patch.object(torch.ops.hyper_parallel, "dsa_cp_attention_version", return_value=1, create=True), \
+                patch.object(torch.ops.hyper_parallel, "dsa_cp_attention_out", create=True) as execute:
+            with self.assertRaisesRegex(RuntimeError, "ABI 2"):
+                self.core.raw_forward(self.invocation, self.states, selection)
+            execute.assert_not_called()
+        self.assertIsNone(self.root.lease_owner)
+        self.assertEqual(self.workspace.transport_epoch, 0)
+
     def test_forward_rejects_changed_layout_and_foreign_selection_before_load(self):
         """Prepared ownership and local storage orders cannot change under a live backend."""
         selection = self.core.prepare_selection(self.indices)
@@ -130,7 +142,8 @@ class TestMegaDsaCore(SharedRootFixture):
                 self.core.raw_forward(self.invocation, self.states, selection)
             load.assert_not_called()
 
-    def test_autograd_saved_hooks_recompute_without_hidden_tensor_cache(self):
+    @patch.object(DefaultDeviceType, "get_device_type", return_value="cpu")
+    def test_autograd_saved_hooks_recompute_without_hidden_tensor_cache(self, _device_type):
         """Checkpoint and retain_graph return exactly four gradients with immutable native stats."""
         complete = torch.full_like(self.indices, -1)
         for row, query in enumerate(self.meta.q_global_ids):
@@ -148,7 +161,8 @@ class TestMegaDsaCore(SharedRootFixture):
             calls.append(shape)
             return SimpleNamespace(gradients=gradients)
 
-        with load, version, execute, patch.object(self.core.backward_backend, "_backward_saved", side_effect=_backward):
+        with load, version, execute, patch.object(self.core.backward_backend, "check_native_support"), \
+                patch.object(self.core.backward_backend, "_backward_saved", side_effect=_backward):
             out, stats = self.core(*main, selection, self.meta)
             self.assertFalse(stats.maximum.requires_grad)
             self.assertFalse(stats.denominator.requires_grad)
@@ -163,14 +177,42 @@ class TestMegaDsaCore(SharedRootFixture):
         self.assertEqual(len(calls), 3)
         self.assertEqual(self.workspace.transport_epoch, 3)
 
-    def test_extra_padding_training_stops_before_unsafe_native_backward(self):
-        """Known native count-contract failures cannot silently enter the public training path."""
+    def test_old_gradient_payload_rejects_padded_training_before_forward_dispatch(self):
+        """ABI 1 cannot silently enter training after admission of a compacted padded selection."""
         incomplete = torch.full_like(self.indices, -1)
         incomplete[0, 0] = 3
         selection = self.core.prepare_selection(incomplete)
-        self.assertFalse(selection.backward_ready)
         main = tuple(tensor.clone().requires_grad_() for tensor in self.states)
-        with patch.object(module, "_load_native") as load:
-            with self.assertRaisesRegex(NotImplementedError, "selected-count fix"):
+        with patch.object(self.core, "raw_forward") as forward, \
+                patch.object(fused_cp_backward, "_load_native"), \
+                patch.object(torch.ops.hyper_parallel, "dsa_fused_grad_version", return_value=1, create=True):
+            with self.assertRaisesRegex(RuntimeError, "ABI 2"):
                 self.core(*main, selection, self.meta)
-            load.assert_not_called()
+            forward.assert_not_called()
+
+    def test_padded_and_empty_selections_enter_training_with_current_gradient_abi(self):
+        """Compacted subsets and empty rows preserve admission and all four gradient slots."""
+        for empty in (False, True):
+            with self.subTest(empty=empty):
+                indices = torch.full_like(self.indices, -1)
+                if not empty:
+                    indices[0, 3] = 3
+                selection = self.core.prepare_selection(indices)
+                main = tuple(tensor.clone().requires_grad_() for tensor in self.states)
+                gradients = tuple(torch.zeros_like(tensor) for tensor in main)
+                load, version, execute = self._native_patches()
+
+                def _backward(saved, _shape, _cotangent):
+                    saved.validate_versions()
+                    self.assertEqual(int((saved.indices >= 0).sum()), 0 if empty else 1)
+                    return SimpleNamespace(gradients=gradients)
+
+                with load, version, execute, patch.object(fused_cp_backward, "_load_native"), \
+                        patch.object(torch.ops.hyper_parallel, "dsa_fused_grad_version", return_value=2, create=True), \
+                        patch.object(self.core.backward_backend, "_backward_saved", side_effect=_backward):
+                    output, stats = self.core(*main, selection, self.meta)
+                    actual = torch.autograd.grad(output.sum(), main)
+                for value, expected in zip(actual, gradients):
+                    torch.testing.assert_close(value, expected)
+                self.assertFalse(stats.maximum.requires_grad)
+                self.assertFalse(stats.denominator.requires_grad)

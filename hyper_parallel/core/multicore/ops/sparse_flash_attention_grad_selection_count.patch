@@ -1,0 +1,56 @@
+--- a/attention/sparse_flash_attention_grad/op_kernel/arch22/sparse_flash_attention_grad_bs1_basic.h
++++ b/attention/sparse_flash_attention_grad/op_kernel/arch22/sparse_flash_attention_grad_bs1_basic.h
+@@ -64,6 +64,7 @@
+     __aicore__ inline void UpdateScatterInfo(int64_t t1ScatterIndex);
+     __aicore__ inline void GetTndSeqLenScatter(const GM_ADDR actual_seq_qlen_addr, const GM_ADDR actual_seq_kvlen_addr,
+                                         const int64_t t1Idx, int64_t &bIdx);
++    __aicore__ inline int32_t ValidSelectedCount(const int64_t t1Idx, const int64_t n2Idx, int32_t limit);
+     __aicore__ inline void GetActualSelCountScatter(const int64_t t1Idx, const int64_t n2Idx, int32_t &actSelBlkCount);
+     __aicore__ inline void ScatterAddByS1(VecOp<SFAGT> &vecOp, const GM_ADDR actual_seq_qlen_addr,
+         const GM_ADDR actual_seq_kvlen);
+@@ -792,6 +793,27 @@
+ }
+ 
+ template <typename SFAGT>
++__aicore__ inline int32_t SelectedAttentionGradBasic<SFAGT>::ValidSelectedCount(
++    const int64_t t1Idx, const int64_t n2Idx, int32_t limit)
++{
++    const int64_t base = t1Idx * (dimN2 * selectedBlockCount) + n2Idx * selectedBlockCount;
++    if (limit <= 0 || topkIndicesGm.GetValue(base + limit - 1) >= 0) {
++        return limit;
++    }
++    int32_t begin = 0;
++    int32_t end = limit;
++    while (begin < end) {
++        const int32_t mid = begin + (end - begin) / 2;
++        if (topkIndicesGm.GetValue(base + mid) >= 0) {
++            begin = mid + 1;
++        } else {
++            end = mid;
++        }
++    }
++    return begin;
++}
++
++template <typename SFAGT>
+ __aicore__ inline void SelectedAttentionGradBasic<SFAGT>::GetActualSelCountScatter(const int64_t t1Idx, const int64_t n2Idx, int32_t &actSelBlkCount)
+ {
+     isLastBlockSelectedScatter = false;
+@@ -800,7 +822,7 @@
+         int64_t newMaxS2 = Max(curS2Scatter - curS1Scatter + s1IndexScatterIndex + 1, 0);
+         maxS2Blk = (newMaxS2 + selectedBlockSize - 1) / selectedBlockSize;
+     }
+-    actualSelectedBlockCountScatter = Min(selectedBlockCount, maxS2Blk);
++    actualSelectedBlockCountScatter = ValidSelectedCount(t1Idx, n2Idx, Min(selectedBlockCount, maxS2Blk));
+     if (actualSelectedBlockCountScatter <= 0) {
+         return;
+     }
+@@ -818,7 +840,7 @@
+         int64_t newMaxS2 = Max(curS2 - curS1 + s1Index + 1, 0);
+         maxS2Blk = (newMaxS2 + selectedBlockSize - 1) / selectedBlockSize;
+     }
+-    actualSelectedBlockCount = Min(selectedBlockCount, maxS2Blk);
++    actualSelectedBlockCount = ValidSelectedCount(t1Idx, n2Idx, Min(selectedBlockCount, maxS2Blk));
+     if (actualSelectedBlockCount <= 0) {
+         return;
+     }
