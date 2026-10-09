@@ -22,17 +22,34 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
-from hyper_parallel.core.multicore.modules.mega_moe.kernel_gradients import prepare_kernel_gradient_return
+from hyper_parallel.core.multicore.modules.mega_moe.kernel_gradients import (
+    kernel_gradient_projections, prepare_kernel_gradient_return,
+)
 from hyper_parallel.core.multicore.modules.mega_moe import plan as plan_module
 from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
-    can_reuse_backward_dispatch, replica_w13_ready_events,
+    can_reuse_backward_dispatch, replica_w13_ready_events, replica_w2_ready_events,
 )
 
 
 class TestKernelGradientReturn(unittest.TestCase):
     """Retain per-call completion storage and encode only a verified ready dependency."""
+
+    def test_return_projection_policy_is_identical_on_every_rank(self):
+        """Reconstruct original skew from compact balanced destinations on every rank."""
+        self.assertEqual(kernel_gradient_projections(None), ())
+        for ranks in (1, 2, 3, 4, 5, 8):
+            plan = build_expert_replica_plan([[100 if expert == 0 else 0 for expert in range(ranks)]] * ranks, 1)
+            expected = (1, 0) if ranks > 3 else ()
+            for rank in range(ranks):
+                route = SimpleNamespace(plan=plan, rank=rank)
+                self.assertEqual(kernel_gradient_projections(route, adaptive=True), expected)
+                self.assertEqual(kernel_gradient_projections(route), () if ranks == 1 else (1, 0))
+                compact = SimpleNamespace(config=plan.config, slot_to_logical=plan.slot_to_logical,
+                                          destination_counts=plan.destination_counts, transfers=plan.transfers)
+                self.assertEqual(kernel_gradient_projections(SimpleNamespace(plan=compact, rank=rank), adaptive=True),
+                                 expected)
 
     def test_metadata_matches_physical_slots_and_ordered_peers(self):
         """Every ready event belongs to its physical expert; records follow FP32 peer order."""
@@ -159,3 +176,6 @@ class TestKernelGradientReturn(unittest.TestCase):
                         self.assertNotEqual(bytes(plan.bwd_runtime), bytes(original))
                         self.assertTrue(plan.replica_w13_events)
                         self.assertTrue(can_reuse_backward_dispatch(plan.bwd_runtime_no_replica, 6, 20))
+                        self.assertTrue(plan.bwd_runtime_no_replica_reuse_dispatch)
+                        self.assertEqual(replica_w2_ready_events(plan.bwd_runtime_no_replica, 6, 20),
+                                         plan.replica_w2_events)
