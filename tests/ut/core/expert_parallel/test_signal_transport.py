@@ -214,6 +214,95 @@ def _guest_gradient(step: int, rank: int, projection: int) -> float:
 class TestSignalReplicaTransport(unittest.TestCase):
     """Check changing owners with many calls queued before any device progress."""
 
+    def test_adaptive_gradient_mode_is_explicit_and_requires_kernel_capability(self):
+        """The existing pure kernel mode cannot silently become an adaptive return."""
+        pure = signal_transport_options("shmem_signal_kernel_gradient")
+        adaptive = signal_transport_options("shmem_signal_kernel_gradient_adaptive")
+        self.assertNotIn("adaptive_gradients", pure)
+        self.assertTrue(adaptive["adaptive_gradients"])
+        self.assertTrue(adaptive["kernel_gradients"])
+        with self.assertRaisesRegex(ValueError, "kernel-gradient capability"):
+            SignalReplicaTransport(MagicMock(), torch.empty(64, dtype=torch.uint8), 1, 2, adaptive_gradients=True)
+
+    def test_saved_backward_generation_reuses_weights_without_overwriting_live_readers(self):
+        """Queue A/B forwards and reversed backwards, with changing owners and delayed copies."""
+        ranks, shapes = 4, ((2, 2), (2, 1))
+        size = signal_storage_bytes(shapes, 1, ranks, 2, projection_ready=True)
+        for seed in range(12):
+            world = _World(ranks, size)
+            runtimes = [_Runtime(world, rank, use_sdma=True) for rank in range(ranks)]
+            providers = [SignalReplicaTransport(runtime, storage, 1, ranks,
+                                                **signal_transport_options("shmem_signal_kernel_gradient"))
+                         for runtime, storage in zip(runtimes, world.storage)]
+            checked = []
+            for step in range(6):
+                hot = build_expert_replica_plan([[100 if expert == step % ranks else 0
+                                                 for expert in range(ranks)]] * ranks, 1)
+                ring = _cyclic_plan(ranks)
+                tokens = [[None] * ranks, [None] * ranks]
+                weights = [[tuple(torch.full((1, *shape), step * 100 + model * 10 + rank,
+                                             dtype=torch.bfloat16) for shape in shapes)
+                            for rank in range(ranks)] for model in range(2)]
+                stages = ((0, False, False), (1, False, False), (1, True, True),
+                          (0, True, False), (1, True, False))
+                for model, backward, reused in stages:
+                    plan, copies = (hot if model == 0 else ring), 0
+                    for rank, provider in enumerate(providers):
+                        runtime = runtimes[rank]
+                        token = tokens[model][rank] if backward else None
+                        route = SimpleNamespace(plan=plan, rank=rank)
+                        with patch.object(torch, "cpu", _Backend(world, rank)), \
+                                patch.object(torch.Tensor, "record_stream"), \
+                                patch.object(runtime, "put", wraps=runtime.put) as put, \
+                                provider.lease(weights[model][rank], route, overlap=True, backward=backward,
+                                               reuse_generation=token) as view:
+                            if not backward:
+                                tokens[model][rank] = view.weight_generation
+                            elif reused:
+                                self.assertIs(view.weight_generation, token)
+                            else:
+                                self.assertIsNot(view.weight_generation, token)
+                            view.wait_weights()
+                            owner = plan.slot_to_logical[rank][1]
+                            if owner >= 0:
+                                def _consume(values=view.weights, expected=step * 100 + model * 10 + owner):
+                                    for value in values:
+                                        torch.testing.assert_close(value, torch.full_like(value, expected))
+                                    checked.append(True)
+                                runtime.enqueue(_consume)
+                        copies += put.call_count
+                    self.assertEqual(copies, 0 if reused else 4 * len(plan.transfers))
+            world.drain(seed)
+            self.assertEqual(len(checked), 108)
+            self.assertEqual(world.barriers, [1] * ranks)
+
+    def test_saved_generation_cannot_survive_provider_replacement_or_epoch_rollover(self):
+        """Opaque tokens cannot alias another pool, and old ready words must survive both returns."""
+        shapes = ((2, 2), (2, 1))
+        size = signal_storage_bytes(shapes, 1, 2, 2, projection_ready=True)
+        world = _World(2, size)
+        weights = tuple(torch.ones(1, *shape, dtype=torch.bfloat16) for shape in shapes)
+        route = SimpleNamespace(plan=build_expert_replica_plan([[1, 0], [0, 1]], 1), rank=0)
+        tokens = []
+        for _ in range(2):
+            provider = SignalReplicaTransport(_Runtime(world, 0, use_sdma=True), world.storage[0], 1, 2,
+                                              **signal_transport_options("shmem_signal_kernel_gradient"))
+            with patch.object(torch, "cpu", _Backend(world, 0)), patch.object(torch.Tensor, "record_stream"):
+                with provider.lease(weights, route, overlap=True) as view:
+                    original = view.weight_generation
+                    self.assertTrue(all(original is not previous for previous in tokens))
+                    tokens.append(original)
+                provider.epoch = 2**31 - 3
+                with provider.lease(weights, route, backward=True, overlap=True,
+                                    reuse_generation=original) as view:
+                    self.assertIsNot(view.weight_generation, original)
+                    self.assertEqual(view.projection_ready[1], 1)
+                    self.assertEqual(provider.kernel_gradient_signals()[0], 2)
+                    self.assertEqual(provider.kernel_gradient_signals()[0], 3)
+                with self.assertRaisesRegex(ValueError, "saved backward context"):
+                    with provider.lease(weights, route, reuse_generation=original):
+                        pass
+
     def test_projection_consumer_does_not_wait_for_the_other_matrix(self):
         """Hold the second DMA until the first guest GMM consumes its own ready matrix."""
         ranks = 4
