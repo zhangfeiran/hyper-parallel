@@ -169,6 +169,7 @@ class MegaMoeExperts(MulticoreModule):
         replica_min_rows: int = 0,
         replica_cost_model: ExpertReplicaCostModel | None = None,
         replica_planner: str = "cpu",
+        replica_target_load: int | None = None,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -199,6 +200,9 @@ class MegaMoeExperts(MulticoreModule):
                 "shmem_signal_kernel_gradient" uses idle kernel AIV workers for W2 return
                 with one-sided MTE reads and ordered FP32 accumulation.
             replica_planner: Shared CPU or fused device replica quota policy.
+            replica_target_load: Preferred received rows per rank, independent of buffer capacity.
+                All EP ranks must agree. None uses current capacity for push and average load for pull.
+                Explicit positive values apply to either dispatch mode and retain lossless routing.
             replica_cost_model: Optional matching offline cost calibration shared by all EP ranks.
             replica_min_rows: Soft minimum rows per copied expert, default zero. Smaller
                 copies are retained when capacity requires them. Removing a copy can grow
@@ -233,9 +237,12 @@ class MegaMoeExperts(MulticoreModule):
                              "or shmem_signal_kernel_gradient")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         _integer(replica_min_rows, "replica_min_rows", 0)
+        if replica_target_load is not None:
+            _integer(replica_target_load, "replica_target_load", 1)
         validate_planner_backend(replica_planner, replica_min_rows, replica_cost_model)
         self.replica_planner = replica_planner
         self.replica_min_rows = replica_min_rows
+        self.replica_target_load = replica_target_load
         if replica_cost_model is not None:
             if not isinstance(replica_cost_model, ExpertReplicaCostModel):
                 raise ValueError("replica_cost_model must be an ExpertReplicaCostModel")
@@ -461,9 +468,12 @@ class MegaMoeExperts(MulticoreModule):
             with torch.no_grad():
                 replica_route = None
                 if self.replica_slots_per_rank:
+                    target_load = self.replica_target_load
+                    if target_load is None and not pull:
+                        target_load = resources.workspace.capacity_floor
                     replica_route = prepare_replica_route(
                         topk_ids, self.replica_config, self._ep_group,
-                        target_load=resources.workspace.capacity_floor if not pull else None,
+                        target_load=target_load,
                         minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
                         planner_backend=self.replica_planner,
                     )

@@ -268,6 +268,47 @@ class TestMegaMoeExperts(unittest.TestCase):
             expert_output, route.unpermute_mapping, topk_weights
         )
 
+    def test_replica_target_load_rejects_invalid_values_before_allocation(self) -> None:
+        """Reject invalid independent load targets before creating parameters."""
+        with patch.object(mega_moe_module, "_create_mega_moe_parameters") as create:
+            for target in (0, -1, True, 1.5, "256"):
+                with self.subTest(target=target), self.assertRaisesRegex(ValueError, "replica_target_load"):
+                    MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                                   num_experts=4, top_k=2, ep_size=2, replica_target_load=target)
+            create.assert_not_called()
+
+    def test_replica_target_load_is_independent_of_capacity_in_push_and_pull(self) -> None:
+        """Preserve default routing targets and pass explicit targets without resizing buffers."""
+        hidden = torch.ones(128, 16, dtype=torch.bfloat16)
+        ids = torch.zeros(128, 2, dtype=torch.int32)
+        probabilities = torch.full((128, 2), 0.5)
+        for mode, target, expected in (("push", None, 384), ("push", 256, 256),
+                                       ("pull", None, None), ("pull", 256, 256)):
+            with self.subTest(mode=mode, target=target):
+                experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                                         num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
+                                         replica_slots_per_rank=1, replica_target_load=target).bfloat16()
+                resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0), plan=object(),
+                                            workspace=Mock(capacity_floor=384), heap_manager=Mock())
+                replica = SimpleNamespace(physical_ids=ids, counts_by_source=torch.zeros(2, 6))
+                route = SimpleNamespace(routed_tokens=object(), metadata=object(), unpermute_mapping=object(),
+                                        maximum_received_slots=256)
+                try:
+                    with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+                          patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
+                          patch.object(experts, "_get_execution_resources", return_value=resources),
+                          patch.object(mega_moe_module, "prepare_replica_route", return_value=replica) as prepare,
+                          patch.object(mega_moe_module, "prepare_topk_route", return_value=route),
+                          patch.object(mega_moe_module, "execute_mega_moe_with_permutation", return_value=hidden),
+                          patch.object(mega_moe_module, "restore_topk_output", return_value=hidden)):
+                        torch.testing.assert_close(experts(hidden, ids, probabilities), hidden)
+                    self.assertEqual(prepare.call_args.kwargs["target_load"], expected)
+                    self.assertEqual(resources.workspace.capacity_floor, 384)
+                    if mode == "push":
+                        resources.heap_manager.ensure_capacity.assert_called_once_with(resources, 256)
+                finally:
+                    experts.close()
+
     def test_pull_forward_releases_route_lease_on_success_and_failure(self) -> None:
         """Keep preparation and execution within one lease, including every failure boundary."""
         experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,

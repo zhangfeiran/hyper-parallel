@@ -23,6 +23,7 @@ from typing import Any
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
+from hyper_parallel.core.expert_parallel.hot_replica._metadata import _async_device_bytes
 
 from .plan import MegaMoePlan
 
@@ -34,6 +35,37 @@ class KernelGradientReturn:
     metadata: torch.Tensor
     completion: torch.Tensor
     matrices: tuple[int, ...] = (1,)
+
+
+def kernel_gradient_projections(route: ReplicaRoute | None, *, adaptive: bool = False) -> tuple[int, ...]:
+    """Choose one globally consistent return policy from the complete replica plan.
+
+    Use parallel SDMA for near-balanced routing to avoid an ordered MTE read/add
+    tail. Enable the full fused return above three times the original mean home
+    load. No rank-local cache or row
+    predicate may select a different ready/ACK epoch sequence.
+
+    Args:
+        route: Complete replica plan shared by every rank in the EP group.
+        adaptive: Select parallel SDMA at original routing skew up to three; the regular
+            kernel-gradient mode continues to use both fused projections.
+
+    Returns:
+        Indices of projections returned by the fused backward workers.
+    """
+    if route is None or not route.plan.transfers:
+        return ()
+    if not adaptive:
+        return (1, 0)
+    plan = route.plan
+    home, ranks = plan.config.home_experts, plan.config.ep_size
+    original_loads = [0] * ranks
+    # Destination slots conserve logical ownership even for compact device summaries.
+    for experts, counts in zip(plan.slot_to_logical, plan.destination_counts):
+        for expert, count in zip(experts, counts):
+            if expert >= 0:
+                original_loads[expert // home] += count
+    return (1, 0) if max(original_loads) * ranks > 3 * sum(original_loads) else ()
 
 
 def _validate_gradient_pair(gradient: torch.Tensor, guest: torch.Tensor | None) -> None:
@@ -84,7 +116,7 @@ def prepare_kernel_gradient_return(plan: MegaMoePlan, route: ReplicaRoute | None
     # are distinct because ready/ACK words are shared across ordered matrices.
     values = records[0] if len(records) == 1 else [2, 3, 3 + len(records[0])] + records[0] + records[1]
     data = struct.pack("<" + "Q" * len(values), *values)
-    metadata = torch.frombuffer(bytearray(data), dtype=torch.uint8).to(gradient.device)
+    metadata = _async_device_bytes(data, gradient.device)
     if len(records) == 1:
         completion = completion[0]
     stream = torch.npu.current_stream(gradient.device)

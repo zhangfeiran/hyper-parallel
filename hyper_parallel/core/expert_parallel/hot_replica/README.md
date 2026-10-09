@@ -481,6 +481,20 @@ MegaMoe 的 `shmem_signal_kernel_gradient` 模式还会在反向内核中返回 
 W2 和 W13 使用不同 epoch 和完成标志存储。
 内核在释放 guest 租约前等待所有远端读取方完成，未识别的调度保留较晚的返回路径。
 
+`shmem_signal_kernel_gradient_adaptive` 沿用相同的按投影 SDMA 权重预取，
+并根据完整的全局副本 plan 选择梯度返回路径。
+原始 home 目标负载的 skew 不超过 3 时，使用原有反向调度，
+通过并行 SDMA 返回两个 FP32 投影的梯度。
+更大的 skew 使用融合 W2/W13 梯度返回及经过验证的生产方调度。
+所有 rank 选择相同路径。该模式需要显式启用；
+普通 `shmem_signal_kernel_gradient` 模式仍对两个投影使用融合返回。
+
+反向可通过不透明的 `weight_generation` 标识，复用其保存的前向所使用的驻留权重。
+Autograd 在反向取得 workspace 租约前检查已保存的参数版本。
+期间发生的其他预取、provider 替换或信号 epoch 回绕都会使复用失效。
+池完成事件仍覆盖此前的所有读取方和远端确认，不保存 owner 参数快照。
+本地参数版本缓存不能证明协议所要求的全 rank 一致决策。
+
 ## 受控性能测试与诊断
 
 使用与正确性测试相同的四卡环境和原生载荷，运行新进程 worker：
@@ -561,7 +575,7 @@ Runtime 保留现有 v2 home 专家寻址标志，guest 指针为空。
 是否使用这一快速路径由全局传输列表决定：
 有发送方向传输的 owner 即使没有本地 guest 工作，也必须参与。
 
-Profiling 关闭时，MegaMoe 还会在其串行 workspace 租约内复用完全相同的静态 v2 runtime 镜像。
+Profiling 关闭时，MegaMoe 还会在其串行 workspace 租约内复用 runtime 镜像。
 缓存同时比较基础 tensor 身份与完整后缀字节，每个基础 tensor 只保留最新镜像，
 并在当前 stream 上记录每次使用。
 
@@ -569,7 +583,9 @@ Workspace 完成事件保证跨 stream 访问顺序；
 close 和堆重建在现有同步清理边界释放镜像存储。
 这些镜像包含可写 worker 临时空间，不能在租约外复用，也不是全局不可变调度 tensor。
 
-动态 v3/v4/v5 的 ready、epoch 和梯度返回描述符仍由每次调用独占。
+动态 v3/v4/v5 镜像保留同一份受租约保护的临时空间，仅更新后缀字节。
+Epoch 和梯度返回元数据从调用所拥有的 pinned CPU 存储异步上传；
+workspace 完成事件保证每次更新都发生在上一消费者完成之后。
 Profiling 独立构造镜像；B=0 返回原有基础 runtime。
 该优化保留现有原生 ABI。
 
