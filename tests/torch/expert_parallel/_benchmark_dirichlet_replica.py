@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Route-matched native/MegaMoe B=0/1 checkpointed MoE training sweep."""
+"""Route-matched native/MegaMoe checkpointed MoE training sweep."""
 
 import argparse
 from datetime import timedelta
@@ -93,7 +93,8 @@ def _make_layer(args, mesh, index, backend=None, budget=None):
                                 ep_size=size, ep_group=dist.group.WORLD, dispatch_mode="push",
                                 initial_capacity_factor=1.5, replica_slots_per_rank=budget,
                                 replica_transport=args.replica_transport, replica_planner=args.replica_planner,
-                                replica_target_load=args.replica_target_load).to(
+                                replica_target_load=args.replica_target_load,
+                                replica_min_rows=args.replica_min_rows).to(
                                     device=device, dtype=torch.bfloat16)
         with torch.no_grad():
             module.gate_up_weight.copy_(torch.cat((weights["w1"].transpose(1, 2),
@@ -111,6 +112,7 @@ def _transport_evidence(module, values, expected):
         return {"actual_transport": "p2p"}
     resources = module._get_execution_resources(values)  # pylint: disable=protected-access
     provider = resources.workspace.replica_provider
+    execution_spec = resources.last_execution_plan.spec
     evidence = {"actual_transport": resources.spec.replica_transport,
                 "provider": type(provider).__name__,
                 "kernel_gradients": getattr(provider, "kernel_gradients", False),
@@ -118,11 +120,15 @@ def _transport_evidence(module, values, expected):
                 "last_kernel_gradient_matrices": list(getattr(provider, "last_kernel_gradient_matrices", ())),
                 "overlap_home": getattr(provider, "overlap_home", False),
                 "planner_target_load": module.replica_target_load,
+                "planner_minimum_replica_rows": module.replica_min_rows,
+                "execution_num_experts": execution_spec.num_experts,
+                "execution_replica_slots_per_rank": execution_spec.replica_slots_per_rank,
+                "weight_gradient_dtype": "float32" if execution_spec.replica_slots_per_rank else "bfloat16",
                 "w2_ready_events": list(resources.plan.replica_w2_events),
                 "w13_ready_events": list(resources.plan.replica_w13_events)}
     matrices = evidence["last_kernel_gradient_matrices"]
     evidence["effective_gradient_transport"] = (
-        "none" if not module.replica_slots_per_rank else
+        "none" if not execution_spec.replica_slots_per_rank else
         "p2p" if expected == "p2p" else
         "kernel_gradient" if matrices == [1, 0] else
         "kernel_w2_sdma_w13" if matrices == [1] else "sdma_parallel")
@@ -407,7 +413,7 @@ def main() -> None:
     """Configure one fresh-process variant; initialize devices only in workers."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("native", "megamoe"), required=True)
-    parser.add_argument("--budget", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--budget", type=int, required=True)
     parser.add_argument("--layers", type=int, default=16)
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--experts", type=int, default=96)
@@ -420,6 +426,7 @@ def main() -> None:
     parser.add_argument("--replica-transport", choices=("p2p", "shmem_signal_kernel_gradient",
                                                      "shmem_signal_kernel_gradient_adaptive"), default="p2p")
     parser.add_argument("--replica-target-load", type=int)
+    parser.add_argument("--replica-min-rows", type=int, default=1024)
     parser.add_argument("--diagnose", action="store_true", help="Capture separate single-layer diagnostic traces.")
     parser.add_argument("--pairs")
     parser.add_argument("--accept", action="store_true")
@@ -427,6 +434,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.backend == "native" and args.replica_transport != "p2p":
         parser.error("native supports only p2p replica transport")
+    if args.budget < 0 or args.replica_min_rows < 0:
+        parser.error("budget and replica-min-rows must be nonnegative")
     if args.replica_target_load is not None and (args.backend != "megamoe" or args.replica_target_load <= 0):
         parser.error("replica-target-load must be positive and is supported only for megamoe")
     if args.diagnose and (args.backend != "megamoe" or args.accept or not args.budget):

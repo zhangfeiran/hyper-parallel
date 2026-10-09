@@ -34,6 +34,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_repl
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import SIGNAL_TRANSPORT_MODES
 
 from hyper_parallel.core.multicore import _collective, shmem
+from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capacity
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
@@ -155,6 +156,13 @@ class _MegaMoeExecutionResources:
                 """Build and bind local resources before converging construction results."""
                 self.plan = (build_mega_moe_plan(self.spec, tensor.device)
                              if not self.spec.dynamic_tokens else None)
+                self.home_plan = None
+                if self.spec.replica_slots_per_rank and not self.spec.dynamic_tokens:
+                    home_spec = replace(self.spec, num_experts=self.spec.logical_num_experts, replica_slots_per_rank=0)
+                    if (mega_moe_event_capacity(home_spec.num_experts, home_spec.ep_size)
+                            == mega_moe_event_capacity(self.spec.num_experts, self.spec.ep_size)):
+                        self.home_plan = build_mega_moe_plan(home_spec, tensor.device)
+                self.last_execution_plan = self.plan
                 self.workspace = MegaMoeWorkspace(shared=shared)
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
                 self.workspace.heap_manager = self.heap_manager
@@ -344,7 +352,7 @@ class MegaMoeExperts(MulticoreModule):
         combine_split: int = _COMMUNICATION_SPLIT,
         replica_slots_per_rank: int = 0,
         replica_transport: str = "p2p",
-        replica_min_rows: int = 0,
+        replica_min_rows: int = 1024,
         replica_cost_model: ExpertReplicaCostModel | None = None,
         replica_planner: str = "cpu",
         replica_target_load: int | None = None,
@@ -377,7 +385,7 @@ class MegaMoeExperts(MulticoreModule):
                 All EP ranks must agree. None uses current capacity for push and average load for pull.
                 Explicit positive values apply to either dispatch mode and retain lossless routing.
             replica_cost_model: Optional matching offline cost calibration shared by all EP ranks.
-            replica_min_rows: Soft minimum rows per copied expert, default zero. Smaller
+            replica_min_rows: Soft minimum rows per copied expert, default 1024. Smaller
                 copies are retained when capacity requires them. Removing a copy can grow
                 the push receive buffer up to its theoretical bound. Calibrate the threshold
                 for the intended shape and use the same value on all EP ranks.
@@ -703,6 +711,8 @@ class MegaMoeExperts(MulticoreModule):
             # Pull source writes and execution must share one workspace lease.
             with torch.no_grad():
                 replica_route = None
+                execution_plan = resources.plan
+                execution_spec = resources.spec
                 if self.replica_slots_per_rank:
                     target_load = self.replica_target_load
                     if target_load is None and not pull:
@@ -712,14 +722,21 @@ class MegaMoeExperts(MulticoreModule):
                         target_load=target_load,
                         minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
                         planner_backend=self.replica_planner,
+                        compact_home=resources.home_plan is not None,
                     )
+                    if replica_route.home_only:
+                        execution_plan = resources.home_plan
+                        execution_spec = execution_plan.spec
+                        # Allocate using the reserved physical topology, even
+                        # when the first invocation executes only home experts.
+                        resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
                     topk_ids = replica_route.physical_ids
                     tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
                 route = prepare_topk_route(
                     hidden_flat,
                     topk_ids,
                     topk_weights,
-                    resources.spec,
+                    execution_spec,
                     tokens_per_expert,
                     workspace=resources.workspace,
                     replica_route=replica_route,
@@ -727,14 +744,15 @@ class MegaMoeExperts(MulticoreModule):
                 )
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
-            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            execution_plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            resources.last_execution_plan = execution_plan
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,
                 weights[0],
                 weights[1],
                 route,
-                plan,
+                execution_plan,
                 resources.workspace,
                 topk_weights=topk_weights if pull else None,
                 workspace_claimed=pull,
