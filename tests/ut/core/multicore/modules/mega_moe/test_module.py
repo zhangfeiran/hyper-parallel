@@ -23,6 +23,7 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
+from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 
 
 class TestMegaMoeExperts(unittest.TestCase):
@@ -288,9 +289,10 @@ class TestMegaMoeExperts(unittest.TestCase):
                 experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
                                          num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
                                          replica_slots_per_rank=1, replica_target_load=target).bfloat16()
-                resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0), plan=object(),
+                resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0), plan=SimpleNamespace(spec=object()),
+                                            home_plan=None,
                                             workspace=Mock(capacity_floor=384), heap_manager=Mock())
-                replica = SimpleNamespace(physical_ids=ids, counts_by_source=torch.zeros(2, 6))
+                replica = SimpleNamespace(physical_ids=ids, counts_by_source=torch.zeros(2, 6), home_only=False)
                 route = SimpleNamespace(routed_tokens=object(), metadata=object(), unpermute_mapping=object(),
                                         maximum_received_slots=256)
                 try:
@@ -303,11 +305,73 @@ class TestMegaMoeExperts(unittest.TestCase):
                           patch.object(mega_moe_module, "restore_topk_output", return_value=hidden)):
                         torch.testing.assert_close(experts(hidden, ids, probabilities), hidden)
                     self.assertEqual(prepare.call_args.kwargs["target_load"], expected)
+                    self.assertEqual(prepare.call_args.kwargs["minimum_replica_rows"], 1024)
                     self.assertEqual(resources.workspace.capacity_floor, 384)
                     if mode == "push":
                         resources.heap_manager.ensure_capacity.assert_called_once_with(resources, 256)
                 finally:
                     experts.close()
+
+    def test_home_only_execution_can_switch_back_to_replica_graph(self) -> None:
+        """Keep physical storage while alternating globally empty and active guest plans."""
+        hidden = torch.ones(128, 16, dtype=torch.bfloat16)
+        ids, probabilities = torch.zeros(128, 2, dtype=torch.int32), torch.full((128, 2), 0.5)
+        for mode, budget in (("push", 1), ("push", 2), ("pull", 1), ("pull", 2)):
+            with self.subTest(mode=mode, budget=budget):
+                experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                                         num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
+                                         replica_slots_per_rank=budget).bfloat16()
+                spec = SimpleNamespace(rank_id=0)
+                resources = SimpleNamespace(spec=spec, plan=SimpleNamespace(spec=spec),
+                                            home_plan=SimpleNamespace(spec=SimpleNamespace(rank_id=0)),
+                                            workspace=Mock(capacity_floor=384, in_use=True), heap_manager=Mock())
+                route = SimpleNamespace(unpermute_mapping=object(), maximum_received_slots=256)
+                try:
+                    with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+                          patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
+                          patch.object(experts, "_get_execution_resources", return_value=resources),
+                          patch.object(mega_moe_module, "prepare_replica_route") as prepare,
+                          patch.object(mega_moe_module, "prepare_topk_route", return_value=route) as topk,
+                          patch.object(mega_moe_module, "execute_mega_moe_with_permutation", return_value=hidden) as execute,
+                          patch.object(mega_moe_module, "restore_topk_output", return_value=hidden)):
+                        for home_only in (True, False, True, False):
+                            prepare.return_value = SimpleNamespace(physical_ids=ids, home_only=home_only,
+                                                                   counts_by_source=torch.zeros(2, 4))
+                            torch.testing.assert_close(experts(hidden, ids, probabilities), hidden)
+                            selected = resources.home_plan if home_only else resources.plan
+                            self.assertIs(topk.call_args.args[3], selected.spec)
+                            self.assertIs(execute.call_args.args[5], selected)
+                            self.assertIs(resources.last_execution_plan, selected)
+                            self.assertTrue(prepare.call_args.kwargs["compact_home"])
+                    self.assertTrue(all(call.args[0] is spec for call in resources.workspace.ensure.call_args_list))
+                    self.assertEqual(resources.workspace.ensure.call_count, 2 if mode == "push" else 6)
+                finally:
+                    experts.close()
+
+    def test_home_plan_requires_matching_persistent_ready_offsets(self) -> None:
+        """Reject workspace sharing when guest slots change the ready-generation offset."""
+        for logical, expected_plans in ((96, 2), (800, 1)):
+            spec = MegaMoeSpec(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                               num_experts=logical + 16 * 4, logical_num_experts=logical,
+                               replica_slots_per_rank=4, top_k=2, initial_capacity_factor=1.5,
+                               receive_capacity=384, ep_size=16, ep_group=object(), rank_id=0, num_cube_cores=24)
+            with (self.subTest(logical=logical),
+                  patch.object(mega_moe_module, "bind_mega_moe_spec", return_value=spec),
+                  patch.object(mega_moe_module, "_validate_resource_layout"),
+                  patch.object(mega_moe_module, "get_heap_manager", return_value=Mock(heap_bytes=1024)),
+                  patch.object(mega_moe_module.shmem, "acquire"),
+                  patch.object(mega_moe_module, "build_mega_moe_plan") as build,
+                  patch.object(mega_moe_module, "MegaMoeWorkspace")):
+                resources = mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
+                    {}, SimpleNamespace(device="npu:0"), shared=False, active_specifications=())
+                self.assertEqual(build.call_count, expected_plans)
+                if expected_plans == 2:
+                    home_spec = build.call_args.args[0]
+                    self.assertEqual(home_spec.num_experts, logical)
+                    self.assertEqual(home_spec.replica_slots_per_rank, 0)
+                    self.assertEqual(home_spec.receive_capacity, spec.receive_capacity)
+                else:
+                    self.assertIsNone(resources.home_plan)
 
     def test_pull_forward_releases_route_lease_on_success_and_failure(self) -> None:
         """Keep preparation and execution within one lease, including every failure boundary."""
@@ -445,7 +509,8 @@ class TestMegaMoeExperts(unittest.TestCase):
     def test_execution_resource_pairs_shmem_acquire_and_release(self) -> None:
         """Pair one SHMEM reference with one execution-resource lifetime."""
         root_group = object()
-        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128, dispatch_mode="push")
+        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
+                                     dispatch_mode="push", replica_slots_per_rank=0)
         workspace = Mock()
 
         with (
@@ -481,7 +546,8 @@ class TestMegaMoeExperts(unittest.TestCase):
     def test_execution_resource_construction_failure_releases_shmem(self) -> None:
         """Release the acquired SHMEM reference when resource construction fails."""
         root_group = object()
-        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128, dispatch_mode="push")
+        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
+                                     dispatch_mode="push", replica_slots_per_rank=0)
 
         with (
             patch.object(
