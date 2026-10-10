@@ -186,7 +186,7 @@ __aicore__ inline void PrepareTransport(CpTransport &transport, const Buffers &b
 template <bool Transport, bool Selected>
 __aicore__ inline void ProgressPhase(CpTransport &transport, const Buffers &buffers, GlobalTensor<int64_t> &trace,
                                      uint32_t groups, uint32_t phase, SelectedRequests &requests,
-                                     __gm__ uint8_t *metadata) {
+                                     __gm__ uint8_t *metadata, uint32_t phaseCount) {
   if constexpr (Transport) {
     if ASCEND_IS_AIV {
       if (GetSubBlockIdx() == 0 && phase == 0 && !Selected) {
@@ -204,7 +204,7 @@ __aicore__ inline void ProgressPhase(CpTransport &transport, const Buffers &buff
                                      buffers.selectedCounts);
         }
       }
-      if (GetSubBlockIdx() == 0 && phase == (Selected ? 8 : 5)) {
+      if (GetSubBlockIdx() == 0 && phase + 1 == phaseCount) {
         transport.WaitAcknowledged();
       }
     }
@@ -243,12 +243,14 @@ __aicore__ inline void Run(const Buffers &buffers, __gm__ uint8_t *runtimeConfig
                          meta.GetValue(15));
   }
   GET_TILING_DATA_WITH_STRUCT(DsaFusedTrainingTilingData, data, buffers.tiling);
-  for (uint32_t phase = 0; phase < (Selected ? 9 : 6); ++phase) {
+  const uint32_t phaseCount = Selected ? (data.withKl ? 9 : 6) : 6;
+  for (uint32_t phase = 0; phase < phaseCount; ++phase) {
     GlobalTensor<int64_t> trace;
     auto *address = reinterpret_cast<__gm__ int64_t *>(groupTrace) + phase * physicalCount * kGroupWords;
     trace.SetGlobalBuffer(address, physicalCount * kGroupWords);
     if (group == groups) {
-      ProgressPhase<Transport, Selected>(transport, buffers, trace, groups, phase, requestsBuilder, metadata);
+      ProgressPhase<Transport, Selected>(transport, buffers, trace, groups, phase, requestsBuilder, metadata,
+                                         phaseCount);
       ClosePhase(trace, groups, phase + 1);
     } else {
       RunComputePhase<FloatWeights, Transport, Selected>(

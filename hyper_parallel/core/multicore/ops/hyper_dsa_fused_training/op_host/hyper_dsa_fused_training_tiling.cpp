@@ -223,13 +223,20 @@ ge::graphStatus ComposeKl(gert::TilingContext *context, DsaFusedTrainingTilingDa
 }  // namespace
 
 ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
+  if (context->GetAttrs() == nullptr || context->GetAttrs()->GetAttrPointer<bool>(1) == nullptr) {
+    return ge::GRAPH_FAILED;
+  }
+  const bool withKl = *context->GetAttrs()->GetAttrPointer<bool>(1);
   const auto *trace = context->GetRequiredInputShape(9);
   const bool selected = context->GetOptionalInputDesc(17) != nullptr;
+  if (!withKl && !selected) {
+    return ge::GRAPH_FAILED;
+  }
   if (selected && (context->GetOptionalInputDesc(13) == nullptr || context->GetOptionalInputDesc(18) == nullptr ||
                    context->GetOptionalInputDesc(19) == nullptr || context->GetOptionalInputDesc(20) == nullptr)) {
     return ge::GRAPH_FAILED;
   }
-  if (trace == nullptr || trace->GetStorageShape().GetShapeSize() != (selected ? 9 : 6) * 20 * 64 ||
+  if (trace == nullptr || trace->GetStorageShape().GetShapeSize() != (selected ? (withKl ? 9 : 6) : 6) * 20 * 64 ||
       context->GetAttrs() == nullptr || context->GetAttrs()->GetAttrPointer<float>(0) == nullptr) {
     return ge::GRAPH_FAILED;
   }
@@ -245,7 +252,7 @@ ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
       Compose(context, data, false, sfaBytes) != ge::GRAPH_SUCCESS) {
     return ge::GRAPH_FAILED;
   }
-  if (ComposeKl(context, data) != ge::GRAPH_SUCCESS) {
+  if (withKl && ComposeKl(context, data) != ge::GRAPH_SUCCESS) {
     return ge::GRAPH_FAILED;
   }
   auto *workspace = context->GetWorkspaceSizes(1);
@@ -258,6 +265,10 @@ ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
   const uint64_t transport = context->GetOptionalInputDesc(13) == nullptr ? 0 : 2;
   context->SetTilingKey((selected ? 4 : 0) + transport +
                         (context->GetInputDesc(6)->GetDataType() == ge::DT_FLOAT ? 1 : 0));
+  const uint64_t klEnabled = withKl ? 1 : 0;
+  const size_t klCapacity = (sizeof(SparseLightningIndexerGradKLLossTilingData) + 7) / 8 * 8;
+  std::memcpy(static_cast<uint8_t *>(raw->GetData()) + data.GetDataSize() - klCapacity - sizeof(uint64_t), &klEnabled,
+              sizeof(klEnabled));
   raw->SetDataSize(data.GetDataSize());
   return ge::GRAPH_SUCCESS;
 }

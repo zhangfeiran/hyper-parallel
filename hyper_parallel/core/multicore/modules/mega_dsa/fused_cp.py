@@ -123,7 +123,7 @@ class FusedDsaCpForwardProbe:
     Support is one node, MTE-reachable CP/root members, H32/H64 and K2048.
     selected_kl extends the same launch with three KL phases. Native CP
     backward and model installation use their separate entry points.
-    selected_pull inserts membership and request/pull stages after LI merge;
+    selected_pull inserts three membership and request/pull stages after LI merge;
     it preserves full query scope and destination addresses.
     """
 
@@ -189,7 +189,7 @@ class FusedDsaCpForwardProbe:
         follow the prepared Q/KV storage orders. Every rank calls collectively.
         selected_kl additionally emits raw KL derivatives/loss in the same kernel;
         all members must agree. Normalization and auxiliary scaling belong to the caller.
-        selected_pull requires prepared row addresses and native KL, and generates
+        selected_pull requires prepared row addresses and generates
         its main-KV request count on device after TopK merge.
         """
         if invocation.workspace is not self.workspace or _layout_signature(invocation.batch_meta) != self.signature:
@@ -202,16 +202,18 @@ class FusedDsaCpForwardProbe:
         if len(main_states) != 4 or len(index_states) != 3 or any(tensor.requires_grad
                                                                 for tensor in (*main_states, *index_states)):
             raise ValueError("fused CP raw forward requires four detached main and three detached index states")
-        if selected_pull and (not selected_kl or self.selected_rows is None):
-            raise ValueError("selected pull requires prepared row addresses and native selected KL")
+        if selected_pull and self.selected_rows is None:
+            raise ValueError("selected pull requires prepared row addresses")
         if selected_pull and self.selected_rows._version != self.selected_rows_version:
             raise ValueError("selected row addresses were modified; prepare a new backend")
         _load_native()
-        if selected_pull and torch.ops.hyper_parallel.dsa_selected_cp_training_version() != 1:
+        if selected_pull and selected_kl and torch.ops.hyper_parallel.dsa_selected_cp_training_version() != 1:
             raise RuntimeError("selected CP training requires adapter ABI 1; rebuild this checkout's payload")
         if selected_kl and torch.ops.hyper_parallel.dsa_fused_training_version() != 1:
             raise RuntimeError("fused CP training requires adapter ABI 1; rebuild this checkout's payload")
-        if not selected_kl and torch.ops.hyper_parallel.dsa_fused_forward_version() != 2:
+        if selected_pull and not selected_kl and torch.ops.hyper_parallel.dsa_selected_cp_forward_version() != 1:
+            raise RuntimeError("selected CP forward requires adapter ABI 1; rebuild this checkout's payload")
+        if not selected_kl and not selected_pull and torch.ops.hyper_parallel.dsa_fused_forward_version() != 2:
             raise RuntimeError("fused CP requires adapter ABI 2; rebuild this checkout's payload")
         with self.workspace.lease(invocation, direction="forward"):
             return self._submit(invocation, main_states, index_states,
@@ -237,7 +239,7 @@ class FusedDsaCpForwardProbe:
         denominator = torch.full_like(maximum, float("nan"))
         phases = 6 if selected_kl else 3
         if selected_pull:
-            phases = 9
+            phases += 3
         trace = torch.zeros((phases, 20, 64), dtype=torch.int64, device=device)
         transport_trace = torch.zeros(32, dtype=torch.int64, device=device)
         retained = torch.empty(MIXED_INDEXER_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
@@ -246,19 +248,20 @@ class FusedDsaCpForwardProbe:
         metadata = self._metadata(invocation, epoch)
         kl_gradients, kl_loss = (), None
         selected_buffers = ()
+        extra = ()
+        if selected_pull:
+            membership = torch.empty((tokens + 7) // 8 * 8, dtype=torch.int32, device=device)
+            selected_table = torch.empty((tokens, 4), dtype=torch.int64, device=device)
+            selected_counts = torch.empty(16, dtype=torch.int64, device=device)
+            selected_buffers = (selected_table, selected_counts, membership)
+            extra = (self.selected_rows, membership, selected_table, selected_counts)
         if selected_kl:
             kl_retained = torch.empty(mixed_kl_workspace_bytes(tokens, self.heads), dtype=torch.uint8, device=device)
             kl_gradients = tuple(torch.full_like(tensor, float("nan")) for tensor in
                                  (full_iq, keys[0][:, 0], full_weights))
             kl_loss = torch.full((1,), float("nan"), dtype=torch.float32, device=device)
             submit = torch.ops.hyper_parallel.dsa_fused_cp_training_out
-            extra = ()
             if selected_pull:
-                membership = torch.empty((tokens + 7) // 8 * 8, dtype=torch.int32, device=device)
-                selected_table = torch.empty((tokens, 4), dtype=torch.int64, device=device)
-                selected_counts = torch.empty(16, dtype=torch.int64, device=device)
-                selected_buffers = (selected_table, selected_counts, membership)
-                extra = (self.selected_rows, membership, selected_table, selected_counts)
                 submit = torch.ops.hyper_parallel.dsa_selected_cp_training_out
             submit(
                 full_iq, keys[0], full_q, keys[1], full_qr, keys[2], full_weights,
@@ -267,6 +270,12 @@ class FusedDsaCpForwardProbe:
                 kl_gradients[0], kl_gradients[1][:, None], kl_gradients[2], kl_loss,
                 self.workspace.arena, metadata, self.requests, transport_trace, *extra)
             kl_loss = kl_loss.reshape(())
+        elif selected_pull:
+            torch.ops.hyper_parallel.dsa_selected_cp_forward_out(
+                full_iq, keys[0], full_q, keys[1], full_qr, keys[2], full_weights,
+                self.native_layout.length_tensor, self.config, trace, retained,
+                self.native_layout.cumulative_lengths, self.scale, indices, values, output, maximum, denominator,
+                self.workspace.arena, metadata, self.requests, transport_trace, *extra)
         else:
             torch.ops.hyper_parallel.dsa_fused_cp_forward_out(
                 full_iq, keys[0], full_q, keys[1], full_qr, keys[2], full_weights,
@@ -322,7 +331,8 @@ class FusedDsaCpForwardProbe:
         if result.selected_requests:
             if selected_snapshots is None or len(selected_snapshots) != 4:
                 raise ValueError("selected transfer requires explicit CPU request/count/membership/index snapshots")
-            compute = validate_selected_training_traces(snapshots, self.schedule, require_ld=require_ld)
+            compute = validate_selected_training_traces(
+                snapshots, self.schedule, require_ld=require_ld, with_kl=result.kl_loss is not None)
             selected = validate_selected_requests(selected_snapshots[3], result.saved.batch_meta,
                                                  *selected_snapshots[:3], result.epoch)
             if int(selected_snapshots[1][9]) > start:

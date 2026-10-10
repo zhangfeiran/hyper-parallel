@@ -123,6 +123,18 @@ class TestSelectedRequests(unittest.TestCase):
             with self.subTest(phase=phase), self.assertRaises(ValueError):
                 validate_selected_training_traces(broken, schedule, require_ld=True)
 
+    def test_selected_forward_closes_six_phases_without_kl_evidence(self):
+        """KL-off accepts all request handoffs and rejects a missing SFA or unexpected KL phase."""
+        traces = self._traces(7)
+        schedule = MixedSfaSchedule(7)
+        evidence = validate_selected_training_traces(traces[:6], schedule, require_ld=True, with_kl=False)
+        self.assertEqual(evidence["phase_order"][-1], "sfa")
+        self.assertEqual(len(evidence["phases"]), 4)
+        for snapshots in (traces[:5], traces, traces[:6]):
+            with self.subTest(phases=len(snapshots)), self.assertRaises(ValueError):
+                validate_selected_training_traces(snapshots, schedule, require_ld=True,
+                                                   with_kl=len(snapshots) == 6)
+
     def test_invalid_reference_shapes_and_dtypes_do_not_admit_device_tensors(self):
         """Offline validation never performs an implicit transfer or shape reinterpretation."""
         meta, indices = self._fixture()

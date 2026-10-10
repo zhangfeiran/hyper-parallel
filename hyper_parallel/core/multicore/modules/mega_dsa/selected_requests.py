@@ -87,10 +87,11 @@ def selected_request_reference(indices: torch.Tensor, meta: DsaBatchMeta) -> Sel
 
 
 def validate_selected_training_traces(traces: tuple[torch.Tensor, ...], schedule: MixedSfaSchedule,
-                                       *, require_ld: bool) -> dict:
-    """Require nine releases, including membership build and completed request/pull before SFA."""
-    if len(traces) != 9:
-        raise ValueError("selected training requires nine phase snapshots")
+                                       *, require_ld: bool, with_kl: bool = True) -> dict:
+    """Require selected phase releases through SFA and, when enabled, all three KL stages."""
+    expected = 9 if with_kl else 6
+    if len(traces) != expected:
+        raise ValueError(f"selected execution requires {expected} phase snapshots")
     snapshots = validate_device_phase_closure(traces, schedule)
     indexer = validate_mixed_indexer_traces(snapshots[:2], schedule, require_ld=require_ld)
     phases = [validate_mixed_trace(trace, schedule) for trace in snapshots[2:]]
@@ -100,7 +101,7 @@ def validate_selected_training_traces(traces: tuple[torch.Tensor, ...], schedule
                 raise ValueError("selected request/SFA/KL phase contains stale LI partition evidence")
     return {"indexer": indexer, "phases": phases, "device_phase_closure": True,
             "phase_order": ["li_main", "li_merge", "membership_init", "membership_build", "request_pack_pull",
-                            "sfa", "kl_init", "kl_compute", "kl_post"]}
+                            "sfa", "kl_init", "kl_compute", "kl_post"][:expected]}
 
 
 def validate_selected_requests(indices: torch.Tensor, meta: DsaBatchMeta, requests: torch.Tensor,

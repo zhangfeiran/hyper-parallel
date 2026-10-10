@@ -136,7 +136,7 @@ def _hot_index_states(inputs, lengths):
 
 
 def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, divisor, lengths,
-              *, kl_backend="native", kv_transfer="full", compute_groups=7, selection_fixture="random"):
+              *, kl_backend="native", kv_transfer="full", compute_groups=7, selection_fixture="random", zero_kl=False):
     meta = _metadata(lengths, pattern, dist.get_world_size(), dist.get_rank())
     capacity = max(1, max(meta.token_owners.count(peer) for peer in range(dist.get_world_size())))
     root = SharedShmemRoot(device, root_group=dist.group.WORLD)
@@ -147,9 +147,9 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
     try:
         prepared = workspace.prepare(meta)
         normalization = DsaLossNormalization(sum(lengths), divisor)
-        coefficient = 0. if mode == "coeff_zero" else .3
+        coefficient = 0. if zero_kl or mode == "coeff_zero" else .3
         selected_backend = "reference" if mode in ("fp32_rejected", "reference") else kl_backend
-        transfer = kv_transfer if selected_backend == "native" and coefficient != 0 else "full"
+        transfer = kv_transfer if selected_backend == "native" else "full"
         model = MegaDsa(workspace, prepared, heads=heads, attention_scale=_SCALE,
                         schedule=MixedSfaSchedule(compute_groups),
                         normalization=normalization, loss_coeff=coefficient, kl_backend=selected_backend,
@@ -222,7 +222,7 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
         expect_fused_kl = selected_backend == "native" and coefficient != 0
         expected_phases = 6 if expect_fused_kl else 3
         if transfer == "selected":
-            expected_phases = 9
+            expected_phases += 3
         if ((raw.kl_loss is not None) != expect_fused_kl or len(raw.phase_traces) != expected_phases
                 or bool(raw.selected_requests) != (transfer == "selected")):
             raise RuntimeError("training forward did not honor its declared KL backend/phase count")
@@ -302,7 +302,8 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
                                 "unfetched_nan_rows": unfetched_nan_rows,
                                 "kl_backend": selected_backend,
                                 "kv_transfer": transfer,
-                                "mode": mode, "auxiliary": auxiliary, "reducer_divisor": divisor,
+                                "mode": mode, "loss_coeff": coefficient, "auxiliary": auxiliary,
+                                "reducer_divisor": divisor,
                                 "kl_reference": ("exact_zero" if coefficient == 0 else
                                                  "stock_native" if weight_dtype == torch.float32 else "enhance_native"),
                                 "selection_stock_set_exact": True, "selection_stock_values_exact": True,
@@ -319,7 +320,7 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
 
 def run_validation(report: dict, output_dir: Path, *, smoke: bool = False, long_history: bool = False,
                    kl_backend: str = "native", kv_transfer: str = "full", compute_groups: int = 7,
-                   selection_fixture: str = "random") -> None:
+                   selection_fixture: str = "random", zero_kl: bool = False) -> None:
     """Check global KL normalization and all seven owner gradients on CP1/CP2/CP4."""
     if kl_backend not in ("native", "reference") or kv_transfer not in ("full", "selected"):
         raise ValueError("validation requires an explicit supported KL backend and KV transfer mode")
@@ -339,6 +340,7 @@ def run_validation(report: dict, output_dir: Path, *, smoke: bool = False, long_
     report["kv_transfer"] = kv_transfer
     report["compute_groups"] = compute_groups
     report["selection_fixture"] = selection_fixture
+    report["zero_kl"] = zero_kl
     cases = [("strided", 32, torch.bfloat16, "joint", 7, 1)]
     if not smoke:
         cases += [("zigzag", 64, torch.bfloat16, "joint", 1, 1),
@@ -362,11 +364,13 @@ def run_validation(report: dict, output_dir: Path, *, smoke: bool = False, long_
                       ("empty", 64, torch.float32, "kl_only", 1, 1),
                       ("zigzag", 64, torch.float32, "checkpoint", 7, dist.get_world_size()),
                       ("strided", 32, torch.bfloat16, "reference", 7, 1)]
+    if zero_kl:
+        cases = [case for case in cases if case[3] not in ("reference", "fp32_rejected")]
     fixtures = [(case, _LENGTHS) for case in cases]
     if long_history:
         fixtures = [(("strided", 32, torch.bfloat16, "joint", 7, 1), (3, 2113))]
         if not smoke:
-            fixtures += [(("zigzag", 64, torch.bfloat16, "joint", 1, 1), (2176, 2240)),
+            fixtures += [(("zigzag", 64, torch.float32 if zero_kl else torch.bfloat16, "joint", 1, 1), (2176, 2240)),
                          (("contiguous", 32, torch.bfloat16, "checkpoint", 7, dist.get_world_size()),
                           (3, 2113)),
                          (("empty", 32, torch.bfloat16, "kl_only", 7, 1), (3, 2113))]
@@ -375,7 +379,7 @@ def run_validation(report: dict, output_dir: Path, *, smoke: bool = False, long_
         report["stage"] = {"lengths": lengths, "case": tuple(str(item) for item in case)}
         _run_case(report, torch.device(f"npu:{local_rank}"), *case, lengths,
                   kl_backend=kl_backend, kv_transfer=kv_transfer, compute_groups=compute_groups,
-                  selection_fixture=selection_fixture)
+                  selection_fixture=selection_fixture, zero_kl=zero_kl)
         (output_dir / f"rank{dist.get_rank()}.json").write_text(json.dumps(report, indent=2) + "\n")
     loaded = {line.split()[-1] for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
               if any(name in line for name in ("libcust_opapi.so", "libcust_opmaster_rt2.0.so",
@@ -392,6 +396,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--zero-kl", action="store_true", help="Disable KL arithmetic across the lifecycle matrix.")
     parser.add_argument("--long-history", action="store_true",
                         help="Verify actual truncated K=2048 training with bounded-memory FP32 query chunks.")
     parser.add_argument("--kl-backend", choices=("native", "reference"), default="native")
@@ -403,7 +408,7 @@ def main() -> None:
     try:
         run_validation(report, args.output_dir, smoke=args.smoke, long_history=args.long_history,
                        kl_backend=args.kl_backend, kv_transfer=args.kv_transfer, compute_groups=args.compute_groups,
-                       selection_fixture=args.selection_fixture)
+                       selection_fixture=args.selection_fixture, zero_kl=args.zero_kl)
     except Exception as error:
         report.update(status="error", error=repr(error), traceback=traceback.format_exc())
         raise

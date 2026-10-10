@@ -119,6 +119,7 @@ class HyperDsaFusedTraining : public OpDef {
       .DataType({ge::DT_FLOAT, ge::DT_FLOAT})
       .Format({ge::FORMAT_ND, ge::FORMAT_ND});
     this->Attr("scale").AttrType(REQUIRED).Float();
+    this->Attr("with_kl").AttrType(OPTIONAL).Bool(true);
     this->AICore().AddConfig("ascend910b");
   }
 };
@@ -141,6 +142,16 @@ ge::graphStatus InferTrainingShape(gert::InferShapeContext *context) {
   *context->GetOutputShape(2) = *query;
   *context->GetOutputShape(3) = gert::Shape({1, tokens, heads});
   *context->GetOutputShape(4) = gert::Shape({1, tokens, heads});
+  const auto *withKl = context->GetAttrs()->GetAttrPointer<bool>(1);
+  if (withKl == nullptr) {
+    return ge::GRAPH_FAILED;
+  }
+  if (!*withKl) {
+    for (size_t index = 5; index < 9; ++index) {
+      *context->GetOutputShape(index) = gert::Shape({0});
+    }
+    return ge::GRAPH_SUCCESS;
+  }
   *context->GetOutputShape(5) = *context->GetInputShape(0);
   *context->GetOutputShape(6) = *context->GetInputShape(1);
   *context->GetOutputShape(7) = *context->GetInputShape(6);

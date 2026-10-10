@@ -282,6 +282,16 @@ class TestMegaDsaTraining(SharedRootFixture):
         args[29].fill_(13)
         args[30].fill_(17)
 
+    def _execute_selected_forward(self, *args):
+        self.assertEqual(len(args), 26)
+        self.assertEqual(args[9].shape, (6, 20, 64))
+        self.assertEqual(args[11], (2, 4))
+        self.assertIs(args[22], self.model.core.backend.selected_rows)
+        self._execute(*args[:11], args[12], *args[13:18])
+        args[23].fill_(11)
+        args[24].fill_(13)
+        args[25].fill_(17)
+
     @contextmanager
     def _patches(self):
         with ExitStack() as stack:
@@ -299,6 +309,10 @@ class TestMegaDsaTraining(SharedRootFixture):
                                             return_value=1, create=True))
             stack.enter_context(patch.object(torch.ops.hyper_parallel, "dsa_selected_cp_training_out",
                                             side_effect=self._execute_selected_training, create=True))
+            stack.enter_context(patch.object(torch.ops.hyper_parallel, "dsa_selected_cp_forward_version",
+                                            return_value=1, create=True))
+            stack.enter_context(patch.object(torch.ops.hyper_parallel, "dsa_selected_cp_forward_out",
+                                            side_effect=self._execute_selected_forward, create=True))
             kl = stack.enter_context(patch.object(module, "_selected_kl_gradients", return_value=(
                 *self.raw_index_gradients, torch.tensor(8.))))
             backward = stack.enter_context(patch.object(self.model.core.backward_backend, "_backward_saved",
@@ -479,9 +493,70 @@ class TestMegaDsaTraining(SharedRootFixture):
         for before, after in zip(results[0].selected_requests, results[1].selected_requests):
             self.assertFalse(before.is_set_to(after))
 
+    @patch.object(DefaultDeviceType, "get_device_type", return_value="cpu")
+    def test_selected_zero_kl_saves_no_global_derivatives_and_returns_local_zeros(self, _device_type):
+        """Zero KL has six phases and local zero gradients without an owner reduction, including retained graphs."""
+        for dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                self.inputs = (*self.inputs[:6], self.inputs[6].detach().to(dtype).requires_grad_())
+                self.model = module.MegaDsa(
+                    self.workspace, self.invocation, heads=32, attention_scale=.1, schedule=MixedSfaSchedule(7),
+                    normalization=DsaLossNormalization(4), loss_coeff=0, kv_transfer="selected")
+                results, saved = [], []
+                forward = self.model.core.backend.forward
+
+                def _capture(*args, **kwargs):
+                    value = forward(*args, **kwargs)
+                    results.append(value)
+                    return value
+
+                def _pack(tensor):
+                    saved.append(tensor)
+                    return tensor
+
+                with self._patches() as (kl, _backward), \
+                        patch.object(self.model.core.backend, "forward", side_effect=_capture), \
+                        patch.object(self.model.core.backend.layout, "reduce_owner_gradients") as reduce, \
+                        torch.autograd.graph.saved_tensors_hooks(_pack, lambda tensor: tensor):
+                    output, loss = self.model(*self.inputs, self.meta)
+                    self.assertEqual(len(saved), 15)
+                    self.model(*(tensor.detach() + .25 for tensor in self.inputs), replace(self.meta, layer=3))
+                    first = torch.autograd.grad(output.sum() + loss * 7, self.inputs, retain_graph=True)
+                    second = torch.autograd.grad(loss * 3, self.inputs, allow_unused=True)
+                    out, aux = checkpoint(lambda *values: self.model(*values, self.meta), *self.inputs,
+                                          use_reentrant=False)
+                    third = torch.autograd.grad(out.sum() + aux * 7, self.inputs)
+                    kl.assert_not_called()
+                    reduce.assert_not_called()
+                self.assertTrue(all(tensor is None for tensor in second[:4]))
+                for gradients in (first, second, third):
+                    for actual, source in zip(gradients[4:], self.inputs[4:]):
+                        torch.testing.assert_close(actual, torch.zeros_like(source), rtol=0, atol=0)
+                        self.assertEqual(actual.dtype, source.dtype)
+                for result in results:
+                    self.assertEqual(len(result.phase_traces), 6)
+                    self.assertEqual(result.kl_gradients, ())
+                    self.assertIsNone(result.kl_loss)
+                    self.assertEqual(len(result.selected_requests), 3)
+                self.assertEqual(float(loss.detach()), 0)
+
+    def test_selected_zero_kl_preserves_absent_index_gradients_and_saved_input_versions(self):
+        """Main-only keeps hard selection detached; an auxiliary backward still checks saved input mutations."""
+        self.model = module.MegaDsa(
+            self.workspace, self.invocation, heads=32, attention_scale=.1, schedule=MixedSfaSchedule(7),
+            normalization=DsaLossNormalization(4), loss_coeff=0, kv_transfer="selected")
+        with self._patches():
+            output, loss = self.model(*self.inputs, self.meta)
+            actual = torch.autograd.grad(output.sum(), self.inputs, allow_unused=True, retain_graph=True)
+            self.assertTrue(all(tensor is None for tensor in actual[4:]))
+            with torch.no_grad():
+                self.inputs[6].add_(1)
+            with self.assertRaisesRegex(RuntimeError, "modified"):
+                torch.autograd.grad(loss, self.inputs[4:])
+
     def test_selected_transfer_rejects_unavailable_objectives_before_preparation(self):
-        """The initial selected producer requires native nonzero KL; full transfer remains available."""
-        for backend, coefficient, transfer in (("reference", .25, "selected"), ("native", 0., "selected"),
+        """Selected transfer requires native selection; the reference backend remains full-only."""
+        for backend, coefficient, transfer in (("reference", .25, "selected"), ("reference", 0., "selected"),
                                                 ("native", .25, "invalid")):
             with self.subTest(backend=backend, coefficient=coefficient, transfer=transfer), \
                     patch.object(fused_cp.FusedDsaCpForwardProbe, "prepare_selected_requests") as prepare, \

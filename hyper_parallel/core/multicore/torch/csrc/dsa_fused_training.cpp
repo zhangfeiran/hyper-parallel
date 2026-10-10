@@ -102,14 +102,21 @@ void check_outputs(const Tensors &tensors) {
               "fused DSA SFA output shapes or dtypes are incompatible");
 }
 
-void check_fused_inputs(const Tensors &tensors, double scale, int64_t phases = 6) {
+void check_fused_inputs(const Tensors &tensors, double scale, int64_t phases = 6, bool withKl = true) {
   TORCH_CHECK(tensors[0]->device().type() == c10::DeviceType::PrivateUse1, "fused training requires an NPU");
-  TORCH_CHECK(!at::globalContext().deterministicAlgorithms(), "fused training supports non-deterministic KL only");
+  TORCH_CHECK(!withKl || !at::globalContext().deterministicAlgorithms(),
+              "fused training supports non-deterministic KL only");
   check_storage(tensors);
   check_states(tensors);
   check_runtime(tensors, phases);
   check_outputs(tensors);
-  check_kl_outputs(tensors);
+  if (withKl) {
+    check_kl_outputs(tensors);
+  } else {
+    for (size_t index : {11U, 17U, 18U, 19U, 20U}) {
+      TORCH_CHECK(tensors[index]->sizes() == at::IntArrayRef({0}), "selected forward requires empty KL descriptors");
+    }
+  }
   TORCH_CHECK(std::isfinite(scale) && scale > 0, "fused DSA scale must be finite and positive");
 }
 
@@ -239,10 +246,39 @@ Result selected_cp_training_npu(const at::Tensor &indexQuery, at::Tensor &indexK
   return Result(indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight, loss, trace,
                 retained, klRetained);
 }
+std::tuple<TensorRef, TensorRef, TensorRef, TensorRef, TensorRef, TensorRef, TensorRef> selected_cp_forward_npu(
+  const at::Tensor &indexQuery, at::Tensor &indexKey, const at::Tensor &query, at::Tensor &compressed,
+  const at::Tensor &queryRope, at::Tensor &keyRope, const at::Tensor &weights, const at::Tensor &lengths,
+  const at::Tensor &config, at::Tensor &trace, at::Tensor &retained, at::IntArrayRef klLengths, double scale,
+  at::Tensor &indices, at::Tensor &values, at::Tensor &attention, at::Tensor &maximum, at::Tensor &sum,
+  at::Tensor &arena, const at::Tensor &metadata, const at::Tensor &requests, at::Tensor &transportTrace,
+  const at::Tensor &selectedRows, at::Tensor &membership, at::Tensor &selectedRequests, at::Tensor &selectedCounts) {
+  auto klRetained = at::empty({0}, retained.options());
+  auto gradIndexQuery = at::empty({0}, indexQuery.options());
+  auto gradIndexKey = at::empty({0}, indexKey.options());
+  auto gradWeight = at::empty({0}, weights.options());
+  auto loss = at::empty({0}, maximum.options());
+  const Tensors tensors{&indexQuery, &indexKey, &query, &compressed,     &queryRope,    &keyRope,    &weights,
+                        &lengths,    &config,   &trace, &retained,       &klRetained,   &indices,    &values,
+                        &attention,  &maximum,  &sum,   &gradIndexQuery, &gradIndexKey, &gradWeight, &loss};
+  check_fused_inputs(tensors, scale, 6, false);
+  check_selected(tensors, {&arena, &metadata, &requests, &transportTrace, &selectedRows, &membership, &selectedRequests,
+                           &selectedCounts});
+  check_lengths(klLengths, query, lengths);
+  check_transport(tensors, arena, metadata, requests, transportTrace);
+  static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaSelectedCpForward",
+                                                          "aclnnHyperDsaSelectedCpForwardGetWorkspaceSize");
+  hyper_parallel::multicore::execute_cached_op(
+    api, indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths, config, trace, retained,
+    klRetained, klLengths, scale, indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight,
+    loss, arena, metadata, requests, transportTrace, selectedRows, membership, selectedRequests, selectedCounts);
+  return {indices, values, attention, maximum, sum, trace, retained};
+}
 }  // namespace
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("dsa_fused_training_out", &fused_training_npu);
   m.impl("dsa_fused_cp_training_out", &fused_cp_training_npu);
   m.impl("dsa_selected_cp_training_out", &selected_cp_training_npu);
+  m.impl("dsa_selected_cp_forward_out", &selected_cp_forward_npu);
 }

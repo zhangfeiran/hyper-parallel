@@ -25,6 +25,7 @@ REGISTER_TILING_DATA_CLASS(SparseFlashAttentionTilingDataMlaOp, SparseFlashAtten
 BEGIN_TILING_DATA_DEF(DsaFusedTrainingTilingData)
 TILING_DATA_FIELD_DEF_STRUCT(LITilingData, li);
 TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionTilingDataMla, sfa);
+TILING_DATA_FIELD_DEF(uint64_t, withKl);
 TILING_DATA_FIELD_DEF_ARR(uint64_t, (sizeof(SparseLightningIndexerGradKLLossTilingData) + 7) / 8, kl);
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(HyperDsaFusedTraining, DsaFusedTrainingTilingData)

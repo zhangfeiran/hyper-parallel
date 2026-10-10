@@ -1556,8 +1556,9 @@ requirements.
 ## Device-generated selected main-KV requests
 
 `MegaDsa(..., kv_transfer="selected")` selects the experimental request/count
-producer inside the existing training operator. It requires native nonzero KL;
-`kv_transfer="full"` remains the default. The initial selected mode gathers the
+producer inside the existing composite operator with the native backend.
+Nonzero KL executes nine phases; `loss_coeff=0` skips its arithmetic and executes
+six phases. `kv_transfer="full"` remains the default. The initial selected mode gathers the
 same complete packed Q/index-Q/weights and pulls full index K for exact selection.
 It retains global-key destination buffers and generates the main-KV union from
 the actual native TopK output. The union may cover all keys, so this mode does
@@ -1577,15 +1578,15 @@ owner-local source and destination are all consecutive. Native request capacity
 is the global key count; the device publishes the actual count after descriptor
 writes. The progress Vector consumes that count to perform real BF16 C512/RoPE64
 pulls, then completes the existing read ACK protocol. Each invocation owns its
-membership, descriptor table, counts and nine phase records. Request/count/TopK
+membership, descriptor table, counts and six or nine phase records. Request/count/TopK
 readback occurs only in explicit offline validation.
 
 The training validator accepts `--kv-transfer selected`. It compares descriptors,
 all membership counts, epochs and local/remote main bytes with the CPU oracle,
-checks descriptor publication before transfer, and requires all nine phase
-releases before accepting stock output and seven gradients. Reference and
-zero-coefficient fixtures explicitly report full transfer; those selected-mode
-extensions remain open. Framework-free [CP1/CP2/CP4 launchers](../../../../../tests/torch/multicore/test_mega_dsa_selected_training_cp.py)
+checks descriptor publication before transfer, and requires all declared phase
+releases before accepting stock output and owner gradients. Reference fixtures
+explicitly report full transfer. `--zero-kl` exercises selected zero-coefficient
+execution across the lifecycle matrix. Framework-free [CP1/CP2/CP4 launchers](../../../../../tests/torch/multicore/test_mega_dsa_selected_training_cp.py)
 provide short and genuinely truncated long-history matrices.
 
 ```bash
@@ -1636,5 +1637,55 @@ error 2.1349173793687763e-05. Unrequested C/RoPE rows remain initialized to NaN;
 all 16 CP4 hotset scenarios explicitly verify that poison remains while output
 and gradients stay finite. Supplementary CP1/CP4 poison smokes run separately.
 Full training-step performance remains unmeasured; full pull remains the default.
-Device sparse gradient owner return, selected zero-KL/external-TopK admission,
+Device sparse gradient owner return, selected external-TopK admission,
 rank-local query/tile scope, CP8/CP×TP and model acceptance remain open.
+
+
+## Selected transfer with zero KL
+
+`MegaDsa(..., loss_coeff=0, kv_transfer="selected")` uses the same composite operator
+with a `with_kl=false` tiling attribute. It runs LI main/merge, membership init/build,
+request pack/pull and SFA, with read ACK on the final sixth phase. The host skips KL
+child tiling, and the kernel never accesses KL scratch or derivative destinations.
+The dedicated forward bridge creates empty auxiliary descriptors rather than global
+zero derivative buffers, while preserving the existing training entry signatures.
+
+Autograd saves caller inputs and main attention state for version checks and delayed
+or retained backward. An explicit auxiliary backward returns zeros in each caller's
+local shape and dtype without an index-gradient owner collective. Main-only backward
+leaves index gradients absent. The forward loss is exact FP32 zero; hard selection
+still has no main-objective derivative.
+
+The training validator accepts `--kv-transfer selected --zero-kl`. The short matrix
+covers BF16/FP32 merge weights, empty owners, checkpoint, retained/delayed backward,
+objective isolation and stream changes. Long hotset fixtures retain complete native
+K2048 selection and explicitly check unfetched C/RoPE poison and actual byte counts.
+Actual CANN 9.1/Ascend910b build and execution accept the empty auxiliary descriptors.
+The 20 nontraining device objects retain their previous hashes. The current CPU
+regression passes 203 tests and 312 subtests; lint, native formatting, ST import
+isolation, documentation links and the AGENTS catalog pass.
+
+Selected zero-KL CP1/CP2/CP4 short matrices pass seven rank reports and 133 scenarios,
+including BF16/FP32 weights, empty owners and the lifecycle cases above. All 182
+forwards close six phases; 119 main backwards and 826 native gradient comparisons
+pass the original pointwise bounds. All auxiliary losses are exactly zero. The
+independent FP32 criterion passes, with maximum gradient relative L2
+0.003189607634470013; 100/826 gradient and 113/133 output pointwise failures remain.
+
+The zero-KL long hotset matrices pass seven rank reports and 28 scenarios, with 42
+six-phase forwards and 21 main backwards. All 168 native gradient comparisons pass
+pointwise bounds. Unrequested C/RoPE rows remain NaN in every scenario; the selected
+sets and byte counts match the 2051/2116 and 4096/4416-key fixtures above, saving
+74,880 and 368,640 main bytes. The H64 long fixture also uses FP32 merge weights.
+Independent FP32 gradients meet the existing criterion, with maximum relative L2
+0.0026095253024382647; 17/168 gradient and 23/28 output pointwise failures remain.
+All 28 auxiliary losses are exact zero.
+
+The rebuilt payload also passes 48 standalone six-phase arithmetic cases and fresh
+full/selected CP1/CP2/CP4 short regressions, each with 140 positive scenarios, seven
+explicit reference FP32-KL rejections and 875 native pointwise gradient comparisons.
+In the selected regression, zero-coefficient cases now execute six selected phases;
+nonzero native KL retains nine phases and the explicit reference fixture uses full
+transfer. Source, activated payload and actually loaded library hashes are recorded
+with the per-rank evidence. These results do not close the full-model BF16 gap or
+establish complete-step speedup; full transfer remains the default.

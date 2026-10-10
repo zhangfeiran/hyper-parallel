@@ -40,6 +40,15 @@ void register_dsa_probes(torch::Library& m) {
         "Tensor(s!) selected_requests, Tensor(t!) selected_counts) "
         "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), "
         "Tensor(i!), Tensor(j!), Tensor(k!), Tensor(l!))");
+  m.def("dsa_selected_cp_forward_version() -> int", []() -> int64_t { return 1; });
+  m.def(
+    "dsa_selected_cp_forward_out(Tensor index_query, Tensor(m!) index_key, Tensor query, "
+    "Tensor(n!) compressed, Tensor query_rope, Tensor(o!) key_rope, Tensor weights, Tensor lengths, "
+    "Tensor config, Tensor(j!) trace, Tensor(k!) retained, int[] lengths_host, float scale, "
+    "Tensor(a!) indices, Tensor(b!) values, Tensor(c!) attention, Tensor(d!) maximum, Tensor(e!) sum, "
+    "Tensor(p!) arena, Tensor metadata, Tensor requests, Tensor(q!) transport_trace, "
+    "Tensor selected_rows, Tensor(r!) membership, Tensor(s!) selected_requests, Tensor(t!) selected_counts) "
+    "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(j!), Tensor(k!))");
   m.def("dsa_mixed_kl_version() -> int", []() -> int64_t { return 1; });
   m.def("dsa_mixed_kl_out(Tensor query, Tensor key, Tensor index_query, Tensor index_key, Tensor weight, "
         "Tensor indices, Tensor maximum, Tensor sum, Tensor query_rope, Tensor key_rope, "

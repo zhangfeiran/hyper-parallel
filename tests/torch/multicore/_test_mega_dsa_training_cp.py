@@ -23,12 +23,12 @@ from pathlib import Path
 from hyper_parallel.core.multicore.examples.mega_dsa_training_cp_validate import run_validation
 
 
-def _validate(*, long_history: bool, kv_transfer: str = "full") -> None:
+def _validate(*, long_history: bool, kv_transfer: str = "full", zero_kl: bool = False) -> None:
     with tempfile.TemporaryDirectory(prefix="mega-dsa-training-") as directory:
         path = Path(os.environ.get("HP_DSA_TRAIN_CP_OUTPUT", directory))
         report = {"status": "running", "scope": "P4 native selection and selected KL training"}
         try:
-            run_validation(report, path, long_history=long_history, kv_transfer=kv_transfer)
+            run_validation(report, path, long_history=long_history, kv_transfer=kv_transfer, zero_kl=zero_kl)
         except Exception as error:
             report.update(status="error", error=repr(error), traceback=traceback.format_exc())
             raise
@@ -55,3 +55,13 @@ def test_mega_dsa_selected_training_cp() -> None:
 def test_mega_dsa_selected_training_long_cp() -> None:
     """Verify request/count generation from genuine truncated native TopK."""
     _validate(long_history=True, kv_transfer="selected")
+
+
+def test_mega_dsa_selected_zero_kl_cp() -> None:
+    """Verify selected zero-KL phases, owner-local zeros and checkpoint/retained backward."""
+    _validate(long_history=False, kv_transfer="selected", zero_kl=True)
+
+
+def test_mega_dsa_selected_zero_kl_long_cp() -> None:
+    """Verify genuine truncated selected zero-KL BF16/FP32 execution with empty owners."""
+    _validate(long_history=True, kv_transfer="selected", zero_kl=True)

@@ -309,7 +309,7 @@ class _DsaTraining(torch.autograd.Function):
                                  tuple(tensor.detach() for tensor in index), **options)
         saved = result.saved
         if module.loss_coeff == 0:
-            index_gradients = tuple(torch.zeros_like(tensor) for tensor in result.index_states)
+            index_gradients = ()
             loss = saved.states[0].new_zeros((), dtype=torch.float32)
         else:
             if module.kl_backend == "native":
@@ -327,6 +327,7 @@ class _DsaTraining(torch.autograd.Function):
         ctx.backend = module.core.backward_backend
         ctx.batch_meta, ctx.versions = saved.batch_meta, saved.versions
         ctx.geometry, ctx.token = saved.geometry, saved._token
+        ctx.zero_kl = module.loss_coeff == 0
         ctx.output_shape = tuple(result.output.shape)
         ctx.input_gradients = tuple(tensor.requires_grad for tensor in inputs)
         ctx.set_materialize_grads(False)
@@ -352,7 +353,9 @@ class _DsaTraining(torch.autograd.Function):
             main_gradients = backend._backward_saved(
                 saved, ctx.output_shape, grad_output.detach().contiguous()).gradients
         index_gradients = (None,) * 3
-        if grad_loss is not None:
+        if grad_loss is not None and ctx.zero_kl:
+            index_gradients = tuple(torch.zeros_like(tensor) * grad_loss for tensor in tensors[4:7])
+        elif grad_loss is not None:
             layout = backend.backend.layout
             full_gradients = tuple(gradient * grad_loss for gradient in tensors[15:18])
             index_gradients = layout.reduce_owner_gradients(
@@ -375,8 +378,9 @@ class MegaDsa(torch.nn.Module):
     The native backend runs six LI/SFA/KL phases in one kernel. The reference
     backend uses the separately activated Omni KL primitive. Full KV transfer
     is the default; the selected candidate generates device request/counts
-    after LI merge and requires native nonzero KL. Both gather packed Q and
-    use FP32 collective index-gradient owner return.
+    after LI merge, with nine phases for native KL or six when its coefficient
+    is zero. Both gather packed Q. Nonzero KL uses FP32 collective index-gradient
+    owner return; zero KL emits local zeros only when the auxiliary objective is used.
     """
 
     def __init__(self, workspace: MegaDsaWorkspace, invocation: DsaWorkspaceInvocation, *, heads: int,
@@ -394,7 +398,7 @@ class MegaDsa(torch.nn.Module):
             loss_coeff: Nonnegative selected-KL coefficient.
             kl_backend: Native single-launch KL or explicit Omni reference.
             kv_transfer: Full main-KV pull, or selected device-generated requests
-                over the gathered query scope with native nonzero KL.
+                over the gathered query scope with the native backend.
         """
         super().__init__()
         if not isinstance(normalization, DsaLossNormalization):
@@ -407,8 +411,8 @@ class MegaDsa(torch.nn.Module):
             raise ValueError("kl_backend must be native or reference")
         if kv_transfer not in ("full", "selected"):
             raise ValueError("kv_transfer must be full or selected")
-        if kv_transfer == "selected" and (kl_backend != "native" or loss_coeff == 0):
-            raise ValueError("selected KV transfer currently requires native nonzero KL")
+        if kv_transfer == "selected" and kl_backend != "native":
+            raise ValueError("selected KV transfer requires the native backend")
         declaration = (normalization, float(loss_coeff), kl_backend, kv_transfer)
         if len(workspace.root.members) > 1:
             declarations = [None] * len(workspace.root.members)
