@@ -90,7 +90,7 @@ are also recorded in the native build fingerprint.
 
 Single-card Gate forward/backward acceptance is available through
 `tests/torch/multicore/test_ast_gate.py`; see the
-[frontend native binding guide](../../frontend/README.md#current-implementation-boundary)
+[前端原生绑定指南](../../frontend/README.md#当前实现边界)
 for build, activation, stream and validation contracts. MoE now emits complete
 current rank-local plans; MHC has sixteen independently captured fixed-revision
 normal/profiled forward/backward snapshots and an isolated builder. Reproduce
