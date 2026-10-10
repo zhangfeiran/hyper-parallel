@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -171,6 +171,52 @@ class DsaCpLayout:
                 local.index_copy_(0, order, value)
                 returned.append(local.reshape(self.local_tokens, *shape).to(target_dtype))
         return tuple(returned)
+
+    def reduce_local_index_gradients(
+        self, gradients: tuple[torch.Tensor, ...], query_meta: DsaBatchMeta,
+        dtypes: tuple[torch.dtype, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        """Return local selected-KL derivatives with exactly one index-K owner sum.
+
+        Call collectively from first-order backward, including empty query tiles
+        and empty owners. Q and merge-weight derivatives already belong to the
+        caller's query rows; only index-K has contributions from other members.
+        This reference exchange uses a complete global K buffer, not sparse return.
+
+        Args:
+            gradients: Detached accumulation-precision local index-Q [M,Hi,Di],
+                global packed index-K [N,Di], and local merge-weight [M,Hi].
+                FP32 is required for BF16/FP32 destinations; FP64 for FP64 oracles.
+            query_meta: Prepared ownership with this tile's caller-ordered query
+                IDs. All other declarations must match this CP layout.
+            dtypes: The three original index input dtypes, in the same order.
+
+        Returns:
+            Local Q and weight gradients in caller order and owner-local K in
+            the declared KV storage order, cast after the FP32/FP64 owner sum.
+            No normalization, CP division, or auxiliary upstream scale is applied.
+        """
+        if not isinstance(query_meta, DsaBatchMeta):
+            raise TypeError("local index gradients require DsaBatchMeta")
+        if (query_meta != replace(self.batch_meta, q_global_ids=query_meta.q_global_ids)
+                or not set(query_meta.q_global_ids).issubset(self.batch_meta.q_global_ids)):
+            raise ValueError("local index queries must use the prepared owner layout")
+        allowed = (torch.bfloat16, torch.float32, torch.float64)
+        if len(gradients) != 3 or len(dtypes) != 3 or any(dtype not in allowed for dtype in dtypes):
+            raise ValueError("local index return requires three gradients and BF16/FP32/FP64 destinations")
+        query, key, weight = gradients
+        rows = len(query_meta.q_global_ids)
+        accumulation = torch.float64 if torch.float64 in dtypes else torch.float32
+        if (query.ndim != 3 or query.shape[0] != rows or min(query.shape[1:]) < 1
+                or key.shape != (self.batch_meta.global_valid_queries, query.shape[2])
+                or weight.shape != query.shape[:2]):
+            raise ValueError("local index gradient shapes must match query rows and complete global keys")
+        if any(tensor.device != self.device or tensor.dtype != accumulation or tensor.requires_grad
+               for tensor in gradients):
+            raise ValueError("local index partials must be detached FP32/FP64 tensors on the prepared device")
+        owned_key = self.reduce_owner_gradients(
+            (key,), ((key.shape[1],),), (self.key_order,), (accumulation,))[0]
+        return query.to(dtypes[0]), owned_key.to(dtypes[1]), weight.to(dtypes[2])
 
     def gather_fields(self, tensors: tuple[torch.Tensor, ...], shapes: tuple[tuple[int, ...], ...]) -> tuple:
         """Gather one packed differentiable buffer for main and indexer fields.

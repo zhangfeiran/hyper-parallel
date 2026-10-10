@@ -179,6 +179,74 @@ class TestDsaCpLayout(unittest.TestCase):
                 layout.gather_fields(invalid, ((1,),) * 4)
         mocked.all_gather_into_tensor.assert_not_called()
 
+    def test_local_index_return_only_reduces_global_key_partials(self):
+        """A subset Q tile stays local while FP32 key sums restore owner storage."""
+        mocked = self._distributed()
+        layout = DsaCpLayout(_meta(), "cpu")
+        meta = replace(_meta(), q_global_ids=(0,))
+        query = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)
+        key = torch.arange(15, dtype=torch.float32).reshape(5, 3) + 0.25
+        weight = torch.tensor([[0.125, -0.375]])
+
+        def _scatter(output, packed, **_):
+            self.assertEqual(packed.dtype, torch.float32)
+            self.assertEqual(packed.shape, (6, 3))
+            torch.testing.assert_close(packed[layout.global_order], key)
+            self.assertEqual(packed[2].count_nonzero(), 0)
+            output.copy_((packed + 256 - 256)[:3])
+
+        mocked.reduce_scatter_tensor.side_effect = _scatter
+        actual = layout.reduce_local_index_gradients(
+            (query, key, weight), meta, (torch.bfloat16, torch.bfloat16, torch.float32))
+        torch.testing.assert_close(actual[0], query.bfloat16())
+        torch.testing.assert_close(actual[1], key[[0, 2]].bfloat16())
+        self.assertIs(actual[2], weight)
+        mocked.reduce_scatter_tensor.assert_called_once()
+        mocked.all_gather_into_tensor.assert_not_called()
+
+    def test_local_index_empty_tile_and_empty_owner_participate(self):
+        """No local Q or KV still submits the key return collective once."""
+        mocked = self._distributed(rank=1)
+        meta = DsaBatchMeta((0, 2), (), (), (0, 0), (0, 1), cp_ranks=(3, 7), root_pes=(1, 4), cp_rank=1)
+        layout = DsaCpLayout(meta, "cpu")
+        partials = (torch.empty(0, 2, 3), torch.zeros(2, 3), torch.empty(0, 2))
+        mocked.reduce_scatter_tensor.side_effect = lambda output, _packed, **_: output.zero_()
+        returned = layout.reduce_local_index_gradients(partials, meta, (torch.bfloat16,) * 3)
+        self.assertEqual(tuple(tensor.shape for tensor in returned), ((0, 2, 3), (0, 3), (0, 2)))
+        mocked.reduce_scatter_tensor.assert_called_once()
+
+    def test_local_index_cp1_oracle_keeps_caller_order_and_fp64(self):
+        """A single owner with permuted keys returns exact FP64 derivatives."""
+        with patch(f"{_MODULE}.dist.is_initialized", return_value=False):
+            meta = replace(DsaBatchMeta.packed((3,)), q_global_ids=(2, 0, 1), kv_global_ids=(1, 2, 0))
+            layout = DsaCpLayout(meta, "cpu")
+        partials = (torch.randn(2, 2, 3, dtype=torch.float64), torch.randn(3, 3, dtype=torch.float64),
+                    torch.randn(2, 2, dtype=torch.float64))
+        returned = layout.reduce_local_index_gradients(
+            partials, replace(meta, q_global_ids=(1, 2)), (torch.float64,) * 3)
+        self.assertIs(returned[0], partials[0])
+        self.assertIs(returned[2], partials[2])
+        torch.testing.assert_close(returned[1], partials[1][[1, 2, 0]], rtol=0, atol=0)
+
+    def test_local_index_invalid_admission_fails_before_key_return(self):
+        """Foreign tiles, half-precision partials and wrong shapes cannot enter a collective."""
+        mocked = self._distributed()
+        layout = DsaCpLayout(_meta(), "cpu")
+        partials = (torch.zeros(2, 2, 3), torch.zeros(5, 3), torch.zeros(2, 2))
+        variants = (
+            (partials, replace(_meta(rank=1), q_global_ids=(1, 4)), (torch.float32,) * 3),
+            (partials, replace(_meta(), layer=1), (torch.float32,) * 3),
+            (tuple(tensor.bfloat16() for tensor in partials), _meta(), (torch.bfloat16,) * 3),
+            ((partials[0], torch.zeros(4, 3), partials[2]), _meta(), (torch.float32,) * 3),
+            ((partials[0], partials[1], torch.zeros(2, 1)), _meta(), (torch.float32,) * 3),
+            ((partials[0].clone().requires_grad_(), *partials[1:]), _meta(), (torch.float32,) * 3),
+            (partials, _meta(), (torch.int32,) * 3),
+        )
+        for gradients, meta, dtypes in variants:
+            with self.subTest(meta=meta, dtypes=dtypes), self.assertRaises(ValueError):
+                layout.reduce_local_index_gradients(gradients, meta, dtypes)
+        mocked.reduce_scatter_tensor.assert_not_called()
+
 
 class TestCannDsaCpReference(unittest.TestCase):
     """Native API routing and KL replica weighting tested using mocked calls."""
