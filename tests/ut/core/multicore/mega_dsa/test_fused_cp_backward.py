@@ -363,8 +363,8 @@ class TestFusedCpBackward(SharedRootFixture):
         for value, expected in zip(actual, gradients):
             torch.testing.assert_close(value, expected)
 
-    def test_trace_rejects_missing_phases_and_incomplete_owner_receipts(self):
-        """Independent synthetic phase records require full transport completion and valid scratch offsets."""
+    @staticmethod
+    def _phase_traces():
         traces = []
         for epoch in (1, 2, 3):
             trace = torch.zeros(20, 64, dtype=torch.int64)
@@ -378,6 +378,56 @@ class TestFusedCpBackward(SharedRootFixture):
             trace[7, [6, 21, 22, 24, 38]] = epoch
             trace[7, 25] = 21
             traces.append(trace)
+        return traces
+
+    def test_sparse_mode_is_collectively_declared_and_versioned(self):
+        """Malformed and inconsistent cold modes cannot enter a native gradient lease."""
+        for invalid in (None, 0, 1, "sparse"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "boolean"):
+                fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, sparse_return=invalid)
+        def _disagree(peers, declaration, **_kwargs):
+            peers[:] = [declaration, (False, None)]
+        with patch.object(self.forward_backend.layout, "cp_size", 2), \
+                patch.object(fused_cp_backward.dist, "all_gather_object", side_effect=_disagree), \
+                self.assertRaisesRegex(ValueError, "disagree"):
+            fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, sparse_return=True)
+        sparse = fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, sparse_return=True)
+        meta = sparse._metadata(self.forward.saved.batch_meta, 7)
+        self.assertEqual(int(meta[1]), 2)
+        with patch.object(fused_cp_backward, "_load_native"), \
+                patch.object(torch.ops.hyper_parallel, "dsa_sparse_cp_grad_version", return_value=0, create=True), \
+                patch.object(self.workspace, "lease") as lease, self.assertRaisesRegex(RuntimeError, "adapter ABI 1"):
+            sparse.backward(self.forward, torch.ones_like(self.forward.output))
+        lease.assert_not_called()
+        sparse.sparse_return = False
+        with self.assertRaisesRegex(ValueError, "mode was modified"):
+            sparse.backward(self.forward, torch.ones_like(self.forward.output))
+
+    def test_sparse_trace_requires_row_receipts_and_clear_extent(self):
+        """A sparse receipt proves its payload counts, deterministic owner extent and full completion."""
+        sparse = fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, sparse_return=True)
+        traces = self._phase_traces()
+        transport = torch.zeros(32, dtype=torch.int64)
+        transport[:19] = torch.tensor([2, 2, 1, 1, 2816, 0, 2816, 0, 100, 120, 130, 150,
+                                      1, 2, 1, 0, 0, 0, 6912])
+        transport[20:22] = torch.tensor([512, 7424])
+        result = fused_cp_backward.FusedCpBackwardResult((), (), (), torch.empty(0), (), transport,
+                                                         torch.empty(13568, dtype=torch.uint8), 2)
+        proof = sparse.validate_trace(result, tuple(traces), transport)
+        self.assertEqual(proof["sparse_return"]["skipped_zero_rows"], 2)
+        self.assertEqual(proof["remote_sent_bytes"], 0)
+        for word, value in ((0, 1), (1, 1), (2, 0), (3, 0), (4, 2817), (5, 1), (6, 0), (7, 2816),
+                            (12, 4), (13, 0), (14, 4), (15, 1), (16, 8), (17, 8), (18, 0), (19, 1), (31, 1)):
+            broken = transport.clone()
+            broken[word] = value
+            with self.subTest(word=word, value=value), self.assertRaises(ValueError):
+                sparse.validate_trace(result, tuple(traces), broken)
+        with self.assertRaises(ValueError):
+            self.backend.validate_trace(result, tuple(traces), transport)
+
+    def test_trace_rejects_missing_phases_and_incomplete_owner_receipts(self):
+        """Independent synthetic phase records require full transport completion and valid scratch offsets."""
+        traces = self._phase_traces()
         transport = torch.zeros(32, dtype=torch.int64)
         transport[:12] = torch.tensor([2, 2, 1, 1, 8448, 0, 8448, 0, 100, 120, 130, 150])
         transport[20:22] = torch.tensor([512, 7424])

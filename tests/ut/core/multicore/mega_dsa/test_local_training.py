@@ -108,10 +108,10 @@ class TestLocalTraining(SharedRootFixture):
                           for shape, value in zip(((rows, 32, 512), (3, 512), (rows, 32, 64), (3, 64)), (2, 3, 5, 7)))
         return SimpleNamespace(gradients=gradients)
 
-    def _probe(self, coefficient=.7, mode="lm_plus_kl", divisor=1, fused_kl=False):
+    def _probe(self, coefficient=.7, mode="lm_plus_kl", divisor=1, fused_kl=False, sparse_main_return=False):
         probe = local_training.FusedDsaLocalCpTrainingProbe(
             self.backend, normalization=DsaLossNormalization(3, divisor), loss_coeff=coefficient, mode=mode,
-            fused_kl=fused_kl)
+            fused_kl=fused_kl, sparse_main_return=sparse_main_return)
         patch.object(probe.backward_backend, "_backward_saved", side_effect=self._main_backward).start()
         return probe
 
@@ -309,6 +309,23 @@ class TestLocalTraining(SharedRootFixture):
             with self.assertRaisesRegex(ValueError, "objective was modified"):
                 probe.forward(self.invocation, inputs[:4], inputs[4:], query_layout=layout)
             forward.assert_not_called()
+
+    def test_sparse_main_return_requires_capability_before_forward(self):
+        """The bound main return and its native capability are checked before forward transport."""
+        layout, inputs = self._inputs()
+        probe = self._probe(0., "lm_only", sparse_main_return=True)
+        self.assertTrue(probe.backward_backend.sparse_return)
+        probe.check_native_support = MethodType(_CHECK_NATIVE_SUPPORT, probe)
+        with patch.object(probe.backward_backend, "check_local_native_support"), \
+                patch.object(local_training, "_load_native"), \
+                patch.object(torch.ops.hyper_parallel, "dsa_sparse_cp_grad_version", return_value=0, create=True), \
+                patch.object(self.backend, "forward_local") as forward:
+            with self.assertRaisesRegex(RuntimeError, "sparse main-gradient return"):
+                probe.forward(self.invocation, inputs[:4], inputs[4:], query_layout=layout)
+            forward.assert_not_called()
+        probe.backward_backend.sparse_return = False
+        with self.assertRaisesRegex(ValueError, "main-gradient return was modified"):
+            _CHECK_NATIVE_SUPPORT(probe)
 
     def test_invalid_and_disagreeing_cold_objective_contracts_reject(self):
         """Normalization, coefficient and mode disagreements fail before a training native lease."""

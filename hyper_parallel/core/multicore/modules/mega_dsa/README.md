@@ -2220,4 +2220,44 @@ index-K 均先使用 FP32，再按既定 owner 契约转换一次；index projec
 的 FP64 profile，不清除原 FP64 逐点失败，不接受 BF16 forward composition 或完整模型。
 `--smoke` 覆盖 interior、first-sequence、零 coefficient、KL-only 零贡献和全空 checkpoint；
 完整矩阵另覆盖两种 heads/weight dtype、四种 ownership、sum/average 和三种 replay。
-该 Native-to-Native 入口的五个定向单卡 smoke 已通过；完整多卡矩阵仍需独立完成。
+该 Native-to-Native 入口的五个定向单卡 smoke 与 CP1/CP2/CP4 完整矩阵均通过：CP1 每
+rank 1152 步，CP2/CP4 每 rank 2304 步，
+合计 14976 个 rank-step。全部参数链、梯度隔离、零 coefficient 的精确零及 replay 检查
+通过，源码和运行库 SHA 已核对。该结果接受所声明的 masked global Native 对照契约；
+FP64 oracle、完整模型和 BF16 forward composition 的验收状态保持独立。
+
+## Main gradient 的稀疏归还
+
+`FusedDsaCpBackwardProbe(..., sparse_return=True)` 选择 Native gradient transport protocol 2，
+支持 CP 最大为八，要求 `dsa_sparse_cp_grad_version()==1`。冷准备集体声明 mode；旧载荷或
+声明改变在进入 Native lease 前拒绝。默认 protocol 1 继续返回完整梯度行。
+
+Protocol 2 在 ready 前清零本 owner 上每个 sender 独占 inbox 的有效 main 区域，再对
+FP32 合并后的 `[dc, dk_rope]` 逐行检测，仅省略数值全零的行。Sender 在传输结束后发布
+每个 destination 的 INT64 行数；owner 仍按 sender `0..CP-1` 求和，最终由 Torch 转换
+一次 BF16，发布 read-complete ACK 后才允许复用。省略的 signed-zero 行归一为零。
+
+计数借用每个 sender stripe 首行的 index 预留区；不增加 symmetric heap allocation。
+消息仍保持原来的 704 个 FP32 槽位，main 的 576 个槽位有效；index-K 没有加入该协议。
+Trace 分开记录实际行 payload、counter 的逻辑控制字节、清零与 owner 扫描的 HBM 字节，
+不能将 payload 减少解释为完整 backward 或 step 加速。全域 FP32 partial scratch 也仍保留。
+
+`FusedDsaLocalCpTrainingProbe(..., sparse_main_return=True)` 可与 `fused_kl=True` 组合。该
+选择参与冷准备声明和 forward 前的能力检查；main 的 owner 求和使用 protocol 2，而
+index-K 继续完整 owner reduction。训练矩阵入口提供 `--sparse-main-return`，仍需使用
+当前载荷独立校准的 reference profile。
+
+[mega_dsa_sparse_main_return_validate.py](../../examples/mega_dsa_sparse_main_return_validate.py)
+对照同载荷的完整归还，并从同次 producer 的 FP32 dK/dV partials 独立计算固定 sender
+顺序的 owner sum，要求转换前数值精确一致。额外检查实际 nonzero 行与传输计数、三阶段
+闭包和 ACK、非零→零→非零复用。CP1/CP2/CP4 的定向 smoke 均通过，各 rank 12 个 case；
+完整多组/ownership 矩阵及长历史 `(3,2113)` 也在 CP1/CP2/CP4 全部通过，各 rank 300 个
+case，合计 2100 个 rank-case。覆盖 1/7/19 compute groups、H32/H64、四种 ownership 和
+四种 query tile；长历史使用 H32/strided/7 groups。同次 producer 的转换前 FP32 owner sum
+逐项数值精确一致，dense 对照、实际 nonzero payload 计数及复用均通过。
+
+同一隔离载荷重新完成 576 样本、12 个精度桶的独立 reference 校准后，`fused_kl=True`
+与 `sparse_main_return=True` 的完整 owner 融合训练矩阵在 CP1/CP2/CP4 全部通过。CP1
+每 rank 144 步，CP2/CP4 每 rank 288 步，合计 1872 个 rank-step；源码、运行库 SHA、
+forward 阶段数及原 pointwise 结果均已核对。该证据仍限定在短序列 fixed-Native-value
+projection VJP；性能、完整模型和发布计划中的 8K/32K/128K 需要独立验收。

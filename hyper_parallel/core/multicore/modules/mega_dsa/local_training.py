@@ -136,7 +136,9 @@ class FusedDsaLocalCpTrainingProbe:
 
     Selected KL can run in the forward graph with ``fused_kl=True`` or through
     separately submitted phases. Both retain complete index-K owner reduction.
-    Mode, coefficient, normalization and fusion are collectively declared at
+    ``sparse_main_return=True`` omits zero merged main-gradient rows; index-K
+    still uses complete owner reduction. Mode, coefficient, normalization,
+    fusion and main-gradient return are collectively declared at
     construction. Every member must enter the same forward/backward schedule,
     including empty owners, with compatible requires-grad policies. Projection
     callers detach hidden states before index projection so auxiliary gradients
@@ -144,7 +146,8 @@ class FusedDsaLocalCpTrainingProbe:
     """
 
     def __init__(self, forward: FusedDsaCpForwardProbe, *, normalization: DsaLossNormalization,
-                 loss_coeff: float = 1.0, mode: str = "lm_plus_kl", fused_kl: bool = False) -> None:
+                 loss_coeff: float = 1.0, mode: str = "lm_plus_kl", fused_kl: bool = False,
+                 sparse_main_return: bool = False) -> None:
         """Cold prepare a common objective contract before any native transport or training step."""
         if mode not in ("lm_only", "kl_only", "lm_plus_kl"):
             raise ValueError("local CP training mode must be lm_only, kl_only or lm_plus_kl")
@@ -158,7 +161,9 @@ class FusedDsaLocalCpTrainingProbe:
             raise ValueError("local CP training coefficient must be finite and nonnegative")
         if not isinstance(fused_kl, bool):
             raise ValueError("local fused KL selection must be a boolean")
-        declaration = (mode, float(loss_coeff), normalization, fused_kl)
+        if not isinstance(sparse_main_return, bool):
+            raise ValueError("local sparse main-gradient return must be a boolean")
+        declaration = (mode, float(loss_coeff), normalization, fused_kl, sparse_main_return)
         peers = [declaration]
         if forward.layout.cp_size > 1:
             peers = [None]*forward.layout.cp_size
@@ -166,19 +171,29 @@ class FusedDsaLocalCpTrainingProbe:
         if any(peer != declaration for peer in peers):
             raise ValueError("CP members disagree on the prepared local training objective")
         self.forward_backend = forward
-        self.backward_backend = FusedDsaCpBackwardProbe(forward)
+        self.backward_backend = FusedDsaCpBackwardProbe(forward, sparse_return=sparse_main_return)
         self.normalization = normalization
         self.loss_coeff = float(loss_coeff)
         self.mode = mode
         self.fused_kl = fused_kl
+        self.sparse_main_return = sparse_main_return
         self._declaration = declaration
 
     def check_native_support(self) -> None:
         """Admit all needed native ABIs before acquiring the forward workspace lease."""
-        if self._declaration != (self.mode, self.loss_coeff, self.normalization, self.fused_kl):
+        if self._declaration != (self.mode, self.loss_coeff, self.normalization, self.fused_kl,
+                                 self.sparse_main_return):
             raise ValueError("local training objective was modified; prepare a new probe")
+        if (not isinstance(self.sparse_main_return, bool)
+                or self.backward_backend.sparse_return != self.sparse_main_return):
+            raise ValueError("local training main-gradient return was modified; prepare a new probe")
         if self.mode != "kl_only":
             self.backward_backend.check_local_native_support()
+            if self.sparse_main_return:
+                _load_native()
+                version = getattr(torch.ops.hyper_parallel, "dsa_sparse_cp_grad_version", None)
+                if version is None or version() != 1:
+                    raise RuntimeError("sparse main-gradient return requires adapter ABI 1; rebuild this payload")
         if self.mode != "lm_only" and self.loss_coeff:
             _load_native()
             name = "dsa_local_cp_training_version" if self.fused_kl else "dsa_local_mixed_kl_version"

@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import (
     FusedCpForwardResult,
@@ -27,10 +28,12 @@ from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import (
     FusedDsaCpForwardProbe,
     _layout_signature,
 )
-from hyper_parallel.core.multicore.modules.mega_dsa.local_query import DsaLocalQueryLayout
+from hyper_parallel.core.multicore.modules.mega_dsa.local_query import (
+    DsaLocalQueryLayout,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_attention import (
-    mixed_sfa_grad_workspace_bytes,
     local_sfa_grad_workspace_bytes,
+    mixed_sfa_grad_workspace_bytes,
 )
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import (
     validate_device_phase_closure,
@@ -62,10 +65,35 @@ class FusedCpBackwardResult:
 class FusedDsaCpBackwardProbe:
     """Use local Q cotangents, original gradient math and peer-exclusive FP32 inbox stripes."""
 
-    def __init__(self, forward: FusedDsaCpForwardProbe) -> None:
-        """Reuse collectively prepared geometry and owner requests from the forward backend."""
+    def __init__(self, forward: FusedDsaCpForwardProbe, *, sparse_return: bool = False) -> None:
+        """Reuse collectively prepared geometry and declare a common gradient-return protocol.
+
+        Args:
+            forward: Prepared CP forward backend with a bound shared workspace.
+            sparse_return: Clear sender-exclusive owner inboxes before readiness
+                and omit numerically zero merged main-gradient rows. FP32 sums
+                retain sender order. This optional protocol supports CP up to
+                eight and requires the sparse-return native capability.
+        """
         self.backend = forward
         self.workspace = forward.workspace
+        error = None
+        if not isinstance(sparse_return, bool):
+            error = "sparse gradient return must be a boolean"
+        elif sparse_return and forward.layout.cp_size > 8:
+            error = "sparse gradient return supports CP sizes up to eight"
+        declaration = (sparse_return, error)
+        declarations = [declaration]
+        if forward.layout.cp_size > 1:
+            declarations = [None] * forward.layout.cp_size
+            dist.all_gather_object(declarations, declaration, group=forward.layout.group)
+        errors = [value[1] for value in declarations if value[1] is not None]
+        if errors:
+            raise ValueError("; ".join(errors))
+        if any(value[0] != sparse_return for value in declarations):
+            raise ValueError("CP members disagree on sparse gradient return")
+        self.sparse_return = sparse_return
+        self._sparse_declaration = sparse_return
         meta = forward.layout.batch_meta
         offsets = tuple(meta.token_local_offsets[token] for token in meta.kv_global_ids)
         self.local_owner_order = torch.tensor(offsets, dtype=torch.long, device=forward.layout.device)
@@ -106,6 +134,13 @@ class FusedDsaCpBackwardProbe:
 
     def _backward_saved(self, saved: FusedCpSavedAttention | None, shape: tuple,
                         grad_output: torch.Tensor, *, local_queries: bool = False) -> FusedCpBackwardResult:
+        if not isinstance(self.sparse_return, bool) or self.sparse_return != self._sparse_declaration:
+            raise ValueError("gradient return mode was modified; prepare a new probe")
+        if self.sparse_return:
+            _load_native()
+            version = getattr(torch.ops.hyper_parallel, "dsa_sparse_cp_grad_version", None)
+            if version is None or version() != 1:
+                raise RuntimeError("sparse gradient return requires adapter ABI 1; rebuild this checkout's payload")
         if (saved is None or saved.backend is not self.backend
                 or _layout_signature(saved.batch_meta) != self.backend.signature):
             raise ValueError("fused CP backward requires this backend's saved attention state")
@@ -131,7 +166,8 @@ class FusedDsaCpBackwardProbe:
 
     def _metadata(self, meta, epoch: int) -> torch.Tensor:
         offsets = {name: offset for name, offset, _, _ in self.workspace.layout}
-        values = (_GRAD_MAGIC, 1, epoch, meta.cp_rank, len(meta.cp_ranks), meta.heap_generation,
+        values = (_GRAD_MAGIC, 2 if self.sparse_return else 1, epoch, meta.cp_rank, len(meta.cp_ranks),
+                  meta.heap_generation,
                   meta.layer, meta.microbatch, meta.invocation, self.backend.layout_hash,
                   offsets["gradient_inbox"], self.workspace.spec.owner_gradient_tokens,
                   len(meta.kv_global_ids), offsets["events"], len(self.backend.runs),
@@ -189,8 +225,25 @@ class FusedDsaCpBackwardProbe:
         compute = tuple(validate_mixed_trace(trace, self.backend.schedule) for trace in phases)
         meta = self.backend.layout.batch_meta
         size, local, total = len(meta.cp_ranks), len(meta.kv_global_ids), meta.global_valid_queries
-        expected = (result.epoch, result.epoch, size, size, total * 2816, (total - local) * 2816,
-                    size * local * 2816, (size - 1) * local * 2816)
+        sparse = None
+        if self.sparse_return:
+            sent, skipped, received, remote_received = (int(transport[index]) for index in (12, 13, 14, 15))
+            remote_sent = int(transport[5]) // 2816
+            if (not 0 <= sent <= total or skipped != total - sent
+                    or not 0 <= remote_sent <= min(sent, total - local)
+                    or not 0 <= received <= size * local
+                    or not 0 <= remote_received <= min(received, (size - 1) * local)
+                    or tuple(transport[16:19].tolist()) != ((size - 1) * 8, (size - 1) * 8, size * local * 576 * 4)):
+                raise ValueError("sparse gradient counters or zero-cleared owner extent are inconsistent")
+            sparse = {"sent_rows": sent, "skipped_zero_rows": skipped, "received_rows": received,
+                      "remote_received_rows": remote_received, "remote_counter_control_bytes": (size - 1) * 8,
+                      "owner_inbox_clear_bytes": size * local * 576 * 4,
+                      "owner_inbox_read_bytes": size * local * 576 * 4}
+            expected = (result.epoch, result.epoch, size, size, sent * 2816, remote_sent * 2816,
+                        received * 2816, remote_received * 2816)
+        else:
+            expected = (result.epoch, result.epoch, size, size, total * 2816, (total - local) * 2816,
+                        size * local * 2816, (size - 1) * local * 2816)
         if tuple(transport[:8].tolist()) != expected:
             raise ValueError("fused CP gradients lack complete ready/write/ACK or exact transport bytes")
         times = tuple(int(transport[index]) for index in (8, 9, 10, 11))
@@ -200,13 +253,13 @@ class FusedDsaCpBackwardProbe:
         sizes = (total * 576 * 4, total * 512 * 4)
         if offsets[0] < 0 or offsets[1] < offsets[0] + sizes[0] or offsets[1] + sizes[1] > result.retained.numel():
             raise ValueError("fused CP gradient accumulator offsets exceed the retained workspace")
-        reserved = torch.cat((transport[12:20], transport[22:]))
+        reserved = torch.cat((transport[19:20] if self.sparse_return else transport[12:20], transport[22:]))
         if bool(reserved.any()):
             raise ValueError("fused CP gradient trace contains unsupported control records")
         return {"compute": compute, "phase_order": ["initialize", "compute", "post_and_owner_return"],
                 "ready_write_ack": True, "epoch": result.epoch, "remote_sent_bytes": expected[5],
                 "remote_received_bytes": expected[7], "fp32_owner_order": list(range(size)),
-                "dk_dv_workspace_offsets": offsets}
+                "dk_dv_workspace_offsets": offsets, "sparse_return": sparse}
 
 
 def _save_attention(ctx, backend, states, index_states, result):
