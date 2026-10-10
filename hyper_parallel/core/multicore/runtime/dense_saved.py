@@ -26,6 +26,7 @@ import torch
 
 _POOLS: WeakValueDictionary[torch.device, DenseSavedPool] = WeakValueDictionary()
 _POOLS_LOCK = Lock()
+_ViewFactory = Callable[[torch.Tensor, tuple[int, ...], tuple[tuple[int, ...], ...]], list[torch.Tensor]]
 
 
 @dataclass
@@ -62,17 +63,21 @@ class DenseSavedPool:
     """保存别名释放后才复用的有界缓存，支持重叠调用和流交接。"""
 
     def __init__(self, device: torch.device, exclusive: Callable[[torch.Tensor], bool],
-                 max_cached_invocations: int = 2) -> None:
+                 max_cached_invocations: int = 2, *, view_factory: _ViewFactory | None = None) -> None:
         """配置缓存；引用查询只读主机元数据。
 
         Args:
             device: 已规范化的设备；CPU 用于协议测试。
             exclusive: 经验证的原生存储独占查询。
             max_cached_invocations: 缓存分配数量上限；零表示每次使用私有分配。
+            view_factory: 原生独占检查及独立叶张量构造；CPU 协议测试可直接构造视图。
         """
         if type(max_cached_invocations) not in (int,) or max_cached_invocations < 0 or not callable(exclusive):
             raise ValueError("Dense saved cache requires a callable query and a nonnegative slot bound")
+        if view_factory is not None and not callable(view_factory):
+            raise ValueError("Dense saved view factory must be callable")
         self.device, self.exclusive = device, exclusive
+        self.view_factory = view_factory
         self.max_cached_invocations = max_cached_invocations
         self._slots: list[_SavedSlot] = []
         self._owners: WeakSet[object] = WeakSet()
@@ -111,8 +116,8 @@ class DenseSavedPool:
             stream.wait_event(event)
             self._transfers += 1
             slot.stream = stream
-        if self.device.type != "cpu":
-            slot.base.record_stream(stream)
+            if self.device.type != "cpu":
+                slot.base.record_stream(stream)
 
     def record_use(self, slot: _SavedSlot, generation: int, stream: object) -> None:
         """消费前建立流依赖，忽略已被 CPU 保存钩子释放的旧代次。
@@ -148,7 +153,7 @@ class DenseSavedPool:
         with self._lock:
             if self._closed:
                 raise RuntimeError("Dense saved pool is closed")
-            slot = next((item for item in self._slots if self.exclusive(item.base)), None)
+            slot, values = self._available(shapes, offsets, elements)
             if slot is None:
                 slot = _SavedSlot(torch.empty(elements, dtype=torch.bfloat16, device=self.device), stream)
                 self._allocations += 1
@@ -164,10 +169,33 @@ class DenseSavedPool:
                 else:
                     self._reuses += 1
             slot.generation += 1
-            # 独立叶张量不通过 _base 暴露缓存分配，所有可访问的别名均增加存储引用。
-            values = {value_id: torch.empty(0, dtype=torch.bfloat16, device=self.device).set_(
-                slot.base.untyped_storage(), offsets[value_id], shape) for value_id, shape in shapes.items()}
+            if values is None:
+                values = self._views(slot.base, shapes, offsets)
             return values, DenseSavedUse(ref(self), ref(slot), slot.generation)
+
+    def _available(self, shapes, offsets, elements):
+        for slot in self._slots:
+            if self.view_factory is None or slot.base.numel() < elements or not shapes:
+                if self.exclusive(slot.base):
+                    return slot, None
+            else:
+                values = self.view_factory(slot.base, tuple(offsets.values()), tuple(shapes.values()))
+                if values:
+                    return slot, self._named_views(shapes, values)
+        return None, None
+
+    @staticmethod
+    def _named_views(shapes, values):
+        if len(values) != len(shapes):
+            raise RuntimeError("Dense saved view factory returned an invalid value count")
+        return dict(zip(shapes, values))
+
+    def _views(self, base, shapes, offsets):
+        if self.view_factory is not None:
+            return self._named_views(shapes, self.view_factory(base, tuple(offsets.values()), tuple(shapes.values())))
+        # 独立叶张量不通过 _base 暴露缓存分配，所有可访问的别名均增加存储引用。
+        return {value_id: torch.empty(0, dtype=torch.bfloat16, device=self.device).set_(
+            base.untyped_storage(), offsets[value_id], shape) for value_id, shape in shapes.items()}
 
     def statistics(self) -> dict[str, int]:
         """读取缓存高水位与复用统计，不同步设备。"""
@@ -186,18 +214,19 @@ class DenseSavedPool:
 
 
 def shared_dense_saved(device: torch.device, exclusive: Callable[[torch.Tensor], bool],
-                       owner: object) -> DenseSavedPool:
+                       owner: object, *, view_factory: _ViewFactory | None = None) -> DenseSavedPool:
     """在同一设备的执行对象之间共享有界保存缓存。
 
     Args:
         device: 已规范化的设备。
         exclusive: 已加载原生适配器的存储查询。
         owner: 持有缓存直到关闭或回收的执行对象。
+        view_factory: 与独占查询同一原生适配器中的叶张量构造入口。
     """
     with _POOLS_LOCK:
         pool = _POOLS.get(device)
         if pool is None or not pool.register_owner(owner):
-            pool = DenseSavedPool(device, exclusive)
+            pool = DenseSavedPool(device, exclusive, view_factory=view_factory)
             pool.register_owner(owner)
             _POOLS[device] = pool
         return pool

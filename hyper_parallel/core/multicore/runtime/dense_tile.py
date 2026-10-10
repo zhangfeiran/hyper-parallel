@@ -106,7 +106,8 @@ class ResidentDenseExecutable(DenseExecutable):
         public_ids = {value.id for value in plan.ir.outputs}
         self.saved_shapes = {value_id: dict(plan.value_types)[value_id].shape for value_id in self.saved_ids
                              if value_id not in public_ids}
-        self.saved_pool = shared_dense_saved(self.device, self.vjp.native_ops.storage_exclusive.default, self)
+        self.saved_pool = shared_dense_saved(self.device, self.vjp.native_ops.storage_exclusive.default, self,
+                                            view_factory=self.vjp.native_ops.saved_views.default)
         self.native_identity = {**data, "tile_plan": self.tile_plan.export_manifest(),
                                 "tiling": tiler.export_manifest(self.binding, bank),
                                 "scratch": {"reuse": "device_shared_per_stream", "max_cached_streams": 2,

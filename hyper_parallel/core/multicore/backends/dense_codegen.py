@@ -31,6 +31,37 @@ bool storage_exclusive(const at::Tensor& base) {
   return base.storage().use_count() == 1;
 }
 
+std::vector<at::Tensor> saved_views(const at::Tensor& base, const std::vector<int64_t>& offsets,
+                                  const std::vector<std::vector<int64_t>>& shapes) {
+  TORCH_CHECK(base.scalar_type() == at::kBFloat16 && base.dim() == 1 && offsets.size() == shapes.size(),
+              "Dense saved views require a BF16 base and matching offsets/shapes");
+  if (!storage_exclusive(base)) {
+    return {};
+  }
+  std::vector<at::Tensor> values;
+  values.reserve(shapes.size());
+  for (size_t index = 0; index < shapes.size(); ++index) {
+    int64_t elements = 1;
+    for (int64_t dimension : shapes[index]) {
+      TORCH_CHECK(dimension >= 0, "Dense saved view dimensions must be nonnegative");
+      if (dimension == 0) {
+        elements = 0;
+      }
+    }
+    if (elements != 0) {
+      for (int64_t dimension : shapes[index]) {
+        TORCH_CHECK(elements <= base.numel() / dimension,
+                    "Dense saved view dimensions exceed their base allocation");
+        elements *= dimension;
+      }
+    }
+    TORCH_CHECK(offsets[index] >= 0 && offsets[index] <= base.numel() &&
+                elements <= base.numel() - offsets[index], "Dense saved view exceeds its base allocation");
+    values.push_back(at::empty({0}, base.options()).set_(base.storage(), offsets[index], shapes[index]));
+  }
+  return values;
+}
+
 at::Tensor dense_matmul(const at::Tensor& left, const at::Tensor& right) {
   if (left.size(0) == 0 || right.size(1) == 0) {
     return at::empty({left.size(0), right.size(1)}, left.options());
@@ -167,11 +198,13 @@ TORCH_LIBRARY({namespace}, m) {{
   m.def("forward(Tensor[] inputs) -> Tensor[]");
   m.def("backward(Tensor[] inputs, Tensor[] saved, Tensor?[] output_grads) -> Tensor?[]");
   m.def("storage_exclusive(Tensor base) -> bool");
+  m.def("saved_views(Tensor base, int[] offsets, int[][] shapes) -> Tensor[]");
 }}
 TORCH_LIBRARY_IMPL({namespace}, CompositeExplicitAutograd, m) {{
   m.impl("forward", &forward);
   m.impl("backward", &backward);
   m.impl("storage_exclusive", &storage_exclusive);
+  m.impl("saved_views", &saved_views);
 }}
 '''
     header = "// Copyright 2026 Huawei Technologies Co., Ltd.\n// SPDX-License-Identifier: Apache-2.0\n"

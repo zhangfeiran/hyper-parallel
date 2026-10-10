@@ -83,6 +83,43 @@ class TestDenseSaved(unittest.TestCase):
         self.query.assert_called()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_native_factory_combines_guard_and_leaf_creation(self):
+        """Feature: 合并的原生保存值借用。
+        Description: 构造入口拒绝活跃槽位，再在最后别名释放后复用并增长。
+        Expectation: 常规借用省去独立查询，增长保留独占检查，地址与统计正确。
+        """
+        held = set()
+        query = Mock(side_effect=lambda base: base.data_ptr() not in held)
+
+        def _factory(base, offsets, shapes):
+            if base.data_ptr() in held:
+                return []
+            return [torch.empty(0, dtype=torch.bfloat16).set_(base.untyped_storage(), offset, shape)
+                    for offset, shape in zip(offsets, shapes)]
+
+        factory = Mock(side_effect=_factory)
+        pool = DenseSavedPool(torch.device("cpu"), query, view_factory=factory)
+        first, _ = pool.acquire({3: (4, 8)}, None)
+        pointer = first[3].data_ptr()
+        held.add(pointer)
+        second, _ = pool.acquire({3: (4, 8)}, None)
+        self.assertNotEqual(second[3].data_ptr(), pointer)
+        held.add(second[3].data_ptr())
+        held.remove(pointer)
+        del first
+        reused, _ = pool.acquire({3: (4, 8)}, None)
+        self.assertEqual(reused[3].data_ptr(), pointer)
+        self.assertIsNone(reused[3]._base)
+        query.assert_not_called()
+        del reused
+        grown, _ = pool.acquire({3: (9, 8)}, None)
+        self.assertEqual(tuple(grown[3].shape), (9, 8))
+        query.assert_called_once()
+        self.assertEqual(pool.statistics()["allocations"], 3)
+        self.assertEqual(pool.statistics()["reuses"], 1)
+        pool.close()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_stream_handoff_and_expired_hook_generation(self):
         """Feature: 消费流交接与保存钩子代次。
         Description: 在新流借用已释放槽位，再使用旧代次的消费令牌。
@@ -150,6 +187,8 @@ class TestDenseSaved(unittest.TestCase):
                 DenseSavedPool(torch.device("cpu"), self.query, bound)
         with self.assertRaises(ValueError):
             self.pool.acquire({3: (-1, 131)}, None)
+        with self.assertRaises(ValueError):
+            DenseSavedPool(torch.device("cpu"), self.query, view_factory=False)
         private = DenseSavedPool(torch.device("cpu"), self.query, max_cached_invocations=0)
         values, _ = private.acquire({3: (7, 131)}, None)
         self.assertEqual(private.statistics()["cached_bytes"], 0)
