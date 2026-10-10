@@ -233,7 +233,8 @@ class TestMegaDsaTraining(SharedRootFixture):
                             heap_generation=self.root.generation)
         self.invocation = self.workspace.prepare(self.meta)
         self.model = module.MegaDsa(self.workspace, self.invocation, heads=32, attention_scale=.1,
-                                    schedule=MixedSfaSchedule(7), normalization=DsaLossNormalization(4), loss_coeff=.25)
+                                    schedule=MixedSfaSchedule(7), normalization=DsaLossNormalization(4), loss_coeff=.25,
+                                    kl_backend="reference")
         self.inputs = tuple(torch.ones(shape, dtype=torch.bfloat16, requires_grad=True)
                             for shape in self.model.input_shapes)
         self.raw_index_gradients = tuple((torch.arange(4, dtype=tensor.dtype) + 1).reshape(
@@ -253,6 +254,23 @@ class TestMegaDsaTraining(SharedRootFixture):
         args[15].fill_(0)
         args[16].fill_(1)
 
+    def _execute_training(self, *args):
+        self.assertIs(self.root.lease_owner, self.workspace.consumer)
+        self.assertEqual(args[9].shape, (6, 20, 64))
+        self.assertEqual(args[12], (2, 4))
+        for index in (1, 3, 5):
+            args[index].fill_(1)
+        args[14].fill_(-1)
+        args[14][:, 0, 0] = 0
+        args[15].fill_(0)
+        args[16].copy_(args[2] * 3)
+        args[17].fill_(0)
+        args[18].fill_(1)
+        args[19].copy_(self.raw_index_gradients[0])
+        args[20].copy_(self.raw_index_gradients[1][:, None])
+        args[21].copy_(self.raw_index_gradients[2].to(args[21].dtype))
+        args[22].fill_(8)
+
     @contextmanager
     def _patches(self):
         with ExitStack() as stack:
@@ -262,6 +280,10 @@ class TestMegaDsaTraining(SharedRootFixture):
                 stack.enter_context(patch.object(torch.ops.hyper_parallel, name, return_value=2, create=True))
             stack.enter_context(patch.object(torch.ops.hyper_parallel, "dsa_fused_cp_forward_out",
                                             side_effect=self._execute, create=True))
+            stack.enter_context(patch.object(torch.ops.hyper_parallel, "dsa_fused_training_version",
+                                            return_value=1, create=True))
+            stack.enter_context(patch.object(torch.ops.hyper_parallel, "dsa_fused_cp_training_out",
+                                            side_effect=self._execute_training, create=True))
             kl = stack.enter_context(patch.object(module, "_selected_kl_gradients", return_value=(
                 *self.raw_index_gradients, torch.tensor(8.))))
             backward = stack.enter_context(patch.object(self.model.core.backward_backend, "_backward_saved",
@@ -271,7 +293,7 @@ class TestMegaDsaTraining(SharedRootFixture):
     def _assert_index_gradients(self, actual, upstream=7):
         for index, (value, global_gradient) in enumerate(zip(actual, self.raw_index_gradients)):
             ids = self.meta.kv_global_ids if index == 1 else self.meta.q_global_ids
-            expected = (global_gradient * (.25 / 4 * upstream))[list(ids)]
+            expected = (global_gradient.to(self.inputs[index + 4].dtype) * (.25 / 4 * upstream))[list(ids)]
             torch.testing.assert_close(value, expected, rtol=0, atol=0)
             self.assertEqual(value.dtype, self.inputs[index + 4].dtype)
 
@@ -359,7 +381,7 @@ class TestMegaDsaTraining(SharedRootFixture):
                 self.assertEqual(loss.requires_grad, not freeze_index)
 
     def test_fp32_kl_weight_rejects_before_forward_without_implicit_precision_conversion(self):
-        """LI supports FP32 weights, while the current selected-KL schema requires BF16."""
+        """LI supports FP32 weights, while the Omni reference selected-KL schema requires BF16."""
         with patch.object(self.model.core.backend, "forward") as forward:
             with self.assertRaisesRegex(ValueError, "KL requires BF16"):
                 self.model(*self.inputs[:6], self.inputs[6].detach().float().requires_grad_(), self.meta)
@@ -376,3 +398,38 @@ class TestMegaDsaTraining(SharedRootFixture):
                 actual, gradients, (torch.bfloat16, torch.bfloat16, torch.float32))):
             rows = self.meta.kv_global_ids if field == 1 else self.meta.q_global_ids
             torch.testing.assert_close(value, expected[list(rows)].to(dtype), rtol=0, atol=0)
+
+    def test_native_kl_uses_owned_forward_derivatives_and_scales_once(self):
+        """Native BF16/FP32 KL skips host KL and restores both objectives in independent owner orders."""
+        self.model = module.MegaDsa(self.workspace, self.invocation, heads=32, attention_scale=.1,
+                                    schedule=MixedSfaSchedule(7), normalization=DsaLossNormalization(4), loss_coeff=.25)
+        self.assertEqual(self.model.kl_backend, "native")
+        for dtype in (torch.bfloat16, torch.float32):
+            self.inputs = (*self.inputs[:6], self.inputs[6].detach().to(dtype).requires_grad_())
+            for kl_only in (False, True):
+                with self.subTest(dtype=dtype, kl_only=kl_only), self._patches() as (kl, backward):
+                    output, loss = self.model(*self.inputs, self.meta)
+                    self.assertEqual(float(loss.detach()), .5)
+                    actual = torch.autograd.grad(loss * 7 if kl_only else output.sum() + loss * 7,
+                                                self.inputs, allow_unused=True)
+                    kl.assert_not_called()
+                    self.assertEqual(backward.call_count, 0 if kl_only else 1)
+                    if kl_only:
+                        self.assertTrue(all(value is None for value in actual[:4]))
+                    self._assert_index_gradients(actual[4:])
+
+    @patch.object(DefaultDeviceType, "get_device_type", return_value="cpu")
+    def test_native_kl_checkpoint_and_retained_backward_preserve_raw_derivatives(self, _device_type):
+        """Saved native derivatives survive later publication, repeated VJPs and recomputed forward."""
+        self.model.kl_backend = "native"
+        with self._patches() as (kl, _backward):
+            output, loss = self.model(*self.inputs, self.meta)
+            self.model(*(tensor.detach() + .25 for tensor in self.inputs), replace(self.meta, layer=3))
+            first = torch.autograd.grad(output.sum() + loss * 7, self.inputs, retain_graph=True)
+            second = torch.autograd.grad(output.sum() + loss * 7, self.inputs)
+            output, loss = checkpoint(lambda *values: self.model(*values, self.meta),
+                                      *self.inputs, use_reentrant=False)
+            third = torch.autograd.grad(output.sum() + loss * 7, self.inputs)
+            kl.assert_not_called()
+        for actual in (first, second, third):
+            self._assert_index_gradients(actual[4:])

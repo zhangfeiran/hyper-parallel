@@ -219,6 +219,10 @@ function validate_multicore_vendor() {
         aclnnHyperDsaMixedTileGetWorkspaceSize
         aclnnHyperDsaMixedIndexer
         aclnnHyperDsaMixedIndexerGetWorkspaceSize
+        aclnnHyperDsaFusedTraining
+        aclnnHyperDsaFusedTrainingGetWorkspaceSize
+        aclnnHyperDsaFusedCpTraining
+        aclnnHyperDsaFusedCpTrainingGetWorkspaceSize
         aclnnHyperDsaMixedKl
         aclnnHyperDsaMixedKlGetWorkspaceSize
         aclnnHyperDsaMixedGrad
@@ -262,7 +266,7 @@ function validate_multicore_vendor() {
     for soc in "${validation_socs[@]}"; do
         validation_ops=(hyper_mega_moe hyper_mega_moe_grad)
         if [[ "${soc}" == "ascend910b" ]]; then
-            validation_ops+=(hyper_dsa_mixed_tile hyper_dsa_mixed_indexer hyper_dsa_mixed_grad hyper_dsa_mixed_kl)
+            validation_ops+=(hyper_dsa_mixed_tile hyper_dsa_mixed_indexer hyper_dsa_mixed_grad hyper_dsa_mixed_kl hyper_dsa_fused_training)
         fi
         for op_name in "${validation_ops[@]}"; do
             mapfile -t artifacts < <(
@@ -296,7 +300,7 @@ function validate_multicore_vendor() {
             "${soc} binary index"
         validation_ops=(hyper_mega_moe hyper_mega_moe_grad)
         if [[ "${soc}" == "ascend910b" ]]; then
-            validation_ops+=(hyper_dsa_mixed_tile hyper_dsa_mixed_indexer hyper_dsa_mixed_grad hyper_dsa_mixed_kl)
+            validation_ops+=(hyper_dsa_mixed_tile hyper_dsa_mixed_indexer hyper_dsa_mixed_grad hyper_dsa_mixed_kl hyper_dsa_fused_training)
         fi
         for op_name in "${validation_ops[@]}"; do
             require_nonempty_artifact \

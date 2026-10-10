@@ -237,14 +237,16 @@ def _compose_hyper_parallel_ops(
     _compose_mixed_grad(source_root, transformer_copy)
     _compose_mixed_kl(source_root, transformer_copy)
     _compose_fused_forward(source_root, transformer_copy)
+    _compose_fused_training(source_root, transformer_copy)
     _compose_fused_grad(source_root, transformer_copy)
     _compose_cp_attention(source_root, transformer_copy)
     for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad", "hyper_dsa_mixed_kl",
-                 "hyper_dsa_fused_forward", "hyper_dsa_fused_grad", "hyper_dsa_cp_attention"):
+                 "hyper_dsa_fused_forward", "hyper_dsa_fused_training", "hyper_dsa_fused_grad",
+                 "hyper_dsa_cp_attention"):
         runtime = source_root / name / "op_kernel" / "runtime"
         runtime.mkdir()
         shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_mixed_group.h", runtime / "dsa_mixed_group.h")
-        if name in ("hyper_dsa_fused_forward", "hyper_dsa_cp_attention"):
+        if name in ("hyper_dsa_fused_forward", "hyper_dsa_fused_training", "hyper_dsa_cp_attention"):
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_transport.h", runtime / "dsa_cp_transport.h")
         if name == "hyper_dsa_fused_grad":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_grad_transport.h", runtime / "dsa_cp_grad_transport.h")
@@ -337,6 +339,30 @@ def _compose_fused_forward(source_root: Path, transformer_copy: Path) -> None:
         root / "op_kernel" / "sfa_template_modes.h")
 
 
+def _compose_fused_training(source_root: Path, transformer_copy: Path) -> None:
+    """Compose LI/SFA/KL callable closures without mutating the comparison operators."""
+    root = source_root / "hyper_dsa_fused_training"
+    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_fused_training", root)
+    shutil.copytree(transformer_copy / "common" / "include" / "err", root / "op_host" / "err")
+    for short, operator in (("li", "lightning_indexer"), ("sfa", "sparse_flash_attention")):
+        upstream = transformer_copy / "attention" / operator
+        shutil.copytree(upstream / "op_kernel", root / "op_kernel" / short)
+        _export_tiling_declarations(upstream / "op_host" / f"{operator}_tiling.h",
+                                    root / "op_host" / f"{short}_tiling_data.h")
+    upstream = transformer_copy / "attention" / "sparse_lightning_indexer_grad_kl_loss"
+    shutil.copytree(upstream / "op_kernel" / "arch22", root / "op_kernel" / "kl" / "arch22")
+    # SFA and KL define these helpers globally; only the combined translation unit needs distinct names.
+    names = {"Min": "KlMin", "BlockAlign": "KlBlockAlign",
+             "SFA_SOFTMAX_FLASHV2_CFG_WITHOUT_BRC": "KL_SOFTMAX_FLASHV2_CFG_WITHOUT_BRC"}
+    pattern = re.compile(r"\b(" + "|".join(names) + r")\b")
+    for header in (root / "op_kernel" / "kl" / "arch22").glob("*.h"):
+        text = header.read_text(encoding="utf-8")
+        header.write_text(pattern.sub(lambda match: names[match.group()], text), encoding="utf-8")
+    _export_sfa_template_modes(
+        root / "op_kernel" / "sfa" / "sparse_flash_attention_template_tiling_key.h",
+        root / "op_kernel" / "sfa_template_modes.h")
+
+
 def _compose_cp_attention(source_root: Path, transformer_copy: Path) -> None:
     """Compose only the locked attention closure for external Top-K CP execution."""
     root = source_root / "hyper_dsa_cp_attention"
@@ -373,6 +399,7 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
         source_root / "hyper_dsa_mixed_kl" / "op_kernel" / "hyper_dsa_mixed_kl.cpp",
         source_root / "hyper_dsa_fused_forward" / "op_kernel" / "hyper_dsa_fused_forward.cpp",
+        source_root / "hyper_dsa_fused_training" / "op_kernel" / "hyper_dsa_fused_training.cpp",
         source_root / "hyper_dsa_fused_grad" / "op_kernel" / "hyper_dsa_fused_grad.cpp",
         source_root / "hyper_dsa_cp_attention" / "op_kernel" / "hyper_dsa_cp_attention.cpp",
         source_root / "shmem" / "data_plane" / "rma.h",

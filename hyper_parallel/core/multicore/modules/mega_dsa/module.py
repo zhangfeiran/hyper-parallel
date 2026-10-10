@@ -302,16 +302,22 @@ class _DsaTraining(torch.autograd.Function):
         main, index = inputs[:4], inputs[4:]
         backend = module.core.backend
         invocation = replace(module.core.prepared_invocation, batch_meta=batch_meta)
+        options = {"selected_kl": True} if module.kl_backend == "native" and module.loss_coeff != 0 else {}
         result = backend.forward(invocation, tuple(tensor.detach() for tensor in main),
-                                 tuple(tensor.detach() for tensor in index))
+                                 tuple(tensor.detach() for tensor in index), **options)
         saved = result.saved
         if module.loss_coeff == 0:
             index_gradients = tuple(torch.zeros_like(tensor) for tensor in result.index_states)
             loss = saved.states[0].new_zeros((), dtype=torch.float32)
         else:
-            *index_gradients, loss = _selected_kl_gradients(
-                *result.index_states, saved.states, saved.indices,
-                CannDsaStats(saved.forward[1], saved.forward[2]), backend.native_layout, backend.scale)
+            if module.kl_backend == "native":
+                if len(result.kl_gradients) != 3 or result.kl_loss is None:
+                    raise RuntimeError("native KL forward did not publish owned raw derivatives and loss")
+                index_gradients, loss = result.kl_gradients, result.kl_loss
+            else:
+                *index_gradients, loss = _selected_kl_gradients(
+                    *result.index_states, saved.states, saved.indices,
+                    CannDsaStats(saved.forward[1], saved.forward[2]), backend.native_layout, backend.scale)
             scale = module.loss_coeff * module.normalization.local_sum_scale / backend.layout.cp_size
             index_gradients = tuple(gradient * scale for gradient in index_gradients)
             loss = loss * scale
@@ -357,20 +363,21 @@ class _DsaTraining(torch.autograd.Function):
 
 
 class MegaDsa(torch.nn.Module):
-    """Parameter-free CP training over native LI/Top-K/SFA and host-dispatched selected KL.
+    """Parameter-free CP training over native LI/Top-K/SFA and an explicit selected-KL backend.
 
     All members call in matching forward/backward order, with matching objective
     and requires-grad masks. Index inputs retain gradients; hard Top-K and the
     main objective do not update them. KL teacher states are detached. Each rank
     returns a replicated global KL contribution divided by CP size, following
     the existing CANN CP reference. Apply aux_loss_auto_scale once in the caller.
-    This first P4 composition preserves full KV replication and uses a separate
-    KL launch and FP32 collective owner return; it is not fused KL/sparse fetch.
+    The native backend runs six LI/SFA/KL phases in one kernel. The reference
+    backend uses the separately activated Omni KL primitive. Both preserve
+    full KV replication and FP32 collective index-gradient owner return.
     """
 
     def __init__(self, workspace: MegaDsaWorkspace, invocation: DsaWorkspaceInvocation, *, heads: int,
                  attention_scale: float, schedule: MixedSfaSchedule, normalization: DsaLossNormalization,
-                 loss_coeff: float = 1.0) -> None:
+                 loss_coeff: float = 1.0, kl_backend: str = "native") -> None:
         """Declare native dimensions and the actual downstream loss reducer at preparation."""
         super().__init__()
         if not isinstance(normalization, DsaLossNormalization):
@@ -379,15 +386,18 @@ class MegaDsa(torch.nn.Module):
             raise ValueError("MegaDsa normalization requires the complete global query count")
         if not math.isfinite(loss_coeff) or loss_coeff < 0:
             raise ValueError("loss_coeff must be finite and nonnegative")
-        declaration = (normalization, float(loss_coeff))
+        if kl_backend not in ("native", "reference"):
+            raise ValueError("kl_backend must be native or reference")
+        declaration = (normalization, float(loss_coeff), kl_backend)
         if len(workspace.root.members) > 1:
             declarations = [None] * len(workspace.root.members)
             dist.all_gather_object(declarations, declaration, group=workspace.root.group)
             if any(item != declaration for item in declarations):
-                raise ValueError("MegaDsa members disagree on KL normalization or loss coefficient")
+                raise ValueError("MegaDsa members disagree on KL normalization, loss coefficient or KL backend")
         self.core = MegaDsaCore(workspace, invocation, heads=heads, attention_scale=attention_scale, schedule=schedule)
         self.normalization = normalization
         self.loss_coeff = float(loss_coeff)
+        self.kl_backend = kl_backend
         meta = invocation.batch_meta
         queries, keys = len(meta.q_global_ids), len(meta.kv_global_ids)
         self.input_shapes = ((queries, heads, 512), (keys, 512), (queries, heads, 64), (keys, 64),
@@ -398,8 +408,8 @@ class MegaDsa(torch.nn.Module):
                 merge_weight: torch.Tensor, batch_meta: DsaBatchMeta) -> tuple[torch.Tensor, torch.Tensor]:
         """Return local compressed output and a normalized replicated KL contribution.
 
-        Merge weights are already scaled signed BF16 model outputs for KL;
-        FP32 weights require loss_coeff=0. All
+        Merge weights are already scaled signed BF16/FP32 model outputs for native KL;
+        the reference backend requires BF16 weights when loss_coeff is nonzero. All
         other inputs are BF16 and follow independent prepared Q/K owner orders.
         Native indexer provenance supplies complete causal Top-K; arbitrary
         external subsets are supported by MegaDsaCore, not this stock KL path.
@@ -411,8 +421,8 @@ class MegaDsa(torch.nn.Module):
             if (not isinstance(tensor, torch.Tensor) or tensor.shape != shape
                     or tensor.device != device or tensor.dtype not in dtypes):
                 raise ValueError("MegaDsa inputs must match prepared BF16 Q/K shapes and BF16/FP32 weights")
-        if self.loss_coeff != 0 and merge_weight.dtype != torch.bfloat16:
-            raise ValueError("selected KL requires BF16 merge weights; FP32 index weights require loss_coeff=0")
+        if self.loss_coeff != 0 and self.kl_backend == "reference" and merge_weight.dtype != torch.bfloat16:
+            raise ValueError("reference selected KL requires BF16 merge weights; select native KL for FP32 weights")
         if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in inputs):
             self.core.backward_backend.check_native_support()
         return _DsaTraining.apply(self, batch_meta, *inputs)

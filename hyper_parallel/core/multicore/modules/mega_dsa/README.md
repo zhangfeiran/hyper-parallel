@@ -1188,7 +1188,7 @@ empty-set and transport contracts; the pointwise/model limitations above remain.
 
 ### P4 training composition: native selection plus selected KL
 
-The parameter-free [MegaDsa](module.py) combines the existing CP native
+The initial parameter-free [MegaDsa](module.py) composition combined the existing CP native
 LI/Top-K/SFA forward with native main backward and the locked enhance selected
 KL operator. It returns `(local_compressed_output, auxiliary_loss)`. The model
 still owns projections, RoPE, state dictionaries and `aux_loss_auto_scale`.
@@ -1432,7 +1432,113 @@ NPU_WAIT_VISIBLE_DEVICES=0 NPU_WAIT_NUM_CARDS=1 NPU_WAIT_POLL_SECONDS=60 \
 
 The [extended ST launcher](../../../../../tests/torch/multicore/test_dsa_mixed_kl.py)
 keeps framework imports in the worker. Standalone callable-phase acceptance does not
-establish KL integration into the CP task DAG. `MegaDsa` still uses its explicitly
-activated host KL reference path and keeps nonzero-KL FP32 weights outside its
-admitted training contract. Device request/count generation, sparse gradient owner
-return, CP8/CP×TP training and complete-step performance remain later requirements.
+establish KL integration into the CP task DAG. The training backend at that milestone
+used its explicitly activated host KL reference path and excluded nonzero-KL FP32
+weights. The following six-phase adapter adds a distinct native training path.
+
+## Six-phase LI/SFA/KL training kernel
+
+The [fused training probe](fused_training.py) composes LI main, LI merge, SFA,
+KL initialization, KL compute and KL post-processing into one native launch. A
+reserved progress group releases each phase only after every compute group has
+completed its logical tasks. KL consumes the selected indices and SFA max/sum
+after their producing phases close. Each invocation owns independent LI/KL scratch,
+nine arithmetic outputs and six phase traces. The KL tile retains its logical
+query/loss partition IDs while reusing physical scratch; it contains no whole-chip
+barrier. The native API takes prepared host cumulative lengths without reading
+selection or length tensors back to the host.
+
+The composite has BF16 and FP32 merge-weight variants for both single-card math
+and CP transport. Other states remain BF16, main heads are 32/64, index heads are
+64, index width is 128, compressed width is 512, RoPE width is 64 and K is 2048.
+FP32 weights are preserved and produce an FP32 weight derivative. Deterministic
+KL and repeated per-phase traversals are outside this adapter's contract.
+
+`MegaDsa` defaults to `kl_backend="native"` for the six-phase CP forward. It saves the
+raw loss and three index derivatives under autograd saved-tensor hooks, applies
+the declared coefficient/global normalization/CP contribution once, and applies
+the incoming auxiliary cotangent once during backward. Main backward continues
+to use the existing native owner-return kernel. LM-only and KL-only gradient
+isolation, independent Q/K owner orders and delayed backward use the same saved
+state contract. A zero coefficient uses the three-phase LI/SFA kernel and exact
+zero index derivatives. `kl_backend="reference"` selects the separately activated
+Omni primitive and requires BF16 weights when KL is enabled. CP members must agree
+on backend, coefficient, normalization and their forward/backward schedule.
+
+The native production path needs the activated multicore payload and CANN. The
+explicit reference backend and validators additionally need the Omni comparison
+vendor. Both paths currently replicate packed Q, pull full KV and return index
+gradients with FP32 collectives. Selected request/count generation and sparse
+owner-gradient transport remain open; the six-phase kernel does not establish
+those transport features or a complete-step speedup.
+
+The [six-phase validator](../../examples/mega_dsa_fused_training_validate.py)
+checks all five forward outputs against stock CANN, raw KL loss and three
+derivatives against stock CANN and an independent FP32 oracle, and all six
+ordered device releases. BF16 weights also compare against Omni. It covers signed
+BF16/FP32 weights, including FP32 values outside the BF16 grid, H32/H64, group
+counts 1/2/7/19 and three distinct results retained across later submissions.
+`--long-history` adds packed lengths `(3,2113)` and `(2176,2240)` with 65/320
+genuinely truncated query histories. Numerical thresholds match the existing
+KL probes; original pointwise results remain separately recorded.
+
+```bash
+NPU_WAIT_VISIBLE_DEVICES=0 NPU_WAIT_NUM_CARDS=1 NPU_WAIT_POLL_SECONDS=60 \
+  bash ~/doc/npu_wait_and_run.sh python -m \
+  hyper_parallel.core.multicore.examples.mega_dsa_fused_training_validate \
+  --output /tmp/mega_dsa_fused_training.json --long-history
+
+NPU_WAIT_VISIBLE_DEVICES=0,1,2,3 NPU_WAIT_NUM_CARDS=4 NPU_WAIT_POLL_SECONDS=60 \
+  bash ~/doc/npu_wait_and_run.sh python -m torch.distributed.run \
+  --standalone --nproc_per_node=4 \
+  --module hyper_parallel.core.multicore.examples.mega_dsa_training_cp_validate \
+  --output-dir /tmp/mega_dsa_fused_training_cp4 --kl-backend native
+```
+
+The [single-card ST](../../../../../tests/torch/multicore/test_dsa_fused_training.py)
+keeps framework imports in the worker. The existing CP training launchers use the
+native backend by default in their validator; `--kl-backend reference` retains the
+earlier comparison matrix. Native short fixtures additionally exercise nonzero-KL
+FP32 weights with joint, KL-only and checkpoint objectives plus an explicitly
+selected BF16 reference case. Each native nonzero-KL forward must emit all six
+phase traces and saved KL outputs.
+
+The complete native build passes and adds two fused-training device objects
+containing the four BF16/FP32 and CP/non-CP variants;
+all 20 previously accepted device objects retain their hashes. The short
+single-card matrix passes 48 cases, 240 exact forward-output comparisons and
+192 raw loss/gradient measurements against each applicable baseline. Maximum
+relative L2 is 0.0024263695767346456 against the independent FP32 oracle. CPU
+regression passes 158 tests and 268 subtests, including raw derivative ownership,
+reference bypass, FP32 weight gradients, checkpoint and retained-graph scaling.
+The combined short/long single-card matrix also passes 96 cases: 480 forward
+outputs are exact and all 384 raw KL measurements per baseline pass the original
+pointwise threshold. Maximum relative L2 is 0.00010109051444359716 against stock
+and 0.0024263695767346456 against the FP32 oracle.
+
+The CP1/CP2/CP4 short native training matrix passes all seven rank reports:
+140 positive training scenarios and seven expected FP32-KL rejections through
+the explicitly selected reference backend. The matrix includes 189 forward
+invocations and 126 native main-backward invocations. All 875 available native
+seven-gradient comparisons pass the original pointwise threshold. Of the 189
+forwards, 168 use six phases and 21 use the explicit reference or zero-KL path. Stock TopK
+sets/values and original CANN outputs are exact; isolation, zero coefficients,
+zero auxiliary cotangents, reducer compensation, empty owners, retained graphs,
+checkpoint, delayed publication and cross-stream execution pass. BF16 reference
+and nonzero-KL FP32 native cases pass alongside native BF16 cases.
+
+All 875 independent FP32 gradient measurements satisfy the existing finite
+relative-L2/maximum-absolute criterion; maximum relative L2 is
+0.0035769540586985246. Original pointwise failures remain for 107/875 gradient
+measurements and 120/140 output measurements. Maximum FP32 output relative L2
+is 0.0022124857085496536. All 140 FP32 loss measurements pass pointwise, with
+maximum relative error 3.0094478258633895e-05 and maximum absolute error
+3.236345946788788e-08. These component results preserve the earlier distinction
+between native pointwise agreement and independent FP32 relative-L2 acceptance.
+The native six-phase long-history CP1/CP2/CP4 matrix is queued separately.
+After selecting native KL as the module default, CPU regression over megaDSA
+and shared-root SHMEM passes 191 tests and 282 subtests. The reference fixture
+selects its backend explicitly, while the native tests exercise the constructor
+default and confirm FP32 derivative dtype and one-time auxiliary scaling.
+Full-model BF16 acceptance, CP8/CP×TP and complete-step performance remain separate
+requirements.

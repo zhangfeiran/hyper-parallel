@@ -1,0 +1,121 @@
+/*
+ * Copyright 2026 Huawei Technologies Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "aclnn_hyper_dsa_fused_training.h"  // NOLINT(build/include_subdir)
+#include <array>
+#include "aclnn_kernels/common/op_error_check.h"
+#include "aclnn_kernels/contiguous.h"
+#include "opdev/tensor_view_utils.h"
+#include "opdev/make_op_executor.h"
+#include "opdev/op_def.h"
+#include "opdev/op_dfx.h"
+#include "opdev/op_executor.h"
+
+namespace l0op {
+OP_TYPE_REGISTER(HyperDsaFusedTraining);
+}
+using l0op::HyperDsaFusedTrainingOpTypeId;
+
+namespace {
+aclnnStatus BuildFusedExecutor(const std::array<const aclTensor *, 8> &originalInputs,
+                               const std::array<const aclTensor *, 8> &control, const aclIntArray *klLengths,
+                               double scale, const std::array<const aclTensor *, 9> &destinations,
+                               uint64_t *workspaceSize, aclOpExecutor **executor) {
+  OP_CHECK_COMM_INPUT(workspaceSize, executor);
+  auto owner = CREATE_EXECUTOR();
+  CHECK_RET(owner.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
+  auto inputs = originalInputs;
+  auto outputs = destinations;
+  for (auto &input : inputs) {
+    input = l0op::Contiguous(input, owner.get());
+    CHECK_RET(input != nullptr, ACLNN_ERR_INNER_NULLPTR);
+  }
+  for (auto &output : outputs) {
+    output = l0op::Contiguous(output, owner.get());
+    CHECK_RET(output != nullptr, ACLNN_ERR_INNER_NULLPTR);
+  }
+  const auto *lengthsConst = owner->ConvertToTensor(klLengths, op::DataType::DT_INT64);
+  CHECK_RET(lengthsConst != nullptr, ACLNN_ERR_INNER_NULLPTR);
+  const float scaleValue = static_cast<float>(scale);
+  auto launch = [&](aclOpExecutor *executor) {
+    return ADD_TO_LAUNCHER_LIST_AICORE(
+      HyperDsaFusedTraining,
+      OP_INPUT(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6], inputs[7], control[0],
+               control[1], control[2], control[3], lengthsConst, control[4], control[5], control[6], control[7]),
+      OP_OUTPUT(
+        const_cast<aclTensor *>(outputs[0]), const_cast<aclTensor *>(outputs[1]), const_cast<aclTensor *>(outputs[2]),
+        const_cast<aclTensor *>(outputs[3]), const_cast<aclTensor *>(outputs[4]), const_cast<aclTensor *>(outputs[5]),
+        const_cast<aclTensor *>(outputs[6]), const_cast<aclTensor *>(outputs[7]), const_cast<aclTensor *>(outputs[8])),
+      OP_ATTR(scaleValue));
+  };
+  const auto status = launch(owner.get());
+  CHECK_RET(status == ACL_SUCCESS, status);
+  for (size_t index = 0; index < outputs.size(); ++index) {
+    CHECK_RET(l0op::ViewCopy(outputs[index], destinations[index], owner.get()) != nullptr, ACLNN_ERR_INNER_NULLPTR);
+  }
+  if (control[4] != nullptr) {
+    for (size_t index : {1U, 3U, 5U}) {
+      CHECK_RET(l0op::ViewCopy(inputs[index], originalInputs[index], owner.get()) != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    }
+  }
+  *workspaceSize = owner->GetWorkspaceSize();
+  owner.ReleaseTo(executor);
+  return ACLNN_SUCCESS;
+}
+
+}  // namespace
+
+extern "C" aclnnStatus aclnnHyperDsaFusedTrainingGetWorkspaceSize(
+  const aclTensor *indexQuery, const aclTensor *indexKey, const aclTensor *query, const aclTensor *compressed,
+  const aclTensor *queryRope, const aclTensor *keyRope, const aclTensor *weights, const aclTensor *lengths,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, const aclTensor *klRetained,
+  const aclIntArray *klLengths, double scale, const aclTensor *indices, const aclTensor *values,
+  const aclTensor *attention, const aclTensor *maximum, const aclTensor *sum, const aclTensor *gradIndexQuery,
+  const aclTensor *gradIndexKey, const aclTensor *gradWeight, const aclTensor *loss, uint64_t *workspaceSize,
+  aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaFusedTraining, DFX_IN(indexQuery, query, config), DFX_OUT(indices, attention));
+  return BuildFusedExecutor({indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths},
+                            {config, trace, retained, klRetained, nullptr, nullptr, nullptr, nullptr}, klLengths, scale,
+                            {indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight, loss},
+                            workspaceSize, executor);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaFusedCpTrainingGetWorkspaceSize(
+  const aclTensor *indexQuery, const aclTensor *indexKey, const aclTensor *query, const aclTensor *compressed,
+  const aclTensor *queryRope, const aclTensor *keyRope, const aclTensor *weights, const aclTensor *lengths,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, const aclTensor *klRetained,
+  const aclIntArray *klLengths, double scale, const aclTensor *indices, const aclTensor *values,
+  const aclTensor *attention, const aclTensor *maximum, const aclTensor *sum, const aclTensor *gradIndexQuery,
+  const aclTensor *gradIndexKey, const aclTensor *gradWeight, const aclTensor *loss, const aclTensor *arena,
+  const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace, uint64_t *workspaceSize,
+  aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaFusedCpTraining, DFX_IN(indexQuery, query, config), DFX_OUT(indices, attention));
+  return BuildFusedExecutor({indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths},
+                            {config, trace, retained, klRetained, arena, metadata, requests, transportTrace}, klLengths,
+                            scale,
+                            {indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight, loss},
+                            workspaceSize, executor);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaFusedTraining(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                  aclrtStream stream) {
+  L2_DFX_PHASE_2(aclnnHyperDsaFusedTraining);
+  return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaFusedCpTraining(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                    aclrtStream stream) {
+  L2_DFX_PHASE_2(aclnnHyperDsaFusedCpTraining);
+  return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}

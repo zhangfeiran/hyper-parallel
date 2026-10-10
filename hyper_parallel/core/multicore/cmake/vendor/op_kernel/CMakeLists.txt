@@ -70,6 +70,16 @@ if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
         -mllvm -cce-vf-remove-membar=false
         -mllvm -cce-aicore-hoist-movemask=false)
     npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE HyperDsaFusedTraining
+        KERNEL_DIR ./hyper_dsa_fused_training/op_kernel
+        KERNEL_FILE hyper_dsa_fused_training.cpp
+        COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+    )
+    npu_op_kernel_options(ascendc_kernels OP_TYPE HyperDsaFusedTraining OPTIONS
+        --cce-auto-sync=off -Wno-deprecated-declarations
+        -mllvm -cce-vf-remove-membar=false
+        -mllvm -cce-aicore-hoist-movemask=false)
+    npu_op_kernel_sources(ascendc_kernels
         OP_TYPE HyperDsaFusedForward
         KERNEL_DIR ./hyper_dsa_fused_forward/op_kernel
         KERNEL_FILE hyper_dsa_fused_forward.cpp
