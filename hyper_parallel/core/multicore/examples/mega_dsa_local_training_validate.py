@@ -28,25 +28,48 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-import torch_npu  # noqa: F401  # pylint: disable=unused-import
+import torch_npu  # pylint: disable=unused-import
 from torch.utils.checkpoint import checkpoint
 
 import hyper_parallel
 from hyper_parallel.core.multicore.examples.mega_dsa_fused_cp_validate import _metadata
-from hyper_parallel.core.multicore.examples.mega_dsa_local_cp_backward_validate import _loaded_library_identity
-from hyper_parallel.core.multicore.examples.mega_dsa_local_cp_validate import _SCALE, _tile
-from hyper_parallel.core.multicore.examples.mega_dsa_local_training_oracle import (
-    ProjectionGeometry, project_local_states, projection_fixture, projection_vjp_metrics, projection_vjp_reference,
+from hyper_parallel.core.multicore.examples.mega_dsa_local_cp_backward_validate import (
+    _loaded_library_identity,
 )
-from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import FusedDsaCpForwardProbe
-from hyper_parallel.core.multicore.modules.mega_dsa.local_training import FusedDsaLocalCpTrainingProbe
-from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta, DsaLossNormalization
+from hyper_parallel.core.multicore.examples.mega_dsa_local_cp_validate import (
+    _SCALE,
+    _tile,
+)
+from hyper_parallel.core.multicore.examples.mega_dsa_local_training_oracle import (
+    ProjectionGeometry,
+    project_local_states,
+    projection_fixture,
+    projection_vjp_metrics,
+    projection_vjp_reference,
+)
+from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import (
+    FusedDsaCpForwardProbe,
+)
+from hyper_parallel.core.multicore.modules.mega_dsa.local_training import (
+    FusedDsaLocalCpTrainingProbe,
+)
+from hyper_parallel.core.multicore.modules.mega_dsa.metadata import (
+    DsaBatchMeta,
+    DsaLossNormalization,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
 from hyper_parallel.core.multicore.modules.mega_dsa.projection_precision import (
-    coupled_projection_objective_check, validate_loaded_projection_reference, validate_projection_reference_profile,
+    coupled_projection_objective_check,
+    validate_loaded_projection_reference,
+    validate_projection_reference_profile,
 )
-from hyper_parallel.core.multicore.modules.mega_dsa.reference_precision import reference_budget_passes
-from hyper_parallel.core.multicore.modules.mega_dsa.workspace import DsaWorkspaceSpec, MegaDsaWorkspace
+from hyper_parallel.core.multicore.modules.mega_dsa.reference_precision import (
+    reference_budget_passes,
+)
+from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
+    DsaWorkspaceSpec,
+    MegaDsaWorkspace,
+)
 from hyper_parallel.core.multicore.shmem.consumer import SharedShmemRoot
 
 _FIELDS = ("hidden", "query_projection", "compressed_projection", "query_rope_projection", "key_rope_projection",
@@ -153,7 +176,7 @@ def _check(peers, cpu_fixture, geometry, lengths, mode, coefficient, auxiliary, 
 
 
 def _step(workspace, backend, base_meta, geometry, cpu_fixture, *, tile_mode, weight_dtype,
-          mode, coefficient, auxiliary, divisor, replay, precision_budgets=None):
+          mode, coefficient, auxiliary, divisor, replay, precision_budgets=None, fused_kl=False):
     device = backend.layout.device
     tile = _tile(base_meta, tile_mode)
     layout = backend.prepare_local_queries(tile.q_global_ids)
@@ -165,12 +188,16 @@ def _step(workspace, backend, base_meta, geometry, cpu_fixture, *, tile_mode, we
     states = project_local_states(hidden, weights, geometry, query_rows, key_rows, weight_dtype)
     probe = FusedDsaLocalCpTrainingProbe(backend, normalization=DsaLossNormalization(base_meta.global_valid_queries,
                                                                                   divisor),
-                                        loss_coeff=coefficient, mode=mode)
+                                        loss_coeff=coefficient, mode=mode, fused_kl=fused_kl)
     invocation = workspace.prepare(replace(base_meta, layer=1, microbatch=2, invocation=workspace.transport_epoch+1))
     captured = []
     original = backend.forward_local
     def _capture(*args, **kwargs):
         result = original(*args, **kwargs)
+        selected_kl = bool(kwargs.get("selected_kl", False))
+        expected_phases = 9 if selected_kl else 6
+        if len(result.phase_traces) != expected_phases or (result.kl_loss is not None) != selected_kl:
+            raise RuntimeError("local training used an unexpected native phase graph")
         captured.append(result)
         return result
     def _forward(*inputs):
@@ -203,7 +230,8 @@ def _step(workspace, backend, base_meta, geometry, cpu_fixture, *, tile_mode, we
     peers = _snapshots(tile, states, captured[0], output, first, objective, loss)
     evidence = _check(peers, cpu_fixture, geometry, (3, 10), mode, coefficient, auxiliary, divisor,
                       precision_budgets=precision_budgets)
-    evidence.update(captured_forward_invocations=len(captured), replay=replay)
+    evidence.update(captured_forward_invocations=len(captured), replay=replay, fused_kl=fused_kl,
+                    native_forward_phase_counts=[len(result.phase_traces) for result in captured])
     return evidence
 
 

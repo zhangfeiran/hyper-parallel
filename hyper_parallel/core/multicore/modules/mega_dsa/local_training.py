@@ -22,12 +22,24 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import FusedCpSavedAttention, FusedDsaCpForwardProbe
-from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp_backward import FusedDsaCpBackwardProbe
-from hyper_parallel.core.multicore.modules.mega_dsa.local_kl import local_kl_gradients
-from hyper_parallel.core.multicore.modules.mega_dsa.local_query import DsaLocalQueryLayout
+from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import (
+    FusedCpSavedAttention,
+    FusedDsaCpForwardProbe,
+)
+from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp_backward import (
+    FusedDsaCpBackwardProbe,
+)
+from hyper_parallel.core.multicore.modules.mega_dsa.local_kl import (
+    LocalKlResult,
+    local_kl_gradients,
+)
+from hyper_parallel.core.multicore.modules.mega_dsa.local_query import (
+    DsaLocalQueryLayout,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaLossNormalization
-from hyper_parallel.core.multicore.modules.mega_dsa.workspace import DsaWorkspaceInvocation
+from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
+    DsaWorkspaceInvocation,
+)
 from hyper_parallel.core.multicore.torch.ops import _load_native
 
 
@@ -66,12 +78,16 @@ class _LocalCpTraining(torch.autograd.Function):
         states = (query, compressed, query_rope, key_rope)
         index = (index_query, index_key, merge_weight)
         probe.check_native_support()
+        fused = probe.fused_kl and probe.mode != "lm_only" and probe.loss_coeff != 0
+        extra = {"selected_kl": True} if fused else {}
         result = probe.forward_backend.forward_local(invocation, tuple(tensor.detach() for tensor in states),
                                                       tuple(tensor.detach() for tensor in index),
-                                                      query_layout=query_layout)
+                                                      query_layout=query_layout, **extra)
         scale = probe.loss_coeff * probe.normalization.local_sum_scale
         if probe.mode != "lm_only" and scale:
-            raw = local_kl_gradients(result)
+            raw = (LocalKlResult(result.kl_gradients, result.kl_key_partials, result.kl_loss,
+                                  result.phase_traces[-3:], result.kl_retained) if fused
+                   else local_kl_gradients(result))
             loss = raw.loss * scale
             gradients = (raw.gradients[0].float()*scale, raw.key_partials*scale, raw.gradients[2].float()*scale)
         else:
@@ -118,8 +134,9 @@ class _LocalCpTraining(torch.autograd.Function):
 class FusedDsaLocalCpTrainingProbe:
     """Local LI/pull/SFA training with raw native selected KL and independent gradient consumers.
 
-    This prototype retains separate native KL phases and complete index-K owner
-    reduction. Mode, coefficient and normalization are collectively declared at
+    Selected KL can run in the forward graph with ``fused_kl=True`` or through
+    separately submitted phases. Both retain complete index-K owner reduction.
+    Mode, coefficient, normalization and fusion are collectively declared at
     construction. Every member must enter the same forward/backward schedule,
     including empty owners, with compatible requires-grad policies. Projection
     callers detach hidden states before index projection so auxiliary gradients
@@ -127,7 +144,7 @@ class FusedDsaLocalCpTrainingProbe:
     """
 
     def __init__(self, forward: FusedDsaCpForwardProbe, *, normalization: DsaLossNormalization,
-                 loss_coeff: float = 1.0, mode: str = "lm_plus_kl") -> None:
+                 loss_coeff: float = 1.0, mode: str = "lm_plus_kl", fused_kl: bool = False) -> None:
         """Cold prepare a common objective contract before any native transport or training step."""
         if mode not in ("lm_only", "kl_only", "lm_plus_kl"):
             raise ValueError("local CP training mode must be lm_only, kl_only or lm_plus_kl")
@@ -139,7 +156,9 @@ class FusedDsaLocalCpTrainingProbe:
             raise ValueError("local CP training coefficient must be finite and nonnegative")
         if loss_coeff < 0:
             raise ValueError("local CP training coefficient must be finite and nonnegative")
-        declaration = (mode, float(loss_coeff), normalization)
+        if not isinstance(fused_kl, bool):
+            raise ValueError("local fused KL selection must be a boolean")
+        declaration = (mode, float(loss_coeff), normalization, fused_kl)
         peers = [declaration]
         if forward.layout.cp_size > 1:
             peers = [None]*forward.layout.cp_size
@@ -151,17 +170,19 @@ class FusedDsaLocalCpTrainingProbe:
         self.normalization = normalization
         self.loss_coeff = float(loss_coeff)
         self.mode = mode
+        self.fused_kl = fused_kl
         self._declaration = declaration
 
     def check_native_support(self) -> None:
         """Admit all needed native ABIs before acquiring the forward workspace lease."""
-        if self._declaration != (self.mode, self.loss_coeff, self.normalization):
+        if self._declaration != (self.mode, self.loss_coeff, self.normalization, self.fused_kl):
             raise ValueError("local training objective was modified; prepare a new probe")
         if self.mode != "kl_only":
             self.backward_backend.check_local_native_support()
         if self.mode != "lm_only" and self.loss_coeff:
             _load_native()
-            version = getattr(torch.ops.hyper_parallel, "dsa_local_mixed_kl_version", None)
+            name = "dsa_local_cp_training_version" if self.fused_kl else "dsa_local_mixed_kl_version"
+            version = getattr(torch.ops.hyper_parallel, name, None)
             if version is None or version() != 1:
                 raise RuntimeError("local CP training requires local KL adapter ABI 1; rebuild this checkout's payload")
 

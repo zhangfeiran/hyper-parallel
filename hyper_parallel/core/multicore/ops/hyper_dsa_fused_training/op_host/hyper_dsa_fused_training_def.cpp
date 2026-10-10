@@ -130,6 +130,12 @@ class HyperDsaFusedTraining : public OpDef {
       .ParamType(REQUIRED)
       .DataType({ge::DT_FLOAT, ge::DT_FLOAT})
       .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+    this->Input("kl_query_lengths")
+      .ParamType(OPTIONAL)
+      .DataType({ge::DT_INT64, ge::DT_INT64})
+      .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+      .ValueDepend(REQUIRED)
+      .AutoContiguous();
     this->Attr("scale").AttrType(REQUIRED).Float();
     this->Attr("with_kl").AttrType(OPTIONAL).Bool(true);
     this->AICore().AddConfig("ascend910b");

@@ -25,10 +25,14 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_dsa import fused_cp
 from hyper_parallel.core.multicore.modules.mega_dsa.cp_reference import DsaCpLayout
-from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp_backward import FusedDsaCpBackwardProbe
+from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp_backward import (
+    FusedDsaCpBackwardProbe,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
-from hyper_parallel.core.multicore.modules.mega_dsa.selected_requests import SELECTED_REQUESTS_MAGIC
+from hyper_parallel.core.multicore.modules.mega_dsa.selected_requests import (
+    SELECTED_REQUESTS_MAGIC,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
     DsaWorkspaceSpec,
     MegaDsaWorkspace,
@@ -95,6 +99,61 @@ class TestFusedCpSubmission(SharedRootFixture):
         index = (query[:, None, None].expand(-1, 64, 128).clone(),
                  key[:, None].expand(-1, 128).clone(), query[:, None].expand(-1, 64).clone())
         return main, index
+
+    def test_local_fused_kl_uses_one_submission_and_owned_fp32_plane(self):
+        """Nine phases use real local counts and retain pre-conversion keys without a second KL launch."""
+        calls = []
+        for ids in ((2, 0), ()):
+            with self.subTest(ids=ids):
+                backend = self._backend()
+                layout = backend.prepare_local_queries(ids)
+                main, index = self._local_states(ids)
+                def _native(*args, query_ids=ids):
+                    self.assertEqual(len(args), 35)
+                    self.assertEqual(args[9].shape, (9, 20, 64))
+                    self.assertEqual(args[29], (len(query_ids),))
+                    self.assertEqual(args[32].shape, (3, 1, 128))
+                    args[13].fill_(-1)
+                    args[14].zero_()
+                    args[15].copy_(args[2])
+                    args[16].zero_()
+                    args[17].fill_(1)
+                    if query_ids:
+                        plane = args[30][-3*512:].view(torch.float32).view(3, 128)
+                        plane.fill_(3.001+len(calls))
+                        args[31].copy_((args[0]+10).bfloat16())
+                        args[32].copy_(plane[:, None].bfloat16())
+                        args[33].copy_(args[6]+2)
+                        args[34].fill_(13.125)
+                    calls.append(args)
+                with patch.object(fused_cp, "_load_native"), \
+                     patch.object(fused_cp, "mixed_kl_workspace_bytes", return_value=512+3*512), \
+                     patch("hyper_parallel.core.multicore.modules.mega_dsa.mixed_kl.mixed_kl_workspace_bytes",
+                           return_value=512+3*512), \
+                     patch.object(torch.ops.hyper_parallel, "dsa_local_cp_forward_version", return_value=1,
+                                  create=True), \
+                     patch.object(torch.ops.hyper_parallel, "dsa_local_cp_training_version", return_value=1,
+                                  create=True), \
+                     patch.object(torch.ops.hyper_parallel, "dsa_local_cp_training_out", side_effect=_native,
+                                  create=True) as submit, \
+                     patch.object(backend.layout, "gather_query_fields", side_effect=AssertionError("Q gather")):
+                    first = backend.forward_local(self.invocation, main, index, query_layout=layout, selected_kl=True)
+                    preserved = first.kl_key_partials.clone()
+                    second = backend.forward_local(self.invocation, main, index, query_layout=layout, selected_kl=True)
+                    self.assertEqual(submit.call_count, 2)
+                torch.testing.assert_close(first.kl_key_partials, preserved, rtol=0, atol=0)
+                if ids:
+                    torch.testing.assert_close(first.kl_gradients[0][:, 0, 0],
+                                               torch.tensor([12, 10], dtype=torch.bfloat16))
+                    torch.testing.assert_close(first.kl_gradients[2][:, 0],
+                                               torch.tensor([4, 2], dtype=torch.bfloat16))
+                    self.assertNotEqual(first.kl_retained.data_ptr(), second.kl_retained.data_ptr())
+                    self.assertEqual(first.kl_key_partials.untyped_storage().data_ptr(),
+                                     first.kl_retained.untyped_storage().data_ptr())
+                else:
+                    self.assertEqual(first.kl_retained.numel(), 0)
+                    self.assertFalse(bool(first.kl_key_partials.count_nonzero()))
+                    self.assertEqual(float(first.kl_loss), 0.)
 
     def test_local_forward_uses_real_tiles_and_owns_delayed_outputs(self):
         """No Q collective, fake empty row or reused saved buffers can satisfy local submission."""

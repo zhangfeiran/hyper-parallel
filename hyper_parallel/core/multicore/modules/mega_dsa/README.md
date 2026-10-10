@@ -2166,3 +2166,58 @@ bound。推断的 main component 和 auxiliary component 必须各自通过对�
 567 subtests；profile 准入、库身份、scalar cancellation 与反例检查通过。原 pointwise 失败和
 首轮 scalar envelope 失败仍保留；这些结果只接受已声明的短序列 fixed-Native-value VJP
 契约，不清除 subset、零 coefficient、长上下文、完整 BF16 模型或 F+B+SGD 的待验收范围。
+
+## Actual local-query 的 LI/pull/SFA/KL 单 kernel
+
+`forward_local(..., selected_kl=True)` 在已有 selected CP composite 中执行九阶段：LI main、
+LI merge、membership init/build、request pack/pull、SFA、KL init/compute/post。Native host
+单独传递实际 local query 的 INT64 cumulative lengths；LI/SFA 的 INT32 lengths、显式
+sequence-relative positions 和 global query IDs 继续保留。KL compute 与 vector 使用同一
+position override，不能把完整 key 的 cumulative lengths 当作 compact query 的长度。
+
+每次调用独立持有 raw KL derivatives/loss、retained workspace 和转换前 FP32 global-packed
+index-K view。Q/weight derivatives 恢复 caller 顺序。空 query 仍执行九阶段闭包与 ACK，但
+不启动 KL 算术、不分配 KL scratch，返回真实零行 Q/weight 和独立 FP32 零 K contribution。
+
+`FusedDsaLocalCpTrainingProbe(..., fused_kl=True)` 在冷准备阶段集体声明该选择；KL-enabled
+forward 消费 composite 产生的导数，不再提交 standalone KL 三阶段。Coefficient、global
+normalization 和 upstream 仍由原训练桥应用一次，index-K 求和与最终 dtype 转换契约不变。
+`lm_only` 或零 coefficient 不执行 KL。默认独立提交路径继续作为显式对照，未启用 fused
+模式时不会静默切换。Higher derivatives、完整模型、长上下文和性能仍需各自验收。
+
+[mega_dsa_local_fused_training_validate.py](../../examples/mega_dsa_local_fused_training_validate.py)
+比较单 kernel 与独立 local forward + raw KL，并检查 CPU oracle、FP32 plane→post 字节转换、
+九阶段 device closure、selected 请求/字节与 ACK、空 tile 和重复调用。该入口不要求 selected
+pull 与 LI 重叠：selected 请求依赖最终 Top-K，性能归因应独立采集。
+
+该原始融合矩阵在 CP1/CP2/CP4 全部通过：每 rank 288 个 case，七个 rank 合计 2016 个
+rank-case。覆盖 H32/H64、BF16/FP32 merge weight、三种 ownership、1/7/19 compute groups、
+owner/interior/first-sequence/empty query tile 及两次调用。每次只有一个 Native submission；
+九阶段闭包和 ready/ACK 均通过，运行库与冻结载荷的 SHA 已核对。原首轮 trace 验证入口缺少
+`require_overlap` 参数的失败记录保留；修正验证调用后执行完整矩阵。
+
+完整 owner 的 projection 验收可使用
+[训练矩阵入口](../../examples/mega_dsa_local_training_profile_validate.py) 的 `--fused-kl`。
+入口显式记录 `fused_kl` 和每次捕获的 forward 阶段数；启用 KL 的训练调用应为九阶段，
+LM-only 和未启用 KL 的独立调用应为六阶段。需先在相同冻结载荷上重新运行独立 reference
+校准，再传入其 profile 和 policy SHA；单次 submission 本身不构成完整训练步性能收益。
+
+相同冻结载荷重新完成 576 样本、12 个精度桶的独立 reference 校准后，融合训练的完整
+owner 矩阵在 CP1/CP2/CP4 全部通过：CP1 每 rank 144 步，CP2/CP4 每 rank 288 步，合计
+1872 个 rank-step。Checkpoint 的两次启用 KL 调用均为九阶段；retain_graph 在中间另一
+次六阶段 forward 后仍正确消费原 saved state。原 pointwise 失败独立保留，判定使用既定
+reference profile 和 scalar component bound。旧全 query composite 另通过 48 个 case，
+旧 selected-training 接口通过单卡 smoke。载荷保持隔离，未作为默认 active payload。
+
+[mega_dsa_local_training_subset_validate.py](../../examples/mega_dsa_local_training_subset_validate.py)
+另外比较 query subset 和零 coefficient 的完整参数 VJP。入口重建参与 query 的固定 Native
+activation/output 数值，将未参与 query 的 Q、Q-RoPE、IQ、merge weight 与输出 cotangent
+置零，在完整 query 的 stock SFA 和独立 mixed SFA/KL 原语上计算对照。Main dK+dV 和
+index-K 均先使用 FP32，再按既定 owner 契约转换一次；index projection 继续与 hidden detach。
+
+该入口只声明 packed `(3,10)` 的 Native-to-Native 参数链对照，保留 pointwise、relative L2
+和梯度隔离检查；零 coefficient 的辅助 loss 与参数梯度额外要求精确零。它不消费完整 query
+的 FP64 profile，不清除原 FP64 逐点失败，不接受 BF16 forward composition 或完整模型。
+`--smoke` 覆盖 interior、first-sequence、零 coefficient、KL-only 零贡献和全空 checkpoint；
+完整矩阵另覆盖两种 heads/weight dtype、四种 ownership、sum/average 和三种 replay。
+该 Native-to-Native 入口的五个定向单卡 smoke 已通过；完整多卡矩阵仍需独立完成。

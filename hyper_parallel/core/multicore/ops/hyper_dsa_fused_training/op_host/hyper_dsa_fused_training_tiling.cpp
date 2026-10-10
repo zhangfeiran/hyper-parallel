@@ -27,6 +27,7 @@ namespace optiling {
 ge::graphStatus TilingForLightningIndexer(gert::TilingContext *context);
 ge::graphStatus TilingHyperDsaMixedTile(gert::TilingContext *context);
 ge::graphStatus TilingHyperDsaMixedKl(gert::TilingContext *context);
+ge::graphStatus TilingHyperDsaLocalMixedKl(gert::TilingContext *context);
 
 namespace {
 gert::Tensor InputMetadata(gert::TilingContext *context, size_t input) {
@@ -204,11 +205,40 @@ ge::graphStatus ComposeKl(gert::TilingContext *context, DsaFusedTrainingTilingDa
                                       inputs[12].GetShapeSize() * sizeof(int64_t), gert::kOnHost));
   gert::Tensor trace(gert::StorageShape({20, 64}, {20, 64}), gert::StorageFormat(ge::FORMAT_ND, ge::FORMAT_ND, {}),
                      ge::DT_INT64);
+  const bool local = context->GetOptionalInputDesc(21) != nullptr;
+  gert::Tensor queryLengths, queryPositions;
+  if (local) {
+    const auto *hostQuery = context->GetOptionalInputTensor(24);
+    if (hostQuery == nullptr || hostQuery->GetData<int64_t>() == nullptr) {
+      return ge::GRAPH_FAILED;
+    }
+    queryLengths = OptionalMetadata(context, 24);
+    queryPositions = OptionalMetadata(context, 22);
+    queryLengths.SetData(gert::TensorData(const_cast<int64_t *>(hostQuery->GetData<int64_t>()), nullptr,
+                                          queryLengths.GetShapeSize() * sizeof(int64_t), gert::kOnHost));
+  }
+  std::vector<gert::Tensor *> childInputs = {&inputs[2],
+                                             &inputs[3],
+                                             &inputs[0],
+                                             &inputs[1],
+                                             &inputs[6],
+                                             &outputs[0],
+                                             &outputs[3],
+                                             &outputs[4],
+                                             &inputs[4],
+                                             &inputs[5],
+                                             local ? &queryLengths : &inputs[12],
+                                             &inputs[12],
+                                             &inputs[8],
+                                             &trace,
+                                             &inputs[11]};
+  if (local) {
+    childInputs.push_back(&queryPositions);
+  }
   gert::OpTilingContextBuilder builder;
-  builder.OpType(ge::AscendString("HyperDsaMixedKl"))
-    .IOInstanceNum({1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 1})
-    .InputTensors({&inputs[2], &inputs[3], &inputs[0], &inputs[1], &inputs[6], &outputs[0], &outputs[3], &outputs[4],
-                   &inputs[4], &inputs[5], &inputs[12], &inputs[12], &inputs[8], &trace, &inputs[11]})
+  builder.OpType(ge::AscendString(local ? "HyperDsaLocalMixedKl" : "HyperDsaMixedKl"))
+    .IOInstanceNum(local ? std::vector<uint32_t>(16, 1) : std::vector<uint32_t>(15, 1), {1, 1, 1, 1})
+    .InputTensors(childInputs)
     .OutputTensors({&outputs[5], &outputs[6], &outputs[7], &outputs[8]})
     .AppendAttr(*context->GetAttrs()->GetAttrPointer<float>(0))
     .AppendAttr(ge::AscendString("TND"))
@@ -230,7 +260,9 @@ ge::graphStatus ComposeKl(gert::TilingContext *context, DsaFusedTrainingTilingDa
     .TilingDataSize(sizeof(SparseLightningIndexerGradKLLossTilingData));
   auto holder = builder.Build();
   auto *child = holder.GetContext();
-  if (child == nullptr || TilingHyperDsaMixedKl(child) != ge::GRAPH_SUCCESS || child->GetBlockDim() != 20 ||
+  if (child == nullptr ||
+      (local ? TilingHyperDsaLocalMixedKl(child) : TilingHyperDsaMixedKl(child)) != ge::GRAPH_SUCCESS ||
+      child->GetBlockDim() != 20 ||
       child->GetRawTilingData()->GetDataSize() != sizeof(SparseLightningIndexerGradKLLossTilingData)) {
     OP_LOGE(context->GetNodeName(), "fused KL child tiling failed");
     return ge::GRAPH_FAILED;
@@ -261,8 +293,8 @@ ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
     return ge::GRAPH_FAILED;
   }
   const bool local = context->GetOptionalInputDesc(21) != nullptr;
-  if (local && (withKl || !selected || context->GetOptionalInputDesc(22) == nullptr ||
-                context->GetOptionalInputDesc(23) == nullptr)) {
+  if (local && (!selected || (withKl && context->GetOptionalInputDesc(24) == nullptr) ||
+                context->GetOptionalInputDesc(22) == nullptr || context->GetOptionalInputDesc(23) == nullptr)) {
     return ge::GRAPH_FAILED;
   }
   for (size_t input = 21; local && input < 24; ++input) {
@@ -283,7 +315,8 @@ ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
        Compose(context, data, false, sfaBytes) != ge::GRAPH_SUCCESS)) {
     return ge::GRAPH_FAILED;
   }
-  if (withKl && ComposeKl(context, data) != ge::GRAPH_SUCCESS) {
+  if (withKl && !(local && context->GetRequiredInputShape(0)->GetStorageShape().GetDim(0) == 0) &&
+      ComposeKl(context, data) != ge::GRAPH_SUCCESS) {
     return ge::GRAPH_FAILED;
   }
   auto *workspace = context->GetWorkspaceSizes(1);

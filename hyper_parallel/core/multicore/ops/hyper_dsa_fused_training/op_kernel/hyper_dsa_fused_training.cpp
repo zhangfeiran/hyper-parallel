@@ -39,6 +39,7 @@ struct Buffers {
   __gm__ uint8_t *retained;
   __gm__ uint8_t *klRetained;
   __gm__ uint8_t *klLengths;
+  __gm__ uint8_t *klQueryLengths;
   __gm__ uint8_t *gradIndexQuery;
   __gm__ uint8_t *gradIndexKey;
   __gm__ uint8_t *gradWeight;
@@ -98,9 +99,11 @@ __aicore__ inline void RunKl(const Buffers &buffers, const optiling::SparseLight
                            SLILayout::TND, SLISparseMode::RightDown, true, false>;
   SparseLightningIndexerGradKLLossBase<TileType> tile;
   tile.Init(buffers.query, buffers.compressed, buffers.indexQuery, buffers.indexKey, buffers.weights, buffers.indices,
-            buffers.maximum, buffers.sum, buffers.queryRope, buffers.keyRope, buffers.klLengths, buffers.klLengths,
+            buffers.maximum, buffers.sum, buffers.queryRope, buffers.keyRope,
+            buffers.klQueryLengths == nullptr ? buffers.klLengths : buffers.klQueryLengths, buffers.klLengths,
             buffers.gradIndexQuery, buffers.gradIndexKey, buffers.gradWeight, buffers.loss, buffers.klRetained, data,
             &pipe, ticket, group, count, phase);
+  tile.SetQueryPositions(buffers.queryPositions);
   tile.ProcessPhase();
 }
 
@@ -161,7 +164,7 @@ __aicore__ inline void RunComputePhase(const Buffers &buffers, const LITilingDat
       if (li->queryTokens != 0) {
         RunAttention(buffers, sfa, ticket, group, physicalCount);
       }
-    } else {
+    } else if (li->queryTokens != 0) {
       RunKl<FloatWeights>(buffers, kl, ticket, group, physicalCount, mathPhase - 3);
     }
     ++count;
@@ -281,16 +284,16 @@ __global__ __aicore__ void hyper_dsa_fused_training(
   __gm__ uint8_t *klLengths, __gm__ uint8_t *arena, __gm__ uint8_t *metadata, __gm__ uint8_t *requests,
   __gm__ uint8_t *transportTrace, __gm__ uint8_t *selectedRows, __gm__ uint8_t *membership,
   __gm__ uint8_t *selectedRequests, __gm__ uint8_t *selectedCounts, __gm__ uint8_t *queryLengths,
-  __gm__ uint8_t *queryPositions, __gm__ uint8_t *queryIds, __gm__ uint8_t *indices, __gm__ uint8_t *values,
-  __gm__ uint8_t *attention, __gm__ uint8_t *maximum, __gm__ uint8_t *sum, __gm__ uint8_t *gradIndexQuery,
-  __gm__ uint8_t *gradIndexKey, __gm__ uint8_t *gradWeight, __gm__ uint8_t *loss, __gm__ uint8_t *workspace,
-  __gm__ uint8_t *tiling) {
+  __gm__ uint8_t *queryPositions, __gm__ uint8_t *queryIds, __gm__ uint8_t *klQueryLengths, __gm__ uint8_t *indices,
+  __gm__ uint8_t *values, __gm__ uint8_t *attention, __gm__ uint8_t *maximum, __gm__ uint8_t *sum,
+  __gm__ uint8_t *gradIndexQuery, __gm__ uint8_t *gradIndexKey, __gm__ uint8_t *gradWeight, __gm__ uint8_t *loss,
+  __gm__ uint8_t *workspace, __gm__ uint8_t *tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-  Buffers buffers{indexQuery, indexKey,     query,      compressed,       queryRope,      keyRope,      weights,
-                  lengths,    retained,     klRetained, klLengths,        gradIndexQuery, gradIndexKey, gradWeight,
-                  loss,       indices,      values,     attention,        maximum,        sum,          workspace,
-                  tiling,     selectedRows, membership, selectedRequests, selectedCounts, queryLengths, queryPositions,
-                  queryIds};
+  Buffers buffers{indexQuery,     indexKey, query,        compressed, queryRope,        keyRope,        weights,
+                  lengths,        retained, klRetained,   klLengths,  klQueryLengths,   gradIndexQuery, gradIndexKey,
+                  gradWeight,     loss,     indices,      values,     attention,        maximum,        sum,
+                  workspace,      tiling,   selectedRows, membership, selectedRequests, selectedCounts, queryLengths,
+                  queryPositions, queryIds};
   Run<FLOAT_WEIGHTS, TRANSPORT, SELECTED>(buffers, runtimeConfig, groupTrace, arena, metadata, requests,
                                           transportTrace);
 }

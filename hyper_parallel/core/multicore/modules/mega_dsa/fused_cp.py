@@ -30,17 +30,26 @@ from hyper_parallel.core.multicore.modules.mega_dsa.cp_reference import DsaCpLay
 from hyper_parallel.core.multicore.modules.mega_dsa.fused_forward import (
     validate_fused_dsa_traces,
 )
+from hyper_parallel.core.multicore.modules.mega_dsa.fused_training import (
+    validate_fused_training_traces,
+)
+from hyper_parallel.core.multicore.modules.mega_dsa.local_query import (
+    DsaLocalQueryLayout,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_indexer import (
     MIXED_INDEXER_WORKSPACE_BYTES,
 )
-from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
-from hyper_parallel.core.multicore.modules.mega_dsa.mixed_kl import mixed_kl_workspace_bytes
-from hyper_parallel.core.multicore.modules.mega_dsa.fused_training import validate_fused_training_traces
-from hyper_parallel.core.multicore.modules.mega_dsa.selected_requests import (
-    selected_request_rows, validate_selected_requests, validate_selected_training_traces,
+from hyper_parallel.core.multicore.modules.mega_dsa.mixed_kl import (
+    mixed_kl_key_partials,
+    mixed_kl_workspace_bytes,
 )
-from hyper_parallel.core.multicore.modules.mega_dsa.local_query import DsaLocalQueryLayout
+from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
+from hyper_parallel.core.multicore.modules.mega_dsa.selected_requests import (
+    selected_request_rows,
+    validate_selected_requests,
+    validate_selected_training_traces,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
     DsaWorkspaceInvocation,
     MegaDsaWorkspace,
@@ -124,6 +133,8 @@ class FusedCpForwardResult:
     selected_requests: tuple[torch.Tensor, ...] = ()
     _runtime_buffers: tuple[torch.Tensor, ...] = field(default=(), repr=False, compare=False)
     index_versions: tuple[int, ...] = field(default=(), repr=False, compare=False)
+    kl_key_partials: torch.Tensor | None = field(default=None, repr=False, compare=False)
+    kl_retained: torch.Tensor | None = field(default=None, repr=False, compare=False)
 
 
 class FusedDsaCpForwardProbe:
@@ -203,13 +214,15 @@ class FusedDsaCpForwardProbe:
 
     def forward_local(self, invocation: DsaWorkspaceInvocation, main_states: tuple[torch.Tensor, ...],
                       index_states: tuple[torch.Tensor, ...], *,
-                      query_layout: DsaLocalQueryLayout | None = None) -> FusedCpForwardResult:
-        """Fuse local LI, selected main-KV pull and SFA without query/weight replication or KL.
+                      query_layout: DsaLocalQueryLayout | None = None,
+                      selected_kl: bool = False) -> FusedCpForwardResult:
+        """Fuse local LI, selected main-KV pull, SFA and optional selected KL without Q replication.
 
-        The prepared tile may be empty. Every member submits the same six-stage
-        protocol and publishes its complete owner-local KV set. Inputs are
+        The prepared tile may be empty. Every member submits the same protocol:
+        six stages, or nine when selected KL is enabled. Each member publishes
+        its complete owner-local KV set. Inputs are
         detached caller-ordered local queries and complete owner-ordered keys.
-        This raw forward is not yet admitted by the global-query backward.
+        Saved state requires the local-query backward adapter.
         An explicit layout returned by this backend's cold preparation supports
         checkpoint replay after another tile has been prepared.
         """
@@ -238,10 +251,14 @@ class FusedDsaCpForwardProbe:
         _load_native()
         if torch.ops.hyper_parallel.dsa_local_cp_forward_version() != 1:
             raise RuntimeError("local fused forward requires adapter ABI 1; rebuild this checkout's payload")
+        if selected_kl:
+            version = getattr(torch.ops.hyper_parallel, "dsa_local_cp_training_version", None)
+            if version is None or version() != 1:
+                raise RuntimeError("local fused KL requires adapter ABI 1; rebuild this checkout's payload")
         with self.workspace.lease(invocation, direction="forward"):
-            return self._submit_local(invocation, main_states, index_states, local)
+            return self._submit_local(invocation, main_states, index_states, local, selected_kl=selected_kl)
 
-    def _submit_local(self, invocation, main_states, index_states, local) -> FusedCpForwardResult:
+    def _submit_local(self, invocation, main_states, index_states, local, *, selected_kl=False) -> FusedCpForwardResult:
         query, compressed, query_rope, key_rope = main_states
         index_query, index_key, weights = index_states
         packed = tuple(local.pack(tensor) for tensor in (index_query, query, query_rope, weights))
@@ -254,7 +271,7 @@ class FusedDsaCpForwardProbe:
         output = torch.full_like(packed[1], float("nan"))
         maximum = torch.full((1, queries, self.heads), float("nan"), dtype=torch.float32, device=device)
         denominator = torch.full_like(maximum, float("nan"))
-        trace = torch.zeros((6, 20, 64), dtype=torch.int64, device=device)
+        trace = torch.zeros((9 if selected_kl else 6, 20, 64), dtype=torch.int64, device=device)
         transport_trace = torch.zeros(32, dtype=torch.int64, device=device)
         retained = torch.empty(MIXED_INDEXER_WORKSPACE_BYTES if queries else 0, dtype=torch.uint8, device=device)
         membership = torch.empty((tokens + 7) // 8 * 8, dtype=torch.int32, device=device)
@@ -263,12 +280,27 @@ class FusedDsaCpForwardProbe:
         self.workspace.publish_owner_states(invocation, (compressed, key_rope, index_key))
         epoch = self.workspace.next_transport_epoch(invocation)
         metadata = self._metadata(invocation, epoch)
-        torch.ops.hyper_parallel.dsa_local_cp_forward_out(
+        extra, kl_gradients, kl_loss, kl_partials, kl_retained = (), (), None, None, None
+        native = (torch.ops.hyper_parallel.dsa_local_cp_training_out if selected_kl
+                  else torch.ops.hyper_parallel.dsa_local_cp_forward_out)
+        if selected_kl:
+            kl_retained = torch.empty(mixed_kl_workspace_bytes(tokens, self.heads) if queries else 0,
+                                      dtype=torch.uint8, device=device)
+            kl_gradients = tuple(torch.zeros_like(tensor) for tensor in (packed[0], keys[0][:, 0], packed[3]))
+            kl_loss = torch.zeros(1, dtype=torch.float32, device=device)
+            extra = (local.cumulative_queries, kl_retained, kl_gradients[0], kl_gradients[1][:, None],
+                     kl_gradients[2], kl_loss)
+        native(
             packed[0], keys[0], packed[1], keys[1], packed[2], keys[2], packed[3], local.key_lengths, self.config,
             trace, retained, self.native_layout.cumulative_lengths, self.scale, indices, values, output,
             maximum, denominator, self.workspace.arena, metadata, self.requests, transport_trace,
             self.selected_rows, membership, table, counts, local.query_lengths, local.positions,
-            local.global_ids_tensor)
+            local.global_ids_tensor, *extra)
+        if selected_kl:
+            kl_partials = (mixed_kl_key_partials(kl_retained, tokens=tokens, heads=self.heads) if queries
+                           else torch.zeros((tokens, 128), dtype=torch.float32, device=device))
+            kl_gradients = (local.restore(kl_gradients[0]), kl_gradients[1], local.restore(kl_gradients[2]))
+            kl_loss = kl_loss.reshape(())
         states = (packed[1], keys[1][:, 0], packed[2], keys[2][:, 0])
         saved_tensors = (*states, indices, output, maximum, denominator)
         meta = replace(invocation.batch_meta, q_global_ids=local.batch_meta.q_global_ids)
@@ -281,6 +313,8 @@ class FusedDsaCpForwardProbe:
                                         (packed[0], keys[0][:, 0], packed[3]),
                                         selected_requests=(table, counts, membership),
                                         _runtime_buffers=(metadata, retained),
+                                        kl_gradients=kl_gradients, kl_loss=kl_loss,
+                                        kl_key_partials=kl_partials, kl_retained=kl_retained,
                                         index_versions=tuple(tensor._version for tensor in
                                                              (packed[0], keys[0][:, 0], packed[3])))
         starts = (local.global_ids_tensor - local.positions).to(torch.int32)[:, None, None]
@@ -292,6 +326,8 @@ class FusedDsaCpForwardProbe:
                                     (packed[0], keys[0][:, 0], packed[3]),
                                     selected_requests=(table, counts, membership),
                                     _runtime_buffers=(metadata, retained),
+                                    kl_gradients=kl_gradients, kl_loss=kl_loss,
+                                    kl_key_partials=kl_partials, kl_retained=kl_retained,
                                     index_versions=tuple(tensor._version for tensor in
                                                          (packed[0], keys[0][:, 0], packed[3])))
 

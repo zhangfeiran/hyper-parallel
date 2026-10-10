@@ -23,11 +23,16 @@ from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from hyper_parallel.core.multicore.modules.mega_dsa import fused_cp, local_training
 from hyper_parallel.core.multicore.modules.mega_dsa.local_kl import LocalKlResult
-from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta, DsaLossNormalization
+from hyper_parallel.core.multicore.modules.mega_dsa.metadata import (
+    DsaBatchMeta,
+    DsaLossNormalization,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
-from hyper_parallel.core.multicore.modules.mega_dsa.workspace import DsaWorkspaceSpec, MegaDsaWorkspace
+from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
+    DsaWorkspaceSpec,
+    MegaDsaWorkspace,
+)
 from tests.ut.core.multicore.shmem.test_consumer import SharedRootFixture
-
 
 _CHECK_NATIVE_SUPPORT = local_training.FusedDsaLocalCpTrainingProbe.check_native_support
 
@@ -103,11 +108,34 @@ class TestLocalTraining(SharedRootFixture):
                           for shape, value in zip(((rows, 32, 512), (3, 512), (rows, 32, 64), (3, 64)), (2, 3, 5, 7)))
         return SimpleNamespace(gradients=gradients)
 
-    def _probe(self, coefficient=.7, mode="lm_plus_kl", divisor=1):
+    def _probe(self, coefficient=.7, mode="lm_plus_kl", divisor=1, fused_kl=False):
         probe = local_training.FusedDsaLocalCpTrainingProbe(
-            self.backend, normalization=DsaLossNormalization(3, divisor), loss_coeff=coefficient, mode=mode)
+            self.backend, normalization=DsaLossNormalization(3, divisor), loss_coeff=coefficient, mode=mode,
+            fused_kl=fused_kl)
         patch.object(probe.backward_backend, "_backward_saved", side_effect=self._main_backward).start()
         return probe
+
+    def test_fused_kl_consumes_forward_derivatives_without_resubmission(self):
+        """Saved FP32 key partials and caller-ordered Q/weight derivatives receive one upstream scale."""
+        layout, inputs = self._inputs()
+        probe = self._probe(fused_kl=True)
+        def _fused_forward(invocation, main, index, *, query_layout, selected_kl):
+            self.assertTrue(selected_kl)
+            forward = self._forward(invocation, main, index, query_layout=query_layout)
+            raw = self._raw(forward)
+            return replace(forward, kl_gradients=raw.gradients, kl_loss=raw.loss,
+                           kl_key_partials=raw.key_partials, kl_retained=raw.retained)
+        with patch.object(self.backend, "forward_local", side_effect=_fused_forward) as submit, \
+             patch.object(local_training, "local_kl_gradients", side_effect=AssertionError("second KL submission")):
+            output, loss = probe.forward(self.invocation, inputs[:4], inputs[4:], query_layout=layout)
+            gradients = torch.autograd.grad(output.sum()+loss*-1.75, inputs)
+        self.assertEqual(submit.call_count, 1)
+        self.assertEqual(self.raw_calls, 1)
+        scale = .7/3*-1.75
+        expected = (self.key_partials*scale)[list(self.meta.kv_global_ids)].bfloat16()
+        torch.testing.assert_close(gradients[5], expected, rtol=0, atol=0)
+        torch.testing.assert_close(gradients[4], torch.full_like(inputs[4], 2*scale))
+        torch.testing.assert_close(gradients[6], torch.full_like(inputs[6], 5*scale))
 
     def test_modes_scaling_zero_coefficient_and_empty_query(self):
         """One coefficient, one global denominator and one upstream scale reach each contribution."""

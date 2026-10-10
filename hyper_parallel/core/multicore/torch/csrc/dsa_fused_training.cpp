@@ -71,8 +71,9 @@ void check_runtime(const Tensors &tensors, int64_t phases, bool local) {
               "fused DSA retained scratch requires 47226880 uint8 bytes");
 }
 
-void check_kl_outputs(const Tensors &tensors) {
-  TORCH_CHECK(tensors[11]->dim() == 1 && tensors[11]->numel() > 0 && tensors[11]->scalar_type() == at::kByte,
+void check_kl_outputs(const Tensors &tensors, bool local = false) {
+  TORCH_CHECK(tensors[11]->dim() == 1 && (tensors[11]->numel() > 0 || (local && tensors[2]->size(0) == 0)) &&
+                tensors[11]->scalar_type() == at::kByte,
               "fused KL retained scratch must be a nonempty uint8 buffer");
   TORCH_CHECK(tensors[17]->sizes() == tensors[0]->sizes() && tensors[18]->sizes() == tensors[1]->sizes() &&
                 tensors[19]->sizes() == tensors[6]->sizes() && tensors[17]->scalar_type() == at::kBFloat16 &&
@@ -115,7 +116,7 @@ void check_fused_inputs(const Tensors &tensors, double scale, int64_t phases = 6
   check_runtime(tensors, phases, local);
   check_outputs(tensors);
   if (withKl) {
-    check_kl_outputs(tensors);
+    check_kl_outputs(tensors, local);
   } else {
     for (size_t index : {11U, 17U, 18U, 19U, 20U}) {
       TORCH_CHECK(tensors[index]->sizes() == at::IntArrayRef({0}), "selected forward requires empty KL descriptors");
@@ -325,6 +326,63 @@ std::tuple<TensorRef, TensorRef, TensorRef, TensorRef, TensorRef, TensorRef, Ten
     queryLengths, queryPositions, queryIds);
   return {indices, values, attention, maximum, sum, trace, retained};
 }
+Result local_cp_training_npu(const at::Tensor &indexQuery, at::Tensor &indexKey, const at::Tensor &query,
+                             at::Tensor &compressed, const at::Tensor &queryRope, at::Tensor &keyRope,
+                             const at::Tensor &weights, const at::Tensor &lengths, const at::Tensor &config,
+                             at::Tensor &trace, at::Tensor &retained, at::IntArrayRef klLengths, double scale,
+                             at::Tensor &indices, at::Tensor &values, at::Tensor &attention, at::Tensor &maximum,
+                             at::Tensor &sum, at::Tensor &arena, const at::Tensor &metadata, const at::Tensor &requests,
+                             at::Tensor &transportTrace, const at::Tensor &selectedRows, at::Tensor &membership,
+                             at::Tensor &selectedRequests, at::Tensor &selectedCounts, const at::Tensor &queryLengths,
+                             const at::Tensor &queryPositions, const at::Tensor &queryIds,
+                             at::IntArrayRef klQueryLengths, at::Tensor &klRetained, at::Tensor &gradIndexQuery,
+                             at::Tensor &gradIndexKey, at::Tensor &gradWeight, at::Tensor &loss) {
+  const Tensors tensors{&indexQuery, &indexKey, &query, &compressed,     &queryRope,    &keyRope,    &weights,
+                        &lengths,    &config,   &trace, &retained,       &klRetained,   &indices,    &values,
+                        &attention,  &maximum,  &sum,   &gradIndexQuery, &gradIndexKey, &gradWeight, &loss};
+  check_fused_inputs(tensors, scale, 9, true, true);
+  check_selected(tensors, {&arena, &metadata, &requests, &transportTrace, &selectedRows, &membership, &selectedRequests,
+                           &selectedCounts});
+  check_lengths(klLengths, indexKey, lengths);
+  TORCH_CHECK(
+    klQueryLengths.size() == klLengths.size() && !klQueryLengths.empty() && klQueryLengths.back() == query.size(0),
+    "local KL cumulative queries must describe actual rows");
+  int64_t previousQuery = 0, previousKey = 0;
+  for (size_t index = 0; index < klQueryLengths.size(); ++index) {
+    TORCH_CHECK(
+      klQueryLengths[index] >= previousQuery && klQueryLengths[index] - previousQuery <= klLengths[index] - previousKey,
+      "local KL query counts must be nondecreasing within key sequence sizes");
+    previousQuery = klQueryLengths[index];
+    previousKey = klLengths[index];
+  }
+  check_transport(tensors, arena, metadata, requests, transportTrace);
+  TORCH_CHECK(queryLengths.sizes() == lengths.sizes() && queryLengths.scalar_type() == at::kInt &&
+                queryPositions.sizes() == at::IntArrayRef({query.size(0)}) &&
+                queryPositions.scalar_type() == at::kLong && queryIds.sizes() == queryPositions.sizes() &&
+                queryIds.scalar_type() == at::kLong,
+              "local CP requires genuine int32 query lengths and int64 positions/global IDs");
+  for (const auto *tensor : {&queryLengths, &queryPositions, &queryIds}) {
+    TORCH_CHECK(tensor->device() == query.device() && tensor->is_contiguous() && !tensor->requires_grad(),
+                "local CP metadata must be detached contiguous tensors on the prepared NPU");
+    for (const auto *original : tensors) {
+      TORCH_CHECK(!tensor->is_alias_of(*original), "local metadata must not alias arithmetic buffers");
+    }
+    const std::array<const at::Tensor *, 8> extras{&arena,        &metadata,   &requests,         &transportTrace,
+                                                   &selectedRows, &membership, &selectedRequests, &selectedCounts};
+    for (const auto *extra : extras) {
+      TORCH_CHECK(!tensor->is_alias_of(*extra), "local metadata must not alias transport/request buffers");
+    }
+  }
+  static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaLocalCpTraining",
+                                                          "aclnnHyperDsaLocalCpTrainingGetWorkspaceSize");
+  hyper_parallel::multicore::execute_cached_op(
+    api, indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths, config, trace, retained,
+    klRetained, klLengths, scale, indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight,
+    loss, arena, metadata, requests, transportTrace, selectedRows, membership, selectedRequests, selectedCounts,
+    queryLengths, queryPositions, queryIds, klQueryLengths);
+  return {indices,      values,     attention, maximum, sum,      gradIndexQuery,
+          gradIndexKey, gradWeight, loss,      trace,   retained, klRetained};
+}
 }  // namespace
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
@@ -333,4 +391,5 @@ TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("dsa_selected_cp_training_out", &selected_cp_training_npu);
   m.impl("dsa_selected_cp_forward_out", &selected_cp_forward_npu);
   m.impl("dsa_local_cp_forward_out", &local_cp_forward_npu);
+  m.impl("dsa_local_cp_training_out", &local_cp_training_npu);
 }
