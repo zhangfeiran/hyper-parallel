@@ -27,6 +27,10 @@ _HELPERS = r'''
 #include <vector>
 
 namespace {
+bool storage_exclusive(const at::Tensor& base) {
+  return base.storage().use_count() == 1;
+}
+
 at::Tensor dense_matmul(const at::Tensor& left, const at::Tensor& right) {
   if (left.size(0) == 0 || right.size(1) == 0) {
     return at::empty({left.size(0), right.size(1)}, left.options());
@@ -162,10 +166,12 @@ def generate_dense_cpp(plan: DenseKernelPlan, namespace: str) -> str:
 TORCH_LIBRARY({namespace}, m) {{
   m.def("forward(Tensor[] inputs) -> Tensor[]");
   m.def("backward(Tensor[] inputs, Tensor[] saved, Tensor?[] output_grads) -> Tensor?[]");
+  m.def("storage_exclusive(Tensor base) -> bool");
 }}
 TORCH_LIBRARY_IMPL({namespace}, CompositeExplicitAutograd, m) {{
   m.impl("forward", &forward);
   m.impl("backward", &backward);
+  m.impl("storage_exclusive", &storage_exclusive);
 }}
 '''
     header = "// Copyright 2026 Huawei Technologies Co., Ltd.\n// SPDX-License-Identifier: Apache-2.0\n"

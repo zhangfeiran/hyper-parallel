@@ -35,6 +35,7 @@ from hyper_parallel.core.multicore.backends.dense_tile import DenseSdkTiler, bin
 from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePolicy, compile_dense_tiles, simulate_dense_tiles
 from hyper_parallel.core.multicore.runtime.dense import DenseExecutable, DenseKernelPlan
 from hyper_parallel.core.multicore.runtime.dense_compiled import CompiledDenseExecutable
+from hyper_parallel.core.multicore.runtime.dense_saved import DenseSavedUse, shared_dense_saved
 from hyper_parallel.core.multicore.runtime.dense_scratch import shared_dense_scratch
 
 _LOADED: dict[str, str] = {}
@@ -102,10 +103,15 @@ class ResidentDenseExecutable(DenseExecutable):
         self.ready.record(torch.get_device_module(self.device).current_stream(self.device))
         self.saved_ids = saved_value_ids(plan)
         self.vjp = CompiledDenseExecutable(plan, self.device, build_dense_payload(plan, cache_root / "vjp"))
+        public_ids = {value.id for value in plan.ir.outputs}
+        self.saved_shapes = {value_id: dict(plan.value_types)[value_id].shape for value_id in self.saved_ids
+                             if value_id not in public_ids}
+        self.saved_pool = shared_dense_saved(self.device, self.vjp.native_ops.storage_exclusive.default, self)
         self.native_identity = {**data, "tile_plan": self.tile_plan.export_manifest(),
                                 "tiling": tiler.export_manifest(self.binding, bank),
                                 "scratch": {"reuse": "device_shared_per_stream", "max_cached_streams": 2,
-                                            "saved_values": "invocation_owned"},
+                                            "saved_values": "storage_alias_guarded"},
+                                "saved_buffers": {"reuse": "after_last_storage_alias", "max_cached_invocations": 2},
                                 "backward_execution_mode": "native_host_stream_adapter",
                                 "backward_payload": self.vjp.native_identity}
 
@@ -116,6 +122,7 @@ class ResidentDenseExecutable(DenseExecutable):
         """Release cached kernel scratch while preserving each pending invocation's backward values."""
         super().close()
         self.scratch.release_owner(self)
+        self.saved_pool.release_owner(self)
 
     def __call__(self, *inputs: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Launch one private invocation without caching current weight addresses.
@@ -126,20 +133,28 @@ class ResidentDenseExecutable(DenseExecutable):
         self._bind_inputs(inputs)
         return _ResidentDenseFunction.apply(self, *inputs)
 
-    def forward_values(self, inputs: tuple[torch.Tensor, ...]) -> dict[int, torch.Tensor]:
-        """Allocate private values and enqueue the resident kernel using stream-owned scratch.
+    def forward_values(self, inputs: tuple[torch.Tensor, ...]
+                       ) -> tuple[dict[int, torch.Tensor], DenseSavedUse | None]:
+        """借用已无存储别名的内部保存值，其余输出归本次调用所有。
 
         Args:
             inputs: Exact contiguous caller-owned tokens and weights for this call.
         """
         values = self._bind_inputs(inputs)
         types = dict(self.plan.value_types)
+        use = None
+        if self.saved_shapes and self.tile_plan.rows:
+            stream = None if self.device.type == "cpu" else torch.get_device_module(
+                self.device).current_stream(self.device)
+            saved, use = self.saved_pool.acquire(self.saved_shapes, stream)
+            values.update(saved)
         for buffer in self.plan.buffers:
-            values[buffer.value_id] = torch.empty(types[buffer.value_id].shape, dtype=torch.bfloat16,
-                                                  device=self.device)
+            if buffer.value_id not in values:
+                values[buffer.value_id] = torch.empty(types[buffer.value_id].shape, dtype=torch.bfloat16,
+                                                      device=self.device)
         if self.tile_plan.rows:
             self._launch(values)
-        return values
+        return values, use
 
     def _launch(self, values):
         stream = torch.get_device_module(self.device).current_stream(self.device)
@@ -168,7 +183,7 @@ class _ResidentDenseFunction(torch.autograd.Function):
         """
         ctx.executable, ctx.input_count = executable, len(inputs)
         ctx.set_materialize_grads(False)
-        values = executable.forward_values(inputs)
+        values, ctx.saved_use = executable.forward_values(inputs)
         ctx.save_for_backward(*inputs, *(values[value_id] for value_id in executable.saved_ids))
         outputs = tuple(values[value.id] for value in executable.plan.ir.outputs)
         return outputs if executable.plan.ir.returns_tuple else outputs[0]
@@ -183,6 +198,10 @@ class _ResidentDenseFunction(torch.autograd.Function):
             *output_grads: Public output cotangents, including unused tuple outputs.
         """
         tensors = ctx.saved_tensors
+        if ctx.saved_use is not None:
+            device = ctx.executable.device
+            stream = None if device.type == "cpu" else torch.get_device_module(device).current_stream(device)
+            ctx.saved_use.consume(tensors[ctx.input_count:], stream)
         gradients = ctx.executable.vjp.native_ops.backward.default(
             list(tensors[:ctx.input_count]), list(tensors[ctx.input_count:]), list(output_grads))
         if len(gradients) != ctx.input_count:

@@ -33,6 +33,7 @@ from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePolicy, c
 from hyper_parallel.core.multicore.frontend.examples.dense_ffn import dense_ffn
 from hyper_parallel.core.multicore.runtime.dense import DenseExecutable, DenseSpec
 from hyper_parallel.core.multicore.runtime.dense_scratch import DenseScratchPool
+from hyper_parallel.core.multicore.runtime.dense_saved import DenseSavedPool
 from hyper_parallel.core.multicore.runtime.dense_tile import ResidentDenseExecutable
 from tests.common.mark_utils import arg_mark
 
@@ -60,6 +61,8 @@ def _cpu_protocol(rows):
     DenseExecutable.__init__(executable, plan, torch.device("cpu"))
     executable.tile_plan = compile_dense_tiles(plan, DenseTilePolicy(cube_workers=1))
     executable.saved_ids = saved_value_ids(plan)
+    executable.saved_shapes = {value_id: dict(plan.value_types)[value_id].shape for value_id in executable.saved_ids}
+    executable.saved_pool = DenseSavedPool(torch.device("cpu"), lambda _base: False, max_cached_invocations=0)
     executable.scratch = DenseScratchPool(torch.device("cpu"), len(plan.value_types),
                                          executable.tile_plan.event_count * 32, 8)
 

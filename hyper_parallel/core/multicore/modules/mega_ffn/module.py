@@ -128,9 +128,10 @@ class MegaFFN(nn.Module):
         self._executables.clear()
 
     def execution_manifest(self) -> list[dict[str, object]]:
-        """Report bound plans and native payload identities without invocation tensors."""
+        """报告绑定计划、原生产物和保存缓存统计，不保留调用张量。"""
         return [{"tokens": rows, "device": str(device), "plan": executable.plan.export_manifest(),
-                 "native": deepcopy(getattr(executable, "native_identity", None))}
+                 "native": deepcopy(getattr(executable, "native_identity", None)),
+                 "saved_buffers": executable.saved_pool.statistics() if hasattr(executable, "saved_pool") else None}
                 for (rows, device), executable in self._executables.items()]
 
     def _apply(self, fn: Callable, recurse: bool = True) -> MegaFFN:

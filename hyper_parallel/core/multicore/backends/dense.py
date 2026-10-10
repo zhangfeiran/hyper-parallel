@@ -43,7 +43,7 @@ def dense_artifacts(plan: DenseKernelPlan) -> tuple[str, str, dict[str, bytes]]:
     inputs = ("primitives/dense.py", "compiler/dense.py", "runtime/dense.py", "runtime/dense_native.py",
               "runtime/dense_compiled.py", "runtime/dense_execution.py", "_build/build_dense.py",
               "backends/providers.py",
-              "backends/dense.py", "backends/dense_codegen.py")
+              "backends/dense.py", "backends/dense_codegen.py", "runtime/dense_saved.py")
     providers = {task.provider.name: task.provider.export_manifest() for task in plan.tasks}
     definition = {"semantic": semantic, "providers": providers,
                   "sources": {name: hashlib.sha256((CORE / name).read_bytes()).hexdigest() for name in inputs}}

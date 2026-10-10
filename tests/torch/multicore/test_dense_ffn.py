@@ -30,6 +30,16 @@ def test_dense_ffn_training() -> None:
                   case_name="test_dense_ffn_training", master_port=29617, num_proc=1)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+def test_dense_ffn_saved_buffers() -> None:
+    """Feature: resident 保存缓存。
+    Description: 验证重叠调用、真实地址复用、跨流、retain_graph、保存钩子和 CPU 卸载。
+    Expectation: 活跃存储别名阻止复用；关闭后待执行反向仍然正确。
+    """
+    torchrun_case(file_name=str(Path(__file__).with_name("_dense_ffn_saved_impl.py")),
+                  case_name="test_dense_ffn_saved_buffers", master_port=29618, num_proc=1)
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dense_ffn_fully_shard() -> None:
     """Feature: Dense FFN FSDP integration.
