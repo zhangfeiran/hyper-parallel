@@ -2310,3 +2310,48 @@ projection VJP consumption policy；这不是完整 BF16 projection composition 
 原保存状态；checkpoint 的两轮启用 KL forward 均为九阶段。
 
 以上回传、校准与训练证据不建立完整模型、CP8、8K/32K/128K 或训练性能验收。
+
+## CP 子组映射到共同 SHMEM root
+
+`MegaDsaWorkspace(..., cp_group=cp_group)` 支持在覆盖 CP 成员的共同 root 上声明 DSA
+arena。`DsaBatchMeta.cp_ranks` 使用 CP group 的有序 global ranks，`cp_rank` 是组内
+ordinal，`root_pes` 由这些 global ranks 在 `root.members` 中的位置确定。Native forward、
+main-gradient return 和 index-K return 在远端地址与传输拓扑查询前转换 CP ordinal，
+owner inbox 的 sender 顺序继续使用 CP ordinal，不使用 root PE 作为 stripe 下标。
+
+所有 root 成员必须以相同顺序声明同名 consumer、相同容量和布局，并参与 bind、对称
+allocation/free 和 close。`dist.GroupMember.NON_GROUP_MEMBER` 成员保留 arena 和生命周期
+责任，禁止 prepare/submit CP work。不同 CP 子组可使用同一声明的 arena；每个子组内部
+须遵守一致的调用顺序，root 级 free/close 前须保证全部子组已完成。当前租约在同一进程
+中串行交接，不提供跨 consumer 的并发执行或 heap growth。
+
+映射协议要求 `dsa_cp_root_mapping_version()==1`，在申请 lease 前检查；旧载荷拒绝
+mapped submission。原有 CP==root 的 18-word metadata 保留；映射路径使用 27-word
+metadata，扩展内容为 root size 和八个 CP→root PE（未用槽位为 `-1`），支持 CP≤8。
+Forward/index return 分别使用映射 protocol `2`，main dense/sparse return 分别为 `3/4`。
+
+[mega_dsa_root_mapping_validate.py](../../examples/mega_dsa_root_mapping_validate.py)
+已在四卡冻结载荷上完成 72 个 rank-case：CP `(1,3)` 与 root `(0,1,2,3)` 的非连续映射、
+非参与成员的分配/释放，以及 CP `(1,3)` 与 `(0,2)` 两个子组分别执行。覆盖四种 query tile、
+非零→零→非零复用、融合 LI/SFA/KL forward、main dense/sparse 对照和 index-K 稀疏归还。
+每个 case 的转换前 FP32 owner sum 精确一致。验收与载荷身份位于
+`build/native/validation/mega-dsa-root-mapping-20261011/`。
+
+MegaMoE 的 shared-root adapter 当前要求 EP 与 root 的有序 membership 相同，因此该映射
+为 CP2/EP4/root4 的真实共存提供 DSA 路径。EP 严格子组的 PE 转换、热副本远端地址转换、
+CP8、CP×TP、完整模型和训练性能需要分别验收。
+
+[真实 CP2/EP4 共存 worker](../../../../../tests/torch/multicore/_test_mapped_cp_ep_shared_root.py)
+在同一冻结载荷上通过八种场景：MoE pull / 预留完整 lossless capacity 的 push、只运行
+CP `(1,3)` / 同时分别运行两个 CP 子组，以及两种 consumer close 顺序。每步先保存两轮
+MoE forward，再在另一 stream 执行融合 DSA LI/SFA/KL 和 main/index 归还，最后反序执行
+MoE backward。MoE output、input/route/expert gradients 及 SGD 后参数与 common EP reference
+对照通过。合计 1296 个融合 DSA rank-case、144 个 MoE F+B+SGD rank-step（288 对
+forward/backward）；关闭一个 consumer 后，剩余 consumer 的实际执行仍通过。
+每个场景的三次固定形状采样中，Torch allocated bytes 和外部 SHMEM heap bytes 保持一致；
+分配计数遵守 `5→4/1→0`，最终 native reference count 归零。此短程 plateau 证据不替代
+长步稳定性与完整模型训练。结果见同目录 `coexistence_audit.json`。
+
+新载荷也重新通过原 18-word 协议的 CP1/CP2/CP4 回归，共 560 个 rank-case，覆盖
+长历史 `(3,2113)`、signed zero/NaN/Inf、实际融合 KL partials 和 main/index 交替复用；
+FP32 owner sum 与实际加载库 SHA 均已核对。

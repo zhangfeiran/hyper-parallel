@@ -27,10 +27,10 @@ void check_extra_shapes(const at::Tensor &query, const at::Tensor &trace, const 
   TORCH_CHECK(trace.sizes() == at::IntArrayRef({3, 20, 64}) && trace.scalar_type() == at::kLong,
               "fused SFA grad expects int64 phase trace[3,20,64]");
   TORCH_CHECK(extra[0]->dim() == 1 && extra[0]->scalar_type() == at::kByte &&
-                extra[1]->sizes() == at::IntArrayRef({18}) && extra[1]->scalar_type() == at::kLong &&
-                extra[2]->dim() == 2 && extra[2]->size(0) > 0 && extra[2]->size(1) == 4 &&
-                extra[2]->scalar_type() == at::kLong && extra[3]->sizes() == at::IntArrayRef({32}) &&
-                extra[3]->scalar_type() == at::kLong,
+                (extra[1]->dim() == 1 && (extra[1]->numel() == 18 || extra[1]->numel() == 27)) &&
+                extra[1]->scalar_type() == at::kLong && extra[2]->dim() == 2 && extra[2]->size(0) > 0 &&
+                extra[2]->size(1) == 4 && extra[2]->scalar_type() == at::kLong &&
+                extra[3]->sizes() == at::IntArrayRef({32}) && extra[3]->scalar_type() == at::kLong,
               "fused SFA grad transport buffer ABI mismatch");
 }
 

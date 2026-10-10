@@ -37,8 +37,9 @@ ge::graphStatus TilingIndexGradReturn(gert::TilingContext *context) {
   const auto &t = trace->GetOriginShape();
   const auto &o = owner->GetOriginShape();
   if (g.GetDimNum() != 2 || g.GetDim(0) <= 0 || g.GetDim(1) != 128 || a.GetDimNum() != 1 || a.GetDim(0) <= 0 ||
-      m.GetDimNum() != 1 || m.GetDim(0) != 18 || r.GetDimNum() != 2 || r.GetDim(1) != 4 || r.GetDim(0) <= 0 ||
-      t.GetDimNum() != 1 || t.GetDim(0) != 32 || o.GetDimNum() != 2 || o.GetDim(0) != *capacity || o.GetDim(1) != 128) {
+      m.GetDimNum() != 1 || (m.GetDim(0) != 18 && m.GetDim(0) != 27) || r.GetDimNum() != 2 || r.GetDim(1) != 4 ||
+      r.GetDim(0) <= 0 || t.GetDimNum() != 1 || t.GetDim(0) != 32 || o.GetDimNum() != 2 || o.GetDim(0) != *capacity ||
+      o.GetDim(1) != 128) {
     const auto dim = [](const auto &shape, size_t axis) {
       return shape.GetDimNum() > axis ? shape.GetDim(axis) : int64_t{-1};
     };

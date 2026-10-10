@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.shmem.consumer import (
@@ -99,10 +100,37 @@ class MegaDsaWorkspace:
     or a remote ready/ACK protocol. Publication only enqueues local copies.
     """
 
-    def __init__(self, root: SharedShmemRoot, consumer_name: str, specification: DsaWorkspaceSpec) -> None:
-        """Declare DSA bytes in the shared registry without allocating native memory."""
-        if len(root.members) != specification.cp_size:
-            raise ValueError("DSA CP must have the same ordered membership as the SHMEM root")
+    def __init__(self, root: SharedShmemRoot, consumer_name: str, specification: DsaWorkspaceSpec,
+                 *, cp_group: dist.ProcessGroup | None = None) -> None:
+        """Declare root-wide storage with optional subgroup execution.
+
+        Every root member reserves, binds and closes the same named workspace
+        with identical capacities, including NON_GROUP_MEMBER ranks. Only CP
+        members prepare invocations or submit work. Root-wide quiescence/free
+        must occur in matching order after all participating groups finish.
+        """
+        self.cp_group = root.group if cp_group is None else cp_group
+        self.participates = cp_group != dist.GroupMember.NON_GROUP_MEMBER
+        if cp_group is None:
+            self.cp_members, self.cp_rank = root.members, root.rank
+        elif self.participates:
+            if not dist.is_initialized():
+                raise ValueError("DSA CP subgroup requires initialized torch.distributed")
+            self.cp_members = tuple(dist.get_process_group_ranks(cp_group))
+            self.cp_rank = dist.get_rank(cp_group)
+        else:
+            self.cp_members, self.cp_rank = (), -1
+        if (self.participates and (len(self.cp_members) != specification.cp_size
+                                  or not set(self.cp_members).issubset(root.members))):
+            raise ValueError("DSA CP group must match its declared size and be contained in the SHMEM root")
+        if specification.cp_size > len(root.members):
+            raise ValueError("DSA CP size exceeds the SHMEM root")
+        self.root_pes = tuple(root.members.index(rank) for rank in self.cp_members)
+        if self.participates and self.root_pes[self.cp_rank] != root.rank:
+            raise ValueError("DSA CP rank must map to the caller SHMEM root PE")
+        self.mapped_transport = self.cp_members != root.members
+        if self.mapped_transport and specification.cp_size > 8:
+            raise ValueError("mapped DSA transport supports CP sizes up to eight")
         self.root = root
         self.spec = specification
         self.arena_bytes, self.layout = specification.arena_layout()
@@ -142,9 +170,11 @@ class MegaDsaWorkspace:
     def prepare(self, batch_meta: DsaBatchMeta) -> DsaWorkspaceInvocation:
         """Prepare owner-local publication order outside the execution hot path."""
         self.bind()
-        if (batch_meta.cp_ranks != self.root.members or batch_meta.cp_rank != self.root.rank
-                or batch_meta.root_pes != tuple(range(self.spec.cp_size))):
-            raise ValueError("DSA metadata must use the same ordered CP/root membership and direct root PE mapping")
+        if not self.participates:
+            raise ValueError("nonparticipating root members allocate/close DSA storage but cannot prepare CP work")
+        if (batch_meta.cp_ranks != self.cp_members or batch_meta.cp_rank != self.cp_rank
+                or batch_meta.root_pes != self.root_pes):
+            raise ValueError("DSA metadata must match the prepared CP/root membership and root PE mapping")
         if batch_meta.heap_generation != self.root.generation:
             raise ValueError("DSA metadata heap_generation must match the bound root")
         owned = {token for token, owner in enumerate(batch_meta.token_owners) if owner == batch_meta.cp_rank}
@@ -155,6 +185,15 @@ class MegaDsaWorkspace:
         order = tuple(sorted(range(len(owned)), key=lambda row: batch_meta.token_local_offsets[
             batch_meta.kv_global_ids[row]]))
         return DsaWorkspaceInvocation(batch_meta, torch.tensor(order, dtype=torch.long, device=self.arena.device), self)
+
+    def transport_metadata(self, values: tuple[int, ...], meta: DsaBatchMeta) -> tuple[int, ...]:
+        """Append immutable root size and eight CP-to-root PEs for mapped native protocols."""
+        if not self.mapped_transport:
+            return values
+        if (not self.participates or meta.root_pes != self.root_pes
+                or meta.cp_ranks != self.cp_members or len(values) != 18):
+            raise ValueError("mapped transport metadata requires this workspace's prepared CP/root topology")
+        return (*values, len(self.root.members), *self.root_pes, *(-1 for _ in range(8-len(self.root_pes))))
 
     @contextmanager
     def lease(self, invocation: DsaWorkspaceInvocation, *, direction: str) -> Iterator[MegaDsaWorkspace]:
@@ -212,7 +251,7 @@ class MegaDsaWorkspace:
 
         The counter belongs to the arena lifetime, so constructing another
         transport adapter cannot reuse stale device flags. Each collective
-        invocation reserves exactly once on every root member.
+        invocation reserves exactly once on every participating CP member.
         """
         meta = invocation.batch_meta
         expected = (meta.layer, meta.microbatch, meta.invocation, meta.layout_id, meta.heap_generation)

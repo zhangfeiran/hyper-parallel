@@ -16,13 +16,14 @@
 #define HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_DSA_CP_TRANSPORT_H_
 #include "kernel_operator.h"  // NOLINT(build/include_subdir)
 #include "data_plane/rma.h"
+#include "dsa_cp_peer_mapping.h"
 #include "dsa_mixed_group.h"  // NOLINT(build/include_subdir)
 
 namespace DsaMixed {
 class CpTransport {
  public:
-  __aicore__ inline void Init(__gm__ uint8_t *arena, __gm__ uint8_t *metadata,
-                             __gm__ uint8_t *requests, __gm__ uint8_t *trace) {
+  __aicore__ inline void Init(__gm__ uint8_t *arena, __gm__ uint8_t *metadata, __gm__ uint8_t *requests,
+                              __gm__ uint8_t *trace) {
     arena_ = arena;
     meta_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(metadata), 18);
     requests_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(requests));
@@ -30,26 +31,29 @@ class CpTransport {
     epoch_ = meta_.GetValue(2);
     rank_ = static_cast<int32_t>(meta_.GetValue(3));
     size_ = static_cast<int32_t>(meta_.GetValue(4));
+    peers_.Init(metadata, meta_.GetValue(1) == 2, rank_, size_);
   }
 
   __aicore__ inline void PublishReady() {
 #ifndef __DAV_C220_CUBE__
     auto *state = aclshmemi_get_state();
-    if (meta_.GetValue(0) != 0x4850445341435031LL || meta_.GetValue(1) != 1 ||
-        state->mype != rank_ || state->npes != size_ || epoch_ <= 0) {
+    if (meta_.GetValue(0) != 0x4850445341435031LL || (meta_.GetValue(1) != 1 && meta_.GetValue(1) != 2) ||
+        epoch_ <= 0) {
       AscendC::Trap();
     }
+    peers_.Validate();
     auto signal = Signal(rank_);
     for (uint32_t index = 0; index < 5; ++index) {
       PublishControl(signal, index, meta_.GetValue(5 + index));
     }
     PublishControl(signal, 8, epoch_);
     for (int32_t peer = 0; peer < size_; ++peer) {
-      if (peer != rank_ && !(state->topo_list[peer] & ACLSHMEM_TRANSPORT_MTE)) {
+      if (peer != rank_ && !(state->topo_list[peers_.RootPe(peer)] & ACLSHMEM_TRANSPORT_MTE)) {
         AscendC::Trap();
       }
       auto remote = Signal(peer);
-      while (ReadVisible(remote, 8) < epoch_) {}
+      while (ReadVisible(remote, 8) < epoch_) {
+      }
       for (uint32_t index = 0; index < 5; ++index) {
         if (ReadVisible(remote, index) != meta_.GetValue(5 + index)) {
           AscendC::Trap();
@@ -72,14 +76,15 @@ class CpTransport {
 #endif
   }
 
-  template<bool WaitIndexer = true>
-  __aicore__ inline void PullMain(__gm__ uint8_t *compressed, __gm__ uint8_t *rope,
-                                 GlobalTensor<int64_t> &compute, uint32_t groups) {
+  template <bool WaitIndexer = true>
+  __aicore__ inline void PullMain(__gm__ uint8_t *compressed, __gm__ uint8_t *rope, GlobalTensor<int64_t> &compute,
+                                  uint32_t groups) {
 #ifndef __DAV_C220_CUBE__
     if constexpr (WaitIndexer) {
       for (uint32_t group = 0; group < groups; ++group) {
         for (uint32_t member = 0; member < 3; ++member) {
-          while (ReadVisible(compute, group * kGroupWords + member * kMemberWords + 7) != 1) {}
+          while (ReadVisible(compute, group * kGroupWords + member * kMemberWords + 7) != 1) {
+          }
         }
       }
       PublishControl(trace_, 13, 3 * groups);
@@ -100,7 +105,8 @@ class CpTransport {
   }
 
   __aicore__ inline void WaitIndex() {
-    while (ReadVisible(trace_, 0) != epoch_) {}
+    while (ReadVisible(trace_, 0) != epoch_) {
+    }
   }
 
   __aicore__ inline void PullSelectedMain(__gm__ uint8_t *compressed, __gm__ uint8_t *rope, __gm__ uint8_t *requests,
@@ -132,7 +138,8 @@ class CpTransport {
 #ifndef __DAV_C220_CUBE__
     for (int32_t peer = 0; peer < size_; ++peer) {
       auto remote = Signal(peer);
-      while (ReadVisible(remote, 16) < epoch_) {}
+      while (ReadVisible(remote, 16) < epoch_) {
+      }
     }
     PublishControl(trace_, 3, size_);
 #endif
@@ -159,8 +166,8 @@ class CpTransport {
       auto *target = destination + targetOffset * rowBytes;
       const int64_t bytes = rows * rowBytes;
       if (peer != rank_) {
-        source =
-          reinterpret_cast<__gm__ uint8_t *>(hyper_parallel::multicore::shmem::data_plane::remote_ptr(source, peer));
+        source = reinterpret_cast<__gm__ uint8_t *>(
+          hyper_parallel::multicore::shmem::data_plane::remote_ptr(source, peers_.RootPe(peer)));
         remote += bytes;
       }
       Copy(target, source, bytes, buffer);
@@ -175,7 +182,7 @@ class CpTransport {
     auto *address = arena_ + meta_.GetValue(13);
     if (peer != rank_) {
       address = reinterpret_cast<__gm__ uint8_t *>(
-          hyper_parallel::multicore::shmem::data_plane::remote_ptr(address, peer));
+        hyper_parallel::multicore::shmem::data_plane::remote_ptr(address, peers_.RootPe(peer)));
     }
     GlobalTensor<int64_t> signal;
     signal.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(address), 32);
@@ -183,7 +190,7 @@ class CpTransport {
   }
 
   __aicore__ inline void PullField(__gm__ uint8_t *destination, int64_t sourceOffset, uint32_t width,
-                                  AscendC::LocalTensor<uint8_t> &buffer, uint32_t totalWord, uint32_t remoteWord) {
+                                   AscendC::LocalTensor<uint8_t> &buffer, uint32_t totalWord, uint32_t remoteWord) {
 #ifndef __DAV_C220_CUBE__
     int64_t total = ReadVisible(trace_, totalWord);
     int64_t remote = ReadVisible(trace_, remoteWord);
@@ -195,7 +202,7 @@ class CpTransport {
       const int64_t bytes = requests_.GetValue(run * 4 + 3) * rowBytes;
       if (peer != rank_) {
         source = reinterpret_cast<__gm__ uint8_t *>(
-            hyper_parallel::multicore::shmem::data_plane::remote_ptr(source, peer));
+          hyper_parallel::multicore::shmem::data_plane::remote_ptr(source, peers_.RootPe(peer)));
         remote += bytes;
       }
       Copy(target, source, bytes, buffer);
@@ -206,8 +213,8 @@ class CpTransport {
 #endif
   }
 
-  __aicore__ inline void Copy(__gm__ uint8_t *destination, __gm__ uint8_t *source,
-                             int64_t bytes, AscendC::LocalTensor<uint8_t> &buffer) {
+  __aicore__ inline void Copy(__gm__ uint8_t *destination, __gm__ uint8_t *source, int64_t bytes,
+                              AscendC::LocalTensor<uint8_t> &buffer) {
 #ifndef __DAV_C220_CUBE__
     GlobalTensor<uint8_t> input, output;
     input.SetGlobalBuffer(source, bytes);
@@ -225,6 +232,7 @@ class CpTransport {
     }
 #endif
   }
+  CpPeerMapping peers_;
   __gm__ uint8_t *arena_ = nullptr;
   GlobalTensor<int64_t> meta_, requests_, trace_;
   int64_t epoch_ = 0;

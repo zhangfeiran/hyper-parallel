@@ -35,10 +35,11 @@ std::tuple<at::Tensor &, at::Tensor &> index_grad_return_npu(const at::Tensor &g
   }
   TORCH_CHECK(arena.scalar_type() == at::kByte && arena.dim() == 1 && arena.numel() > 0,
               "index-K return requires a bound symmetric uint8 arena");
-  TORCH_CHECK(metadata.scalar_type() == at::kLong && metadata.sizes() == at::IntArrayRef({18}) &&
+  TORCH_CHECK(metadata.scalar_type() == at::kLong &&
+                (metadata.dim() == 1 && (metadata.numel() == 18 || metadata.numel() == 27)) &&
                 requests.scalar_type() == at::kLong && requests.dim() == 2 && requests.size(0) > 0 &&
                 requests.size(1) == 4 && trace.scalar_type() == at::kLong && trace.sizes() == at::IntArrayRef({32}),
-              "index-K return requires int64 metadata[18], requests[runs,4], trace[32]");
+              "index-K return requires int64 metadata[18 or 27], requests[runs,4], trace[32]");
   TORCH_CHECK(owner.scalar_type() == at::kFloat && owner.dim() == 2 && owner.size(0) > 0 && owner.size(1) == 128,
               "index-K return requires an FP32 [owner capacity,128] output");
   static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaIndexGradReturn",

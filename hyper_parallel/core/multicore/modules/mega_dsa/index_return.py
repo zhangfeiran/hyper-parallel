@@ -95,15 +95,18 @@ class SparseIndexGradReturnProbe:
                 or partial.requires_grad):
             raise ValueError("index-K partial must be detached contiguous global-packed FP32 [N,128]")
         self.check_native_support()
+        self.backend.check_mapping_support()
         with self.workspace.lease(invocation, direction="backward"):
             epoch = self.workspace.next_transport_epoch(invocation)
             offsets = {name: offset for name, offset, _, _ in self.workspace.layout}
-            values = (_INDEX_MAGIC, 1, epoch, meta.cp_rank, len(meta.cp_ranks), meta.heap_generation,
+            values = (_INDEX_MAGIC, 2 if self.workspace.mapped_transport else 1, epoch, meta.cp_rank,
+                      len(meta.cp_ranks), meta.heap_generation,
                       meta.layer, meta.microbatch, meta.invocation, self.backend.layout_hash,
                       offsets["gradient_inbox"], self.workspace.spec.owner_gradient_tokens,
                       len(meta.kv_global_ids), offsets["events"], len(self.backend.runs),
                       meta.global_valid_queries, self.workspace.arena_bytes, self.workspace.spec.source_tokens)
-            metadata = torch.tensor(values, dtype=torch.int64).to(partial.device, non_blocking=True)
+            metadata = torch.tensor(self.workspace.transport_metadata(values, meta), dtype=torch.int64).to(
+                partial.device, non_blocking=True)
             trace = torch.zeros(32, dtype=torch.int64, device=partial.device)
             owner = torch.full((self.workspace.spec.owner_gradient_tokens, 128), float("nan"),
                                dtype=torch.float32, device=partial.device)

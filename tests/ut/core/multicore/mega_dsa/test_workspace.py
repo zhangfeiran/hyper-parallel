@@ -17,6 +17,7 @@
 from dataclasses import replace
 
 import torch
+import torch.distributed as dist
 
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta
 from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
@@ -42,6 +43,22 @@ class TestDsaWorkspace(SharedRootFixture):
         meta = replace(DsaBatchMeta.packed((3, 5)), kv_global_ids=(7, 0, 6, 1, 5, 2, 4, 3),
                        heap_generation=self.root.generation)
         return self.workspace.prepare(meta)
+
+    def test_nonparticipant_reserves_binds_and_frees_without_cp_submission(self):
+        """Inactive root PEs retain the identical allocation lifecycle and reject CP execution."""
+        inactive = MegaDsaWorkspace(self.root, "inactive-dsa", DsaWorkspaceSpec(1, 1, 1, 1),
+                                    cp_group=dist.GroupMember.NON_GROUP_MEMBER)
+        self.consumers.append(inactive.consumer)
+        self.addCleanup(inactive.close)
+        inactive.bind()
+        self.assertFalse(inactive.participates)
+        self.assertIsNotNone(inactive.arena)
+        self.assertEqual(self.native._empty.call_count, 1)
+        with self.assertRaisesRegex(ValueError, "nonparticipating"):
+            inactive.prepare(DsaBatchMeta.packed((1,)))
+        inactive.close()
+        self.assertIsNone(inactive.arena)
+        self.assertEqual(self.native._free.call_count, 1)
 
     def test_arena_alignment_and_peer_exclusive_fp32_inbox(self):
         """Independent fields are aligned and signals occupy separate 64-byte cache lines."""

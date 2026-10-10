@@ -134,10 +134,12 @@ class ShmemConsumer:
 class SharedShmemRoot:
     """Declare every consumer before binding; keep one native reference and frozen heap.
 
-    The first version requires identical ordered CP/EP/root membership and
-    serial execution. Consumer layouts are independent. No consumer can grow
-    or rebuild this root. Every member declares/binds/allocates/frees/closes in
-    the same collective order. Close consumers first, then close this root.
+    Each consumer owns its subgroup-to-root mapping; MegaMoE currently
+    requires EP membership to match this root, while MegaDSA permits CP
+    subgroups. Execution is serial per process. Consumer layouts are
+    independent. No consumer can grow or rebuild this root. Every root
+    member declares/binds/allocates/frees/closes in the same collective order,
+    including subgroup nonmembers. Close consumers first, then this root.
     Legacy standalone SHMEM lifecycles remain independent of this opt-in API.
     """
 

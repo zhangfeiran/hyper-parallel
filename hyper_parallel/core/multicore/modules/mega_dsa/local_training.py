@@ -201,6 +201,7 @@ class FusedDsaLocalCpTrainingProbe:
         if (not isinstance(self.sparse_main_return, bool)
                 or self.backward_backend.sparse_return != self.sparse_main_return):
             raise ValueError("local training main-gradient return was modified; prepare a new probe")
+        self.forward_backend.check_mapping_support()
         if self.mode != "kl_only":
             self.backward_backend.check_local_native_support()
             if self.sparse_main_return:

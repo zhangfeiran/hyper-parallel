@@ -16,6 +16,7 @@
 #define HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_DSA_INDEX_GRAD_TRANSPORT_H_
 #include "kernel_operator.h"
 #include "data_plane/rma.h"
+#include "dsa_cp_peer_mapping.h"
 #include "dsa_mixed_group.h"
 
 namespace DsaMixed {
@@ -32,18 +33,19 @@ class IndexGradTransport {
     epoch_ = meta_.GetValue(2);
     rank_ = static_cast<int32_t>(meta_.GetValue(3));
     size_ = static_cast<int32_t>(meta_.GetValue(4));
+    peers_.Init(metadata, meta_.GetValue(1) == 2, rank_, size_);
   }
 
   __aicore__ inline void Process(int64_t tokens, int64_t capacity, int64_t arenaBytes, int64_t runs) {
 #ifndef __DAV_C220_CUBE__
-    auto *state = aclshmemi_get_state();
-    if (meta_.GetValue(0) != 0x4850445341494731LL || meta_.GetValue(1) != 1 || state->mype != rank_ ||
-        state->npes != size_ || size_ <= 0 || size_ > 8 || epoch_ <= 0 || meta_.GetValue(11) != capacity ||
-        capacity <= 0 || meta_.GetValue(12) < 0 || meta_.GetValue(12) > capacity || meta_.GetValue(15) != tokens ||
-        meta_.GetValue(14) != runs || meta_.GetValue(10) < 0 || meta_.GetValue(13) < 0 ||
+    if (meta_.GetValue(0) != 0x4850445341494731LL || (meta_.GetValue(1) != 1 && meta_.GetValue(1) != 2) || size_ <= 0 ||
+        size_ > 8 || epoch_ <= 0 || meta_.GetValue(11) != capacity || capacity <= 0 || meta_.GetValue(12) < 0 ||
+        meta_.GetValue(12) > capacity || meta_.GetValue(15) != tokens || meta_.GetValue(14) != runs ||
+        meta_.GetValue(10) < 0 || meta_.GetValue(13) < 0 ||
         meta_.GetValue(10) + size_ * capacity * 704 * 4 > arenaBytes || meta_.GetValue(13) + 32 * 8 > arenaBytes) {
       AscendC::Trap();
     }
+    peers_.Validate();
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECCALC> storage;
     pipe.InitBuffer(storage, 1024);
@@ -79,7 +81,7 @@ class IndexGradTransport {
     auto *address = arena_ + meta_.GetValue(10) + sender * meta_.GetValue(11) * 704 * 4;
     return peer == rank_ ? address
                          : reinterpret_cast<__gm__ uint8_t *>(
-                             hyper_parallel::multicore::shmem::data_plane::remote_ptr(address, peer));
+                             hyper_parallel::multicore::shmem::data_plane::remote_ptr(address, peers_.RootPe(peer)));
   }
   __aicore__ inline GlobalTensor<float> Inbox(int32_t peer, int32_t sender) {
     GlobalTensor<float> inbox;
@@ -94,8 +96,8 @@ class IndexGradTransport {
   __aicore__ inline GlobalTensor<int64_t> Signal(int32_t peer) {
     auto *address = arena_ + meta_.GetValue(13);
     if (peer != rank_) {
-      address =
-        reinterpret_cast<__gm__ uint8_t *>(hyper_parallel::multicore::shmem::data_plane::remote_ptr(address, peer));
+      address = reinterpret_cast<__gm__ uint8_t *>(
+        hyper_parallel::multicore::shmem::data_plane::remote_ptr(address, peers_.RootPe(peer)));
     }
     GlobalTensor<int64_t> signal;
     signal.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(address), 32);
@@ -134,7 +136,7 @@ class IndexGradTransport {
     PublishControl(local, 5, meta_.GetValue(0));
     PublishControl(local, 24, epoch_);
     for (int32_t peer = 0; peer < size_; ++peer) {
-      if (peer != rank_ && !(aclshmemi_get_state()->topo_list[peer] & ACLSHMEM_TRANSPORT_MTE)) {
+      if (peer != rank_ && !(aclshmemi_get_state()->topo_list[peers_.RootPe(peer)] & ACLSHMEM_TRANSPORT_MTE)) {
         AscendC::Trap();
       }
       auto remote = Signal(peer);
@@ -240,6 +242,7 @@ class IndexGradTransport {
     PublishControl(trace_, 18, size_ * meta_.GetValue(12) * 512);
 #endif
   }
+  CpPeerMapping peers_;
   __gm__ uint8_t *arena_ = nullptr;
   GlobalTensor<int64_t> meta_, requests_, trace_;
   GlobalTensor<float> gradient_, owner_;

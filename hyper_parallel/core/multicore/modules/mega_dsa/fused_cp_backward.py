@@ -161,18 +161,21 @@ class FusedDsaCpBackwardProbe:
         else:
             self.check_native_support()
         invocation = self.workspace.prepare(saved.batch_meta)
+        self.backend.check_mapping_support()
         with self.workspace.lease(invocation, direction="backward"):
             return self._submit(saved, grad_output, invocation, local_queries=local_queries)
 
     def _metadata(self, meta, epoch: int) -> torch.Tensor:
         offsets = {name: offset for name, offset, _, _ in self.workspace.layout}
-        values = (_GRAD_MAGIC, 2 if self.sparse_return else 1, epoch, meta.cp_rank, len(meta.cp_ranks),
+        protocol = (2 if self.sparse_return else 1) + (2 if self.workspace.mapped_transport else 0)
+        values = (_GRAD_MAGIC, protocol, epoch, meta.cp_rank, len(meta.cp_ranks),
                   meta.heap_generation,
                   meta.layer, meta.microbatch, meta.invocation, self.backend.layout_hash,
                   offsets["gradient_inbox"], self.workspace.spec.owner_gradient_tokens,
                   len(meta.kv_global_ids), offsets["events"], len(self.backend.runs),
                   meta.global_valid_queries, self.workspace.arena_bytes, self.workspace.spec.source_tokens)
-        return torch.tensor(values, dtype=torch.int64).to(self.backend.layout.device, non_blocking=True)
+        return torch.tensor(self.workspace.transport_metadata(values, meta), dtype=torch.int64).to(
+            self.backend.layout.device, non_blocking=True)
 
     def _submit(self, saved, grad_output, invocation, *, local_queries=False) -> FusedCpBackwardResult:
         query, compressed, query_rope, key_rope = saved.states

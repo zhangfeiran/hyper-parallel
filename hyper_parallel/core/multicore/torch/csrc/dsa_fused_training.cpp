@@ -148,7 +148,8 @@ Result fused_training_npu(const at::Tensor &indexQuery, const at::Tensor &indexK
 }
 void check_transport_shapes(const at::Tensor &arena, const at::Tensor &metadata, const at::Tensor &requests,
                             const at::Tensor &transportTrace) {
-  TORCH_CHECK(arena.dim() == 1 && arena.scalar_type() == at::kByte && metadata.sizes() == at::IntArrayRef({18}) &&
+  TORCH_CHECK(arena.dim() == 1 && arena.scalar_type() == at::kByte &&
+                (metadata.dim() == 1 && (metadata.numel() == 18 || metadata.numel() == 27)) &&
                 metadata.scalar_type() == at::kLong && requests.dim() == 2 && requests.size(0) > 0 &&
                 requests.size(1) == 4 && requests.scalar_type() == at::kLong &&
                 transportTrace.sizes() == at::IntArrayRef({32}) && transportTrace.scalar_type() == at::kLong,

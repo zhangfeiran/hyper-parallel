@@ -249,6 +249,9 @@ def _compose_hyper_parallel_ops(
         runtime = source_root / name / "op_kernel" / "runtime"
         runtime.mkdir()
         shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_mixed_group.h", runtime / "dsa_mixed_group.h")
+        if name in ("hyper_dsa_fused_forward", "hyper_dsa_fused_training", "hyper_dsa_cp_attention",
+                    "hyper_dsa_fused_grad", "hyper_dsa_index_grad_return"):
+            shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_peer_mapping.h", runtime / "dsa_cp_peer_mapping.h")
         if name in ("hyper_dsa_fused_forward", "hyper_dsa_fused_training", "hyper_dsa_cp_attention"):
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_transport.h", runtime / "dsa_cp_transport.h")
         if name == "hyper_dsa_fused_grad":

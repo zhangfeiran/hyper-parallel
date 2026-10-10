@@ -163,13 +163,13 @@ class FusedDsaCpForwardProbe:
         if invocation.workspace is not workspace:
             raise ValueError("fused CP preparation requires the invocation's owning workspace")
         declaration = (heads, float(attention_scale))
-        if len(workspace.root.members) > 1:
-            declarations = [None] * len(workspace.root.members)
-            dist.all_gather_object(declarations, declaration, group=workspace.root.group)
+        if len(workspace.cp_members) > 1:
+            declarations = [None] * len(workspace.cp_members)
+            dist.all_gather_object(declarations, declaration, group=workspace.cp_group)
             if any(item != declaration for item in declarations):
                 raise ValueError("fused CP members disagree on head count or attention scale")
         self.workspace = workspace
-        self.layout = DsaCpLayout(invocation.batch_meta, workspace.arena.device, group=workspace.root.group)
+        self.layout = DsaCpLayout(invocation.batch_meta, workspace.arena.device, group=workspace.cp_group)
         self.signature = _layout_signature(invocation.batch_meta)
         self.heads = heads
         self.scale = attention_scale
@@ -187,6 +187,14 @@ class FusedDsaCpForwardProbe:
         self.local_query_layout_reference: DsaLocalQueryLayout | None = None
         self.local_selected_rows: torch.Tensor | None = None
         self._prepared_local_layouts: WeakSet[DsaLocalQueryLayout] = WeakSet()
+
+    def check_mapping_support(self) -> None:
+        """Require mapped transport support before submitting any subgroup native work."""
+        if self.workspace.mapped_transport:
+            _load_native()
+            version = getattr(torch.ops.hyper_parallel, "dsa_cp_root_mapping_version", None)
+            if version is None or version() != 1:
+                raise RuntimeError("mapped DSA transport requires root mapping ABI 1; rebuild this checkout")
 
     def prepare_selected_requests(self) -> None:
         """Prepare immutable row addresses collectively before selected-transfer submissions."""
@@ -255,6 +263,7 @@ class FusedDsaCpForwardProbe:
             version = getattr(torch.ops.hyper_parallel, "dsa_local_cp_training_version", None)
             if version is None or version() != 1:
                 raise RuntimeError("local fused KL requires adapter ABI 1; rebuild this checkout's payload")
+        self.check_mapping_support()
         with self.workspace.lease(invocation, direction="forward"):
             return self._submit_local(invocation, main_states, index_states, local, selected_kl=selected_kl)
 
@@ -334,12 +343,14 @@ class FusedDsaCpForwardProbe:
     def _metadata(self, invocation: DsaWorkspaceInvocation, epoch: int) -> torch.Tensor:
         meta = invocation.batch_meta
         offsets = {name: offset for name, offset, _, _ in self.workspace.layout}
-        values = (_TRANSPORT_MAGIC, 1, epoch, meta.cp_rank, len(meta.cp_ranks), meta.heap_generation,
+        values = (_TRANSPORT_MAGIC, 2 if self.workspace.mapped_transport else 1, epoch, meta.cp_rank,
+                  len(meta.cp_ranks), meta.heap_generation,
                   meta.layer, meta.microbatch, meta.invocation, self.layout_hash,
                   offsets["source_index"], offsets["source_compressed"], offsets["source_rope"],
                   offsets["events"], len(self.runs), meta.global_valid_queries,
                   self.workspace.arena_bytes, self.workspace.spec.source_tokens)
-        return torch.tensor(values, dtype=torch.int64, device=self.layout.device)
+        return torch.tensor(self.workspace.transport_metadata(values, meta), dtype=torch.int64,
+                            device=self.layout.device)
 
     def forward(self, invocation: DsaWorkspaceInvocation, main_states: tuple[torch.Tensor, ...],
                 index_states: tuple[torch.Tensor, ...], *, selected_kl: bool = False,
@@ -378,6 +389,7 @@ class FusedDsaCpForwardProbe:
             raise RuntimeError("selected CP forward requires adapter ABI 1; rebuild this checkout's payload")
         if not selected_kl and not selected_pull and torch.ops.hyper_parallel.dsa_fused_forward_version() != 2:
             raise RuntimeError("fused CP requires adapter ABI 2; rebuild this checkout's payload")
+        self.check_mapping_support()
         with self.workspace.lease(invocation, direction="forward"):
             return self._submit(invocation, main_states, index_states,
                                 selected_kl=selected_kl, selected_pull=selected_pull)

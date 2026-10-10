@@ -389,7 +389,7 @@ class MegaDsa(torch.nn.Module):
         """Declare native dimensions, reducer compensation and transfer mode at preparation.
 
         Args:
-            workspace: Bound workspace with the same ordered CP/root membership.
+            workspace: Bound workspace with prepared CP membership and root PE mapping.
             invocation: Prepared ownership and packed layout for this layer.
             heads: Main attention heads, 32 or 64.
             attention_scale: Positive original attention scale.
@@ -414,9 +414,9 @@ class MegaDsa(torch.nn.Module):
         if kv_transfer == "selected" and kl_backend != "native":
             raise ValueError("selected KV transfer requires the native backend")
         declaration = (normalization, float(loss_coeff), kl_backend, kv_transfer)
-        if len(workspace.root.members) > 1:
-            declarations = [None] * len(workspace.root.members)
-            dist.all_gather_object(declarations, declaration, group=workspace.root.group)
+        if len(workspace.cp_members) > 1:
+            declarations = [None] * len(workspace.cp_members)
+            dist.all_gather_object(declarations, declaration, group=workspace.cp_group)
             if any(item != declaration for item in declarations):
                 raise ValueError("MegaDsa members disagree on normalization, coefficient, KL backend or KV transfer")
         self.core = MegaDsaCore(workspace, invocation, heads=heads, attention_scale=attention_scale, schedule=schedule)

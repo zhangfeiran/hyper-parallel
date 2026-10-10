@@ -38,3 +38,13 @@ def test_shared_shmem_root_cp4(monkeypatch) -> None:
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", "4")
     worker = str(Path(__file__).with_name("_test_shared_shmem_root.py"))
     torchrun_case(worker, "test_shared_shmem_root_coexistence", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="essential")
+def test_shared_shmem_root_mapped_cp2_ep4(monkeypatch) -> None:
+    """Validate CP subgroups with real fused DSA and EP4 MegaMoE on one root."""
+    prepare_multicore_test_environment()
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", "4")
+    worker = str(Path(__file__).with_name("_test_mapped_cp_ep_shared_root.py"))
+    torchrun_case(worker, "test_mapped_cp_ep_shared_root", num_proc=4)
