@@ -2382,3 +2382,35 @@ checkpoint。启用 KL 的 forward 为九阶段；retained backward 插入另一
 checkpoint 的两次启用 KL forward 均为九阶段。关闭的 auxiliary 梯度精确为零，实际
 SGD 检查通过。证据存于 `build/native/validation/mega-dsa-mapped-training-20261011/smoke_audit.json`。
 完整 H32/H64、BF16/FP32 merge weight、四种 ownership 的 13824 个 rank-step 矩阵另行验收。
+
+完整映射 CP2 训练矩阵现已通过，共 13824 个 rank-step；H32/H64、BF16/FP32 merge weight、
+四种 ownership、三种 objective、coefficient `0/.3`、sum/average reducer、四种 query tile
+以及 plain/retained/checkpoint 均完成。每个 case 的独立 masked global Native VJP 和实际
+SGD 更新检查通过，关闭的 auxiliary 梯度精确为零，阶段数、源码及加载载荷 SHA 已核对。
+完整证据见 `build/native/validation/mega-dsa-mapped-training-20261011/full_audit.json`。
+
+CP8 main-gradient dense/sparse return 的完整数值矩阵也已通过：每 rank 300 个 case，合计
+2400 个 rank-case，覆盖 H32/H64、四种 ownership、1/7/19 compute groups、四种 query tile、
+非零→零→非零复用和长历史 `(3,2113)`。同次 producer 的转换前 FP32 owner sum 精确一致，
+dense/sparse 对照和实际加载库 SHA 匹配；证据见 root-mapping 验收目录 `cp8_main_audit.json`。
+
+## 真实 HP attention 的融合 CP 接线
+
+[FusedDsaCpAttention](fused_model_boundary.py) 是显式 opt-in replacement，替换已构造的
+`DeepseekV32DSAAttention`。它保留原 Parameters、children、state dict、训练状态、RoPE、
+Q/KV latent projections、W_UK absorption、W_UV restoration 和 `o_proj`，不再次运行会创建
+fused Parameter 的源构造器。模型仍由 caller 准备 workspace、training probe、invocation、
+query layout、参数归约和 auxiliary upstream scale。
+
+调用要求 `dsa_training`、`dsa_invocation` 和 `dsa_query_layout`；本阶段支持完整 owner-local
+hidden shard，Q/KV 使用同一 caller row order。RoPE embeddings 必须对应这些 global token
+positions。支持 H32/H64、Hi64、K2048、C512、Dr64、Di128；Native dtype/协议准入由显式
+training probe 检查。TP 当前拒绝，training/freeze/coefficient gates 必须与冷准备的 probe
+一致；KL 使用融合阶段。该边界保持 first-order backward 契约，无自动 backend 构造或
+fallback。空 owner 仍提交 CP work，输出恢复使用显式维度，避免零行的 `reshape(...,-1)`。
+
+CPU 测试通过真实 HP 投影与显式 oracle 检查：参数/child identity、checkpoint keys、完整
+FP64 absorbed/unabsorbed output 与 hidden/全部参数梯度、freeze/zero/eval、checkpoint、
+错误声明提前失败及空 owner 的执行接线。硬件验收由
+[mega_dsa_fused_model_cp_validate.py](../../examples/mega_dsa_fused_model_cp_validate.py) 记录，
+对照独立 stock LI/SFA/KL 的完整模型路径；CPU 接线验收不代表 BF16 模型验收。
