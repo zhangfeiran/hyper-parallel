@@ -51,6 +51,8 @@ namespace {
 using Matrix = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t>;
 using DenseMatmul = Matmul<Matrix, Matrix, Matrix>;
 constexpr uint32_t VECTOR_CHUNK = 512;
+constexpr uint32_t VECTOR_ROWS = 16;
+constexpr uint32_t VECTOR_ELEMENTS = VECTOR_CHUNK * VECTOR_ROWS;
 
 template <typename Data>
 __aicore__ inline Data LoadDescriptor(const __gm__ Data *source) {
@@ -315,30 +317,40 @@ class DenseTileWorker {
 #else
   __aicore__ inline void Swiglu(const DenseTileOperation &operation, uint32_t first, uint32_t end,
                                 uint32_t column_begin, uint32_t column_end) {
+    if (first == end) {
+      return;
+    }
     TPipe pipe;
     TQue<TPosition::VECIN, 1> gate_queue, up_queue;
     TQue<TPosition::VECOUT, 1> output_queue;
     TBuf<TPosition::VECCALC> gate_float, up_float, temporary;
-    pipe.InitBuffer(gate_queue, 1, VECTOR_CHUNK * sizeof(bfloat16_t));
-    pipe.InitBuffer(up_queue, 1, VECTOR_CHUNK * sizeof(bfloat16_t));
-    pipe.InitBuffer(output_queue, 1, VECTOR_CHUNK * sizeof(bfloat16_t));
-    pipe.InitBuffer(gate_float, VECTOR_CHUNK * sizeof(float));
-    pipe.InitBuffer(up_float, VECTOR_CHUNK * sizeof(float));
-    pipe.InitBuffer(temporary, VECTOR_CHUNK * sizeof(float));
+    pipe.InitBuffer(gate_queue, 1, VECTOR_ELEMENTS * sizeof(bfloat16_t));
+    pipe.InitBuffer(up_queue, 1, VECTOR_ELEMENTS * sizeof(bfloat16_t));
+    pipe.InitBuffer(output_queue, 1, VECTOR_ELEMENTS * sizeof(bfloat16_t));
+    pipe.InitBuffer(gate_float, VECTOR_ELEMENTS * sizeof(float));
+    pipe.InitBuffer(up_float, VECTOR_ELEMENTS * sizeof(float));
+    pipe.InitBuffer(temporary, VECTOR_ELEMENTS * sizeof(float));
     GlobalTensor<bfloat16_t> packed, output;
     packed.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(values_[operation.left]));
     output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(values_[operation.output]));
-    for (uint32_t row = first; row < end; ++row) {
+    for (uint32_t row = first; row < end; row += VECTOR_ROWS) {
+      const uint32_t remaining_rows = end - row;
+      const uint32_t rows = remaining_rows < VECTOR_ROWS ? remaining_rows : VECTOR_ROWS;
       for (uint32_t column = column_begin; column < column_end; column += VECTOR_CHUNK) {
         const uint32_t remaining = column_end - column;
         const uint32_t size = remaining < VECTOR_CHUNK ? remaining : VECTOR_CHUNK;
         auto gate = gate_queue.AllocTensor<bfloat16_t>();
         auto up = up_queue.AllocTensor<bfloat16_t>();
-        DataCopyExtParams copy{1, static_cast<uint32_t>(size * sizeof(bfloat16_t)), 0, 0, 0};
-        DataCopyPadExtParams<bfloat16_t> pad{false, 0, 0, 0};
-        DataCopyPad(gate, packed[static_cast<uint64_t>(row) * operation.contracted + column], copy, pad);
-        DataCopyPad(up, packed[static_cast<uint64_t>(row) * operation.contracted + operation.columns + column], copy,
-                    pad);
+        const uint32_t block_elements = 32 / sizeof(bfloat16_t);
+        const uint32_t padded_size = (size + block_elements - 1) / block_elements * block_elements;
+        const uint32_t elements = rows * padded_size;
+        // 行间空隙由 DMA 步长处理；UB 尾部补零，保持每行独立的打包布局。
+        DataCopyExtParams copy_in{static_cast<uint16_t>(rows), static_cast<uint32_t>(size * sizeof(bfloat16_t)),
+                                 static_cast<uint32_t>((operation.contracted - size) * sizeof(bfloat16_t)), 0, 0};
+        DataCopyPadExtParams<bfloat16_t> pad{true, 0, static_cast<uint8_t>(padded_size - size), 0};
+        DataCopyPad(gate, packed[static_cast<uint64_t>(row) * operation.contracted + column], copy_in, pad);
+        DataCopyPad(up, packed[static_cast<uint64_t>(row) * operation.contracted + operation.columns + column],
+                    copy_in, pad);
         gate_queue.EnQue(gate);
         up_queue.EnQue(up);
         gate = gate_queue.DeQue<bfloat16_t>();
@@ -346,24 +358,26 @@ class DenseTileWorker {
         auto gate32 = gate_float.Get<float>();
         auto up32 = up_float.Get<float>();
         auto temp = temporary.Get<float>();
-        Cast(gate32, gate, RoundMode::CAST_NONE, size);
-        Cast(up32, up, RoundMode::CAST_NONE, size);
+        Cast(gate32, gate, RoundMode::CAST_NONE, elements);
+        Cast(up32, up, RoundMode::CAST_NONE, elements);
         PipeBarrier<PIPE_V>();
-        Muls(temp, gate32, -1.0f, size);
+        Muls(temp, gate32, -1.0f, elements);
         PipeBarrier<PIPE_V>();
-        Exp(temp, temp, size);
+        Exp(temp, temp, elements);
         PipeBarrier<PIPE_V>();
-        Adds(temp, temp, 1.0f, size);
+        Adds(temp, temp, 1.0f, elements);
         PipeBarrier<PIPE_V>();
-        Div(temp, gate32, temp, size);
+        Div(temp, gate32, temp, elements);
         PipeBarrier<PIPE_V>();
-        Mul(temp, temp, up32, size);
+        Mul(temp, temp, up32, elements);
         PipeBarrier<PIPE_V>();
         auto result = output_queue.AllocTensor<bfloat16_t>();
-        Cast(result, temp, RoundMode::CAST_RINT, size);
+        Cast(result, temp, RoundMode::CAST_RINT, elements);
         output_queue.EnQue(result);
         result = output_queue.DeQue<bfloat16_t>();
-        DataCopyPad(output[static_cast<uint64_t>(row) * operation.columns + column], result, copy);
+        DataCopyExtParams copy_out{static_cast<uint16_t>(rows), static_cast<uint32_t>(size * sizeof(bfloat16_t)),
+                                  0, static_cast<uint32_t>((operation.columns - size) * sizeof(bfloat16_t)), 0};
+        DataCopyPad(output[static_cast<uint64_t>(row) * operation.columns + column], result, copy_out);
         output_queue.FreeTensor(result);
         gate_queue.FreeTensor(gate);
         up_queue.FreeTensor(up);
