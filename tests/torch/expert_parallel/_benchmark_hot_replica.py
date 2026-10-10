@@ -118,7 +118,7 @@ def _host_breakdown(module, optimizer, values, ids, probabilities, gradient):
         values.grad = None
         dist.barrier()
         torch.npu.synchronize()
-        with HostMeasurements(device_intervals=False, prefetch_details=True) as host:
+        with HostMeasurements(device_intervals=False, prefetch_details=True, count_details=True) as host:
             output = module(values, ids, probabilities)
             output.backward(gradient)
             optimizer.step()
