@@ -90,6 +90,16 @@ void register_dsa_probes(torch::Library &m) {
     "Tensor(i!) transport_trace, Tensor(j!) owner_gradient, Tensor(k!) partials) "
     "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), "
     "Tensor(j!), Tensor(k!), Tensor(i!))");
+  m.def("dsa_local_cp_grad_version() -> int", []() -> int64_t { return 1; });
+  m.def(
+    "dsa_local_cp_grad_out(Tensor query, Tensor key, Tensor value, Tensor indices, Tensor grad_out, "
+    "Tensor out, Tensor maximum, Tensor sum, Tensor actual_query, Tensor actual_kv, Tensor query_rope, "
+    "Tensor key_rope, Tensor config, Tensor(f!) trace, Tensor(g!) retained, float scale, "
+    "Tensor(a!) grad_query, Tensor(b!) grad_key, Tensor(c!) grad_value, Tensor(d!) grad_query_rope, "
+    "Tensor(e!) grad_key_rope, Tensor(h!) arena, Tensor metadata, Tensor requests, "
+    "Tensor(i!) transport_trace, Tensor(j!) owner_gradient, Tensor(k!) partials, Tensor query_positions) "
+    "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), "
+    "Tensor(j!), Tensor(k!), Tensor(i!))");
   m.def("dsa_fused_forward_version() -> int", []() -> int64_t { return 2; });
   m.def(
     "dsa_fused_forward_out(Tensor index_query, Tensor index_key, Tensor query, Tensor compressed, "

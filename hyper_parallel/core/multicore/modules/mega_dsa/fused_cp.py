@@ -20,6 +20,7 @@ import hashlib
 import math
 from dataclasses import dataclass, field, replace
 from itertools import pairwise
+from weakref import WeakSet
 
 import torch
 import torch.distributed as dist
@@ -173,6 +174,7 @@ class FusedDsaCpForwardProbe:
         self.local_query_layout: DsaLocalQueryLayout | None = None
         self.local_query_layout_reference: DsaLocalQueryLayout | None = None
         self.local_selected_rows: torch.Tensor | None = None
+        self._prepared_local_layouts: WeakSet[DsaLocalQueryLayout] = WeakSet()
 
     def prepare_selected_requests(self) -> None:
         """Prepare immutable row addresses collectively before selected-transfer submissions."""
@@ -181,31 +183,41 @@ class FusedDsaCpForwardProbe:
         self.selected_rows = selected_request_rows(self.layout.batch_meta, self.layout.device)
         self.selected_rows_version = self.selected_rows._version
 
-    def prepare_local_queries(self, query_ids: tuple[int, ...] | None = None) -> None:
-        """Cold prepare a caller-ordered local query tile and complete owner addresses on every member."""
+    def prepare_local_queries(self, query_ids: tuple[int, ...] | None = None) -> DsaLocalQueryLayout:
+        """Cold prepare local query metadata and complete owner addresses on every member.
+
+        Returns:
+            Immutable query layout to capture explicitly for delayed execution or checkpoint replay.
+        """
         meta = self.layout.batch_meta
         ids = meta.q_global_ids if query_ids is None else query_ids
         if not set(ids).issubset(meta.q_global_ids):
             raise ValueError("a local query tile must use this member's prepared owner queries")
         self.local_query_layout = DsaLocalQueryLayout(replace(meta, q_global_ids=ids), self.layout.device)
         self.local_query_layout_reference = self.local_query_layout
+        self._prepared_local_layouts.add(self.local_query_layout)
         self.prepare_selected_requests()
         self.local_selected_rows = self.selected_rows
+        return self.local_query_layout
 
     def forward_local(self, invocation: DsaWorkspaceInvocation, main_states: tuple[torch.Tensor, ...],
-                      index_states: tuple[torch.Tensor, ...]) -> FusedCpForwardResult:
+                      index_states: tuple[torch.Tensor, ...], *,
+                      query_layout: DsaLocalQueryLayout | None = None) -> FusedCpForwardResult:
         """Fuse local LI, selected main-KV pull and SFA without query/weight replication or KL.
 
         The prepared tile may be empty. Every member submits the same six-stage
         protocol and publishes its complete owner-local KV set. Inputs are
         detached caller-ordered local queries and complete owner-ordered keys.
         This raw forward is not yet admitted by the global-query backward.
+        An explicit layout returned by this backend's cold preparation supports
+        checkpoint replay after another tile has been prepared.
         """
         if (invocation.workspace is not self.workspace or _layout_signature(invocation.batch_meta) != self.signature
                 or invocation.batch_meta.kv_global_ids != self.layout.batch_meta.kv_global_ids):
             raise ValueError("local forward requires unchanged prepared ownership and key storage order")
-        local = self.local_query_layout
-        if local is None or local is not self.local_query_layout_reference:
+        local = self.local_query_layout if query_layout is None else query_layout
+        if (local is None or local not in self._prepared_local_layouts
+                or (query_layout is None and local is not self.local_query_layout_reference)):
             raise ValueError("local forward requires its cold prepared query layout")
         local.validate_versions()
         if (self.selected_rows is not self.local_selected_rows
@@ -226,10 +238,9 @@ class FusedDsaCpForwardProbe:
         if torch.ops.hyper_parallel.dsa_local_cp_forward_version() != 1:
             raise RuntimeError("local fused forward requires adapter ABI 1; rebuild this checkout's payload")
         with self.workspace.lease(invocation, direction="forward"):
-            return self._submit_local(invocation, main_states, index_states)
+            return self._submit_local(invocation, main_states, index_states, local)
 
-    def _submit_local(self, invocation, main_states, index_states) -> FusedCpForwardResult:
-        local = self.local_query_layout
+    def _submit_local(self, invocation, main_states, index_states, local) -> FusedCpForwardResult:
         query, compressed, query_rope, key_rope = main_states
         index_query, index_key, weights = index_states
         packed = tuple(local.pack(tensor) for tensor in (index_query, query, query_rope, weights))

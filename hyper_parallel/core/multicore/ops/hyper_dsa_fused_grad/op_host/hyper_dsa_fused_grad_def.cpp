@@ -22,8 +22,7 @@ class HyperDsaFusedGrad : public OpDef {
     for (const char *input : {"query", "key"}) {
       this->Input(input).ParamType(REQUIRED).DataType({ge::DT_BF16}).Format({ge::FORMAT_ND}).AutoContiguous();
     }
-    this->Input("sparse_indices").ParamType(REQUIRED).DataType({ge::DT_INT32})
-        .Format({ge::FORMAT_ND}).AutoContiguous();
+    this->Input("sparse_indices").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND}).AutoContiguous();
     for (const char *input : {"d_out", "out"}) {
       this->Input(input).ParamType(REQUIRED).DataType({ge::DT_BF16}).Format({ge::FORMAT_ND}).AutoContiguous();
     }
@@ -49,6 +48,11 @@ class HyperDsaFusedGrad : public OpDef {
     for (const char *input : {"owner_gradient", "partials"}) {
       this->Input(input).ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).AutoContiguous();
     }
+    this->Input("query_positions")
+      .ParamType(OPTIONAL)
+      .DataType({ge::DT_INT64})
+      .Format({ge::FORMAT_ND})
+      .AutoContiguous();
     for (const char *output : {"d_query", "d_key", "d_value", "d_query_rope", "d_key_rope"}) {
       this->Output(output).ParamType(REQUIRED).DataType({ge::DT_BF16}).Format({ge::FORMAT_ND});
     }

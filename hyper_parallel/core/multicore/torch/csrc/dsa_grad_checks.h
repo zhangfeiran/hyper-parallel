@@ -18,6 +18,6 @@
 #include <array>
 namespace hyper_parallel::multicore {
 using DsaGradInputs = std::array<const at::Tensor *, 20>;
-void check_dsa_grad_inputs(const DsaGradInputs &tensors, double scale);
-}
+void check_dsa_grad_inputs(const DsaGradInputs &tensors, double scale, bool localQueries = false);
+}  // namespace hyper_parallel::multicore
 #endif  // HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_DSA_GRAD_CHECKS_H_

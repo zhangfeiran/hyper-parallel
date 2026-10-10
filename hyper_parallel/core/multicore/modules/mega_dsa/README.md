@@ -1782,9 +1782,201 @@ Local saved state 还持有本次 forward 使用的 `DsaLocalQueryLayout`；back
 CANN 9.1 / Ascend 910B3 上的冻结载荷已通过 CP1/CP2/CP4 完整短、长序列 raw forward 验收，
 每个 rank 各执行 320 次调用，合计 2240 次 rank-forward，三个 launcher 均正常退出。
 独立 FP32 oracle 的最大 relative L2 为 `0.002419553899592081`，限值 `.02`。
-标准构建成功，22 个 device objects 与冻结载荷相同；打包后载荷的补充运行检查单独执行。
+标准构建成功，22 个 device objects 与冻结载荷相同；补齐独立冻结目录所需的相邻 SHMEM 载荷后，
+打包载荷的 CP1 补充 smoke 正常退出，owner/empty tile 的四次 forward 均通过。
 
 该 raw 接口尚未安装 KL 或 autograd。保存状态显式标为 local；现有 global-query backward 在提交前
-拒绝该状态。训练路径迁移到 local query 前，仍需完成 local-query main backward、local LM+KL
-normalization 和 FP32 owner accumulation。当前已验收的产品训练路径仍使用 global query scope；
+拒绝该状态。训练路径迁移到 local query 前，仍需完成 local-query main backward 与 FP32 owner
+accumulation 的独立数值验收，并接通 local LM+KL normalization 和 autograd。
+当前已验收的产品训练路径仍使用 global query scope；
 CP8/CP×TP、模型验收、稳定性、共存及完整训练步性能仍待验证。
+
+## Local-query main backward 原始接口
+
+[反向 adapter](fused_cp_backward.py) 新增 `backward_local(forward, grad_output)`，仅接收该 backend
+产生的 local saved state。调用方的 BF16 cotangent 经保存的 query layout 打包，native 使用实际本地
+query 行数和本次 forward 的显式序列位置；后续重新准备另一块 tile 不会替换这些位置或排列。
+全局 query 的旧接口保持独立，local ABI 不可用时在申请 workspace lease 前拒绝调用。
+
+Query scratch 按实际 query 行数计算，FP32 dK/dV 累加区和 partials 按完整 key 行数计算。
+空 query 不调用非空 SFA child tiler，也不构造虚拟 query；它初始化完整 key 的零 partials，参与
+initialize、compute、post/owner-return 三阶段闭合，并接收其他 rank 对该 owner 的梯度贡献。
+Kernel 系统 workspace 与调用方算术 scratch 分别申请。结果持有 metadata，避免异步操作期间释放。
+
+本版使用完整 key 的 owner 归还：每个 peer 的 FP32 dK/dV 先合并一次，再按 rank 顺序累加到 owner，
+最后转换为 BF16 并恢复 owner 的输入排列。该原始接口不负责 autograd 或 KL；主注意力的
+实验性 autograd 接口见下一节。稀疏梯度归还仍未实现，不能据此宣称完整 local LM+KL 训练
+或训练步性能收益。
+
+[设备验证器](../../examples/mega_dsa_local_cp_backward_validate.py) 比较 local 和 global-query
+原始梯度、检查独立 FP32 oracle、精确 FP32 owner 累加顺序和字节数，并覆盖延迟 backward、重复
+backward、跨 stream、owner/interior/first-sequence/empty tile。CP2/CP4 系统测试入口保持 framework-free。
+独立 FP32 门槛为逐元素 `rtol=.02, atol=2e-5`；验证器记录所有 oracle 差异并将失败汇总为失败状态，
+同时记录 global-query 基线的 oracle 误差，诊断信息不能替代验收。
+
+当前 CPU 回归通过 186 tests、389 subtests，最终 native 构建成功。
+CP1/CP2/CP4 每个 rank 各完成 144 次 backward，合计 1008 次调用、5040 个原始 native 梯度比较，
+全部通过三阶段闭合和精确 FP32 owner 位模式检查；加载的候选库 SHA256 与冻结载荷一致。
+独立 FP32 门槛仍失败，三个 runner 均返回非零。CP1 的 compressed-KV 有 108 个失败场景，
+key RoPE 有 72 个，global-query 基线的对应失败场景数相同。CP2/CP4 也保留各 rank 的逐字段
+误差和基线对照。Local backward 的独立数值验收仍未通过。
+
+## BF16 主梯度的独立参考校准
+
+[校准工具](../../examples/mega_dsa_grad_reference_calibrate.py) 只调用 stock SFA primitive，
+不运行 local CP 候选。工具使用四个独立种子，其中最后一个仅用于验证前三个种子的观测范围；
+覆盖 H32/H64、owner/interior/first-sequence/singleton/empty cotangent scope，分别保存原始 K/V
+梯度、FP32 合并的 shared-C 梯度和 stock autograd 的 BF16 合并梯度。
+
+CPU oracle 使用 FP64，独立计算 K/V 后相加，并与 shared-C oracle 比较。两个 oracle 的数学
+等价性采用 `rtol=1e-11, atol=1e-12` 验证，避免把 FP32 加法顺序差异误判为数学错误。
+BF16 比较仍记录原逐元素门槛以及 relative L2、cosine、max abs。若 oracle 梯度范数为零，
+normalized metrics 不适用，观测范围只使用绝对误差；single-prefix 场景专门覆盖此情况。
+
+当前独立校准完成 40 个场景、80 组重复观测，两个 FP64 oracle 全部一致，stock raw 与 autograd
+在已有逐元素门槛下均一致。最后一个种子仅有 31/40 个字段落在前三个种子的全部观测范围内，
+因此这些范围尚不能作为验收阈值。报告显式标为 `measured`、`accepted_tolerance_profile=false`，
+不会改变候选的失败记录或自动激活默认载荷，也不能替代模型、长序列或完整训练验收。
+
+## Local-query 主注意力 autograd 与 checkpoint
+
+`FusedDsaCpAttentionProbe.attention_local()` 返回四个主输入的 first-order 梯度：local Q、
+owner-local shared compressed-KV、local Q-RoPE、owner-local K-RoPE。Indexer 输入保持 detached，
+不由主损失安装梯度路径；KL、auxiliary loss normalization 和完整模型集成仍需另行接通。
+
+调用方显式传入 `prepare_local_queries()` 返回的 cold layout，避免 checkpoint 重算依赖 backend
+后来准备的其他 tile。Backend 仅用弱引用登记已准备的 layout，拒绝其他 backend 或自行构造的
+layout；原始 forward、saved backward 和重算均检查 metadata 地址及版本。
+
+```python
+query_layout = forward_backend.prepare_local_queries(local_query_ids)
+attention = FusedDsaCpAttentionProbe(forward_backend)
+
+def local_attention(q, c, q_rope, k_rope, *, saved_layout=query_layout,
+                    saved_invocation=invocation, saved_index=index_states):
+    # 显式保存本次 tile 身份，随后准备其他 tile 不会改变重算的排列或位置。
+    return attention.attention_local(
+        saved_invocation, (q, c, q_rope, k_rope), saved_index, query_layout=saved_layout)
+
+output = checkpoint(local_attention, *main_states, use_reentrant=False)
+```
+
+Native 激活与原始输入通过 `save_for_backward()` 保存，参与 saved-tensor hooks 和版本检查。
+空 query 的原始输出与 Native saved output 是同一个 Tensor；autograd bridge 返回独立的
+detached Tensor 引用，共享存储而不复制数据，避免 PyTorch 给返回值安装 autograd metadata
+时把 Native 输入标为 `requires_grad=True`。Native 保存的 output、max/sum 和输入仍保持 detached。
+
+本轮 CPU 回归通过 191 tests、395 subtests，覆盖旧 layout 重算、重复 backward、空输出别名、
+原始输入与 metadata 修改拒绝、first-order 限制、indexer 梯度隔离及旧 layout 的释放。
+CP1 首轮 NPU smoke 的 owner/interior/first-sequence 场景通过，empty 场景暴露上述输出引用问题；
+修正后的 CP1 smoke 通过。CP1/CP2/CP4 完整生命周期矩阵的七个 rank 每个各通过 24 个场景，
+共 168 个场景、672 次 backward 和 2016 个主梯度比较；候选库 SHA256 与冻结载荷一致。
+`--autograd-only` 仅验证主 autograd 生命周期，不清除独立数值门槛或模型验收失败。
+
+## 按 CP query mask 冻结的参考数值契约
+
+[CPU 参考精度契约](reference_precision.py) 对非零 oracle 梯度同时检查 relative L2、cosine error
+和按 oracle RMS 归一化的 max abs；零范数使用单独的绝对误差规则，不使用人为截断的相对分母。
+NaN/Inf、未校准的非零区间、修改后的策略或预算、缺失的 scope、重复样本，以及运行时版本或
+参考库身份变化均拒绝验收。消费者重新拟合各字段预算并重新检查独立验证种子，不能只信任
+producer 的 `accepted_tolerance_profile` 标志。
+
+`mega_dsa_grad_reference_calibrate --cp-reference-profile` 使用新的三个校准种子和两个独立验证
+种子，覆盖 H32/H64、CP1/CP2/CP4 各 rank、三种 owner 分布和五种 query mask，另随机化合法
+selected slots 的排列。策略在采样前冻结：误差范数和 RMS max error 的 margin 为 `2`，
+cosine error 对角度误差是二次量，margin 为 `4`；zero-oracle `atol=2e-5` 保持原有绝对门槛。
+Oracle 始终使用 FP64，K/V 分别求导再合并与 shared-C oracle 一致。
+
+本轮独立参考采集的 1050 个场景、210 个 scope bucket、840 个梯度字段均通过新的 held-out
+验证，stock raw 与 autograd 对照一致。该契约仅覆盖 `(3,10)`、BF16、`H32/H64`、`K2048`
+的声明合成分布；不接受长序列、其他数据分布或模型梯度。
+
+候选验证器显式传入 `--reference-profile` 和独立保存的 `--profile-policy-sha256` 后才使用该契约。
+同时检查各 peer 的 FP64 oracle 之和与 owner FP32 梯度：误差界包含独立参考的 partial budgets
+和按 rank 顺序 FP32 相加的 `gamma(n)` 舍入项。Legacy pointwise 结果继续记录；默认验证入口
+仍使用原有逐元素门槛，训练默认路径不因参考契约通过而自动迁移。
+使用该契约的 CP1 矩阵已通过 144 次 backward、720 个 native 对照、576 个校准 partial
+检查和 288 个 owner 误差界检查，实际加载库 SHA256 与冻结载荷一致。旧 pointwise gate 仍失败，
+本次通过只证明上述短序列合成分布中的校准契约。补充 CP4 矩阵的四个 rank 均通过，各完成
+144 次 backward，共通过 2880 个 native 对照、2304 个校准 partial 检查和 1152 个 owner
+误差界检查。补充 CP2 矩阵则失败：rank 0 的 `H32/strided/owner` Q 字段在三种 schedule、
+两次重复中均越界，RMS-normalized max abs 为 `0.08319747182188637`，冻结上限为
+`0.07223937633149653`。其 Q 与 global-query native 对照的 max abs 为零；两 rank 的
+1440 个 native 对照和 576 个 owner 误差界检查全部通过。参考包络对该输入的覆盖仍需诊断，
+不扩大现有阈值，不清除失败记录。原设备上的 CP2 完整矩阵也已完成，在同样六个 Q 检查中
+复现相同失败指标；两个物理设备组合的报告独立保存。原设备上的 CP4 任务仍在等待。
+
+诊断复跑在同一冻结预算下分别记录 local 和 global-query primitive baseline 的校准指标与
+位模式：失败 owner Q 的两条路径位精确一致，所有误差指标相同且同样越界。CPU FP64 oracle
+最近 BF16 可表示梯度的 RMS-normalized max error 为 `0.024266288937042725`，低于冻结
+上限，因此最终 BF16 转换本身不足以解释该失败。校准包络在这些原语输入上的覆盖仍未关闭。
+
+校准工具支持 `--fit-seeds` 和 `--held-out-seeds`，以逗号分隔的整数列表指定完整采样计划。
+两组必须非空、各自唯一且互不重叠；producer 在保存 policy 和运行设备采样前验证，consumer
+按冻结的全部 seed/bucket 对重新验证覆盖，不依赖固定的场景数。Held-out 数据不参与拟合，
+任一字段的独立验证失败都会拒绝 profile。
+
+新的 v2 采样计划固定为 16 个 fit 种子和 8 个 held-out 种子，覆盖原有 210 个 bucket、5040
+个场景；误差 margin、zero-oracle 门槛、输入分布和选择规则与 v1 相同。它只运行 stock
+primitive，fixture、FP64 oracle 和测量函数与 v1 的源码 hash 一致。运行时 policy 与独立
+保存的采样前 policy 逐字一致。v1 的候选失败报告继续保留；v2 须完成全部独立验证后才可用于
+候选重放，不自动改变默认训练路径或模型验收。
+
+v2 已完成 5040 个场景，840 个字段的全部 held-out 检查通过；consumer 重新拟合预算并
+核对完整覆盖、采样前策略、核心 source 和实际 reference library hashes。使用该已验证
+profile 的 CP1/CP2/CP4 候选重放全部通过：七个 rank 各完成 144 次 backward，合计
+1008 次调用、5040 个 native 对照、4032 个校准 partial 检查和 2016 个 owner 误差界检查。
+三阶段通信闭合、FP32 owner 位模式及实际加载库 SHA256 全部通过；v1 的 CP2 失败继续保留，
+原逐元素 gate 仍失败。该验收只覆盖声明的短序列 BF16 分布，尚非完整模型或训练步验收。
+
+硬件 worker 可通过 `HP_DSA_REFERENCE_PROFILE` 和 `HP_DSA_REFERENCE_POLICY_SHA256` 显式
+指定独立校准档案及采样前保存的策略 commitment；必须同时提供。Worker 使用同一 consumer
+重算预算、验证 scope 和运行环境。未提供时保留原逐元素检查，`autograd-only` 不接受数值
+profile，也不改变其独立生命周期验收范围。
+
+## Local-query KL 的 indexer 梯度归还与目标契约
+
+`DsaCpLayout.reduce_local_index_gradients()` 接收 detached FP32 partials：caller-ordered local
+index-Q、完整 global-packed index-K、caller-ordered local merge weight。仅 index-K 进入一次
+owner reduce-scatter；Q 和 weight 保持本地 query 排列，支持完整 owner 集合、query subset、
+空 tile 和空 owner。K 按声明的 owner KV 存储顺序恢复，并在求和后转换为原输入 dtype。
+FP64 CPU oracle 保留 FP64 accumulation。该路径使用完整 K partial buffer，尚非稀疏归还。
+Layer/microbatch/invocation 可以推进并复用同一 owner geometry；过时 heap generation、
+其他 topology/layout ID 或 KV 存储排列仍会拒绝。
+调用身份复用修正通过 CPU 回归和 CP2 HCCL 的 8 个场景、24 个字段位精确检查。
+
+该归还接口不再乘 loss coefficient、auxiliary upstream scale 或除以 CP size。真正的 local
+KL producer 应先以 `loss_coeff * normalization.local_sum_scale` 缩放本地有效 query 的 KL sum，
+再在 first-order backward 乘一次 `grad_loss`，随后按上述接口归还 K。分母始终是 global valid
+query 数，query tile 或空 rank 不改变它。声明为 average 的后续复制参数 reducer 则由
+`DsaLossNormalization.reducer_divisor` 补偿。
+
+[CPU 目标契约](../../../../../tests/ut/core/multicore/mega_dsa/test_local_training_contract.py) 将
+CP1/CP2/CP4 的 local LM+KL contribution 与未分片 FP64 objective 比较，覆盖不等长、zigzag、
+packed 边界、重排 sparse slots、空 rank、空 tile、sum/average reducer、非单位且负的 aux
+upstream scale、`loss_coeff=0`、KL-only 和 freeze-main。比较全部主输入与 index/output projection
+参数梯度，验证 detach-before-index-projection；另设置反例检测 local mean 平均及重复 CP 除法。
+
+[设备归还验证器](../../../../../tests/torch/multicore/_test_mega_dsa_local_index_owner.py) 独立测试
+真实 HCCL 的 FP32 K owner sum、BF16/FP32 目标 dtype、caller/owner 排列及空 rank 的集体参与。
+CP1/CP2/CP4 的七个 rank 共通过 28 个场景、84 个字段的位精确比较，source SHA256 与冻结
+清单一致。相关 CPU 回归通过 65 tests、59 subtests，新增代码通过 pylint 和 launcher import 检查。
+本节实现的是 local KL 的归还基础及数学契约；local KL kernel producer 和完整 local LM+KL
+autograd 仍需接通，不能将这些检查作为完整训练或模型数值验收。
+
+## KL 的 FP32 index-K partial 导出
+
+`MixedKlResult.key_partials` 从每次调用独立持有的 retained workspace 导出 FP32 `[N,128]`
+view。`N` 为完整 key 数，main head 数由 producer 保存；decoder 检查 dtype、连续性、对齐和
+精确容量，拒绝错误 geometry。View 保持原存储的生命周期；跨 stream 读取前需等待 submission
+stream 的事件，保存不受后续 workspace 修改影响的梯度时需 clone 或 scale 到独立 Tensor。
+
+该 plane 位于锁定非 deterministic KL kernel 的 FP32 scatter-add 区，post phase 从这里读取
+并转换出原 BF16 index-K。接口导出转换前的数据，不把 BF16 输出转换回 FP32 冒充 partial。
+主 backward 的 Native ABI 和已冻结载荷均未改动。
+
+设备验证覆盖 H32/H64、BF16/FP32 merge weight、groups=1/2/7/19 和三次独立调用，共 48 个
+场景、79872 个 key 元素。FP32 view 共享 retained 存储，转换回 BF16 后与 Native 输出位精确
+一致，原 native/stock 及独立 oracle 检查均通过。CPU 所有权/准入检查和相关回归通过。
+当前仍是完整 query 的 standalone KL；local query 的显式 causal position 和完整 LM+KL
+autograd 接入尚未完成。

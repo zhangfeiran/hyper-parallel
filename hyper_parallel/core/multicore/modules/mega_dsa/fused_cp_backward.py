@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -27,8 +27,10 @@ from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import (
     FusedDsaCpForwardProbe,
     _layout_signature,
 )
+from hyper_parallel.core.multicore.modules.mega_dsa.local_query import DsaLocalQueryLayout
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_attention import (
     mixed_sfa_grad_workspace_bytes,
+    local_sfa_grad_workspace_bytes,
 )
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import (
     validate_device_phase_closure,
@@ -54,6 +56,7 @@ class FusedCpBackwardResult:
     transport_trace: torch.Tensor
     retained: torch.Tensor
     epoch: int
+    _runtime_buffers: tuple[torch.Tensor, ...] = field(default=(), repr=False, compare=False)
 
 
 class FusedDsaCpBackwardProbe:
@@ -84,12 +87,31 @@ class FusedDsaCpBackwardProbe:
         """
         return self._backward_saved(forward.saved, tuple(forward.output.shape), grad_output)
 
+    @staticmethod
+    def check_local_native_support() -> None:
+        """Require the explicit-position local gradient ABI before acquiring a workspace lease."""
+        _load_native()
+        version = getattr(torch.ops.hyper_parallel, "dsa_local_cp_grad_version", None)
+        if version is None or version() != 1:
+            raise RuntimeError("local CP backward requires adapter ABI 1; rebuild this checkout's payload")
+
+    def backward_local(self, forward: FusedCpForwardResult, grad_output: torch.Tensor) -> FusedCpBackwardResult:
+        """Return main-attention gradients for actual local Q, including empty tiles.
+
+        Query cotangents use caller order and stay local. Complete-key FP32
+        partials are returned to owners before casting; this raw baseline still
+        uses complete owner return and has no KL or autograd installation.
+        """
+        return self._backward_saved(forward.saved, tuple(forward.output.shape), grad_output, local_queries=True)
+
     def _backward_saved(self, saved: FusedCpSavedAttention | None, shape: tuple,
-                        grad_output: torch.Tensor) -> FusedCpBackwardResult:
+                        grad_output: torch.Tensor, *, local_queries: bool = False) -> FusedCpBackwardResult:
         if (saved is None or saved.backend is not self.backend
                 or _layout_signature(saved.batch_meta) != self.backend.signature):
             raise ValueError("fused CP backward requires this backend's saved attention state")
-        if saved.query_scope != "global":
+        if local_queries and saved.query_scope != "local":
+            raise ValueError("local CP backward requires local-query saved state")
+        if not local_queries and saved.query_scope != "global":
             raise ValueError("local-query saved state requires the local backward adapter")
         saved.validate_versions()
         if saved.geometry != (self.backend.heads, self.backend.scale, self.backend.schedule):
@@ -99,10 +121,13 @@ class FusedDsaCpBackwardProbe:
         if (grad_output.device != self.backend.layout.device or grad_output.dtype != torch.bfloat16
                 or tuple(grad_output.shape) != shape or grad_output.requires_grad):
             raise ValueError("fused CP backward requires an explicitly detached local BF16 output cotangent")
-        self.check_native_support()
+        if local_queries:
+            self.check_local_native_support()
+        else:
+            self.check_native_support()
         invocation = self.workspace.prepare(saved.batch_meta)
         with self.workspace.lease(invocation, direction="backward"):
-            return self._submit(saved, grad_output, invocation)
+            return self._submit(saved, grad_output, invocation, local_queries=local_queries)
 
     def _metadata(self, meta, epoch: int) -> torch.Tensor:
         offsets = {name: offset for name, offset, _, _ in self.workspace.layout}
@@ -113,34 +138,45 @@ class FusedDsaCpBackwardProbe:
                   meta.global_valid_queries, self.workspace.arena_bytes, self.workspace.spec.source_tokens)
         return torch.tensor(values, dtype=torch.int64).to(self.backend.layout.device, non_blocking=True)
 
-    def _submit(self, saved, grad_output, invocation) -> FusedCpBackwardResult:
+    def _submit(self, saved, grad_output, invocation, *, local_queries=False) -> FusedCpBackwardResult:
         query, compressed, query_rope, key_rope = saved.states
         local = self.backend.layout.local_query_ids
-        full_grad = torch.zeros_like(query)
-        full_grad.index_copy_(0, local, grad_output)
+        layout = saved.local_query_layout if local_queries else None
+        if local_queries:
+            full_grad = layout.pack(grad_output)
+        else:
+            full_grad = torch.zeros_like(query)
+            full_grad.index_copy_(0, local, grad_output)
         gradients = tuple(torch.full_like(tensor, float("nan")) for tensor in
                           (query, compressed[:, None], compressed[:, None], query_rope, key_rope[:, None]))
         traces = torch.zeros((3, 20, 64), dtype=torch.int64, device=query.device)
         transport_trace = torch.zeros(32, dtype=torch.int64, device=query.device)
-        retained = torch.empty(mixed_sfa_grad_workspace_bytes(query.shape[0], query.shape[1]),
-                               dtype=torch.uint8, device=query.device)
+        required = (local_sfa_grad_workspace_bytes(query.shape[0], compressed.shape[0], query.shape[1])
+                    if local_queries else mixed_sfa_grad_workspace_bytes(query.shape[0], query.shape[1]))
+        retained = torch.empty(required, dtype=torch.uint8, device=query.device)
         owner = torch.full((self.workspace.spec.owner_gradient_tokens, 576), float("nan"),
                            dtype=torch.float32, device=query.device)
-        partials = torch.full((query.shape[0], 1088), float("nan"), dtype=torch.float32, device=query.device)
+        partials = torch.full((compressed.shape[0], 1088), float("nan"), dtype=torch.float32, device=query.device)
         epoch = self.workspace.next_transport_epoch(invocation)
         metadata = self._metadata(saved.batch_meta, epoch)
         lengths = self.backend.native_layout.length_tensor
-        torch.ops.hyper_parallel.dsa_fused_cp_grad_out(
+        native = (torch.ops.hyper_parallel.dsa_local_cp_grad_out if local_queries
+                  else torch.ops.hyper_parallel.dsa_fused_cp_grad_out)
+        positions = (layout.positions,) if local_queries else ()
+        native(
             query, compressed[:, None], compressed[:, None], saved.indices, full_grad,
-            *saved.forward, lengths, lengths, query_rope, key_rope[:, None], self.backend.config,
+            *saved.forward, layout.query_lengths if local_queries else lengths, lengths,
+            query_rope, key_rope[:, None], self.backend.config,
             traces, retained, self.backend.scale, *gradients, self.workspace.arena,
-            metadata, self.backend.requests, transport_trace, owner, partials)
+            metadata, self.backend.requests, transport_trace, owner, partials, *positions)
         restored = owner.index_select(0, self.local_owner_order)
         owner_fp32 = (restored[:, :512].contiguous(), restored[:, 512:].contiguous())
-        local_gradients = (gradients[0].index_select(0, local), owner_fp32[0].bfloat16(),
-                           gradients[3].index_select(0, local), owner_fp32[1].bfloat16())
+        query_gradients = (tuple(layout.restore(gradients[index]) for index in (0, 3)) if local_queries
+                           else tuple(gradients[index].index_select(0, local) for index in (0, 3)))
+        local_gradients = (query_gradients[0], owner_fp32[0].bfloat16(),
+                           query_gradients[1], owner_fp32[1].bfloat16())
         return FusedCpBackwardResult(local_gradients, owner_fp32, gradients, partials, tuple(traces.unbind()),
-                                      transport_trace, retained, epoch)
+                                      transport_trace, retained, epoch, (metadata,))
 
     def validate_trace(self, result: FusedCpBackwardResult, snapshots: tuple[torch.Tensor, ...],
                        transport: torch.Tensor) -> dict:
@@ -173,6 +209,36 @@ class FusedDsaCpBackwardProbe:
                 "dk_dv_workspace_offsets": offsets}
 
 
+def _save_attention(ctx, backend, states, index_states, result):
+    saved = result.saved
+    ctx.save_for_backward(*states, *index_states, *saved.states, saved.indices, *saved.forward)
+    ctx.backend = backend
+    ctx.batch_meta = saved.batch_meta
+    ctx.versions = saved.versions
+    ctx.geometry = saved.geometry
+    ctx.token = saved._token
+    ctx.output_shape = tuple(result.output.shape)
+    ctx.query_scope = saved.query_scope
+    ctx.local_query_layout = saved.local_query_layout
+
+
+def _attention_backward(ctx, grad_output):
+    if torch.is_grad_enabled():
+        raise ValueError("fused CP attention supports first-order backward only")
+    if ctx.geometry != (ctx.backend.backend.heads, ctx.backend.backend.scale, ctx.backend.backend.schedule):
+        raise ValueError("fused CP backward requires unchanged forward geometry/scale/schedule")
+    tensors = ctx.saved_tensors
+    if len(tensors) != 15:
+        raise RuntimeError("fused CP attention saved-state contract is incomplete")
+    saved = FusedCpSavedAttention(ctx.batch_meta, tuple(tensors[7:11]), tensors[11], tuple(tensors[12:]),
+                                  ctx.versions, ctx.backend.backend, ctx.geometry, ctx.token,
+                                  ctx.query_scope, ctx.local_query_layout)
+    cotangent = grad_output.detach().contiguous()
+    if ctx.query_scope == "local":
+        return ctx.backend._backward_saved(saved, ctx.output_shape, cotangent, local_queries=True)
+    return ctx.backend._backward_saved(saved, ctx.output_shape, cotangent)
+
+
 class _FusedCpAttention(torch.autograd.Function):
     """Versioned first-order main-attention bridge; indexer/KL gradients remain separate."""
 
@@ -184,30 +250,38 @@ class _FusedCpAttention(torch.autograd.Function):
         states = (query, compressed, query_rope, key_rope)
         result = backend.backend.forward(invocation, tuple(tensor.detach() for tensor in states),
                                          tuple(tensor.detach() for tensor in index_states))
-        saved = result.saved
-        ctx.save_for_backward(*states, *index_states, *saved.states, saved.indices, *saved.forward)
-        ctx.backend = backend
-        ctx.batch_meta = saved.batch_meta
-        ctx.versions = saved.versions
-        ctx.geometry = saved.geometry
-        ctx.token = saved._token
-        ctx.output_shape = tuple(result.output.shape)
+        _save_attention(ctx, backend, states, index_states, result)
         return result.output
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
         """Return owner-local main gradients without installing a gradient path for hard selection."""
-        if torch.is_grad_enabled():
-            raise ValueError("fused CP attention supports first-order backward only")
-        if ctx.geometry != (ctx.backend.backend.heads, ctx.backend.backend.scale, ctx.backend.backend.schedule):
-            raise ValueError("fused CP backward requires unchanged forward geometry/scale/schedule")
-        tensors = ctx.saved_tensors
-        if len(tensors) != 15:
-            raise RuntimeError("fused CP attention saved-state contract is incomplete")
-        saved = FusedCpSavedAttention(ctx.batch_meta, tuple(tensors[7:11]), tensors[11], tuple(tensors[12:]),
-                                      ctx.versions, ctx.backend.backend, ctx.geometry, ctx.token)
-        result = ctx.backend._backward_saved(saved, ctx.output_shape, grad_output.detach().contiguous())
+        result = _attention_backward(ctx, grad_output)
         return (None, None, *result.gradients, None)
+
+
+class _FusedLocalCpAttention(torch.autograd.Function):
+    """First-order local attention with a caller-owned cold layout for checkpoint replay."""
+
+    @staticmethod
+    def forward(ctx: Any, backend: FusedDsaCpBackwardProbe, invocation: DsaWorkspaceInvocation,
+                query: torch.Tensor, compressed: torch.Tensor, query_rope: torch.Tensor,
+                key_rope: torch.Tensor, index_states: tuple[torch.Tensor, ...],
+                query_layout: DsaLocalQueryLayout) -> torch.Tensor:
+        """Save native activations through tensor hooks and retain immutable cold query metadata."""
+        states = (query, compressed, query_rope, key_rope)
+        result = backend.backend.forward_local(invocation, tuple(tensor.detach() for tensor in states),
+                                                tuple(tensor.detach() for tensor in index_states),
+                                                query_layout=query_layout)
+        _save_attention(ctx, backend, states, index_states, result)
+        # Empty tiles expose the native output itself; keep its autograd metadata detached.
+        return result.output.detach()
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
+        """Return four owner-local main gradients while keeping hard selection detached."""
+        result = _attention_backward(ctx, grad_output)
+        return (None, None, *result.gradients, None, None)
 
 
 class FusedDsaCpAttentionProbe:
@@ -228,3 +302,24 @@ class FusedDsaCpAttentionProbe:
         if len(main_states) != 4 or len(index_states) != 3:
             raise ValueError("fused CP attention requires four main and three index states")
         return _FusedCpAttention.apply(self.backward_backend, invocation, *main_states, index_states)
+
+    def attention_local(self, invocation: DsaWorkspaceInvocation, main_states: tuple[torch.Tensor, ...],
+                        index_states: tuple[torch.Tensor, ...], *, query_layout: DsaLocalQueryLayout) -> torch.Tensor:
+        """Compute local-query main attention with explicit immutable tile identity.
+
+        Args:
+            invocation: Prepared workspace invocation with unchanged owner geometry.
+            main_states: Caller-ordered local Q/Q-RoPE and complete owner-local C/K-RoPE.
+            index_states: Local index Q/weights and complete owner-local index K; no main-loss gradients.
+            query_layout: Layout returned by this backend's cold preparation. Capture it
+                explicitly in checkpoint callbacks so replay survives preparation of later tiles.
+
+        Returns:
+            Compressed BF16 output in caller query order, with first-order main gradients.
+            Selected KL and auxiliary loss normalization remain separate.
+        """
+        if len(main_states) != 4 or len(index_states) != 3:
+            raise ValueError("local CP attention requires four main and three index states")
+        if not isinstance(query_layout, DsaLocalQueryLayout):
+            raise ValueError("local CP attention requires its cold prepared query layout")
+        return _FusedLocalCpAttention.apply(self.backward_backend, invocation, *main_states, index_states, query_layout)

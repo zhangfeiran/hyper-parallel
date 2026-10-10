@@ -1,0 +1,64 @@
+--- a/attention/sparse_flash_attention_grad/op_kernel/arch22/sparse_flash_attention_grad_bs1_basic.h
++++ b/attention/sparse_flash_attention_grad/op_kernel/arch22/sparse_flash_attention_grad_bs1_basic.h
+@@ -43,3 +43,4 @@
+                                    GM_ADDR workspace, const TILING_CLASS *__restrict tilingData,
+-                                   uint32_t logicalId, uint32_t physicalId, uint32_t phase);
++                                   uint32_t logicalId, uint32_t physicalId, uint32_t phase,
++                                   GM_ADDR queryPositions = nullptr);
+
+@@ -66,2 +67,4 @@
+                                         const int64_t t1Idx, int64_t &bIdx);
++    __aicore__ inline int64_t CausalPrefix(int64_t queryRow, int64_t keyLength, int64_t queryLength,
++                                          int64_t sequenceRow);
+     __aicore__ inline int32_t ValidSelectedCount(const int64_t t1Idx, const int64_t n2Idx, int32_t limit);
+@@ -153,2 +156,4 @@
+     constexpr static uint32_t SCATTER_VECTOR_SYNC_FLAG = 8;
++    GlobalTensor<int64_t> queryPositionsGm;
++    bool hasQueryPositions = false;
+     bool isLastBlockSelected = false;
+@@ -233,4 +238,8 @@
+     GM_ADDR workspace, const TILING_CLASS *__restrict tilingData,
+-    uint32_t logicalId, uint32_t physicalId, uint32_t phase)
+-{
++    uint32_t logicalId, uint32_t physicalId, uint32_t phase, GM_ADDR queryPositions)
++{
++    hasQueryPositions = queryPositions != nullptr;
++    if (hasQueryPositions) {
++        queryPositionsGm.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(queryPositions));
++    }
+     Init(tilingData, logicalId);
+@@ -609,3 +618,4 @@
+
+-    curMaxS2Scatter = ATTEN_ENABLE ? (s1IndexScatterIndex + curS2Scatter - curS1Scatter + 1) : curS2Scatter;
++    curMaxS2Scatter = ATTEN_ENABLE ? CausalPrefix(t1ScatterIndex, curS2Scatter, curS1Scatter,
++                                                s1IndexScatterIndex) : curS2Scatter;
+
+@@ -677,2 +687,5 @@
++    if (hasQueryPositions && ATTEN_ENABLE) {
++        curMaxS2 = CausalPrefix(t1Offset + s1Index, curS2, curS1, s1Index);
++    }
+     runInfo[mmPingPongIdx].task = task;
+     runInfo[mmPingPongIdx].sumGmOffset = sumGmOffset;
+@@ -795,2 +805,12 @@
+ template <typename SFAGT>
++__aicore__ inline int64_t SelectedAttentionGradBasic<SFAGT>::CausalPrefix(
++    int64_t queryRow, int64_t keyLength, int64_t queryLength, int64_t sequenceRow)
++{
++    if (hasQueryPositions) {
++        return Min(Max(queryPositionsGm.GetValue(queryRow) + 1, 0), keyLength);
++    }
++    return keyLength - queryLength + sequenceRow + 1;
++}
++
++template <typename SFAGT>
+ __aicore__ inline int32_t SelectedAttentionGradBasic<SFAGT>::ValidSelectedCount(
+@@ -821,3 +841,3 @@
+     if constexpr(ATTEN_ENABLE) {
+-        int64_t newMaxS2 = Max(curS2Scatter - curS1Scatter + s1IndexScatterIndex + 1, 0);
++        int64_t newMaxS2 = Max(CausalPrefix(t1Idx, curS2Scatter, curS1Scatter, s1IndexScatterIndex), 0);
+         maxS2Blk = (newMaxS2 + selectedBlockSize - 1) / selectedBlockSize;
+@@ -839,3 +859,3 @@
+     if constexpr(ATTEN_ENABLE) {
+-        int64_t newMaxS2 = Max(curS2 - curS1 + s1Index + 1, 0);
++        int64_t newMaxS2 = Max(CausalPrefix(t1Idx, curS2, curS1, s1Index), 0);
+         maxS2Blk = (newMaxS2 + selectedBlockSize - 1) / selectedBlockSize;

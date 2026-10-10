@@ -38,13 +38,26 @@ def mixed_sfa_grad_workspace_bytes(tokens: int, heads: int) -> int:
     """
     if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens <= 0:
         raise ValueError("tokens must be a positive integer")
+    return local_sfa_grad_workspace_bytes(tokens, tokens, heads)
+
+
+def local_sfa_grad_workspace_bytes(query_tokens: int, key_tokens: int, heads: int) -> int:
+    """Bound local-Q gradient scratch with independent complete-key FP32 accumulators.
+
+    Empty Q retains only initialized key/value accumulators; it has no query
+    math or scatter scratch. The native wrapper still owns its system workspace.
+    """
+    if not isinstance(query_tokens, int) or isinstance(query_tokens, bool) or query_tokens < 0:
+        raise ValueError("query_tokens must be a nonnegative integer")
+    if not isinstance(key_tokens, int) or isinstance(key_tokens, bool) or key_tokens <= 0:
+        raise ValueError("key_tokens must be a positive integer")
     if not isinstance(heads, int) or isinstance(heads, bool) or heads not in (32, 64):
         raise ValueError("mixed SFA gradients support H32/H64")
     scratch_per_core = 128 * 576 * 2 * 4 + 128 * 512 * 2 * 2 + heads * 128 * 4 * 2 * 4
     gradients = sum((elements * 4 + 511) // 512 * 512
-                    for elements in (tokens * heads * 576, tokens * 576, tokens * 512))
-    scatter = 24 * 3 * 2048 * (576 + 512) * 4
-    return min(tokens, 20) * scratch_per_core + gradients + scatter
+                    for elements in (query_tokens * heads * 576, key_tokens * 576, key_tokens * 512))
+    scatter = 24 * 3 * 2048 * (576 + 512) * 4 if query_tokens else 0
+    return min(query_tokens, 20) * scratch_per_core + gradients + scatter
 
 
 def _ensure_native() -> None:

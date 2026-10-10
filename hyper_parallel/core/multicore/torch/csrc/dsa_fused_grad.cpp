@@ -27,16 +27,17 @@ void check_extra_shapes(const at::Tensor &query, const at::Tensor &trace, const 
   TORCH_CHECK(trace.sizes() == at::IntArrayRef({3, 20, 64}) && trace.scalar_type() == at::kLong,
               "fused SFA grad expects int64 phase trace[3,20,64]");
   TORCH_CHECK(extra[0]->dim() == 1 && extra[0]->scalar_type() == at::kByte &&
-              extra[1]->sizes() == at::IntArrayRef({18}) && extra[1]->scalar_type() == at::kLong &&
-              extra[2]->dim() == 2 && extra[2]->size(0) > 0 && extra[2]->size(1) == 4 &&
-              extra[2]->scalar_type() == at::kLong && extra[3]->sizes() == at::IntArrayRef({32}) &&
-              extra[3]->scalar_type() == at::kLong, "fused SFA grad transport buffer ABI mismatch");
+                extra[1]->sizes() == at::IntArrayRef({18}) && extra[1]->scalar_type() == at::kLong &&
+                extra[2]->dim() == 2 && extra[2]->size(0) > 0 && extra[2]->size(1) == 4 &&
+                extra[2]->scalar_type() == at::kLong && extra[3]->sizes() == at::IntArrayRef({32}) &&
+                extra[3]->scalar_type() == at::kLong,
+              "fused SFA grad transport buffer ABI mismatch");
 }
 
 void check_grad_buffers(const at::Tensor &query, const Extras &extra) {
   TORCH_CHECK(extra[4]->dim() == 2 && extra[4]->size(0) > 0 && extra[4]->size(1) == 576 &&
-              extra[4]->scalar_type() == at::kFloat &&
-              extra[5]->sizes() == at::IntArrayRef({query.size(0), 1088}) && extra[5]->scalar_type() == at::kFloat,
+                extra[4]->scalar_type() == at::kFloat && extra[5]->sizes() == at::IntArrayRef({query.size(0), 1088}) &&
+                extra[5]->scalar_type() == at::kFloat,
               "fused SFA grad requires FP32 owner[capacity,576] and partials[T,1088]");
 }
 
@@ -56,37 +57,82 @@ void check_extra_storage(const hyper_parallel::multicore::DsaGradInputs &origina
   }
 }
 
-Result fused_cp_grad_npu(
-    const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
-    const at::Tensor &indices, const at::Tensor &gradOut, const at::Tensor &out,
-    const at::Tensor &maximum, const at::Tensor &sum, const at::Tensor &actualQuery, const at::Tensor &actualKv,
-    const at::Tensor &queryRope, const at::Tensor &keyRope, const at::Tensor &config,
-    at::Tensor &trace, at::Tensor &retained, double scale,
-    at::Tensor &gradQuery, at::Tensor &gradKey, at::Tensor &gradValue,
-    at::Tensor &gradQueryRope, at::Tensor &gradKeyRope,
-    at::Tensor &arena, const at::Tensor &metadata, const at::Tensor &requests,
-    at::Tensor &transportTrace, at::Tensor &ownerGradient, at::Tensor &partials) {
+Result RunFusedGrad(const at::Tensor &query, const at::Tensor &key, const at::Tensor &value, const at::Tensor &indices,
+                    const at::Tensor &gradOut, const at::Tensor &out, const at::Tensor &maximum, const at::Tensor &sum,
+                    const at::Tensor &actualQuery, const at::Tensor &actualKv, const at::Tensor &queryRope,
+                    const at::Tensor &keyRope, const at::Tensor &config, at::Tensor &trace, at::Tensor &retained,
+                    double scale, at::Tensor &gradQuery, at::Tensor &gradKey, at::Tensor &gradValue,
+                    at::Tensor &gradQueryRope, at::Tensor &gradKeyRope, at::Tensor &arena, const at::Tensor &metadata,
+                    const at::Tensor &requests, at::Tensor &transportTrace, at::Tensor &ownerGradient,
+                    at::Tensor &partials, const at::Tensor *queryPositions) {
   const Extras extras{&arena, &metadata, &requests, &transportTrace, &ownerGradient, &partials};
   check_extra_shapes(query, trace, extras);
-  check_grad_buffers(query, extras);
+  check_grad_buffers(key, extras);
   const auto firstPhase = trace.select(0, 0);
   const hyper_parallel::multicore::DsaGradInputs tensors{
-      &query, &key, &value, &indices, &gradOut, &out, &maximum, &sum, &actualQuery, &actualKv,
-      &queryRope, &keyRope, &config, &firstPhase, &retained, &gradQuery, &gradKey, &gradValue,
-      &gradQueryRope, &gradKeyRope};
-  hyper_parallel::multicore::check_dsa_grad_inputs(tensors, scale);
+    &query,    &key,         &value,    &indices,   &gradOut,       &out,        &maximum,
+    &sum,      &actualQuery, &actualKv, &queryRope, &keyRope,       &config,     &firstPhase,
+    &retained, &gradQuery,   &gradKey,  &gradValue, &gradQueryRope, &gradKeyRope};
+  hyper_parallel::multicore::check_dsa_grad_inputs(tensors, scale, queryPositions != nullptr);
   check_extra_storage(tensors, extras);
-  static const hyper_parallel::multicore::CachedOpApi api(
-      "aclnnHyperDsaFusedGrad", "aclnnHyperDsaFusedGradGetWorkspaceSize");
-  hyper_parallel::multicore::execute_cached_op(api, query, key, value, indices, gradOut, out, maximum, sum,
-      actualQuery, actualKv, queryRope, keyRope, config, trace, retained, scale,
-      gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope,
-      arena, metadata, requests, transportTrace, ownerGradient, partials);
-  return Result(gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope, trace, retained,
-                ownerGradient, partials, transportTrace);
+  if (queryPositions != nullptr) {
+    TORCH_CHECK(queryPositions->sizes() == at::IntArrayRef({query.size(0)}) &&
+                  queryPositions->scalar_type() == at::kLong && queryPositions->device() == query.device() &&
+                  queryPositions->is_contiguous() && !queryPositions->requires_grad(),
+                "local CP gradients require detached int64 query positions on the prepared NPU");
+    for (const auto *tensor : tensors) {
+      TORCH_CHECK(!queryPositions->is_alias_of(*tensor), "local query positions must not alias gradient buffers");
+    }
+    for (const auto *tensor : extras) {
+      TORCH_CHECK(!queryPositions->is_alias_of(*tensor), "local query positions must not alias transport buffers");
+    }
+    static const hyper_parallel::multicore::CachedOpApi localApi("aclnnHyperDsaLocalCpGrad",
+                                                                 "aclnnHyperDsaLocalCpGradGetWorkspaceSize");
+    hyper_parallel::multicore::execute_cached_op(
+      localApi, query, key, value, indices, gradOut, out, maximum, sum, actualQuery, actualKv, queryRope, keyRope,
+      config, trace, retained, scale, gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope, arena, metadata,
+      requests, transportTrace, ownerGradient, partials, *queryPositions);
+  } else {
+    static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaFusedGrad",
+                                                            "aclnnHyperDsaFusedGradGetWorkspaceSize");
+    hyper_parallel::multicore::execute_cached_op(api, query, key, value, indices, gradOut, out, maximum, sum,
+                                                 actualQuery, actualKv, queryRope, keyRope, config, trace, retained,
+                                                 scale, gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope,
+                                                 arena, metadata, requests, transportTrace, ownerGradient, partials);
+  }
+  return Result(gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope, trace, retained, ownerGradient, partials,
+                transportTrace);
+}
+Result fused_cp_grad_npu(const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
+                         const at::Tensor &indices, const at::Tensor &gradOut, const at::Tensor &out,
+                         const at::Tensor &maximum, const at::Tensor &sum, const at::Tensor &actualQuery,
+                         const at::Tensor &actualKv, const at::Tensor &queryRope, const at::Tensor &keyRope,
+                         const at::Tensor &config, at::Tensor &trace, at::Tensor &retained, double scale,
+                         at::Tensor &gradQuery, at::Tensor &gradKey, at::Tensor &gradValue, at::Tensor &gradQueryRope,
+                         at::Tensor &gradKeyRope, at::Tensor &arena, const at::Tensor &metadata,
+                         const at::Tensor &requests, at::Tensor &transportTrace, at::Tensor &ownerGradient,
+                         at::Tensor &partials) {
+  return RunFusedGrad(query, key, value, indices, gradOut, out, maximum, sum, actualQuery, actualKv, queryRope, keyRope,
+                      config, trace, retained, scale, gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope, arena,
+                      metadata, requests, transportTrace, ownerGradient, partials, nullptr);
+}
+
+Result local_cp_grad_npu(const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
+                         const at::Tensor &indices, const at::Tensor &gradOut, const at::Tensor &out,
+                         const at::Tensor &maximum, const at::Tensor &sum, const at::Tensor &actualQuery,
+                         const at::Tensor &actualKv, const at::Tensor &queryRope, const at::Tensor &keyRope,
+                         const at::Tensor &config, at::Tensor &trace, at::Tensor &retained, double scale,
+                         at::Tensor &gradQuery, at::Tensor &gradKey, at::Tensor &gradValue, at::Tensor &gradQueryRope,
+                         at::Tensor &gradKeyRope, at::Tensor &arena, const at::Tensor &metadata,
+                         const at::Tensor &requests, at::Tensor &transportTrace, at::Tensor &ownerGradient,
+                         at::Tensor &partials, const at::Tensor &queryPositions) {
+  return RunFusedGrad(query, key, value, indices, gradOut, out, maximum, sum, actualQuery, actualKv, queryRope, keyRope,
+                      config, trace, retained, scale, gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope, arena,
+                      metadata, requests, transportTrace, ownerGradient, partials, &queryPositions);
 }
 }  // namespace
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("dsa_fused_cp_grad_out", &fused_cp_grad_npu);
+  m.impl("dsa_local_cp_grad_out", &local_cp_grad_npu);
 }

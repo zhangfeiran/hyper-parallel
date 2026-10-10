@@ -59,6 +59,87 @@ class TestFusedCpBackward(SharedRootFixture):
                                                      torch.zeros(32, dtype=torch.int64), 1, saved)
         self.backend = fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend)
 
+    def _local_forward(self, ids):
+        self.forward_backend.prepare_local_queries(ids)
+        layout = self.forward_backend.local_query_layout
+        meta = replace(self.forward.saved.batch_meta, q_global_ids=ids)
+        states = (self.forward.saved.states[0][:len(ids)].clone(), self.forward.saved.states[1].clone(),
+                  self.forward.saved.states[2][:len(ids)].clone(), self.forward.saved.states[3].clone())
+        indices = torch.full((len(ids), 1, 2048), -1, dtype=torch.int32)
+        forward = (torch.ones_like(states[0]), torch.zeros(1, len(ids), 32), torch.ones(1, len(ids), 32))
+        tensors = (*states, indices, *forward)
+        saved = fused_cp.FusedCpSavedAttention(meta, states, indices, forward,
+                                               tuple(tensor._version for tensor in tensors), self.forward_backend,
+                                               (32, 0.1, MixedSfaSchedule(7)), fused_cp._SAVED_ATTENTION_TOKEN,
+                                               "local", layout)
+        output = layout.restore(forward[0]) if ids else forward[0]
+        return replace(self.forward, output=output, saved=saved)
+
+    def test_local_backward_keeps_real_q_and_complete_key_partials_after_reprepare(self):
+        """A saved subset restores caller Q and owner K orders without query replication."""
+        for ids in ((2, 0), ()):
+            with self.subTest(ids=ids):
+                forward = self._local_forward(ids)
+                layout = forward.saved.local_query_layout
+                self.forward_backend.prepare_local_queries((1,))
+                cotangent = torch.tensor([5, 7][:len(ids)], dtype=torch.bfloat16)
+                cotangent = cotangent[:, None, None].expand(-1, 32, 512).clone()
+                epochs = []
+
+                def _execute(*args):
+                    self.assertEqual(len(args), 28)
+                    self.assertIs(self.root.lease_owner, self.workspace.consumer)
+                    self.assertEqual(args[0].shape[0], len(ids))
+                    self.assertEqual(args[1].shape[0], 3)
+                    self.assertEqual(args[26].shape, (3, 1088))
+                    self.assertIs(args[8], layout.query_lengths)
+                    self.assertIs(args[27], layout.positions)
+                    torch.testing.assert_close(args[4], layout.pack(cotangent))
+                    if not ids:
+                        self.assertEqual(args[14].numel(), 13312)
+                    epochs.append(int(args[22][2]))
+                    args[16].copy_(args[4] * 2)
+                    args[19].fill_(3)
+                    args[17].fill_(999)
+                    args[18].fill_(777)
+                    args[25].copy_(torch.arange(3, dtype=torch.float32)[:, None].expand(3, 576) + .001)
+                    args[26].fill_(17)
+
+                with patch.object(fused_cp_backward, "_load_native"), \
+                        patch.object(torch.ops.hyper_parallel, "dsa_local_cp_grad_version", return_value=1,
+                                     create=True), \
+                        patch.object(torch.ops.hyper_parallel, "dsa_local_cp_grad_out", new=_execute, create=True):
+                    first = self.backend.backward_local(forward, cotangent)
+                    second = self.backend.backward_local(forward, cotangent)
+                self.assertEqual(epochs[1], epochs[0] + 1)
+                self.assertEqual(int(first._runtime_buffers[0][2]), epochs[0])
+                self.assertIsNot(first._runtime_buffers[0], second._runtime_buffers[0])
+                torch.testing.assert_close(first.gradients[0], cotangent * 2)
+                torch.testing.assert_close(first.owner_fp32[0][:, 0], torch.tensor([1.001, 2.001, .001]))
+                torch.testing.assert_close(first.gradients[1], first.owner_fp32[0].bfloat16())
+                self.assertEqual(first.owner_fp32[0].dtype, torch.float32)
+                self.assertNotEqual(first.partials.data_ptr(), second.partials.data_ptr())
+                self.assertIsNone(self.root.lease_owner)
+                forward.saved.validate_versions()
+
+    def test_local_admission_rejects_mutated_layout_and_stale_payload_before_lease(self):
+        """Native availability cannot bypass saved positions or consume an epoch on failure."""
+        forward = self._local_forward((2, 0))
+        before = self.workspace.transport_epoch
+        with patch.object(fused_cp_backward, "_load_native"), \
+                patch.object(torch.ops.hyper_parallel, "dsa_local_cp_grad_version", return_value=0, create=True), \
+                patch.object(torch.ops.hyper_parallel, "dsa_local_cp_grad_out", create=True) as execute:
+            with self.assertRaisesRegex(RuntimeError, "adapter ABI 1"):
+                self.backend.backward_local(forward, forward.output)
+            execute.assert_not_called()
+        self.assertEqual(self.workspace.transport_epoch, before)
+        self.assertIsNone(self.root.lease_owner)
+        forward.saved.local_query_layout.positions.add_(0)
+        with patch.object(fused_cp_backward, "_load_native") as load:
+            with self.assertRaisesRegex(ValueError, "metadata was modified"):
+                self.backend.backward_local(forward, forward.output)
+            load.assert_not_called()
+
     def test_cotangent_and_owner_gradients_restore_independent_q_k_orders(self):
         """Native receives global Q cotangents while FP32 owner results follow original KV order."""
         cotangent = torch.tensor([5, 7, 11], dtype=torch.bfloat16)[:, None, None].expand(3, 32, 512).clone()
@@ -147,6 +228,101 @@ class TestFusedCpBackward(SharedRootFixture):
             torch.testing.assert_close(actual, expected)
             torch.testing.assert_close(replay, expected)
         self.assertTrue(all(tensor.grad is None for tensor in index))
+
+    def test_local_autograd_retains_original_layout_and_returns_only_main_gradients(self):
+        """Repeated backward uses the saved local ABI after another query tile is prepared."""
+        bridge = fused_cp_backward.FusedDsaCpAttentionProbe(self.forward_backend)
+        for ids in ((2, 0), ()):
+            with self.subTest(ids=ids):
+                result = self._local_forward(ids)
+                layout = result.saved.local_query_layout
+                main = tuple(tensor.clone().requires_grad_() for tensor in result.saved.states)
+                index = tuple(torch.ones(1, requires_grad=True) for _ in range(3))
+                gradients = tuple(torch.full_like(tensor, factor if ids else 0)
+                                  for factor, tensor in enumerate(main, start=2))
+                invocation = self.workspace.prepare(result.saved.batch_meta)
+
+                def _forward(_invocation, states, index_states, *, query_layout):
+                    self.assertIs(query_layout, layout)
+                    self.assertTrue(all(not tensor.requires_grad for tensor in (*states, *index_states)))
+                    return result
+
+                def _backward(saved, shape, cotangent, *, local_queries):
+                    self.assertTrue(local_queries)
+                    self.assertEqual(shape, tuple(result.output.shape))
+                    self.assertFalse(cotangent.requires_grad)
+                    self.assertIs(saved.local_query_layout, layout)
+                    self.assertTrue(all(not tensor.requires_grad for tensor in
+                                        (*saved.states, saved.indices, *saved.forward)))
+                    saved.validate_versions()
+                    return SimpleNamespace(gradients=gradients)
+
+                with patch.object(self.forward_backend, "forward_local", side_effect=_forward), \
+                        patch.object(bridge.backward_backend, "_backward_saved", side_effect=_backward):
+                    output = bridge.attention_local(invocation, main, index, query_layout=layout)
+                    self.forward_backend.prepare_local_queries((1,))
+                    first = torch.autograd.grad(output.sum(), (*main, *index), retain_graph=True, allow_unused=True)
+                    second = torch.autograd.grad(output.sum(), main)
+                for actual, replay, expected in zip(first[:4], second, gradients):
+                    torch.testing.assert_close(actual, expected)
+                    torch.testing.assert_close(replay, expected)
+                self.assertTrue(all(tensor is None for tensor in first[4:]))
+
+    @patch.object(DefaultDeviceType, "get_device_type", return_value="cpu")
+    def test_local_checkpoint_replay_uses_explicit_layout_after_reprepare(self, _device_type):
+        """The checkpoint callback retains cold tile identity while native activations use saved hooks."""
+        bridge = fused_cp_backward.FusedDsaCpAttentionProbe(self.forward_backend)
+        result = self._local_forward((2, 0))
+        layout = result.saved.local_query_layout
+        main = tuple(tensor.clone().requires_grad_() for tensor in result.saved.states)
+        index = (torch.ones(1),) * 3
+        invocation = self.workspace.prepare(result.saved.batch_meta)
+        gradients = tuple(torch.full_like(tensor, factor) for factor, tensor in enumerate(main, start=2))
+
+        def _forward(*_args, query_layout):
+            self.assertIs(query_layout, layout)
+            return replace(result, output=result.output.detach().clone())
+
+        def _attention(*states):
+            return bridge.attention_local(invocation, states, index, query_layout=layout)
+
+        with patch.object(self.forward_backend, "forward_local", side_effect=_forward) as forward, \
+                patch.object(bridge.backward_backend, "_backward_saved",
+                             return_value=SimpleNamespace(gradients=gradients)):
+            output = checkpoint(_attention, *main, use_reentrant=False)
+            self.assertFalse(hasattr(output.grad_fn, "result"))
+            self.forward_backend.prepare_local_queries(())
+            actual = torch.autograd.grad(output.sum(), main)
+        self.assertEqual(forward.call_count, 2)
+        for value, expected in zip(actual, gradients):
+            torch.testing.assert_close(value, expected)
+
+    def test_local_autograd_rejects_input_mutation_and_higher_order_before_native(self):
+        """Detaching the native ABI must retain original input version and first-order protections."""
+        bridge = fused_cp_backward.FusedDsaCpAttentionProbe(self.forward_backend)
+        for mode in ("main", "index", "higher_order", "layout"):
+            with self.subTest(mode=mode):
+                result = self._local_forward((2, 0))
+                main = tuple(tensor.clone().requires_grad_() for tensor in result.saved.states)
+                index = tuple(torch.ones(1, requires_grad=True) for _ in range(3))
+                layout = result.saved.local_query_layout
+                invocation = self.workspace.prepare(result.saved.batch_meta)
+                with patch.object(self.forward_backend, "forward_local", return_value=result), \
+                        patch.object(fused_cp_backward, "_load_native") as load:
+                    output = bridge.attention_local(invocation, main, index, query_layout=layout)
+                    if mode == "higher_order":
+                        with self.assertRaisesRegex(ValueError, "first-order"):
+                            torch.autograd.grad(output.sum(), main, create_graph=True)
+                    elif mode == "layout":
+                        layout.positions.add_(0)
+                        with self.assertRaisesRegex(ValueError, "metadata was modified"):
+                            torch.autograd.grad(output.sum(), main)
+                    else:
+                        with torch.no_grad():
+                            (main[1] if mode == "main" else index[0]).add_(1)
+                        with self.assertRaisesRegex(RuntimeError, "modified by an inplace operation"):
+                            torch.autograd.grad(output.sum(), main)
+                    load.assert_not_called()
 
     def test_autograd_rejects_original_input_mutation_before_native_backward(self):
         """Versioned original inputs remain protected even though native saved buffers are independent."""

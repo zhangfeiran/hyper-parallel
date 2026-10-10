@@ -17,7 +17,7 @@
 #include "runtime/dsa_mixed_group.h"
 #include "runtime/dsa_cp_grad_transport.h"
 
-using namespace AscendC;  // NOLINT(build/namespaces)
+using namespace AscendC;   // NOLINT(build/namespaces)
 using namespace DsaMixed;  // NOLINT(build/namespaces)
 
 namespace {
@@ -25,6 +25,7 @@ struct Buffers {
   __gm__ uint8_t *query, *key, *value, *indices, *gradOut, *out, *maximum, *sum;
   __gm__ uint8_t *actualQuery, *actualKv, *queryRope, *keyRope, *retained;
   __gm__ uint8_t *gradQuery, *gradKey, *gradValue, *gradQueryRope, *gradKeyRope;
+  __gm__ uint8_t *queryPositions;
 };
 
 __aicore__ inline void ClosePhase(GlobalTensor<int64_t> &trace, uint32_t groups, int64_t epoch) {
@@ -43,20 +44,57 @@ __aicore__ inline void ClosePhase(GlobalTensor<int64_t> &trace, uint32_t groups,
   PublishControl(trace, groups * kGroupWords + member * kMemberWords + kArrivalWord, epoch);
 }
 
+__aicore__ inline void EmptyQueryPhase(const Buffers &buffers, const SparseFlashAttentionGradBasicTilingData *data,
+                                       uint32_t ticket, uint32_t physicalCount, uint32_t phase) {
+#ifndef __DAV_C220_CUBE__
+  if (GetSubBlockIdx() != 0 || phase == 1) {
+    return;
+  }
+  TPipe pipe;
+  TBuf<TPosition::VECCALC> storage;
+  pipe.InitBuffer(storage, 1088 * sizeof(float));
+  auto zero = storage.Get<float>();
+  Duplicate(zero, 0.0f, 1088);
+  SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+  WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+  GlobalTensor<float> key, value;
+  key.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(buffers.retained + data->postTilingData.dkWorkSpaceOffset));
+  value.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(buffers.retained + data->postTilingData.dvWorkSpaceOffset));
+  GlobalTensor<bfloat16_t> gradKey, gradValue, gradRope;
+  gradKey.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(buffers.gradKey));
+  gradValue.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(buffers.gradValue));
+  gradRope.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(buffers.gradKeyRope));
+  auto zeroBf16 = zero.ReinterpretCast<bfloat16_t>();
+  for (int64_t token = ticket; token < data->opInfo.S2; token += physicalCount) {
+    if (phase == 0) {
+      DataCopyPad(key[token * 576], zero, DataCopyExtParams{1, 576 * sizeof(float), 0, 0, 0});
+      DataCopyPad(value[token * 512], zero, DataCopyExtParams{1, 512 * sizeof(float), 0, 0, 0});
+    } else {
+      DataCopyPad(gradKey[token * 512], zeroBf16, DataCopyExtParams{1, 512 * sizeof(bfloat16_t), 0, 0, 0});
+      DataCopyPad(gradValue[token * 512], zeroBf16, DataCopyExtParams{1, 512 * sizeof(bfloat16_t), 0, 0, 0});
+      DataCopyPad(gradRope[token * 64], zeroBf16, DataCopyExtParams{1, 64 * sizeof(bfloat16_t), 0, 0, 0});
+    }
+  }
+  PipeBarrier<PIPE_ALL>();
+#endif
+}
+
 __aicore__ inline void ComputePhase(const Buffers &buffers, const SparseFlashAttentionGradBasicTilingData *data,
-                                   GlobalTensor<int64_t> &trace, uint32_t phase,
-                                   uint32_t group, uint32_t groups, uint32_t physicalCount) {
+                                    GlobalTensor<int64_t> &trace, uint32_t phase, uint32_t group, uint32_t groups,
+                                    uint32_t physicalCount) {
   uint32_t count = 0, checksum = 0;
   for (uint32_t logical = group; logical < physicalCount; logical += groups) {
     const uint32_t ticket = Dispatch(trace, group * kGroupWords, logical);
-    using TileType = SFAG_BASIC::SFAG_TYPE<SparseFlashAttentionGradBasicTilingData,
-        bfloat16_t, 3, true, true, false, false, false>;
-    {
+    using TileType =
+      SFAG_BASIC::SFAG_TYPE<SparseFlashAttentionGradBasicTilingData, bfloat16_t, 3, true, true, false, false, false>;
+    if (data->opInfo.S1 == 0) {
+      EmptyQueryPhase(buffers, data, ticket, physicalCount, phase);
+    } else {
       SFAG_BASIC::SelectedAttentionGradBasic<TileType> tile;
-      tile.Process(buffers.query, buffers.key, buffers.value, buffers.out, buffers.gradOut,
-                   buffers.maximum, buffers.sum, buffers.indices, buffers.actualQuery, buffers.actualKv,
-                   buffers.queryRope, buffers.keyRope, buffers.gradQuery, buffers.gradKey, buffers.gradValue,
-                   buffers.gradQueryRope, buffers.gradKeyRope, buffers.retained, data, ticket, group, phase);
+      tile.Process(buffers.query, buffers.key, buffers.value, buffers.out, buffers.gradOut, buffers.maximum,
+                   buffers.sum, buffers.indices, buffers.actualQuery, buffers.actualKv, buffers.queryRope,
+                   buffers.keyRope, buffers.gradQuery, buffers.gradKey, buffers.gradValue, buffers.gradQueryRope,
+                   buffers.gradKeyRope, buffers.retained, data, ticket, group, phase, buffers.queryPositions);
     }
     ++count;
     checksum += ticket + 1;
@@ -65,14 +103,16 @@ __aicore__ inline void ComputePhase(const Buffers &buffers, const SparseFlashAtt
   ArriveAndWait(trace, group, groups, phase + 1);
 }
 
-__aicore__ inline void Run(const Buffers &buffers, CpGradTransport &transport,
-                           __gm__ uint8_t *runtimeConfig, __gm__ uint8_t *groupTrace, __gm__ uint8_t *tiling) {
+__aicore__ inline void Run(const Buffers &buffers, CpGradTransport &transport, __gm__ uint8_t *runtimeConfig,
+                           __gm__ uint8_t *groupTrace, __gm__ uint8_t *tiling) {
   GlobalTensor<int64_t> config;
   config.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(runtimeConfig), 4);
   const uint32_t groups = static_cast<uint32_t>(config.GetValue(2));
   const uint32_t physicalCount = GetBlockNum();
-  if (config.GetValue(0) != kMixedMagic || config.GetValue(1) != 1 || groups == 0 ||
-      groups >= physicalCount || config.GetValue(3) != 1) { return; }
+  if (config.GetValue(0) != kMixedMagic || config.GetValue(1) != 1 || groups == 0 || groups >= physicalCount ||
+      config.GetValue(3) != 1) {
+    return;
+  }
   uint32_t group = GetBlockIdx();
   if ASCEND_IS_AIV {
     group /= 2;
@@ -104,19 +144,17 @@ __aicore__ inline void Run(const Buffers &buffers, CpGradTransport &transport,
 }  // namespace
 
 extern "C" __global__ __aicore__ void hyper_dsa_fused_grad(
-    __gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *indices,
-    __gm__ uint8_t *gradOut, __gm__ uint8_t *out, __gm__ uint8_t *maximum, __gm__ uint8_t *sum,
-    __gm__ uint8_t *value, __gm__ uint8_t *actualQuery, __gm__ uint8_t *actualKv,
-    __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope, __gm__ uint8_t *runtimeConfig,
-    __gm__ uint8_t *groupTrace, __gm__ uint8_t *retained, __gm__ uint8_t *arena,
-    __gm__ uint8_t *metadata, __gm__ uint8_t *requests, __gm__ uint8_t *transportTrace,
-    __gm__ uint8_t *ownerGradient, __gm__ uint8_t *partials,
-    __gm__ uint8_t *gradQuery, __gm__ uint8_t *gradKey, __gm__ uint8_t *gradValue,
-    __gm__ uint8_t *gradQueryRope, __gm__ uint8_t *gradKeyRope,
-    __gm__ uint8_t *workspace, __gm__ uint8_t *tiling) {
+  __gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *indices, __gm__ uint8_t *gradOut, __gm__ uint8_t *out,
+  __gm__ uint8_t *maximum, __gm__ uint8_t *sum, __gm__ uint8_t *value, __gm__ uint8_t *actualQuery,
+  __gm__ uint8_t *actualKv, __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope, __gm__ uint8_t *runtimeConfig,
+  __gm__ uint8_t *groupTrace, __gm__ uint8_t *retained, __gm__ uint8_t *arena, __gm__ uint8_t *metadata,
+  __gm__ uint8_t *requests, __gm__ uint8_t *transportTrace, __gm__ uint8_t *ownerGradient, __gm__ uint8_t *partials,
+  __gm__ uint8_t *queryPositions, __gm__ uint8_t *gradQuery, __gm__ uint8_t *gradKey, __gm__ uint8_t *gradValue,
+  __gm__ uint8_t *gradQueryRope, __gm__ uint8_t *gradKeyRope, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-  Buffers buffers{query, key, value, indices, gradOut, out, maximum, sum, actualQuery, actualKv,
-                  queryRope, keyRope, retained, gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope};
+  Buffers buffers{query,   key,         value,         indices,     gradOut,       out,      maximum,
+                  sum,     actualQuery, actualKv,      queryRope,   keyRope,       retained, gradQuery,
+                  gradKey, gradValue,   gradQueryRope, gradKeyRope, queryPositions};
   CpGradTransport transport;
   transport.Init(arena, metadata, requests, transportTrace, partials, ownerGradient);
   Run(buffers, transport, runtimeConfig, groupTrace, tiling);

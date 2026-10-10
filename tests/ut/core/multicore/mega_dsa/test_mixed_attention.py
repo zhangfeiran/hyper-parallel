@@ -134,3 +134,18 @@ class TestMixedGradBudget(unittest.TestCase):
         for tokens, heads in ((0, 32), (True, 32), (1.0, 32), (1, 16), (1, False)):
             with self.subTest(tokens=tokens, heads=heads), self.assertRaises(ValueError):
                 mixed_attention.mixed_sfa_grad_workspace_bytes(tokens, heads)
+
+
+class TestLocalGradientWorkspace(unittest.TestCase):
+    """Empty query math still requires complete global-key FP32 accumulation storage."""
+
+    def test_empty_q_preserves_key_value_accumulators_and_rejects_invalid_geometry(self):
+        """A zero-row tile must have enough aligned storage for three real C512/RoPE64 keys."""
+        required = mixed_attention.local_sfa_grad_workspace_bytes(0, 3, 32)
+        self.assertEqual(required, 13312)
+        self.assertGreaterEqual(required, 3 * (576 + 512) * 4)
+        for queries, keys, heads in ((-1, 3, 32), (True, 3, 32), (0, 0, 32), (0, False, 32), (0, 3, 16)):
+            with self.subTest(queries=queries, keys=keys, heads=heads), self.assertRaises(ValueError):
+                mixed_attention.local_sfa_grad_workspace_bytes(queries, keys, heads)
+        with self.assertRaises(ValueError):
+            mixed_attention.mixed_sfa_grad_workspace_bytes(0, 32)

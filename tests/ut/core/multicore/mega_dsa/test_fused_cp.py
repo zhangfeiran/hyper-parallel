@@ -14,10 +14,12 @@
 # ============================================================================
 """Owner-run coverage, Q-only permutation and leased native CP submission contracts."""
 
+import gc
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
+from weakref import ref
 
 import torch
 
@@ -228,6 +230,44 @@ class TestFusedCpSubmission(SharedRootFixture):
                 with self.assertRaises(ValueError):
                     backend.forward_local(self.invocation, tuple(values[:4]), tuple(values[4:]))
                 load.assert_not_called()
+
+    def test_explicit_prepared_layout_survives_reprepare_without_accepting_foreign_layout(self):
+        """Checkpoint can replay an admitted old tile, but metadata equivalence cannot forge admission."""
+        backend = self._backend()
+        layout = backend.prepare_local_queries((2, 0))
+        backend.prepare_local_queries(())
+        seen = []
+
+        def _execute(*args):
+            self.assertIs(args[26], layout.query_lengths)
+            self.assertIs(args[27], layout.positions)
+            seen.append(args[0].shape[0])
+
+        with patch.object(fused_cp, "_load_native"), \
+                patch.object(torch.ops.hyper_parallel, "dsa_local_cp_forward_version", return_value=1, create=True), \
+                patch.object(torch.ops.hyper_parallel, "dsa_local_cp_forward_out", new=_execute, create=True):
+            result = backend.forward_local(self.invocation, *self._local_states((2, 0)), query_layout=layout)
+        self.assertEqual(seen, [2])
+        self.assertIs(result.saved.local_query_layout, layout)
+        foreign = fused_cp.DsaLocalQueryLayout(layout.batch_meta, "cpu")
+        with patch.object(fused_cp, "_load_native") as load:
+            with self.assertRaisesRegex(ValueError, "cold prepared query layout"):
+                backend.forward_local(self.invocation, *self._local_states((2, 0)), query_layout=foreign)
+            layout.positions.add_(0)
+            with self.assertRaisesRegex(ValueError, "metadata was modified"):
+                backend.forward_local(self.invocation, *self._local_states((2, 0)), query_layout=layout)
+            load.assert_not_called()
+
+    def test_backend_does_not_keep_retired_query_metadata_alive(self):
+        """Long-running preparation must release cold tile tensors once no saved consumer remains."""
+        backend = self._backend()
+        old = backend.prepare_local_queries((2, 0))
+        weak = ref(old)
+        backend.prepare_local_queries(())
+        self.assertIs(weak(), old)
+        del old
+        gc.collect()
+        self.assertIsNone(weak())
 
     def test_epoch_requires_lease_and_survives_adapter_recreation(self):
         with self.assertRaisesRegex(RuntimeError, "active invocation"):

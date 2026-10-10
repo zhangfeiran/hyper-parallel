@@ -12,11 +12,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <vector>
 #include "base/context_builder/op_tiling_context_builder.h"
 #include "register/op_impl_registry.h"
+#include "tiling/platform/platform_ascendc.h"
 #include "hyper_dsa_fused_grad_tiling.h"  // NOLINT(build/include_subdir)
 
 namespace optiling {
@@ -27,14 +29,14 @@ namespace {
 gert::Tensor InputMetadata(gert::TilingContext *context, size_t index) {
   const auto *desc = context->GetInputDesc(index);
   return gert::Tensor(*context->GetRequiredInputShape(index),
-      gert::StorageFormat(desc->GetOriginFormat(), desc->GetStorageFormat(), desc->GetExpandDimsType()),
-      desc->GetDataType());
+                      gert::StorageFormat(desc->GetOriginFormat(), desc->GetStorageFormat(), desc->GetExpandDimsType()),
+                      desc->GetDataType());
 }
 gert::Tensor OutputMetadata(gert::TilingContext *context, size_t index) {
   const auto *desc = context->GetOutputDesc(index);
   return gert::Tensor(*context->GetOutputShape(index),
-      gert::StorageFormat(desc->GetOriginFormat(), desc->GetStorageFormat(), desc->GetExpandDimsType()),
-      desc->GetDataType());
+                      gert::StorageFormat(desc->GetOriginFormat(), desc->GetStorageFormat(), desc->GetExpandDimsType()),
+                      desc->GetDataType());
 }
 ge::graphStatus Metadata(gert::TilingContext *context, std::array<gert::Tensor, 15> &inputs,
                          std::array<gert::Tensor, 5> &outputs) {
@@ -53,8 +55,7 @@ ge::graphStatus Metadata(gert::TilingContext *context, std::array<gert::Tensor, 
   return ge::GRAPH_SUCCESS;
 }
 void Configure(gert::TilingContext *context, gert::OpTilingContextBuilder &builder,
-               std::array<gert::Tensor, 15> &inputs, std::array<gert::Tensor, 5> &outputs,
-               gert::Tensor &trace) {
+               std::array<gert::Tensor, 15> &inputs, std::array<gert::Tensor, 5> &outputs, gert::Tensor &trace) {
   std::vector<gert::Tensor *> in;
   std::vector<gert::Tensor *> out;
   for (size_t index = 0; index < inputs.size(); ++index) {
@@ -63,12 +64,58 @@ void Configure(gert::TilingContext *context, gert::OpTilingContextBuilder &build
   for (auto &tensor : outputs) {
     out.push_back(&tensor);
   }
-  builder.OpName(ge::AscendString(context->GetNodeName())).OpType(ge::AscendString("HyperDsaMixedGrad"))
-      .IOInstanceNum({1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 1, 1})
-      .InputTensors(in).OutputTensors(out).PlatformInfo(context->GetPlatformInfo()).Deterministic(0)
-      .AppendAttr(*context->GetAttrs()->GetAttrPointer<float>(0)).AppendAttr(int64_t{1})
-      .AppendAttr(ge::AscendString("TND")).AppendAttr(int64_t{3}).AppendAttr(int64_t{INT64_MAX})
-      .AppendAttr(int64_t{INT64_MAX}).AppendAttr(false).AppendAttr(int64_t{1});
+  builder.OpName(ge::AscendString(context->GetNodeName()))
+    .OpType(ge::AscendString("HyperDsaMixedGrad"))
+    .IOInstanceNum({1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 1, 1})
+    .InputTensors(in)
+    .OutputTensors(out)
+    .PlatformInfo(context->GetPlatformInfo())
+    .Deterministic(0)
+    .AppendAttr(*context->GetAttrs()->GetAttrPointer<float>(0))
+    .AppendAttr(int64_t{1})
+    .AppendAttr(ge::AscendString("TND"))
+    .AppendAttr(int64_t{3})
+    .AppendAttr(int64_t{INT64_MAX})
+    .AppendAttr(int64_t{INT64_MAX})
+    .AppendAttr(false)
+    .AppendAttr(int64_t{1});
+}
+ge::graphStatus EmptyQueryTiling(gert::TilingContext *context, const std::array<gert::Tensor, 15> &inputs) {
+  const auto &query = inputs[0].GetStorageShape();
+  const auto &key = inputs[1].GetStorageShape();
+  if (query.GetDimNum() != 3 || query.GetDim(0) != 0 || query.GetDim(2) != 512 ||
+      (query.GetDim(1) != 32 && query.GetDim(1) != 64) || key.GetDimNum() != 3 || key.GetDim(0) <= 0 ||
+      key.GetDim(1) != 1 || key.GetDim(2) != 512) {
+    return ge::GRAPH_FAILED;
+  }
+  const uint64_t keys = key.GetDim(0);
+  const uint64_t keyBytes = (keys * 576 * sizeof(float) + 511) / 512 * 512;
+  const uint64_t valueBytes = (keys * 512 * sizeof(float) + 511) / 512 * 512;
+  if (inputs[14].GetStorageShape().GetShapeSize() < static_cast<int64_t>(keyBytes + valueBytes)) {
+    return ge::GRAPH_FAILED;
+  }
+  platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+  if (platform.GetCoreNumAic() != 20 || platform.GetCoreNumAiv() != 40) {
+    return ge::GRAPH_FAILED;
+  }
+  SparseFlashAttentionGradBasicTilingData data;
+  data.opInfo.set_S1(0);
+  data.opInfo.set_S2(keys);
+  data.postTilingData.set_dkWorkSpaceOffset(0);
+  data.postTilingData.set_dvWorkSpaceOffset(keyBytes);
+  auto *raw = context->GetRawTilingData();
+  auto *sizes = context->GetWorkspaceSizes(1);
+  if (raw == nullptr || raw->GetCapacity() < data.GetDataSize() || sizes == nullptr) {
+    return ge::GRAPH_FAILED;
+  }
+  data.SaveToBuffer(raw->GetData(), raw->GetCapacity());
+  raw->SetDataSize(data.GetDataSize());
+  // The generated MIX entry owns a system region even when no query math is issued.
+  sizes[0] = std::max<uint64_t>(32 * 1024 * 1024, platform.GetLibApiWorkSpaceSize());
+  context->SetBlockDim(20);
+  context->SetScheduleMode(1);
+  context->SetTilingKey(0);
+  return ge::GRAPH_SUCCESS;
 }
 }  // namespace
 
@@ -83,6 +130,18 @@ ge::graphStatus TilingDsaFusedGrad(gert::TilingContext *context) {
   }
   if (inputs[13].GetStorageShape().GetShapeSize() != 3 * 20 * 64) {
     return ge::GRAPH_FAILED;
+  }
+  const bool local = context->GetOptionalInputDesc(21) != nullptr;
+  if (local) {
+    const auto *positions = context->GetOptionalInputShape(21);
+    if (positions == nullptr || positions->GetStorageShape().GetDimNum() != 1 ||
+        context->GetOptionalInputDesc(21)->GetDataType() != ge::DT_INT64 ||
+        positions->GetStorageShape().GetShapeSize() != inputs[0].GetStorageShape().GetDim(0)) {
+      return ge::GRAPH_FAILED;
+    }
+    if (inputs[0].GetStorageShape().GetDim(0) == 0) {
+      return EmptyQueryTiling(context, inputs);
+    }
   }
   gert::Tensor trace(gert::StorageShape({20, 64}, {20, 64}), gert::StorageFormat(), ge::DT_INT64);
   gert::OpTilingContextBuilder builder;

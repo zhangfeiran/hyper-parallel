@@ -27,24 +27,23 @@ OP_TYPE_REGISTER(HyperDsaFusedGrad);
 }
 using l0op::HyperDsaFusedGradOpTypeId;
 
-extern "C" aclnnStatus aclnnHyperDsaFusedGradGetWorkspaceSize(
-    const aclTensor *query, const aclTensor *key, const aclTensor *value,
-    const aclTensor *indices, const aclTensor *gradOut, const aclTensor *out,
-    const aclTensor *maximum, const aclTensor *sum, const aclTensor *actualQuery,
-    const aclTensor *actualKv, const aclTensor *queryRope, const aclTensor *keyRope,
-    const aclTensor *config, const aclTensor *trace, const aclTensor *retained, double scale,
-    const aclTensor *gradQuery, const aclTensor *gradKey, const aclTensor *gradValue,
-    const aclTensor *gradQueryRope, const aclTensor *gradKeyRope,
-    const aclTensor *arena, const aclTensor *metadata, const aclTensor *requests,
-    const aclTensor *transportTrace, const aclTensor *ownerGradient, const aclTensor *partials,
-    uint64_t *workspaceSize, aclOpExecutor **executor) {
+namespace {
+aclnnStatus BuildFusedGrad(const aclTensor *query, const aclTensor *key, const aclTensor *value,
+                           const aclTensor *indices, const aclTensor *gradOut, const aclTensor *out,
+                           const aclTensor *maximum, const aclTensor *sum, const aclTensor *actualQuery,
+                           const aclTensor *actualKv, const aclTensor *queryRope, const aclTensor *keyRope,
+                           const aclTensor *config, const aclTensor *trace, const aclTensor *retained, double scale,
+                           const aclTensor *gradQuery, const aclTensor *gradKey, const aclTensor *gradValue,
+                           const aclTensor *gradQueryRope, const aclTensor *gradKeyRope, const aclTensor *arena,
+                           const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace,
+                           const aclTensor *ownerGradient, const aclTensor *partials, const aclTensor *queryPositions,
+                           uint64_t *workspaceSize, aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
-  L2_DFX_PHASE_1(aclnnHyperDsaFusedGrad, DFX_IN(query, key, value, indices), DFX_OUT(gradQuery, gradKey));
   auto owner = CREATE_EXECUTOR();
   CHECK_RET(owner.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
   const std::array<const aclTensor *, 21> original{
-      query, key, indices, gradOut, out, maximum, sum, value, actualQuery, actualKv, queryRope, keyRope,
-      config, trace, retained, arena, metadata, requests, transportTrace, ownerGradient, partials};
+    query,   key,    indices, gradOut,  out,   maximum,  sum,      value,          actualQuery,   actualKv, queryRope,
+    keyRope, config, trace,   retained, arena, metadata, requests, transportTrace, ownerGradient, partials};
   auto inputs = original;
   const std::array<const aclTensor *, 5> destinations{gradQuery, gradKey, gradValue, gradQueryRope, gradKeyRope};
   auto outputs = destinations;
@@ -65,14 +64,15 @@ extern "C" aclnnStatus aclnnHyperDsaFusedGradGetWorkspaceSize(
   const char *layout = "TND";
   const bool deterministic = false;
   auto launch = [&](aclOpExecutor *executor) {
-    return ADD_TO_LAUNCHER_LIST_AICORE(HyperDsaFusedGrad,
-        OP_INPUT(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6], inputs[7],
-                 inputs[8], inputs[9], inputs[10], inputs[11], inputs[12], inputs[13], inputs[14], inputs[15],
-                 inputs[16], inputs[17], inputs[18], inputs[19], inputs[20]),
-        OP_OUTPUT(const_cast<aclTensor *>(outputs[0]), const_cast<aclTensor *>(outputs[1]),
-                  const_cast<aclTensor *>(outputs[2]), const_cast<aclTensor *>(outputs[3]),
-                  const_cast<aclTensor *>(outputs[4])),
-        OP_ATTR(scaleValue, blockSize, layout, mode, preTokens, nextTokens, deterministic, phase));
+    return ADD_TO_LAUNCHER_LIST_AICORE(
+      HyperDsaFusedGrad,
+      OP_INPUT(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6], inputs[7], inputs[8],
+               inputs[9], inputs[10], inputs[11], inputs[12], inputs[13], inputs[14], inputs[15], inputs[16],
+               inputs[17], inputs[18], inputs[19], inputs[20], queryPositions),
+      OP_OUTPUT(const_cast<aclTensor *>(outputs[0]), const_cast<aclTensor *>(outputs[1]),
+                const_cast<aclTensor *>(outputs[2]), const_cast<aclTensor *>(outputs[3]),
+                const_cast<aclTensor *>(outputs[4])),
+      OP_ATTR(scaleValue, blockSize, layout, mode, preTokens, nextTokens, deterministic, phase));
   };
   const auto status = launch(owner.get());
   CHECK_RET(status == ACL_SUCCESS, status);
@@ -86,8 +86,47 @@ extern "C" aclnnStatus aclnnHyperDsaFusedGradGetWorkspaceSize(
   owner.ReleaseTo(executor);
   return ACLNN_SUCCESS;
 }
-extern "C" aclnnStatus aclnnHyperDsaFusedGrad(
-    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+}  // namespace
+
+extern "C" aclnnStatus aclnnHyperDsaFusedGradGetWorkspaceSize(
+  const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *indices,
+  const aclTensor *gradOut, const aclTensor *out, const aclTensor *maximum, const aclTensor *sum,
+  const aclTensor *actualQuery, const aclTensor *actualKv, const aclTensor *queryRope, const aclTensor *keyRope,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, double scale, const aclTensor *gradQuery,
+  const aclTensor *gradKey, const aclTensor *gradValue, const aclTensor *gradQueryRope, const aclTensor *gradKeyRope,
+  const aclTensor *arena, const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace,
+  const aclTensor *ownerGradient, const aclTensor *partials, uint64_t *workspaceSize, aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaFusedGrad, DFX_IN(query, key, value, indices), DFX_OUT(gradQuery, gradKey));
+  return BuildFusedGrad(query, key, value, indices, gradOut, out, maximum, sum, actualQuery, actualKv, queryRope,
+                        keyRope, config, trace, retained, scale, gradQuery, gradKey, gradValue, gradQueryRope,
+                        gradKeyRope, arena, metadata, requests, transportTrace, ownerGradient, partials, nullptr,
+                        workspaceSize, executor);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaLocalCpGradGetWorkspaceSize(
+  const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *indices,
+  const aclTensor *gradOut, const aclTensor *out, const aclTensor *maximum, const aclTensor *sum,
+  const aclTensor *actualQuery, const aclTensor *actualKv, const aclTensor *queryRope, const aclTensor *keyRope,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, double scale, const aclTensor *gradQuery,
+  const aclTensor *gradKey, const aclTensor *gradValue, const aclTensor *gradQueryRope, const aclTensor *gradKeyRope,
+  const aclTensor *arena, const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace,
+  const aclTensor *ownerGradient, const aclTensor *partials, const aclTensor *queryPositions, uint64_t *workspaceSize,
+  aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaLocalCpGrad, DFX_IN(query, key, queryPositions), DFX_OUT(gradQuery, gradKey));
+  return BuildFusedGrad(query, key, value, indices, gradOut, out, maximum, sum, actualQuery, actualKv, queryRope,
+                        keyRope, config, trace, retained, scale, gradQuery, gradKey, gradValue, gradQueryRope,
+                        gradKeyRope, arena, metadata, requests, transportTrace, ownerGradient, partials, queryPositions,
+                        workspaceSize, executor);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaFusedGrad(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                              aclrtStream stream) {
   L2_DFX_PHASE_2(aclnnHyperDsaFusedGrad);
+  return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaLocalCpGrad(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                aclrtStream stream) {
+  L2_DFX_PHASE_2(aclnnHyperDsaLocalCpGrad);
   return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
 }

@@ -18,17 +18,25 @@
 #include "aclnn_util.h"  // NOLINT(build/include_subdir)
 extern "C" {
 ACLNN_API aclnnStatus aclnnHyperDsaFusedGradGetWorkspaceSize(
-    const aclTensor *query, const aclTensor *key, const aclTensor *value,
-    const aclTensor *indices, const aclTensor *gradOut, const aclTensor *out,
-    const aclTensor *maximum, const aclTensor *sum, const aclTensor *actualQuery,
-    const aclTensor *actualKv, const aclTensor *queryRope, const aclTensor *keyRope,
-    const aclTensor *config, const aclTensor *trace, const aclTensor *retained, double scale,
-    const aclTensor *gradQuery, const aclTensor *gradKey, const aclTensor *gradValue,
-    const aclTensor *gradQueryRope, const aclTensor *gradKeyRope,
-    const aclTensor *arena, const aclTensor *metadata, const aclTensor *requests,
-    const aclTensor *transportTrace, const aclTensor *ownerGradient, const aclTensor *partials,
-    uint64_t *workspaceSize, aclOpExecutor **executor);
-ACLNN_API aclnnStatus aclnnHyperDsaFusedGrad(
-    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
+  const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *indices,
+  const aclTensor *gradOut, const aclTensor *out, const aclTensor *maximum, const aclTensor *sum,
+  const aclTensor *actualQuery, const aclTensor *actualKv, const aclTensor *queryRope, const aclTensor *keyRope,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, double scale, const aclTensor *gradQuery,
+  const aclTensor *gradKey, const aclTensor *gradValue, const aclTensor *gradQueryRope, const aclTensor *gradKeyRope,
+  const aclTensor *arena, const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace,
+  const aclTensor *ownerGradient, const aclTensor *partials, uint64_t *workspaceSize, aclOpExecutor **executor);
+ACLNN_API aclnnStatus aclnnHyperDsaLocalCpGradGetWorkspaceSize(
+  const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *indices,
+  const aclTensor *gradOut, const aclTensor *out, const aclTensor *maximum, const aclTensor *sum,
+  const aclTensor *actualQuery, const aclTensor *actualKv, const aclTensor *queryRope, const aclTensor *keyRope,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, double scale, const aclTensor *gradQuery,
+  const aclTensor *gradKey, const aclTensor *gradValue, const aclTensor *gradQueryRope, const aclTensor *gradKeyRope,
+  const aclTensor *arena, const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace,
+  const aclTensor *ownerGradient, const aclTensor *partials, const aclTensor *queryPositions, uint64_t *workspaceSize,
+  aclOpExecutor **executor);
+ACLNN_API aclnnStatus aclnnHyperDsaLocalCpGrad(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                               aclrtStream stream);
+ACLNN_API aclnnStatus aclnnHyperDsaFusedGrad(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                             aclrtStream stream);
 }
 #endif  // HYPER_PARALLEL_CORE_MULTICORE_OPS_HYPER_DSA_FUSED_GRAD_OP_HOST_OP_API_ACLNN_HYPER_DSA_FUSED_GRAD_H_

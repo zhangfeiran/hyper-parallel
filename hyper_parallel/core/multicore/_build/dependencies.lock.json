@@ -92,6 +92,11 @@
             "purpose": "honor the compacted valid sparse-index prefix in both gradient compute and scatter while preserving complete-cardinality fast paths"
           },
           {
+            "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_grad_query_positions.patch",
+            "sha256": "255745f1bb25e37ece63b2a25fced56ed5e5f9ea7d0ed4603e6f57c75782e4cd",
+            "purpose": "use saved explicit sequence-relative query positions in local SFA gradient compute and scatter causal bounds"
+          },
+          {
             "path": "hyper_parallel/core/multicore/ops/sparse_lightning_indexer_kl_mixed.patch",
             "sha256": "0d8917cafe896e305e2f4b2f2f78c94499279a611ae8737b4b8362c3ec81e696",
             "purpose": "extract selected KL initialization, mixed physical scratch and logical query/post phases with retained FP32 loss/key partials"
