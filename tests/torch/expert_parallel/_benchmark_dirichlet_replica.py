@@ -290,7 +290,7 @@ def _diagnose(args, layer, inputs, gradient, optimizer, alpha, seed, directory):
     prefix = directory / f"diagnostic-alpha{alpha:g}-seed{seed}"
     with torch_npu.profiler.profile(activities=[torch_npu.profiler.ProfilerActivity.CPU,
                                                 torch_npu.profiler.ProfilerActivity.NPU]) as outer:
-        with mega_kernel_profile(detailed_task_names=True) as internal, HostMeasurements() as host:
+        with mega_kernel_profile(detailed_task_names=True) as internal, HostMeasurements(prefetch_details=True) as host:
             with torch.profiler.record_function("checkpointed_moe_fwd_bwd"):
                 _step([layer], [inputs], gradient, route, optimizer)
             with torch.profiler.record_function("adamw"):

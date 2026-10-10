@@ -51,7 +51,8 @@ def _plan(output, planner, budget, cost_model):
     actual = "device" if route.device_plan is not None else "cpu"
     if actual != planner:
         raise AssertionError(f"Expected {planner}, executed {actual}")
-    return {"planner": actual, "dw_dtype": "float32", "slots": route.plan.slot_to_logical,
+    return {"planner": actual, "dw_dtype": "bfloat16" if route.home_only else "float32",
+            "execution_budget": 0 if route.home_only else budget, "slots": route.plan.slot_to_logical,
             "counts": route.plan.destination_counts, "transfers": len(route.plan.transfers),
             "score_ms": None if cost_model is None else cost_model.estimate_ms(route.plan)}
 
@@ -132,6 +133,7 @@ def _make_module(args, calibration, device, size):
                           intermediate_size=args.intermediate, num_experts=size * 6, top_k=args.top_k,
                           ep_size=size, ep_group=dist.group.WORLD, dispatch_mode=args.backend,
                           replica_slots_per_rank=args.budget, replica_transport=args.replica_transport,
+                          replica_min_rows=args.replica_min_rows, replica_target_load=args.replica_target_load,
                           replica_planner=args.replica_planner, replica_cost_model=calibration).to(
                               device=device, dtype=torch.bfloat16)
 
@@ -234,6 +236,8 @@ def main() -> None:
     parser.add_argument("--budget", type=int, default=1)
     parser.add_argument("--replica-transport", default="p2p")
     parser.add_argument("--replica-planner", choices=("cpu", "device"), default="cpu")
+    parser.add_argument("--replica-min-rows", type=int, default=1024)
+    parser.add_argument("--replica-target-load", type=int)
     parser.add_argument("--tokens", type=int, default=512)
     parser.add_argument("--hidden", type=int, default=5120)
     parser.add_argument("--intermediate", type=int, default=1792)

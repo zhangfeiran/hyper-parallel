@@ -15,10 +15,14 @@
 """Keep payload accounting separate from shared storage reservations."""
 
 import unittest
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from hyper_parallel.core.expert_parallel.hot_replica import signal_transport
+from hyper_parallel.core.multicore.modules.mega_moe import function
 from tests.common.mark_utils import arg_mark
 from tests.torch.expert_parallel.hot_replica_measurements import HostMeasurements, _payload_bytes
 
@@ -61,3 +65,34 @@ class TestReplicaMeasurements(unittest.TestCase):
         values = torch.empty(24, dtype=torch.float32)
         self.assertEqual(_payload_bytes((values[:8], values[:8], values[8:16])), 64)
         self.assertEqual(_payload_bytes(()), 0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_prefetch_observes_async_epoch_and_actual_saved_generation_reuse(self) -> None:
+        """
+        Feature: Prefetch diagnostics after saved-forward reuse
+        Description: Observe fresh and reused views through an async epoch uploader without device events.
+        Expectation: Report the provider's actual generation match and preserve upload bytes without synchronization.
+        """
+        token = object()
+        current = [None]
+        data = bytes((17, 0, 0, 1))
+
+        @contextmanager
+        def _prefetch(*_args, **_options):
+            signal_transport._async_device_bytes(data, torch.device("cpu"))
+            yield SimpleNamespace(weight_generation=current[0])
+
+        weights = (torch.empty(1), torch.empty(1))
+        with (patch.object(function, "prefetch_weights", _prefetch),
+              patch.object(torch.npu, "Event", side_effect=AssertionError("Unexpected device event")),
+              patch.object(torch.npu, "synchronize", side_effect=AssertionError("Unexpected synchronization"))):
+            with HostMeasurements(device_intervals=False, prefetch_details=True) as host:
+                for generation in (object(), token, None):
+                    current[0] = generation
+                    with function.prefetch_weights(weights, object(), backward=True, reuse_generation=token):
+                        pass
+        prefetches = [record for record in host.records if record["stage"] == "weight_prefetch_enqueue"]
+        self.assertEqual([record["weights_reused"] for record in prefetches], [False, True, False])
+        self.assertEqual(sum(record["stage"] == "prefetch_epoch_upload" for record in host.records), 3)
+        self.assertTrue(all("stream_interval_ms" not in record for record in host.records))

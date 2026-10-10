@@ -124,6 +124,10 @@ class HostMeasurements:
             context = original_prefetch(*args, **kwargs)
             with self.span("weight_prefetch_enqueue"):
                 pool = context.__enter__()
+            generation = kwargs.get("reuse_generation")
+            self.records[-1]["weights_reused"] = bool(
+                kwargs.get("backward", False) and generation is not None
+                and getattr(pool, "weight_generation", None) is generation)
             try:
                 yield pool
             finally:

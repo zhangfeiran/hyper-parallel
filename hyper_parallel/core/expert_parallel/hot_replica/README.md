@@ -612,10 +612,12 @@ Profiling 独立构造镜像；B=0 返回原有基础 runtime。
 该模式不启用 Torch/内部 profiling，不插入逐阶段设备 event，也不单独同步各区间。
 它报告 runtime 基础/镜像大小及观测到的缓存命中。
 
-预取区间还细分为池租约与清零、credit 发布/等待下发、source 连续化、epoch tensor 构造、
+预取区间还细分为池租约与清零、credit 发布/等待下发、source 连续化、epoch 异步上传、
 copy stream 分叉/汇合、权重/ready put 和 ACK。
 权重 put 记录下发的字节数，ready put 单独统计。
-这些嵌套区间仍包含前序设备排队；小 epoch tensor 的构造耗时不能解释为几个字节的传输耗时。
+预取入口的 `weights_reused` 依据返回 view 与保存的前向 generation 是否匹配，记录 provider 的实际复用。
+Dirichlet 基准的独立 `--diagnose` 调用也记录这些细分区间和 checkpoint 重计算。
+这些嵌套区间仍包含前序设备排队；epoch 上传入口耗时不能解释为几个字节的纯传输耗时。
 
 Host 区间仍可能包含已排队设备工作的提交等待，也可能嵌套，
 性能判断仍以完整步 ABBA 为准。
@@ -623,27 +625,33 @@ Host 区间仍可能包含已排队设备工作的提交等待，也可能嵌套
 
 添加 `--residency-audit`，可在正式计时结束后执行独立的权重驻留机会审计：
 两个参数独立、共享执行资源的模块先预热到稳定容量，随后运行同版本 micro-batch、
-跨层覆盖、真实 optimizer 更新和热点轮换，并按各自保存的 plan 逆序反向。
+跨层覆盖、checkpoint 重计算、真实 optimizer 更新和热点轮换，并按各自保存的 plan 逆序反向。
 
 审计仅保存调用方明确提供的诊断层身份、权重代际、专家、layout 和 heap generation。
 它按投影记录潜在命中字节及失效原因，并区分 host 已观察到完成和现有串行租约建立的有序依赖。
-所有实际权重拷贝仍执行，guest dW 仍计算并归还；这些统计不是已实现的生产缓存命中或性能收益。
+审计沿用 provider 的正常复制和保存前向复用策略，guest dW 每次仍计算并归还。
+`actual_weight_copy_bytes` 和 `actual_weight_reused_bytes` 区分实际复制与内置复用；
+`potential_additional_reuse_bytes` 仅统计仍发生复制的 shadow 命中，不重复计入已经省掉的传输。
+这些字节统计不能直接解释为完整步性能收益。
 原 benchmark 每步执行 optimizer 更新，不能把相邻步相同的专家放置直接视为有效权重驻留。
 
 例如：
 
 ```bash
 torchrun --standalone --nproc-per-node=4 tests/torch/expert_parallel/_benchmark_hot_replica.py \
-  --backend push --budget 1 --replica-transport shmem_signal_sdma_projection \
+  --backend push --budget 1 --replica-transport shmem_signal_kernel_gradient \
+  --replica-target-load 4096 --replica-min-rows 1024 \
   --host-breakdown --residency-audit --result-dir /tmp/replica-residency-audit
 ```
 
-权重驻留缓存、双方命中协议和历史放置偏好仍未实现。
+跨调用的通用权重驻留缓存、双方命中协议和历史放置偏好仍未实现。
 
 `tests/torch/expert_parallel/test_hot_replica.py` 中的四 rank 启动入口
 `test_push_static_runtime_streams` 和 `test_pull_static_runtime_streams`
 检查两个不同的保留 plan、逆序反向，
 以及前向和反向各自在两个真实 NPU stream 上复用同一个 v2 镜像。
+Projection 跨 stream 验收还检查串行租约内复用的 v4 镜像，
+保存每次消费者完成后的 suffix 快照，并核对各次调用的 epoch。
 
 它们将输出、dX、路由概率梯度和 owner 权重梯度与 FP32 native 参考比较。
 如果要覆盖纯 home v2 路径的 profiler，给 benchmark 添加
