@@ -73,7 +73,7 @@ def run_validation(report: dict) -> None:
         for empty in (False, True):
             for weight_dtype in (torch.bfloat16, torch.float32):
                 rows = () if empty else meta.q_global_ids[::2]
-                tile = replace(meta, q_global_ids=rows)
+                tile = replace(meta, q_global_ids=rows, layer=2, microbatch=3, invocation=1 + int(empty))
                 query = torch.arange(len(rows) * 64 * 128, dtype=torch.float32).reshape(len(rows), 64, 128) / 64
                 weight = torch.arange(len(rows) * 64, dtype=torch.float32).reshape(len(rows), 64) / 32
                 key = _key_partial(rank, size, empty)
@@ -88,6 +88,7 @@ def run_validation(report: dict) -> None:
                     torch.testing.assert_close(actual.cpu(), wanted, rtol=0, atol=0)
                 report["cases"].append({"empty_tile": empty, "weight_dtype": str(weight_dtype),
                                         "query_rows": len(rows), "owner_key_rows": len(meta.kv_global_ids),
+                                        "invocation_identity": [tile.layer, tile.microbatch, tile.invocation],
                                         "passed": True})
         dist.barrier()
         report.update(status="passed", case_count=len(report["cases"]), full_model_acceptance=False,

@@ -235,7 +235,7 @@ class TestDsaCpLayout(unittest.TestCase):
         partials = (torch.zeros(2, 2, 3), torch.zeros(5, 3), torch.zeros(2, 2))
         variants = (
             (partials, replace(_meta(rank=1), q_global_ids=(1, 4)), (torch.float32,) * 3),
-            (partials, replace(_meta(), layer=1), (torch.float32,) * 3),
+            (partials, replace(_meta(), heap_generation=1), (torch.float32,) * 3),
             (tuple(tensor.bfloat16() for tensor in partials), _meta(), (torch.bfloat16,) * 3),
             ((partials[0], torch.zeros(4, 3), partials[2]), _meta(), (torch.float32,) * 3),
             ((partials[0], partials[1], torch.zeros(2, 1)), _meta(), (torch.float32,) * 3),
@@ -246,6 +246,21 @@ class TestDsaCpLayout(unittest.TestCase):
             with self.subTest(meta=meta, dtypes=dtypes), self.assertRaises(ValueError):
                 layout.reduce_local_index_gradients(gradients, meta, dtypes)
         mocked.reduce_scatter_tensor.assert_not_called()
+
+    def test_local_index_delayed_invocation_keeps_prepared_owner_geometry(self):
+        """Layer/microbatch/invocation can advance without replacing the static owner permutations."""
+        mocked = self._distributed()
+        layout = DsaCpLayout(_meta(), "cpu")
+        tile = replace(_meta(), q_global_ids=(0,), layer=2, microbatch=3, invocation=9)
+        query = torch.full((1, 2, 3), 0.5)
+        key = torch.arange(15, dtype=torch.float32).reshape(5, 3)
+        weight = torch.full((1, 2), -0.25)
+        mocked.reduce_scatter_tensor.side_effect = lambda output, packed, **_: output.copy_(packed[:3])
+        returned = layout.reduce_local_index_gradients((query, key, weight), tile, (torch.float32,) * 3)
+        self.assertIs(returned[0], query)
+        self.assertIs(returned[2], weight)
+        torch.testing.assert_close(returned[1], key[[0, 2]], rtol=0, atol=0)
+        mocked.reduce_scatter_tensor.assert_called_once()
 
 
 class TestCannDsaCpReference(unittest.TestCase):

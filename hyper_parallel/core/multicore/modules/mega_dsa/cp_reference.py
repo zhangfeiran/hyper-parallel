@@ -188,7 +188,8 @@ class DsaCpLayout:
                 global packed index-K [N,Di], and local merge-weight [M,Hi].
                 FP32 is required for BF16/FP32 destinations; FP64 for FP64 oracles.
             query_meta: Prepared ownership with this tile's caller-ordered query
-                IDs. All other declarations must match this CP layout.
+                IDs. Topology, KV storage, layout ID and heap generation must
+                match this CP layout; layer/microbatch/invocation may change.
             dtypes: The three original index input dtypes, in the same order.
 
         Returns:
@@ -198,7 +199,10 @@ class DsaCpLayout:
         """
         if not isinstance(query_meta, DsaBatchMeta):
             raise TypeError("local index gradients require DsaBatchMeta")
-        if (query_meta != replace(self.batch_meta, q_global_ids=query_meta.q_global_ids)
+        prepared_tile = replace(self.batch_meta, q_global_ids=query_meta.q_global_ids,
+                                layer=query_meta.layer, microbatch=query_meta.microbatch,
+                                invocation=query_meta.invocation)
+        if (query_meta != prepared_tile
                 or not set(query_meta.q_global_ids).issubset(self.batch_meta.q_global_ids)):
             raise ValueError("local index queries must use the prepared owner layout")
         allowed = (torch.bfloat16, torch.float32, torch.float64)
