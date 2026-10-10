@@ -32,7 +32,9 @@ from hyper_parallel.core.multicore.modules.mega_dsa.cann_reference import (
     CannDsaLayout, CannDsaReference, _selected_kl_gradients,
 )
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta, DsaLossNormalization
-from hyper_parallel.core.multicore.modules.mega_dsa.mixed_kl import MixedDsaKlProbe, _submit_mixed_kl
+from hyper_parallel.core.multicore.modules.mega_dsa.mixed_kl import (
+    MixedDsaKlProbe, _submit_mixed_kl, mixed_kl_native_key_cast,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
 
 
@@ -83,7 +85,8 @@ def _case(report, heads, lengths, device, weight_dtype):
         for repeat, result in enumerate(retained):
             baseline, oracle_values, stock = fixtures[repeat][3:]
             key_partials = result.key_partials
-            torch.testing.assert_close(key_partials.bfloat16(), result.gradients[1], rtol=0, atol=0)
+            torch.testing.assert_close(mixed_kl_native_key_cast(key_partials.cpu()), result.gradients[1].cpu(),
+                                       rtol=0, atol=0)
             key_partial_oracle = _metrics(key_partials, oracle_values[1])
             if not (key_partial_oracle["relative_l2"] <= .02 or key_partial_oracle["max_abs"] <= 2e-5):
                 raise RuntimeError(f"mixed KL FP32 key partial oracle mismatch: {key_partial_oracle}")

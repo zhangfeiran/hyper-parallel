@@ -1,0 +1,47 @@
+--- a/attention/sparse_lightning_indexer_grad_kl_loss/op_kernel/arch22/sparse_lightning_indexer_grad_kl_loss_base.h
++++ b/attention/sparse_lightning_indexer_grad_kl_loss/op_kernel/arch22/sparse_lightning_indexer_grad_kl_loss_base.h
+@@ -70,2 +70,10 @@
+     __aicore__ inline void InitWorkspace(__gm__ uint8_t *workspace);
++    __aicore__ inline void SetQueryPositions(__gm__ uint8_t *positions)
++    {
++        hasQueryPositions_ = positions != nullptr;
++        if (hasQueryPositions_) {
++            queryPositionsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(positions));
++        }
++        vectorService.SetQueryPositions(positions);
++    }
+     __aicore__ inline void ProcessPhase();
+@@ -88,2 +96,4 @@
+     uint32_t logicalId_ = 0, scratchId_ = 0, logicalCount_ = 0, phase_ = 0;
++    bool hasQueryPositions_ = false;
++    GlobalTensor<int64_t> queryPositionsGm_;
+     TPipe *pipe = nullptr;
+@@ -624,2 +634,5 @@
+     runInfo.s2SparseLen = GetS2SparseLen(runInfo.s1Idx, runInfo.actS1Size, runInfo.actS2Size, constInfo.sparseMode);
++    if (hasQueryPositions_) {
++        runInfo.s2SparseLen = static_cast<int32_t>(queryPositionsGm_.GetValue(runInfo.accumS1Idx) + 1);
++    }
+     runInfo.s2RealSize = Min(topKSize, runInfo.s2SparseLen);
+--- a/attention/sparse_lightning_indexer_grad_kl_loss/op_kernel/arch22/sparse_lightning_indexer_grad_kl_loss_vector.h
++++ b/attention/sparse_lightning_indexer_grad_kl_loss/op_kernel/arch22/sparse_lightning_indexer_grad_kl_loss_vector.h
+@@ -57,2 +57,9 @@
+     __aicore__ inline void InitBuffers(TPipe *pipe);
++    __aicore__ inline void SetQueryPositions(__gm__ uint8_t *positions)
++    {
++        hasQueryPositions_ = positions != nullptr;
++        if (hasQueryPositions_) {
++            queryPositionsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(positions));
++        }
++    }
+     __aicore__ inline void AllocEventID();
+@@ -131,2 +138,4 @@
+     // global tensor
++    bool hasQueryPositions_ = false;
++    GlobalTensor<int64_t> queryPositionsGm_;
+     GlobalTensor<KV_T> keyGm;
+@@ -767,2 +776,5 @@
+     runInfo.s2SparseLen = GetS2SparseLen(runInfo.s1Idx, runInfo.actS1Size, runInfo.actS2Size, constInfo.sparseMode);
++    if (hasQueryPositions_) {
++        runInfo.s2SparseLen = static_cast<int32_t>(queryPositionsGm_.GetValue(runInfo.accumS1Idx) + 1);
++    }
+     runInfo.s2RealSize = Min(topKSize, runInfo.s2SparseLen);

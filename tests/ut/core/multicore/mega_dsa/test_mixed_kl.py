@@ -118,6 +118,26 @@ class TestKlFp32KeyExport(unittest.TestCase):
                 gc.collect()
                 torch.testing.assert_close(partials, expected, rtol=0, atol=0)
 
+    def test_native_post_conversion_uses_round_away_at_exact_bf16_midpoints(self):
+        """CAST_ROUND midpoint conversion differs from Torch ties-even without losing FP32 partials."""
+        bits = torch.tensor([0x3F808000, 0x3F818000, 0xBF808000, 0xBF818000,
+                             0x00000000, 0x80000000, 0x3F807FFF, 0x3F808001,
+                             0xB8108000, 0xB7208000], dtype=torch.int64).to(torch.int32)
+        partials = bits.view(torch.float32)
+        expected = torch.tensor([0x3F81, 0x3F82, 0xBF81, 0xBF82, 0, 0x8000,
+                                 0x3F80, 0x3F81, 0xB811, 0xB721], dtype=torch.int64).to(torch.int16)
+        actual = mixed_kl.mixed_kl_native_key_cast(partials)
+        torch.testing.assert_close(actual.view(torch.int16), expected, rtol=0, atol=0)
+        self.assertFalse(torch.equal(actual.view(torch.int16), partials.bfloat16().view(torch.int16)))
+        torch.testing.assert_close(partials.view(torch.int32), bits, rtol=0, atol=0)
+
+    def test_native_post_conversion_rejects_nonfinite_and_non_fp32_snapshots(self):
+        """Conversion evidence requires finite FP32 values and cannot silently reinterpret another dtype."""
+        for partials in (torch.ones(2, dtype=torch.float64), torch.ones(2, dtype=torch.bfloat16),
+                         torch.tensor([float("nan")]), torch.tensor([float("inf")])):
+            with self.subTest(dtype=partials.dtype), self.assertRaises(ValueError):
+                mixed_kl.mixed_kl_native_key_cast(partials)
+
     def test_wrong_geometry_dtype_and_unaligned_storage_reject(self):
         """Wrong head counts and byte views cannot silently decode another scratch region."""
         required = mixed_kl.mixed_kl_workspace_bytes(2, 64)

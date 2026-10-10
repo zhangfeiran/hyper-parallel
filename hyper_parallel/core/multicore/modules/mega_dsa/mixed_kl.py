@@ -63,6 +63,23 @@ def mixed_kl_key_partials(retained: torch.Tensor, *, tokens: int, heads: int) ->
     return retained[required - key_bytes:required].view(torch.float32).reshape(tokens, 128)
 
 
+def mixed_kl_native_key_cast(partials: torch.Tensor) -> torch.Tensor:
+    """Decode the locked post kernel's CAST_ROUND conversion on a completed CPU FP32 snapshot.
+
+    Native midpoint rounding is away from zero. Torch's ordinary BF16 cast uses
+    ties to even, so it cannot establish bit-exact post-phase conversion at a
+    midpoint. This verification-only helper neither changes the native math nor
+    replaces the training bridge's FP32 owner sum and final destination cast.
+    """
+    if partials.device.type != "cpu" or partials.dtype != torch.float32:
+        raise ValueError("native KL conversion reference requires an explicit CPU FP32 snapshot")
+    if not bool(torch.isfinite(partials).all()):
+        raise ValueError("native KL conversion reference requires finite FP32 partials")
+    words = partials.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    rounded = ((words + 0x8000) >> 16).to(torch.int16)
+    return rounded.view(torch.bfloat16)
+
+
 @dataclass(frozen=True)
 class MixedKlResult:
     """Owned raw index derivatives and unnormalized KL, plus explicit phase evidence."""

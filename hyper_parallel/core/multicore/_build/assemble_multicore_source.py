@@ -236,11 +236,13 @@ def _compose_hyper_parallel_ops(
     _compose_mixed_indexer(source_root, transformer_copy)
     _compose_mixed_grad(source_root, transformer_copy)
     _compose_mixed_kl(source_root, transformer_copy)
+    _compose_mixed_kl(source_root, transformer_copy, operator="hyper_dsa_local_mixed_kl")
     _compose_fused_forward(source_root, transformer_copy)
     _compose_fused_training(source_root, transformer_copy)
     _compose_fused_grad(source_root, transformer_copy)
     _compose_cp_attention(source_root, transformer_copy)
     for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad", "hyper_dsa_mixed_kl",
+                 "hyper_dsa_local_mixed_kl",
                  "hyper_dsa_fused_forward", "hyper_dsa_fused_training", "hyper_dsa_fused_grad",
                  "hyper_dsa_cp_attention"):
         runtime = source_root / name / "op_kernel" / "runtime"
@@ -290,10 +292,11 @@ def _compose_mixed_grad(source_root: Path, transformer_copy: Path) -> None:
     shutil.copytree(upstream / "basic_modules", mixed_root / "basic_modules")
 
 
-def _compose_mixed_kl(source_root: Path, transformer_copy: Path) -> None:
+def _compose_mixed_kl(source_root: Path, transformer_copy: Path, *,
+                      operator: str = "hyper_dsa_mixed_kl") -> None:
     """Export the pinned selected-KL closure with separated retained-workspace phases."""
-    root = source_root / "hyper_dsa_mixed_kl"
-    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_mixed_kl", root)
+    root = source_root / operator
+    shutil.copytree(_MULTICORE_OPS / operator, root)
     shutil.copytree(transformer_copy / "common" / "include" / "err", root / "op_host" / "err")
     (root / "op_host" / "op_host").mkdir()
     for name in ("tiling_base.h", "tiling_type.h", "tiling_templates_registry.h"):
@@ -400,6 +403,7 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "hyper_mega_moe_grad.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
         source_root / "hyper_dsa_mixed_kl" / "op_kernel" / "hyper_dsa_mixed_kl.cpp",
+        source_root / "hyper_dsa_local_mixed_kl" / "op_kernel" / "hyper_dsa_local_mixed_kl.cpp",
         source_root / "hyper_dsa_fused_forward" / "op_kernel" / "hyper_dsa_fused_forward.cpp",
         source_root / "hyper_dsa_fused_training" / "op_kernel" / "hyper_dsa_fused_training.cpp",
         source_root / "hyper_dsa_fused_grad" / "op_kernel" / "hyper_dsa_fused_grad.cpp",

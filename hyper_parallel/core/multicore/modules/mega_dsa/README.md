@@ -1961,8 +1961,8 @@ upstream scale、`loss_coeff=0`、KL-only 和 freeze-main。比较全部主输�
 真实 HCCL 的 FP32 K owner sum、BF16/FP32 目标 dtype、caller/owner 排列及空 rank 的集体参与。
 CP1/CP2/CP4 的七个 rank 共通过 28 个场景、84 个字段的位精确比较，source SHA256 与冻结
 清单一致。相关 CPU 回归通过 65 tests、59 subtests，新增代码通过 pylint 和 launcher import 检查。
-本节实现的是 local KL 的归还基础及数学契约；local KL kernel producer 和完整 local LM+KL
-autograd 仍需接通，不能将这些检查作为完整训练或模型数值验收。
+本节实现的是 local KL 的归还基础及数学契约；raw local KL producer 与 local LM+KL autograd
+见后续章节，不能将这些接口检查作为完整训练或模型数值验收。
 
 ## KL 的 FP32 index-K partial 导出
 
@@ -1976,7 +1976,129 @@ stream 的事件，保存不受后续 workspace 修改影响的梯度时需 clon
 主 backward 的 Native ABI 和已冻结载荷均未改动。
 
 设备验证覆盖 H32/H64、BF16/FP32 merge weight、groups=1/2/7/19 和三次独立调用，共 48 个
-场景、79872 个 key 元素。FP32 view 共享 retained 存储，转换回 BF16 后与 Native 输出位精确
-一致，原 native/stock 及独立 oracle 检查均通过。CPU 所有权/准入检查和相关回归通过。
-当前仍是完整 query 的 standalone KL；local query 的显式 causal position 和完整 LM+KL
-autograd 接入尚未完成。
+场景、79872 个 key 元素。FP32 view 共享 retained 存储，该轮普通 Torch BF16 转换与 Native 输出
+位精确一致，原 native/stock 及独立 oracle 检查均通过。后续 local-query 完整矩阵发现精确中点
+不能用普通 Torch 转换验证：锁定 post kernel 使用 `RoundMode::CAST_ROUND`，中点向远离零的
+方向舍入，而 Torch CPU/NPU 转换使用 ties-to-even。验证器通过
+`mixed_kl_native_key_cast()` 对完成的 CPU FP32 快照解码 Native 转换；不改变 Native 算术或
+训练 bridge 的 owner 求和及目标 dtype 转换。两个设备快照共 3328 个元素与该位参考完全一致，
+包括原来普通 Torch 转换失败的两个负数精确中点。CPU 检查另覆盖正负中点、相邻位模式和 signed zero。
+上述设备证据覆盖完整 query 的 standalone KL；local query producer 具有独立的验收入口，
+local LM+KL autograd 的接口与 CPU 证据见后续章节，设备验收尚未完成。
+
+## 实际 local-query 的 raw Native KL
+
+`local_kl_gradients(forward)` 消费 `forward_local()` 产生的 invocation-owned saved state。
+Main teacher 的 Q/c/RoPE 保持 detached；输入必须保留 forward 的 ownership、geometry、
+index Tensor version 和冷准备 query layout。保存状态或静态位置被修改时，在提交 Native 前拒绝。
+该接口不执行 Q/weight collective，也不从 backend 的最新 query tile 推导旧调用的位置。
+
+新增 `HyperDsaLocalMixedKl` / `dsa_local_mixed_kl_out` 使用实际 local query 数、各 packed sequence
+的真实累计 query 数，以及显式 sequence-relative query positions。没有 query 的 sequence 可以
+重复累计数。锁定 KL kernel 的 compute 和 vector/scatter 均使用同一位置计算 causal prefix，
+避免用 right-down 的 `L-M+i` 接纳 compact Top-K 后面的 `-1` slots。全 query ABI 保持独立。
+
+`LocalKlResult` 持有每次调用独立的三阶段 trace、retained workspace、raw KL sum 和 index
+derivatives。Q/merge-weight 梯度恢复 caller-local 顺序；K 输出及 FP32 partials 保持完整 global
+packed 顺序。Retained 容量按全局 K 数分配，FP32 K 直接读取 native scatter-add plane。空 tile
+不提交 KL arithmetic，返回真实零行 Q/weight 和独立的完整 FP32 零 K contribution；后续训练
+bridge 仍须让空 rank 参与 owner reduction。Raw producer 不乘 loss coefficient、normalization
+或 downstream cotangent。
+
+CPU 准入、行序与所有权检查位于
+[test_local_kl.py](../../../../../tests/ut/core/multicore/mega_dsa/test_local_kl.py)。设备入口为
+[mega_dsa_local_kl_validate.py](../../examples/mega_dsa_local_kl_validate.py)，CP1/CP2/CP4 launcher
+为 [test_mega_dsa_local_kl.py](../../../../../tests/torch/multicore/test_mega_dsa_local_kl.py)。设备检查
+将 local subset 与独立 FP32 selected-KL oracle 及零化其他 query contribution 的全 query Native
+baseline 比较，同时检查转换前 FP32 K、三阶段闭包、重复调用、空 tile 和重复累计 query 数。
+
+当前完整 native 构建与 megaDSA CPU 回归已通过；raw local KL 的 CP1/CP2/CP4 完整矩阵通过
+七个 rank 的 2016 个场景，每 rank 288 个。覆盖 H32/H64、BF16/FP32 merge weight、groups=1/7/19、
+contiguous/strided/empty ownership、owner/interior/first-sequence/empty query tiles，以及保留两次
+forward 后的独立校验。运行时加载的库、冻结载荷的 87 个文件及提交验收前的验证源码 SHA
+均已核对。上述短 packed `(3,10)` 矩阵不建立长上下文或完整训练正确性。
+该 producer 已接入下述 local LM+KL autograd，尚未合并至 forward 的单 kernel task graph。稀疏梯度归还、
+长上下文、模型验收和 full-step 性能/HBM 证据仍需独立完成。
+
+## Local LM+KL 的 first-order 训练桥
+
+`FusedDsaLocalCpTrainingProbe` 在冷准备阶段集体声明 `mode`、`loss_coeff` 和
+`DsaLossNormalization`，拒绝不同 CP member 的 objective 契约不一致。支持 `lm_only`、
+`kl_only` 和 `lm_plus_kl`。调用 `forward(invocation, main_states, index_states,
+query_layout=...)` 返回 caller-ordered compressed output 与本 tile 的辅助 loss contribution。
+Query layout 必须显式捕获，后续 tile 的准备不能改变 checkpoint replay 的行序或位置。
+
+辅助分支在 forward 保存 `loss_coeff * normalization.local_sum_scale` 缩放后的三组独立
+FP32 derivatives；K 取自 raw producer 的转换前 plane。Backward 乘一次 `grad_loss`，仅将
+完整 global-packed K contribution 归还 owner，求和后转回原 dtype。分母始终是全局有效 query
+数，后续复制参数的 sum/average reducer 由声明的 `reducer_divisor` 补偿，无额外 CP 除法。
+Main 分支使用已有 local Native backward，KL teacher 与 hard selection 不进入 main VJP。
+调用者在 index projection 前 detach hidden，以阻断 auxiliary 对共享 hidden 输入的梯度。
+
+对于 `lm_plus_kl`，某 rank 的 main 或 auxiliary cotangent 缺失时，以本地零贡献参与对应的
+owner return，仍可接收其他 rank 对 owner-local K/C/RoPE 的贡献。模式由所有 rank 冷声明；
+`lm_only` 不计算 KL，`kl_only` 不提交 main backward。共同声明的 `loss_coeff=0` 跳过 KL
+arithmetic、完整 FP32 auxiliary scratch 和 index-K exchange，返回 index 输入的零梯度。
+
+七个原始输入、八个 Native saved activations 和三个缩放后的 KL derivatives 全部通过
+`save_for_backward` 保存，支持 saved-tensor hooks、retained backward 与 non-reentrant
+checkpoint；拒绝原输入/位置/geometry 修改以及 higher-order backward。后续调用无法覆盖
+旧调用已保存的 K contribution。每个 rank 必须进入相同模式的 forward/backward 调用序列，
+包括空 owner，并使用兼容的 requires-grad 策略。
+
+[训练桥 CPU 检查](../../../../../tests/ut/core/multicore/mega_dsa/test_local_training.py) 覆盖三种
+mode、BF16/FP32 merge weight、sum/average normalization、负 aux upstream、零 coefficient、
+空 query、缺失本地 cotangent 时的远端 owner contribution、retained backward、checkpoint、
+准入和版本保护。新增桥接后，全套 megaDSA CPU 回归通过 227 tests、514 subtests。
+上述证据证明 Python 梯度桥的调用、生命周期与缩放契约；raw local KL、完整 LM+KL 的
+完整 CP1/CP2/CP4 Native 数值和模型验证仍需完成，不构成训练性能或单 kernel 融合的验收。
+
+## Local training 的 projection VJP 验收
+
+[mega_dsa_local_training_validate.py](../../examples/mega_dsa_local_training_validate.py) 将真实
+local training bridge 接至七个输入投影与 output projection。检查 shared hidden 和全部八个
+projection 参数的梯度，并按声明的 sum/average reducer 归并 CP contribution。矩阵包括三种
+mode、零 coefficient、负 upstream、query subset/empty owner、retained backward 和 checkpoint。
+框架无关的 [CP launcher](../../../../../tests/torch/multicore/test_mega_dsa_local_training.py) 提供
+CP1/CP2/CP4 入口。
+
+[FP64 oracle](../../examples/mega_dsa_local_training_oracle.py) 固定 Native activation 与 compressed
+output 的数值，独立求 linear projection、selected SFA/KL 的 Jacobian；这些固定值不替换
+对应导数。此契约验证梯度桥和 projection VJP 的组合，不测 BF16 projection/output 的 forward
+composition 误差，因此设备报告继续设置 `full_model_acceptance=False`。
+
+在候选运行前冻结 pointwise `rtol=.02, atol=2e-5` 与非零 oracle 的 `relative_l2<=.02`，
+要求二者同时通过。零 oracle 使用独立绝对规则；非有限值、缺失梯度及不应存在的梯度均拒绝。
+[闭式 chain-rule CPU 检查](../../../../../tests/ut/core/multicore/mega_dsa/test_local_training_projection_oracle.py)
+覆盖每个参数、hidden detach、padding、全局 normalization 和小非零梯度被绝对容差掩盖的反例。
+全套 megaDSA CPU 回归通过 238 tests、540 subtests。
+
+首轮 H32/FP32 weight、strided CP1/CP2/CP4、LM+KL smoke 均在第一场景未通过严格 pointwise gate：hidden
+relative L2 为 `0.0012694554419907047`、max abs 为 `5.795180502238782e-05`；index-K projection
+relative L2 为 `0.0019266434951632776`、max abs 为 `6.58863912048023e-05`。其余已比较字段通过，
+失败报告保留。较小的整体 relative L2 不清除逐点失败，不能以该场景作为完整训练或模型通过证据。
+
+CP1 的实际 activation 梯度与转换前 owner FP32 快照进一步分解了该失败。Hidden projection
+矩阵乘的 max abs 误差为 `1.0158698472706451e-08`，最终 BF16 转换贡献的 max abs 为
+`3.854824412469031e-05`，转换前 Native 误差的 max abs 为 `3.9305716180389194e-05`；
+使用转换前梯度的闭式诊断对照通过逐点门槛。Index-K projection 矩阵乘误差为
+`2.137980459337996e-09`，转换贡献为 `5.8836731359708516e-05`，转换前 Native 误差为
+`3.866686460949568e-05`；转换前诊断对照仍未通过逐点门槛。这些诊断没有替换训练梯度，也
+没有放宽门槛；仍需区分锁定基线误差与训练桥新增误差。
+
+原始 raw KL 全矩阵的 CP1 曾在 217 个通过场景后被上述舍入校验假设拒绝。CP2/CP4 的原始
+运行出现 HCCL collective 序列不一致：部分 rank 进入验证失败后的 close，其他 rank 继续
+下一调用的冷准备。验证控制现通过
+[collective_validation_check](../../examples/mega_dsa_validation_control.py) 汇总 rank-local
+检查异常，在下一次 Native 调用或集体 teardown 前让全部 member 得到同一失败判定。该机制
+只处理本地验证异常；HCCL 自身故障仍由 launcher/process group 恢复。原失败日志保留，
+使用修正后的转换校验与异常同步重新执行完整 CP1/CP2/CP4 矩阵并通过。
+
+同一 CP1 activation/output 快照另在完整 query 的 stock CANN SFA/KL 与原 mixed KL 路径上
+执行诊断。Stock SFA forward 与捕获的 output 位精确一致；mixed KL 三组原始梯度与 stock
+位精确一致，loss 最大差为 `1.1920928955078125e-07`。Local bridge 的 index-K owner FP32
+与完整 query 的转换前梯度最大差为 `3.725290298461914e-09`；index-K projection 参数梯度
+与该完整 query 基线的最大差为 `2.137980459337996e-09`。完整 query 基线对 FP64 的 index-K
+projection 逐点检查同样失败，因此本快照的失败可在独立于 local bridge 的路径上复现。
+Main hidden 的 stock 对照将 K/V 各自转换 BF16 后相加，与 bridge 的 FP32 合并后一次转换
+存在不同的舍入边界；其逐点比较仍失败，不能据此证明两种 main VJP 契约等价。

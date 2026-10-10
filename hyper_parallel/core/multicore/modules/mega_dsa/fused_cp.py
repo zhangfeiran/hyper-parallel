@@ -123,6 +123,7 @@ class FusedCpForwardResult:
     kl_loss: torch.Tensor | None = None
     selected_requests: tuple[torch.Tensor, ...] = ()
     _runtime_buffers: tuple[torch.Tensor, ...] = field(default=(), repr=False, compare=False)
+    index_versions: tuple[int, ...] = field(default=(), repr=False, compare=False)
 
 
 class FusedDsaCpForwardProbe:
@@ -279,7 +280,9 @@ class FusedDsaCpForwardProbe:
                                         tuple(trace.unbind()), transport_trace, epoch, saved,
                                         (packed[0], keys[0][:, 0], packed[3]),
                                         selected_requests=(table, counts, membership),
-                                        _runtime_buffers=(metadata, retained))
+                                        _runtime_buffers=(metadata, retained),
+                                        index_versions=tuple(tensor._version for tensor in
+                                                             (packed[0], keys[0][:, 0], packed[3])))
         starts = (local.global_ids_tensor - local.positions).to(torch.int32)[:, None, None]
         global_indices = torch.where(indices >= 0, indices + starts, -1)
         restore = local.restore_order
@@ -288,7 +291,9 @@ class FusedDsaCpForwardProbe:
                                     tuple(trace.unbind()), transport_trace, epoch, saved,
                                     (packed[0], keys[0][:, 0], packed[3]),
                                     selected_requests=(table, counts, membership),
-                                    _runtime_buffers=(metadata, retained))
+                                    _runtime_buffers=(metadata, retained),
+                                    index_versions=tuple(tensor._version for tensor in
+                                                         (packed[0], keys[0][:, 0], packed[3])))
 
     def _metadata(self, invocation: DsaWorkspaceInvocation, epoch: int) -> torch.Tensor:
         meta = invocation.batch_meta
