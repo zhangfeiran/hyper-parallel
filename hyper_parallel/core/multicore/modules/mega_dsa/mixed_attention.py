@@ -60,6 +60,44 @@ def local_sfa_grad_workspace_bytes(query_tokens: int, key_tokens: int, heads: in
     return min(query_tokens, 20) * scratch_per_core + gradients + scatter
 
 
+def mixed_sfa_gradient_partials(retained: torch.Tensor, *, query_tokens: int,
+                                key_tokens: int, heads: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """View locked arch22 TND dK/RoPE and dV FP32 accumulators before post conversion.
+
+    This decoder is for the complete-query mixed reference, whose locked tiler
+    lays out per-logical-core scratch, aligned dQ, aligned dK/RoPE and dV in
+    that order. It does not accept the special empty-query CP layout. Views
+    retain storage ownership; callers must wait for the producer stream before
+    reading, and clone before reusing scratch. No host synchronization occurs.
+
+    Args:
+        retained: Producer-owned contiguous uint8 workspace, or a completed
+            snapshot retaining every byte through the end of the dV plane.
+        query_tokens: Actual positive query count used by the producer.
+        key_tokens: Complete positive key count used by the producer.
+        heads: Producer main head count, 32 or 64.
+
+    Returns:
+        FP32 views with shapes ``[key_tokens, 576]`` and ``[key_tokens, 512]``.
+        The first view includes key RoPE in its last 64 columns.
+    """
+    local_sfa_grad_workspace_bytes(query_tokens, key_tokens, heads)
+    if query_tokens == 0:
+        raise ValueError("mixed reference partials require a positive query count")
+    if (retained.dtype != torch.uint8 or retained.ndim != 1 or not retained.is_contiguous()
+            or retained.storage_offset() % 4):
+        raise ValueError("mixed reference partials require an aligned contiguous uint8 workspace")
+    scratch_per_core = 128 * 576 * 2 * 4 + 128 * 512 * 2 * 2 + heads * 128 * 4 * 2 * 4
+    key_offset = (min(query_tokens, 20) * scratch_per_core
+                  + (query_tokens * heads * 576 * 4 + 511) // 512 * 512)
+    value_offset = key_offset + (key_tokens * 576 * 4 + 511) // 512 * 512
+    if retained.numel() < value_offset + key_tokens * 512 * 4:
+        raise ValueError("mixed reference workspace does not contain complete FP32 key/value planes")
+    key = retained.narrow(0, key_offset, key_tokens * 576 * 4).view(torch.float32).view(key_tokens, 576)
+    value = retained.narrow(0, value_offset, key_tokens * 512 * 4).view(torch.float32).view(key_tokens, 512)
+    return key, value
+
+
 def _ensure_native() -> None:
     _load_native()
     versions = (torch.ops.hyper_parallel.dsa_mixed_tile_version(), torch.ops.hyper_parallel.dsa_mixed_grad_version())

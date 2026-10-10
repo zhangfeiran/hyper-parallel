@@ -149,3 +149,46 @@ class TestLocalGradientWorkspace(unittest.TestCase):
                 mixed_attention.local_sfa_grad_workspace_bytes(queries, keys, heads)
         with self.assertRaises(ValueError):
             mixed_attention.mixed_sfa_grad_workspace_bytes(0, 32)
+
+
+class TestMixedReferencePartials(unittest.TestCase):
+    """Decode independent reference storage without recovering FP32 from rounded BF16."""
+
+    def test_pinned_offsets_alias_and_survive_owner_deletion(self):
+        """Pinned tiler offsets cover one core, aligned key padding and the twenty-core cap."""
+        cases = ((1, 1, 32, 1056768, 1059328),
+                 (13, 13, 32, 13737984, 13768192),
+                 (21, 21, 64, 25378816, 25427456))
+        for queries, keys, heads, key_offset, value_offset in cases:
+            with self.subTest(queries=queries, keys=keys, heads=heads):
+                arena = torch.zeros(value_offset + keys*512*4, dtype=torch.uint8)
+                arena[key_offset:key_offset + keys*576*4].view(torch.float32).fill_(1.003)
+                arena[value_offset:value_offset + keys*512*4].view(torch.float32).fill_(-.007)
+                key, value = mixed_attention.mixed_sfa_gradient_partials(
+                    arena, query_tokens=queries, key_tokens=keys, heads=heads)
+                self.assertEqual(key.shape, (keys, 576))
+                self.assertEqual(value.shape, (keys, 512))
+                self.assertEqual(key.untyped_storage().data_ptr(), arena.untyped_storage().data_ptr())
+                self.assertEqual(value.untyped_storage().data_ptr(), arena.untyped_storage().data_ptr())
+                self.assertEqual(key.storage_offset()*4, key_offset)
+                self.assertEqual(value.storage_offset()*4, value_offset)
+                del arena
+                torch.testing.assert_close(key, torch.full_like(key, 1.003), rtol=0, atol=0)
+                torch.testing.assert_close(value, torch.full_like(value, -.007), rtol=0, atol=0)
+                self.assertFalse(torch.equal(key, key.bfloat16().float()))
+
+    def test_rejects_empty_geometry_truncated_and_misaligned_storage(self):
+        """Wrong dtype, rank, alignment and incomplete buffers cannot expose a plausible plane."""
+        cases = ((torch.empty(8, dtype=torch.uint8), 0, 1, 32),
+                 (torch.empty(8, dtype=torch.uint8), 1, 0, 32),
+                 (torch.empty(8, dtype=torch.uint8), 1, 1, 8),
+                 (torch.empty(8, dtype=torch.float32), 1, 1, 32),
+                 (torch.empty((2, 4), dtype=torch.uint8), 1, 1, 32),
+                 (torch.empty(8, dtype=torch.uint8)[1:], 1, 1, 32),
+                 (torch.empty(8, dtype=torch.uint8)[::2], 1, 1, 32),
+                 (torch.empty(8, dtype=torch.uint8), 1, 1, 32))
+        for retained, queries, keys, heads in cases:
+            with self.subTest(shape=retained.shape, dtype=retained.dtype, queries=queries, keys=keys, heads=heads):
+                with self.assertRaises(ValueError):
+                    mixed_attention.mixed_sfa_gradient_partials(
+                        retained, query_tokens=queries, key_tokens=keys, heads=heads)

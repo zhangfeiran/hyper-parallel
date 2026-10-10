@@ -2100,5 +2100,69 @@ CP1 的实际 activation 梯度与转换前 owner FP32 快照进一步分解了�
 与完整 query 的转换前梯度最大差为 `3.725290298461914e-09`；index-K projection 参数梯度
 与该完整 query 基线的最大差为 `2.137980459337996e-09`。完整 query 基线对 FP64 的 index-K
 projection 逐点检查同样失败，因此本快照的失败可在独立于 local bridge 的路径上复现。
-Main hidden 的 stock 对照将 K/V 各自转换 BF16 后相加，与 bridge 的 FP32 合并后一次转换
-存在不同的舍入边界；其逐点比较仍失败，不能据此证明两种 main VJP 契约等价。
+Main hidden 的首轮 stock 对照将 K/V 各自转换 BF16 后相加，与 bridge 的 FP32 合并后一次
+转换存在不同的舍入边界，不能据此证明两种 main VJP 契约等价。
+
+进一步通过 `mixed_sfa_gradient_partials()` 解码独立完整 query mixed SFA reference 的转换前
+FP32 dK/RoPE `[N,576]` 与 dV `[N,512]`。Decoder 按锁定 arch22 TND tiler 的每逻辑核
+scratch、512-byte 对齐 dQ、dK 和 dV 顺序确定 offset；拒绝空 query、错误 geometry、dtype、
+非连续/未对齐及截断存储。View 保持 retained workspace 的生命周期，消费前需遵守 producer
+stream 完成顺序；不能从 BF16 输出回转来构造该 reference。
+
+上述 CP1 快照使用 reference 的 FP32 dK+dV 合并和一次 BF16 转换后，bridge hidden 参数链的
+最大差为 `1.0158698472706451e-08`；转换前 compressed owner 最大差为
+`1.3969838619232178e-09`，key-RoPE owner 最大差为 `7.275957614183426e-12`。此独立
+reference 的 hidden 与 index-K projection 对原 FP64 逐点门槛同样失败。该证据覆盖本次
+同状态短序列诊断，不替代其他形状、CP topology 或完整模型的数值验收。
+
+## 独立 projection reference 校准
+
+[mega_dsa_projection_reference_calibrate.py](../../examples/mega_dsa_projection_reference_calibrate.py)
+按实现计划的 reference-to-reference 口径，在采样前冻结 16 个拟合 seed、8 个独立 held-out
+seed、normalized margin=2、cosine margin=4 和 zero-oracle `atol=2e-5`。数据来自完整 query
+stock LI/SFA、独立 mixed SFA/KL 原语及固定 Native 数值的 FP64 projection oracle；不调用
+local training bridge，候选 CP 数值不进入拟合或 held-out 验证。
+
+校准范围为 packed `(3,10)`、H32/H64、BF16/FP32 merge weight、完整 global query、
+`lm_only`/`kl_only`/`lm_plus_kl`、coefficient `.3` 和 auxiliary upstream `-2.5`。每 fixture
+重复两次，main 采用转换前 FP32 dK+dV 合并后一次 BF16 转换，index-K 采用 FP32 scale、
+upstream 后一次转换。Reference 保留原 pointwise 检查的每个结果，独立计算 relative L2、
+cosine 和 RMS-scaled max abs envelope；held-out 数据不能扩大拟合出的预算。
+
+两个独立非 deterministic backward 的原始梯度采用固定 `rtol=.02, atol=2e-5` 且
+`relative_l2<=.02` 的数值一致性检查；同次调用的 FP32 plane→Native post 输出则使用字节级
+校验，包含 signed zero。校准入口输出 policy SHA、完整样本、各字段预算、held-out 判定和
+运行库 SHA，失败仍保存报告。该独立校准完成 576 份样本、12 个 H/weight/mode 组合，所有
+held-out 字段均通过预先冻结的 envelope；原 pointwise 检查仍记录 360 个未通过字段。
+
+Local training validator 可显式传入 `--reference-profile` 与独立冻结的
+`--profile-policy-sha256`。CPU-only 的
+[profile 准入](projection_precision.py) 重算全部拟合预算及 held-out 判定，核对完整
+seed/repeat/field 覆盖、policy、Torch 版本和运行库 SHA，拒绝候选数据、缺失/重复样本、
+预算改写或 held-out 失败。调用方另外检查完整 global query 覆盖、默认投影 geometry 和
+已校准 objective；不覆盖的 subset/shape/objective 直接拒绝，不能静默套用预算。
+
+显式 profile 模式报告 `calibrated_reference`，并独立保留 `independent_fp64_vjp` 与
+`original_pointwise_passed`。未提供 profile 时继续使用原逐点门槛。Profile 的通过不能清除
+原逐点失败，或完整模型与 BF16 forward composition 的未通过状态。
+
+[完整 owner 矩阵入口](../../examples/mega_dsa_local_training_profile_validate.py) 覆盖 H32/H64、
+BF16/FP32 weight、contiguous/strided/zigzag/empty ownership、三种 mode、sum/average reducer、
+plain/retain_graph/checkpoint。各 rank 的 query 合集必须仍是完整 global query；subset 与其他
+objective 不进入此 profile 的支持范围。
+
+首轮 CP4 owner 矩阵在每 rank 210 个通过步骤后，H64/BF16、empty ownership 的 LM+KL 场景
+触发 coupled objective envelope：误差 `2.135412876386189e-08`，相消后的目标值约
+`0.003913455709050252`，normalized error 超过该字段预算；全部梯度字段均通过。原失败记录
+保留。合成 scalar loss 的检查进一步使用独立 LM objective、KL loss 的 reference 预算，并
+通过 triangle inequality 传播误差，加上两次 FP32 乘加与有序 peer 求和的 analytical gamma
+bound。推断的 main component 和 auxiliary component 必须各自通过对应误差界；梯度预算
+不变。报告同时保留原 coupled normalized 判定与 component bound，不能将该 scalar 规则用于
+近零参数梯度。CPU 检查覆盖相消变号、component corruption、非有限值及预算保持不变。
+
+上述完整 owner 矩阵随后在 CP1/CP2/CP4 全部通过：CP1 每 rank 144 步，CP2/CP4 每 rank
+288 步，七个 rank 合计 1872 步。固定 reference profile、consumption policy、采样/候选源码和
+运行库 SHA 均已核对，使用同一份未激活的冻结 Native 载荷。全套 CPU 回归通过 246 tests、
+567 subtests；profile 准入、库身份、scalar cancellation 与反例检查通过。原 pointwise 失败和
+首轮 scalar envelope 失败仍保留；这些结果只接受已声明的短序列 fixed-Native-value VJP
+契约，不清除 subset、零 coefficient、长上下文、完整 BF16 模型或 F+B+SGD 的待验收范围。

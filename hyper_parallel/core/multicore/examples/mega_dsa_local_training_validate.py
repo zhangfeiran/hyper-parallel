@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import traceback
@@ -41,6 +42,10 @@ from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import FusedDsaCpFo
 from hyper_parallel.core.multicore.modules.mega_dsa.local_training import FusedDsaLocalCpTrainingProbe
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta, DsaLossNormalization
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
+from hyper_parallel.core.multicore.modules.mega_dsa.projection_precision import (
+    coupled_projection_objective_check, validate_loaded_projection_reference, validate_projection_reference_profile,
+)
+from hyper_parallel.core.multicore.modules.mega_dsa.reference_precision import reference_budget_passes
 from hyper_parallel.core.multicore.modules.mega_dsa.workspace import DsaWorkspaceSpec, MegaDsaWorkspace
 from hyper_parallel.core.multicore.shmem.consumer import SharedShmemRoot
 
@@ -60,7 +65,7 @@ def _snapshots(meta, states, result, output, gradients, objective, loss):
     return peers
 
 
-def _check(peers, cpu_fixture, geometry, lengths, mode, coefficient, auxiliary, divisor):
+def _check(peers, cpu_fixture, geometry, lengths, mode, coefficient, auxiliary, divisor, *, precision_budgets=None):
     total = sum(lengths)
     hidden, weights, targets = cpu_fixture
     states = tuple(torch.zeros((total, *tail), dtype=peers[0]["states"][field].dtype)
@@ -111,13 +116,44 @@ def _check(peers, cpu_fixture, geometry, lengths, mode, coefficient, auxiliary, 
             metrics[name] = metric
     passed = all(metric.get("passed", metric.get("absent", False))
                  and metric.get("disabled_aux_exact_zero", True) for metric in metrics.values())
-    return {"passed": passed, "independent_fp64_vjp": metrics, "query_rows": len(contributing),
+    calibrated = None
+    if precision_budgets is not None:
+        if (sorted(contributing) != list(range(total)) or tuple(lengths) != (3, 10)
+                or geometry != ProjectionGeometry(heads=geometry.heads) or coefficient != .3 or auxiliary != -2.5):
+            raise ValueError("projection profile does not cover this query subset, geometry or objective")
+        dtype = str(states[6].dtype)
+        bucket = f"H{geometry.heads}/{dtype}/{mode}"
+        if bucket not in precision_budgets:
+            raise ValueError("projection profile does not cover the requested head/weight/mode bucket")
+        calibrated = {}
+        for name, metric in metrics.items():
+            if name in precision_budgets[bucket] and "finite" in metric:
+                calibrated[name] = {**metric, "passed": reference_budget_passes(metric,
+                                                                                precision_budgets[bucket][name])}
+            else:
+                calibrated[name] = metric
+        if mode == "lm_plus_kl":
+            component = coupled_projection_objective_check(
+                tuple(peer["objective"] for peer in peers), tuple(peer["loss"] for peer in peers),
+                expected_objective, expected_loss, upstream=auxiliary, divisor=divisor,
+                main_budget=precision_budgets[f"H{geometry.heads}/{dtype}/lm_only"]["objective"],
+                auxiliary_budget=precision_budgets[f"H{geometry.heads}/{dtype}/kl_only"]["auxiliary_loss"])
+            calibrated["objective"].update(normalized_reference_passed=calibrated["objective"]["passed"],
+                                           component_reference_bound=component, passed=component["passed"],
+                                           criterion="independent_components_plus_fp32_rounding")
+        calibrated_passed = all(metric.get("passed", metric.get("absent", False))
+                                and metric.get("disabled_aux_exact_zero", True) for metric in calibrated.values())
+    else:
+        calibrated_passed = None
+    return {"passed": calibrated_passed if calibrated is not None else passed,
+            "original_pointwise_passed": passed, "calibrated_reference": calibrated,
+            "independent_fp64_vjp": metrics, "query_rows": len(contributing),
             "global_normalization_queries": total, "native_activation_and_output_values_fixed": True,
             "bf16_projection_composition_acceptance": False}
 
 
 def _step(workspace, backend, base_meta, geometry, cpu_fixture, *, tile_mode, weight_dtype,
-          mode, coefficient, auxiliary, divisor, replay):
+          mode, coefficient, auxiliary, divisor, replay, precision_budgets=None):
     device = backend.layout.device
     tile = _tile(base_meta, tile_mode)
     layout = backend.prepare_local_queries(tile.q_global_ids)
@@ -165,12 +201,13 @@ def _step(workspace, backend, base_meta, geometry, cpu_fixture, *, tile_mode, we
                     torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=.02, atol=2e-5)
     torch.npu.synchronize()
     peers = _snapshots(tile, states, captured[0], output, first, objective, loss)
-    evidence = _check(peers, cpu_fixture, geometry, (3, 10), mode, coefficient, auxiliary, divisor)
+    evidence = _check(peers, cpu_fixture, geometry, (3, 10), mode, coefficient, auxiliary, divisor,
+                      precision_budgets=precision_budgets)
     evidence.update(captured_forward_invocations=len(captured), replay=replay)
     return evidence
 
 
-def _fixture(report, heads, weight_dtype, pattern, *, smoke):
+def _fixture(report, heads, weight_dtype, pattern, *, smoke, precision_budgets=None):
     device = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
     rank, size = dist.get_rank(), dist.get_world_size()
     lengths = (3, 10)
@@ -198,7 +235,7 @@ def _fixture(report, heads, weight_dtype, pattern, *, smoke):
                                "reducer_divisor": divisor, "tile": tile, "replay": replay}
             evidence = _step(workspace, backend, meta, geometry, cpu_fixture, tile_mode=tile,
                              weight_dtype=weight_dtype, mode=mode, coefficient=coefficient,
-                             auxiliary=auxiliary, divisor=divisor, replay=replay)
+                             auxiliary=auxiliary, divisor=divisor, replay=replay, precision_budgets=precision_budgets)
             report["cases"].append({**report["stage"], **evidence})
             if not evidence["passed"]:
                 raise RuntimeError(f"local training projection VJP did not pass: {evidence}")
@@ -207,17 +244,35 @@ def _fixture(report, heads, weight_dtype, pattern, *, smoke):
         root.close()
 
 
-def run_validation(report: dict, *, smoke: bool = False) -> None:
+def run_validation(report: dict, *, smoke: bool = False, reference_profile: Path | None = None,
+                   profile_policy_sha256: str | None = None) -> None:
     """Run actual local CP training and fixed-Native-value FP64 projection VJP checks."""
     torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     dist.init_process_group("hccl", timeout=timedelta(minutes=10))
     report.update(rank=dist.get_rank(), cp_size=dist.get_world_size(), cases=[], package_path=hyper_parallel.__file__)
+    budgets, profile = None, None
     fixtures = [(32, torch.float32, "strided")] if smoke else [
         (heads, dtype, pattern) for heads in (32, 64) for dtype in (torch.bfloat16, torch.float32)
         for pattern in ("contiguous", "strided", "zigzag", "empty")]
     try:
+        if reference_profile is not None:
+            if profile_policy_sha256 is None:
+                raise ValueError("projection reference profile requires an independently frozen policy SHA")
+            profile = json.loads(reference_profile.read_text())
+            libraries = {name: hashlib.sha256(Path(name).read_bytes()).hexdigest()
+                         for name in profile["loaded_library_sha256"]}
+            budgets = validate_projection_reference_profile(
+                profile, expected_versions={"torch_version": torch.__version__,
+                                            "torch_npu_version": torch_npu.__version__},
+                expected_library_hashes=libraries, expected_policy_sha256=profile_policy_sha256)
+            report.update(reference_profile_sha256=hashlib.sha256(reference_profile.read_bytes()).hexdigest(),
+                          reference_policy_sha256=profile_policy_sha256)
         for heads, dtype, pattern in fixtures:
-            _fixture(report, heads, dtype, pattern, smoke=smoke)
+            _fixture(report, heads, dtype, pattern, smoke=smoke, precision_budgets=budgets)
+        loaded = _loaded_library_identity()
+        report["loaded_library_sha256"] = loaded
+        if profile is not None:
+            validate_loaded_projection_reference(profile, loaded)
         report.update(status="passed", loaded_library_sha256=_loaded_library_identity())
     finally:
         dist.destroy_process_group()
@@ -228,11 +283,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--reference-profile", type=Path)
+    parser.add_argument("--profile-policy-sha256")
     args = parser.parse_args()
     report = {"status": "running", "scope": "local CP training projection VJP at fixed Native values",
               "full_model_acceptance": False, "bf16_projection_composition_acceptance": False}
     try:
-        run_validation(report, smoke=args.smoke)
+        run_validation(report, smoke=args.smoke, reference_profile=args.reference_profile,
+                       profile_policy_sha256=args.profile_policy_sha256)
     except Exception as error:
         report.update(status="error", error=repr(error), traceback=traceback.format_exc())
         raise
