@@ -1748,3 +1748,43 @@ These are local-indexer and existing-training regression results. They do not pr
 local-query SFA/KL/backward, reduced end-to-end memory, full-model BF16 acceptance
 or training-step speedup. Those remaining contracts follow the implementation
 sequence above; the original multi-card CP and fused-execution goal remains active.
+
+## Local-query fused CP forward
+
+[原始 CP forward adapter](fused_cp.py) 提供 `prepare_local_queries(query_ids)` 和
+`forward_local(invocation, main_states, index_states)`。冷准备支持完整 owner query 集合或调用方指定顺序的
+子集，包括 CP1 上的空 tile。每次调用仍发布该 owner 的完整 index K、compressed KV 和 key RoPE。
+Query、index-query 和 merge weights 保留实际本地行数；这条前向路径不执行 query gather。
+
+Native launch 闭合六个阶段：indexer main、indexer merge、membership init、membership build、
+request pack/pull 和 SFA。Membership 根据显式 global query IDs 和序列起点解析本地 selected slots。
+SFA adapter 使用显式 query position 确定 sparse prefix 和因果边界。空 query tile 跳过 LI/SFA 算术
+及 SFA child tiling，LI retained 算术 scratch 为零，但仍参与全部六个阶段闭合和 peer ready/read-ACK 交换。
+
+零算术 scratch 仅指调用方的 LI retained buffer。MIX kernel 的生成入口仍会清零系统 workspace，
+因此 tiling 始终申请至少 `PlatformAscendC::GetLibApiWorkSpaceSize()` 返回的系统空间。非空 query 使用
+SFA child tiling 返回的更大空间；空 query 不能因跳过 SFA tiling 而把 kernel workspace 设为零，
+否则入口初始化可能越界覆盖相邻张量。
+
+输出和保存的激活由各次调用独立持有；输出置换恢复调用方的 query 顺序。Main-KV 目标缓冲区初始化为
+NaN，便于验证未获取的行保持 poisoned 状态。Transport trace 记录完整 index-K 字节数及实际去重后的
+main-KV 字节数；空 query tile 的 main-KV 字节数应为零。保存结果还持有 native 使用的 runtime buffers，
+避免异步执行期间释放 metadata 或 retained scratch。
+Local saved state 还持有本次 forward 使用的 `DsaLocalQueryLayout`；backend 重新准备另一块 tile
+不会改变该状态的 query lengths、positions 或恢复顺序。使用保存状态前会核对这些张量的地址与版本。
+
+[设备验证器](../../examples/mega_dsa_local_cp_validate.py) 将本地 LI selected sets 和 values 与 stock LI
+逐项比较，按 sparse slot 顺序对齐 stock SFA，使用独立 FP32 attention oracle 检查每个本地 query，
+并验证 selected descriptors、通信字节和阶段闭合。Framework-free CP1/CP2/CP4 launcher 覆盖 owner
+置换、interior 和 first-sequence tile、空 owner/tile、H32/H64，以及 BF16/FP32 merge weights。
+`--long-history` 额外覆盖 native K2048 截断和未拉取的 cold main-KV 行。
+
+CANN 9.1 / Ascend 910B3 上的冻结载荷已通过 CP1/CP2/CP4 完整短、长序列 raw forward 验收，
+每个 rank 各执行 320 次调用，合计 2240 次 rank-forward，三个 launcher 均正常退出。
+独立 FP32 oracle 的最大 relative L2 为 `0.002419553899592081`，限值 `.02`。
+标准构建成功，22 个 device objects 与冻结载荷相同；打包后载荷的补充运行检查单独执行。
+
+该 raw 接口尚未安装 KL 或 autograd。保存状态显式标为 local；现有 global-query backward 在提交前
+拒绝该状态。训练路径迁移到 local query 前，仍需完成 local-query main backward、local LM+KL
+normalization 和 FP32 owner accumulation。当前已验收的产品训练路径仍使用 global query scope；
+CP8/CP×TP、模型验收、稳定性、共存及完整训练步性能仍待验证。

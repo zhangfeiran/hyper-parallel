@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 
 import torch
@@ -39,6 +39,7 @@ from hyper_parallel.core.multicore.modules.mega_dsa.fused_training import valida
 from hyper_parallel.core.multicore.modules.mega_dsa.selected_requests import (
     selected_request_rows, validate_selected_requests, validate_selected_training_traces,
 )
+from hyper_parallel.core.multicore.modules.mega_dsa.local_query import DsaLocalQueryLayout
 from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
     DsaWorkspaceInvocation,
     MegaDsaWorkspace,
@@ -78,11 +79,19 @@ class FusedCpSavedAttention:
     backend: FusedDsaCpForwardProbe
     geometry: tuple[int, float, MixedSfaSchedule]
     _token: object = field(default=None, repr=False, compare=False)
+    query_scope: str = "global"
+    local_query_layout: DsaLocalQueryLayout | None = field(default=None, repr=False, compare=False)
 
     def validate_versions(self) -> None:
         """Reject mutation of any saved activation before a delayed or retained backward."""
         if self._token is not _SAVED_ATTENTION_TOKEN:
             raise ValueError("fused CP backward requires native forward-produced saved state")
+        if self.query_scope == "local":
+            layout = self.local_query_layout
+            if (layout is None or _layout_signature(layout.batch_meta) != _layout_signature(self.batch_meta)
+                    or layout.batch_meta.q_global_ids != self.batch_meta.q_global_ids):
+                raise ValueError("local saved attention requires its forward query layout")
+            layout.validate_versions()
         tensors = (*self.states, self.indices, *self.forward)
         if tuple(tensor._version for tensor in tensors) != self.versions:
             raise ValueError("fused CP saved attention state was modified after forward")
@@ -112,6 +121,7 @@ class FusedCpForwardResult:
     kl_gradients: tuple[torch.Tensor, ...] = ()
     kl_loss: torch.Tensor | None = None
     selected_requests: tuple[torch.Tensor, ...] = ()
+    _runtime_buffers: tuple[torch.Tensor, ...] = field(default=(), repr=False, compare=False)
 
 
 class FusedDsaCpForwardProbe:
@@ -160,6 +170,9 @@ class FusedDsaCpForwardProbe:
         self.layout_hash = int.from_bytes(hashlib.sha256(repr(self.signature).encode()).digest()[:8], "little") % 2**63
         self.selected_rows: torch.Tensor | None = None
         self.selected_rows_version: int | None = None
+        self.local_query_layout: DsaLocalQueryLayout | None = None
+        self.local_query_layout_reference: DsaLocalQueryLayout | None = None
+        self.local_selected_rows: torch.Tensor | None = None
 
     def prepare_selected_requests(self) -> None:
         """Prepare immutable row addresses collectively before selected-transfer submissions."""
@@ -167,6 +180,104 @@ class FusedDsaCpForwardProbe:
             raise ValueError("selected membership occurrences exceed int32 capacity")
         self.selected_rows = selected_request_rows(self.layout.batch_meta, self.layout.device)
         self.selected_rows_version = self.selected_rows._version
+
+    def prepare_local_queries(self, query_ids: tuple[int, ...] | None = None) -> None:
+        """Cold prepare a caller-ordered local query tile and complete owner addresses on every member."""
+        meta = self.layout.batch_meta
+        ids = meta.q_global_ids if query_ids is None else query_ids
+        if not set(ids).issubset(meta.q_global_ids):
+            raise ValueError("a local query tile must use this member's prepared owner queries")
+        self.local_query_layout = DsaLocalQueryLayout(replace(meta, q_global_ids=ids), self.layout.device)
+        self.local_query_layout_reference = self.local_query_layout
+        self.prepare_selected_requests()
+        self.local_selected_rows = self.selected_rows
+
+    def forward_local(self, invocation: DsaWorkspaceInvocation, main_states: tuple[torch.Tensor, ...],
+                      index_states: tuple[torch.Tensor, ...]) -> FusedCpForwardResult:
+        """Fuse local LI, selected main-KV pull and SFA without query/weight replication or KL.
+
+        The prepared tile may be empty. Every member submits the same six-stage
+        protocol and publishes its complete owner-local KV set. Inputs are
+        detached caller-ordered local queries and complete owner-ordered keys.
+        This raw forward is not yet admitted by the global-query backward.
+        """
+        if (invocation.workspace is not self.workspace or _layout_signature(invocation.batch_meta) != self.signature
+                or invocation.batch_meta.kv_global_ids != self.layout.batch_meta.kv_global_ids):
+            raise ValueError("local forward requires unchanged prepared ownership and key storage order")
+        local = self.local_query_layout
+        if local is None or local is not self.local_query_layout_reference:
+            raise ValueError("local forward requires its cold prepared query layout")
+        local.validate_versions()
+        if (self.selected_rows is not self.local_selected_rows
+                or self.selected_rows._version != self.selected_rows_version):
+            raise ValueError("local selected row addresses were modified")
+        queries, keys = len(local.global_ids), len(invocation.batch_meta.kv_global_ids)
+        shapes = ((queries, self.heads, 512), (keys, 512), (queries, self.heads, 64), (keys, 64),
+                  (queries, 64, 128), (keys, 128), (queries, 64))
+        tensors = (*main_states, *index_states)
+        if len(main_states) != 4 or len(index_states) != 3:
+            raise ValueError("local forward requires four main and three index states")
+        for field_index, (tensor, shape) in enumerate(zip(tensors, shapes)):
+            dtypes = (torch.bfloat16, torch.float32) if field_index == 6 else (torch.bfloat16,)
+            if (tuple(tensor.shape) != shape or tensor.device != self.layout.device or tensor.dtype not in dtypes
+                    or tensor.requires_grad or not tensor.is_contiguous()):
+                raise ValueError("local forward states must be detached, contiguous and match prepared shapes/dtypes")
+        _load_native()
+        if torch.ops.hyper_parallel.dsa_local_cp_forward_version() != 1:
+            raise RuntimeError("local fused forward requires adapter ABI 1; rebuild this checkout's payload")
+        with self.workspace.lease(invocation, direction="forward"):
+            return self._submit_local(invocation, main_states, index_states)
+
+    def _submit_local(self, invocation, main_states, index_states) -> FusedCpForwardResult:
+        local = self.local_query_layout
+        query, compressed, query_rope, key_rope = main_states
+        index_query, index_key, weights = index_states
+        packed = tuple(local.pack(tensor) for tensor in (index_query, query, query_rope, weights))
+        device, queries = self.layout.device, len(local.global_ids)
+        tokens = invocation.batch_meta.global_valid_queries
+        keys = tuple(torch.full(shape, float("nan"), dtype=torch.bfloat16, device=device)
+                     for shape in ((tokens, 1, 128), (tokens, 1, 512), (tokens, 1, 64)))
+        indices = torch.full((queries, 1, 2048), -2, dtype=torch.int32, device=device)
+        values = torch.full(indices.shape, float("nan"), dtype=torch.bfloat16, device=device)
+        output = torch.full_like(packed[1], float("nan"))
+        maximum = torch.full((1, queries, self.heads), float("nan"), dtype=torch.float32, device=device)
+        denominator = torch.full_like(maximum, float("nan"))
+        trace = torch.zeros((6, 20, 64), dtype=torch.int64, device=device)
+        transport_trace = torch.zeros(32, dtype=torch.int64, device=device)
+        retained = torch.empty(MIXED_INDEXER_WORKSPACE_BYTES if queries else 0, dtype=torch.uint8, device=device)
+        membership = torch.empty((tokens + 7) // 8 * 8, dtype=torch.int32, device=device)
+        table = torch.empty((tokens, 4), dtype=torch.int64, device=device)
+        counts = torch.empty(16, dtype=torch.int64, device=device)
+        self.workspace.publish_owner_states(invocation, (compressed, key_rope, index_key))
+        epoch = self.workspace.next_transport_epoch(invocation)
+        metadata = self._metadata(invocation, epoch)
+        torch.ops.hyper_parallel.dsa_local_cp_forward_out(
+            packed[0], keys[0], packed[1], keys[1], packed[2], keys[2], packed[3], local.key_lengths, self.config,
+            trace, retained, self.native_layout.cumulative_lengths, self.scale, indices, values, output,
+            maximum, denominator, self.workspace.arena, metadata, self.requests, transport_trace,
+            self.selected_rows, membership, table, counts, local.query_lengths, local.positions,
+            local.global_ids_tensor)
+        states = (packed[1], keys[1][:, 0], packed[2], keys[2][:, 0])
+        saved_tensors = (*states, indices, output, maximum, denominator)
+        meta = replace(invocation.batch_meta, q_global_ids=local.batch_meta.q_global_ids)
+        saved = FusedCpSavedAttention(meta, states, indices, (output, maximum, denominator),
+                                      tuple(tensor._version for tensor in saved_tensors), self,
+                                      (self.heads, self.scale, self.schedule), _SAVED_ATTENTION_TOKEN, "local", local)
+        if not queries:
+            return FusedCpForwardResult(output, indices, values, maximum, denominator, keys,
+                                        tuple(trace.unbind()), transport_trace, epoch, saved,
+                                        (packed[0], keys[0][:, 0], packed[3]),
+                                        selected_requests=(table, counts, membership),
+                                        _runtime_buffers=(metadata, retained))
+        starts = (local.global_ids_tensor - local.positions).to(torch.int32)[:, None, None]
+        global_indices = torch.where(indices >= 0, indices + starts, -1)
+        restore = local.restore_order
+        return FusedCpForwardResult(local.restore(output), local.restore(global_indices), local.restore(values),
+                                    maximum.index_select(1, restore), denominator.index_select(1, restore), keys,
+                                    tuple(trace.unbind()), transport_trace, epoch, saved,
+                                    (packed[0], keys[0][:, 0], packed[3]),
+                                    selected_requests=(table, counts, membership),
+                                    _runtime_buffers=(metadata, retained))
 
     def _metadata(self, invocation: DsaWorkspaceInvocation, epoch: int) -> torch.Tensor:
         meta = invocation.batch_meta
@@ -326,7 +437,11 @@ class FusedDsaCpForwardProbe:
         """Decode explicitly completed CPU snapshots and exact local/remote byte counts."""
         start, end = self._transport_interval(transport)
         lengths = self.native_layout.batch_meta.global_cu_seqlens
-        require_ld = any(end - begin > 2048 for begin, end in pairwise(lengths))
+        query_ids = (tuple(sorted(result.saved.batch_meta.q_global_ids))
+                     if result.saved is not None and result.saved.query_scope == "local" else None)
+        require_ld = any(end - begin > 2048 and (query_ids is None or
+                                                any(begin <= query < end for query in query_ids))
+                         for begin, end in pairwise(lengths))
         selected = None
         if result.selected_requests:
             if selected_snapshots is None or len(selected_snapshots) != 4:
@@ -334,7 +449,8 @@ class FusedDsaCpForwardProbe:
             compute = validate_selected_training_traces(
                 snapshots, self.schedule, require_ld=require_ld, with_kl=result.kl_loss is not None)
             selected = validate_selected_requests(selected_snapshots[3], result.saved.batch_meta,
-                                                 *selected_snapshots[:3], result.epoch)
+                                                 *selected_snapshots[:3], result.epoch,
+                                                 query_ids=query_ids)
             if int(selected_snapshots[1][9]) > start:
                 raise ValueError("selected main-KV transfer started before descriptor publication completed")
         elif result.kl_loss is not None:

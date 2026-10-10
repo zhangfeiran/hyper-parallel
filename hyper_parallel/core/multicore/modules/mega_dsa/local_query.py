@@ -51,6 +51,7 @@ class DsaLocalQueryLayout:
                            for end in batch_meta.global_cu_seqlens[1:])
         positions = tuple(batch_meta.sequence_position(token)[1] for token in self.global_ids)
         self.cumulative_queries = cumulative
+        self.global_ids_tensor = torch.tensor(self.global_ids, dtype=torch.long, device=self.device)
         self.positions = torch.tensor(positions, dtype=torch.long, device=self.device)
         self.query_lengths = torch.tensor(cumulative, dtype=torch.int32, device=self.device)
         self.key_lengths = torch.tensor(batch_meta.global_cu_seqlens[1:], dtype=torch.int32, device=self.device)
@@ -59,7 +60,8 @@ class DsaLocalQueryLayout:
         self._identity = (batch_meta, self.device, self.global_ids, self.cumulative_queries)
 
     def _tensors(self) -> tuple[torch.Tensor, ...]:
-        return self.pack_order, self.restore_order, self.positions, self.query_lengths, self.key_lengths
+        return (self.pack_order, self.restore_order, self.positions, self.query_lengths, self.key_lengths,
+                self.global_ids_tensor)
 
     def validate_versions(self) -> None:
         """Reject mutated addresses or layout declarations before native loading or submission."""

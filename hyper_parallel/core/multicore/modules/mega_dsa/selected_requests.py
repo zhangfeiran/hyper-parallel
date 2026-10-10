@@ -49,7 +49,8 @@ def selected_request_rows(meta: DsaBatchMeta, device: torch.device | str) -> tor
     return torch.tensor(rows, dtype=torch.int64, device=device)
 
 
-def selected_request_reference(indices: torch.Tensor, meta: DsaBatchMeta) -> SelectedRequestReference:
+def selected_request_reference(indices: torch.Tensor, meta: DsaBatchMeta,
+                               *, query_ids: tuple[int, ...] | None = None) -> SelectedRequestReference:
     """Resolve sequence-relative slots and build a selected union with a CPU set oracle.
 
     This offline checker accepts duplicate/padded slots to exercise the device
@@ -58,12 +59,18 @@ def selected_request_reference(indices: torch.Tensor, meta: DsaBatchMeta) -> Sel
     No device tensor is transferred implicitly.
     """
     tokens = meta.global_valid_queries
+    queries = tuple(range(tokens)) if query_ids is None else query_ids
+    if (len(set(queries)) != len(queries) or any(not isinstance(query, int) or isinstance(query, bool)
+                                               or not 0 <= query < tokens for query in queries)):
+        raise ValueError("selected query IDs must be unique valid global integer IDs")
+    if query_ids is not None and any(meta.token_owners[query] != meta.cp_rank for query in queries):
+        raise ValueError("selected local query IDs must belong to this CP member")
     if (indices.device.type != "cpu" or indices.dtype != torch.int32 or indices.ndim != 3
-            or indices.shape[:2] != (tokens, 1) or not 1 <= indices.shape[2] <= 2048):
-        raise ValueError("selected request reference requires CPU int32 [global Q,1,K<=2048]")
+            or indices.shape[:2] != (len(queries), 1) or not 1 <= indices.shape[2] <= 2048):
+        raise ValueError("selected request reference requires CPU int32 [declared Q,1,K<=2048]")
     rows = selected_request_rows(meta, "cpu").tolist()
     keys, occurrences = set(), [0] * ((tokens + 7) // 8 * 8)
-    for query, slots in enumerate(indices[:, 0].tolist()):
+    for query, slots in zip(queries, indices[:, 0].tolist()):
         start = rows[query][0]
         for index in slots:
             if 0 <= index <= query - start:
@@ -105,7 +112,8 @@ def validate_selected_training_traces(traces: tuple[torch.Tensor, ...], schedule
 
 
 def validate_selected_requests(indices: torch.Tensor, meta: DsaBatchMeta, requests: torch.Tensor,
-                                counts: torch.Tensor, membership: torch.Tensor, epoch: int) -> dict:
+                                counts: torch.Tensor, membership: torch.Tensor, epoch: int,
+                                *, query_ids: tuple[int, ...] | None = None) -> dict:
     """Compare completed CPU descriptor/count snapshots with the independent set oracle."""
     tokens = meta.global_valid_queries
     if (requests.device.type != "cpu" or requests.dtype != torch.int64 or requests.shape != (tokens, 4)
@@ -113,7 +121,7 @@ def validate_selected_requests(indices: torch.Tensor, meta: DsaBatchMeta, reques
             or membership.device.type != "cpu" or membership.dtype != torch.int32
             or membership.shape != ((tokens + 7) // 8 * 8,)):
         raise ValueError("selected request validation requires explicit CPU snapshots with prepared shapes")
-    oracle = selected_request_reference(indices, meta)
+    oracle = selected_request_reference(indices, meta, query_ids=query_ids)
     run_count, unique = len(oracle.requests), int(oracle.membership.count_nonzero())
     expected = (SELECTED_REQUESTS_MAGIC, epoch, run_count, unique, oracle.selected_slots,
                 oracle.remote_keys, oracle.remote_runs, 0)

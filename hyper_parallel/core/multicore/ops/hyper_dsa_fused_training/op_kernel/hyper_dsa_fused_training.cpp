@@ -54,6 +54,9 @@ struct Buffers {
   __gm__ uint8_t *membership;
   __gm__ uint8_t *selectedRequests;
   __gm__ uint8_t *selectedCounts;
+  __gm__ uint8_t *queryLengths;
+  __gm__ uint8_t *queryPositions;
+  __gm__ uint8_t *queryIds;
 };
 
 template <bool FloatWeights>
@@ -63,8 +66,10 @@ __aicore__ inline uint32_t RunIndexer(const Buffers &buffers, const LITilingData
   using TileType = LICommon::LIType<bfloat16_t, bfloat16_t, int32_t, false, LICommon::LI_LAYOUT::TND,
                                     LICommon::LI_LAYOUT::TND, FloatWeights>;
   LIKernel::LightningIndexerKernel<TileType> tile;
-  tile.Init(buffers.indexQuery, buffers.indexKey, buffers.weights, buffers.lengths, buffers.lengths, nullptr,
-            buffers.indices, buffers.values, buffers.retained, data, &pipe, ticket, count, group, count, merge);
+  tile.Init(buffers.indexQuery, buffers.indexKey, buffers.weights,
+            buffers.queryLengths == nullptr ? buffers.lengths : buffers.queryLengths, buffers.lengths, nullptr,
+            buffers.indices, buffers.values, buffers.retained, data, &pipe, ticket, count, group, count, merge,
+            buffers.queryPositions);
   const uint32_t ld = tile.IsLdPartition() ? 1 : 0;
   tile.ProcessPhase(merge);
   return ld;
@@ -75,10 +80,12 @@ __aicore__ inline void RunAttention(const Buffers &buffers, const SparseFlashAtt
   TPipe pipe;
   using TileType = SFAType<bfloat16_t, bfloat16_t, bfloat16_t, 0, SFA_LAYOUT::TND, SFA_LAYOUT::TND, 1>;
   SparseFlashAttentionMla<TileType> tile;
-  tile.Init(buffers.query, buffers.compressed, buffers.compressed, buffers.indices, buffers.lengths, buffers.lengths,
-            nullptr, buffers.queryRope, buffers.keyRope, buffers.attention, buffers.maximum, buffers.sum,
+  tile.Init(buffers.query, buffers.compressed, buffers.compressed, buffers.indices,
+            buffers.queryLengths == nullptr ? buffers.lengths : buffers.queryLengths, buffers.lengths, nullptr,
+            buffers.queryRope, buffers.keyRope, buffers.attention, buffers.maximum, buffers.sum,
             GetUserWorkspace(buffers.workspace), data,
-            buffers.tiling + __builtin_offsetof(DsaFusedTrainingTilingData, sfa), &pipe, ticket, count, group, count);
+            buffers.tiling + __builtin_offsetof(DsaFusedTrainingTilingData, sfa), &pipe, ticket, count, group, count,
+            buffers.queryPositions);
   tile.Process();
 }
 
@@ -147,9 +154,13 @@ __aicore__ inline void RunComputePhase(const Buffers &buffers, const LITilingDat
     if (Selected && phase >= 2 && phase <= 4) {
       // Membership and packing have their own releases before any SFA/KL reader.
     } else if (mathPhase < 2) {
-      ldCount += RunIndexer<FloatWeights>(buffers, li, ticket, group, physicalCount, phase == 1);
+      if (li->queryTokens != 0) {
+        ldCount += RunIndexer<FloatWeights>(buffers, li, ticket, group, physicalCount, phase == 1);
+      }
     } else if (mathPhase == 2) {
-      RunAttention(buffers, sfa, ticket, group, physicalCount);
+      if (li->queryTokens != 0) {
+        RunAttention(buffers, sfa, ticket, group, physicalCount);
+      }
     } else {
       RunKl<FloatWeights>(buffers, kl, ticket, group, physicalCount, mathPhase - 3);
     }
@@ -235,14 +246,14 @@ __aicore__ inline void Run(const Buffers &buffers, __gm__ uint8_t *runtimeConfig
     transport.Init(arena, metadata, requests, transportTrace);
   }
   PrepareTransport<Transport>(transport, buffers, group, groups);
+  GET_TILING_DATA_WITH_STRUCT(DsaFusedTrainingTilingData, data, buffers.tiling);
   SelectedRequests requestsBuilder;
   if constexpr (Selected) {
     GlobalTensor<int64_t> meta;
     meta.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(metadata), 18);
     requestsBuilder.Init(buffers.selectedRows, buffers.membership, buffers.selectedRequests, buffers.selectedCounts,
-                         meta.GetValue(15));
+                         meta.GetValue(15), data.li.queryTokens, buffers.queryIds);
   }
-  GET_TILING_DATA_WITH_STRUCT(DsaFusedTrainingTilingData, data, buffers.tiling);
   const uint32_t phaseCount = Selected ? (data.withKl ? 9 : 6) : 6;
   for (uint32_t phase = 0; phase < phaseCount; ++phase) {
     GlobalTensor<int64_t> trace;
@@ -269,7 +280,8 @@ __global__ __aicore__ void hyper_dsa_fused_training(
   __gm__ uint8_t *runtimeConfig, __gm__ uint8_t *groupTrace, __gm__ uint8_t *retained, __gm__ uint8_t *klRetained,
   __gm__ uint8_t *klLengths, __gm__ uint8_t *arena, __gm__ uint8_t *metadata, __gm__ uint8_t *requests,
   __gm__ uint8_t *transportTrace, __gm__ uint8_t *selectedRows, __gm__ uint8_t *membership,
-  __gm__ uint8_t *selectedRequests, __gm__ uint8_t *selectedCounts, __gm__ uint8_t *indices, __gm__ uint8_t *values,
+  __gm__ uint8_t *selectedRequests, __gm__ uint8_t *selectedCounts, __gm__ uint8_t *queryLengths,
+  __gm__ uint8_t *queryPositions, __gm__ uint8_t *queryIds, __gm__ uint8_t *indices, __gm__ uint8_t *values,
   __gm__ uint8_t *attention, __gm__ uint8_t *maximum, __gm__ uint8_t *sum, __gm__ uint8_t *gradIndexQuery,
   __gm__ uint8_t *gradIndexKey, __gm__ uint8_t *gradWeight, __gm__ uint8_t *loss, __gm__ uint8_t *workspace,
   __gm__ uint8_t *tiling) {
@@ -277,7 +289,8 @@ __global__ __aicore__ void hyper_dsa_fused_training(
   Buffers buffers{indexQuery, indexKey,     query,      compressed,       queryRope,      keyRope,      weights,
                   lengths,    retained,     klRetained, klLengths,        gradIndexQuery, gradIndexKey, gradWeight,
                   loss,       indices,      values,     attention,        maximum,        sum,          workspace,
-                  tiling,     selectedRows, membership, selectedRequests, selectedCounts};
+                  tiling,     selectedRows, membership, selectedRequests, selectedCounts, queryLengths, queryPositions,
+                  queryIds};
   Run<FLOAT_WEIGHTS, TRANSPORT, SELECTED>(buffers, runtimeConfig, groupTrace, arena, metadata, requests,
                                           transportTrace);
 }

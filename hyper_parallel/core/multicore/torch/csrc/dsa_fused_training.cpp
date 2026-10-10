@@ -38,17 +38,19 @@ void check_storage(const Tensors &tensors) {
   }
 }
 
-void check_states(const Tensors &tensors) {
+void check_states(const Tensors &tensors, bool local = false) {
   const auto &query = *tensors[2];
   const auto tokens = query.size(0);
-  TORCH_CHECK(query.dim() == 3 && tokens > 0 && (query.size(1) == 32 || query.size(1) == 64) && query.size(2) == 512,
-              "fused DSA query must be [T,32|64,512]");
-  TORCH_CHECK(tensors[0]->sizes() == at::IntArrayRef({tokens, 64, 128}) &&
-                tensors[1]->sizes() == at::IntArrayRef({tokens, 1, 128}),
+  TORCH_CHECK(
+    query.dim() == 3 && (local || tokens > 0) && (query.size(1) == 32 || query.size(1) == 64) && query.size(2) == 512,
+    "fused DSA query must be [T,32|64,512]");
+  TORCH_CHECK(tensors[0]->sizes() == at::IntArrayRef({tokens, 64, 128}) && tensors[1]->dim() == 3 &&
+                tensors[1]->size(0) > 0 && (local ? tokens <= tensors[1]->size(0) : tokens == tensors[1]->size(0)) &&
+                tensors[1]->sizes() == at::IntArrayRef({tensors[1]->size(0), 1, 128}),
               "fused DSA LI shapes are incompatible");
-  TORCH_CHECK(tensors[3]->sizes() == at::IntArrayRef({tokens, 1, 512}) &&
+  TORCH_CHECK(tensors[3]->sizes() == at::IntArrayRef({tensors[1]->size(0), 1, 512}) &&
                 tensors[4]->sizes() == at::IntArrayRef({tokens, query.size(1), 64}) &&
-                tensors[5]->sizes() == at::IntArrayRef({tokens, 1, 64}),
+                tensors[5]->sizes() == at::IntArrayRef({tensors[1]->size(0), 1, 64}),
               "fused DSA KV/RoPE shapes are incompatible");
   for (size_t index = 0; index < 6; ++index) {
     TORCH_CHECK(tensors[index]->scalar_type() == at::kBFloat16, "fused DSA states must be BF16");
@@ -58,13 +60,14 @@ void check_states(const Tensors &tensors) {
               "fused DSA LI weights must be BF16 or FP32 [T,64]");
 }
 
-void check_runtime(const Tensors &tensors, int64_t phases) {
+void check_runtime(const Tensors &tensors, int64_t phases, bool local) {
   TORCH_CHECK(tensors[7]->dim() == 1 && tensors[7]->numel() > 0 && tensors[7]->scalar_type() == at::kInt,
               "fused DSA packed cumulative lengths must be a nonempty int32 vector");
   TORCH_CHECK(tensors[8]->sizes() == at::IntArrayRef({4}) && tensors[8]->scalar_type() == at::kLong &&
                 tensors[9]->sizes() == at::IntArrayRef({phases, 20, 64}) && tensors[9]->scalar_type() == at::kLong,
               "fused DSA runtime ABI expects int64 config[4] and the declared phase trace");
-  TORCH_CHECK(tensors[10]->dim() == 1 && tensors[10]->numel() >= 47226880 && tensors[10]->scalar_type() == at::kByte,
+  TORCH_CHECK(tensors[10]->dim() == 1 && tensors[10]->numel() >= (local && tensors[2]->size(0) == 0 ? 0 : 47226880) &&
+                tensors[10]->scalar_type() == at::kByte,
               "fused DSA retained scratch requires 47226880 uint8 bytes");
 }
 
@@ -102,13 +105,14 @@ void check_outputs(const Tensors &tensors) {
               "fused DSA SFA output shapes or dtypes are incompatible");
 }
 
-void check_fused_inputs(const Tensors &tensors, double scale, int64_t phases = 6, bool withKl = true) {
+void check_fused_inputs(const Tensors &tensors, double scale, int64_t phases = 6, bool withKl = true,
+                        bool local = false) {
   TORCH_CHECK(tensors[0]->device().type() == c10::DeviceType::PrivateUse1, "fused training requires an NPU");
   TORCH_CHECK(!withKl || !at::globalContext().deterministicAlgorithms(),
               "fused training supports non-deterministic KL only");
   check_storage(tensors);
-  check_states(tensors);
-  check_runtime(tensors, phases);
+  check_states(tensors, local);
+  check_runtime(tensors, phases, local);
   check_outputs(tensors);
   if (withKl) {
     check_kl_outputs(tensors);
@@ -176,7 +180,7 @@ void check_transport(const Tensors &tensors, const at::Tensor &arena, const at::
 }
 
 void check_selected(const Tensors &tensors, const std::array<const at::Tensor *, 8> &extras) {
-  const auto tokens = tensors[2]->size(0);
+  const auto tokens = tensors[1]->size(0);
   TORCH_CHECK(tokens <= INT32_MAX / 2048, "selected membership occurrence counts exceed int32 capacity");
   TORCH_CHECK(extras[4]->sizes() == at::IntArrayRef({tokens, 3}) && extras[4]->scalar_type() == at::kLong &&
                 extras[5]->sizes() == at::IntArrayRef({(tokens + 7) / 8 * 8}) && extras[5]->scalar_type() == at::kInt &&
@@ -274,6 +278,53 @@ std::tuple<TensorRef, TensorRef, TensorRef, TensorRef, TensorRef, TensorRef, Ten
     loss, arena, metadata, requests, transportTrace, selectedRows, membership, selectedRequests, selectedCounts);
   return {indices, values, attention, maximum, sum, trace, retained};
 }
+std::tuple<TensorRef, TensorRef, TensorRef, TensorRef, TensorRef, TensorRef, TensorRef> local_cp_forward_npu(
+  const at::Tensor &indexQuery, at::Tensor &indexKey, const at::Tensor &query, at::Tensor &compressed,
+  const at::Tensor &queryRope, at::Tensor &keyRope, const at::Tensor &weights, const at::Tensor &lengths,
+  const at::Tensor &config, at::Tensor &trace, at::Tensor &retained, at::IntArrayRef klLengths, double scale,
+  at::Tensor &indices, at::Tensor &values, at::Tensor &attention, at::Tensor &maximum, at::Tensor &sum,
+  at::Tensor &arena, const at::Tensor &metadata, const at::Tensor &requests, at::Tensor &transportTrace,
+  const at::Tensor &selectedRows, at::Tensor &membership, at::Tensor &selectedRequests, at::Tensor &selectedCounts,
+  const at::Tensor &queryLengths, const at::Tensor &queryPositions, const at::Tensor &queryIds) {
+  auto klRetained = at::empty({0}, retained.options());
+  auto gradIndexQuery = at::empty({0}, indexQuery.options());
+  auto gradIndexKey = at::empty({0}, indexKey.options());
+  auto gradWeight = at::empty({0}, weights.options());
+  auto loss = at::empty({0}, maximum.options());
+  const Tensors tensors{&indexQuery, &indexKey, &query, &compressed,     &queryRope,    &keyRope,    &weights,
+                        &lengths,    &config,   &trace, &retained,       &klRetained,   &indices,    &values,
+                        &attention,  &maximum,  &sum,   &gradIndexQuery, &gradIndexKey, &gradWeight, &loss};
+  check_fused_inputs(tensors, scale, 6, false, true);
+  check_selected(tensors, {&arena, &metadata, &requests, &transportTrace, &selectedRows, &membership, &selectedRequests,
+                           &selectedCounts});
+  check_lengths(klLengths, indexKey, lengths);
+  check_transport(tensors, arena, metadata, requests, transportTrace);
+  TORCH_CHECK(queryLengths.sizes() == lengths.sizes() && queryLengths.scalar_type() == at::kInt &&
+                queryPositions.sizes() == at::IntArrayRef({query.size(0)}) &&
+                queryPositions.scalar_type() == at::kLong && queryIds.sizes() == queryPositions.sizes() &&
+                queryIds.scalar_type() == at::kLong,
+              "local CP requires genuine int32 query lengths and int64 positions/global IDs");
+  for (const auto *tensor : {&queryLengths, &queryPositions, &queryIds}) {
+    TORCH_CHECK(tensor->device() == query.device() && tensor->is_contiguous() && !tensor->requires_grad(),
+                "local CP metadata must be detached contiguous tensors on the prepared NPU");
+    for (const auto *original : tensors) {
+      TORCH_CHECK(!tensor->is_alias_of(*original), "local metadata must not alias arithmetic buffers");
+    }
+    const std::array<const at::Tensor *, 8> extras{&arena,        &metadata,   &requests,         &transportTrace,
+                                                   &selectedRows, &membership, &selectedRequests, &selectedCounts};
+    for (const auto *extra : extras) {
+      TORCH_CHECK(!tensor->is_alias_of(*extra), "local metadata must not alias transport/request buffers");
+    }
+  }
+  static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaLocalCpForward",
+                                                          "aclnnHyperDsaLocalCpForwardGetWorkspaceSize");
+  hyper_parallel::multicore::execute_cached_op(
+    api, indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths, config, trace, retained,
+    klRetained, klLengths, scale, indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight,
+    loss, arena, metadata, requests, transportTrace, selectedRows, membership, selectedRequests, selectedCounts,
+    queryLengths, queryPositions, queryIds);
+  return {indices, values, attention, maximum, sum, trace, retained};
+}
 }  // namespace
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
@@ -281,4 +332,5 @@ TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("dsa_fused_cp_training_out", &fused_cp_training_npu);
   m.impl("dsa_selected_cp_training_out", &selected_cp_training_npu);
   m.impl("dsa_selected_cp_forward_out", &selected_cp_forward_npu);
+  m.impl("dsa_local_cp_forward_out", &local_cp_forward_npu);
 }

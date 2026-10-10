@@ -67,6 +67,11 @@
             "purpose": "separate logical SFA partitions from physical mixed-group scratch and remove global output initialization for TND callable tiles"
           },
           {
+            "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_query_positions.patch",
+            "sha256": "af61596c108f5f925c1f4a27f177ad234476a00868feedddc68078037f3ddcf9",
+            "purpose": "use explicit sequence-relative query positions for local SFA sparse-prefix length and causal thresholds"
+          },
+          {
             "path": "hyper_parallel/core/multicore/ops/lightning_indexer_mixed.patch",
             "sha256": "844cfa49e53fbbb151836cf0f61afafe1abc8f3efe3d94ed40fc4de7aa9e102d",
             "purpose": "retain logical LI partial Top-K across reusable mixed groups and separate main/LD merge kernel phases"

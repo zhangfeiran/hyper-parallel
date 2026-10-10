@@ -22,12 +22,18 @@ constexpr int64_t kSelectedRequestsMagic = 0x4850445341525131LL;
 class SelectedRequests {
  public:
   __aicore__ inline void Init(__gm__ uint8_t *rows, __gm__ uint8_t *membership, __gm__ uint8_t *requests,
-                              __gm__ uint8_t *counts, uint32_t tokens) {
+                              __gm__ uint8_t *counts, uint32_t tokens, uint32_t queries,
+                              __gm__ uint8_t *queryIds = nullptr) {
     rows_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(rows), tokens * 3);
     membership_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(membership), (tokens + 7) / 8 * 8);
     requests_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(requests), tokens * 4);
     counts_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(counts), 16);
     tokens_ = tokens;
+    queries_ = queries;
+    hasQueryIds_ = queryIds != nullptr;
+    if (hasQueryIds_) {
+      queryIds_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(queryIds), queries);
+    }
   }
 
   __aicore__ inline void Clear(uint32_t logical, uint32_t partitions) {
@@ -58,6 +64,9 @@ class SelectedRequests {
 
   __aicore__ inline void Mark(__gm__ uint8_t *indices, uint32_t logical, uint32_t partitions) {
 #ifndef __DAV_C220_CUBE__
+    if (queries_ == 0) {
+      return;
+    }
     TPipe pipe;
     TBuf<TPosition::VECIN> indexStorage;
     TBuf<TPosition::VECOUT> deltaStorage;
@@ -69,19 +78,23 @@ class SelectedRequests {
       delta.SetValue(word, 0);
     }
     GlobalTensor<int32_t> input;
-    input.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(indices), tokens_ * 2048);
+    input.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(indices), queries_ * 2048);
     uint32_t previous = 0;
-    for (uint32_t query = logical * 2 + GetSubBlockIdx(); query < tokens_; query += partitions * 2) {
+    for (uint32_t query = logical * 2 + GetSubBlockIdx(); query < queries_; query += partitions * 2) {
       DataCopy(selected, input[query * 2048], 2048);
       SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
       WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-      const int64_t start = rows_.GetValue(query * 3);
-      if (start < 0 || start > query) {
+      const int64_t globalQuery = hasQueryIds_ ? queryIds_.GetValue(query) : query;
+      if (globalQuery < 0 || globalQuery >= tokens_) {
+        Trap();
+      }
+      const int64_t start = rows_.GetValue(globalQuery * 3);
+      if (start < 0 || start > globalQuery) {
         Trap();
       }
       for (uint32_t slot = 0; slot < 2048; ++slot) {
         const int32_t index = selected.GetValue(slot);
-        if (index < 0 || index > static_cast<int64_t>(query) - start) {
+        if (index < 0 || index > globalQuery - start) {
           continue;
         }
         const uint32_t key = static_cast<uint32_t>(start + index);
@@ -154,9 +167,11 @@ class SelectedRequests {
   }
 
  private:
-  GlobalTensor<int64_t> rows_, requests_, counts_;
+  GlobalTensor<int64_t> rows_, requests_, counts_, queryIds_;
   GlobalTensor<int32_t> membership_;
   uint32_t tokens_ = 0;
+  uint32_t queries_ = 0;
+  bool hasQueryIds_ = false;
 };
 }  // namespace DsaMixed
 #endif  // HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_DSA_SELECTED_REQUESTS_H_

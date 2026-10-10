@@ -89,6 +89,8 @@ class FusedDsaCpBackwardProbe:
         if (saved is None or saved.backend is not self.backend
                 or _layout_signature(saved.batch_meta) != self.backend.signature):
             raise ValueError("fused CP backward requires this backend's saved attention state")
+        if saved.query_scope != "global":
+            raise ValueError("local-query saved state requires the local backward adapter")
         saved.validate_versions()
         if saved.geometry != (self.backend.heads, self.backend.scale, self.backend.schedule):
             raise ValueError("fused CP backward requires unchanged forward geometry/scale/schedule")

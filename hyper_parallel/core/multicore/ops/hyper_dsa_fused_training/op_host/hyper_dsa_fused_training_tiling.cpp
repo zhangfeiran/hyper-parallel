@@ -12,12 +12,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 #include "base/context_builder/op_tiling_context_builder.h"
 #include "register/op_impl_registry.h"
+#include "tiling/platform/platform_ascendc.h"
 #include "err/ops_err.h"
 #include "hyper_dsa_fused_training_tiling.h"  // NOLINT(build/include_subdir)
 
@@ -31,6 +33,12 @@ gert::Tensor InputMetadata(gert::TilingContext *context, size_t input) {
   const auto *desc = context->GetInputDesc(input);
   const gert::StorageFormat format(desc->GetOriginFormat(), desc->GetStorageFormat(), desc->GetExpandDimsType());
   return gert::Tensor(*context->GetRequiredInputShape(input), format, desc->GetDataType());
+}
+
+gert::Tensor OptionalMetadata(gert::TilingContext *context, size_t input) {
+  const auto *desc = context->GetOptionalInputDesc(input);
+  const gert::StorageFormat format(desc->GetOriginFormat(), desc->GetStorageFormat(), desc->GetExpandDimsType());
+  return gert::Tensor(*context->GetOptionalInputShape(input), format, desc->GetDataType());
 }
 
 gert::Tensor OutputMetadata(gert::TilingContext *context, size_t output) {
@@ -91,16 +99,20 @@ ge::graphStatus Metadata(gert::TilingContext *context, std::array<gert::Tensor, 
 }
 
 void ConfigureIo(gert::OpTilingContextBuilder &builder, std::array<gert::Tensor, 11> &inputs,
-                 std::array<gert::Tensor, 5> &outputs, gert::Tensor &trace, bool indexer) {
-  const std::vector<gert::Tensor *> liInputs = {&inputs[0], &inputs[1], &inputs[6], &inputs[7],
-                                                &inputs[7], &inputs[8], &trace,     &inputs[10]};
-  const std::vector<gert::Tensor *> sfaInputs = {&inputs[2], &inputs[3], &inputs[3], &outputs[0], &inputs[7],
+                 std::array<gert::Tensor, 5> &outputs, gert::Tensor &trace, bool indexer, gert::Tensor &queryLengths,
+                 gert::Tensor &queryPositions, bool local) {
+  std::vector<gert::Tensor *> liInputs = {&inputs[0], &inputs[1], &inputs[6], &queryLengths,
+                                          &inputs[7], &inputs[8], &trace,     &inputs[10]};
+  const std::vector<gert::Tensor *> sfaInputs = {&inputs[2], &inputs[3], &inputs[3], &outputs[0], &queryLengths,
                                                  &inputs[7], &inputs[4], &inputs[5], &inputs[8],  &trace};
+  if (local) {
+    liInputs.push_back(&queryPositions);
+  }
   const std::vector<gert::Tensor *> liOutputs = {&outputs[0], &outputs[1]};
   const std::vector<gert::Tensor *> sfaOutputs = {&outputs[2], &outputs[3], &outputs[4]};
   if (indexer) {
     builder.OpType(ge::AscendString("HyperDsaMixedIndexer"))
-      .IOInstanceNum({1, 1, 1, 1, 1, 0, 1, 1, 1, 0}, {1, 1})
+      .IOInstanceNum({1, 1, 1, 1, 1, 0, 1, 1, 1, local ? 1U : 0U}, {1, 1})
       .InputTensors(liInputs)
       .OutputTensors(liOutputs);
     IndexerAttrs(builder);
@@ -123,7 +135,15 @@ ge::graphStatus Compose(gert::TilingContext *context, DsaFusedTrainingTilingData
   gert::Tensor trace(gert::StorageShape({20, 64}, {20, 64}), gert::StorageFormat(ge::FORMAT_ND, ge::FORMAT_ND, {}),
                      ge::DT_INT64);
   gert::OpTilingContextBuilder builder;
-  ConfigureIo(builder, inputs, outputs, trace, indexer);
+  const bool local = context->GetOptionalInputDesc(21) != nullptr;
+  gert::Tensor queryLengths;
+  gert::Tensor queryPositions;
+  if (local) {
+    queryLengths = OptionalMetadata(context, 21);
+    queryPositions = OptionalMetadata(context, 22);
+  }
+  auto &effectiveQueryLengths = local ? queryLengths : inputs[7];
+  ConfigureIo(builder, inputs, outputs, trace, indexer, effectiveQueryLengths, queryPositions, local);
   auto workspaceOwner = gert::ContinuousVector::Create<size_t>(1);
   if (workspaceOwner == nullptr) {
     return ge::GRAPH_FAILED;
@@ -240,6 +260,16 @@ ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
       context->GetAttrs() == nullptr || context->GetAttrs()->GetAttrPointer<float>(0) == nullptr) {
     return ge::GRAPH_FAILED;
   }
+  const bool local = context->GetOptionalInputDesc(21) != nullptr;
+  if (local && (withKl || !selected || context->GetOptionalInputDesc(22) == nullptr ||
+                context->GetOptionalInputDesc(23) == nullptr)) {
+    return ge::GRAPH_FAILED;
+  }
+  for (size_t input = 21; local && input < 24; ++input) {
+    if (context->GetOptionalInputShape(input) == nullptr) {
+      return ge::GRAPH_FAILED;
+    }
+  }
   DsaFusedTrainingTilingData data;
   auto *raw = context->GetRawTilingData();
   if (raw == nullptr || raw->GetCapacity() < data.GetDataSize()) {
@@ -249,7 +279,8 @@ ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
   uint64_t liBytes = 0;
   uint64_t sfaBytes = 0;
   if (Compose(context, data, true, liBytes) != ge::GRAPH_SUCCESS ||
-      Compose(context, data, false, sfaBytes) != ge::GRAPH_SUCCESS) {
+      (!(local && context->GetRequiredInputShape(0)->GetStorageShape().GetDim(0) == 0) &&
+       Compose(context, data, false, sfaBytes) != ge::GRAPH_SUCCESS)) {
     return ge::GRAPH_FAILED;
   }
   if (withKl && ComposeKl(context, data) != ge::GRAPH_SUCCESS) {
@@ -259,7 +290,9 @@ ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
   if (workspace == nullptr || context->GetInputDesc(6) == nullptr) {
     return ge::GRAPH_FAILED;
   }
-  workspace[0] = sfaBytes;
+  // The generated MIX entry clears its system workspace even when every query tile is empty.
+  platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+  workspace[0] = std::max<uint64_t>(sfaBytes, platform.GetLibApiWorkSpaceSize());
   context->SetBlockDim(20);
   context->SetScheduleMode(1);
   const uint64_t transport = context->GetOptionalInputDesc(13) == nullptr ? 0 : 2;

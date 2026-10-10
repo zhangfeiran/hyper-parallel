@@ -31,7 +31,9 @@ namespace {
 aclnnStatus BuildFusedExecutor(const std::array<const aclTensor *, 8> &originalInputs,
                                const std::array<const aclTensor *, 12> &control, const aclIntArray *klLengths,
                                double scale, const std::array<const aclTensor *, 9> &destinations,
-                               uint64_t *workspaceSize, aclOpExecutor **executor, bool withKl = true) {
+                               uint64_t *workspaceSize, aclOpExecutor **executor, bool withKl = true,
+                               const aclTensor *queryLengths = nullptr, const aclTensor *queryPositions = nullptr,
+                               const aclTensor *queryIds = nullptr) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
   auto owner = CREATE_EXECUTOR();
   CHECK_RET(owner.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
@@ -54,7 +56,7 @@ aclnnStatus BuildFusedExecutor(const std::array<const aclTensor *, 8> &originalI
       HyperDsaFusedTraining,
       OP_INPUT(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6], inputs[7], control[0],
                control[1], control[2], control[3], lengthsConst, control[4], control[5], control[6], control[7],
-               control[8], control[9], control[10], control[11]),
+               control[8], control[9], control[10], control[11], queryLengths, queryPositions, queryIds),
       OP_OUTPUT(
         const_cast<aclTensor *>(outputs[0]), const_cast<aclTensor *>(outputs[1]), const_cast<aclTensor *>(outputs[2]),
         const_cast<aclTensor *>(outputs[3]), const_cast<aclTensor *>(outputs[4]), const_cast<aclTensor *>(outputs[5]),
@@ -150,6 +152,26 @@ extern "C" aclnnStatus aclnnHyperDsaSelectedCpForwardGetWorkspaceSize(
                             workspaceSize, executor, false);
 }
 
+extern "C" aclnnStatus aclnnHyperDsaLocalCpForwardGetWorkspaceSize(
+  const aclTensor *indexQuery, const aclTensor *indexKey, const aclTensor *query, const aclTensor *compressed,
+  const aclTensor *queryRope, const aclTensor *keyRope, const aclTensor *weights, const aclTensor *lengths,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, const aclTensor *klRetained,
+  const aclIntArray *klLengths, double scale, const aclTensor *indices, const aclTensor *values,
+  const aclTensor *attention, const aclTensor *maximum, const aclTensor *sum, const aclTensor *gradIndexQuery,
+  const aclTensor *gradIndexKey, const aclTensor *gradWeight, const aclTensor *loss, const aclTensor *arena,
+  const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace, const aclTensor *selectedRows,
+  const aclTensor *membership, const aclTensor *selectedRequests, const aclTensor *selectedCounts,
+  const aclTensor *queryLengths, const aclTensor *queryPositions, const aclTensor *queryIds, uint64_t *workspaceSize,
+  aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaLocalCpForward, DFX_IN(indexQuery, query, config), DFX_OUT(indices, attention));
+  return BuildFusedExecutor({indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths},
+                            {config, trace, retained, klRetained, arena, metadata, requests, transportTrace,
+                             selectedRows, membership, selectedRequests, selectedCounts},
+                            klLengths, scale,
+                            {indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight, loss},
+                            workspaceSize, executor, false, queryLengths, queryPositions, queryIds);
+}
+
 extern "C" aclnnStatus aclnnHyperDsaFusedTraining(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                   aclrtStream stream) {
   L2_DFX_PHASE_2(aclnnHyperDsaFusedTraining);
@@ -171,5 +193,11 @@ extern "C" aclnnStatus aclnnHyperDsaSelectedCpTraining(void *workspace, uint64_t
 extern "C" aclnnStatus aclnnHyperDsaSelectedCpForward(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                       aclrtStream stream) {
   L2_DFX_PHASE_2(aclnnHyperDsaSelectedCpForward);
+  return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaLocalCpForward(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                   aclrtStream stream) {
+  L2_DFX_PHASE_2(aclnnHyperDsaLocalCpForward);
   return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
 }

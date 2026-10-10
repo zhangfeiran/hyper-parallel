@@ -1,0 +1,80 @@
+diff --git a/attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h b/attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h
+index f3a3bacc..f07f77ee 100644
+--- a/attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h
++++ b/attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h
+@@ -69,7 +69,8 @@ public:
+                                 __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+                                 __gm__ uint8_t *workspace, const SparseFlashAttentionTilingDataMla *__restrict tiling,
+ 				                __gm__ uint8_t *gmTiling, TPipe *tPipe, uint32_t logicalId, uint32_t logicalCount,
+-                                uint32_t scratchId, uint32_t scratchCount);
++                                uint32_t scratchId, uint32_t scratchCount,
++                                __gm__ uint8_t *queryPositions = nullptr);
+
+     __aicore__ inline void Process();
+
+@@ -146,6 +147,8 @@ private:
+     GlobalTensor<int32_t> blockTableGm;
+     GlobalTensor<int32_t> topKGm;
+
++    GlobalTensor<int64_t> queryPositionsGm_;
++    bool hasQueryPositions_ = false;
+     GlobalTensor<int32_t> actualSeqLengthsQGm;
+     GlobalTensor<int32_t> actualSeqLengthsKVGm;
+
+@@ -177,6 +180,17 @@ private:
+                                            RunInfo extraInfo[SFA_PRELOAD_TASK_CACHE_SIZE], uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock);
+     // ================================Offset Calc=====================================
+     __aicore__ inline void GetActualSeqLen(uint32_t bIdx, uint32_t s1Idx = 0);
++    __aicore__ inline int64_t QueryThreshold(uint32_t bIdx, uint32_t s1Idx)
++    {
++        if (hasQueryPositions_) {
++            const uint32_t prefix = bIdx == 0 ? 0 : actualSeqLengthsQGm.GetValue(bIdx - 1);
++            if (s1Idx >= actualSeqLengthsQGm.GetValue(bIdx) - prefix) {
++                return 0;
++            }
++            return queryPositionsGm_.GetValue(prefix + s1Idx) + 1;
++        }
++        return static_cast<int64_t>(tempLoopInfo.nextTokensPerBatch) + s1Idx + 1;
++    }
+     __aicore__ inline void GetSparseActualSeqLen(uint32_t bIdx, uint32_t s1Idx, uint32_t n2Idx);
+     __aicore__ inline void CalcSinnerTopKBegin(RunInfo &info, uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock);
+     __aicore__ inline void UpdateInnerLoopCond();
+@@ -309,7 +323,7 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::GetSparseActualSeqLen(uint
+     }
+     int64_t threshold = tempLoopInfo.curActualSeqLenOri;
+     if (constInfo.sparseMode == 3) {
+-        threshold = static_cast<int64_t>(tempLoopInfo.nextTokensPerBatch) + s1Idx + 1;
++        threshold = QueryThreshold(bIdx, s1Idx);
+     }
+     tempLoopInfo.curActualSeqLen = (constInfo.sparseBlockCount * constInfo.sparseBlockSize > threshold) ?
+                                     threshold : (constInfo.sparseBlockCount * constInfo.sparseBlockSize);
+@@ -388,7 +402,8 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
+                        __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, 
+                        __gm__ uint8_t *workspace, const SparseFlashAttentionTilingDataMla *__restrict tiling,
+                        __gm__ uint8_t *gmTiling, TPipe *tPipe, uint32_t logicalId, uint32_t logicalCount,
+-                       uint32_t scratchId, uint32_t scratchCount)
++                       uint32_t scratchId, uint32_t scratchCount,
++                       __gm__ uint8_t *queryPositions)
+ {
+     // Work partitioning is independent of the physical group's private scratch slot.
+     logicalCoreCount = logicalCount;
+@@ -403,6 +418,10 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
+
+     InitTilingData();
+     InitActualSeqLen(actualSeqLengthsQ, actualSeqLengths);
++    hasQueryPositions_ = queryPositions != nullptr;
++    if (hasQueryPositions_) {
++        queryPositionsGm_.SetGlobalBuffer((__gm__ int64_t *)queryPositions);
++    }
+
+     // 初始化计算参数
+     InitCalcParamsEach();
+@@ -646,7 +665,7 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::CalcParams(uint32_t loop,
+         tensorBCoreOffset = info.tndBIdxOffsetForKV + info.n2Idx * headDim;
+         tensorBRopeCoreOffset = tndBIdxRopeOffsetForK + info.n2Idx * headDimRope;
+         if (constInfo.sparseMode == 3) {
+-            threshold = static_cast<int64_t>(tempLoopInfo.nextTokensPerBatch) + info.gS1Idx / constInfo.gSize + 1;
++            threshold = QueryThreshold(info.bIdx, info.gS1Idx / constInfo.gSize);
+         } else {
+             threshold = tempLoopInfo.curActualSeqLenOri;
+         }

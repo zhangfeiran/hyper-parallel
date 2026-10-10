@@ -88,6 +88,18 @@ class HyperDsaFusedTraining : public OpDef {
         .Format({ge::FORMAT_ND, ge::FORMAT_ND})
         .AutoContiguous();
     }
+    this->Input("query_lengths")
+      .ParamType(OPTIONAL)
+      .DataType({ge::DT_INT32, ge::DT_INT32})
+      .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+      .AutoContiguous();
+    for (const char *input : {"query_positions", "query_ids"}) {
+      this->Input(input)
+        .ParamType(OPTIONAL)
+        .DataType({ge::DT_INT64, ge::DT_INT64})
+        .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+        .AutoContiguous();
+    }
     this->Output("indices")
       .ParamType(REQUIRED)
       .DataType({ge::DT_INT32, ge::DT_INT32})

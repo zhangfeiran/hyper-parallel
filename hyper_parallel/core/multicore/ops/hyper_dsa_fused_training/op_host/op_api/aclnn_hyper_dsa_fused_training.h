@@ -64,6 +64,19 @@ ACLNN_API aclnnStatus aclnnHyperDsaSelectedCpForwardGetWorkspaceSize(
   uint64_t *workspaceSize, aclOpExecutor **executor);
 ACLNN_API aclnnStatus aclnnHyperDsaSelectedCpForward(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                      aclrtStream stream);
+ACLNN_API aclnnStatus aclnnHyperDsaLocalCpForwardGetWorkspaceSize(
+  const aclTensor *indexQuery, const aclTensor *indexKey, const aclTensor *query, const aclTensor *compressed,
+  const aclTensor *queryRope, const aclTensor *keyRope, const aclTensor *weights, const aclTensor *lengths,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, const aclTensor *klRetained,
+  const aclIntArray *klLengths, double scale, const aclTensor *indices, const aclTensor *values,
+  const aclTensor *attention, const aclTensor *maximum, const aclTensor *sum, const aclTensor *gradIndexQuery,
+  const aclTensor *gradIndexKey, const aclTensor *gradWeight, const aclTensor *loss, const aclTensor *arena,
+  const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace, const aclTensor *selectedRows,
+  const aclTensor *membership, const aclTensor *selectedRequests, const aclTensor *selectedCounts,
+  const aclTensor *queryLengths, const aclTensor *queryPositions, const aclTensor *queryIds, uint64_t *workspaceSize,
+  aclOpExecutor **executor);
+ACLNN_API aclnnStatus aclnnHyperDsaLocalCpForward(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                  aclrtStream stream);
 #ifdef __cplusplus
 }
 #endif

@@ -70,6 +70,35 @@ class TestSelectedRequests(unittest.TestCase):
         torch.testing.assert_close(full.requests[:, 2], torch.arange(7))
         torch.testing.assert_close(full.membership, torch.tensor([1, 1, 1, 1, 1, 1, 1, 0], dtype=torch.int32))
 
+    def test_local_query_slots_use_explicit_global_causal_positions(self):
+        """Interior queries omit future keys even when their row index differs from their global position."""
+        meta, _ = self._fixture()
+        meta = replace(meta, cp_rank=1, q_global_ids=(6, 3, 5, 4), kv_global_ids=(3, 4, 6, 5))
+        indices = torch.tensor([[1, 1, 2, 3], [0, 1, -1, 99]], dtype=torch.int32)[:, None]
+        actual = selected_request_reference(indices, meta, query_ids=(4, 3))
+        torch.testing.assert_close(actual.requests, torch.tensor([[1, 0, 3, 2]], dtype=torch.int64))
+        torch.testing.assert_close(actual.membership, torch.tensor([0, 0, 0, 1, 2, 0, 0, 0], dtype=torch.int32))
+        self.assertEqual((actual.selected_slots, actual.remote_keys, actual.remote_runs), (3, 0, 0))
+        table = torch.full((7, 4), -7, dtype=torch.int64)
+        table[:1] = actual.requests
+        counts = torch.tensor([SELECTED_REQUESTS_MAGIC, 8, 1, 2, 3, 0, 0, 0, 100, 110] + [0] * 6)
+        evidence = validate_selected_requests(indices, meta, table, counts, actual.membership, 8,
+                                              query_ids=(4, 3))
+        self.assertEqual(evidence["unique_keys"], 2)
+        with self.assertRaises(ValueError):
+            validate_selected_requests(indices, meta, table, counts, actual.membership, 8, query_ids=(3, 4))
+
+    def test_empty_local_tile_and_invalid_query_declarations(self):
+        """Zero query rows retain global membership capacity; foreign or duplicate IDs reject."""
+        meta, _ = self._fixture()
+        empty = selected_request_reference(torch.empty(0, 1, 2048, dtype=torch.int32), meta, query_ids=())
+        self.assertEqual(empty.requests.shape, (0, 4))
+        self.assertEqual(empty.membership.shape, (8,))
+        self.assertFalse(bool(empty.membership.any()))
+        for ids in ((0, 0), (3,), (-1,), (7,), (True,)):
+            with self.subTest(ids=ids), self.assertRaises(ValueError):
+                selected_request_reference(torch.empty(len(ids), 1, 1, dtype=torch.int32), meta, query_ids=ids)
+
     def test_count_and_membership_snapshots_reject_stale_or_truncated_records(self):
         """Numerical output cannot replace actual descriptor/count and generation evidence."""
         meta, indices = self._fixture()

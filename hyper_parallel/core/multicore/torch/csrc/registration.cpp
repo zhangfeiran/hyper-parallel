@@ -12,34 +12,37 @@
 #include <torch/library.h>
 
 namespace {
-void register_dsa_probes(torch::Library& m) {
+void register_dsa_probes(torch::Library &m) {
   m.def("dsa_fused_training_version() -> int", []() -> int64_t { return 1; });
-  m.def("dsa_fused_training_out(Tensor index_query, Tensor index_key, Tensor query, Tensor compressed, "
-        "Tensor query_rope, Tensor key_rope, Tensor weights, Tensor lengths, Tensor config, "
-        "Tensor(j!) trace, Tensor(k!) retained, Tensor(l!) kl_retained, int[] kl_lengths, float scale, "
-        "Tensor(a!) indices, Tensor(b!) values, Tensor(c!) attention, Tensor(d!) maximum, Tensor(e!) sum, "
-        "Tensor(f!) grad_index_query, Tensor(g!) grad_index_key, Tensor(h!) grad_weight, Tensor(i!) loss) "
-        "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), "
-        "Tensor(i!), Tensor(j!), Tensor(k!), Tensor(l!))");
-  m.def("dsa_fused_cp_training_out(Tensor index_query, Tensor(m!) index_key, Tensor query, "
-        "Tensor(n!) compressed, Tensor query_rope, Tensor(o!) key_rope, Tensor weights, Tensor lengths, "
-        "Tensor config, Tensor(j!) trace, Tensor(k!) retained, Tensor(l!) kl_retained, int[] kl_lengths, float scale, "
-        "Tensor(a!) indices, Tensor(b!) values, Tensor(c!) attention, Tensor(d!) maximum, Tensor(e!) sum, "
-        "Tensor(f!) grad_index_query, Tensor(g!) grad_index_key, Tensor(h!) grad_weight, Tensor(i!) loss, "
-        "Tensor(p!) arena, Tensor metadata, Tensor requests, Tensor(q!) transport_trace) "
-        "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), "
-        "Tensor(i!), Tensor(j!), Tensor(k!), Tensor(l!))");
+  m.def(
+    "dsa_fused_training_out(Tensor index_query, Tensor index_key, Tensor query, Tensor compressed, "
+    "Tensor query_rope, Tensor key_rope, Tensor weights, Tensor lengths, Tensor config, "
+    "Tensor(j!) trace, Tensor(k!) retained, Tensor(l!) kl_retained, int[] kl_lengths, float scale, "
+    "Tensor(a!) indices, Tensor(b!) values, Tensor(c!) attention, Tensor(d!) maximum, Tensor(e!) sum, "
+    "Tensor(f!) grad_index_query, Tensor(g!) grad_index_key, Tensor(h!) grad_weight, Tensor(i!) loss) "
+    "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), "
+    "Tensor(i!), Tensor(j!), Tensor(k!), Tensor(l!))");
+  m.def(
+    "dsa_fused_cp_training_out(Tensor index_query, Tensor(m!) index_key, Tensor query, "
+    "Tensor(n!) compressed, Tensor query_rope, Tensor(o!) key_rope, Tensor weights, Tensor lengths, "
+    "Tensor config, Tensor(j!) trace, Tensor(k!) retained, Tensor(l!) kl_retained, int[] kl_lengths, float scale, "
+    "Tensor(a!) indices, Tensor(b!) values, Tensor(c!) attention, Tensor(d!) maximum, Tensor(e!) sum, "
+    "Tensor(f!) grad_index_query, Tensor(g!) grad_index_key, Tensor(h!) grad_weight, Tensor(i!) loss, "
+    "Tensor(p!) arena, Tensor metadata, Tensor requests, Tensor(q!) transport_trace) "
+    "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), "
+    "Tensor(i!), Tensor(j!), Tensor(k!), Tensor(l!))");
   m.def("dsa_selected_cp_training_version() -> int", []() -> int64_t { return 1; });
-  m.def("dsa_selected_cp_training_out(Tensor index_query, Tensor(m!) index_key, Tensor query, "
-        "Tensor(n!) compressed, Tensor query_rope, Tensor(o!) key_rope, Tensor weights, Tensor lengths, "
-        "Tensor config, Tensor(j!) trace, Tensor(k!) retained, Tensor(l!) kl_retained, int[] kl_lengths, float scale, "
-        "Tensor(a!) indices, Tensor(b!) values, Tensor(c!) attention, Tensor(d!) maximum, Tensor(e!) sum, "
-        "Tensor(f!) grad_index_query, Tensor(g!) grad_index_key, Tensor(h!) grad_weight, Tensor(i!) loss, "
-        "Tensor(p!) arena, Tensor metadata, Tensor requests, Tensor(q!) transport_trace, "
-        "Tensor selected_rows, Tensor(r!) membership, "
-        "Tensor(s!) selected_requests, Tensor(t!) selected_counts) "
-        "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), "
-        "Tensor(i!), Tensor(j!), Tensor(k!), Tensor(l!))");
+  m.def(
+    "dsa_selected_cp_training_out(Tensor index_query, Tensor(m!) index_key, Tensor query, "
+    "Tensor(n!) compressed, Tensor query_rope, Tensor(o!) key_rope, Tensor weights, Tensor lengths, "
+    "Tensor config, Tensor(j!) trace, Tensor(k!) retained, Tensor(l!) kl_retained, int[] kl_lengths, float scale, "
+    "Tensor(a!) indices, Tensor(b!) values, Tensor(c!) attention, Tensor(d!) maximum, Tensor(e!) sum, "
+    "Tensor(f!) grad_index_query, Tensor(g!) grad_index_key, Tensor(h!) grad_weight, Tensor(i!) loss, "
+    "Tensor(p!) arena, Tensor metadata, Tensor requests, Tensor(q!) transport_trace, "
+    "Tensor selected_rows, Tensor(r!) membership, "
+    "Tensor(s!) selected_requests, Tensor(t!) selected_counts) "
+    "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), "
+    "Tensor(i!), Tensor(j!), Tensor(k!), Tensor(l!))");
   m.def("dsa_selected_cp_forward_version() -> int", []() -> int64_t { return 1; });
   m.def(
     "dsa_selected_cp_forward_out(Tensor index_query, Tensor(m!) index_key, Tensor query, "
@@ -49,65 +52,85 @@ void register_dsa_probes(torch::Library& m) {
     "Tensor(p!) arena, Tensor metadata, Tensor requests, Tensor(q!) transport_trace, "
     "Tensor selected_rows, Tensor(r!) membership, Tensor(s!) selected_requests, Tensor(t!) selected_counts) "
     "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(j!), Tensor(k!))");
+  m.def("dsa_local_cp_forward_version() -> int", []() -> int64_t { return 1; });
+  m.def(
+    "dsa_local_cp_forward_out(Tensor index_query, Tensor(m!) index_key, Tensor query, "
+    "Tensor(n!) compressed, Tensor query_rope, Tensor(o!) key_rope, Tensor weights, Tensor lengths, "
+    "Tensor config, Tensor(j!) trace, Tensor(k!) retained, int[] lengths_host, float scale, "
+    "Tensor(a!) indices, Tensor(b!) values, Tensor(c!) attention, Tensor(d!) maximum, Tensor(e!) sum, "
+    "Tensor(p!) arena, Tensor metadata, Tensor requests, Tensor(q!) transport_trace, "
+    "Tensor selected_rows, Tensor(r!) membership, Tensor(s!) selected_requests, Tensor(t!) selected_counts, "
+    "Tensor query_lengths, Tensor query_positions, Tensor query_ids) "
+    "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(j!), Tensor(k!))");
   m.def("dsa_local_indexer_version() -> int", []() -> int64_t { return 1; });
-  m.def("dsa_local_indexer_out(Tensor query, Tensor key, Tensor weights, Tensor actual_query, Tensor actual_kv, "
-        "Tensor config, Tensor(c!) trace, Tensor(d!) retained, Tensor query_positions, "
-        "Tensor(a!) indices, Tensor(b!) values) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!))");
+  m.def(
+    "dsa_local_indexer_out(Tensor query, Tensor key, Tensor weights, Tensor actual_query, Tensor actual_kv, "
+    "Tensor config, Tensor(c!) trace, Tensor(d!) retained, Tensor query_positions, "
+    "Tensor(a!) indices, Tensor(b!) values) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!))");
   m.def("dsa_mixed_kl_version() -> int", []() -> int64_t { return 1; });
-  m.def("dsa_mixed_kl_out(Tensor query, Tensor key, Tensor index_query, Tensor index_key, Tensor weight, "
-        "Tensor indices, Tensor maximum, Tensor sum, Tensor query_rope, Tensor key_rope, "
-        "int[] actual_query, int[] actual_key, Tensor config, Tensor(e!) trace, Tensor(f!) retained, "
-        "float scale, int phase, Tensor(a!) grad_query, Tensor(b!) grad_key, Tensor(c!) grad_weight, "
-        "Tensor(d!) loss) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!))");
+  m.def(
+    "dsa_mixed_kl_out(Tensor query, Tensor key, Tensor index_query, Tensor index_key, Tensor weight, "
+    "Tensor indices, Tensor maximum, Tensor sum, Tensor query_rope, Tensor key_rope, "
+    "int[] actual_query, int[] actual_key, Tensor config, Tensor(e!) trace, Tensor(f!) retained, "
+    "float scale, int phase, Tensor(a!) grad_query, Tensor(b!) grad_key, Tensor(c!) grad_weight, "
+    "Tensor(d!) loss) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!))");
   m.def("dsa_cp_attention_version() -> int", []() -> int64_t { return 2; });
-  m.def("dsa_cp_attention_out(Tensor query, Tensor(a!) compressed, Tensor query_rope, Tensor(b!) key_rope, "
-        "Tensor indices, Tensor lengths, Tensor config, Tensor(c!) trace, Tensor(d!) arena, Tensor metadata, "
-        "Tensor requests, Tensor(e!) transport_trace, float scale, Tensor(f!) attention, Tensor(g!) maximum, "
-        "Tensor(h!) sum) -> (Tensor(f!), Tensor(g!), Tensor(h!), Tensor(c!), Tensor(e!))");
+  m.def(
+    "dsa_cp_attention_out(Tensor query, Tensor(a!) compressed, Tensor query_rope, Tensor(b!) key_rope, "
+    "Tensor indices, Tensor lengths, Tensor config, Tensor(c!) trace, Tensor(d!) arena, Tensor metadata, "
+    "Tensor requests, Tensor(e!) transport_trace, float scale, Tensor(f!) attention, Tensor(g!) maximum, "
+    "Tensor(h!) sum) -> (Tensor(f!), Tensor(g!), Tensor(h!), Tensor(c!), Tensor(e!))");
   m.def("dsa_fused_grad_version() -> int", []() -> int64_t { return 2; });
-  m.def("dsa_fused_cp_grad_out(Tensor query, Tensor key, Tensor value, Tensor indices, Tensor grad_out, "
-        "Tensor out, Tensor maximum, Tensor sum, Tensor actual_query, Tensor actual_kv, Tensor query_rope, "
-        "Tensor key_rope, Tensor config, Tensor(f!) trace, Tensor(g!) retained, float scale, "
-        "Tensor(a!) grad_query, Tensor(b!) grad_key, Tensor(c!) grad_value, Tensor(d!) grad_query_rope, "
-        "Tensor(e!) grad_key_rope, Tensor(h!) arena, Tensor metadata, Tensor requests, "
-        "Tensor(i!) transport_trace, Tensor(j!) owner_gradient, Tensor(k!) partials) "
-        "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), "
-        "Tensor(j!), Tensor(k!), Tensor(i!))");
+  m.def(
+    "dsa_fused_cp_grad_out(Tensor query, Tensor key, Tensor value, Tensor indices, Tensor grad_out, "
+    "Tensor out, Tensor maximum, Tensor sum, Tensor actual_query, Tensor actual_kv, Tensor query_rope, "
+    "Tensor key_rope, Tensor config, Tensor(f!) trace, Tensor(g!) retained, float scale, "
+    "Tensor(a!) grad_query, Tensor(b!) grad_key, Tensor(c!) grad_value, Tensor(d!) grad_query_rope, "
+    "Tensor(e!) grad_key_rope, Tensor(h!) arena, Tensor metadata, Tensor requests, "
+    "Tensor(i!) transport_trace, Tensor(j!) owner_gradient, Tensor(k!) partials) "
+    "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), "
+    "Tensor(j!), Tensor(k!), Tensor(i!))");
   m.def("dsa_fused_forward_version() -> int", []() -> int64_t { return 2; });
-  m.def("dsa_fused_forward_out(Tensor index_query, Tensor index_key, Tensor query, Tensor compressed, "
-        "Tensor query_rope, Tensor key_rope, Tensor weights, Tensor lengths, Tensor config, "
-        "Tensor(a!) trace, Tensor(b!) retained, float scale, Tensor(c!) indices, Tensor(d!) values, "
-        "Tensor(e!) attention, Tensor(f!) maximum, Tensor(g!) sum) "
-        "-> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
-  m.def("dsa_fused_cp_forward_out(Tensor index_query, Tensor(h!) index_key, Tensor query, Tensor(i!) compressed, "
-        "Tensor query_rope, Tensor(j!) key_rope, Tensor weights, Tensor lengths, Tensor config, "
-        "Tensor(a!) trace, Tensor(b!) retained, float scale, Tensor(c!) indices, Tensor(d!) values, "
-        "Tensor(e!) attention, Tensor(f!) maximum, Tensor(g!) sum, Tensor(k!) arena, Tensor metadata, "
-        "Tensor requests, Tensor(l!) transport_trace) "
-        "-> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
+  m.def(
+    "dsa_fused_forward_out(Tensor index_query, Tensor index_key, Tensor query, Tensor compressed, "
+    "Tensor query_rope, Tensor key_rope, Tensor weights, Tensor lengths, Tensor config, "
+    "Tensor(a!) trace, Tensor(b!) retained, float scale, Tensor(c!) indices, Tensor(d!) values, "
+    "Tensor(e!) attention, Tensor(f!) maximum, Tensor(g!) sum) "
+    "-> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
+  m.def(
+    "dsa_fused_cp_forward_out(Tensor index_query, Tensor(h!) index_key, Tensor query, Tensor(i!) compressed, "
+    "Tensor query_rope, Tensor(j!) key_rope, Tensor weights, Tensor lengths, Tensor config, "
+    "Tensor(a!) trace, Tensor(b!) retained, float scale, Tensor(c!) indices, Tensor(d!) values, "
+    "Tensor(e!) attention, Tensor(f!) maximum, Tensor(g!) sum, Tensor(k!) arena, Tensor metadata, "
+    "Tensor requests, Tensor(l!) transport_trace) "
+    "-> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
   m.def("dsa_mixed_grad_version() -> int", []() -> int64_t { return 2; });
-  m.def("dsa_mixed_grad_out(Tensor query, Tensor key, Tensor value, Tensor indices, Tensor grad_out, "
-        "Tensor out, Tensor maximum, Tensor sum, Tensor actual_query, Tensor actual_kv, Tensor query_rope, "
-        "Tensor key_rope, Tensor config, Tensor(a!) trace, Tensor(b!) retained, float scale, int phase, "
-        "Tensor(c!) grad_query, Tensor(d!) grad_key, Tensor(e!) grad_value, Tensor(f!) grad_query_rope, "
-        "Tensor(g!) grad_key_rope) "
-        "-> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
+  m.def(
+    "dsa_mixed_grad_out(Tensor query, Tensor key, Tensor value, Tensor indices, Tensor grad_out, "
+    "Tensor out, Tensor maximum, Tensor sum, Tensor actual_query, Tensor actual_kv, Tensor query_rope, "
+    "Tensor key_rope, Tensor config, Tensor(a!) trace, Tensor(b!) retained, float scale, int phase, "
+    "Tensor(c!) grad_query, Tensor(d!) grad_key, Tensor(e!) grad_value, Tensor(f!) grad_query_rope, "
+    "Tensor(g!) grad_key_rope) "
+    "-> (Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(a!), Tensor(b!))");
   m.def("dsa_mixed_indexer_version() -> int", []() -> int64_t { return 2; });
-  m.def("dsa_mixed_indexer_out(Tensor query, Tensor key, Tensor weights, Tensor actual_query, "
-        "Tensor actual_kv, Tensor config, Tensor(a!) trace, Tensor(b!) retained, int merge_phase, "
-        "Tensor(c!) indices, Tensor(d!) values) -> (Tensor(c!), Tensor(d!), Tensor(a!), Tensor(b!))");
+  m.def(
+    "dsa_mixed_indexer_out(Tensor query, Tensor key, Tensor weights, Tensor actual_query, "
+    "Tensor actual_kv, Tensor config, Tensor(a!) trace, Tensor(b!) retained, int merge_phase, "
+    "Tensor(c!) indices, Tensor(d!) values) -> (Tensor(c!), Tensor(d!), Tensor(a!), Tensor(b!))");
   m.def("dsa_mixed_tile_version() -> int", []() -> int64_t { return 1; });
-  m.def("dsa_mixed_tile_out(Tensor query, Tensor key, Tensor value, Tensor indices, "
-        "Tensor actual_query, Tensor actual_kv, Tensor query_rope, Tensor key_rope, Tensor config, "
-        "Tensor(a!) trace, float scale, Tensor(b!) out, Tensor(c!) maximum, Tensor(d!) sum) "
-        "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!))");
+  m.def(
+    "dsa_mixed_tile_out(Tensor query, Tensor key, Tensor value, Tensor indices, "
+    "Tensor actual_query, Tensor actual_kv, Tensor query_rope, Tensor key_rope, Tensor config, "
+    "Tensor(a!) trace, float scale, Tensor(b!) out, Tensor(c!) maximum, Tensor(d!) sum) "
+    "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!))");
 }
 }  // namespace
 
 TORCH_LIBRARY(hyper_parallel, m) {
   register_dsa_probes(m);
-  m.def("moe_token_permute_out(Tensor tokens, Tensor indices, Tensor(a!) output, Tensor(b!) mapping) "
-        "-> (Tensor(a!), Tensor(b!))");
+  m.def(
+    "moe_token_permute_out(Tensor tokens, Tensor indices, Tensor(a!) output, Tensor(b!) mapping) "
+    "-> (Tensor(a!), Tensor(b!))");
   m.def(
     "mega_moe_unpermute_grad_out(Tensor permuted_tokens, Tensor grad_output, "
     "Tensor sorted_indices, Tensor probs, Tensor(a!) grad_permuted, Tensor(b!) grad_probs) "

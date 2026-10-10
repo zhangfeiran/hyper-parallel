@@ -68,7 +68,7 @@ class TestLocalQuery(unittest.TestCase):
 
     def test_metadata_mutation_and_replacement_reject_before_loading_native(self):
         """Both in-place mutation and same-version replacement invalidate prepared address tensors."""
-        for name in ("positions", "pack_order", "restore_order", "query_lengths", "key_lengths"):
+        for name in ("positions", "pack_order", "restore_order", "query_lengths", "key_lengths", "global_ids_tensor"):
             for replacement in (False, True):
                 with self.subTest(name=name, replacement=replacement):
                     layout = self._layout()
