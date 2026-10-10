@@ -51,6 +51,7 @@ class DenseBackwardTilePlan:
     aliases: tuple[tuple[int, int], ...]
     tasks: tuple[DenseTileTask, ...]
     event_count: int
+    input_mask: tuple[bool, ...]
 
     def queues(self) -> dict[tuple[str, int], tuple[DenseTileTask, ...]]:
         """先完成全部行窗口，再让 worker 进入完整收缩阶段。"""
@@ -67,7 +68,8 @@ class DenseBackwardTilePlan:
         """展示矩形域、全 token 汇合和转置输出，保留未绑定状态。"""
         return {"format_version": 1, "native_status": "unbound", "execution_mode": "resident_backward_candidate",
                 "numeric_policy": self.backward.forward.ir.numeric_policy, "policy": asdict(self.policy),
-                "output_mask": self.output_mask, "regions": [asdict(region) for region in self.regions],
+                "output_mask": self.output_mask, "input_mask": self.input_mask,
+                "regions": [asdict(region) for region in self.regions],
                 "aliases": self.aliases, "tasks": [asdict(task) for task in self.tasks],
                 "event_count": self.event_count, "event_stride_bytes": 128,
                 "reduction": "complete_contracted_axis_per_output_fragment"}
@@ -149,23 +151,44 @@ def _tasks(backward, policy, regions, producers, defined):
     return tuple(result)
 
 
+def _required_values(backward, defined, input_mask):
+    if (len(input_mask) != len(backward.gradients)
+            or any(type(value) not in (bool,) for value in input_mask)):
+        raise ValueError("Dense gradient input mask must match the input positions")
+    producers = {node.output.id: node for node in backward.nodes}
+    pending = [gradient for gradient, required in zip(backward.gradients, input_mask)
+               if required and gradient in defined]
+    result = set()
+    while pending:
+        value = pending.pop()
+        if value in result:
+            continue
+        result.add(value)
+        if value in producers:
+            pending.extend(item for item in producers[value].inputs if item in defined)
+    return frozenset(result)
+
+
 def compile_dense_backward_tiles(backward: DenseBackwardPlan, policy: DenseTilePolicy = DenseTilePolicy(),
-                                 output_mask: tuple[bool, ...] | None = None) -> DenseBackwardTilePlan:
+                                 output_mask: tuple[bool, ...] | None = None,
+                                 input_mask: tuple[bool, ...] | None = None) -> DenseBackwardTilePlan:
     """按行数据流和完整 token 收缩分阶段，不拆分 BF16 权重梯度的 K 轴。
 
     Args:
         backward: 来自已准入显式 recipe 的完整梯度 SSA。
         policy: 每个矩形域的行高、输出列分区及 worker 数量。
         output_mask: 本次调用各余切的主机存在性；缺省为全部存在。
+        input_mask: 本次调用需要返回的输入梯度；缺省为全部需要。
     """
     if backward != compile_dense_backward(backward.forward):
         raise ValueError("Dense backward tile plan differs from its canonical explicit recipes")
     forward = compile_dense_tiles(backward.forward, policy)
     mask = (True,) * len(backward.seeds) if output_mask is None else output_mask
-    defined = backward.defined_values(mask)
+    requested = (True,) * len(backward.gradients) if input_mask is None else input_mask
+    defined = _required_values(backward, backward.defined_values(mask), requested)
     regions, producers, aliases, count = _regions(backward, policy, set(forward.tiled_values), defined)
     return DenseBackwardTilePlan(backward, policy, mask, regions, aliases,
-                                 _tasks(backward, policy, regions, producers, defined), count)
+                                 _tasks(backward, policy, regions, producers, defined), count, requested)
 
 
 def simulate_dense_backward_tiles(plan: DenseBackwardTilePlan) -> tuple[DenseTileTask, ...]:

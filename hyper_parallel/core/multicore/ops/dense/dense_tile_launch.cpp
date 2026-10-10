@@ -10,7 +10,9 @@
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
+#include "dense/dense_backward_abi.h"
 #include "dense_tile_binary.inc"
+#include "dense_backward_binary.inc"
 
 extern "C" {
 uint32_t RegisterAscendBinary(const char *buffer, size_t size, uint32_t type, void **handle);
@@ -26,15 +28,17 @@ struct KernelState {
   void *handle = nullptr;
 };
 
-void *RegisteredKernel() {
+void *RegisteredKernel(bool backward) {
   // The process owns its registration. Module close cannot unload a kernel still used by a saved graph.
-  static KernelState state;
+  static KernelState forward_state, backward_state;
+  auto &state = backward ? backward_state : forward_state;
   std::lock_guard<std::mutex> guard(state.mutex);
   if (state.handle == nullptr) {
     char error[1024] = {};
     TORCH_CHECK(AscendCheckSoCVersion(HP_DENSE_SOC, error), "Dense compiled/device SoC mismatch: ", error);
-    const auto status =
-      RegisterAscendBinary(reinterpret_cast<const char *>(HP_DENSE_BINARY), sizeof(HP_DENSE_BINARY), 0, &state.handle);
+    const auto *binary = backward ? HP_DENSE_BACKWARD_BINARY : HP_DENSE_BINARY;
+    const auto size = backward ? sizeof(HP_DENSE_BACKWARD_BINARY) : sizeof(HP_DENSE_BINARY);
+    const auto status = RegisterAscendBinary(reinterpret_cast<const char *>(binary), size, 0, &state.handle);
     TORCH_CHECK(status == 0 && state.handle != nullptr, "Dense binary registration failed: ", status);
   }
   return state.handle;
@@ -65,14 +69,14 @@ void CheckMetadata(const at::Tensor &config, const at::Tensor &tilings, const at
               "Invalid dense workspace/overflow storage");
 }
 
-void Launch(const std::vector<at::Tensor> &inputs, const std::vector<at::Tensor> &outputs, const at::Tensor &pointers,
-            const at::Tensor &config, const at::Tensor &tilings, const at::Tensor &events, const at::Tensor &ones,
-            const at::Tensor &workspace, const at::Tensor &overflow, int64_t cube_workers) {
+void LaunchKernel(const std::vector<at::Tensor> &inputs, const std::vector<at::Tensor> &outputs,
+                  const at::Tensor &pointers, const at::Tensor &config, const at::Tensor &tilings,
+                  const at::Tensor &events, const at::Tensor &ones, const at::Tensor &workspace,
+                  const at::Tensor &overflow, int64_t cube_workers, bool backward) {
   TORCH_CHECK(cube_workers > 0 && cube_workers <= 24, "Dense launch requires 1..24 resident cube workers");
   TORCH_CHECK(!inputs.empty() && !outputs.empty() && pointers.scalar_type() == at::kLong &&
                 pointers.numel() == static_cast<int64_t>(inputs.size() + outputs.size()),
               "Invalid dense pointer table");
-  CheckMetadata(config, tilings, events, ones, workspace, overflow);
   std::vector<at::Tensor> retained(inputs);
   retained.insert(retained.end(), outputs.begin(), outputs.end());
   for (const auto &value : retained) {
@@ -87,7 +91,8 @@ void Launch(const std::vector<at::Tensor> &inputs, const std::vector<at::Tensor>
       c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
     }
   }
-  auto handler = [retained, pointers, config, tilings, events, ones, workspace, overflow, cube_workers, stream]() {
+  auto handler = [retained, pointers, config, tilings, events, ones, workspace, overflow,
+                  cube_workers, stream, backward]() {
     void *ffts = nullptr;
     const auto status = GetAscendCoreSyncAddr(&ffts);
     TORCH_CHECK(status == 0 && ffts != nullptr, "Dense core synchronization address failed: ", status);
@@ -99,12 +104,47 @@ void Launch(const std::vector<at::Tensor> &inputs, const std::vector<at::Tensor>
                               ones.data_ptr(),
                               workspace.data_ptr(),
                               overflow.data_ptr()};
-    return static_cast<int>(LaunchAscendKernel(RegisteredKernel(), 0, static_cast<uint32_t>(cube_workers),
+    return static_cast<int>(LaunchAscendKernel(RegisteredKernel(backward), 0, static_cast<uint32_t>(cube_workers),
                                                reinterpret_cast<void **>(&arguments), sizeof(arguments),
                                                stream.stream(false)));
   };
   // TorchNPU queues preceding Tensor copies and this launch in order; the handler retains their storage.
-  at_npu::native::OpCommand::RunOpApiV3("HyperParallelDenseTile", handler, false, &stream);
+  at_npu::native::OpCommand::RunOpApiV3(backward ? "HyperParallelDenseBackward" : "HyperParallelDenseTile",
+                                     handler, false, &stream);
+}
+
+void Launch(const std::vector<at::Tensor> &inputs, const std::vector<at::Tensor> &outputs, const at::Tensor &pointers,
+            const at::Tensor &config, const at::Tensor &tilings, const at::Tensor &events, const at::Tensor &ones,
+            const at::Tensor &workspace, const at::Tensor &overflow, int64_t cube_workers) {
+  CheckMetadata(config, tilings, events, ones, workspace, overflow);
+  LaunchKernel(inputs, outputs, pointers, config, tilings, events, ones, workspace, overflow, cube_workers, false);
+}
+
+void LaunchBackward(const std::vector<at::Tensor> &inputs, const std::vector<at::Tensor> &outputs,
+                    const at::Tensor &pointers, const at::Tensor &config, const at::Tensor &tilings,
+                    const at::Tensor &events, const at::Tensor &ones, const at::Tensor &workspace,
+                    const at::Tensor &overflow, int64_t cube_workers, int64_t operations,
+                    int64_t dependencies, int64_t event_count) {
+  using HyperParallelDense::DENSE_BACKWARD_MAX_OPERATIONS;
+  using HyperParallelDense::DENSE_BACKWARD_MAX_VALUES;
+  using HyperParallelDense::DenseBackwardDependency;
+  using HyperParallelDense::DenseBackwardHeader;
+  using HyperParallelDense::DenseBackwardOperation;
+  TORCH_CHECK(operations > 0 && operations <= DENSE_BACKWARD_MAX_OPERATIONS && dependencies >= 0 &&
+                dependencies <= operations * 2 && event_count >= 0 && event_count <= UINT32_MAX / 32 &&
+                pointers.numel() <= DENSE_BACKWARD_MAX_VALUES,
+              "Invalid dense backward descriptor counts");
+  TORCH_CHECK(config.scalar_type() == at::kByte &&
+                config.numel() == static_cast<int64_t>(sizeof(DenseBackwardHeader)) +
+                                  operations * sizeof(DenseBackwardOperation) +
+                                  dependencies * sizeof(DenseBackwardDependency) &&
+                tilings.scalar_type() == at::kByte && tilings.numel() == operations * HP_DENSE_BANK_STRIDE,
+              "Invalid dense backward task/tiling storage");
+  TORCH_CHECK(events.scalar_type() == at::kInt && events.numel() == event_count * 32 &&
+                ones.scalar_type() == at::kInt && ones.numel() == 8 && workspace.scalar_type() == at::kByte &&
+                overflow.scalar_type() == at::kByte && overflow.numel() == 8,
+              "Invalid dense backward event/workspace storage");
+  LaunchKernel(inputs, outputs, pointers, config, tilings, events, ones, workspace, overflow, cube_workers, true);
 }
 }  // namespace
 
@@ -115,5 +155,12 @@ HP_DENSE_LIBRARY(HP_DENSE_NAMESPACE, module) {
   module.def(
     "launch(Tensor[] inputs, Tensor(a!)[] outputs, Tensor pointers, Tensor config, Tensor tilings, Tensor(b!) events, "
     "Tensor ones, Tensor(c!) workspace, Tensor(d!) overflow, int cube_workers) -> ()");
+  module.def(
+    "launch_backward(Tensor[] inputs, Tensor(a!)[] outputs, Tensor pointers, Tensor config, Tensor tilings, "
+    "Tensor(b!) events, Tensor ones, Tensor(c!) workspace, Tensor(d!) overflow, int cube_workers, "
+    "int operations, int dependencies, int event_count) -> ()");
 }
-HP_DENSE_LIBRARY_IMPL(HP_DENSE_NAMESPACE, PrivateUse1, module) { module.impl("launch", Launch); }
+HP_DENSE_LIBRARY_IMPL(HP_DENSE_NAMESPACE, PrivateUse1, module) {
+  module.impl("launch", Launch);
+  module.impl("launch_backward", LaunchBackward);
+}

@@ -40,6 +40,16 @@ def test_dense_ffn_saved_buffers() -> None:
                   case_name="test_dense_ffn_saved_buffers", master_port=29618, num_proc=1)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+def test_dense_backward_components() -> None:
+    """Feature: 原生反向 worker。
+    Description: 核对完整 K 权重梯度、SDK SwiGLUGrad、梯度累加和跨流队列。
+    Expectation: 与独立原生 autograd 一致，完整 FFN 的未绑定能力保持拒绝。
+    """
+    torchrun_case(file_name=str(Path(__file__).with_name("_dense_backward_impl.py")),
+                  case_name="test_dense_backward_components", master_port=29620, num_proc=1)
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dense_ffn_fully_shard() -> None:
     """Feature: Dense FFN FSDP integration.

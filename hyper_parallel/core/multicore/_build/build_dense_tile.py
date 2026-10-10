@@ -43,10 +43,14 @@ SOURCES = ("ops/dense/dense_tile_abi.h", "ops/dense/dense_tile_kernel.cpp", "ops
            "compiler/dense_tile.py", "backends/dense_tile.py", "runtime/dense_tile.py", "runtime/dense_scratch.py")
 SOURCES += ("ops/dense/dense_access.h", "ops/dense/dense_reference_tiling.cpp", "backends/dense_reference.py",
             "_build/query_dense_reference.py")
+SOURCES += ("ops/dense/dense_backward_abi.h", "ops/dense/dense_backward_kernel.cpp",
+            "ops/dense/dense_backward_vector.h", "compiler/dense_backward.py", "compiler/dense_backward_tiles.py",
+            "backends/dense_backward.py", "runtime/dense_backward.py")
 SDK_LIBRARIES = ("libtiling_api.a", "libplatform.so", "libregister.so", "libascendc_runtime.a",
                  "libascendcl.so", "libruntime.so", "libunified_dlog.so", "libc_sec.so")
 SDK_VERSIONS = ("runtime", "bisheng-compiler", "asc-devkit", "metadef")
 REFERENCE_SDK_SOURCES = (
+    "opp/built-in/op_impl/ai_core/tbe/impl/ops_nn/ascendc/swi_glu_grad/swi_glu_grad_bf16.hpp",
     "python/site-packages/tbe/dsl/static_schedule/gemm_integrated_schedule.py",
     "python/site-packages/tbe/dsl/static_schedule/gemm_integrated_schedule_util.py",
     "python/site-packages/tbe/dsl/unify_schedule/gemm_tilingcase.py",
@@ -138,18 +142,19 @@ def verify_dense_tile_payload(manifest: Path, identity: dict[str, object]) -> di
         path = (manifest.parent / name).resolve()
         if not path.is_relative_to(manifest.parent) or _hash(path) != digest:
             raise ValueError("Resident dense artifact path or integrity mismatch")
-    required = {record["library"], record["tiling_library"], record["reference_library"], record["binary"]}
+    required = {record["library"], record["tiling_library"], record["reference_library"], record["binary"],
+                record["backward_binary"]}
     if not required.issubset(record["files"]):
         raise ValueError("Resident dense manifest omits a required native artifact")
     return record
 
 
-def _extract_binary(archive, directory, soc):
-    stub = directory / "host_stub.o"
-    blob = directory / "kernel-section.bin"
+def _extract_binary(archive, directory, soc, stem="dense_tile", entry="hyper_parallel_dense_tile", symbol="HP_DENSE"):
+    stub = directory / f"{stem}-host-stub.o"
+    blob = directory / f"{stem}-kernel-section.bin"
     with stub.open("wb") as stream:
         subprocess.run(["/usr/bin/ar", "p", str(archive), "host_stub.cpp.o"], stdout=stream, check=True)
-    section = f".ascend.kernel.{soc.lower()}.hyper_parallel_dense_tile"
+    section = f".ascend.kernel.{soc.lower()}.{entry}"
     subprocess.run(["/usr/bin/objcopy", "--dump-section", f"{section}={blob}", str(stub)], check=True)
     data = blob.read_bytes()
     if len(data) < 20:
@@ -157,13 +162,13 @@ def _extract_binary(archive, directory, soc):
     version, count, kind, padded, length = struct.unpack_from("<5I", data)
     if version != 1 or count != 1 or kind != 0 or length == 0 or padded != length or len(data) != 20 + length:
         raise ValueError("Dense standalone SDK mixed-binary section ABI is unsupported")
-    binary = directory / "dense_tile.bin"
+    binary = directory / f"{stem}.bin"
     binary.write_bytes(data[20:])
     literals = [", ".join(f"0x{value:02x}" for value in data[first:first + 16])
                 for first in range(20, len(data), 16)]
-    include = directory / "dense_tile_binary.inc"
-    include.write_text(f'constexpr char HP_DENSE_SOC[] = "{soc.lower()}";\n'
-                       + "alignas(64) constexpr unsigned char HP_DENSE_BINARY[] = {\n"
+    include = directory / f"{stem}_binary.inc"
+    include.write_text(f'constexpr char {symbol}_SOC[] = "{soc.lower()}";\n'
+                       + f"alignas(64) constexpr unsigned char {symbol}_BINARY[] = {{\n"
                        + ",\n".join(literals) + "\n};\n", encoding="utf-8")
     return binary
 
@@ -185,6 +190,9 @@ def _build_payload(cann_root, directory, identity):
     build = _build_sdk(cann_root, directory, soc)
     archive = build / "lib/libhyper_parallel_dense_tile.a"
     binary = _extract_binary(archive, directory, soc)
+    backward_archive = build / "lib/libhyper_parallel_dense_backward.a"
+    backward_binary = _extract_binary(backward_archive, directory, soc, "dense_backward",
+                                      "hyper_parallel_dense_backward", "HP_DENSE_BACKWARD")
     tiler = build / "libhyper_parallel_dense_tiling.so"
     tiling_bytes = DenseSdkTiler(tiler, soc).tiling_bytes
     with (directory / "dense_tile_binary.inc").open("a", encoding="utf-8") as stream:
@@ -196,17 +204,23 @@ def _build_payload(cann_root, directory, identity):
     links = [str(cann_root / "lib64/libascendc_runtime.a"), f"-L{cann_root}/lib64", "-lascendcl", "-lruntime",
              f"-L{npu}/lib", "-ltorch_npu", "-ldl", f"-Wl,-rpath,{cann_root}/lib64", f"-Wl,-rpath,{npu}/lib"]
     library = Path(load(name=namespace, sources=[str(CORE / "ops/dense/dense_tile_launch.cpp")],
-                        extra_include_paths=[str(directory), str(npu / "include"), str(cann_root / "include")],
+                        extra_include_paths=[str(directory), str(CORE / "ops"), str(npu / "include"),
+                                             str(cann_root / "include")],
                         extra_cflags=flags, extra_ldflags=links, build_directory=str(directory),
                         is_python_module=False, verbose=False))
     schema = getattr(torch.ops, namespace).launch.default._schema
     if schema.arguments[0].alias_info is not None or not schema.arguments[1].alias_info.is_write:
         raise ValueError("Resident dense native schema must preserve read-only inputs and declare output writes")
+    backward_schema = getattr(torch.ops, namespace).launch_backward.default._schema
+    if backward_schema.arguments[0].alias_info is not None or not backward_schema.arguments[1].alias_info.is_write:
+        raise ValueError("Resident backward schema must declare borrowed inputs and output writes")
     reference = build / "libhyper_parallel_dense_reference.so"
-    artifacts = (library, tiler, reference, binary, archive, directory / "dense_tile_binary.inc")
+    artifacts = (library, tiler, reference, binary, archive, directory / "dense_tile_binary.inc",
+                 backward_binary, backward_archive, directory / "dense_backward_binary.inc")
     return {"format_version": 1, "execution_mode": "resident_dense_tile_candidate", "device_status": "unvalidated",
             "identity": identity, "namespace": namespace, "library": str(library.relative_to(directory)),
             "tiling_library": str(tiler.relative_to(directory)), "binary": str(binary.relative_to(directory)),
+            "backward_binary": str(backward_binary.relative_to(directory)),
             "reference_library": str(reference.relative_to(directory)),
             "files": {str(path.relative_to(directory)): _hash(path) for path in artifacts}}
 

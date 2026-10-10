@@ -14,11 +14,11 @@ platform_ascendc::PlatformAscendC *Platform(const char *soc) {
 }
 
 bool Configure(matmul_tiling::MatmulApiTilingBase &builder, uint32_t rows, uint32_t tile_rows, uint32_t columns,
-               uint32_t tile_columns, uint32_t contracted, bool transpose_right) {
+               uint32_t tile_columns, uint32_t contracted, bool transpose_right, bool transpose_left = false) {
   using matmul_tiling::CubeFormat;
   using matmul_tiling::DataType;
   using matmul_tiling::TPosition;
-  return builder.SetAType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, false) == 0 &&
+  return builder.SetAType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, transpose_left) == 0 &&
          builder.SetBType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, transpose_right) == 0 &&
          builder.SetCType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16) == 0 &&
          builder.SetShape(tile_rows, tile_columns, contracted) == 0 &&
@@ -36,6 +36,28 @@ extern "C" int hyper_parallel_dense_platform(const char *soc, uint32_t *cube_wor
   *cube_workers = platform->GetCoreNumAic();
   *workspace_bytes = platform->GetLibApiWorkSpaceSize();
   *tiling_bytes = sizeof(AscendC::tiling::TCubeTiling);
+  return 0;
+}
+
+extern "C" int hyper_parallel_dense_backward_tiling(const char *soc, uint32_t rows, uint32_t tile_rows,
+                                                     uint32_t columns, uint32_t tile_columns, uint32_t contracted,
+                                                     uint32_t transpose_left, uint32_t transpose_right,
+                                                     void *output, uint32_t capacity) {
+  auto *platform = Platform(soc);
+  if (platform == nullptr || output == nullptr || capacity != sizeof(AscendC::tiling::TCubeTiling) || rows == 0 ||
+      tile_rows == 0 || tile_rows > rows || columns == 0 || tile_columns == 0 || tile_columns > columns ||
+      contracted == 0 || transpose_left > 1 || transpose_right != 0) {
+    return -1;
+  }
+  matmul_tiling::MatmulApiTiling builder(*platform);
+  if (!Configure(builder, rows, tile_rows, columns, tile_columns, contracted, false, transpose_left != 0)) {
+    return -2;
+  }
+  AscendC::tiling::TCubeTiling tiling{};
+  if (builder.GetTiling(tiling) != 0) {
+    return -3;
+  }
+  std::memcpy(output, &tiling, sizeof(tiling));
   return 0;
 }
 

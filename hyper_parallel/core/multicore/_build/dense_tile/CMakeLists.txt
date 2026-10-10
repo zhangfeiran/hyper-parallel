@@ -26,6 +26,12 @@ ascendc_library(hyper_parallel_dense_tile STATIC
 ascendc_include_directories(hyper_parallel_dense_tile PRIVATE
     ${HP_DENSE_SOURCE_ROOT}/.. ${HP_ASCEND_ARCH_ROOT})
 
+ascendc_library(hyper_parallel_dense_backward STATIC
+    ${HP_DENSE_SOURCE_ROOT}/dense_backward_kernel.cpp)
+ascendc_include_directories(hyper_parallel_dense_backward PRIVATE
+    ${HP_DENSE_SOURCE_ROOT}/.. ${HP_ASCEND_ARCH_ROOT}
+    ${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/ai_core/tbe/impl/ops_nn/ascendc)
+
 add_library(hyper_parallel_dense_tiling SHARED
     ${HP_DENSE_SOURCE_ROOT}/dense_tile_tiling.cpp)
 target_include_directories(hyper_parallel_dense_tiling PRIVATE
