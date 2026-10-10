@@ -241,10 +241,11 @@ def _compose_hyper_parallel_ops(
     _compose_fused_training(source_root, transformer_copy)
     _compose_fused_grad(source_root, transformer_copy)
     _compose_cp_attention(source_root, transformer_copy)
+    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_index_grad_return", source_root / "hyper_dsa_index_grad_return")
     for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad", "hyper_dsa_mixed_kl",
                  "hyper_dsa_local_mixed_kl",
                  "hyper_dsa_fused_forward", "hyper_dsa_fused_training", "hyper_dsa_fused_grad",
-                 "hyper_dsa_cp_attention"):
+                 "hyper_dsa_cp_attention", "hyper_dsa_index_grad_return"):
         runtime = source_root / name / "op_kernel" / "runtime"
         runtime.mkdir()
         shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_mixed_group.h", runtime / "dsa_mixed_group.h")
@@ -252,6 +253,9 @@ def _compose_hyper_parallel_ops(
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_transport.h", runtime / "dsa_cp_transport.h")
         if name == "hyper_dsa_fused_grad":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_grad_transport.h", runtime / "dsa_cp_grad_transport.h")
+        if name == "hyper_dsa_index_grad_return":
+            shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_index_grad_transport.h",
+                         runtime / "dsa_index_grad_transport.h")
         if name == "hyper_dsa_fused_training":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_selected_requests.h", runtime / "dsa_selected_requests.h")
 
@@ -408,6 +412,9 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_dsa_fused_training" / "op_kernel" / "hyper_dsa_fused_training.cpp",
         source_root / "hyper_dsa_fused_grad" / "op_kernel" / "hyper_dsa_fused_grad.cpp",
         source_root / "hyper_dsa_cp_attention" / "op_kernel" / "hyper_dsa_cp_attention.cpp",
+        source_root / "hyper_dsa_index_grad_return" / "op_host" / "hyper_dsa_index_grad_return_tiling.h",
+        source_root / "hyper_dsa_index_grad_return" / "op_kernel" / "hyper_dsa_index_grad_return.cpp",
+        source_root / "hyper_dsa_index_grad_return" / "op_kernel" / "runtime" / "dsa_index_grad_transport.h",
         source_root / "shmem" / "data_plane" / "rma.h",
         source_root / "shmem" / "data_plane" / "sync.h",
         source_root / "hyper_dsa_mixed_tile" / "op_kernel" / "hyper_dsa_mixed_tile.cpp",

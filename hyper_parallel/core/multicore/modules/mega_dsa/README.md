@@ -1805,8 +1805,8 @@ Kernel 系统 workspace 与调用方算术 scratch 分别申请。结果持有 m
 
 本版使用完整 key 的 owner 归还：每个 peer 的 FP32 dK/dV 先合并一次，再按 rank 顺序累加到 owner，
 最后转换为 BF16 并恢复 owner 的输入排列。该原始接口不负责 autograd 或 KL；主注意力的
-实验性 autograd 接口见下一节。稀疏梯度归还仍未实现，不能据此宣称完整 local LM+KL 训练
-或训练步性能收益。
+实验性 autograd 接口见下一节。该原始接口默认使用完整归还；后文分别说明 main 与 index-K
+的可选稀疏归还。原始接口的证据不构成完整 local LM+KL 模型或训练步性能验收。
 
 [设备验证器](../../examples/mega_dsa_local_cp_backward_validate.py) 比较 local 和 global-query
 原始梯度、检查独立 FP32 oracle、精确 FP32 owner 累加顺序和字节数，并覆盖延迟 backward、重复
@@ -1940,7 +1940,8 @@ profile，也不改变其独立生命周期验收范围。
 index-Q、完整 global-packed index-K、caller-ordered local merge weight。仅 index-K 进入一次
 owner reduce-scatter；Q 和 weight 保持本地 query 排列，支持完整 owner 集合、query subset、
 空 tile 和空 owner。K 按声明的 owner KV 存储顺序恢复，并在求和后转换为原输入 dtype。
-FP64 CPU oracle 保留 FP64 accumulation。该路径使用完整 K partial buffer，尚非稀疏归还。
+FP64 CPU oracle 保留 FP64 accumulation。该默认路径使用完整 K partial buffer；后文的
+`sparse_index_return=True` 使用独立设备端稀疏归还。
 Layer/microbatch/invocation 可以推进并复用同一 owner geometry；过时 heap generation、
 其他 topology/layout ID 或 KV 存储排列仍会拒绝。
 调用身份复用修正通过 CPU 回归和 CP2 HCCL 的 8 个场景、24 个字段位精确检查。
@@ -2017,8 +2018,9 @@ baseline 比较，同时检查转换前 FP32 K、三阶段闭包、重复调用�
 contiguous/strided/empty ownership、owner/interior/first-sequence/empty query tiles，以及保留两次
 forward 后的独立校验。运行时加载的库、冻结载荷的 87 个文件及提交验收前的验证源码 SHA
 均已核对。上述短 packed `(3,10)` 矩阵不建立长上下文或完整训练正确性。
-该 producer 已接入下述 local LM+KL autograd，尚未合并至 forward 的单 kernel task graph。稀疏梯度归还、
-长上下文、模型验收和 full-step 性能/HBM 证据仍需独立完成。
+该独立 producer 已接入下述 local LM+KL autograd；后文给出 `fused_kl=True` 的 forward
+单 kernel task graph 及两条可选稀疏归还路径。长上下文、模型验收和 full-step 性能/HBM
+证据分别记录。
 
 ## Local LM+KL 的 first-order 训练桥
 
@@ -2244,7 +2246,8 @@ Trace 分开记录实际行 payload、counter 的逻辑控制字节、清零与 
 
 `FusedDsaLocalCpTrainingProbe(..., sparse_main_return=True)` 可与 `fused_kl=True` 组合。该
 选择参与冷准备声明和 forward 前的能力检查；main 的 owner 求和使用 protocol 2，而
-index-K 继续完整 owner reduction。训练矩阵入口提供 `--sparse-main-return`，仍需使用
+index-K 默认继续完整 owner reduction，或通过后文的 `sparse_index_return=True` 切换归还。
+训练矩阵入口提供 `--sparse-main-return`，仍需使用
 当前载荷独立校准的 reference profile。
 
 [mega_dsa_sparse_main_return_validate.py](../../examples/mega_dsa_sparse_main_return_validate.py)
@@ -2261,3 +2264,49 @@ case，合计 2100 个 rank-case。覆盖 1/7/19 compute groups、H32/H64、四�
 每 rank 144 步，CP2/CP4 每 rank 288 步，合计 1872 个 rank-step；源码、运行库 SHA、
 forward 阶段数及原 pointwise 结果均已核对。该证据仍限定在短序列 fixed-Native-value
 projection VJP；性能、完整模型和发布计划中的 8K/32K/128K 需要独立验收。
+
+## Index-K gradient 的设备端稀疏归还
+
+`FusedDsaLocalCpTrainingProbe(..., sparse_index_return=True)` 将已乘 coefficient、
+normalization 和 upstream 的 global-packed FP32 index-K partials 交给独立 native
+归还算子。每个 sender 只发送数值非零的 `[128]` 行；`+0`、`-0` 可省略，NaN/Inf
+仍作为非零数据发送。owner 按 CP sender `0..CP-1` 顺序作 FP32 汇总，再由 Torch
+转换一次到输入 dtype 并恢复 caller KV 顺序。该接口不再次缩放，不调用完整 K
+reduce-scatter。默认路径继续使用已有完整归还。
+
+该协议复用每个 sender 的 `[704]` FP32 inbox 行中最后 128 个元素；行计数位于
+该 sender stripe 第一行的 main-gradient 区域。owner 在发布 ready 前清零有效 owner
+行，sender 发布数据和计数后进入 write barrier，owner 汇总后通过 ACK 才允许复用。
+main 与 index 归还必须以各 CP 成员一致的顺序执行，使用独立 epoch 和 protocol
+identity。支持范围为 CP≤8；每个成员都参与，包括空 query 和空 owner。零 coefficient
+在全体成员上没有 KL 贡献，保持现有直接返回零梯度的行为。
+
+[mega_dsa_sparse_index_return_validate.py](../../examples/mega_dsa_sparse_index_return_validate.py)
+以受控 FP32 partials 独立检查固定 sender 顺序的 owner sum、真实非零行与 512-byte
+payload 计数、ready/write/ACK 和非零→零→非零复用。完整 owner 的独立 reference
+矩阵提供 `--fused-kl`、`--sparse-main-return`、`--sparse-index-return` 三个开关；
+subset/zero-coefficient 的 Native-to-Native 矩阵固定启用融合 KL，并提供两条稀疏归还开关。
+正式冻结载荷包含 91 个文件，已完成 CP1/CP2/CP4 的回传矩阵：每 rank 80 个 case，
+合计 560 个 rank-case。覆盖短 packed `(3,10)` 的四种 ownership、长历史 `(3,2113)`、
+四种 query tile，以及受控 partials 的 signed zero/NaN/Inf 和真实融合 KL partials。
+固定 sender 顺序的转换前 FP32 owner sum 逐项数值精确一致，main/index 交替复用、
+实际非零行 payload 计数及 ready/write/ACK 均通过。trace 分别记录每行 512-byte 数据
+payload 和逻辑 counter 控制字节；链路流量与延迟由独立性能测量记录。
+
+同载荷完成 576 个样本、12 个精度桶的独立 projection reference 校准，保持原 consumption
+policy。设备验收与源码/载荷 SHA 存于
+`build/native/validation/mega-dsa-index-return-fixed-20261011/`。
+
+同一载荷上，`fused_kl=True`、`sparse_main_return=True`、`sparse_index_return=True` 的
+完整 owner 训练矩阵在 CP1/CP2/CP4 全部通过，合计 1872 个 rank-step；涵盖 H32/H64、
+BF16/FP32 merge weight、四种 ownership、LM-only/KL-only/LM+KL、sum/average reducer
+及 plain/retained/checkpoint。验收保留原 pointwise 结果，使用上述独立校准的 fixed-Native-value
+projection VJP consumption policy；这不是完整 BF16 projection composition 验收。
+
+另以 masked global Native VJP 校验 subset/zero-coefficient 矩阵，合计 14976 个 rank-step
+全部通过；增加 coefficient `0/.3`、owner/interior/first_sequence/empty 四种 query tile，
+并要求关闭的 auxiliary 梯度及 loss 精确为零。该矩阵使用 Native-to-Native 参考，
+不借用完整 query 的 FP64 校准预算。Retained backward 插入一轮六阶段 forward 后仍消费
+原保存状态；checkpoint 的两轮启用 KL forward 均为九阶段。
+
+以上回传、校准与训练证据不建立完整模型、CP8、8K/32K/128K 或训练性能验收。

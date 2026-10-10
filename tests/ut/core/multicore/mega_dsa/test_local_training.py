@@ -108,10 +108,11 @@ class TestLocalTraining(SharedRootFixture):
                           for shape, value in zip(((rows, 32, 512), (3, 512), (rows, 32, 64), (3, 64)), (2, 3, 5, 7)))
         return SimpleNamespace(gradients=gradients)
 
-    def _probe(self, coefficient=.7, mode="lm_plus_kl", divisor=1, fused_kl=False, sparse_main_return=False):
+    def _probe(self, coefficient=.7, mode="lm_plus_kl", divisor=1, fused_kl=False, sparse_main_return=False,
+               sparse_index_return=False):
         probe = local_training.FusedDsaLocalCpTrainingProbe(
             self.backend, normalization=DsaLossNormalization(3, divisor), loss_coeff=coefficient, mode=mode,
-            fused_kl=fused_kl, sparse_main_return=sparse_main_return)
+            fused_kl=fused_kl, sparse_main_return=sparse_main_return, sparse_index_return=sparse_index_return)
         patch.object(probe.backward_backend, "_backward_saved", side_effect=self._main_backward).start()
         return probe
 
@@ -136,6 +137,51 @@ class TestLocalTraining(SharedRootFixture):
         torch.testing.assert_close(gradients[5], expected, rtol=0, atol=0)
         torch.testing.assert_close(gradients[4], torch.full_like(inputs[4], 2*scale))
         torch.testing.assert_close(gradients[6], torch.full_like(inputs[6], 5*scale))
+
+    def test_sparse_index_returns_scaled_fp32_without_dense_collective(self):
+        """Empty query members still receive owner sums; coefficient and upstream apply before transport."""
+        for ids in ((2, 0), ()):
+            with self.subTest(ids=ids):
+                layout, inputs = self._inputs(ids)
+                probe = self._probe(divisor=2, sparse_index_return=True)
+                received = self.key_partials[list(self.meta.kv_global_ids)] * .1937
+                with patch.object(probe.index_return_backend, "return_owner",
+                                  return_value=SimpleNamespace(owner_fp32=received)) as returned, \
+                        patch.object(self.backend.layout, "reduce_local_index_gradients",
+                                     side_effect=AssertionError("dense owner collective")):
+                    output, loss = probe.forward(self.invocation, inputs[:4], inputs[4:], query_layout=layout)
+                    actual = torch.autograd.grad(output.sum()+loss*-1.75, inputs)
+                returned.assert_called_once()
+                partial = returned.call_args.args[1]
+                self.assertEqual(partial.dtype, torch.float32)
+                self.assertFalse(partial.requires_grad)
+                expected = self.key_partials*(.7*2/3)*-1.75 if ids else torch.zeros_like(self.key_partials)
+                torch.testing.assert_close(partial, expected, rtol=0, atol=0)
+                torch.testing.assert_close(actual[5], received.bfloat16(), rtol=0, atol=0)
+                torch.testing.assert_close(actual[4], torch.full_like(inputs[4], 2*(.7*2/3)*-1.75))
+
+    def test_sparse_index_capability_rejects_before_forward(self):
+        """Unsupported index return cannot begin forward or fall back to a dense collective."""
+        layout, inputs = self._inputs()
+        probe = self._probe(mode="kl_only", sparse_index_return=True)
+        probe.check_native_support = MethodType(_CHECK_NATIVE_SUPPORT, probe)
+        with patch.object(probe.index_return_backend, "check_native_support",
+                          side_effect=RuntimeError("index-K return requires adapter ABI 1")), \
+                patch.object(self.backend, "forward_local") as forward:
+            with self.assertRaisesRegex(RuntimeError, "index-K return requires"):
+                probe.forward(self.invocation, inputs[:4], inputs[4:], query_layout=layout)
+            forward.assert_not_called()
+
+    def test_sparse_index_zero_coefficient_skips_return(self):
+        """A collectively zero KL coefficient needs no index transport and produces exact zeros."""
+        layout, inputs = self._inputs()
+        probe = self._probe(coefficient=0., mode="kl_only", sparse_index_return=True)
+        with patch.object(probe.index_return_backend, "return_owner",
+                          side_effect=AssertionError("zero KL entered transport")):
+            _, loss = probe.forward(self.invocation, inputs[:4], inputs[4:], query_layout=layout)
+            actual = torch.autograd.grad(loss, inputs[4:])
+        for value, original in zip(actual, inputs[4:]):
+            torch.testing.assert_close(value, torch.zeros_like(original), rtol=0, atol=0)
 
     def test_modes_scaling_zero_coefficient_and_empty_query(self):
         """One coefficient, one global denominator and one upstream scale reach each contribution."""

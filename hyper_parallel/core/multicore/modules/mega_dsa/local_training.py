@@ -29,6 +29,9 @@ from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp import (
 from hyper_parallel.core.multicore.modules.mega_dsa.fused_cp_backward import (
     FusedDsaCpBackwardProbe,
 )
+from hyper_parallel.core.multicore.modules.mega_dsa.index_return import (
+    SparseIndexGradReturnProbe,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.local_kl import (
     LocalKlResult,
     local_kl_gradients,
@@ -124,7 +127,13 @@ class _LocalCpTraining(torch.autograd.Function):
         if ctx.index_enabled and ctx.has_index_gradients:
             upstream = (tensors[15].new_zeros(()) if grad_loss is None else grad_loss.detach())
             gradients = tuple(tensor * upstream for tensor in tensors[15:])
-            index = backend.layout.reduce_local_index_gradients(gradients, ctx.batch_meta, ctx.index_dtypes)
+            if ctx.probe.sparse_index_return:
+                returned = ctx.probe.index_return_backend.return_owner(
+                    backend.workspace.prepare(ctx.batch_meta), gradients[1].contiguous())
+                index = (gradients[0].to(ctx.index_dtypes[0]), returned.owner_fp32.to(ctx.index_dtypes[1]),
+                         gradients[2].to(ctx.index_dtypes[2]))
+            else:
+                index = backend.layout.reduce_local_index_gradients(gradients, ctx.batch_meta, ctx.index_dtypes)
         elif ctx.index_enabled:
             # The collectively declared zero coefficient has no contribution on any member.
             index = tuple(torch.zeros_like(tensor) for tensor in tensors[4:7])
@@ -135,10 +144,11 @@ class FusedDsaLocalCpTrainingProbe:
     """Local LI/pull/SFA training with raw native selected KL and independent gradient consumers.
 
     Selected KL can run in the forward graph with ``fused_kl=True`` or through
-    separately submitted phases. Both retain complete index-K owner reduction.
-    ``sparse_main_return=True`` omits zero merged main-gradient rows; index-K
-    still uses complete owner reduction. Mode, coefficient, normalization,
-    fusion and main-gradient return are collectively declared at
+    separately submitted phases. The default index-K path reduces the complete
+    partial buffer; ``sparse_index_return=True`` sends nonzero FP32 index-K rows
+    and casts after ordered owner accumulation. ``sparse_main_return=True``
+    omits zero merged main-gradient rows. Mode, coefficient, normalization,
+    fusion and both gradient-return choices are collectively declared at
     construction. Every member must enter the same forward/backward schedule,
     including empty owners, with compatible requires-grad policies. Projection
     callers detach hidden states before index projection so auxiliary gradients
@@ -147,7 +157,7 @@ class FusedDsaLocalCpTrainingProbe:
 
     def __init__(self, forward: FusedDsaCpForwardProbe, *, normalization: DsaLossNormalization,
                  loss_coeff: float = 1.0, mode: str = "lm_plus_kl", fused_kl: bool = False,
-                 sparse_main_return: bool = False) -> None:
+                 sparse_main_return: bool = False, sparse_index_return: bool = False) -> None:
         """Cold prepare a common objective contract before any native transport or training step."""
         if mode not in ("lm_only", "kl_only", "lm_plus_kl"):
             raise ValueError("local CP training mode must be lm_only, kl_only or lm_plus_kl")
@@ -163,7 +173,9 @@ class FusedDsaLocalCpTrainingProbe:
             raise ValueError("local fused KL selection must be a boolean")
         if not isinstance(sparse_main_return, bool):
             raise ValueError("local sparse main-gradient return must be a boolean")
-        declaration = (mode, float(loss_coeff), normalization, fused_kl, sparse_main_return)
+        if not isinstance(sparse_index_return, bool):
+            raise ValueError("local sparse index-gradient return must be a boolean")
+        declaration = (mode, float(loss_coeff), normalization, fused_kl, sparse_main_return, sparse_index_return)
         peers = [declaration]
         if forward.layout.cp_size > 1:
             peers = [None]*forward.layout.cp_size
@@ -172,17 +184,19 @@ class FusedDsaLocalCpTrainingProbe:
             raise ValueError("CP members disagree on the prepared local training objective")
         self.forward_backend = forward
         self.backward_backend = FusedDsaCpBackwardProbe(forward, sparse_return=sparse_main_return)
+        self.index_return_backend = SparseIndexGradReturnProbe(forward) if sparse_index_return else None
         self.normalization = normalization
         self.loss_coeff = float(loss_coeff)
         self.mode = mode
         self.fused_kl = fused_kl
         self.sparse_main_return = sparse_main_return
+        self.sparse_index_return = sparse_index_return
         self._declaration = declaration
 
     def check_native_support(self) -> None:
         """Admit all needed native ABIs before acquiring the forward workspace lease."""
         if self._declaration != (self.mode, self.loss_coeff, self.normalization, self.fused_kl,
-                                 self.sparse_main_return):
+                                 self.sparse_main_return, self.sparse_index_return):
             raise ValueError("local training objective was modified; prepare a new probe")
         if (not isinstance(self.sparse_main_return, bool)
                 or self.backward_backend.sparse_return != self.sparse_main_return):
@@ -195,6 +209,8 @@ class FusedDsaLocalCpTrainingProbe:
                 if version is None or version() != 1:
                     raise RuntimeError("sparse main-gradient return requires adapter ABI 1; rebuild this payload")
         if self.mode != "lm_only" and self.loss_coeff:
+            if self.sparse_index_return:
+                self.index_return_backend.check_native_support()
             _load_native()
             name = "dsa_local_cp_training_version" if self.fused_kl else "dsa_local_mixed_kl_version"
             version = getattr(torch.ops.hyper_parallel, name, None)

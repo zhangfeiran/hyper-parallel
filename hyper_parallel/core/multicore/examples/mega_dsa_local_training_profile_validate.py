@@ -51,7 +51,7 @@ from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
 from hyper_parallel.core.multicore.shmem.consumer import SharedShmemRoot
 
 
-def _fixture(report, heads, dtype, pattern, budgets, fused_kl, sparse_main_return):
+def _fixture(report, heads, dtype, pattern, budgets, fused_kl, sparse_main_return, sparse_index_return):
     device = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
     rank, size = dist.get_rank(), dist.get_world_size()
     meta = validation._metadata((3, 10), pattern, size, rank)
@@ -75,7 +75,8 @@ def _fixture(report, heads, dtype, pattern, budgets, fused_kl, sparse_main_retur
                     evidence = validation._step(workspace, backend, meta, geometry, fixture, tile_mode="owner",
                                                 weight_dtype=dtype, mode=mode, coefficient=.3, auxiliary=-2.5,
                                                 divisor=divisor, replay=replay, precision_budgets=budgets,
-                                                fused_kl=fused_kl, sparse_main_return=sparse_main_return)
+                                                fused_kl=fused_kl, sparse_main_return=sparse_main_return,
+                                                sparse_index_return=sparse_index_return)
                     report["cases"].append({**stage, **evidence})
                     if not evidence["passed"]:
                         raise RuntimeError(f"calibrated complete-query projection matrix failed: {evidence}")
@@ -85,13 +86,13 @@ def _fixture(report, heads, dtype, pattern, budgets, fused_kl, sparse_main_retur
 
 
 def run_validation(report: dict, reference_profile: Path, policy_sha256: str, *, fused_kl: bool = False,
-                   sparse_main_return: bool = False) -> None:
+                   sparse_main_return: bool = False, sparse_index_return: bool = False) -> None:
     """Check sum/average reducers, empty owners and replay without applying the profile to subsets."""
     torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     dist.init_process_group("hccl", timeout=timedelta(minutes=10))
     report.update(rank=dist.get_rank(), cp_size=dist.get_world_size(), cases=[], full_model_acceptance=False,
                   bf16_projection_composition_acceptance=False, scope="complete-query CP projection VJP matrix",
-                  fused_kl=fused_kl, sparse_main_return=sparse_main_return)
+                  fused_kl=fused_kl, sparse_main_return=sparse_main_return, sparse_index_return=sparse_index_return)
     try:
         profile = json.loads(reference_profile.read_text())
         libraries = {name: hashlib.sha256(Path(name).read_bytes()).hexdigest()
@@ -105,7 +106,7 @@ def run_validation(report: dict, reference_profile: Path, policy_sha256: str, *,
         for heads in (32, 64):
             for dtype in (torch.bfloat16, torch.float32):
                 for pattern in ("contiguous", "strided", "zigzag", "empty"):
-                    _fixture(report, heads, dtype, pattern, budgets, fused_kl, sparse_main_return)
+                    _fixture(report, heads, dtype, pattern, budgets, fused_kl, sparse_main_return, sparse_index_return)
         loaded = validation._loaded_library_identity()
         validate_loaded_projection_reference(profile, loaded)
         report.update(status="passed", loaded_library_sha256=loaded)
@@ -121,11 +122,13 @@ def main() -> None:
     parser.add_argument("--profile-policy-sha256", required=True)
     parser.add_argument("--fused-kl", action="store_true", help="Use one native LI/pull/SFA/KL forward graph")
     parser.add_argument("--sparse-main-return", action="store_true", help="Omit zero merged main-gradient rows")
+    parser.add_argument("--sparse-index-return", action="store_true",
+                        help="Return index-K FP32 rows through device inboxes")
     args = parser.parse_args()
     report = {"status": "running", "full_model_acceptance": False}
     try:
         run_validation(report, args.reference_profile, args.profile_policy_sha256, fused_kl=args.fused_kl,
-                       sparse_main_return=args.sparse_main_return)
+                       sparse_main_return=args.sparse_main_return, sparse_index_return=args.sparse_index_return)
     except Exception as error:
         report.update(status="error", error=repr(error), traceback=traceback.format_exc())
         raise

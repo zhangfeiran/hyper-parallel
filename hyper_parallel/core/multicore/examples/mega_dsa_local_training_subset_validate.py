@@ -168,7 +168,7 @@ def _guarded_check(*args, **kwargs):
     return collective_validation_check(partial(_check_native, *args, **kwargs))
 
 
-def _fixture(report, heads, dtype, pattern, smoke):
+def _fixture(report, heads, dtype, pattern, smoke, sparse_main_return=False, sparse_index_return=False):
     device = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
     size, rank = dist.get_world_size(), dist.get_rank()
     meta = validation._metadata((3, 10), pattern, size, rank)
@@ -197,7 +197,8 @@ def _fixture(report, heads, dtype, pattern, smoke):
             report["stage"] = stage
             evidence = _TRAINING_STEP(workspace, backend, meta, geometry, fixture, tile_mode=tile,
                                       weight_dtype=dtype, mode=mode, coefficient=coefficient, auxiliary=-2.5,
-                                      divisor=divisor, replay=replay, fused_kl=True)
+                                      divisor=divisor, replay=replay, fused_kl=True,
+                                      sparse_main_return=sparse_main_return, sparse_index_return=sparse_index_return)
             report["cases"].append({**stage, **evidence})
             if not evidence["passed"]:
                 raise RuntimeError(f"masked global native projection VJP mismatch: {evidence}")
@@ -211,18 +212,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--sparse-main-return", action="store_true")
+    parser.add_argument("--sparse-index-return", action="store_true")
     args = parser.parse_args()
     report = {"status": "running", "scope": "subset/zero-coefficient fixed-value native projection VJP",
               "full_model_acceptance": False, "bf16_projection_composition_acceptance": False}
     try:
         torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
         dist.init_process_group("hccl", timeout=timedelta(minutes=10))
-        report.update(rank=dist.get_rank(), cp_size=dist.get_world_size(), cases=[])
+        report.update(rank=dist.get_rank(), cp_size=dist.get_world_size(), cases=[],
+                      sparse_main_return=args.sparse_main_return, sparse_index_return=args.sparse_index_return)
         fixtures = [(32, torch.float32, "strided")] if args.smoke else product(
             (32, 64), (torch.bfloat16, torch.float32), ("contiguous", "strided", "zigzag", "empty"))
         with patch.object(validation, "_check", side_effect=_guarded_check):
             for heads, dtype, pattern in fixtures:
-                _fixture(report, heads, dtype, pattern, args.smoke)
+                _fixture(report, heads, dtype, pattern, args.smoke, args.sparse_main_return, args.sparse_index_return)
         report.update(status="passed", loaded_library_sha256=validation._loaded_library_identity())
     except Exception as error:
         report.update(status="error", error=repr(error), traceback=traceback.format_exc())

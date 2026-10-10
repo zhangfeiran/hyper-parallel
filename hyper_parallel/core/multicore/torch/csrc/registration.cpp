@@ -102,6 +102,10 @@ void register_dsa_probes(torch::Library &m) {
     "Tensor(h!) sum) -> (Tensor(f!), Tensor(g!), Tensor(h!), Tensor(c!), Tensor(e!))");
   m.def("dsa_fused_grad_version() -> int", []() -> int64_t { return 2; });
   m.def("dsa_sparse_cp_grad_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_sparse_index_grad_version() -> int", []() -> int64_t { return 1; });
+  m.def(
+    "dsa_sparse_index_grad_out(Tensor gradient, Tensor(a!) arena, Tensor metadata, Tensor requests, "
+    "Tensor(b!) trace, Tensor(c!) owner) -> (Tensor(c!), Tensor(b!))");
   m.def(
     "dsa_fused_cp_grad_out(Tensor query, Tensor key, Tensor value, Tensor indices, Tensor grad_out, "
     "Tensor out, Tensor maximum, Tensor sum, Tensor actual_query, Tensor actual_kv, Tensor query_rope, "

@@ -177,7 +177,7 @@ def _check(peers, cpu_fixture, geometry, lengths, mode, coefficient, auxiliary, 
 
 def _step(workspace, backend, base_meta, geometry, cpu_fixture, *, tile_mode, weight_dtype,
           mode, coefficient, auxiliary, divisor, replay, precision_budgets=None, fused_kl=False,
-          sparse_main_return=False):
+          sparse_main_return=False, sparse_index_return=False):
     device = backend.layout.device
     tile = _tile(base_meta, tile_mode)
     layout = backend.prepare_local_queries(tile.q_global_ids)
@@ -190,7 +190,7 @@ def _step(workspace, backend, base_meta, geometry, cpu_fixture, *, tile_mode, we
     probe = FusedDsaLocalCpTrainingProbe(backend, normalization=DsaLossNormalization(base_meta.global_valid_queries,
                                                                                   divisor),
                                         loss_coeff=coefficient, mode=mode, fused_kl=fused_kl,
-                                        sparse_main_return=sparse_main_return)
+                                        sparse_main_return=sparse_main_return, sparse_index_return=sparse_index_return)
     invocation = workspace.prepare(replace(base_meta, layer=1, microbatch=2, invocation=workspace.transport_epoch+1))
     captured = []
     original = backend.forward_local
@@ -233,7 +233,7 @@ def _step(workspace, backend, base_meta, geometry, cpu_fixture, *, tile_mode, we
     evidence = _check(peers, cpu_fixture, geometry, (3, 10), mode, coefficient, auxiliary, divisor,
                       precision_budgets=precision_budgets)
     evidence.update(captured_forward_invocations=len(captured), replay=replay, fused_kl=fused_kl,
-                    sparse_main_return=sparse_main_return,
+                    sparse_main_return=sparse_main_return, sparse_index_return=sparse_index_return,
                     native_forward_phase_counts=[len(result.phase_traces) for result in captured])
     return evidence
 
