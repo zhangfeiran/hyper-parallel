@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -31,6 +32,7 @@ import torch.distributed as dist
 import torch_npu  # noqa: F401  # pylint: disable=unused-import  # Registers the NPU backend.
 from torch.utils.checkpoint import checkpoint
 
+import hyper_parallel
 from hyper_parallel.core.multicore.examples.mega_dsa_fused_cp_validate import _metadata, _SCALE
 from hyper_parallel.core.multicore.examples.mega_dsa_mixed_tile_validate import _reference as stock_attention
 from hyper_parallel.core.multicore.examples.mega_dsa_training_oracle import training_reference
@@ -116,8 +118,25 @@ def _selection_coverage(indices, lengths):
             "minimum_selected_count": int(counts.min()), "maximum_selected_count": int(counts.max())}
 
 
+def _hot_index_states(inputs, lengths):
+    """Keep each sequence's first K keys strictly above its unused cold suffix."""
+    query = torch.full_like(inputs[4], .125)
+    key = torch.full_like(inputs[5], -.0625)
+    start = 0
+    for length in lengths:
+        hot = min(length, 2048)
+        values = torch.linspace(.0625, .0703125, hot).to(key.dtype)
+        key[start:start + hot] = values[:, None]
+        start += length
+    weights = torch.full_like(inputs[6], .1)
+    weights += (torch.arange(64) % 4).to(weights.dtype) * .00390625
+    if weights.dtype == torch.float32:
+        weights += .000013
+    return (*inputs[:4], query, key, weights)
+
+
 def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, divisor, lengths,
-              *, kl_backend="native"):
+              *, kl_backend="native", kv_transfer="full", compute_groups=7, selection_fixture="random"):
     meta = _metadata(lengths, pattern, dist.get_world_size(), dist.get_rank())
     capacity = max(1, max(meta.token_owners.count(peer) for peer in range(dist.get_world_size())))
     root = SharedShmemRoot(device, root_group=dist.group.WORLD)
@@ -130,11 +149,16 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
         normalization = DsaLossNormalization(sum(lengths), divisor)
         coefficient = 0. if mode == "coeff_zero" else .3
         selected_backend = "reference" if mode in ("fp32_rejected", "reference") else kl_backend
-        model = MegaDsa(workspace, prepared, heads=heads, attention_scale=_SCALE, schedule=MixedSfaSchedule(7),
-                        normalization=normalization, loss_coeff=coefficient, kl_backend=selected_backend)
+        transfer = kv_transfer if selected_backend == "native" and coefficient != 0 else "full"
+        model = MegaDsa(workspace, prepared, heads=heads, attention_scale=_SCALE,
+                        schedule=MixedSfaSchedule(compute_groups),
+                        normalization=normalization, loss_coeff=coefficient, kl_backend=selected_backend,
+                        kv_transfer=transfer)
         cpu, cotangent = _inputs(heads, weight_dtype, lengths)
         if weight_dtype == torch.float32 and coefficient != 0:
             cpu = (*cpu[:6], cpu[6] * 1.003 + .000013)
+        if selection_fixture == "hotset":
+            cpu = _hot_index_states(cpu, lengths)
         full = tuple(tensor.to(device) for tensor in cpu)
         cotangent = cotangent.to(device)
         local = tuple(tensor[list(meta.kv_global_ids if field in (1, 3, 5) else meta.q_global_ids)]
@@ -167,6 +191,7 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
             report["cases"].append({"lengths": lengths, "pattern": pattern, "heads": heads,
                                     "weight_dtype": str(weight_dtype),
                                     "kl_backend": selected_backend,
+                                    "kv_transfer": transfer,
                                     "mode": mode, "status": "rejected_before_native_dispatch"})
             return
         with patch.object(model.core.backend, "forward", side_effect=_forward), \
@@ -195,7 +220,11 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
         torch.npu.synchronize()
         raw = forwards[1] if mode == "checkpoint" else forwards[0]
         expect_fused_kl = selected_backend == "native" and coefficient != 0
-        if (raw.kl_loss is not None) != expect_fused_kl or len(raw.phase_traces) != (6 if expect_fused_kl else 3):
+        expected_phases = 6 if expect_fused_kl else 3
+        if transfer == "selected":
+            expected_phases = 9
+        if ((raw.kl_loss is not None) != expect_fused_kl or len(raw.phase_traces) != expected_phases
+                or bool(raw.selected_requests) != (transfer == "selected")):
             raise RuntimeError("training forward did not honor its declared KL backend/phase count")
         native_layout = model.core.backend.native_layout
         indices = native_layout.sequence_to_global_indices(raw.saved.indices).cpu()
@@ -208,6 +237,20 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
         torch.testing.assert_close(raw.values.cpu().view(torch.int16),
                                    stock_values[list(meta.q_global_ids)].cpu().view(torch.int16), rtol=0, atol=0)
         coverage = _selection_coverage(indices, lengths)
+        unfetched_nan_rows = None
+        if selection_fixture == "hotset":
+            expected, start = [], 0
+            for length in lengths:
+                expected.extend(range(start, start + min(length, 2048)))
+                start += length
+            actual = indices[indices >= 0].unique().sort().values
+            torch.testing.assert_close(actual, torch.tensor(expected, dtype=torch.int32), rtol=0, atol=0)
+            if transfer == "selected":
+                cold = sorted(set(range(sum(lengths))) - set(expected))
+                for tensor in raw.global_keys[1:]:
+                    if not bool(torch.isnan(tensor[cold].cpu()).all()):
+                        raise RuntimeError("selected pull overwrote an unrequested poisoned main-KV row")
+                unfetched_nan_rows = len(cold)
         baseline = _full_native(full, cotangent, raw, native_layout,
                                 normalization, coefficient, mode, auxiliary)
         oracle = training_reference(full, cotangent, indices, normalization, coefficient, mode, auxiliary, lengths,
@@ -243,15 +286,22 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
         if (not math.isfinite(loss_metric["relative_l2"]) or not math.isfinite(loss_metric["max_abs"])
                 or (loss_metric["relative_l2"] > .02 and loss_metric["max_abs"] > 2e-5)):
             raise RuntimeError(f"independent FP32 KL loss mismatch {loss_metric}")
-        traces = [model.core.backend.validate_trace(value, tuple(trace.cpu() for trace in value.phase_traces),
-                                                    value.transport_trace.cpu(), require_overlap=False)
-                  for value in forwards]
+        traces = []
+        for value in forwards:
+            selected = ((*[tensor.cpu() for tensor in value.selected_requests], value.saved.indices.cpu())
+                        if value.selected_requests else None)
+            traces.append(model.core.backend.validate_trace(
+                value, tuple(trace.cpu() for trace in value.phase_traces), value.transport_trace.cpu(),
+                require_overlap=False, selected_snapshots=selected))
         gradient_traces = [model.core.backward_backend.validate_trace(
             value, tuple(trace.cpu() for trace in value.phase_traces), value.transport_trace.cpu())
             for value in backwards]
         report["cases"].append({"lengths": lengths, "pattern": pattern, "heads": heads,
                                 "weight_dtype": str(weight_dtype), "selection_coverage": coverage,
+                                "selection_fixture": selection_fixture,
+                                "unfetched_nan_rows": unfetched_nan_rows,
                                 "kl_backend": selected_backend,
+                                "kv_transfer": transfer,
                                 "mode": mode, "auxiliary": auxiliary, "reducer_divisor": divisor,
                                 "kl_reference": ("exact_zero" if coefficient == 0 else
                                                  "stock_native" if weight_dtype == torch.float32 else "enhance_native"),
@@ -268,16 +318,27 @@ def _run_case(report, device, pattern, heads, weight_dtype, mode, auxiliary, div
 
 
 def run_validation(report: dict, output_dir: Path, *, smoke: bool = False, long_history: bool = False,
-                   kl_backend: str = "native") -> None:
+                   kl_backend: str = "native", kv_transfer: str = "full", compute_groups: int = 7,
+                   selection_fixture: str = "random") -> None:
     """Check global KL normalization and all seven owner gradients on CP1/CP2/CP4."""
+    if kl_backend not in ("native", "reference") or kv_transfer not in ("full", "selected"):
+        raise ValueError("validation requires an explicit supported KL backend and KV transfer mode")
+    if selection_fixture not in ("random", "hotset"):
+        raise ValueError("selection_fixture must be random or hotset")
+    MixedSfaSchedule(compute_groups)
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.npu.set_device(local_rank)
     dist.init_process_group("hccl", timeout=timedelta(minutes=10))
     report.update(rank=dist.get_rank(), cp_size=dist.get_world_size(), cases=[],
                   torch_version=torch.__version__, torch_npu_version=torch_npu.__version__,
+                  package_path=hyper_parallel.__file__,
+                  validator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   custom_opp_path=os.environ.get("ASCEND_CUSTOM_OPP_PATH"),
                   library_path=os.environ.get("LD_LIBRARY_PATH"))
     report["kl_backend"] = kl_backend
+    report["kv_transfer"] = kv_transfer
+    report["compute_groups"] = compute_groups
+    report["selection_fixture"] = selection_fixture
     cases = [("strided", 32, torch.bfloat16, "joint", 7, 1)]
     if not smoke:
         cases += [("zigzag", 64, torch.bfloat16, "joint", 1, 1),
@@ -312,11 +373,16 @@ def run_validation(report: dict, output_dir: Path, *, smoke: bool = False, long_
     output_dir.mkdir(parents=True, exist_ok=True)
     for case, lengths in fixtures:
         report["stage"] = {"lengths": lengths, "case": tuple(str(item) for item in case)}
-        _run_case(report, torch.device(f"npu:{local_rank}"), *case, lengths, kl_backend=kl_backend)
+        _run_case(report, torch.device(f"npu:{local_rank}"), *case, lengths,
+                  kl_backend=kl_backend, kv_transfer=kv_transfer, compute_groups=compute_groups,
+                  selection_fixture=selection_fixture)
         (output_dir / f"rank{dist.get_rank()}.json").write_text(json.dumps(report, indent=2) + "\n")
     loaded = {line.split()[-1] for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
-              if "libcust_opapi.so" in line}
-    report.update(status="passed", stage="complete", loaded_op_api_libraries=sorted(loaded))
+              if any(name in line for name in ("libcust_opapi.so", "libcust_opmaster_rt2.0.so",
+                                               "libhyper_parallel_mega_moe_torch.so"))}
+    report.update(status="passed", stage="complete", loaded_op_api_libraries=sorted(loaded),
+                  loaded_library_sha256={path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                                         for path in sorted(loaded)})
     dist.barrier()
     dist.destroy_process_group()
 
@@ -329,11 +395,15 @@ def main() -> None:
     parser.add_argument("--long-history", action="store_true",
                         help="Verify actual truncated K=2048 training with bounded-memory FP32 query chunks.")
     parser.add_argument("--kl-backend", choices=("native", "reference"), default="native")
+    parser.add_argument("--kv-transfer", choices=("full", "selected"), default="full")
+    parser.add_argument("--compute-groups", type=int, choices=range(1, 20), default=7)
+    parser.add_argument("--selection-fixture", choices=("random", "hotset"), default="random")
     args = parser.parse_args()
     report = {"status": "running", "scope": "P4 CP LM+KL with an explicitly selected KL backend"}
     try:
         run_validation(report, args.output_dir, smoke=args.smoke, long_history=args.long_history,
-                       kl_backend=args.kl_backend)
+                       kl_backend=args.kl_backend, kv_transfer=args.kv_transfer, compute_groups=args.compute_groups,
+                       selection_fixture=args.selection_fixture)
     except Exception as error:
         report.update(status="error", error=repr(error), traceback=traceback.format_exc())
         raise

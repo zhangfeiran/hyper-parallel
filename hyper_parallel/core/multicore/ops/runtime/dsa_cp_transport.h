@@ -103,6 +103,31 @@ class CpTransport {
     while (ReadVisible(trace_, 0) != epoch_) {}
   }
 
+  __aicore__ inline void PullSelectedMain(__gm__ uint8_t *compressed, __gm__ uint8_t *rope, __gm__ uint8_t *requests,
+                                          __gm__ uint8_t *counts) {
+#ifndef __DAV_C220_CUBE__
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> storage;
+    pipe.InitBuffer(storage, 8192);
+    auto buffer = storage.Get<uint8_t>();
+    GlobalTensor<int64_t> table, count;
+    table.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(requests));
+    count.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(counts), 16);
+    const int64_t runs = ReadVisible(count, 2);
+    if (ReadVisible(count, 1) != epoch_ || runs < 0 || runs > meta_.GetValue(15)) {
+      AscendC::Trap();
+    }
+    PublishControl(trace_, 10, AscendC::GetSystemCycle());
+    PullSelectedField(compressed, meta_.GetValue(11), 512, buffer, table, runs);
+    PullSelectedField(rope, meta_.GetValue(12), 64, buffer, table, runs);
+    PublishControl(trace_, 11, AscendC::GetSystemCycle());
+    auto local = Signal(rank_);
+    PublishControl(local, 16, epoch_);
+    PublishControl(trace_, 2, size_);
+    PublishControl(trace_, 1, epoch_);
+#endif
+  }
+
   __aicore__ inline void WaitAcknowledged() {
 #ifndef __DAV_C220_CUBE__
     for (int32_t peer = 0; peer < size_; ++peer) {
@@ -114,6 +139,38 @@ class CpTransport {
   }
 
  private:
+  __aicore__ inline void PullSelectedField(__gm__ uint8_t *destination, int64_t sourceOffset, uint32_t width,
+                                           AscendC::LocalTensor<uint8_t> &buffer, GlobalTensor<int64_t> &table,
+                                           int64_t runs) {
+#ifndef __DAV_C220_CUBE__
+    int64_t total = ReadVisible(trace_, 5);
+    int64_t remote = ReadVisible(trace_, 7);
+    const uint32_t rowBytes = width * 2;
+    for (int64_t run = 0; run < runs; ++run) {
+      const int32_t peer = static_cast<int32_t>(table.GetValue(run * 4));
+      const int64_t offset = table.GetValue(run * 4 + 1);
+      const int64_t targetOffset = table.GetValue(run * 4 + 2);
+      const int64_t rows = table.GetValue(run * 4 + 3);
+      if (peer < 0 || peer >= size_ || offset < 0 || rows <= 0 || offset + rows > meta_.GetValue(17) ||
+          targetOffset < 0 || targetOffset + rows > meta_.GetValue(15)) {
+        AscendC::Trap();
+      }
+      auto *source = arena_ + sourceOffset + offset * rowBytes;
+      auto *target = destination + targetOffset * rowBytes;
+      const int64_t bytes = rows * rowBytes;
+      if (peer != rank_) {
+        source =
+          reinterpret_cast<__gm__ uint8_t *>(hyper_parallel::multicore::shmem::data_plane::remote_ptr(source, peer));
+        remote += bytes;
+      }
+      Copy(target, source, bytes, buffer);
+      total += bytes;
+    }
+    PublishControl(trace_, 5, total);
+    PublishControl(trace_, 7, remote);
+#endif
+  }
+
   __aicore__ inline GlobalTensor<int64_t> Signal(int32_t peer) {
     auto *address = arena_ + meta_.GetValue(13);
     if (peer != rank_) {

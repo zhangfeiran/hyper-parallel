@@ -256,7 +256,7 @@ class TestMegaDsaTraining(SharedRootFixture):
 
     def _execute_training(self, *args):
         self.assertIs(self.root.lease_owner, self.workspace.consumer)
-        self.assertEqual(args[9].shape, (6, 20, 64))
+        self.assertEqual(args[9].shape, (9 if len(args) == 31 else 6, 20, 64))
         self.assertEqual(args[12], (2, 4))
         for index in (1, 3, 5):
             args[index].fill_(1)
@@ -271,6 +271,17 @@ class TestMegaDsaTraining(SharedRootFixture):
         args[21].copy_(self.raw_index_gradients[2].to(args[21].dtype))
         args[22].fill_(8)
 
+    def _execute_selected_training(self, *args):
+        self.assertEqual(len(args), 31)
+        self._execute_training(*args)
+        self.assertIs(args[27], self.model.core.backend.selected_rows)
+        self.assertEqual(args[28].shape, (8,))
+        self.assertEqual(args[29].shape, (4, 4))
+        self.assertEqual(args[30].shape, (16,))
+        args[28].fill_(11)
+        args[29].fill_(13)
+        args[30].fill_(17)
+
     @contextmanager
     def _patches(self):
         with ExitStack() as stack:
@@ -284,6 +295,10 @@ class TestMegaDsaTraining(SharedRootFixture):
                                             return_value=1, create=True))
             stack.enter_context(patch.object(torch.ops.hyper_parallel, "dsa_fused_cp_training_out",
                                             side_effect=self._execute_training, create=True))
+            stack.enter_context(patch.object(torch.ops.hyper_parallel, "dsa_selected_cp_training_version",
+                                            return_value=1, create=True))
+            stack.enter_context(patch.object(torch.ops.hyper_parallel, "dsa_selected_cp_training_out",
+                                            side_effect=self._execute_selected_training, create=True))
             kl = stack.enter_context(patch.object(module, "_selected_kl_gradients", return_value=(
                 *self.raw_index_gradients, torch.tensor(8.))))
             backward = stack.enter_context(patch.object(self.model.core.backward_backend, "_backward_saved",
@@ -433,3 +448,59 @@ class TestMegaDsaTraining(SharedRootFixture):
             kl.assert_not_called()
         for actual in (first, second, third):
             self._assert_index_gradients(actual[4:])
+
+    def test_selected_transfer_uses_device_counts_without_reading_them_in_autograd(self):
+        """Selected forward owns its nine traces and descriptors across later source publication."""
+        self.model = module.MegaDsa(self.workspace, self.invocation, heads=32, attention_scale=.1,
+                                    schedule=MixedSfaSchedule(7), normalization=DsaLossNormalization(4),
+                                    loss_coeff=.25, kv_transfer="selected")
+        forward = self.model.core.backend.forward
+        results = []
+
+        def _capture(*args, **kwargs):
+            value = forward(*args, **kwargs)
+            results.append(value)
+            return value
+
+        with self._patches() as (kl, _backward), \
+                patch.object(self.model.core.backend, "forward", side_effect=_capture):
+            output, loss = self.model(*self.inputs, self.meta)
+            self.model(*(tensor.detach() + .25 for tensor in self.inputs), replace(self.meta, layer=3))
+            first = torch.autograd.grad(output.sum() + loss * 7, self.inputs, retain_graph=True)
+            second = torch.autograd.grad(output.sum() + loss * 7, self.inputs)
+            kl.assert_not_called()
+        for actual in (first, second):
+            self._assert_index_gradients(actual[4:])
+        for result in results:
+            self.assertEqual(len(result.phase_traces), 9)
+            self.assertEqual(len(result.selected_requests), 3)
+            for tensor, expected in zip(result.selected_requests, (13, 17, 11)):
+                self.assertTrue(bool((tensor == expected).all()))
+        for before, after in zip(results[0].selected_requests, results[1].selected_requests):
+            self.assertFalse(before.is_set_to(after))
+
+    def test_selected_transfer_rejects_unavailable_objectives_before_preparation(self):
+        """The initial selected producer requires native nonzero KL; full transfer remains available."""
+        for backend, coefficient, transfer in (("reference", .25, "selected"), ("native", 0., "selected"),
+                                                ("native", .25, "invalid")):
+            with self.subTest(backend=backend, coefficient=coefficient, transfer=transfer), \
+                    patch.object(fused_cp.FusedDsaCpForwardProbe, "prepare_selected_requests") as prepare, \
+                    self.assertRaises(ValueError):
+                module.MegaDsa(self.workspace, self.invocation, heads=32, attention_scale=.1,
+                               schedule=MixedSfaSchedule(7), normalization=DsaLossNormalization(4),
+                               loss_coeff=coefficient, kl_backend=backend, kv_transfer=transfer)
+            prepare.assert_not_called()
+
+    def test_selected_address_mutation_rejects_before_lease_or_native_submission(self):
+        """A modified prepared owner address cannot silently redirect a device main-KV pull."""
+        backend = self.model.core.backend
+        backend.prepare_selected_requests()
+        backend.selected_rows[0, 2].add_(1)
+        with patch.object(fused_cp, "_load_native") as load:
+            with self.assertRaisesRegex(ValueError, "row addresses were modified"):
+                backend.forward(self.invocation, tuple(tensor.detach() for tensor in self.inputs[:4]),
+                                tuple(tensor.detach() for tensor in self.inputs[4:]),
+                                selected_kl=True, selected_pull=True)
+            load.assert_not_called()
+        self.assertEqual(self.workspace.transport_epoch, 0)
+        self.assertIsNone(self.root.lease_owner)

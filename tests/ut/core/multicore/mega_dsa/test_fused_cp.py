@@ -16,6 +16,7 @@
 
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -24,6 +25,7 @@ from hyper_parallel.core.multicore.modules.mega_dsa import fused_cp
 from hyper_parallel.core.multicore.modules.mega_dsa.cp_reference import DsaCpLayout
 from hyper_parallel.core.multicore.modules.mega_dsa.metadata import DsaBatchMeta
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import MixedSfaSchedule
+from hyper_parallel.core.multicore.modules.mega_dsa.selected_requests import SELECTED_REQUESTS_MAGIC
 from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
     DsaWorkspaceSpec,
     MegaDsaWorkspace,
@@ -182,3 +184,45 @@ class TestFusedCpSubmission(SharedRootFixture):
         backend.validate_trace(result, tuple(phases), no_overlap, require_overlap=False)
         with self.assertRaisesRegex(ValueError, "transfer overlap"):
             backend.validate_trace(result, tuple(phases), no_overlap, require_overlap=True)
+
+    def test_selected_transport_accounts_only_for_admitted_keys_and_published_counts(self):
+        """Device counts determine main bytes, and descriptor publication precedes the main pull."""
+        backend = self._backend()
+        phases = []
+        for epoch in range(1, 10):
+            trace = torch.zeros(20, 64, dtype=torch.int64)
+            for group in range(7):
+                tasks = tuple(range(group, 20, 7))
+                trace[group, 0] = tasks[-1]
+                for offset in (0, 16, 32):
+                    trace[group, offset + 1:offset + 4] = torch.tensor(
+                        [len(tasks), sum(task + 1 for task in tasks), tasks[-1]])
+                    trace[group, offset + 6] = epoch
+                    if epoch == 1:
+                        trace[group, offset + 7:offset + 10] = torch.tensor([1, 150, 180])
+            trace[7, [6, 21, 22, 24, 38]] = epoch
+            trace[7, 25] = 21
+            phases.append(trace)
+        indices = torch.tensor([[[0, -1]], [[0, -1]], [[2, -1]]], dtype=torch.int32)
+        requests = torch.tensor([[0, 0, 0, 1], [0, 2, 2, 1], [-1, -1, -1, -1]], dtype=torch.int64)
+        membership = torch.tensor([2, 0, 1, 0, 0, 0, 0, 0], dtype=torch.int32)
+        counts = torch.tensor([SELECTED_REQUESTS_MAGIC, 5, 2, 2, 3, 0, 0, 0, 190, 195] + [0] * 6)
+        transport = torch.tensor([5, 5, 1, 1, 768, 2304, 0, 0, 100, 120, 200, 250] + [0] * 20)
+        empty = torch.empty(0)
+        result = fused_cp.FusedCpForwardResult(empty, empty, empty, empty, empty, (), (), transport, 5,
+                                              saved=SimpleNamespace(batch_meta=self.meta), kl_loss=torch.tensor(1.),
+                                              selected_requests=(requests, counts, membership))
+        snapshots = (requests, counts, membership, indices)
+        evidence = backend.validate_trace(result, tuple(phases), transport, require_overlap=False,
+                                           selected_snapshots=snapshots)
+        self.assertEqual(evidence["main_bytes"], 2304)
+        self.assertEqual(evidence["selected_requests"]["request_count"], 2)
+        self.assertEqual(evidence["compute_members_overlapping_transfer"], [])
+        with self.assertRaisesRegex(ValueError, "explicit CPU"):
+            backend.validate_trace(result, tuple(phases), transport, require_overlap=False)
+        for word, value in ((5, 3456), (13, 21), (10, 194)):
+            broken = transport.clone()
+            broken[word] = value
+            with self.subTest(word=word), self.assertRaises(ValueError):
+                backend.validate_trace(result, tuple(phases), broken, require_overlap=False,
+                                       selected_snapshots=snapshots)

@@ -1535,10 +1535,106 @@ is 0.0022124857085496536. All 140 FP32 loss measurements pass pointwise, with
 maximum relative error 3.0094478258633895e-05 and maximum absolute error
 3.236345946788788e-08. These component results preserve the earlier distinction
 between native pointwise agreement and independent FP32 relative-L2 acceptance.
-The native six-phase long-history CP1/CP2/CP4 matrix is queued separately.
+The native six-phase long-history CP1/CP2/CP4 matrix also passes all seven rank
+reports: 28 training scenarios, 42 six-phase forwards and 21 native main backwards.
+All 168 available native gradient measurements and 28 loss measurements pass
+the original pointwise threshold. The packed fixtures contain 65/320 queries
+with genuinely truncated histories; stock selection sets/values and outputs are
+exact. All 168 independent FP32 gradient measurements satisfy the existing
+L2/absolute criterion, with maximum relative L2 0.003298960380207957. Original
+pointwise failures remain for 17/168 gradient and 23/28 output measurements.
+All 28 FP32 loss measurements pass pointwise; maximum relative error is
+7.684610066669985e-06 and maximum absolute error is 6.28642737865448e-09.
 After selecting native KL as the module default, CPU regression over megaDSA
 and shared-root SHMEM passes 191 tests and 282 subtests. The reference fixture
 selects its backend explicitly, while the native tests exercise the constructor
 default and confirm FP32 derivative dtype and one-time auxiliary scaling.
 Full-model BF16 acceptance, CP8/CP×TP and complete-step performance remain separate
 requirements.
+
+
+## Device-generated selected main-KV requests
+
+`MegaDsa(..., kv_transfer="selected")` selects the experimental request/count
+producer inside the existing training operator. It requires native nonzero KL;
+`kv_transfer="full"` remains the default. The initial selected mode gathers the
+same complete packed Q/index-Q/weights and pulls full index K for exact selection.
+It retains global-key destination buffers and generates the main-KV union from
+the actual native TopK output. The union may cover all keys, so this mode does
+not promise lower traffic or compact saved activation storage.
+
+Three additional stages run after LI merge: membership initialization, atomic
+membership construction and deterministic request packing/main-KV pull. SFA and
+KL wait for the reserved progress group to close those stages. Native indices
+resolve through prepared per-query sequence starts, with padding/future slots
+excluded. Membership accumulates aligned int32 atomic counts, preserving repeated
+slots without neighboring-key cache-line races. Occurrence capacity is limited
+to int32, admitting at most `(2**31-1)//2048` global queries.
+
+The [CPU descriptor oracle](selected_requests.py) independently builds a selected
+set, preserves packed destination addresses and coalesces runs only when owner,
+owner-local source and destination are all consecutive. Native request capacity
+is the global key count; the device publishes the actual count after descriptor
+writes. The progress Vector consumes that count to perform real BF16 C512/RoPE64
+pulls, then completes the existing read ACK protocol. Each invocation owns its
+membership, descriptor table, counts and nine phase records. Request/count/TopK
+readback occurs only in explicit offline validation.
+
+The training validator accepts `--kv-transfer selected`. It compares descriptors,
+all membership counts, epochs and local/remote main bytes with the CPU oracle,
+checks descriptor publication before transfer, and requires all nine phase
+releases before accepting stock output and seven gradients. Reference and
+zero-coefficient fixtures explicitly report full transfer; those selected-mode
+extensions remain open. Framework-free [CP1/CP2/CP4 launchers](../../../../../tests/torch/multicore/test_mega_dsa_selected_training_cp.py)
+provide short and genuinely truncated long-history matrices.
+
+```bash
+NPU_WAIT_VISIBLE_DEVICES=0,1,2,3 NPU_WAIT_NUM_CARDS=4 NPU_WAIT_POLL_SECONDS=60 \
+  bash ~/doc/npu_wait_and_run.sh python -m torch.distributed.run \
+  --standalone --nproc_per_node=4 \
+  --module hyper_parallel.core.multicore.examples.mega_dsa_training_cp_validate \
+  --output-dir /tmp/mega_dsa_selected_training_cp4 --kv-transfer selected --long-history
+```
+
+The complete candidate native build passes and preserves all 20 non-training
+DSA/MoE device object hashes. The original six-phase path is retained as a
+separately tested baseline. Final CPU megaDSA/shared-root regression passes
+200 tests and 307 subtests, including transfer byte/timestamp decoding and
+prepared-address mutation rejection before a lease or native submission. The first selected CP1 device smoke passes descriptor,
+byte-count, nine-phase and seven-gradient checks: 61 admitted selected slots
+produce 13 unique keys and 13 descriptors, with 14,976 main bytes. Its query
+scope covers all keys, giving the same main byte count as full pull. The full/selected CP1/CP2/CP4 short matrices both pass seven rank reports and
+140 positive scenarios plus seven explicit reference FP32-KL rejections. All
+875 native gradient measurements per mode pass original pointwise bounds. The
+selected mode has 168 nine-phase forwards; reference/zero-KL cases retain 21
+baseline forwards. All 875 independent FP32 gradient measurements satisfy the
+existing L2/absolute criterion, with maximum relative L2 0.0035769540586985246;
+107/875 gradient and 120/140 output measurements retain original pointwise failures.
+
+The selected random long-history CP1/CP2/CP4 matrix also passes seven rank reports,
+28 scenarios, 42 nine-phase forwards and 21 main backwards. All 168 native gradient
+measurements pass pointwise. Independent FP32 gradient maximum relative L2 is
+0.003298960380207957; original pointwise failures remain for 17/168 gradients and
+23/28 outputs. All 28 FP32 loss measurements pass pointwise, with maximum relative
+error 7.684610066669985e-06. Device descriptors/counts and actual bytes match the
+CPU oracle in every forward. All sampled random unions cover the full key domain,
+so these fixtures establish no main-byte reduction. Compute groups 1/2/19 each
+pass CP1/CP2/CP4 short smoke, adding 21 rank scenarios alongside group 7.
+
+`--selection-fixture hotset` creates strictly positive scores for each sequence's
+first K keys and zero scores for its cold suffix through the actual native
+indexer. It preserves complete causal K2048 provenance. The long fixtures then
+request 2051 of 2116 keys and 4096 of 4416 keys, respectively. Their main bytes
+are 2,362,752 and 4,718,592, saving 74,880 and 368,640 bytes against full pull.
+The hotset CP1/CP2/CP4 matrices pass all seven rank reports: 28 scenarios, 42
+nine-phase forwards and 21 main backwards. All 168 native gradients and 28 loss
+measurements pass original pointwise bounds. All independent FP32 gradients
+satisfy the existing L2/absolute criterion; maximum relative L2 is
+0.013767521826761008. Pointwise failures remain for 17/168 FP32 gradients and
+23/28 outputs. All FP32 loss measurements pass pointwise, with maximum relative
+error 2.1349173793687763e-05. Unrequested C/RoPE rows remain initialized to NaN;
+all 16 CP4 hotset scenarios explicitly verify that poison remains while output
+and gradients stay finite. Supplementary CP1/CP4 poison smokes run separately.
+Full training-step performance remains unmeasured; full pull remains the default.
+Device sparse gradient owner return, selected zero-KL/external-TopK admission,
+rank-local query/tile scope, CP8/CP×TP and model acceptance remain open.

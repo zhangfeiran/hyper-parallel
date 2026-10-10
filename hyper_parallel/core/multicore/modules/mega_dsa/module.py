@@ -303,6 +303,8 @@ class _DsaTraining(torch.autograd.Function):
         backend = module.core.backend
         invocation = replace(module.core.prepared_invocation, batch_meta=batch_meta)
         options = {"selected_kl": True} if module.kl_backend == "native" and module.loss_coeff != 0 else {}
+        if module.kv_transfer == "selected":
+            options["selected_pull"] = True
         result = backend.forward(invocation, tuple(tensor.detach() for tensor in main),
                                  tuple(tensor.detach() for tensor in index), **options)
         saved = result.saved
@@ -371,14 +373,29 @@ class MegaDsa(torch.nn.Module):
     returns a replicated global KL contribution divided by CP size, following
     the existing CANN CP reference. Apply aux_loss_auto_scale once in the caller.
     The native backend runs six LI/SFA/KL phases in one kernel. The reference
-    backend uses the separately activated Omni KL primitive. Both preserve
-    full KV replication and FP32 collective index-gradient owner return.
+    backend uses the separately activated Omni KL primitive. Full KV transfer
+    is the default; the selected candidate generates device request/counts
+    after LI merge and requires native nonzero KL. Both gather packed Q and
+    use FP32 collective index-gradient owner return.
     """
 
     def __init__(self, workspace: MegaDsaWorkspace, invocation: DsaWorkspaceInvocation, *, heads: int,
                  attention_scale: float, schedule: MixedSfaSchedule, normalization: DsaLossNormalization,
-                 loss_coeff: float = 1.0, kl_backend: str = "native") -> None:
-        """Declare native dimensions and the actual downstream loss reducer at preparation."""
+                 loss_coeff: float = 1.0, kl_backend: str = "native", kv_transfer: str = "full") -> None:
+        """Declare native dimensions, reducer compensation and transfer mode at preparation.
+
+        Args:
+            workspace: Bound workspace with the same ordered CP/root membership.
+            invocation: Prepared ownership and packed layout for this layer.
+            heads: Main attention heads, 32 or 64.
+            attention_scale: Positive original attention scale.
+            schedule: Mixed groups with one reserved progress group and rounds=1.
+            normalization: Global query count and actual downstream reducer divisor.
+            loss_coeff: Nonnegative selected-KL coefficient.
+            kl_backend: Native single-launch KL or explicit Omni reference.
+            kv_transfer: Full main-KV pull, or selected device-generated requests
+                over the gathered query scope with native nonzero KL.
+        """
         super().__init__()
         if not isinstance(normalization, DsaLossNormalization):
             raise TypeError("MegaDsa requires explicit DsaLossNormalization")
@@ -388,16 +405,23 @@ class MegaDsa(torch.nn.Module):
             raise ValueError("loss_coeff must be finite and nonnegative")
         if kl_backend not in ("native", "reference"):
             raise ValueError("kl_backend must be native or reference")
-        declaration = (normalization, float(loss_coeff), kl_backend)
+        if kv_transfer not in ("full", "selected"):
+            raise ValueError("kv_transfer must be full or selected")
+        if kv_transfer == "selected" and (kl_backend != "native" or loss_coeff == 0):
+            raise ValueError("selected KV transfer currently requires native nonzero KL")
+        declaration = (normalization, float(loss_coeff), kl_backend, kv_transfer)
         if len(workspace.root.members) > 1:
             declarations = [None] * len(workspace.root.members)
             dist.all_gather_object(declarations, declaration, group=workspace.root.group)
             if any(item != declaration for item in declarations):
-                raise ValueError("MegaDsa members disagree on KL normalization, loss coefficient or KL backend")
+                raise ValueError("MegaDsa members disagree on normalization, coefficient, KL backend or KV transfer")
         self.core = MegaDsaCore(workspace, invocation, heads=heads, attention_scale=attention_scale, schedule=schedule)
         self.normalization = normalization
         self.loss_coeff = float(loss_coeff)
         self.kl_backend = kl_backend
+        self.kv_transfer = kv_transfer
+        if kv_transfer == "selected":
+            self.core.backend.prepare_selected_requests()
         meta = invocation.batch_meta
         queries, keys = len(meta.q_global_ids), len(meta.kv_global_ids)
         self.input_shapes = ((queries, heads, 512), (keys, 512), (queries, heads, 64), (keys, 64),

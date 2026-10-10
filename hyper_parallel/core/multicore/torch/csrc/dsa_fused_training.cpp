@@ -58,12 +58,12 @@ void check_states(const Tensors &tensors) {
               "fused DSA LI weights must be BF16 or FP32 [T,64]");
 }
 
-void check_runtime(const Tensors &tensors) {
+void check_runtime(const Tensors &tensors, int64_t phases) {
   TORCH_CHECK(tensors[7]->dim() == 1 && tensors[7]->numel() > 0 && tensors[7]->scalar_type() == at::kInt,
               "fused DSA packed cumulative lengths must be a nonempty int32 vector");
   TORCH_CHECK(tensors[8]->sizes() == at::IntArrayRef({4}) && tensors[8]->scalar_type() == at::kLong &&
-                tensors[9]->sizes() == at::IntArrayRef({6, 20, 64}) && tensors[9]->scalar_type() == at::kLong,
-              "fused DSA runtime ABI expects int64 config[4] and trace[6,20,64]");
+                tensors[9]->sizes() == at::IntArrayRef({phases, 20, 64}) && tensors[9]->scalar_type() == at::kLong,
+              "fused DSA runtime ABI expects int64 config[4] and the declared phase trace");
   TORCH_CHECK(tensors[10]->dim() == 1 && tensors[10]->numel() >= 47226880 && tensors[10]->scalar_type() == at::kByte,
               "fused DSA retained scratch requires 47226880 uint8 bytes");
 }
@@ -102,12 +102,12 @@ void check_outputs(const Tensors &tensors) {
               "fused DSA SFA output shapes or dtypes are incompatible");
 }
 
-void check_fused_inputs(const Tensors &tensors, double scale) {
+void check_fused_inputs(const Tensors &tensors, double scale, int64_t phases = 6) {
   TORCH_CHECK(tensors[0]->device().type() == c10::DeviceType::PrivateUse1, "fused training requires an NPU");
   TORCH_CHECK(!at::globalContext().deterministicAlgorithms(), "fused training supports non-deterministic KL only");
   check_storage(tensors);
   check_states(tensors);
-  check_runtime(tensors);
+  check_runtime(tensors, phases);
   check_outputs(tensors);
   check_kl_outputs(tensors);
   TORCH_CHECK(std::isfinite(scale) && scale > 0, "fused DSA scale must be finite and positive");
@@ -168,6 +168,27 @@ void check_transport(const Tensors &tensors, const at::Tensor &arena, const at::
   }
 }
 
+void check_selected(const Tensors &tensors, const std::array<const at::Tensor *, 8> &extras) {
+  const auto tokens = tensors[2]->size(0);
+  TORCH_CHECK(tokens <= INT32_MAX / 2048, "selected membership occurrence counts exceed int32 capacity");
+  TORCH_CHECK(extras[4]->sizes() == at::IntArrayRef({tokens, 3}) && extras[4]->scalar_type() == at::kLong &&
+                extras[5]->sizes() == at::IntArrayRef({(tokens + 7) / 8 * 8}) && extras[5]->scalar_type() == at::kInt &&
+                extras[6]->sizes() == at::IntArrayRef({tokens, 4}) && extras[6]->scalar_type() == at::kLong &&
+                extras[7]->sizes() == at::IntArrayRef({16}) && extras[7]->scalar_type() == at::kLong,
+              "selected request buffers must match prepared packed tokens and bounded capacity");
+  for (size_t index = 4; index < extras.size(); ++index) {
+    const auto &tensor = *extras[index];
+    TORCH_CHECK(tensor.device() == tensors[0]->device() && tensor.is_contiguous() && !tensor.requires_grad(),
+                "selected request buffers must be detached contiguous tensors on the prepared NPU");
+    for (const auto *original : tensors) {
+      TORCH_CHECK(!tensor.is_alias_of(*original), "selected request buffers must own independent storage");
+    }
+    for (size_t other = 0; other < extras.size(); ++other) {
+      TORCH_CHECK(index == other || !tensor.is_alias_of(*extras[other]), "selected request buffers must not alias");
+    }
+  }
+}
+
 Result fused_cp_training_npu(const at::Tensor &indexQuery, at::Tensor &indexKey, const at::Tensor &query,
                              at::Tensor &compressed, const at::Tensor &queryRope, at::Tensor &keyRope,
                              const at::Tensor &weights, const at::Tensor &lengths, const at::Tensor &config,
@@ -191,9 +212,37 @@ Result fused_cp_training_npu(const at::Tensor &indexQuery, at::Tensor &indexKey,
   return Result(indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight, loss, trace,
                 retained, klRetained);
 }
+Result selected_cp_training_npu(const at::Tensor &indexQuery, at::Tensor &indexKey, const at::Tensor &query,
+                                at::Tensor &compressed, const at::Tensor &queryRope, at::Tensor &keyRope,
+                                const at::Tensor &weights, const at::Tensor &lengths, const at::Tensor &config,
+                                at::Tensor &trace, at::Tensor &retained, at::Tensor &klRetained,
+                                at::IntArrayRef klLengths, double scale, at::Tensor &indices, at::Tensor &values,
+                                at::Tensor &attention, at::Tensor &maximum, at::Tensor &sum, at::Tensor &gradIndexQuery,
+                                at::Tensor &gradIndexKey, at::Tensor &gradWeight, at::Tensor &loss, at::Tensor &arena,
+                                const at::Tensor &metadata, const at::Tensor &requests, at::Tensor &transportTrace,
+                                const at::Tensor &selectedRows, at::Tensor &membership, at::Tensor &selectedRequests,
+                                at::Tensor &selectedCounts) {
+  const Tensors tensors{&indexQuery, &indexKey, &query, &compressed,     &queryRope,    &keyRope,    &weights,
+                        &lengths,    &config,   &trace, &retained,       &klRetained,   &indices,    &values,
+                        &attention,  &maximum,  &sum,   &gradIndexQuery, &gradIndexKey, &gradWeight, &loss};
+  check_fused_inputs(tensors, scale, 9);
+  check_selected(tensors, {&arena, &metadata, &requests, &transportTrace, &selectedRows, &membership, &selectedRequests,
+                           &selectedCounts});
+  check_lengths(klLengths, query, lengths);
+  check_transport(tensors, arena, metadata, requests, transportTrace);
+  static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaSelectedCpTraining",
+                                                          "aclnnHyperDsaSelectedCpTrainingGetWorkspaceSize");
+  hyper_parallel::multicore::execute_cached_op(
+    api, indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths, config, trace, retained,
+    klRetained, klLengths, scale, indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight,
+    loss, arena, metadata, requests, transportTrace, selectedRows, membership, selectedRequests, selectedCounts);
+  return Result(indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight, loss, trace,
+                retained, klRetained);
+}
 }  // namespace
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("dsa_fused_training_out", &fused_training_npu);
   m.impl("dsa_fused_cp_training_out", &fused_cp_training_npu);
+  m.impl("dsa_selected_cp_training_out", &selected_cp_training_npu);
 }

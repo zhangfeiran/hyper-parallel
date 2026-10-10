@@ -224,8 +224,13 @@ ge::graphStatus ComposeKl(gert::TilingContext *context, DsaFusedTrainingTilingDa
 
 ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
   const auto *trace = context->GetRequiredInputShape(9);
-  if (trace == nullptr || trace->GetStorageShape().GetShapeSize() != 6 * 20 * 64 || context->GetAttrs() == nullptr ||
-      context->GetAttrs()->GetAttrPointer<float>(0) == nullptr) {
+  const bool selected = context->GetOptionalInputDesc(17) != nullptr;
+  if (selected && (context->GetOptionalInputDesc(13) == nullptr || context->GetOptionalInputDesc(18) == nullptr ||
+                   context->GetOptionalInputDesc(19) == nullptr || context->GetOptionalInputDesc(20) == nullptr)) {
+    return ge::GRAPH_FAILED;
+  }
+  if (trace == nullptr || trace->GetStorageShape().GetShapeSize() != (selected ? 9 : 6) * 20 * 64 ||
+      context->GetAttrs() == nullptr || context->GetAttrs()->GetAttrPointer<float>(0) == nullptr) {
     return ge::GRAPH_FAILED;
   }
   DsaFusedTrainingTilingData data;
@@ -251,7 +256,8 @@ ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
   context->SetBlockDim(20);
   context->SetScheduleMode(1);
   const uint64_t transport = context->GetOptionalInputDesc(13) == nullptr ? 0 : 2;
-  context->SetTilingKey(transport + (context->GetInputDesc(6)->GetDataType() == ge::DT_FLOAT ? 1 : 0));
+  context->SetTilingKey((selected ? 4 : 0) + transport +
+                        (context->GetInputDesc(6)->GetDataType() == ge::DT_FLOAT ? 1 : 0));
   raw->SetDataSize(data.GetDataSize());
   return ge::GRAPH_SUCCESS;
 }

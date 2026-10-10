@@ -250,6 +250,8 @@ def _compose_hyper_parallel_ops(
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_transport.h", runtime / "dsa_cp_transport.h")
         if name == "hyper_dsa_fused_grad":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_grad_transport.h", runtime / "dsa_cp_grad_transport.h")
+        if name == "hyper_dsa_fused_training":
+            shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_selected_requests.h", runtime / "dsa_selected_requests.h")
 
 
 def _compose_mixed_indexer(source_root: Path, transformer_copy: Path) -> None:

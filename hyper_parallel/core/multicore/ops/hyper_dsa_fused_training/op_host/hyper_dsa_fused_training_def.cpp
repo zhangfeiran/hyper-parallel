@@ -71,6 +71,23 @@ class HyperDsaFusedTraining : public OpDef {
         .Format({ge::FORMAT_ND, ge::FORMAT_ND})
         .AutoContiguous();
     }
+    this->Input("selected_rows")
+      .ParamType(OPTIONAL)
+      .DataType({ge::DT_INT64, ge::DT_INT64})
+      .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+      .AutoContiguous();
+    this->Input("selected_membership")
+      .ParamType(OPTIONAL)
+      .DataType({ge::DT_INT32, ge::DT_INT32})
+      .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+      .AutoContiguous();
+    for (const char *input : {"selected_requests", "selected_counts"}) {
+      this->Input(input)
+        .ParamType(OPTIONAL)
+        .DataType({ge::DT_INT64, ge::DT_INT64})
+        .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+        .AutoContiguous();
+    }
     this->Output("indices")
       .ParamType(REQUIRED)
       .DataType({ge::DT_INT32, ge::DT_INT32})
