@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from hyper_parallel.core.multicore.compiler.dense_backward import compile_dense_backward
 from hyper_parallel.core.multicore.ir.program import Value
 from hyper_parallel.core.multicore.runtime.dense import DenseKernelPlan
 
@@ -132,24 +133,19 @@ def _forward_expression(provider, arguments):
     raise ValueError(f"No native dense source template for {provider.implementation}")
 
 
-def _backward_statements(operation):
-    args = dict(operation.arguments)
-    out, = operation.outputs
-    if operation.logical_name == "dense.matmul":
-        left = _operand(args["left"], args["transpose_left"])
-        right = _operand(args["right"], args["transpose_right"])
-        left_grad = f"dense_matmul(gradients[{out.id}], ({right}).t())"
-        right_grad = f"dense_matmul(({left}).t(), gradients[{out.id}])"
-        if args["transpose_left"]:
-            left_grad = f"({left_grad}).t()"
-        if args["transpose_right"]:
-            right_grad = f"({right_grad}).t()"
-        return [f"    accumulate(gradients, {args['left'].id}, {left_grad});",
-                f"    accumulate(gradients, {args['right'].id}, {right_grad});"]
-    if operation.logical_name == "dense.swiglu":
-        packed = args["packed"].id
-        return [f"    accumulate(gradients, {packed}, dense_swiglu_grad(gradients[{out.id}], v{packed}));"]
-    raise ValueError(f"No native VJP template for {operation.logical_name}")
+def _backward_statement(node, contribution):
+    primal, = node.primal_inputs
+    gradient = f"gradients[{contribution.source_target}]"
+    if node.kind == "swiglu_input_grad":
+        expression = f"dense_swiglu_grad({gradient}, v{primal})"
+    else:
+        side = 1 if node.kind == "matmul_left_grad" else 0
+        operand = f"v{primal}" + (".t()" if node.operand_transposes[side][0] else "")
+        arguments = f"{gradient}, ({operand}).t()" if side else f"({operand}).t(), {gradient}"
+        expression = f"dense_matmul({arguments})"
+        if node.transpose_output:
+            expression = f"({expression}).t()"
+    return f"    accumulate(gradients, {contribution.target}, {expression});"
 
 
 def generate_dense_cpp(plan: DenseKernelPlan, namespace: str) -> str:
@@ -162,6 +158,7 @@ def generate_dense_cpp(plan: DenseKernelPlan, namespace: str) -> str:
     if not namespace.isidentifier() or not namespace.startswith("hp_dense_"):
         raise ValueError("Dense native namespace must be a sealed hp_dense identifier")
     operations = plan.ir.operations
+    adjoint = compile_dense_backward(plan)
     saved = saved_value_ids(plan)
     forward = ["std::vector<at::Tensor> forward(const std::vector<at::Tensor>& inputs) {",
                f'  TORCH_CHECK(inputs.size() == {len(plan.ir.inputs)}, "Dense native input count mismatch");']
@@ -184,10 +181,12 @@ def generate_dense_cpp(plan: DenseKernelPlan, namespace: str) -> str:
         forward.append(f"  auto v{out.id} = {_forward_expression(task.provider, dict(operation.arguments))};")
     returns = [f"v{value.id}" for value in plan.ir.outputs] + [f"v{value_id}" for value_id in saved]
     forward.extend(["  return {" + ", ".join(returns) + "};", "}"])
-    for operation in reversed(operations):
+    for index in reversed(range(len(operations))):
+        operation = operations[index]
         out, = operation.outputs
         backward.append(f"  if (gradients[{out.id}].defined()) {{")
-        backward.extend(_backward_statements(operation))
+        backward.extend(_backward_statement(adjoint.nodes[item.node], item) for item in adjoint.contributions
+                        if item.operation == index)
         backward.append("  }")
     input_grads = [f"gradients[{value.id}].defined() ? std::make_optional(gradients[{value.id}]) : std::nullopt"
                    for value in plan.ir.inputs]

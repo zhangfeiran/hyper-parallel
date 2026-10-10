@@ -113,6 +113,14 @@ ffn = MegaFFN(1024, 4096, execution=execution).to("npu")
 并在清单中记录原因。主机查询是重建证据，不能替代设备运行时 tiling 捕获或全模型验收。
 
 当前反向通过独立生成的原生执行提供方 VJP，读取本次 resident 调用的确切打包值和激活缓存。
+`compiler/dense_backward.py` 将规范 provider 的显式 recipe 转成带类型的梯度 SSA，记录余切种子、
+完整 Matmul 收缩维度、原始转置链、贡献依赖和逐次舍入后的累加。生成适配器使用此计划，
+并保留原始 C++ 数值调用顺序；绑定产物包含 `bindings/backward.json`。
+`compiler/dense_backward_tiles.py` 已提供独立的反向工作队列计划。每个 worker 完成全部行梯度窗口
+之后再进入权重梯度阶段，后者等待所有必要的 token 生产片段，每个输出矩形独立完成完整 K 收缩。
+SwiGLUGrad 按成对通道分区；空 token 的权重梯度规划为零填充。可选余切只用主机存在性控制，
+单个贡献不再次相加。CPU 回放已覆盖队头阻塞、尾部、分叉、转置输出和独立完整图 autograd 对照。
+这些反向工作队列仍为 `native_status=unbound`，尚未生成或执行 resident 反向设备描述符。
 权重梯度保留完整的 token 维度收缩，不对已经舍入为 BF16 的 tile 局部结果求和。
 中间值归每次调用所有，在待执行反向结束之前保持完整。内部保存值使用设备共享的有界缓存，
 返回值、输入和借用权重不进入此缓存。逻辑值通过 `set_` 创建不暴露私有基准分配的独立叶张量；

@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 
 from hyper_parallel.core.multicore.backends.dense_codegen import generate_dense_cpp
+from hyper_parallel.core.multicore.compiler.dense_backward import compile_dense_backward
 from hyper_parallel.core.multicore.runtime.dense import DenseKernelPlan
 
 CORE = Path(__file__).resolve().parents[1]
@@ -40,7 +41,8 @@ def dense_artifacts(plan: DenseKernelPlan) -> tuple[str, str, dict[str, bytes]]:
     for operation in semantic["operations"]:
         operation.pop("source")
         operation.pop("call_chain")
-    inputs = ("primitives/dense.py", "compiler/dense.py", "runtime/dense.py", "runtime/dense_native.py",
+    inputs = ("primitives/dense.py", "compiler/dense.py", "compiler/dense_backward.py",
+              "runtime/dense.py", "runtime/dense_native.py",
               "runtime/dense_compiled.py", "runtime/dense_execution.py", "_build/build_dense.py",
               "backends/providers.py",
               "backends/dense.py", "backends/dense_codegen.py", "runtime/dense_saved.py")
@@ -51,6 +53,7 @@ def dense_artifacts(plan: DenseKernelPlan) -> tuple[str, str, dict[str, bytes]]:
     manifest = plan.export_manifest()
     plan_key = hashlib.sha256(_json({"definition_key": definition_key, "plan": manifest})).hexdigest()
     files = {"plan.json": _json(manifest), "bindings/providers.json": _json(providers),
+             "bindings/backward.json": _json(compile_dense_backward(plan).export_manifest()),
              "source_map.json": plan.explain().encode(), "definition.json": _json(definition)}
     files["native/dense.cpp"] = generate_dense_cpp(plan, "hp_dense_" + definition_key[:24]).encode()
     return definition_key, plan_key, files
