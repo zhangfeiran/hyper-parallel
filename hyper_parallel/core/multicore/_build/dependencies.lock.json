@@ -68,7 +68,7 @@
           },
           {
             "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_query_positions.patch",
-            "sha256": "af61596c108f5f925c1f4a27f177ad234476a00868feedddc68078037f3ddcf9",
+            "sha256": "3fceed07a45e48016ed2391990024e8ac9a480339330b4850743908cd45622ba",
             "purpose": "use explicit sequence-relative query positions for local SFA sparse-prefix length and causal thresholds"
           },
           {

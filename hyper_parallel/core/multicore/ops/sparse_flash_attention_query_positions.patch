@@ -2,10 +2,7 @@ diff --git a/attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_atte
 index f3a3bacc..f07f77ee 100644
 --- a/attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h
 +++ b/attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h
-@@ -69,7 +69,8 @@ public:
-                                 __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
-                                 __gm__ uint8_t *workspace, const SparseFlashAttentionTilingDataMla *__restrict tiling,
- 				                __gm__ uint8_t *gmTiling, TPipe *tPipe, uint32_t logicalId, uint32_t logicalCount,
+@@ -72,4 +72,5 @@ public:
 -                                uint32_t scratchId, uint32_t scratchCount);
 +                                uint32_t scratchId, uint32_t scratchCount,
 +                                __gm__ uint8_t *queryPositions = nullptr);
@@ -48,8 +45,7 @@ index f3a3bacc..f07f77ee 100644
      }
      tempLoopInfo.curActualSeqLen = (constInfo.sparseBlockCount * constInfo.sparseBlockSize > threshold) ?
                                      threshold : (constInfo.sparseBlockCount * constInfo.sparseBlockSize);
-@@ -388,7 +402,8 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
-                        __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, 
+@@ -389,6 +403,7 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
                         __gm__ uint8_t *workspace, const SparseFlashAttentionTilingDataMla *__restrict tiling,
                         __gm__ uint8_t *gmTiling, TPipe *tPipe, uint32_t logicalId, uint32_t logicalCount,
 -                       uint32_t scratchId, uint32_t scratchCount)
