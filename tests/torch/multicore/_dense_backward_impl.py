@@ -211,6 +211,10 @@ def test_dense_backward_components() -> None:
                      37 if tokens < 1024 else 8192, (False, True), (True,),
                      policies[index % 2], cache_root, 991 + index)
     _append_case(rows, destination, "linear", 129, 17, 37, (False, True), (True,), None, cache_root, 1191)
+    for index, tokens in enumerate((1, 65, 129, 1024)):
+        _append_case(rows, destination, "linear", tokens, 17 if tokens < 1024 else 1024,
+                     37 if tokens < 1024 else 8192, (True, True), (True,),
+                     policies[index % 2], cache_root, 1291 + index, streams=tokens == 129)
     for index, tokens in enumerate((1, 65, 1024)):
         _append_case(rows, destination, "linear_transpose", tokens, 17 if tokens < 1024 else 1024,
                      37 if tokens < 1024 else 8192, (True, False), (True,),
@@ -230,6 +234,10 @@ def test_dense_backward_components() -> None:
         for mask in masks:
             _append_case(rows, destination, kind, 129, 76, 0, (True,), mask, policies[0], cache_root, 2991 + index)
     _append_case(rows, destination, "ffn", 129, 17, 38, (False, False, True), (True,), policies[0], cache_root, 3991)
+    for index, tokens in enumerate((0, 1, 129, 1024)):
+        _append_case(rows, destination, "ffn", tokens, 17 if tokens < 129 else 1024,
+                     38 if tokens < 129 else 8192, (True, True, True), (True,),
+                     policies[index % 2], cache_root, 4991 + index, streams=tokens == 129)
     _write_record(rows, destination, True)
 
 

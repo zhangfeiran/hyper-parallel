@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""显式反向 SSA 的独立设备执行入口；完整 FFN 的未绑定能力严格拒绝。"""
+"""显式反向 SSA 的独立设备执行入口，按真实需求拒绝未绑定能力。"""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from hyper_parallel.core.multicore.backends.dense_backward import (
     bind_dense_backward_tiles,
 )
 from hyper_parallel.core.multicore.backends.dense_codegen import saved_value_ids
+from hyper_parallel.core.multicore.backends.dense_reference import DenseReferenceTiler
 from hyper_parallel.core.multicore.compiler.dense_backward import compile_dense_backward
 from hyper_parallel.core.multicore.compiler.dense_backward_tiles import compile_dense_backward_tiles
 from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePolicy
@@ -64,6 +65,8 @@ class ResidentDenseBackward:
         manifest = build_dense_tile_payload(cann_root, Path(cache_root) / "resident", soc)
         data, self.native_ops = load_dense_payload(manifest, dense_tile_build_identity(cann_root, soc))
         tiler = DenseBackwardSdkTiler(manifest.parent / data["tiling_library"], soc)
+        tiler.reference = DenseReferenceTiler(cann_root, manifest.parent / data["reference_library"], soc,
+                                             tiler.sdk.cube_workers, torch.are_deterministic_algorithms_enabled())
         if policy is None:
             policy = DenseTilePolicy(cube_workers=min(24, tiler.sdk.cube_workers))
             self.tile_plan = compile_dense_backward_tiles(self.backward, policy, output_mask, input_mask)

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from hyper_parallel.core.multicore.backends.dense_reference import ACCESS
+from hyper_parallel.core.multicore.backends.dense_reference import reference_access
 from hyper_parallel.core.multicore.backends.dense_tile import DenseSdkTiler
 from hyper_parallel.core.multicore.compiler.dense_backward_tiles import (
     DenseBackwardTilePlan,
@@ -54,11 +55,11 @@ class DenseBackwardBinding:
 
     def unbound_capabilities(self) -> tuple[str, ...]:
         """按稳定顺序返回尚未实现的设备能力，不吞掉调度或绑定错误。"""
-        supported = {"matmul_nn", "matmul_tn", "swiglu_grad", "add", "zero"}
+        supported = {"matmul_nn", "matmul_tn", "matmul_nt", "swiglu_grad", "add", "zero"}
         return tuple(sorted(set(self.required_capabilities) - supported))
 
     def admit_native(self) -> None:
-        """设备能力必须全部实现；右转置及转置输出尚未放行。"""
+        """设备能力必须全部实现；双侧转置及非空转置输出尚未放行。"""
         unsupported = self.unbound_capabilities()
         if unsupported:
             raise ValueError(f"Dense resident backward has unbound native capabilities: {sorted(unsupported)}")
@@ -156,6 +157,9 @@ class DenseBackwardSdkTiler:
         self.generate = self.sdk.library.hyper_parallel_dense_backward_tiling
         self.generate.argtypes = [ctypes.c_char_p, *([ctypes.c_uint32] * 7), ctypes.c_void_p, ctypes.c_uint32]
         self.generate.restype = ctypes.c_int
+        self.reference = None
+        self.reference_record = None
+        self.reference_shapes = ()
 
     def bank(self, plan: DenseBackwardTilePlan, binding: DenseBackwardBinding) -> bytes:
         """在设备地址建立前检查全部能力，生成逐操作原始 tiling。
@@ -170,16 +174,28 @@ class DenseBackwardSdkTiler:
         workers = HEADER.unpack_from(binding.config)[3]
         if workers > self.sdk.cube_workers:
             raise ValueError("Dense backward cube worker count exceeds the selected SDK hardware target")
+        shapes = tuple(dict.fromkeys((m, n, k, right) for shape in binding.matmul_shapes if shape is not None
+                                     for m, n, k, left, right in (shape,) if m and n and k and right and not left))
+        if getattr(self, "reference", None) is not None and shapes != self.reference_shapes:
+            self.reference_record = self.reference.query(shapes)
+            self.reference_shapes = shapes
+        record = getattr(self, "reference_record", None) or {}
+        reference = {tuple(result["shape"]): result for result in record.get("results", [])}
         blocks = []
         for shape, tile in zip(binding.matmul_shapes, binding.tile_shapes):
             block = ctypes.create_string_buffer(self.sdk.tiling_bytes)
+            access = bytes(ACCESS.size)
             if shape is not None and all(shape[:3]):
                 rows, columns, contracted, transpose_left, transpose_right = shape
                 status = self.generate(self.sdk.soc.encode(), rows, tile[0], columns, tile[1], contracted,
                                        int(transpose_left), int(transpose_right), block, self.sdk.tiling_bytes)
                 if status:
                     raise ValueError(f"Dense backward SDK matrix tiling failed for {shape}: status={status}")
-            blocks.append(block.raw + bytes(ACCESS.size))
+                if (rows, columns, contracted, transpose_right) in reference and not transpose_left:
+                    access, _reason = reference_access(reference[(rows, columns, contracted, transpose_right)],
+                                                       (rows, columns, contracted, transpose_right),
+                                                       self.sdk.cube_workers, allow_right_transpose=True)
+            blocks.append(block.raw + access)
         return b"".join(blocks)
 
     def export_manifest(self, binding: DenseBackwardBinding, bank: bytes) -> dict[str, object]:
@@ -189,7 +205,9 @@ class DenseBackwardSdkTiler:
             raise ValueError("Dense backward tiling bank length differs from the native ABI")
         return {"soc": self.sdk.soc, "cube_workers": self.sdk.cube_workers,
                 "workspace_bytes": self.sdk.workspace_bytes, "tiling_bytes": self.sdk.tiling_bytes,
-                "bank_stride_bytes": stride, "matrix_access": "sequential_sdk_unproved",
+                "bank_stride_bytes": stride, "matrix_access": "sdk_nt_reference_candidate"
+                if getattr(self, "reference_record", None) is not None else "sequential_sdk_unproved",
+                "reference": getattr(self, "reference_record", None),
                 "required_capabilities": binding.required_capabilities,
                 "config_sha256": hashlib.sha256(binding.config).hexdigest(),
                 "bank_sha256": hashlib.sha256(bank).hexdigest()}

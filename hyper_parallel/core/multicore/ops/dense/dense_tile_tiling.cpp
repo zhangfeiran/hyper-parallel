@@ -46,11 +46,12 @@ extern "C" int hyper_parallel_dense_backward_tiling(const char *soc, uint32_t ro
   auto *platform = Platform(soc);
   if (platform == nullptr || output == nullptr || capacity != sizeof(AscendC::tiling::TCubeTiling) || rows == 0 ||
       tile_rows == 0 || tile_rows > rows || columns == 0 || tile_columns == 0 || tile_columns > columns ||
-      contracted == 0 || transpose_left > 1 || transpose_right != 0) {
+      contracted == 0 || transpose_left > 1 || transpose_right > 1 || (transpose_left && transpose_right)) {
     return -1;
   }
   matmul_tiling::MatmulApiTiling builder(*platform);
-  if (!Configure(builder, rows, tile_rows, columns, tile_columns, contracted, false, transpose_left != 0)) {
+  if (!Configure(builder, rows, tile_rows, columns, tile_columns, contracted,
+                 transpose_right != 0, transpose_left != 0)) {
     return -2;
   }
   AscendC::tiling::TCubeTiling tiling{};

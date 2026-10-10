@@ -7,6 +7,7 @@
 #include "dense/dense_tile_abi.h"
 #include "dense/dense_backward_abi.h"
 #include "dense/dense_backward_vector.h"
+#include "dense/dense_access.h"
 
 namespace {
 using AscendC::CacheLine;
@@ -38,14 +39,19 @@ using HyperParallelDense::DenseBackwardDependency;
 using HyperParallelDense::DenseBackwardHeader;
 using HyperParallelDense::DenseBackwardOperation;
 using HyperParallelDense::DenseMatrixAccess;
+using HyperParallelDense::MatrixKOffset;
+using HyperParallelDense::MatrixKState;
+using HyperParallelDense::MatrixSegmentEnd;
 #ifndef __DAV_C220_CUBE__
 using HyperParallelDense::DenseGradientAdd;
 using HyperParallelDense::DenseSwiGluGrad;
 #endif
 using Matrix = matmul::MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t>;
 using LeftTransposeMatrix = matmul::MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t, true>;
+using RightTransposeMatrix = matmul::MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t, true>;
 using DenseMatmul = matmul::Matmul<Matrix, Matrix, Matrix>;
 using DenseLeftTransposeMatmul = matmul::Matmul<LeftTransposeMatrix, Matrix, Matrix>;
+using DenseRightTransposeMatmul = matmul::Matmul<Matrix, RightTransposeMatrix, Matrix>;
 
 template <typename Data>
 __aicore__ inline Data LoadDescriptor(const __gm__ Data *source) {
@@ -57,6 +63,66 @@ __aicore__ inline Data LoadDescriptor(const __gm__ Data *source) {
   }
   return result;
 }
+
+#ifdef __DAV_C220_CUBE__
+__aicore__ inline void BackwardOrderedCopyA(const AscendC::LocalTensor<int8_t> &local, const __gm__ void *gm,
+                                           int row, int column, int use_m, int use_k, uint64_t tiling_ptr,
+                                           uint64_t state) {
+  const auto tiling = LoadDescriptor(reinterpret_cast<const __gm__ TCubeTiling *>(tiling_ptr));
+  GlobalTensor<bfloat16_t> source;
+  source.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(const_cast<__gm__ void *>(gm)));
+  auto target = local.ReinterpretCast<bfloat16_t>();
+  const uint32_t chunk = static_cast<uint32_t>(state);
+  const uint32_t stride = (use_m + 15) / 16 * 16;
+  for (uint32_t done = 0; done < use_k;) {
+    const uint32_t offset = column * tiling.baseK + done;
+    const uint32_t remaining = chunk - offset % chunk;
+    const uint32_t count = use_k - done < remaining ? use_k - done : remaining;
+    AscendC::Nd2NzParams copy{};
+    copy.ndNum = 1;
+    copy.nValue = use_m;
+    copy.dValue = count;
+    copy.srcDValue = tiling.Ka;
+    copy.dstNzC0Stride = stride;
+    copy.dstNzNStride = 1;
+    const uint64_t position = static_cast<uint64_t>(row * tiling.baseM) * tiling.Ka +
+                              MatrixKOffset(offset, tiling.Ka, state);
+    DataCopy(target[done * stride], source[position], copy);
+    done += count;
+  }
+}
+
+__aicore__ inline void BackwardOrderedCopyB(const AscendC::LocalTensor<int8_t> &local, const __gm__ void *gm,
+                                           int row, int column, int use_k, int use_n, uint64_t tiling_ptr,
+                                           uint64_t state) {
+  const auto tiling = LoadDescriptor(reinterpret_cast<const __gm__ TCubeTiling *>(tiling_ptr));
+  GlobalTensor<bfloat16_t> source;
+  source.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(const_cast<__gm__ void *>(gm)));
+  auto target = local.ReinterpretCast<bfloat16_t>();
+  const uint32_t chunk = static_cast<uint32_t>(state);
+  const uint32_t stride = (use_n + 15) / 16 * 16;
+  // SDK 的回调保留逻辑 K/N 参数；转置 B 的 GM 与 L1 按物理 N/K 布局搬运。
+  for (uint32_t done = 0; done < use_k;) {
+    const uint32_t offset = row * tiling.baseK + done;
+    const uint32_t remaining = chunk - offset % chunk;
+    const uint32_t count = use_k - done < remaining ? use_k - done : remaining;
+    AscendC::Nd2NzParams copy{};
+    copy.ndNum = 1;
+    copy.nValue = use_n;
+    copy.dValue = count;
+    copy.srcDValue = tiling.Kb;
+    copy.dstNzC0Stride = stride;
+    copy.dstNzNStride = 1;
+    const uint64_t position = static_cast<uint64_t>(column * tiling.baseN) * tiling.Kb +
+                              MatrixKOffset(offset, tiling.Kb, state);
+    DataCopy(target[done * stride], source[position], copy);
+    done += count;
+  }
+}
+
+using OrderedRightTransposeMatmul = matmul::Matmul<Matrix, RightTransposeMatrix, Matrix, Matrix, CFG_NORM,
+  AscendC::MatmulCallBackFunc<nullptr, BackwardOrderedCopyA, BackwardOrderedCopyB>>;
+#endif
 
 class DenseBackwardWorker {
  public:
@@ -120,7 +186,8 @@ class DenseBackwardWorker {
  private:
   __aicore__ inline void Validate(const DenseBackwardOperation &operation) {
     if (operation.left >= header_.value_count || operation.right >= header_.value_count ||
-        operation.output >= header_.value_count || operation.transpose_right != 0 ||
+        operation.output >= header_.value_count || operation.transpose_right > 1 ||
+        (operation.kind == DENSE_MATMUL && operation.transpose_left && operation.transpose_right) ||
         (operation.transpose_output != 0 && operation.kind != DENSE_ZERO) ||
         operation.transpose_left > 1 || operation.kind == DENSE_SWIGLU || operation.kind > DENSE_ZERO ||
         operation.columns_per_tile == 0 || operation.column_tiles !=
@@ -212,11 +279,7 @@ class DenseBackwardWorker {
     uint32_t column_end = column + operation.columns_per_tile;
     column_end = column_end < operation.columns ? column_end : operation.columns;
 #ifdef __DAV_C220_CUBE__
-    if (operation.transpose_left) {
-      Matrix<DenseLeftTransposeMatmul>(operation, index, first, end - first, column, column_end - column);
-    } else {
-      Matrix<DenseMatmul>(operation, index, first, end - first, column, column_end - column);
-    }
+    Matrix(operation, index, first, end - first, column, column_end);
 #else
     const uint32_t middle = first + (end - first + 1) / 2;
     if (GetBlockIdx() % 2 == 0) {
@@ -244,11 +307,54 @@ class DenseBackwardWorker {
   }
 
 #ifdef __DAV_C220_CUBE__
-  template <typename MatrixKernel>
   __aicore__ inline void Matrix(const DenseBackwardOperation &operation, uint32_t index, uint32_t first,
-                                uint32_t rows, uint32_t column, uint32_t columns) {
-    const GM_ADDR source = tilings_ + index * (sizeof(TCubeTiling) + sizeof(DenseMatrixAccess));
+                                uint32_t rows, uint32_t first_column, uint32_t end_column) {
+    GM_ADDR source = tilings_ + index * (sizeof(TCubeTiling) + sizeof(DenseMatrixAccess));
     auto tiling = LoadDescriptor(reinterpret_cast<const __gm__ TCubeTiling *>(source));
+    const auto access =
+      LoadDescriptor(reinterpret_cast<const __gm__ DenseMatrixAccess *>(source + sizeof(TCubeTiling)));
+    if (operation.transpose_left) {
+      MatrixSegment<DenseLeftTransposeMatmul>(operation, source, tiling, first, rows, first_column,
+                                            end_column - first_column, 0);
+      return;
+    }
+    if (!operation.transpose_right) {
+      MatrixSegment<DenseMatmul>(operation, source, tiling, first, rows, first_column,
+                                end_column - first_column, 0);
+      return;
+    }
+    const uint32_t extent = access.m_extent >= access.n_extent ? access.m_extent : access.n_extent;
+    if (access.k_chunk == 0 || access.close_shift != 0 || extent < 4 ||
+        extent / 2 > operation.contracted / access.k_chunk) {
+      MatrixSegment<DenseRightTransposeMatmul>(operation, source, tiling, first, rows, first_column,
+                                              end_column - first_column, 0);
+      return;
+    }
+    const bool row_axis = access.m_extent >= access.n_extent;
+    for (uint32_t row = first; row < first + rows;) {
+      const uint32_t row_end = row_axis ? MatrixSegmentEnd(row, access.m_span, first + rows) : first + rows;
+      for (uint32_t column = first_column; column < end_column;) {
+        const uint32_t column_end =
+          row_axis ? end_column : MatrixSegmentEnd(column, access.n_span, end_column);
+        const uint64_t state = MatrixKState(access, operation.rows, operation.columns, operation.contracted,
+                                            row, column);
+        if (state == 0) {
+          MatrixSegment<DenseRightTransposeMatmul>(operation, source, tiling, row, row_end - row, column,
+                                                  column_end - column, 0);
+        } else {
+          MatrixSegment<OrderedRightTransposeMatmul>(operation, source, tiling, row, row_end - row, column,
+                                                    column_end - column, state);
+        }
+        column = column_end;
+      }
+      row = row_end;
+    }
+  }
+
+  template <typename MatrixKernel>
+  __aicore__ inline void MatrixSegment(const DenseBackwardOperation &operation, GM_ADDR source, TCubeTiling &tiling,
+                                       uint32_t first, uint32_t rows, uint32_t column, uint32_t columns,
+                                       uint64_t state) {
     TPipe pipe;
     MatrixKernel mm;
     REGIST_MATMUL_OBJ(&pipe, workspace_, mm, &tiling);
@@ -258,9 +364,13 @@ class DenseBackwardWorker {
     output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(values_[operation.output]));
     mm.SetOrgShape(operation.rows, operation.columns, operation.contracted);
     mm.SetTail(rows, columns, operation.contracted);
+    mm.SetUserDefInfo(reinterpret_cast<uint64_t>(source));
+    mm.SetSelfDefineData(state);
     const uint64_t offset = operation.transpose_left ? first : static_cast<uint64_t>(first) * operation.contracted;
     mm.SetTensorA(left[offset], operation.transpose_left != 0);
-    mm.SetTensorB(right[column]);
+    const uint64_t right_offset = operation.transpose_right ? static_cast<uint64_t>(column) * operation.contracted :
+                                                            column;
+    mm.SetTensorB(right[right_offset], operation.transpose_right != 0);
     mm.IterateAll(output[static_cast<uint64_t>(first) * operation.columns + column]);
     mm.End();
   }

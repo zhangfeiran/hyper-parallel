@@ -63,25 +63,49 @@ class TestDenseBackwardRouter(unittest.TestCase):
     """主机替身仅核对选择及生命周期，真实数值由 NPU 系统用例负责。"""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-    def test_unbound_full_ffn_uses_one_complete_host_vjp(self):
-        """Feature: 完整 FFN 的未绑定能力。
-        Description: 按真实三个输入需求请求所有梯度，并监视设备构建入口。
+    def test_unbound_output_transpose_uses_one_complete_host_vjp(self):
+        """Feature: 非空转置输出的未绑定能力。
+        Description: 请求转置权重的全部梯度，并监视设备构建入口。
         Expectation: 整次调用使用原主机 VJP，不能拼接部分设备梯度。
         """
-        plan = dense_ffn.plan(mc.DenseSpec({"T": 7, "H": 5, "I": 9, "PackedI": 18}), intermediate_size=9)
-        values = tuple(torch.zeros(shape, dtype=torch.bfloat16) for shape in ((7, 5), (5, 18), (9, 5)))
+        plan = mc.from_source("def linear(x, weight):\n    return ml.matmul(x, weight, transpose_right=True)\n",
+                              signature={"x": ml.Tensor[ml.bf16, (7, 5)],
+                                         "weight": ml.Tensor[ml.bf16, (9, 5)]},
+                              symbols={"ml": ml}, schedule=mc.TaskDAG("dense_v1")).plan(mc.DenseSpec({}))
+        values = tuple(torch.zeros(shape, dtype=torch.bfloat16) for shape in ((7, 5), (9, 5)))
         host = Mock(return_value=values)
         router = _router(plan, host)
-        delta = torch.zeros(7, 5, dtype=torch.bfloat16)
+        delta = torch.zeros(7, 9, dtype=torch.bfloat16)
         with patch("hyper_parallel.core.multicore.runtime.dense_backward_router.ResidentDenseBackward") as native:
-            self.assertEqual(len(router(values, (), (delta,), (True, True, True))), 3)
-            self.assertEqual(len(router(values, (), (delta,), (True, True, True))), 3)
+            self.assertEqual(len(router(values, (), (delta,), (True, True))), 2)
+            self.assertEqual(len(router(values, (), (delta,), (True, True))), 2)
         native.assert_not_called()
         self.assertEqual(host.call_count, 2)
         statistics = router.statistics()
         self.assertEqual(statistics["execution_mode"], "native_host_stream_adapter")
         self.assertEqual(statistics["cached_variants"], 1)
-        self.assertEqual(statistics["unbound_capabilities"], ["matmul_nt"])
+        self.assertEqual(statistics["unbound_capabilities"], ["transpose_output"])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_full_ffn_requests_all_three_device_gradients(self):
+        """Feature: 完整 FFN 的设备梯度图。
+        Description: 使用真实三个输入需求及输出余切，核对完整设备反向的选择。
+        Expectation: dX、gate/up 和 down 梯度属于同次设备调用，主机 VJP 不执行。
+        """
+        plan = dense_ffn.plan(mc.DenseSpec({"T": 7, "H": 5, "I": 9, "PackedI": 18}), intermediate_size=9)
+        values = tuple(torch.zeros(shape, dtype=torch.bfloat16) for shape in ((7, 5), (5, 18), (9, 5)))
+        host = Mock()
+        router = _router(plan, host)
+        delta = torch.zeros(7, 5, dtype=torch.bfloat16)
+        with patch("hyper_parallel.core.multicore.runtime.dense_backward_router.ResidentDenseBackward",
+                   side_effect=_NativeDouble) as native:
+            actual = router(values, (), (delta,), (True, True, True))
+        native.assert_called_once()
+        self.assertEqual(len(actual), 3)
+        self.assertTrue(all(value is not None for value in actual))
+        host.assert_not_called()
+        self.assertEqual(router.statistics()["execution_mode"], "resident_dense_backward")
+        self.assertEqual(router.statistics()["unbound_capabilities"], [])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_bound_native_cache_retirement_and_pending_backward_after_close(self):

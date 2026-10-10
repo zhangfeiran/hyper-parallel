@@ -16,14 +16,17 @@
 
 from __future__ import annotations
 
+import json
 import struct
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import hyper_parallel.core.multicore.frontend as mc
 import hyper_parallel.core.multicore.language as ml
 from hyper_parallel.core.multicore.backends.dense_backward import (
+    ACCESS,
     DEPENDENCY,
     HEADER,
     OPERATION,
@@ -42,10 +45,12 @@ def _ffn(rows, **policy):
     return compile_dense_backward_tiles(compile_dense_backward(forward), DenseTilePolicy(**policy))
 
 
-def _linear(rows, hidden=17, output=37, **masks):
-    forward = mc.from_source("def linear(x, weight):\n    return ml.matmul(x, weight)\n",
+def _linear(rows, hidden=17, output=37, transpose_right=False, **masks):
+    forward = mc.from_source(f"def linear(x, weight):\n    return ml.matmul(x, weight, "
+                             f"transpose_right={transpose_right})\n",
                              signature={"x": ml.Tensor[ml.bf16, (rows, hidden)],
-                                        "weight": ml.Tensor[ml.bf16, (hidden, output)]},
+                                        "weight": ml.Tensor[ml.bf16, (output, hidden) if transpose_right
+                                                            else (hidden, output)]},
                              symbols={"ml": ml}, schedule=mc.TaskDAG("dense_v1")).plan(mc.DenseSpec({}))
     return compile_dense_backward_tiles(compile_dense_backward(forward),
                                         DenseTilePolicy(cube_workers=3, column_workers=4), **masks)
@@ -97,8 +102,8 @@ class TestDenseBackwardBinding(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_complete_ffn_domains_and_global_join_are_serialized(self):
         """Feature: 完整 FFN 反向 ABI。
-        Description: 检查 token 行、两组完整 token 权重收缩以及 SDK 能力拒绝。
-        Expectation: dWgu 等待全部 dP 行；完整 FFN 保留未绑定右转置状态。
+        Description: 检查 token 行、两组完整 token 权重收缩以及左右转置能力。
+        Expectation: dWgu 等待全部 dP 行；完整 FFN 的五个操作具备设备绑定。
         """
         plan = _ffn(129, rows_per_tile=64, cube_workers=3, column_workers=4)
         binding = bind_dense_backward_tiles(plan)
@@ -112,8 +117,8 @@ class TestDenseBackwardBinding(unittest.TestCase):
         offset = HEADER.size + 5 * OPERATION.size + operations[4][16] * DEPENDENCY.size
         self.assertEqual(DEPENDENCY.unpack_from(binding.config, offset),
                          (plan.regions[2].events[0], 3, plan.regions[2].signals, 0))
-        with self.assertRaisesRegex(ValueError, "matmul_nt"):
-            binding.admit_native()
+        binding.admit_native()
+        self.assertEqual(binding.required_capabilities, ("matmul_nt", "matmul_tn", "swiglu_grad"))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_only_requested_input_gradients_keep_their_complete_ancestors(self):
@@ -188,8 +193,34 @@ class TestDenseBackwardBinding(unittest.TestCase):
         self.assertEqual([region.kind for region in plan.regions if region.events], ["zero", "zero"])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_nt_reference_access_is_bound_once_to_its_exact_matrix_slot(self):
+        """Feature: NT 访问规则的逐操作绑定。
+        Description: 使用实际 SDK 快照，分别绑定 dA 的 V2 重排及 dX 的 V3 顺序访问。
+        Expectation: 两种规则进入正确的固定偏移，重复生成不会重复查询主机 SDK。
+        """
+        fixture = Path(__file__).parent / "fixtures/dense_reference_nt_910b3.json"
+        record = json.loads(fixture.read_text(encoding="utf-8"))
+        record["results"] = record["results"][:2]
+        forward = dense_ffn.plan(mc.DenseSpec({"T": 1024, "H": 1024, "I": 4096, "PackedI": 8192}),
+                                 intermediate_size=4096)
+        plan = compile_dense_backward_tiles(compile_dense_backward(forward), DenseTilePolicy(cube_workers=3))
+        binding = bind_dense_backward_tiles(plan)
+        tiler = DenseBackwardSdkTiler.__new__(DenseBackwardSdkTiler)
+        tiler.sdk = SimpleNamespace(soc="test-target", cube_workers=20, workspace_bytes=128, tiling_bytes=200)
+        queries = []
+        tiler.reference = SimpleNamespace(query=lambda shapes: queries.append(shapes) or record)
+        tiler.reference_record, tiler.reference_shapes = None, ()
+        tiler.generate = lambda *_args: 0
+        bank = tiler.bank(plan, binding)
+        self.assertEqual(ACCESS.unpack(bank[200:224]), (256, 896, 4, 5, 256, 0))
+        self.assertEqual(bank[3 * 224 + 200:4 * 224], bytes(24))
+        self.assertEqual(tiler.bank(plan, binding), bank)
+        self.assertEqual(queries, [((1024, 4096, 1024, True), (1024, 1024, 8192, True))])
+        self.assertEqual(tiler.export_manifest(binding, bank)["reference"], record)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_sdk_tiling_keeps_full_k_and_actual_left_transpose(self):
-        """Feature: 左转置 SDK tiling 参数。
+        """Feature: 左右转置 SDK tiling 参数。
         Description: 用原始结构大小的主机库替身记录反向矩形配置。
         Expectation: tile 只切输出 M/N，K 仍为完整 token，能力错误早于 SDK 调用。
         """
@@ -210,9 +241,14 @@ class TestDenseBackwardBinding(unittest.TestCase):
         self.assertEqual(calls, [(131, 64, 73, 32, 1024, 1, 0)])
         self.assertEqual(len(bank), 224)
         self.assertEqual(tiler.export_manifest(binding, bank)["matrix_access"], "sequential_sdk_unproved")
+        ffn = _ffn(65, cube_workers=3)
+        ffn_binding = bind_dense_backward_tiles(ffn)
+        self.assertEqual(len(tiler.bank(ffn, ffn_binding)), 5 * 224)
+        self.assertEqual(calls[1:], [(65, 64, 19, 19, 17, 0, 1), (19, 19, 17, 17, 65, 1, 0),
+                                     (65, 64, 17, 17, 38, 0, 1), (17, 17, 38, 38, 65, 1, 0)])
         with self.assertRaisesRegex(ValueError, "unbound"):
-            unsupported = _ffn(65)
+            unsupported = _linear(65, transpose_right=True, input_mask=(False, True))
             tiler.bank(unsupported, bind_dense_backward_tiles(unsupported))
         with self.assertRaisesRegex(ValueError, "canonical"):
             tiler.bank(plan, replace(binding, matmul_shapes=((131, 73, 512, True, False),)))
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 5)

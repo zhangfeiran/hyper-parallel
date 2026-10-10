@@ -33,17 +33,20 @@ REFERENCE_FIELDS = (
 
 
 def reference_access(result: dict[str, object], shape: tuple[int, int, int, bool],
-                     cube_workers: int) -> tuple[bytes, str]:
+                     cube_workers: int, *, allow_right_transpose: bool = False) -> tuple[bytes, str]:
     """从 BF16 ND 模板的原始字段生成 M/N 分区、K 块大小和禁用标志。
 
     Args:
         result: 同一矩阵的 SDK 主机查询记录。
         shape: 行数、列数、收缩维度和右转置标志。
         cube_workers: SDK 查询得到的目标 Cube 数。
+        allow_right_transpose: 仅由具有可转置 B 加载回调的独立反向 worker 启用。
 
     Returns:
         固定 24 字节的设备访问参数及准入原因。
     """
+    if type(allow_right_transpose) not in (bool,):
+        raise ValueError("稠密参考的右转置加载能力必须为精确布尔值")
     if tuple(result["shape"]) != shape:
         raise ValueError("稠密参考查询的矩阵形状不匹配")
     run = result["run_info"]
@@ -74,7 +77,7 @@ def reference_access(result: dict[str, object], shape: tuple[int, int, int, bool
         reason = "native_matmul_v3_sequential" if family == "MatMulV3" else "ambiguous_native_family"
         return bytes(ACCESS.size), reason
     # 位布局来自选定 SDK 的 gemm_tilingcase；满载、split-K 和其他布局尚未证明可复现。
-    compatible = (not transpose and columns % 16 == 0 and contracted % 16 == 0
+    compatible = ((not transpose or allow_right_transpose) and columns % 16 == 0 and contracted % 16 == 0
                   and max(columns, contracted) <= 65535
                   and fields["datatype_bf16"] == 1 and fields["bias_flag"] == fields["hf32_flag"] == 0
                   and fields["batch_dim"] == fields["k_dim"] == 1

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -77,14 +78,31 @@ class TestDenseBackwardRuntime(unittest.TestCase):
             executable._values(inputs, (), (gradient.float(),))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-    def test_full_ffn_capability_rejection_happens_before_build_or_device_allocation(self):
-        """Feature: 完整 FFN 能力边界。
-        Description: 以设备元数据替身请求所有 FFN 输入梯度，并监视构建入口。
-        Expectation: 未绑定的右转置先被拒绝，不创建隐式主机补算或替代权重路径。
+    def test_output_transpose_rejection_happens_before_build_or_device_allocation(self):
+        """Feature: 非空转置输出的能力边界。
+        Description: 以设备元数据替身请求转置权重梯度，并监视构建入口。
+        Expectation: 未绑定的输出转置先被拒绝，不创建隐式主机补算或替代权重路径。
         """
-        plan = dense_ffn.plan(mc.DenseSpec({"T": 7, "H": 5, "I": 9, "PackedI": 18}), intermediate_size=9)
+        plan = mc.from_source("def linear(x, weight):\n    return ml.matmul(x, weight, transpose_right=True)\n",
+                              signature={"x": ml.Tensor[ml.bf16, (7, 5)],
+                                         "weight": ml.Tensor[ml.bf16, (9, 5)]},
+                              symbols={"ml": ml}, schedule=mc.TaskDAG("dense_v1")).plan(mc.DenseSpec({}))
         with patch("hyper_parallel.core.multicore.runtime.dense_backward.build_dense_tile_payload") as build:
-            with self.assertRaisesRegex(ValueError, "matmul_nt"):
+            with self.assertRaisesRegex(ValueError, "transpose_output"):
                 ResidentDenseBackward(plan, SimpleNamespace(type="npu"), cann_root=None, cache_root=None,
                                       soc="Ascend910B3")
         build.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_full_ffn_admits_all_gradients_before_native_build(self):
+        """Feature: 完整 FFN 的反向设备绑定。
+        Description: 请求所有真实梯度，在原生构建边界使用明确异常停止 CPU 协议。
+        Expectation: NN/TN/NT 与激活梯度的完整图通过准入，进入原生构建。
+        """
+        plan = dense_ffn.plan(mc.DenseSpec({"T": 7, "H": 5, "I": 9, "PackedI": 18}), intermediate_size=9)
+        with patch("hyper_parallel.core.multicore.runtime.dense_backward.build_dense_tile_payload",
+                   side_effect=RuntimeError("native-build-boundary")) as build:
+            with self.assertRaisesRegex(RuntimeError, "native-build-boundary"):
+                ResidentDenseBackward(plan, SimpleNamespace(type="npu"), cann_root=None,
+                                      cache_root=Path("metadata-only"), soc="Ascend910B3")
+        build.assert_called_once()

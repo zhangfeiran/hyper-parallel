@@ -37,6 +37,7 @@ from tests.common.mark_utils import arg_mark
 
 ROOT = Path(__file__).resolve().parents[5]
 FIXTURE = Path(__file__).parent / "fixtures/dense_reference_910b3.json"
+NT_FIXTURE = Path(__file__).parent / "fixtures/dense_reference_nt_910b3.json"
 PROBE = """
 #define __aicore__
 #include "dense_access.h"
@@ -108,6 +109,29 @@ class TestDenseReference(unittest.TestCase):
                     expected_reason = ("native_matmul_v3_sequential" if index in (2, 3)
                                        else "unsupported_reference_template")
                     self.assertEqual(reason, expected_reason)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_nt_access_requires_transposed_callback_and_matches_sdk_column_orders(self):
+        """Feature: 独立反向 NT 的原生 K 顺序。
+        Description: 使用真实 NT 查询快照，检查列分区、转置能力及 V3 禁用。
+        Expectation: 默认前向继续拒绝 NT 重排；反向回调覆盖原生逆序、旋转和尾部顺序。
+        """
+        results = json.loads(NT_FIXTURE.read_text(encoding="utf-8"))["results"]
+        result, v3 = results[:2]
+        shape = tuple(result["shape"])
+        self.assertEqual(reference_access(result, shape, 20)[0], bytes(24))
+        access, reason = reference_access(result, shape, 20, allow_right_transpose=True)
+        self.assertEqual((ACCESS.unpack(access), reason), ((256, 896, 4, 5, 256, 0), "sdk_k_block_access"))
+        orders = ((0, 1, 2, 3), (3, 2, 1, 0), (2, 3, 0, 1), (0, 1, 2, 3), (0, 1, 2, 3))
+        for index, order in enumerate(orders):
+            with self.subTest(column_partition=index):
+                _, mapping, _ = self._probe(ACCESS.unpack(access), shape, 0, index * 896)
+                expected = tuple(element for block in order for element in range(block * 256, (block + 1) * 256))
+                self.assertEqual(mapping, expected)
+        self.assertEqual(reference_access(v3, tuple(v3["shape"]), 20, allow_right_transpose=True),
+                         (bytes(24), "native_matmul_v3_sequential"))
+        with self.assertRaisesRegex(ValueError, "精确布尔"):
+            reference_access(result, shape, 20, allow_right_transpose=1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_device_mapping_matches_compiler_golden_orders(self):

@@ -28,10 +28,12 @@ from hyper_parallel.core.multicore.runtime.dense_tile import ResidentDenseExecut
 from tests.torch.multicore._dense_backward_impl import _program, _rand, _reference
 
 
-def _case(kind, input_mask, output_mask, seed, cache_root, close=False, retain=False, stream=False, hooks=False):
+def _case(kind, input_mask, output_mask, seed, cache_root, close=False, retain=False, stream=False, hooks=False,
+          geometry=None):
     device = torch.device("npu:0")
-    plan = _program(kind, 129, 76 if kind in ("glu", "chain", "duplicate") else 513,
-                    74 if kind == "glu_linear" else 37)
+    tokens, hidden, columns = geometry or (129, 76 if kind in ("glu", "chain", "duplicate") else 513,
+                                          74 if kind == "glu_linear" else 37)
+    plan = _program(kind, tokens, hidden, columns)
     executable = ResidentDenseExecutable(plan, device, cann_root=Path(os.environ["ASCEND_HOME_PATH"]),
                                         cache_root=cache_root, soc=torch.npu.get_device_name(device),
                                         policy=DenseTilePolicy(rows_per_tile=32, cube_workers=3,
@@ -80,11 +82,12 @@ def _case(kind, input_mask, output_mask, seed, cache_root, close=False, retain=F
         comparisons = []
         for value, reference in zip(actual, expected):
             torch.testing.assert_close(value, reference, rtol=0.02, atol=0.002)
-            comparisons.append(float((value.float() - reference.float()).abs().max()))
+            comparisons.append(float((value.float() - reference.float()).abs().max()) if value.numel() else 0.0)
         runtime = executable.backward_router.statistics()
         if runtime["execution_mode"] != "resident_dense_backward" or runtime["host_calls"]:
             raise AssertionError("标准 autograd 用例必须使用完整设备反向")
-        return {"kind": kind, "input_mask": input_mask, "output_mask": output_mask,
+        return {"kind": kind, "tokens": tokens, "hidden": hidden, "columns": columns,
+                "input_mask": input_mask, "output_mask": output_mask,
                 "close_before_backward": close, "retain_graph": retain, "nondefault_stream": stream,
                 "saved_hooks": hooks, "gradient_max_abs": comparisons,
                 "backward_mode": runtime["execution_mode"], "native_calls": runtime["native_calls"],
@@ -97,7 +100,7 @@ def _case(kind, input_mask, output_mask, seed, cache_root, close=False, retain=F
 
 
 def test_dense_backward_autograd() -> None:
-    """核对真实 autograd，保持未绑定完整 FFN 的准入边界。"""
+    """核对真实 autograd，包括完整 FFN 的三组实际设备梯度。"""
     if not torch_npu.npu.is_available():
         raise RuntimeError("常驻反向 autograd 验收需要真实 Ascend NPU")
     torch.npu.set_device(0)
@@ -111,6 +114,12 @@ def test_dense_backward_autograd() -> None:
         _case("duplicate", (True,), (False, True), 8005, cache_root, close=True),
         _case("glu_linear", (False, True), (True,), 8006, cache_root, retain=True, stream=True),
         _case("shared", (False, True), (True, True, True), 8007, cache_root),
+        _case("ffn", (True, True, True), (True,), 8011, cache_root, geometry=(0, 17, 38)),
+        _case("ffn", (True, True, True), (True,), 8012, cache_root, geometry=(1, 17, 38)),
+        _case("ffn", (True, True, True), (True,), 8013, cache_root, retain=True, stream=True, hooks=True,
+              geometry=(129, 513, 1030)),
+        _case("ffn", (True, True, True), (True,), 8014, cache_root, close=True, stream=True,
+              geometry=(1024, 1024, 8192)),
     ]
     destination = os.environ.get("HP_FFN_EVIDENCE_DIR")
     if destination:
