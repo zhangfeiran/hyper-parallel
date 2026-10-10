@@ -76,15 +76,15 @@ _FIELDS = ("hidden", "query_projection", "compressed_projection", "query_rope_pr
            "index_query_projection", "index_key_projection", "merge_projection", "output_projection")
 
 
-def _snapshots(meta, states, result, output, gradients, objective, loss):
+def _snapshots(meta, states, result, output, gradients, objective, loss, *, group=None):
     payload = {"queries": meta.q_global_ids, "keys": meta.kv_global_ids,
                "states": tuple(tensor.detach().cpu() for tensor in states),
                "indices": result.global_indices[:, 0].cpu(), "output": output.detach().cpu(),
                "gradients": tuple(None if tensor is None else tensor.detach().cpu() for tensor in gradients),
                "objective": objective.detach().cpu(), "loss": loss.detach().cpu(),
                "loss_requires_grad": loss.requires_grad}
-    peers = [None]*dist.get_world_size()
-    dist.all_gather_object(peers, payload)
+    peers = [None]*dist.get_world_size(group)
+    dist.all_gather_object(peers, payload, group=group)
     return peers
 
 
@@ -177,7 +177,7 @@ def _check(peers, cpu_fixture, geometry, lengths, mode, coefficient, auxiliary, 
 
 def _step(workspace, backend, base_meta, geometry, cpu_fixture, *, tile_mode, weight_dtype,
           mode, coefficient, auxiliary, divisor, replay, precision_budgets=None, fused_kl=False,
-          sparse_main_return=False, sparse_index_return=False):
+          sparse_main_return=False, sparse_index_return=False, sgd_step=False):
     device = backend.layout.device
     tile = _tile(base_meta, tile_mode)
     layout = backend.prepare_local_queries(tile.q_global_ids)
@@ -229,13 +229,40 @@ def _step(workspace, backend, base_meta, geometry, cpu_fixture, *, tile_mode, we
                 else:
                     torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=.02, atol=2e-5)
     torch.npu.synchronize()
-    peers = _snapshots(tile, states, captured[0], output, first, objective, loss)
+    peers = _snapshots(tile, states, captured[0], output, first, objective, loss, group=backend.layout.group)
     evidence = _check(peers, cpu_fixture, geometry, (3, 10), mode, coefficient, auxiliary, divisor,
                       precision_budgets=precision_budgets)
+    if sgd_step:
+        evidence["sgd"] = _sgd_check(weights, first[1:], peers, divisor, backend.layout.group)
     evidence.update(captured_forward_invocations=len(captured), replay=replay, fused_kl=fused_kl,
                     sparse_main_return=sparse_main_return, sparse_index_return=sparse_index_return,
                     native_forward_phase_counts=[len(result.phase_traces) for result in captured])
     return evidence
+
+
+def _sgd_check(weights, gradients, peers, divisor, group):
+    expected = []
+    updates = 0
+    for field, (weight, gradient) in enumerate(zip(weights, gradients)):
+        contributions = [peer["gradients"][field+1] for peer in peers if peer["gradients"][field+1] is not None]
+        before = weight.detach().cpu().clone()
+        if contributions:
+            reduced = (torch.zeros_like(weight) if gradient is None
+                       else gradient.detach().clone(memory_format=torch.contiguous_format))
+            dist.all_reduce(reduced, group=group)
+            reduced.div_(divisor)
+            reference = sum(contributions)/divisor
+            torch.testing.assert_close(reduced.cpu(), reference, rtol=0, atol=0)
+            weight.grad = reduced
+            before.add_(reference, alpha=-1e-3)
+            updates += 1
+        expected.append(before)
+    torch.optim.SGD(weights, lr=1e-3, foreach=False).step()
+    torch.npu.synchronize()
+    for weight, reference in zip(weights, expected):
+        torch.testing.assert_close(weight.detach().cpu(), reference, rtol=0, atol=torch.finfo(torch.float32).eps)
+    return {"passed": True, "reducer_divisor": divisor, "updated_parameters": updates, "learning_rate": 1e-3,
+            "reference": "CPU ordered CP gradient aggregation after independent Native VJP validation"}
 
 
 def _fixture(report, heads, weight_dtype, pattern, *, smoke, precision_budgets=None):

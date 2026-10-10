@@ -2355,3 +2355,30 @@ forward/backward）；关闭一个 consumer 后，剩余 consumer 的实际执�
 新载荷也重新通过原 18-word 协议的 CP1/CP2/CP4 回归，共 560 个 rank-case，覆盖
 长历史 `(3,2113)`、signed zero/NaN/Inf、实际融合 KL partials 和 main/index 交替复用；
 FP32 owner sum 与实际加载库 SHA 均已核对。
+
+CP8 在同一冻结载荷上的 index-K 归还矩阵已通过：每 rank 80 个 case，合计 640 个
+rank-case；短 packed `(3,10)` 的四种 ownership、长历史 `(3,2113)`、受控 signed zero/
+NaN/Inf、真实融合 KL partials、main/index 交替复用均完成。转换前 FP32 index-K owner sum
+逐项数值精确一致，实际加载库 SHA 匹配冻结载荷。证据见该目录 `cp8_index_audit.json`。
+此 CP8 矩阵校验 main-gradient 的阶段/通信 trace；main-gradient 数值、训练 autograd 与
+SGD、CP×TP 和长上下文性能还需各自完成验收。
+
+## 映射 CP 子组的训练 autograd 与 SGD
+
+[mega_dsa_mapped_training_validate.py](../../examples/mega_dsa_mapped_training_validate.py)
+使用覆盖四个 root 成员的 workspace，只在 CP `(1,3)` 或两个独立 CP 子组中执行训练。
+快照收集和 SGD 的梯度归约均使用 backend 的 CP group，非参与成员只加入 root 级准备、
+结束确认与关闭。两个子组使用不同的 projection fixture seed，以检查各组独立的数据路径。
+
+数值对照采用 masked global Native VJP，在固定 Native activation/output 值下检查 hidden
+和全部八个 projection 参数的梯度；不使用完整 query 的 FP64 reference profile。随后执行
+真实 CP SUM 与 downstream divisor 补偿，并以 `lr=1e-3` 做 SGD，检查归约值和更新后的
+参数。HCCL 的梯度缓冲在提交前转为 contiguous。该 fixture 是有限维 projection 边界，
+仍不建立完整 BF16 projection composition 或完整模型训练验收。
+
+四卡 smoke 已通过 48 个 rank-step，涵盖 LM-only/KL-only/LM+KL、coefficient `0/.3`、
+负 auxiliary upstream `-2.5`、sum/average reducer、四种 query tile、plain/retain_graph/
+checkpoint。启用 KL 的 forward 为九阶段；retained backward 插入另一轮六阶段 forward，
+checkpoint 的两次启用 KL forward 均为九阶段。关闭的 auxiliary 梯度精确为零，实际
+SGD 检查通过。证据存于 `build/native/validation/mega-dsa-mapped-training-20261011/smoke_audit.json`。
+完整 H32/H64、BF16/FP32 merge weight、四种 ownership 的 13824 个 rank-step 矩阵另行验收。
