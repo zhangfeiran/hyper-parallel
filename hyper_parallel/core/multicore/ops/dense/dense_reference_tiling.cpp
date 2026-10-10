@@ -7,8 +7,8 @@
 #include "platform/platform_info.h"
 
 // 选定 SDK 的 legacy 包间接口；原型与桥接源码、库哈希一起封存。
-extern "C" bool LegacyMmCheckHitV3Shape(const gert::Tensor *, const gert::Tensor *, const gert::Tensor *,
-                                        bool, bool, ge::Format, bool, uint32_t, const std::string &);
+extern "C" bool LegacyMmCheckHitV3Shape(const gert::Tensor *, const gert::Tensor *, const gert::Tensor *, bool, bool,
+                                        ge::Format, bool, uint32_t, const std::string &);
 
 extern "C" int hyper_parallel_dense_compile_platform(const char *soc, uint32_t cube_workers) {
   if (soc == nullptr || cube_workers == 0) {
@@ -35,22 +35,30 @@ extern "C" int hyper_parallel_dense_compile_platform(const char *soc, uint32_t c
   return 0;
 }
 
-extern "C" int hyper_parallel_dense_native_family(const char *soc, uint32_t cube_workers, uint32_t rows,
-                                                   uint32_t columns, uint32_t contracted, uint32_t transpose,
-                                                   uint32_t split_k) {
-  if (soc == nullptr || cube_workers == 0 || rows == 0 || columns == 0 || contracted == 0) {
+extern "C" int hyper_parallel_dense_native_family_ex(const char *soc, uint32_t cube_workers, uint32_t rows,
+                                                     uint32_t columns, uint32_t contracted, uint32_t transpose_left,
+                                                     uint32_t transpose_right, uint32_t split_k) {
+  if (soc == nullptr || cube_workers == 0 || rows == 0 || columns == 0 || contracted == 0 || transpose_left > 1 ||
+      transpose_right > 1 || split_k > 1) {
     return -1;
   }
   gert::Tensor left, right;
-  left.MutableOriginShape() = gert::Shape({rows, contracted});
+  left.MutableOriginShape() = transpose_left ? gert::Shape({contracted, rows}) : gert::Shape({rows, contracted});
   left.MutableStorageShape() = left.GetOriginShape();
-  right.MutableOriginShape() = transpose ? gert::Shape({columns, contracted}) : gert::Shape({contracted, columns});
+  right.MutableOriginShape() =
+    transpose_right ? gert::Shape({columns, contracted}) : gert::Shape({contracted, columns});
   right.MutableStorageShape() = right.GetOriginShape();
   for (auto *tensor : {&left, &right}) {
     tensor->SetOriginFormat(ge::FORMAT_ND);
     tensor->SetStorageFormat(ge::FORMAT_ND);
     tensor->SetDataType(ge::DT_BF16);
   }
-  return LegacyMmCheckHitV3Shape(&left, &right, nullptr, false, transpose != 0, ge::FORMAT_ND, split_k != 0,
-                                 cube_workers, std::string(soc));
+  return LegacyMmCheckHitV3Shape(&left, &right, nullptr, transpose_left != 0, transpose_right != 0, ge::FORMAT_ND,
+                                 split_k != 0, cube_workers, std::string(soc));
+}
+
+extern "C" int hyper_parallel_dense_native_family(const char *soc, uint32_t cube_workers, uint32_t rows,
+                                                  uint32_t columns, uint32_t contracted, uint32_t transpose,
+                                                  uint32_t split_k) {
+  return hyper_parallel_dense_native_family_ex(soc, cube_workers, rows, columns, contracted, 0, transpose, split_k);
 }

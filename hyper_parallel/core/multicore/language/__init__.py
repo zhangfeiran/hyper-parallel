@@ -27,7 +27,7 @@ from hyper_parallel.core.multicore.language.types import (
     TensorType,
 )
 from hyper_parallel.core.multicore.language.values import RaggedTensor, RouteMetadata
-from hyper_parallel.core.multicore.primitives.dense import matmul, swiglu_dense
+from hyper_parallel.core.multicore.primitives.dense import linear, matmul, swiglu_dense
 from hyper_parallel.core.multicore.primitives.gate import (
     add,
     cast,
@@ -84,6 +84,7 @@ __all__ = [
     "grouped_matmul",
     "int32",
     "int64",
+    "linear",
     "matmul",
     "mhc_input_mix",
     "mhc_mapping",

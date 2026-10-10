@@ -1,0 +1,302 @@
+{
+  "scope": "当前 worktree 的 packed/common 实际单词元组件记录切片，仅用于结构测试",
+  "native_namespace": "hp_dense_tile_daf60b7e2e093b8807e5ebe6",
+  "entries": {
+    "common": {
+      "native": {
+        "execution_mode": "resident_dense_tile_candidate",
+        "backward_execution_mode": "resident_dense_backward",
+        "tiling": {
+          "matrix_references": [
+            {
+              "source": "dense.linear",
+              "matrix": [
+                1,
+                128,
+                64,
+                false,
+                true
+              ],
+              "coordinates_transposed": false
+            },
+            {
+              "source": "dense.linear",
+              "matrix": [
+                1,
+                128,
+                64,
+                false,
+                true
+              ],
+              "coordinates_transposed": false
+            },
+            null,
+            null,
+            {
+              "source": "dense.linear",
+              "matrix": [
+                1,
+                64,
+                128,
+                false,
+                true
+              ],
+              "coordinates_transposed": false
+            }
+          ],
+          "access_reasons": [
+            "sdk_single_k_block_sequential",
+            "sdk_single_k_block_sequential",
+            "no_matrix",
+            "no_matrix",
+            "sdk_single_k_block_sequential"
+          ],
+          "required_capabilities": [
+            "matmul_nt",
+            "multiply",
+            "silu"
+          ],
+          "direction": "forward"
+        },
+        "backward_runtime": {
+          "native_calls": 1,
+          "host_calls": 0,
+          "unbound_capabilities": [],
+          "native_payloads": [
+            {
+              "execution_mode": "resident_backward_candidate",
+              "plan": {
+                "input_mask": [
+                  true,
+                  true,
+                  true,
+                  true
+                ],
+                "output_mask": [
+                  true
+                ]
+              },
+              "tiling": {
+                "matrix_references": [
+                  {
+                    "source": "dense.linear.input_grad",
+                    "matrix": [
+                      1,
+                      128,
+                      64,
+                      false,
+                      false
+                    ],
+                    "coordinates_transposed": false
+                  },
+                  {
+                    "source": "dense.linear.weight_grad",
+                    "matrix": [
+                      128,
+                      64,
+                      1,
+                      true,
+                      false
+                    ],
+                    "coordinates_transposed": true
+                  },
+                  null,
+                  null,
+                  null,
+                  {
+                    "source": "dense.linear.input_grad",
+                    "matrix": [
+                      1,
+                      64,
+                      128,
+                      false,
+                      false
+                    ],
+                    "coordinates_transposed": false
+                  },
+                  {
+                    "source": "dense.linear.weight_grad",
+                    "matrix": [
+                      64,
+                      128,
+                      1,
+                      true,
+                      false
+                    ],
+                    "coordinates_transposed": true
+                  },
+                  {
+                    "source": "dense.linear.input_grad",
+                    "matrix": [
+                      1,
+                      64,
+                      128,
+                      false,
+                      false
+                    ],
+                    "coordinates_transposed": false
+                  },
+                  null,
+                  {
+                    "source": "dense.linear.weight_grad",
+                    "matrix": [
+                      64,
+                      128,
+                      1,
+                      true,
+                      false
+                    ],
+                    "coordinates_transposed": true
+                  }
+                ],
+                "access_reasons": [
+                  "sdk_single_k_block_sequential",
+                  "sdk_single_k_block_sequential",
+                  "no_matrix",
+                  "no_matrix",
+                  "no_matrix",
+                  "sdk_single_k_block_sequential",
+                  "sdk_single_k_block_sequential",
+                  "sdk_single_k_block_sequential",
+                  "no_matrix",
+                  "sdk_single_k_block_sequential"
+                ],
+                "required_capabilities": [
+                  "add",
+                  "matmul_nn",
+                  "matmul_tn",
+                  "multiply",
+                  "silu_grad"
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "packed": {
+      "native": {
+        "execution_mode": "resident_dense_tile_candidate",
+        "backward_execution_mode": "resident_dense_backward",
+        "tiling": {
+          "matrix_references": [
+            {
+              "source": "dense.linear",
+              "matrix": [
+                1,
+                256,
+                64,
+                false,
+                true
+              ],
+              "coordinates_transposed": false
+            },
+            null,
+            {
+              "source": "dense.linear",
+              "matrix": [
+                1,
+                64,
+                128,
+                false,
+                true
+              ],
+              "coordinates_transposed": false
+            }
+          ],
+          "access_reasons": [
+            "sdk_single_k_block_sequential",
+            "no_matrix",
+            "sdk_single_k_block_sequential"
+          ],
+          "required_capabilities": [
+            "matmul_nt",
+            "swiglu"
+          ],
+          "direction": "forward"
+        },
+        "backward_runtime": {
+          "native_calls": 1,
+          "host_calls": 0,
+          "unbound_capabilities": [],
+          "native_payloads": [
+            {
+              "execution_mode": "resident_backward_candidate",
+              "plan": {
+                "input_mask": [
+                  true,
+                  true,
+                  true
+                ],
+                "output_mask": [
+                  true
+                ]
+              },
+              "tiling": {
+                "matrix_references": [
+                  {
+                    "source": "dense.linear.input_grad",
+                    "matrix": [
+                      1,
+                      128,
+                      64,
+                      false,
+                      false
+                    ],
+                    "coordinates_transposed": false
+                  },
+                  {
+                    "source": "dense.linear.weight_grad",
+                    "matrix": [
+                      128,
+                      64,
+                      1,
+                      true,
+                      false
+                    ],
+                    "coordinates_transposed": true
+                  },
+                  null,
+                  {
+                    "source": "dense.linear.input_grad",
+                    "matrix": [
+                      1,
+                      64,
+                      256,
+                      false,
+                      false
+                    ],
+                    "coordinates_transposed": false
+                  },
+                  {
+                    "source": "dense.linear.weight_grad",
+                    "matrix": [
+                      64,
+                      256,
+                      1,
+                      true,
+                      false
+                    ],
+                    "coordinates_transposed": true
+                  }
+                ],
+                "access_reasons": [
+                  "sdk_single_k_block_sequential",
+                  "sdk_single_k_block_sequential",
+                  "no_matrix",
+                  "sdk_single_k_block_sequential",
+                  "sdk_single_k_block_sequential"
+                ],
+                "required_capabilities": [
+                  "matmul_nn",
+                  "matmul_tn",
+                  "swiglu_grad"
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

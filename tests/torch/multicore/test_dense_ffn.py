@@ -60,6 +60,26 @@ def test_dense_backward_autograd() -> None:
                   case_name="test_dense_backward_autograd", master_port=29621, num_proc=1)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+def test_dense_linear_ffn_training() -> None:
+    """Feature: 原始 Linear 数值契约。
+    Description: 核对 NK 权重的配套常驻前后向、尾部、重计算和关闭后反向。
+    Expectation: 与原始打包 FFN 逐值一致，完整设备反向没有主机补算。
+    """
+    torchrun_case(file_name=str(Path(__file__).with_name("_dense_linear_ffn_impl.py")),
+                  case_name="test_dense_linear_ffn_training", master_port=29623, num_proc=1)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+def test_dense_common_ffn_training() -> None:
+    """Feature: 原始 common 数值契约。
+    Description: 核对三个独立 NK 投影、BF16 SiLU 和乘法，覆盖可选梯度及重计算。
+    Expectation: 与原始 common FFN 逐值一致，完整设备反向没有主机补算。
+    """
+    torchrun_case(file_name=str(Path(__file__).with_name("_dense_common_ffn_impl.py")),
+                  case_name="test_dense_common_ffn_training", master_port=29624, num_proc=1)
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dense_ffn_fully_shard() -> None:
     """Feature: 稠密 FFN FSDP 接入。

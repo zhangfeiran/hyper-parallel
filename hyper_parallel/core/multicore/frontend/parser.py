@@ -257,6 +257,10 @@ class Parser:
             declared = annotated
         return declared
 
+    def parameter_types(self, signature: dict) -> dict:
+        """读取参数注解与显式签名，不执行函数体或不受信任的属性。"""
+        return {arg.arg: self._parameter_type(arg, signature) for arg in self.function.args.args}
+
     def _bind_parameter(self, arg, declared, constants, defaults):
         if isinstance(declared, LOGICAL_TYPES):
             if arg.arg in constants:

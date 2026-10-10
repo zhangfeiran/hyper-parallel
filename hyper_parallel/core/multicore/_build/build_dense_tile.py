@@ -47,6 +47,9 @@ SOURCES += ("ops/dense/dense_backward_abi.h", "ops/dense/dense_backward_kernel.c
             "ops/dense/dense_backward_vector.h", "compiler/dense_backward.py", "compiler/dense_backward_tiles.py",
             "backends/dense_backward.py", "runtime/dense_backward.py", "runtime/dense_backward_router.py",
             "runtime/dense_payload.py")
+SOURCES += ("ir/dense_matrix.py", "backends/dense_linear.py", "primitives/dense.py", "backends/providers.py",
+            "runtime/dense.py", "ops/dense/dense_swiglu_forward.h")
+SOURCES += ("primitives/dense_common.py", "ops/dense/dense_common_vector.h")
 SDK_LIBRARIES = ("libtiling_api.a", "libplatform.so", "libregister.so", "libascendc_runtime.a",
                  "libascendcl.so", "libruntime.so", "libunified_dlog.so", "libc_sec.so")
 SDK_VERSIONS = ("runtime", "bisheng-compiler", "asc-devkit", "metadef")
@@ -54,12 +57,18 @@ REFERENCE_SDK_SOURCES = (
     "opp/built-in/op_impl/ai_core/tbe/impl/ops_nn/ascendc/swi_glu_grad/swi_glu_grad_bf16.hpp",
     "python/site-packages/tbe/dsl/static_schedule/gemm_integrated_schedule.py",
     "python/site-packages/tbe/dsl/static_schedule/gemm_integrated_schedule_util.py",
+    "python/site-packages/tbe/dsl/boost_schedule_kit/schedule_agent.py",
     "python/site-packages/tbe/dsl/unify_schedule/gemm_tilingcase.py",
+    "python/site-packages/tbe/dsl/unify_schedule/gemm_tiling_util.py",
     "python/site-packages/tbe/dsl/unify_schedule/cube_tilingcase.py",
+    "opp/built-in/op_impl/ai_core/tbe/impl/ops_legacy/dynamic/swish.py",
+    "opp/built-in/op_impl/ai_core/tbe/impl/ops_legacy/dynamic/silu_grad.py",
     "opp/built-in/op_impl/ai_core/tbe/kernel/ascend910b/ops_legacy/mat_mul/"
     "MatMulV2_ND_ND_FP16_FP16_false_false_all.json",
     "opp/built-in/op_impl/ai_core/tbe/kernel/ascend910b/ops_legacy/mat_mul/"
     "MatMulV2_ND_ND_FP16_FP16_false_true_all.json",
+    "opp/built-in/op_impl/ai_core/tbe/kernel/ascend910b/ops_legacy/mat_mul/"
+    "MatMulV2_ND_ND_FP16_FP16_true_false_all.json",
 )
 
 

@@ -64,6 +64,14 @@ def _matmul_reference(left: torch.Tensor, right: torch.Tensor, transpose_left: b
     return torch.mm(left.t() if transpose_left else left, right.t() if transpose_right else right)
 
 
+def _linear_reference(left: torch.Tensor, right: torch.Tensor, transpose_left: bool = False,
+                      transpose_right: bool = True) -> torch.Tensor:
+    """用原始 Linear 执行 CPU 数值参考；默认借用输出×输入列的 NK 权重。"""
+    value = left.t() if transpose_left else left
+    weight = right if transpose_right else right.t().contiguous()
+    return functional.linear(value, weight)  # pylint: disable=not-callable
+
+
 def _swiglu_reference(packed: torch.Tensor, intermediate_size: int, layout: str = "gate_up") -> torch.Tensor:
     if layout != "gate_up" or packed.shape[-1] != 2 * intermediate_size:
         raise ValueError("Dense SwiGLU input does not match its declared packed layout")
@@ -73,6 +81,9 @@ def _swiglu_reference(packed: torch.Tensor, intermediate_size: int, layout: str 
 
 matmul = REGISTRY.register(OpSchema(
     "dense.matmul", 1, inspect.signature(_matmul_reference), _matmul_types, _matmul_reference,
+))
+linear = REGISTRY.register(OpSchema(
+    "dense.linear", 1, inspect.signature(_linear_reference), _matmul_types, _linear_reference,
 ))
 swiglu_dense = REGISTRY.register(OpSchema(
     "dense.swiglu", 1, inspect.signature(_swiglu_reference), _swiglu_types, _swiglu_reference,

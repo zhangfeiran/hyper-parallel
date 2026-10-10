@@ -1,0 +1,127 @@
+{
+  "scope": "实际设备组件清单的结构快照；不代表完整模型训练验收",
+  "entry": {
+    "native": {
+      "execution_mode": "resident_dense_tile_candidate",
+      "backward_execution_mode": "resident_dense_backward",
+      "tiling": {
+        "direction": "forward",
+        "matrix_references": [
+          {
+            "source": "dense.linear",
+            "matrix": [
+              1,
+              256,
+              64,
+              false,
+              true
+            ],
+            "coordinates_transposed": false
+          },
+          null,
+          {
+            "source": "dense.linear",
+            "matrix": [
+              1,
+              64,
+              128,
+              false,
+              true
+            ],
+            "coordinates_transposed": false
+          }
+        ],
+        "access_reasons": [
+          "sdk_single_k_block_sequential",
+          "no_matrix",
+          "sdk_single_k_block_sequential"
+        ],
+        "required_capabilities": [
+          "matmul_nt",
+          "swiglu"
+        ]
+      },
+      "backward_runtime": {
+        "native_calls": 1,
+        "host_calls": 0,
+        "unbound_capabilities": [],
+        "native_payloads": [
+          {
+            "execution_mode": "resident_backward_candidate",
+            "plan": {
+              "input_mask": [
+                true,
+                true,
+                true
+              ],
+              "output_mask": [
+                true
+              ]
+            },
+            "tiling": {
+              "matrix_references": [
+                {
+                  "source": "dense.linear.input_grad",
+                  "matrix": [
+                    1,
+                    128,
+                    64,
+                    false,
+                    false
+                  ],
+                  "coordinates_transposed": false
+                },
+                {
+                  "source": "dense.linear.weight_grad",
+                  "matrix": [
+                    64,
+                    128,
+                    1,
+                    true,
+                    false
+                  ],
+                  "coordinates_transposed": false
+                },
+                null,
+                {
+                  "source": "dense.linear.input_grad",
+                  "matrix": [
+                    1,
+                    64,
+                    256,
+                    false,
+                    false
+                  ],
+                  "coordinates_transposed": false
+                },
+                {
+                  "source": "dense.linear.weight_grad",
+                  "matrix": [
+                    256,
+                    64,
+                    1,
+                    true,
+                    false
+                  ],
+                  "coordinates_transposed": false
+                }
+              ],
+              "access_reasons": [
+                "sdk_single_k_block_sequential",
+                "sdk_single_k_block_sequential",
+                "no_matrix",
+                "sdk_single_k_block_sequential",
+                "sdk_single_k_block_sequential"
+              ],
+              "required_capabilities": [
+                "matmul_nn",
+                "matmul_tn",
+                "swiglu_grad"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -19,8 +19,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from hyper_parallel.core.multicore.ir.program import Operation, SourceSpan, Value
+from hyper_parallel.core.multicore.ir.dense_matrix import DenseMatrixReference
 from hyper_parallel.core.multicore.language.types import TensorType
-from hyper_parallel.core.multicore.primitives.dense import matmul, swiglu_dense
+from hyper_parallel.core.multicore.primitives.dense import linear, matmul, swiglu_dense
+from hyper_parallel.core.multicore.primitives.dense_common import multiply_dense, silu_dense
 from hyper_parallel.core.multicore.primitives.registry import REGISTRY
 from hyper_parallel.core.multicore.runtime.dense import DenseKernelPlan
 
@@ -51,6 +53,7 @@ class DenseGradientNode:
     operand_transposes: tuple[tuple[bool, ...], tuple[bool, ...]] = ((), ())
     transpose_output: bool = False
     source: SourceSpan | None = None
+    numeric_reference: DenseMatrixReference | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,8 @@ class DenseBackwardPlan:
                            "gradient_source": node.gradient_source, "primal_inputs": node.primal_inputs,
                            "matrix": node.matrix, "operand_transposes": node.operand_transposes,
                            "transpose_output": node.transpose_output,
+                           "numeric_reference": node.numeric_reference.export_manifest()
+                           if node.numeric_reference is not None else None,
                            "source": str(node.source) if node.source is not None else None}
                           for node in self.nodes],
                 "input_gradients": self.gradients,
@@ -161,7 +166,12 @@ class _Builder:
         args = dict(operation.arguments)
         output, = operation.outputs
         gradient = self.latest.get(output.id)
-        if kind == "swiglu_input_grad":
+        if kind in ("silu_input_grad", "multiply_left_grad", "multiply_right_grad"):
+            name = "value" if kind == "silu_input_grad" else "left" if kind == "multiply_left_grad" else "right"
+            primal = "value" if kind == "silu_input_grad" else "right" if name == "left" else "left"
+            target, primals = args[name].id, (args[primal].id,)
+            matrix, transforms, transpose_output = None, ((), ()), False
+        elif kind == "swiglu_input_grad":
             target, primals = args["packed"].id, (args["packed"].id,)
             matrix, transforms, transpose_output = None, ((), ()), False
         else:
@@ -172,6 +182,10 @@ class _Builder:
                 target, primals = left, (right,)
                 matrix = (rows, contracted, columns, False, not args["transpose_right"])
                 transforms, transpose_output = ((), (args["transpose_right"], True)), args["transpose_left"]
+            elif kind == "linear_weight_grad":
+                target, primals = right, (left,)
+                matrix = (columns, contracted, rows, True, args["transpose_left"])
+                transforms, transpose_output = ((True,), (args["transpose_left"],)), not args["transpose_right"]
             else:
                 target, primals = right, (left,)
                 matrix = (contracted, columns, rows, not args["transpose_left"], False)
@@ -180,11 +194,22 @@ class _Builder:
         inputs = (*primals, *((gradient,) if gradient is not None else ()))
         dependencies = (self.producers[gradient],) if gradient in self.producers else ()
         node = DenseGradientNode(len(self.nodes), kind, inputs, value, dependencies, index, target, gradient,
-                                 primals, matrix, transforms, transpose_output, operation.source)
+                                 primals, matrix, transforms, transpose_output, operation.source,
+                                 _linear_gradient_reference(operation, kind, matrix))
         self.nodes.append(node)
         self.producers[value.id] = node.index
         self.contributions.append(DenseGradientContribution(node.index, index, output.id, target))
         self._add(target, value, index, operation.source)
+
+
+def _linear_gradient_reference(operation, kind, matrix):
+    if operation.logical_name != "dense.linear" or matrix is None:
+        return None
+    rows, columns, contracted, _left, _right = matrix
+    if kind == "matmul_left_grad":
+        return DenseMatrixReference("dense.linear.input_grad", (rows, columns, contracted, False, False))
+    # TorchNPU 的 matmul_backward 先计算 X.T @ dY，再由原始权重转置恢复 NK 输出。
+    return DenseMatrixReference("dense.linear.weight_grad", (columns, rows, contracted, True, False), True)
 
 
 def _recipes(task, operation):
@@ -192,7 +217,11 @@ def _recipes(task, operation):
     if (task.provider.logical_name, task.provider.version) != (schema.logical_name, schema.version):
         raise ValueError("Dense backward provider does not match its canonical schema")
     expected = {"dense.matmul": (matmul.schema, "aten.mm.default", ("matmul_left_grad", "matmul_right_grad")),
-                "dense.swiglu": (swiglu_dense.schema, "npu.npu_swiglu.default", ("swiglu_input_grad",))}
+                "dense.linear": (linear.schema, "aten.linear.default", ("matmul_left_grad", "linear_weight_grad")),
+                "dense.swiglu": (swiglu_dense.schema, "npu.npu_swiglu.default", ("swiglu_input_grad",)),
+                "dense.silu": (silu_dense.schema, "aten.silu.default", ("silu_input_grad",)),
+                "dense.multiply": (multiply_dense.schema, "aten.mul.Tensor",
+                                   ("multiply_left_grad", "multiply_right_grad"))}
     contract = expected.get(schema.logical_name)
     if (contract is None or schema is not contract[0]
             or contract[1:] != (task.provider.implementation, task.provider.backward)):

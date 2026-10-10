@@ -95,13 +95,21 @@ class DenseTilePlan:
 
 def _check_row_operation(operation, tiled):
     arguments = dict(operation.arguments)
-    if operation.logical_name == "dense.matmul":
+    if operation.logical_name in ("dense.matmul", "dense.linear"):
         left, right = arguments["left"], arguments["right"]
         if left.id not in tiled or right.id in tiled or arguments["transpose_left"]:
             raise ValueError("Dense forward tiles require row-local left data and invariant right weights")
+        if operation.logical_name == "dense.linear" and not arguments["transpose_right"]:
+            raise ValueError("Resident Linear requires the original contiguous NK weight layout")
     elif operation.logical_name == "dense.swiglu":
         if arguments["packed"].id not in tiled:
             raise ValueError("Dense activation must consume row-local data")
+    elif operation.logical_name == "dense.silu":
+        if arguments["value"].id not in tiled:
+            raise ValueError("Dense SiLU must consume row-local data")
+    elif operation.logical_name == "dense.multiply":
+        if any(arguments[name].id not in tiled for name in ("left", "right")):
+            raise ValueError("Dense multiply requires two row-local inputs")
     else:
         raise ValueError("No resident tile implementation for this dense primitive")
 

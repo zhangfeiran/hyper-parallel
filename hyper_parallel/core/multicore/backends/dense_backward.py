@@ -31,13 +31,14 @@ from hyper_parallel.core.multicore.compiler.dense_backward_tiles import (
     row_local_dependency,
     simulate_dense_backward_tiles,
 )
+from hyper_parallel.core.multicore.ir.dense_matrix import DenseMatrixReference
 
 HEADER = struct.Struct("<11I")
 OPERATION = struct.Struct("<18I")
 DEPENDENCY = struct.Struct("<4I")
 MAGIC = 0x444E4231
 VERSION = 1
-KINDS = {"matmul": 0, "swiglu_grad": 2, "gradient_add": 3, "zero": 4}
+KINDS = {"matmul": 0, "swiglu_grad": 2, "gradient_add": 3, "zero": 4, "multiply": 6, "silu_grad": 7}
 
 
 @dataclass(frozen=True)
@@ -52,10 +53,11 @@ class DenseBackwardBinding:
     matmul_shapes: tuple[tuple[int, int, int, bool, bool] | None, ...]
     tile_shapes: tuple[tuple[int, int], ...]
     required_capabilities: tuple[str, ...]
+    matrix_references: tuple[DenseMatrixReference | None, ...] = ()
 
     def unbound_capabilities(self) -> tuple[str, ...]:
         """按稳定顺序返回尚未实现的设备能力，不吞掉调度或绑定错误。"""
-        supported = {"matmul_nn", "matmul_tn", "matmul_nt", "swiglu_grad", "add", "zero"}
+        supported = {"matmul_nn", "matmul_tn", "matmul_nt", "swiglu_grad", "add", "zero", "multiply", "silu_grad"}
         return tuple(sorted(set(self.required_capabilities) - supported))
 
     def admit_native(self) -> None:
@@ -74,9 +76,11 @@ def _resolved(value, aliases):
 def _operands(node):
     if node.kind == "matmul_left_grad":
         return node.gradient_source, node.primal_inputs[0]
+    if node.kind == "linear_weight_grad":
+        return node.gradient_source, node.primal_inputs[0]
     if node.kind == "matmul_right_grad":
         return node.primal_inputs[0], node.gradient_source
-    if node.kind == "swiglu_input_grad":
+    if node.kind in ("swiglu_input_grad", "silu_input_grad", "multiply_left_grad", "multiply_right_grad"):
         return node.primal_inputs[0], node.gradient_source
     return node.inputs
 
@@ -145,7 +149,8 @@ def bind_dense_backward_tiles(plan: DenseBackwardTilePlan) -> DenseBackwardBindi
                          len(dependencies), *phase_tiles)
     config += b"".join(descriptors) + b"".join(DEPENDENCY.pack(*wait) for wait in dependencies)
     return DenseBackwardBinding(value_ids, plan.aliases, tuple(node.output.id for node in nodes.values()),
-                                gradients, config, tuple(shapes), tuple(tile_shapes), tuple(sorted(capabilities)))
+                                gradients, config, tuple(shapes), tuple(tile_shapes), tuple(sorted(capabilities)),
+                                tuple(nodes[region.node].numeric_reference for region in plan.regions))
 
 
 class DenseBackwardSdkTiler:
@@ -170,32 +175,49 @@ class DenseBackwardSdkTiler:
         """
         if binding != bind_dense_backward_tiles(plan):
             raise ValueError("Dense backward SDK binding differs from its canonical worker plan")
+        return self._bank(binding)
+
+    def _bank(self, binding):
         binding.admit_native()
         workers = HEADER.unpack_from(binding.config)[3]
         if workers > self.sdk.cube_workers:
             raise ValueError("Dense backward cube worker count exceeds the selected SDK hardware target")
-        shapes = tuple(dict.fromkeys((m, n, k, right) for shape in binding.matmul_shapes if shape is not None
-                                     for m, n, k, left, right in (shape,) if m and n and k and right and not left))
+        references = binding.matrix_references or (None,) * len(binding.matmul_shapes)
+        queries = tuple(reference.matrix if reference is not None else
+                        (*shape[:3], shape[4]) if shape is not None and shape[4] and not shape[3] else None
+                        for shape, reference in zip(binding.matmul_shapes, references))
+        shapes = tuple(dict.fromkeys(query for query in queries if query is not None and all(query[:3])))
         if getattr(self, "reference", None) is not None and shapes != self.reference_shapes:
             self.reference_record = self.reference.query(shapes)
             self.reference_shapes = shapes
         record = getattr(self, "reference_record", None) or {}
         reference = {tuple(result["shape"]): result for result in record.get("results", [])}
-        blocks = []
-        for shape, tile in zip(binding.matmul_shapes, binding.tile_shapes):
+        blocks, reasons = [], []
+        for shape, tile, query, numeric in zip(binding.matmul_shapes, binding.tile_shapes, queries, references):
             block = ctypes.create_string_buffer(self.sdk.tiling_bytes)
             access = bytes(ACCESS.size)
+            reason = "no_matrix"
             if shape is not None and all(shape[:3]):
                 rows, columns, contracted, transpose_left, transpose_right = shape
                 status = self.generate(self.sdk.soc.encode(), rows, tile[0], columns, tile[1], contracted,
                                        int(transpose_left), int(transpose_right), block, self.sdk.tiling_bytes)
                 if status:
                     raise ValueError(f"Dense backward SDK matrix tiling failed for {shape}: status={status}")
-                if (rows, columns, contracted, transpose_right) in reference and not transpose_left:
-                    access, _reason = reference_access(reference[(rows, columns, contracted, transpose_right)],
-                                                       (rows, columns, contracted, transpose_right),
-                                                       self.sdk.cube_workers, allow_right_transpose=True)
+                reason = "no_reference_query"
+                if query in reference:
+                    access, reason = reference_access(reference[query], query, self.sdk.cube_workers,
+                                                      allow_right_transpose=True, allow_left_transpose=True,
+                                                      allow_sequential_reference=numeric is not None)
+                    if numeric is not None and numeric.coordinates_transposed:
+                        m_span, n_span, m_extent, n_extent, chunk, close = ACCESS.unpack(access)
+                        access = ACCESS.pack(n_span, m_span, n_extent, m_extent, chunk, close)
+                if (numeric is not None and numeric.source.startswith("dense.linear") and reason not in
+                        ("sdk_k_block_access", "native_matmul_v3_sequential", "sdk_single_k_block_sequential",
+                         "sdk_single_partition_sequential", "sdk_full_l1_k_sequential")):
+                    raise ValueError(f"Dense Linear numerical reference is not admitted: {query}: {reason}")
             blocks.append(block.raw + access)
+            reasons.append(reason)
+        self.access_reasons = tuple(reasons)
         return b"".join(blocks)
 
     def export_manifest(self, binding: DenseBackwardBinding, bank: bytes) -> dict[str, object]:
@@ -208,6 +230,9 @@ class DenseBackwardSdkTiler:
                 "bank_stride_bytes": stride, "matrix_access": "sdk_nt_reference_candidate"
                 if getattr(self, "reference_record", None) is not None else "sequential_sdk_unproved",
                 "reference": getattr(self, "reference_record", None),
+                "matrix_references": [reference.export_manifest() if reference is not None else None
+                                      for reference in binding.matrix_references],
+                "access_reasons": getattr(self, "access_reasons", ()),
                 "required_capabilities": binding.required_capabilities,
                 "config_sha256": hashlib.sha256(binding.config).hexdigest(),
                 "bank_sha256": hashlib.sha256(bank).hexdigest()}

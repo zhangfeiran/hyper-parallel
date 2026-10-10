@@ -19,7 +19,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 from hyper_parallel.core.multicore.language.types import DType
-from hyper_parallel.core.multicore.primitives.dense import matmul, swiglu_dense
+from hyper_parallel.core.multicore.primitives.dense import linear, matmul, swiglu_dense
+from hyper_parallel.core.multicore.primitives.dense_common import multiply_dense, silu_dense
 from hyper_parallel.core.multicore.primitives.registry import REGISTRY, OpSchema
 
 
@@ -95,7 +96,19 @@ DENSE_PROVIDERS.register(matmul.schema, NativeProvider(
     "torch_mm_v1", "dense.matmul", 1, "aten.mm.default", (DType.BF16, DType.FP16, DType.FP32),
     "cube", ("matmul_left_grad", "matmul_right_grad"), ("left", "right"),
 ))
+DENSE_PROVIDERS.register(linear.schema, NativeProvider(
+    "torch_linear_v1", "dense.linear", 1, "aten.linear.default", (DType.BF16, DType.FP16, DType.FP32),
+    "cube", ("matmul_left_grad", "linear_weight_grad"), ("left", "right"),
+))
 DENSE_PROVIDERS.register(swiglu_dense.schema, NativeProvider(
     "npu_swiglu_v1", "dense.swiglu", 1, "npu.npu_swiglu.default", (DType.BF16, DType.FP16, DType.FP32),
     "vector", ("swiglu_input_grad",), ("packed",),
+))
+DENSE_PROVIDERS.register(silu_dense.schema, NativeProvider(
+    "torch_silu_v1", "dense.silu", 1, "aten.silu.default", (DType.BF16,),
+    "vector", ("silu_input_grad",), ("value",),
+))
+DENSE_PROVIDERS.register(multiply_dense.schema, NativeProvider(
+    "torch_multiply_v1", "dense.multiply", 1, "aten.mul.Tensor", (DType.BF16,),
+    "vector", ("multiply_left_grad", "multiply_right_grad"), ("left", "right"),
 ))

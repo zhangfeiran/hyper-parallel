@@ -84,7 +84,10 @@ def _geometry(node, row_values):
             rows, columns = node.output.type.shape
     else:
         rows, columns = node.output.type.shape
-        kind = "swiglu_grad" if node.kind == "swiglu_input_grad" else "gradient_add"
+        kinds = {"swiglu_input_grad": "swiglu_grad", "silu_input_grad": "silu_grad",
+                 "multiply_left_grad": "multiply", "multiply_right_grad": "multiply",
+                 "gradient_add": "gradient_add"}
+        kind = kinds[node.kind]
         if kind == "swiglu_grad":
             columns //= 2
     if any(dimension > 2**31 - 1 for dimension in (rows, columns, *(node.matrix[:3] if node.matrix else ()))):

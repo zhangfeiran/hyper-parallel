@@ -53,7 +53,7 @@ def _operation_descriptor(plan, task, slots):
     types = dict(plan.dense.value_types)
     output, = operation.outputs
     columns = types[output.id].shape[1]
-    if operation.logical_name == "dense.matmul":
+    if operation.logical_name in ("dense.matmul", "dense.linear"):
         left, right = arguments["left"], arguments["right"]
         contracted, transpose = types[left.id].shape[1], arguments["transpose_right"]
         descriptor = (0, slots[left.id], slots[right.id], slots[output.id], columns, contracted, int(transpose))
@@ -79,6 +79,8 @@ def bind_dense_tiles(plan: DenseTilePlan) -> DenseTileBinding:
     Args:
         plan: Admitted, concrete BF16 forward tile candidate.
     """
+    if any(operation.logical_name == "dense.linear" for operation in plan.dense.ir.operations):
+        raise ValueError("Explicit Linear requires the shared matrix forward binding")
     value_ids = tuple(value_id for value_id, _ in plan.dense.value_types)
     slots = {value_id: slot for slot, value_id in enumerate(value_ids)}
     sizes = (plan.rows, plan.policy.rows_per_tile, plan.policy.cube_workers, plan.policy.prefetch_tiles)
@@ -152,7 +154,7 @@ class DenseSdkTiler:
             return DenseTilePolicy(cube_workers=1)
         shapes = []
         for operation in plan.ir.operations:
-            if operation.logical_name == "dense.matmul":
+            if operation.logical_name in ("dense.matmul", "dense.linear"):
                 args = dict(operation.arguments)
                 output, = operation.outputs
                 shapes.append((rows, types[output.id].shape[1], types[args["left"].id].shape[1],

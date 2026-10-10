@@ -25,6 +25,7 @@ import torch
 
 from hyper_parallel.core.multicore.backends.providers import NativeProvider
 from hyper_parallel.core.multicore.ir.program import ProgramIR, Value
+from hyper_parallel.core.multicore.ir.dense_matrix import forward_matrix_reference
 from hyper_parallel.core.multicore.language.types import TensorType
 from hyper_parallel.core.multicore.primitives.gate import TORCH_DTYPES
 from hyper_parallel.core.multicore.primitives.registry import REGISTRY
@@ -99,9 +100,23 @@ class DenseKernelPlan:
         return {"family": "dense", "format_version": 1, "native_status": "unbound",
                 "execution_mode": "current_stream_primitives", "dimensions": dict(self.spec.dimensions),
                 "numeric_policy": self.ir.numeric_policy, "tasks": [task.export_manifest() for task in self.tasks],
+                "matrix_references": self.matrix_references(),
                 "buffers": [{"value_id": buffer.value_id, "first_task": buffer.first_task,
                              "last_task": buffer.last_task, "size_bytes": buffer.size_bytes,
                              "saved_for_backward": buffer.saved_for_backward} for buffer in self.buffers]}
+
+    def matrix_references(self) -> list[dict[str, object]]:
+        """在计划中显式保存每个矩阵原语的物理标志和数值来源。"""
+        types = dict(self.value_types)
+        references = []
+        for index, operation in enumerate(self.ir.operations):
+            reference = forward_matrix_reference(operation, types)
+            if reference is not None:
+                arguments = dict(operation.arguments)
+                references.append({"operation": index, "physical_transposes":
+                                   (arguments["transpose_left"], arguments["transpose_right"]),
+                                   "reference": reference.export_manifest()})
+        return references
 
     def explain(self) -> str:
         """Describe bindings, live intervals and original source locations."""

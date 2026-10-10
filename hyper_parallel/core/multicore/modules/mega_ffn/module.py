@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Training-compatible dense FFN using the shared AST primitive DAG."""
+"""通过共享 AST 原语 DAG 接入训练的稠密 FFN 模块。"""
 
 from __future__ import annotations
 
@@ -25,30 +25,30 @@ from torch import nn
 
 from hyper_parallel.core.multicore.frontend.examples.dense_ffn import dense_ffn
 from hyper_parallel.core.multicore.frontend.program import Program
+from hyper_parallel.core.multicore.language.types import ConstexprType
 from hyper_parallel.core.multicore.runtime.dense import DenseExecutable, DenseKernelPlan, DenseSpec
 from hyper_parallel.core.multicore.runtime.dense_execution import DenseExecutionConfig, materialize_dense
 
 
 class MegaFFN(nn.Module):
-    """Bias-free BF16 SwiGLU with packed gate/up columns and ordinary dense inputs.
+    """支持打包 gate/up 或三个独立 NK 投影的无偏置 BF16 FFN。
 
-    CPU calls execute explicit references. NPU calls execute generated native
-    host-stream adapters; resident-worker fusion is a separate backend.
-    External weights are borrowed for the invocation without caching or copying.
+    CPU 调用执行显式参考；NPU 调用按配置使用生成的主机流调用或常驻 worker。
+    外部权重只在本次调用中借用，不缓存调用张量或复制权重。
     """
 
     def __init__(self, hidden_size: int, intermediate_size: int, *, create_parameters: bool = True,
                  program: Program | None = None, device: torch.device | str | None = None,
                  execution: DenseExecutionConfig | None = None) -> None:
-        """Configure shape, semantic program and parameter ownership.
+        """配置形状、语义程序及参数所有权。
 
         Args:
-            hidden_size: Input/output channel count.
-            intermediate_size: Unpacked SwiGLU channel count.
-            create_parameters: Own packed parameters; False borrows weights per call.
-            program: Dense AST program accepting tokens, packed gate/up, down and intermediate_size.
-            device: Initial parameter device; defaults to CPU for standard module placement.
-            execution: Host-stream default or explicit experimental resident tile configuration.
+            hidden_size: 输入与输出的通道数。
+            intermediate_size: 未打包的中间通道数。
+            create_parameters: 是否持有参数；False 时每次调用借用外部权重。
+            program: 声明 x/gate_up/down 或 x/gate/up/down 的稠密 AST 程序。
+            device: 参数的初始设备；默认为 CPU，供普通模块迁移使用。
+            execution: 默认主机流调用，或显式常驻分块配置。
         """
         super().__init__()
         if any(type(size) not in (int,) or size <= 0 for size in (hidden_size, intermediate_size)):
@@ -66,43 +66,51 @@ class MegaFFN(nn.Module):
             raise ValueError("MegaFFN requires a dense_v1 AST program")
         self._executables: dict[tuple[int, torch.device], DenseExecutable] = {}
         self._closed = False
+        parameters = self.program.parameter_types()
+        self._constants = {}
+        if "intermediate_size" in parameters:
+            if not isinstance(parameters["intermediate_size"], ConstexprType):
+                raise ValueError("MegaFFN intermediate_size must be a declared constexpr")
+            self._constants["intermediate_size"] = intermediate_size
+        self.weight_shapes = self._weight_shapes()
+        self.weight_names = ("gate_up", "down") if len(self.weight_shapes) == 2 else ("gate", "up", "down")
+        packed_kn = ((hidden_size, 2 * intermediate_size), (intermediate_size, hidden_size))
+        self.weight_layout = "kn" if self.weight_shapes == packed_kn else "nk"
+        for name, shape in zip(self.weight_names, self.weight_shapes):
+            value = nn.Parameter(torch.empty(shape, dtype=torch.bfloat16, device=device)) if create_parameters else None
+            self.register_parameter(name, value)
         if create_parameters:
-            self.gate_up = nn.Parameter(torch.empty(hidden_size, 2 * intermediate_size,
-                                                   dtype=torch.bfloat16, device=device))
-            self.down = nn.Parameter(torch.empty(intermediate_size, hidden_size,
-                                                dtype=torch.bfloat16, device=device))
             self.reset_parameters()
-        else:
-            self.register_parameter("gate_up", None)
-            self.register_parameter("down", None)
 
     def reset_parameters(self) -> None:
-        """Initialize each packed projection with its actual input fan-in."""
-        if self.gate_up is None:
+        """按各投影的实际输入通道数初始化参数。"""
+        if getattr(self, self.weight_names[0]) is None:
             return
         with torch.no_grad():
-            self.gate_up.uniform_(-1 / math.sqrt(self.hidden_size), 1 / math.sqrt(self.hidden_size))
-            self.down.uniform_(-1 / math.sqrt(self.intermediate_size), 1 / math.sqrt(self.intermediate_size))
+            for name in self.weight_names:
+                fan_in = self.intermediate_size if name == "down" else self.hidden_size
+                getattr(self, name).uniform_(-1 / math.sqrt(fan_in), 1 / math.sqrt(fan_in))
 
     def forward(self, x: torch.Tensor, *,
-                weights: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
-        """Apply FFN to the final channel axis, preserving all leading dimensions.
+                weights: tuple[torch.Tensor, ...] | None = None) -> torch.Tensor:
+        """沿末尾通道执行 FFN，保留所有前导维度。
 
         Args:
-            x: Contiguous BF16 tokens with shape [..., hidden_size].
-            weights: Invocation-owned (gate_up [H, 2I], down [I, H]) when parameters are external.
+            x: 形状为 [..., hidden_size] 的连续 BF16 词元。
+            weights: 外部权重，按 weight_names 顺序传入，形状必须符合程序输入注解。
         """
         if self._closed:
             raise RuntimeError("MegaFFN is closed")
         if (not isinstance(x, torch.Tensor) or x.ndim < 2 or x.shape[-1] != self.hidden_size
                 or x.dtype != torch.bfloat16 or not x.is_contiguous()):
             raise ValueError("MegaFFN input must be contiguous BF16 tokens with the configured final dimension")
-        if self.gate_up is not None:
+        if getattr(self, self.weight_names[0]) is not None:
             if weights is not None:
                 raise ValueError("External MegaFFN weights require create_parameters=False")
-            weights = (self.gate_up, self.down)
-        if not isinstance(weights, tuple) or len(weights) != 2:
-            raise ValueError("MegaFFN requires a gate_up/down weight pair for this invocation")
+            weights = tuple(getattr(self, name) for name in self.weight_names)
+        if not isinstance(weights, tuple) or len(weights) != len(self.weight_names):
+            kind = "gate_up/down weight pair" if len(self.weight_names) == 2 else "gate/up/down weight triple"
+            raise ValueError(f"MegaFFN requires a {kind} in the declared {self.weight_names} order")
         rows = x.numel() // self.hidden_size
         key = (rows, x.device)
         if key not in self._executables:
@@ -113,15 +121,29 @@ class MegaFFN(nn.Module):
     def _plan(self, rows: int) -> DenseKernelPlan:
         spec = DenseSpec({"T": rows, "H": self.hidden_size, "PackedI": 2 * self.intermediate_size,
                           "I": self.intermediate_size})
-        plan = self.program.plan(spec, intermediate_size=self.intermediate_size)
-        if len(plan.ir.inputs) != 3 or len(plan.ir.outputs) != 1 or plan.ir.returns_tuple:
-            raise ValueError("MegaFFN programs must have three tensor inputs and one tensor output")
+        plan = self.program.plan(spec, **self._constants)
+        if len(plan.ir.inputs) not in (3, 4) or len(plan.ir.outputs) != 1 or plan.ir.returns_tuple:
+            raise ValueError("MegaFFN programs must have three or four tensor inputs and one tensor output")
         if dict(plan.value_types)[plan.ir.outputs[0].id].shape != (rows, self.hidden_size):
             raise ValueError("MegaFFN program output must preserve the token/hidden shape")
         return plan
 
+    def _weight_shapes(self) -> tuple[tuple[int, int], ...]:
+        """从已校验的程序输入注解取得权重布局，不根据函数体名称选择实现。"""
+        plan = self._plan(0)
+        types = dict(plan.value_types)
+        shapes = tuple(types[value.id].shape for value in plan.ir.inputs)
+        expected = ((self.hidden_size, 2 * self.intermediate_size), (self.intermediate_size, self.hidden_size))
+        alternate = ((2 * self.intermediate_size, self.hidden_size), (self.hidden_size, self.intermediate_size))
+        separate = ((self.intermediate_size, self.hidden_size),) * 2 + ((self.hidden_size, self.intermediate_size),)
+        names = tuple(value.name for value in plan.ir.inputs)
+        valid_names = names == (("x", "gate_up", "down") if len(shapes) == 3 else ("x", "gate", "up", "down"))
+        if not valid_names or shapes[0] != (0, self.hidden_size) or shapes[1:] not in (expected, alternate, separate):
+            raise ValueError("MegaFFN input annotations must declare matching KN or NK gate/up and down weights")
+        return shapes[1:]
+
     def close(self) -> None:
-        """Release cached plans and reject new forwards; pending backward remains valid."""
+        """释放缓存计划并拒绝新前向；已保存的待执行反向仍然有效。"""
         self._closed = True
         for executable in self._executables.values():
             executable.close()

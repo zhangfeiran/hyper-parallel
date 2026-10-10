@@ -22,6 +22,20 @@ output.float().square().mean().backward()
 自动求导、优化器、状态字典，以及检查点/重计算接口。归一化和残差组合保留在解码器边界。
 初始稠密契约不包含偏置和 TP 集合通信。
 
+需要沿用原始 Linear 数值契约时，可显式选择
+[`linear_ffn`](examples/linear_ffn.py)。它通过独立的 `ml.linear` 原语保留原始 NK 权重，
+gate/up 沿输出维拼接为 `[2I, H]`，down 为 `[H, I]`。
+模块从已绑定的输入类型推导权重形状；不通过 FFN 函数体或原语名称匹配来授权执行。
+
+```python
+from hyper_parallel.core.multicore.frontend.examples.linear_ffn import linear_ffn
+
+ffn = MegaFFN(1024, 4096, program=linear_ffn).to("npu")
+```
+
+这个程序描述现有打包 SwiGLU 的数值契约。常规三投影 FFN 的独立 SiLU 与乘法舍入边界
+仍需单独描述和验收；打包程序不能替代该基线。
+
 调用方持有的本地权重通过 `MegaFFN(..., create_parameters=False)` 和
 `ffn(tokens, weights=(local_gate_up, local_down))` 接入。借用权重不被缓存或复制。
 自动求导状态归每次调用所有；关闭后拒绝新的前向调用，但已有调用的待执行反向仍然有效。
@@ -50,6 +64,10 @@ model.to(dtype=torch.bfloat16, device="npu")
 工厂仅打包一次无偏置 SiLU 的 gate/up/down 权重，在迁移到目标设备之前保留源数据类型、设备和全部训练标记。
 检查点变换精确逆转拼接和转置。共享投影参数，以及 gate/up 不同的 `requires_grad` 策略会被拒绝。
 双卡 BF16 FSDP/SGD 组件门禁已通过权重更新、重计算和精确检查点恢复检查。
+
+替换时可通过 `context={"mega_ffn_program": linear_ffn, "mega_ffn_execution": execution}`
+选择显式 Linear 程序。NK 模式只拼接 gate/up；down 检查点通过现有改名变换恢复，不创建空操作转换器。
+上述已通过的双卡门禁属于原有 KN 程序，不能直接作为新 NK 程序的设备验收证据。
 
 ## 原生执行与证据范围
 
@@ -199,6 +217,33 @@ FP32 主参数和 AdamW 状态均逐值一致；此内部调度回归不替代�
 原始训练基线与设备调优仍待完成；反向仍需读取的前向缓冲区不会发生别名复用。
 CPU 原生执行仅作为参考。
 
+## 显式 Linear 的配套数值来源
+
+`ir/dense_matrix.py` 将原始数值算子的来源、M/N/K、两侧转置和坐标映射纳入计划与绑定身份。
+NK Linear 的前向使用 NT；输入梯度保留原始 NN。权重梯度在设备上以物理 TN
+`dY.T @ X` 直接写入 NK 存储，其数值参考保留原始 TorchNPU `matmul_backward` 的
+`(X.T @ dY).T`。参考查询交换 M/N，访问跨度与核分区通过显式转置坐标映射对应物理输出。
+主机 VJP 同样保留该原始计算方向；两种等价公式不能自行被认为具有相同 BF16 累加顺序。
+这一来源对应 TorchNPU 所固定的
+[MatmulBackwardKernelNpuOpApi.cpp](https://github.com/Ascend/op-plugin/blob/8b9c8534fa41eff367a41c155843daa530ab3a08/op_plugin/ops/opapi/MatmulBackwardKernelNpuOpApi.cpp)。
+原始借用权重必须连续；不允许通过热路径权重复制改变物理布局。
+
+`backends/dense_linear.py` 为真实前向队列提供独立绑定，复用已经具有正确 NT 类型的共享矩阵核心，
+并保留打包 SwiGLU 的 FP32 计算和 BF16 舍入。操作主序的原生事件编号通过显式映射与逻辑队列对应。
+旧 Matmul 前向入口拒绝显式 Linear，避免该原语落入另一套数值契约。
+
+SDK 查询保留实际 NN/NT/TN 布局，逐操作访问原因、原始查询字节和参数表哈希均进入清单。
+受支持的多 K 块模板使用相同的 K 块逆序或旋转；MatMulV3 保留原有顺序。
+单 L0 K 块模板要求实际字段证明完整 K 覆盖、两侧 L1 覆盖以及没有跨核 K 收缩，
+因为此时 K 外层只有一次迭代，不能形成块间重排。
+其他尚未证明的 Linear 模板会在建立设备状态之前被拒绝，不以另一种数值顺序继续运行。
+
+新路径已通过独立 CPU Linear 输出与全部梯度、真实 ABI 队列解码、检查点恢复和 SDK 字段检查。
+新增设备入口为 `test_dense_linear_ffn_training`，覆盖空输入、尾部、非对齐通道、重计算、
+关闭后待执行反向，以及大矩阵不同列分区。当前 packed 七项和 common 八项设备组件已经逐值一致，覆盖大矩阵、尾部、重计算、
+冻结 up 和非默认列分区。原始完整模型独立轨迹、Source-NK FSDP 生命周期与完整训练步收益
+仍需分别验收；组件一致性不能替代这些门禁。
+
 已安装的 `npu_ffn` 接口仅允许门控激活用于 FP16 推理，因此不能作为 BF16 训练的快捷路径。
 主机编译成功和 CPU 梯度正确不代表 NPU 数值正确或具有性能收益。
 
@@ -267,3 +312,44 @@ HyperParallel AdamW，比较输出、dX、权重梯度、BF16 参数、FP32 主�
 加载模型与优化器状态之后，精确检查 BF16 回写与 FP32 主参数一致，防止恢复时丢失低精度未能表示的主参数位。
 通过相同的空闲等待脚本启动双卡用例，并精确选择两张设备卡；可通过 `HP_FFN_CACHE_ROOT`
 显式选择已封存的原生构建缓存，通过 `HP_FFN_EVIDENCE_DIR` 保存各进程的逐步比较和磁盘检查点。
+
+## Source-NK 完整训练入口
+
+`examples/mega_ffn/source_training.py` 分别使用原始 `common` 和 `packed` 完整模型作为对照，
+候选通过现有模块替换接口选择对应的显式程序。common 保留三个独立 NK 投影、BF16 SiLU
+和 BF16 乘法；packed 保留打包激活的单次 BF16 舍入。注意力、残差、归一化、嵌入及
+语言模型头均包含在同一训练步骤内。
+
+模型和优化器只在初始化时对齐。入口检查 logits、损失、全部更新前梯度、BF16 参数、
+FP32 主参数、AdamW 一阶矩、二阶矩，以及真实参数组更新次数。更新后缺失优化器矩会
+直接拒绝；两条轨迹即使具有相同但错误的步数，也不能通过应有更新次数检查。
+
+```bash
+python -m hyper_parallel.core.multicore.examples.mega_ffn.source_training \
+  --mode validate --baseline common --backend mega_ffn --steps 100 \
+  --dense-backend resident_tiles --dense-soc Ascend910B3 \
+  --cache-root build/native/dense/source-cache --output build/source-common-trajectory.json
+```
+
+`--mode measure` 在新进程中记录包含完整反向和 FP32 主参数 AdamW 的训练步样本、
+测量时间窗口与峰值设备内存。入口显式启用相同确定性配置，并封存原始数值契约及
+新增训练入口的源码身份。运行仍须通过既有设备空闲门禁。
+
+单个入口的成功不放行完整目标。正式数值轨迹还需核对每层三/四输入的真实常驻反向、
+零主机补算、源码与设备进程归属；性能还需原生/原生噪声对照、至少三个新进程 ABBA 块、
+主机测量窗口、完整训练步置信区间与设备内存证据。Source-NK 的 FSDP 和磁盘恢复另行验收。
+
+完整监督入口为 `examples/mega_ffn/source_acceptance.py`。它为两种基线各执行原生与
+候选的独立训练、原生/原生噪声对照及至少三块完整优化器步 ABBA，共 52 个新进程任务。
+common/packed 的数值契约身份分别保存，其余源码、模型、数据、设备和优化器配置必须一致。
+真实更新计数、八项固定阈值、全部层与梯度、零主机补算、峰值 HBM 和测量归属缺一不可。
+
+```bash
+python hyper_parallel/core/multicore/examples/mega_ffn/source_acceptance.py run \
+  --root build/source-acceptance --helper ~/doc/npu_wait_and_run.sh --device 0 --blocks 3 -- \
+  --steps 100 --warmup 100 --iterations 100 --dense-backend resident_tiles \
+  --dense-soc Ascend910B3 --cache-root build/native/dense/source-cache
+```
+
+监督进程通过脚本路径导入既有统计与归属工具，不加载框架；只有经过原有空闲门禁的
+子进程执行训练。失败步骤和污染轮次保留原始文件，不拼接不同轮次来放行。

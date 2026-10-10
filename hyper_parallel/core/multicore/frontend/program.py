@@ -120,6 +120,10 @@ class Program:
         self.constants = {key: frozen(value) for key, value in (constants or {}).items()}
         self.registry = registry
 
+    def parameter_types(self) -> dict[str, LogicalType | None]:
+        """返回经受限解析器校验的输入注解，供模块绑定声明接口与编译期常量。"""
+        return Parser(self.source, self.registry).parameter_types(self.signature)
+
     def lower(self, *, signature: Mapping[str, LogicalType] | None = None, **constants: object) -> ProgramIR:
         """Specialize constexpr parameters and lower to immutable ProgramIR.
 

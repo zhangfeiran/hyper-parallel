@@ -56,16 +56,18 @@ def _tensor(name, shape):
 
 
 def _query_shape(query, request, shape):
-    rows, columns, contracted, transpose = shape
+    rows, columns, contracted = shape[:3]
+    transpose_left, transpose = (False, shape[3]) if len(shape) == 4 else shape[3:]
     sdk = Path(request["cann_root"])
     metadata = sdk / "opp/built-in/op_impl/ai_core/tbe/kernel/ascend910b/ops_legacy/mat_mul"
-    metadata /= f"MatMulV2_ND_ND_FP16_FP16_false_{str(transpose).lower()}_all.json"
+    metadata /= f"MatMulV2_ND_ND_FP16_FP16_{str(transpose_left).lower()}_{str(transpose).lower()}_all.json"
     compile_info = json.loads(metadata.read_text(encoding="utf-8"))["compileInfo"]
     compile_info["hardware_info"]["CORE_NUM"] = request["cube_workers"]
     right = (columns, contracted) if transpose else (contracted, columns)
-    inputs = [_tensor("x1", (rows, contracted)), _tensor("x2", right), None, None]
+    left = (contracted, rows) if transpose_left else (rows, contracted)
+    inputs = [_tensor("x1", left), _tensor("x2", right), None, None]
     outputs = [_tensor("y", (rows, columns))]
-    attrs = [{"name": "transpose_x1", "dtype": "bool", "value": False},
+    attrs = [{"name": "transpose_x1", "dtype": "bool", "value": transpose_left},
              {"name": "transpose_x2", "dtype": "bool", "value": transpose},
              {"name": "offset_x", "dtype": "int", "value": 0},
              {"name": "_op_impl_mode_enum", "dtype": "int", "value": 4}]
@@ -86,8 +88,9 @@ def _query_shape(query, request, shape):
 
 
 def _native_family(initializer, request, shape):
-    select = initializer.hyper_parallel_dense_native_family
-    select.argtypes = [ctypes.c_char_p] + [ctypes.c_uint32] * 6
+    select = (initializer.hyper_parallel_dense_native_family if len(shape) == 4
+              else initializer.hyper_parallel_dense_native_family_ex)
+    select.argtypes = [ctypes.c_char_p] + [ctypes.c_uint32] * (len(shape) + 2)
     select.restype = ctypes.c_int
     choices = [select(request["soc"].encode(), request["cube_workers"], *shape, split) for split in (0, 1)]
     if any(choice not in (0, 1) for choice in choices):

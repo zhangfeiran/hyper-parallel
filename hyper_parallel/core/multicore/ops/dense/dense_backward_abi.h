@@ -14,6 +14,9 @@ constexpr uint32_t DENSE_BACKWARD_MAX_VALUES = 128;
 constexpr uint32_t DENSE_SWIGLU_GRAD = 2;
 constexpr uint32_t DENSE_GRADIENT_ADD = 3;
 constexpr uint32_t DENSE_ZERO = 4;
+constexpr uint32_t DENSE_SILU = 5;
+constexpr uint32_t DENSE_MULTIPLY = 6;
+constexpr uint32_t DENSE_SILU_GRAD = 7;
 
 struct DenseBackwardHeader {
   uint32_t magic;

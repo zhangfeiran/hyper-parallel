@@ -1,0 +1,36 @@
+{
+  "cube_workers": 20,
+  "deterministic": false,
+  "format_version": 2,
+  "operator": "native_dense_matmul",
+  "results": [
+    {
+      "compile_info_sha256": "d92daa4ceffd3f0db87cf37109d14b1bafb636ad55f3775fd7adf2c5d80d7fff",
+      "native_family": "MatMulV2",
+      "run_info": {
+        "aicpu_block_dim": 0,
+        "block_dim": 1,
+        "clear_atomic": true,
+        "local_memory_size": 0,
+        "schedule_mode": 0,
+        "tiling_cond": 0,
+        "tiling_data": "8100000040000000800000000900000004000000080000000100000001000000010000000100000001000000010000000100000001000000010000000100000004000000030000000800000003000000030000000100000001000000090000000900000001000000010000000100000001000000010000000000000000000000010000000000000000000000010000000E00000000000000",
+        "tiling_key": 98433,
+        "workspaces": []
+      },
+      "shape": [
+        64,
+        128,
+        129,
+        true,
+        false
+      ],
+      "v3_with_split_k_false_true": [
+        0,
+        0
+      ]
+    }
+  ],
+  "scope": "sdk_host_query",
+  "soc": "Ascend910B3"
+}

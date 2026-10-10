@@ -28,6 +28,8 @@ from hyper_parallel.core.multicore._build.build_dense_tile import (
     dense_tile_build_identity,
 )
 from hyper_parallel.core.multicore.backends.dense_codegen import saved_value_ids
+from hyper_parallel.core.multicore.backends.dense_backward import HEADER as MATRIX_HEADER
+from hyper_parallel.core.multicore.backends.dense_linear import DenseLinearSdkTiler, bind_dense_linear_tiles
 from hyper_parallel.core.multicore.backends.dense_reference import DenseReferenceTiler
 from hyper_parallel.core.multicore.backends.dense_tile import DenseSdkTiler, bind_dense_tiles
 from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePolicy, compile_dense_tiles, simulate_dense_tiles
@@ -67,9 +69,18 @@ class ResidentDenseExecutable(DenseExecutable):
             policy = tiler.recommended_policy(plan)
         self.tile_plan = compile_dense_tiles(plan, policy)
         simulate_dense_tiles(self.tile_plan)
-        self.binding = bind_dense_tiles(self.tile_plan)
+        self.linear_forward = any(operation.logical_name == "dense.linear" for operation in plan.ir.operations)
+        if self.linear_forward:
+            shared_tiler = DenseLinearSdkTiler(manifest.parent / data["tiling_library"], soc)
+            shared_tiler.reference = tiler.reference
+            tiler = shared_tiler
+            self.binding = bind_dense_linear_tiles(self.tile_plan)
+        else:
+            self.binding = bind_dense_tiles(self.tile_plan)
+        counts = MATRIX_HEADER.unpack_from(self.binding.config) if self.linear_forward else None
+        self.launch_counts = (counts[5], counts[8], counts[7]) if counts is not None else ()
         bank = tiler.bank(self.tile_plan, self.binding)
-        self.workspace_bytes = tiler.workspace_bytes
+        self.workspace_bytes = tiler.sdk.workspace_bytes if self.linear_forward else tiler.workspace_bytes
         self.scratch = shared_dense_scratch(self.device, len(self.binding.value_ids),
                                            self.tile_plan.event_count * 32, self.workspace_bytes, self)
         self.config = self._bytes(self.binding.config)
@@ -146,9 +157,10 @@ class ResidentDenseExecutable(DenseExecutable):
         with self.scratch.lease(stream, pointers=len(tensors),
                                 event_elements=self.tile_plan.event_count * 32) as scratch:
             scratch.prepare(tuple(tensor.data_ptr() for tensor in tensors))
-            self.native_ops.launch.default(inputs, outputs, scratch.pointers, self.config, self.tilings,
-                                           scratch.events, self.ones, scratch.workspace, scratch.overflow,
-                                           self.tile_plan.policy.cube_workers)
+            launch = self.native_ops.launch_backward if self.linear_forward else self.native_ops.launch
+            launch.default(inputs, outputs, scratch.pointers, self.config, self.tilings,
+                           scratch.events, self.ones, scratch.workspace, scratch.overflow,
+                           self.tile_plan.policy.cube_workers, *self.launch_counts)
 
 
 class _ResidentDenseFunction(torch.autograd.Function):

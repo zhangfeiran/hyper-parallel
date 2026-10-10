@@ -36,6 +36,11 @@ from hyper_parallel.core.dtensor.dtensor import SkipDTensorDispatch
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, wait_grad_handle
 from hyper_parallel.core.multicore.examples.mega_ffn.acceptance import _resident_backward_entry
+from hyper_parallel.core.multicore.examples.mega_ffn.qwen_dense_model import DenseMLP, QwenDenseConfig
+from hyper_parallel.core.multicore.examples.mega_ffn.source_contract import resident_source_entry
+from hyper_parallel.core.multicore.examples.mega_ffn.source_layout import source_layout_tensors
+from hyper_parallel.core.multicore.frontend.examples.common_ffn import common_ffn
+from hyper_parallel.core.multicore.frontend.examples.linear_ffn import linear_ffn
 from hyper_parallel.core.multicore.modules.mega_ffn.adapter import MegaFFNAdapter
 from hyper_parallel.core.optimizer import get_hyper_optimizer
 from tests.torch.multicore._dense_ffn_fsdp_impl import _SourceFFN, _execution_config
@@ -57,7 +62,7 @@ def _optimizer(model: nn.Module) -> Float16OptimizerWithFloat16Params:
     return Float16OptimizerWithFloat16Params(inner, model)
 
 
-def _state(model, optimizer, kind):
+def _state(model, optimizer, kind, *, layout="kn"):
     values = {}
     names = {"linear_fc1.weight": "gate_up", "linear_fc2.weight": "down"}
     for name, parameter in model.named_parameters():
@@ -80,12 +85,18 @@ def _state(model, optimizer, kind):
         if value is None:
             raise AssertionError(f"FSDP 梯度缺失：{name}")
         value = _global_cpu(value, parameter)
-        values[names.get(name, name)] = value.t() if name in names and value.ndim else value
+        values[name] = value
+    if layout == "source_nk":
+        return source_layout_tensors(model, values)
+    if layout != "kn":
+        raise ValueError("FSDP 状态比较必须显式选择 kn 或 source_nk 布局")
+    values = {names.get(name, name): value.t() if name in names and value.ndim else value
+              for name, value in values.items()}
     return values
 
 
-def _updated_state(model, optimizer):
-    return {kind: _state(model, optimizer, kind)
+def _updated_state(model, optimizer, *, layout="kn"):
+    return {kind: _state(model, optimizer, kind, layout=layout)
             for kind in ("parameters", "main", "exp_avg", "exp_avg_sq", "step")}
 
 
@@ -115,7 +126,7 @@ def _assert_copyback(model, optimizer):
         torch.testing.assert_close(parameter.to_local(), main.to_local().to(torch.bfloat16), rtol=0, atol=0)
 
 
-def _advance(models, optimizers, value, cotangent, recompute):
+def _advance(models, optimizers, value, cotangent, recompute, *, layout="kn"):
     records = []
     for model, optimizer in zip(models, optimizers):
         optimizer.zero_grad(set_to_none=True)
@@ -124,11 +135,11 @@ def _advance(models, optimizers, value, cotangent, recompute):
         output.backward(cotangent)
         wait_grad_handle()
         record = {"output": {"value": output.detach().cpu()}, "dX": {"value": tokens.grad.detach().cpu()},
-                  "gradients": _state(model, optimizer, "gradients")}
+                  "gradients": _state(model, optimizer, "gradients", layout=layout)}
         with SkipDTensorDispatch():
             optimizer.step()
         _assert_copyback(model, optimizer)
-        record.update(_updated_state(model, optimizer))
+        record.update(_updated_state(model, optimizer, layout=layout))
         records.append(record)
     return records
 
@@ -146,12 +157,13 @@ def _checkpoint_cpu(value):
     return deepcopy(value)
 
 
-def _restore(source, mesh, candidate, optimizer, directory, rank):
+def _restore(source, mesh, candidate, optimizer, directory, rank, *, layout="kn", program=None):
     path = directory / f"fsdp-adamw-checkpoint-rank-{rank}.pt"
     saved = {"model": {name: _global_cpu(parameter, parameter) for name, parameter in candidate.named_parameters()},
              "optimizer": _checkpoint_cpu(optimizer.state_dict())}
     torch.save(saved, path)
-    restored = MegaFFNAdapter(module=source, context={"mega_ffn_execution": _execution_config()}).to(
+    restored = MegaFFNAdapter(module=source, context={"mega_ffn_execution": _execution_config(),
+                                                    "mega_ffn_program": program}).to(
         torch.device("npu", rank))
     policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32,
                                   output_dtype=torch.bfloat16, cast_forward_inputs=False)
@@ -161,23 +173,33 @@ def _restore(source, mesh, candidate, optimizer, directory, rank):
     restored.load_state_dict(loaded["model"])
     with SkipDTensorDispatch():
         restored_optimizer.load_state_dict(loaded["optimizer"])
-    checks = _compare(_updated_state(restored, restored_optimizer), _updated_state(candidate, optimizer), exact=True)
+    checks = _compare(_updated_state(restored, restored_optimizer, layout=layout),
+                      _updated_state(candidate, optimizer, layout=layout), exact=True)
     _assert_copyback(restored, restored_optimizer)
     return restored, restored_optimizer, {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                                           "layout": "full_model_and_rank_local_optimizer", "checks": checks}
 
 
-def _native(model):
+def _native(model, *, source_baseline=None):
     # 验收分析器读取磁盘 JSON；梯度掩码遵循相同的列表契约。
     entries = json.loads(json.dumps(model.execution_manifest()))
-    if not entries or any(entry["native"].get("execution_mode") != "resident_dense_tile_candidate"
-                          or not _resident_backward_entry(entry) for entry in entries):
-        raise AssertionError("FSDP 必须执行 resident 前向和三个输入的完整设备反向，禁止主机补算")
+    if not entries:
+        raise AssertionError("FSDP 必须保留真实的原生执行记录")
+    for entry in entries:
+        complete = (resident_source_entry(entry, source_baseline) if source_baseline is not None else
+                    entry["native"].get("execution_mode") == "resident_dense_tile_candidate"
+                    and _resident_backward_entry(entry))
+        if not complete:
+            raise AssertionError("FSDP 必须执行 resident 前向和全部声明输入的完整设备反向，禁止主机补算")
     return entries
 
 
-def test_dense_ffn_fully_shard_adamw() -> None:
-    """比较独立 AdamW 轨迹，并精确验证同一双卡拓扑下的磁盘恢复及后续更新。"""
+def _fsdp_adamw(source_baseline=None):
+    programs = {None: None, "common": common_ffn, "packed": linear_ffn}
+    if source_baseline not in programs:
+        raise ValueError("FSDP Source-NK 验收必须选择原始 common 或 packed 数值契约")
+    program = programs[source_baseline]
+    layout = "kn" if source_baseline is None else "source_nk"
     rank, world_size = int(os.environ.get("LOCAL_RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
     if world_size != 2:
         raise ValueError("Dense FSDP AdamW 验收要求恰好两个 worker rank")
@@ -189,28 +211,32 @@ def test_dense_ffn_fully_shard_adamw() -> None:
     try:
         mesh = init_device_mesh("npu", (world_size,), mesh_dim_names=("dp",))
         torch.manual_seed(17)
-        source = _SourceFFN().to(dtype=torch.bfloat16)
-        candidate = MegaFFNAdapter(module=source, context={"mega_ffn_execution": _execution_config()}).to(device)
-        baseline = SwiGLUMLP(module=deepcopy(source)).to(device)
+        source = (DenseMLP(QwenDenseConfig(hidden_size=64, intermediate_size=128))
+                  if source_baseline == "common" else _SourceFFN()).to(dtype=torch.bfloat16)
+        candidate = MegaFFNAdapter(module=source, context={"mega_ffn_execution": _execution_config(),
+                                                         "mega_ffn_program": program}).to(device)
+        baseline = (deepcopy(source) if source_baseline == "common" else SwiGLUMLP(module=deepcopy(source))).to(device)
         policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32,
                                       output_dtype=torch.bfloat16, cast_forward_inputs=False)
         models = [candidate, baseline]
         for model in models:
             fully_shard(model, mesh=mesh, reshard_after_forward=True, mp_policy=policy)
         optimizers = [_optimizer(model) for model in models]
-        initial = _compare(_updated_state(candidate, optimizers[0]),
-                           _updated_state(baseline, optimizers[1]), exact=True)
+        initial = _compare(_updated_state(candidate, optimizers[0], layout=layout),
+                           _updated_state(baseline, optimizers[1], layout=layout), exact=True)
         rows = []
         checkpoint_record = None
         with TemporaryDirectory(prefix="hp-ffn-fsdp-adamw-") as temporary:
             directory = Path(os.environ.get("HP_FFN_EVIDENCE_DIR", temporary))
+            if source_baseline is not None:
+                directory = directory / source_baseline
             directory.mkdir(parents=True, exist_ok=True)
             progress_path = directory / f"fsdp-adamw-progress-rank-{rank}.json"
             for step, tokens in enumerate((7, 129, 7, 1, 129, 7, 1, 7)):
                 generator = torch.Generator(device="cpu").manual_seed(1000 + rank * 100 + step)
                 value = torch.randn(tokens, 64, generator=generator, dtype=torch.bfloat16).to(device)
                 cotangent = torch.randn(tokens, 64, generator=generator, dtype=torch.bfloat16).to(device)
-                records = _advance(models, optimizers, value, cotangent, step in (2, 5))
+                records = _advance(models, optimizers, value, cotangent, step in (2, 5), layout=layout)
                 checks = _compare(records[0], records[1])
                 for record in records:
                     if any(int(count) != step + 1 for count in record["step"].values()):
@@ -223,7 +249,7 @@ def test_dense_ffn_fully_shard_adamw() -> None:
                                                      indent=2) + "\n", encoding="utf-8")
                 if step == 3:
                     restored, restored_optimizer, checkpoint_record = _restore(
-                        source, mesh, candidate, optimizers[0], directory, rank)
+                        source, mesh, candidate, optimizers[0], directory, rank, layout=layout, program=program)
                     models.append(restored)
                     optimizers.append(restored_optimizer)
             if checkpoint_record is None or restored is None:
@@ -231,11 +257,14 @@ def test_dense_ffn_fully_shard_adamw() -> None:
             torch.npu.synchronize()
             record = {"rank": rank, "world_size": world_size, "torch": torch.__version__,
                       "torch_npu": torch_npu.__version__, "scope": "BF16 FSDP FP32-main AdamW component lifecycle",
+                      "source_baseline": source_baseline, "parameter_layout": layout,
                       "model": {"hidden_size": 64, "intermediate_size": 128, "seed": 17},
                       "optimizer": {"family": "HyperParallel AdamW", "fp32_main_params": True,
                                     "lr": 1e-3, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01},
                       "initial": initial, "steps": rows, "checkpoint": checkpoint_record,
-                      "native_payloads": _native(candidate), "resumed_native_payloads": _native(restored)}
+                      "native_payloads": _native(candidate, source_baseline=source_baseline),
+                      "resumed_native_payloads": _native(restored, source_baseline=source_baseline),
+                      "formal_original_training_accepted": False, "performance_accepted": False}
             (directory / f"fsdp-adamw-rank-{rank}.json").write_text(json.dumps(record, indent=2) + "\n",
                                                                  encoding="utf-8")
     finally:
@@ -244,3 +273,18 @@ def test_dense_ffn_fully_shard_adamw() -> None:
         if candidate is not None:
             candidate.close()
         dist.destroy_process_group()
+
+
+def test_dense_ffn_fully_shard_adamw() -> None:
+    """比较原有 KN 模块的独立 AdamW 轨迹、双卡磁盘恢复及后续更新。"""
+    _fsdp_adamw()
+
+
+def test_dense_source_packed_fully_shard_adamw() -> None:
+    """比较原始 packed 与 NK Linear 的独立 AdamW 轨迹、双卡磁盘恢复及后续更新。"""
+    _fsdp_adamw("packed")
+
+
+def test_dense_source_common_fully_shard_adamw() -> None:
+    """比较原始 common 与三个 NK Linear 的独立 AdamW 轨迹、双卡磁盘恢复及后续更新。"""
+    _fsdp_adamw("common")

@@ -73,6 +73,13 @@ at::Tensor dense_matmul(const at::Tensor& left, const at::Tensor& right) {
   return at::mm(left, right);
 }
 
+at::Tensor dense_linear(const at::Tensor& left, const at::Tensor& right, bool transpose_right) {
+  TORCH_CHECK(transpose_right || left.device().type() != c10::DeviceType::PrivateUse1,
+              "Native Linear requires borrowed NK weights without a layout copy");
+  const auto weight = transpose_right ? right : right.t().contiguous();
+  return at::linear(left, weight);
+}
+
 at::Tensor dense_swiglu(const at::Tensor& packed) {
   if (packed.numel() == 0 || packed.device().type() == c10::DeviceType::Meta) {
     return at::empty({packed.size(0), packed.size(1) / 2}, packed.options());
@@ -128,8 +135,15 @@ def _forward_expression(provider, arguments):
         left = _operand(arguments["left"], arguments["transpose_left"])
         right = _operand(arguments["right"], arguments["transpose_right"])
         return f"dense_matmul({left}, {right})"
+    if provider.implementation == "aten.linear.default":
+        left = _operand(arguments["left"], arguments["transpose_left"])
+        return f"dense_linear({left}, v{arguments['right'].id}, {str(arguments['transpose_right']).lower()})"
     if provider.implementation == "npu.npu_swiglu.default":
         return f"dense_swiglu(v{arguments['packed'].id})"
+    if provider.implementation == "aten.silu.default":
+        return f"at::silu(v{arguments['value'].id})"
+    if provider.implementation == "aten.mul.Tensor":
+        return f"(v{arguments['left'].id} * v{arguments['right'].id})"
     raise ValueError(f"No native dense source template for {provider.implementation}")
 
 
@@ -138,6 +152,15 @@ def _backward_statement(node, contribution):
     gradient = f"gradients[{contribution.source_target}]"
     if node.kind == "swiglu_input_grad":
         expression = f"dense_swiglu_grad({gradient}, v{primal})"
+    elif node.kind == "silu_input_grad":
+        expression = f"at::silu_backward({gradient}, v{primal})"
+    elif node.kind in ("multiply_left_grad", "multiply_right_grad"):
+        expression = f"({gradient} * v{primal})"
+    elif node.kind == "linear_weight_grad":
+        operand = f"v{primal}" + (".t()" if node.operand_transposes[1][0] else "")
+        expression = f"(dense_matmul(({operand}).t(), {gradient})).t()"
+        if node.transpose_output:
+            expression = f"({expression}).t()"
     else:
         side = 1 if node.kind == "matmul_left_grad" else 0
         operand = f"v{primal}" + (".t()" if node.operand_transposes[side][0] else "")
