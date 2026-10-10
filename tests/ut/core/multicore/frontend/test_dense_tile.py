@@ -46,14 +46,16 @@ def _execute_queues(plan, inputs):
         operation = plan.dense.ir.operations[task.operation]
         arguments = dict(operation.arguments)
         first, end = task.row_begin, task.row_end
+        column, stop = task.column_begin, task.column_end
         if operation.logical_name == "dense.matmul":
             right = values[arguments["right"].id]
-            right = right.t() if arguments["transpose_right"] else right
+            right = right[column:stop].t() if arguments["transpose_right"] else right[:, column:stop]
             result = values[arguments["left"].id][first:end] @ right
         else:
             gate, up = values[arguments["packed"].id][first:end].float().chunk(2, dim=-1)
+            gate, up = gate[:, column:stop], up[:, column:stop]
             result = (functional.silu(gate) * up).to(torch.bfloat16)
-        values[operation.outputs[0].id][first:end] = result
+        values[operation.outputs[0].id][first:end, column:stop] = result
     return tuple(values[value.id] for value in plan.dense.ir.outputs)
 
 
@@ -144,15 +146,15 @@ class TestDenseTile(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_descriptor_has_exact_golden_abi_and_no_addresses(self):
         """Feature: Dense device task ABI.
-        Description: Serialize a nonaligned FFN to the native 32-byte header and 36-byte operations.
+        Description: Serialize a nonaligned FFN to the native 32-byte header and 44-byte operations.
         Expectation: Compact SSA slots, primitive widths and two-vector joins match golden bytes.
         """
         binding = bind_dense_tiles(_plan(129, hidden=80, intermediate=131, cube_workers=2))
-        golden = struct.pack("<8I", 0x444E5331, 2, 129, 64, 2, 2, 3, 6)
-        golden += struct.pack("<7IiI", 0, 0, 1, 3, 262, 80, 0, -1, 1)
-        golden += struct.pack("<7IiI", 1, 3, 0, 4, 131, 262, 0, 0, 1)
-        golden += struct.pack("<7IiI", 0, 4, 2, 5, 80, 131, 0, 1, 2)
-        self.assertEqual((HEADER.size, OPERATION.size), (32, 36))
+        golden = struct.pack("<8I", 0x444E5331, 3, 129, 64, 2, 2, 3, 6)
+        golden += struct.pack("<7IiI2I", 0, 0, 1, 3, 262, 80, 0, -1, 1, 262, 1)
+        golden += struct.pack("<7IiI2I", 1, 3, 0, 4, 131, 262, 0, 0, 1, 131, 1)
+        golden += struct.pack("<7IiI2I", 0, 4, 2, 5, 80, 131, 0, 1, 2, 80, 1)
+        self.assertEqual((HEADER.size, OPERATION.size), (32, 44))
         self.assertEqual(binding.config, golden)
         self.assertEqual(binding.value_ids, tuple(range(6)))
 
@@ -184,10 +186,13 @@ class TestDenseTile(unittest.TestCase):
         tiler = DenseSdkTiler.__new__(DenseSdkTiler)
         tiler.soc, tiler.cube_workers, tiler.tiling_bytes = "test-target", 2, 200
         tiler.reference = None
+        tiler.reference_shapes = ()
+        tiler.reference_record = None
+        tiler.partition_hints = ()
         calls = []
 
-        def _generate(_soc, rows, tile, columns, contracted, transpose, block, capacity):
-            calls.append((rows, tile, columns, contracted, transpose, capacity))
+        def _generate(_soc, rows, tile, columns, tile_columns, contracted, transpose, block, capacity):
+            calls.append((rows, tile, columns, tile_columns, contracted, transpose, capacity))
             block.raw = struct.pack("<5I", rows, tile, columns, contracted, transpose) + bytes(capacity - 20)
             return 0
 
@@ -197,10 +202,76 @@ class TestDenseTile(unittest.TestCase):
         stride = 200 + ACCESS.size
         self.assertEqual(len(bank), 3 * stride)
         self.assertEqual(bank[stride:2 * stride], bytes(stride))
-        self.assertEqual(calls, [(129, 64, 12, 8, 0, 200), (129, 64, 8, 6, 0, 200)])
+        self.assertEqual(calls, [(129, 64, 12, 12, 8, 0, 200), (129, 64, 8, 8, 6, 0, 200)])
         empty = _plan(0, cube_workers=2)
         self.assertEqual(tiler.bank(empty, bind_dense_tiles(empty)), bytes(3 * stride))
         self.assertEqual(len(calls), 2)
         with self.assertRaisesRegex(ValueError, "hardware target"):
             oversubscribed = _plan(1, cube_workers=3)
             tiler.bank(oversubscribed, bind_dense_tiles(oversubscribed))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_spatial_queues_cover_outputs_and_wait_all_producer_fragments(self):
+        """Feature: 二维任务所有权及汇合。
+        Description: 枚举行尾部、列尾部、多核及预取窗口，按真实队列头推进。
+        Expectation: 每个输出元素恰好写一次，任何消费者都在本行全部生产片段完成后执行。
+        """
+        for rows in (0, 1, 7, 129):
+            for cores in (1, 3, 20):
+                for columns in (1, 2, 4, 7):
+                    with self.subTest(rows=rows, cores=cores, columns=columns):
+                        plan = _plan(rows, hidden=16, intermediate=17, cube_workers=cores,
+                                     column_workers=columns, prefetch_tiles=2)
+                        completed = simulate_dense_tiles(plan)
+                        for operation, width in enumerate((34, 17, 16)):
+                            owners = Counter((row, column) for task in completed if task.operation == operation
+                                             for row in range(task.row_begin, task.row_end)
+                                             for column in range(task.column_begin, task.column_end))
+                            self.assertEqual(owners, Counter((row, column) for row in range(rows)
+                                                            for column in range(width)))
+                        positions = {task: position for position, task in enumerate(completed)}
+                        for task in completed:
+                            for event, required in task.dependencies:
+                                producers = [producer for producer in completed if producer.trigger == event]
+                                self.assertEqual(required, len(producers))
+                                self.assertLess(max(positions[producer] for producer in producers), positions[task])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_spatial_replay_preserves_packed_activation_and_transposed_weights(self):
+        """Feature: 二维原语片段语义。
+        Description: 在非对齐宽度上回放打包 SwiGLU，并切分右转置矩阵的输出列。
+        Expectation: 独立整图计算和队列片段输出一致，无列间遗漏或重复写入。
+        """
+        torch.manual_seed(29)
+        plan = _plan(129, hidden=80, intermediate=131, cube_workers=3, column_workers=4)
+        inputs = tuple(torch.randn(shape, dtype=torch.bfloat16) * 0.05
+                       for shape in ((129, 80), (80, 262), (131, 80)))
+        actual, = _execute_queues(plan, inputs)
+        torch.testing.assert_close(actual, plan.dense.materialize("cpu")(*inputs), rtol=0.02, atol=0.002)
+        program = mc.from_source(
+            "def linear(x, weight):\n    return ml.matmul(x, weight, transpose_right=True)\n",
+            signature={"x": ml.Tensor[ml.bf16, (65, 4)], "weight": ml.Tensor[ml.bf16, (37, 4)]},
+            symbols={"ml": ml}, schedule=mc.TaskDAG("dense_v1"))
+        plan = compile_dense_tiles(program.plan(mc.DenseSpec({})),
+                                   DenseTilePolicy(cube_workers=3, column_workers=4))
+        inputs = (torch.randn(65, 4, dtype=torch.bfloat16), torch.randn(37, 4, dtype=torch.bfloat16))
+        actual, = _execute_queues(plan, inputs)
+        torch.testing.assert_close(actual, inputs[0] @ inputs[1].t(), rtol=0.02, atol=0.002)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_spatial_descriptor_counts_match_native_worker_grid(self):
+        """Feature: 二维设备描述符。
+        Description: 将完整形状的 FFN 映射为五行分区和四列分区。
+        Expectation: 三阶段均分配全部核，Matmul 汇合四个片段，SwiGLU 汇合八个通道。
+        """
+        plan = _plan(1024, hidden=1024, intermediate=4096, rows_per_tile=224,
+                     cube_workers=20, column_workers=4)
+        binding = bind_dense_tiles(plan)
+        descriptors = [OPERATION.unpack_from(binding.config, HEADER.size + index * OPERATION.size)
+                       for index in range(3)]
+        self.assertEqual([row[-2:] for row in descriptors], [(2048, 4), (1024, 4), (256, 4)])
+        self.assertEqual([row[8] for row in descriptors], [1, 4, 8])
+        for operation, kind, workers in ((0, "cube", 20), (1, "vector", 40), (2, "cube", 20)):
+            self.assertEqual({task.worker for task in plan.tasks if task.operation == operation and
+                              task.worker_kind == kind}, set(range(workers)))
+        self.assertEqual(len(simulate_dense_tiles(plan)), 80)

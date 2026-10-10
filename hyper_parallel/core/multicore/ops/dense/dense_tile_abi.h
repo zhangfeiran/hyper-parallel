@@ -8,7 +8,7 @@
 
 namespace HyperParallelDense {
 constexpr uint32_t DENSE_TILE_MAGIC = 0x444E5331;
-constexpr uint32_t DENSE_TILE_VERSION = 2;
+constexpr uint32_t DENSE_TILE_VERSION = 3;
 constexpr uint32_t DENSE_MAX_OPERATIONS = 16;
 constexpr uint32_t DENSE_MAX_VALUES = 32;
 constexpr uint32_t DENSE_EVENT_STRIDE = 32;
@@ -36,6 +36,8 @@ struct DenseTileOperation {
   uint32_t transpose_right;
   int32_t dependency;
   uint32_t dependency_count;
+  uint32_t columns_per_tile;
+  uint32_t column_tiles;
 };
 
 struct DenseMatrixAccess {
@@ -48,7 +50,7 @@ struct DenseMatrixAccess {
 };
 
 static_assert(sizeof(DenseTileHeader) == 32, "Dense tile header ABI drift");
-static_assert(sizeof(DenseTileOperation) == 36, "Dense tile operation ABI drift");
+static_assert(sizeof(DenseTileOperation) == 44, "Dense tile operation ABI drift");
 static_assert(sizeof(DenseMatrixAccess) == 24, "Dense matrix access ABI drift");
 }  // namespace HyperParallelDense
 

@@ -22,13 +22,19 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from hyper_parallel.core.multicore.backends.dense_reference import ACCESS, DenseReferenceTiler, reference_access
-from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePlan
+from hyper_parallel.core.multicore.backends.dense_reference import (
+    ACCESS,
+    REFERENCE_FIELDS,
+    DenseReferenceTiler,
+    reference_access,
+)
+from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePlan, DenseTilePolicy, column_partition
+from hyper_parallel.core.multicore.runtime.dense import DenseKernelPlan
 
 HEADER = struct.Struct("<8I")
-OPERATION = struct.Struct("<7IiI")
+OPERATION = struct.Struct("<7IiI2I")
 MAGIC = 0x444E5331
-VERSION = 2
+VERSION = 3
 EVENT_STRIDE_BYTES = 128
 
 
@@ -59,8 +65,12 @@ def _operation_descriptor(plan, task, slots):
     if len(task.dependencies) > 1:
         raise ValueError("Resident dense forward descriptor admits one row-local producer per primitive")
     dependency = task.dependencies[0] if task.dependencies else -1
-    count = 2 if dependency >= 0 and plan.dense.tasks[dependency].provider.worker == "vector" else 1
-    return OPERATION.pack(*descriptor, dependency, count), shape
+    count = 1
+    if dependency >= 0:
+        count = column_partition(plan.dense, dependency, plan.policy)[1]
+        count *= 2 if plan.dense.tasks[dependency].provider.worker == "vector" else 1
+    width, parts = column_partition(plan.dense, task.index, plan.policy)
+    return OPERATION.pack(*descriptor, dependency, count, width, parts), shape
 
 
 def bind_dense_tiles(plan: DenseTilePlan) -> DenseTileBinding:
@@ -99,6 +109,8 @@ class DenseSdkTiler:
         self.soc = soc
         self.reference = reference
         self.reference_record = None
+        self.reference_shapes = ()
+        self.partition_hints = ()
         self.library = ctypes.CDLL(str(Path(library).resolve()))
         query = self.library.hyper_parallel_dense_platform
         query.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint64),
@@ -110,8 +122,64 @@ class DenseSdkTiler:
             raise ValueError(f"Dense SDK platform query failed for {soc}: status={status}")
         self.cube_workers, self.workspace_bytes, self.tiling_bytes = workers.value, workspace.value, size.value
         self.generate = self.library.hyper_parallel_dense_matmul_tiling
-        self.generate.argtypes = [ctypes.c_char_p, *([ctypes.c_uint32] * 5), ctypes.c_void_p, ctypes.c_uint32]
+        self.generate.argtypes = [ctypes.c_char_p, *([ctypes.c_uint32] * 6), ctypes.c_void_p, ctypes.c_uint32]
         self.generate.restype = ctypes.c_int
+        self.partition = self.library.hyper_parallel_dense_partition
+        self.partition.argtypes = [ctypes.c_char_p, *([ctypes.c_uint32] * 4),
+                                   ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)]
+        self.partition.restype = ctypes.c_int
+
+    def _query_reference(self, shapes):
+        if self.reference is None or not shapes:
+            self.reference_shapes, self.reference_record = shapes, None
+        elif shapes != self.reference_shapes:
+            self.reference_record = self.reference.query(shapes)
+            self.reference_shapes = shapes
+        return self.reference_record
+
+    def recommended_policy(self, plan: DenseKernelPlan) -> DenseTilePolicy:
+        """用 SDK 的整矩阵分区建议生成共享的行 tile 和列 worker 数。
+
+        Args:
+            plan: 具体形状的稠密 SSA，不包含本次调用的设备地址。
+        """
+        types = dict(plan.value_types)
+        inputs = [value for value in plan.ir.inputs if value.name == "x"]
+        if len(inputs) != 1:
+            raise ValueError("Dense row input must identify exactly one semantic tensor parameter")
+        rows = types[inputs[0].id].shape[0]
+        if rows == 0:
+            return DenseTilePolicy(cube_workers=1)
+        shapes = []
+        for operation in plan.ir.operations:
+            if operation.logical_name == "dense.matmul":
+                args = dict(operation.arguments)
+                output, = operation.outputs
+                shapes.append((rows, types[output.id].shape[1], types[args["left"].id].shape[1],
+                               args["transpose_right"]))
+        if any(dimension <= 0 or dimension > 2**31 - 1 for shape in shapes for dimension in shape[:3]):
+            raise ValueError("Dense matrix dimensions exceed the signed SDK tiling boundary")
+        reference = self._query_reference(tuple(shapes))
+        hints = []
+        for index, shape in enumerate(shapes):
+            row_size, column_size = ctypes.c_uint32(), ctypes.c_uint32()
+            status = self.partition(self.soc.encode(), *shape, ctypes.byref(row_size), ctypes.byref(column_size))
+            if status or row_size.value == 0 or column_size.value == 0:
+                raise ValueError(f"Dense SDK multicore partition failed for {shape}: status={status}")
+            height = row_size.value
+            if reference is not None and reference["results"][index]["native_family"] == "MatMulV2":
+                raw = bytes.fromhex(reference["results"][index]["run_info"]["tiling_data"])
+                fields = dict(zip(REFERENCE_FIELDS, struct.unpack("<38i", raw)))
+                height = 16 * fields["m_single_core"] * fields["m_al1"] * fields["m_l0"]
+                if height <= 0:
+                    raise ValueError("Dense native row partition is not positive")
+            hints.append({"shape": shape, "rows": height, "columns": column_size.value})
+        self.partition_hints = tuple(hints)
+        height = min(rows, min((hint["rows"] for hint in hints), default=64))
+        row_tiles = (rows + height - 1) // height
+        columns = max(1, min(24, self.cube_workers) // row_tiles)
+        workers = min(24, self.cube_workers, row_tiles * columns)
+        return DenseTilePolicy(rows_per_tile=height, cube_workers=workers, column_workers=columns)
 
     def bank(self, plan: DenseTilePlan, binding: DenseTileBinding) -> bytes:
         """Bind every matrix primitive, keeping activation slots at SDK-sized offsets.
@@ -125,16 +193,18 @@ class DenseSdkTiler:
         if binding != bind_dense_tiles(plan):
             raise ValueError("Dense SDK tiling binding differs from its SSA tile plan")
         shapes = tuple(shape for shape in binding.matmul_shapes if shape is not None and plan.rows)
-        self.reference_record = self.reference.query(shapes) if self.reference is not None and shapes else None
+        self._query_reference(shapes)
         results = iter(self.reference_record["results"] if self.reference_record is not None else ())
         blocks, reasons = [], []
-        for shape in binding.matmul_shapes:
+        for index, shape in enumerate(binding.matmul_shapes):
             block = ctypes.create_string_buffer(self.tiling_bytes)
             access, reason = bytes(ACCESS.size), "no_matrix"
             if shape is not None and plan.rows:
                 rows, columns, contracted, transpose = shape
                 tile_rows = min(rows, plan.policy.rows_per_tile)
-                status = self.generate(self.soc.encode(), rows, tile_rows, columns, contracted, int(transpose),
+                tile_columns = min(columns, column_partition(plan.dense, index, plan.policy)[0])
+                status = self.generate(self.soc.encode(), rows, tile_rows, columns, tile_columns,
+                                       contracted, int(transpose),
                                        block, self.tiling_bytes)
                 if status != 0:
                     raise ValueError(f"Dense SDK matrix tiling failed for {shape}: status={status}")
@@ -160,4 +230,5 @@ class DenseSdkTiler:
                 "tiling_bytes": self.tiling_bytes, "config_sha256": hashlib.sha256(binding.config).hexdigest(),
                 "access_bytes": ACCESS.size, "bank_stride_bytes": self.tiling_bytes + ACCESS.size,
                 "reference": self.reference_record, "access_reasons": self.access_reasons,
+                "partition_hints": self.partition_hints,
                 "bank_sha256": hashlib.sha256(bank).hexdigest()}

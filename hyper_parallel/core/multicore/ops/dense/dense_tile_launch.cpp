@@ -54,9 +54,9 @@ static_assert(sizeof(KernelArguments) == 8 * sizeof(void *), "Dense standalone l
 
 void CheckMetadata(const at::Tensor &config, const at::Tensor &tilings, const at::Tensor &events,
                    const at::Tensor &ones, const at::Tensor &workspace, const at::Tensor &overflow) {
-  TORCH_CHECK(config.scalar_type() == at::kByte && config.numel() >= 68 && (config.numel() - 32) % 36 == 0 &&
+  TORCH_CHECK(config.scalar_type() == at::kByte && config.numel() >= 76 && (config.numel() - 32) % 44 == 0 &&
                 tilings.scalar_type() == at::kByte &&
-                tilings.numel() == (config.numel() - 32) / 36 * HP_DENSE_BANK_STRIDE,
+                tilings.numel() == (config.numel() - 32) / 44 * HP_DENSE_BANK_STRIDE,
               "Invalid dense task/tiling storage");
   TORCH_CHECK(
     events.scalar_type() == at::kInt && events.numel() % 32 == 0 && ones.scalar_type() == at::kInt && ones.numel() == 8,

@@ -37,7 +37,7 @@ target_include_directories(hyper_parallel_dense_tiling PRIVATE
 target_link_directories(hyper_parallel_dense_tiling PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/lib64)
 target_link_libraries(hyper_parallel_dense_tiling PRIVATE
-    tiling_api platform register)
+    tiling_api platform register unified_dlog c_sec)
 
 # SDK 的编译平台接口使用旧版 libstdc++ ABI，单独隔离于 Torch 启动器。
 add_library(hyper_parallel_dense_reference SHARED

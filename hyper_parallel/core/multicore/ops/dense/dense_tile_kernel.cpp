@@ -163,8 +163,15 @@ class DenseTileWorker {
           continue;
         }
 #endif
-        for (uint32_t tile = base + cube; tile < tiles && tile < base + window; tile += header_.cube_workers) {
-          Execute(operation, index, tile);
+        if (operation.columns_per_tile == 0 || operation.column_tiles == 0 ||
+            operation.column_tiles !=
+              (operation.columns + operation.columns_per_tile - 1) / operation.columns_per_tile) {
+          Trap();
+        }
+        const uint32_t stop = tiles < base + window ? tiles : base + window;
+        for (uint32_t slice = base * operation.column_tiles + cube; slice < stop * operation.column_tiles;
+             slice += header_.cube_workers) {
+          Execute(operation, index, slice / operation.column_tiles, slice % operation.column_tiles);
         }
       }
     }
@@ -223,15 +230,19 @@ class DenseTileWorker {
     pipe.Destroy();
   }
 
-  __aicore__ inline void Execute(const DenseTileOperation &operation, uint32_t index, uint32_t tile) {
+  __aicore__ inline void Execute(const DenseTileOperation &operation, uint32_t index, uint32_t tile,
+                                 uint32_t column_tile) {
     if (operation.dependency >= 0) {
       Wait(tile * header_.operation_count + operation.dependency, operation.dependency_count);
     }
     uint32_t first = tile * header_.rows_per_tile;
     uint32_t end = first + header_.rows_per_tile;
     end = end > header_.rows ? header_.rows : end;
+    const uint32_t column = column_tile * operation.columns_per_tile;
+    const uint32_t column_stop = column + operation.columns_per_tile;
+    const uint32_t column_end = column_stop < operation.columns ? column_stop : operation.columns;
 #ifdef __DAV_C220_CUBE__
-    Matmul(operation, index, first, end - first);
+    Matmul(operation, index, first, end - first, column, column_end);
 #else
     const uint32_t middle = first + (end - first + 1) / 2;
     if (GetBlockIdx() % 2 == 0) {
@@ -239,13 +250,14 @@ class DenseTileWorker {
     } else {
       first = middle;
     }
-    Swiglu(operation, first, end);
+    Swiglu(operation, first, end, column, column_end);
 #endif
     Signal(tile * header_.operation_count + index);
   }
 
 #ifdef __DAV_C220_CUBE__
-  __aicore__ inline void Matmul(const DenseTileOperation &operation, uint32_t index, uint32_t first, uint32_t rows) {
+  __aicore__ inline void Matmul(const DenseTileOperation &operation, uint32_t index, uint32_t first, uint32_t rows,
+                                uint32_t first_column, uint32_t end_column) {
     GM_ADDR source = tilings_ + index * (sizeof(TCubeTiling) + sizeof(DenseMatrixAccess));
     auto tiling = LoadDescriptor(reinterpret_cast<const __gm__ TCubeTiling *>(source));
     const auto access =
@@ -253,21 +265,23 @@ class DenseTileWorker {
     const uint32_t extent = access.m_extent >= access.n_extent ? access.m_extent : access.n_extent;
     if (access.k_chunk == 0 || access.close_shift != 0 || operation.transpose_right != 0 || extent < 4 ||
         extent / 2 > operation.contracted / access.k_chunk) {
-      MatmulSegment<DenseMatmul>(operation, source, tiling, first, rows, 0, operation.columns, 0);
+      MatmulSegment<DenseMatmul>(operation, source, tiling, first, rows, first_column,
+                                 end_column - first_column, 0);
       return;
     }
     // 分段继承原来的行任务及事件归属，仅在 SDK 访问顺序改变的位置切开矩阵。
     const bool row_axis = access.m_extent >= access.n_extent;
     for (uint32_t row = first; row < first + rows;) {
       const uint32_t row_end = row_axis ? MatrixSegmentEnd(row, access.m_span, first + rows) : first + rows;
-      for (uint32_t column = 0; column < operation.columns;) {
+      for (uint32_t column = first_column; column < end_column;) {
         const uint32_t column_end =
-          row_axis ? operation.columns : MatrixSegmentEnd(column, access.n_span, operation.columns);
+          row_axis ? end_column : MatrixSegmentEnd(column, access.n_span, end_column);
         const uint64_t state = MatrixKState(access, header_.rows, operation.columns, operation.contracted, row, column);
         if (state == 0) {
           MatmulSegment<DenseMatmul>(operation, source, tiling, row, row_end - row, column, column_end - column, 0);
         } else {
-          MatmulSegment<OrderedMatmul>(operation, source, tiling, row, row_end - row, column, column_end - column, state);
+          MatmulSegment<OrderedMatmul>(operation, source, tiling, row, row_end - row, column,
+                                       column_end - column, state);
         }
         column = column_end;
       }
@@ -292,12 +306,15 @@ class DenseTileWorker {
     mm.SetUserDefInfo(reinterpret_cast<uint64_t>(source));
     mm.SetSelfDefineData(state);
     mm.SetTensorA(left[static_cast<uint64_t>(first) * operation.contracted]);
-    mm.SetTensorB(right[column], operation.transpose_right != 0);
+    const uint64_t right_offset = operation.transpose_right ? static_cast<uint64_t>(column) * operation.contracted
+                                                            : column;
+    mm.SetTensorB(right[right_offset], operation.transpose_right != 0);
     mm.IterateAll(output[static_cast<uint64_t>(first) * operation.columns + column]);
     mm.End();
   }
 #else
-  __aicore__ inline void Swiglu(const DenseTileOperation &operation, uint32_t first, uint32_t end) {
+  __aicore__ inline void Swiglu(const DenseTileOperation &operation, uint32_t first, uint32_t end,
+                                uint32_t column_begin, uint32_t column_end) {
     TPipe pipe;
     TQue<TPosition::VECIN, 1> gate_queue, up_queue;
     TQue<TPosition::VECOUT, 1> output_queue;
@@ -312,8 +329,8 @@ class DenseTileWorker {
     packed.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(values_[operation.left]));
     output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(values_[operation.output]));
     for (uint32_t row = first; row < end; ++row) {
-      for (uint32_t column = 0; column < operation.columns; column += VECTOR_CHUNK) {
-        const uint32_t remaining = operation.columns - column;
+      for (uint32_t column = column_begin; column < column_end; column += VECTOR_CHUNK) {
+        const uint32_t remaining = column_end - column;
         const uint32_t size = remaining < VECTOR_CHUNK ? remaining : VECTOR_CHUNK;
         auto gate = gate_queue.AllocTensor<bfloat16_t>();
         auto up = up_queue.AllocTensor<bfloat16_t>();

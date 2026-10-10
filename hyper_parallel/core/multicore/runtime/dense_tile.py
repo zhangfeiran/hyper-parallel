@@ -40,14 +40,6 @@ from hyper_parallel.core.multicore.runtime.dense_scratch import shared_dense_scr
 _LOADED: dict[str, str] = {}
 
 
-def _default_policy(plan, hardware_workers):
-    row_inputs = [value for value in plan.ir.inputs if value.name == "x"]
-    if len(row_inputs) != 1:
-        raise ValueError("Dense row input must identify exactly one semantic tensor parameter")
-    rows = dict(plan.value_types)[row_inputs[0].id].shape[0]
-    return DenseTilePolicy(cube_workers=min(24, hardware_workers, max(1, (rows + 63) // 64)))
-
-
 def _load(manifest, identity):
     data = verify_dense_tile_payload(manifest, identity)
     library = (manifest.parent / data["library"]).resolve()
@@ -95,7 +87,7 @@ class ResidentDenseExecutable(DenseExecutable):
         tiler.reference = DenseReferenceTiler(cann_root, manifest.parent / data["reference_library"], soc,
                                              tiler.cube_workers, torch.are_deterministic_algorithms_enabled())
         if policy is None:
-            policy = _default_policy(plan, tiler.cube_workers)
+            policy = tiler.recommended_policy(plan)
         self.tile_plan = compile_dense_tiles(plan, policy)
         simulate_dense_tiles(self.tile_plan)
         self.binding = bind_dense_tiles(self.tile_plan)

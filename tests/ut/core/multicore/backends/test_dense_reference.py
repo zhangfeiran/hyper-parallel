@@ -216,8 +216,11 @@ class TestDenseReference(unittest.TestCase):
         tiler = DenseSdkTiler.__new__(DenseSdkTiler)
         tiler.soc, tiler.cube_workers, tiler.tiling_bytes, tiler.workspace_bytes = "test-target", 20, 200, 8
         tiler.reference = SimpleNamespace(query=lambda shapes: record)
+        tiler.reference_shapes = ()
+        tiler.reference_record = None
+        tiler.partition_hints = ()
 
-        def _generate(_soc, _rows, _tile, _columns, _contracted, _transpose, block, capacity):
+        def _generate(_soc, _rows, _tile, _columns, _tile_columns, _contracted, _transpose, block, capacity):
             block.raw = bytes([7]) * capacity
             return 0
 
@@ -255,3 +258,36 @@ class TestDenseReference(unittest.TestCase):
         self.assertTrue(loaded[0].endswith("/libophost_comm_legacy.so"))
         self.assertEqual(loaded[1], "/cache/reference.so")
         self.assertEqual(len(libraries), 5)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_sdk_recommendation_aligns_native_reduction_and_reuses_query(self):
+        """Feature: 默认二维分区。
+        Description: SDK 建议两个不同的行高，V2 原生分区另有收缩顺序边界。
+        Expectation: 共同分区保持 V2 的行边界，充分使用核数，后续 bank 复用已验证的查询。
+        """
+        dense = dense_ffn.plan(DenseSpec({"T": 1024, "H": 1024, "PackedI": 8192, "I": 4096}),
+                               intermediate_size=4096)
+        record = {"results": [self.fixture[2], self.fixture[0]]}
+        query = Mock(return_value=record)
+        tiler = DenseSdkTiler.__new__(DenseSdkTiler)
+        tiler.soc, tiler.cube_workers, tiler.tiling_bytes, tiler.workspace_bytes = "test-target", 20, 200, 8
+        tiler.reference = SimpleNamespace(query=query)
+        tiler.reference_shapes, tiler.reference_record, tiler.partition_hints = (), None, ()
+
+        def _partition(_soc, _rows, columns, _contracted, _transpose, row_ptr, column_ptr):
+            row_ptr._obj.value = 256 if columns == 8192 else 205
+            column_ptr._obj.value = 1639 if columns == 8192 else 256
+            return 0
+
+        def _generate(_soc, _rows, _height, _columns, _width, _contracted, _transpose, block, capacity):
+            block.raw = bytes(capacity)
+            return 0
+
+        tiler.partition, tiler.generate = _partition, _generate
+        policy = tiler.recommended_policy(dense)
+        self.assertEqual((policy.rows_per_tile, policy.cube_workers, policy.column_workers), (224, 20, 4))
+        plan = compile_dense_tiles(dense, policy)
+        bank = tiler.bank(plan, bind_dense_tiles(plan))
+        self.assertEqual(len(bank), 672)
+        query.assert_called_once_with(((1024, 8192, 1024, False), (1024, 1024, 4096, False)))
+        self.assertEqual(tiler.partition_hints[1]["rows"], 224)

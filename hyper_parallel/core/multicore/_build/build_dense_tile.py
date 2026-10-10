@@ -44,7 +44,7 @@ SOURCES = ("ops/dense/dense_tile_abi.h", "ops/dense/dense_tile_kernel.cpp", "ops
 SOURCES += ("ops/dense/dense_access.h", "ops/dense/dense_reference_tiling.cpp", "backends/dense_reference.py",
             "_build/query_dense_reference.py")
 SDK_LIBRARIES = ("libtiling_api.a", "libplatform.so", "libregister.so", "libascendc_runtime.a",
-                 "libascendcl.so", "libruntime.so")
+                 "libascendcl.so", "libruntime.so", "libunified_dlog.so", "libc_sec.so")
 SDK_VERSIONS = ("runtime", "bisheng-compiler", "asc-devkit", "metadef")
 REFERENCE_SDK_SOURCES = (
     "python/site-packages/tbe/dsl/static_schedule/gemm_integrated_schedule.py",

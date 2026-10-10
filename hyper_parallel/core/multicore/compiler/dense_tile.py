@@ -26,18 +26,19 @@ from hyper_parallel.core.multicore.runtime.dense import DenseKernelPlan
 
 @dataclass(frozen=True)
 class DenseTilePolicy:
-    """Static row partitioning without expert topology or invocation addresses."""
+    """按行和输出列静态分区，不依赖专家拓扑或本次调用的地址。"""
 
     row_input: str = "x"
     rows_per_tile: int = 64
     cube_workers: int = 24
     prefetch_tiles: int = 2
+    column_workers: int = 1
 
     def __post_init__(self) -> None:
-        sizes = (self.rows_per_tile, self.cube_workers, self.prefetch_tiles)
+        sizes = (self.rows_per_tile, self.cube_workers, self.prefetch_tiles, self.column_workers)
         if any(type(size) not in (int,) or size <= 0 for size in sizes):
             raise ValueError("Dense tile sizes and worker counts must be positive integers")
-        if self.cube_workers > 24 or self.prefetch_tiles > 8:
+        if self.cube_workers > 24 or self.prefetch_tiles > 8 or self.column_workers > 24:
             raise ValueError("Dense tile policy exceeds Ascend910B worker/prefetch bounds")
 
 
@@ -51,6 +52,9 @@ class DenseTileTask:
     worker: int
     row_begin: int
     row_end: int
+    column_begin: int
+    column_end: int
+    column_tile: int
     dependencies: tuple[tuple[int, int], ...]
     trigger: int
 
@@ -75,7 +79,7 @@ class DenseTilePlan:
         for worker, tasks in queues.items():
             result[worker] = tuple(sorted(tasks, key=lambda task: (
                 task.tile // (self.policy.cube_workers * self.policy.prefetch_tiles),
-                task.operation, task.tile)))
+                task.operation, task.tile, task.column_tile)))
         return result
 
     def export_manifest(self) -> dict[str, object]:
@@ -123,11 +127,11 @@ def _tiled_values(plan, policy):
 
 
 def compile_dense_tiles(plan: DenseKernelPlan, policy: DenseTilePolicy = DenseTilePolicy()) -> DenseTilePlan:
-    """Expand row-separable SSA into real private worker queues and counted joins.
+    """将可按行分离的 SSA 展开为二维工作队列及整行生产者汇合。
 
     Args:
         plan: Canonical dense primitive DAG.
-        policy: Row input, tile height, cube count and producer-prefetch window.
+        policy: 行输入、tile 高度、Cube 数、预取窗口及目标列分区数。
     """
     rows, values = _tiled_values(plan, policy)
     tasks = []
@@ -139,24 +143,46 @@ def compile_dense_tiles(plan: DenseKernelPlan, policy: DenseTilePolicy = DenseTi
     tiles = (rows + policy.rows_per_tile - 1) // policy.rows_per_tile
     if tiles * count > (2**32 - 1) // 32:
         raise ValueError("Dense tile event offsets exceed their native uint32 boundary")
+    partitions = tuple(column_partition(plan, task.index, policy) for task in plan.tasks)
+    producer_counts = tuple(parts * (2 if task.provider.worker == "vector" else 1)
+                            for task, (_, parts) in zip(plan.tasks, partitions))
     for tile in range(tiles):
         first, end = tile * policy.rows_per_tile, min((tile + 1) * policy.rows_per_tile, rows)
-        cube = tile % policy.cube_workers
         for task in plan.tasks:
             kind = task.provider.worker
             if kind not in ("cube", "vector"):
                 raise ValueError("Dense task requires a known cube/vector worker implementation")
-            joins = tuple((tile * count + producer,
-                           2 if plan.tasks[producer].provider.worker == "vector" else 1)
-                          for producer in task.dependencies)
+            joins = tuple((tile * count + producer, producer_counts[producer]) for producer in task.dependencies)
             trigger = tile * count + task.index
-            if kind == "cube":
-                tasks.append(DenseTileTask(task.index, tile, kind, cube, first, end, joins, trigger))
-            else:
-                middle = first + (end - first + 1) // 2
-                for lane, begin, stop in ((0, first, middle), (1, middle, end)):
-                    tasks.append(DenseTileTask(task.index, tile, kind, cube * 2 + lane, begin, stop, joins, trigger))
+            width, parts = partitions[task.index]
+            output, = plan.ir.operations[task.index].outputs
+            columns = dict(plan.value_types)[output.id].shape[1]
+            for part in range(parts):
+                column_begin, column_end = part * width, min((part + 1) * width, columns)
+                cube = (tile * parts + part) % policy.cube_workers
+                slices = ((cube, first, end),) if kind == "cube" else (
+                    (cube * 2, first, first + (end - first + 1) // 2),
+                    (cube * 2 + 1, first + (end - first + 1) // 2, end))
+                for worker, begin, stop in slices:
+                    tasks.append(DenseTileTask(task.index, tile, kind, worker, begin, stop,
+                                               column_begin, column_end, part, joins, trigger))
     return DenseTilePlan(plan, policy, rows, values, tuple(tasks), tiles * count)
+
+
+def column_partition(plan: DenseKernelPlan, operation: int, policy: DenseTilePolicy) -> tuple[int, int]:
+    """返回输出列片段宽度和实际片段数，保留非对齐尾部。
+
+    Args:
+        plan: 已绑定具体形状的稠密 SSA。
+        operation: 原语索引。
+        policy: 目标列分区数。
+    """
+    output, = plan.ir.operations[operation].outputs
+    columns = dict(plan.value_types)[output.id].shape[1]
+    if policy.column_workers == 1:
+        return columns, 1
+    width = ((columns + policy.column_workers * 16 - 1) // (policy.column_workers * 16)) * 16
+    return width, (columns + width - 1) // width
 
 
 def simulate_dense_tiles(plan: DenseTilePlan) -> tuple[DenseTileTask, ...]:
