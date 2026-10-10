@@ -33,6 +33,7 @@ from torch.utils.checkpoint import checkpoint
 from hyper_parallel import DTensor, Shard, init_device_mesh
 from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.core.expert_parallel import ExpertParallel
+from hyper_parallel.core.expert_parallel.hot_replica import count_kernel, routing
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore._loader import get_multicore_paths
 from hyper_parallel.core.multicore.profiler import mega_kernel_profile
@@ -107,13 +108,27 @@ def _parameters(module):
     return [_local(value) for value in module.parameters()]
 
 
+def _count_evidence(module, values):
+    """Identify the supported count path and its separately built binary outside timing."""
+    if not module.replica_slots_per_rank:
+        return {"route_count_backend": "ordinary_counts"}
+    spec = module._get_execution_resources(values).spec  # pylint: disable=protected-access
+    enabled = ("try_count_payload" in routing._replica_count_payload.__code__.co_names
+               and 1 <= spec.top_k <= 8 and spec.num_experts <= 256
+               and count_kernel._counts_available(values.device))  # pylint: disable=protected-access
+    path = Path(count_kernel.__file__).parent / "_device_kernel" / "libhyper_parallel_replica_counts.so"
+    return {"route_count_backend": "ascend_integer" if enabled else "torch",
+            "route_count_binary": file_identity(path) if path.is_file() else None}
+
+
 def _transport_evidence(module, values, expected):
     if not isinstance(module, MegaMoeExperts):
-        return {"actual_transport": "p2p"}
+        return {"actual_transport": "p2p", "route_count_backend": "native_counts"}
     resources = module._get_execution_resources(values)  # pylint: disable=protected-access
     provider = resources.workspace.replica_provider
     execution_spec = resources.last_execution_plan.spec
     evidence = {"actual_transport": resources.spec.replica_transport,
+                **_count_evidence(module, values),
                 "provider": type(provider).__name__,
                 "kernel_gradients": getattr(provider, "kernel_gradients", False),
                 "adaptive_gradients": getattr(provider, "adaptive_gradients", False),
@@ -290,7 +305,8 @@ def _diagnose(args, layer, inputs, gradient, optimizer, alpha, seed, directory):
     prefix = directory / f"diagnostic-alpha{alpha:g}-seed{seed}"
     with torch_npu.profiler.profile(activities=[torch_npu.profiler.ProfilerActivity.CPU,
                                                 torch_npu.profiler.ProfilerActivity.NPU]) as outer:
-        with mega_kernel_profile(detailed_task_names=True) as internal, HostMeasurements(prefetch_details=True) as host:
+        with (mega_kernel_profile(detailed_task_names=True) as internal,
+              HostMeasurements(prefetch_details=True, count_details=True) as host):
             with torch.profiler.record_function("checkpointed_moe_fwd_bwd"):
                 _step([layer], [inputs], gradient, route, optimizer)
             with torch.profiler.record_function("adamw"):
@@ -348,7 +364,11 @@ def _accept(args, mesh, module, values, gradient, points):
 
 
 def run(args: argparse.Namespace) -> None:
-    """Run a persistent layer sweep, keeping diagnostics outside timing."""
+    """Run a persistent layer sweep, keeping diagnostics outside timing.
+
+    Args:
+        args: Training shape, replica settings, acceptance and diagnostic options.
+    """
     rank, size = dist.get_rank(), dist.get_world_size()
     directory = Path(args.result_dir) / f"rank{rank}"
     directory.mkdir(parents=True, exist_ok=False)

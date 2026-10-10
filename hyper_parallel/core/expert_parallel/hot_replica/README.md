@@ -447,6 +447,18 @@ CPU plan 的派生数据仅缓存在不可变 plan 上；设备元数据和权�
 在 `ExpertParallel` 或 `MegaMoeExperts` 上设置 `replica_planner="device"` 可选择设备规划器，
 默认仍为 `"cpu"`。
 
+共享构建还包含可选的 Ascend 910B 路由计数库 `libhyper_parallel_replica_counts.so`。
+库已安装、输入为 int64、TopK 在 1–8 且逻辑专家数在 1–256 时，
+CPU 和设备规划器之前的路由校验/计数会自动使用两个顺序执行的 AIV 任务。
+分块任务逐行校验范围和重复 ID，生成 int64 partial；归并任务输出原布局的精确 histogram 和校验标志。
+全过程使用整数，保留非法 ID 的 clamp 计数，标志仍随现有 collective 由所有 rank 一致报告。
+
+每次调用独占 partial 和输出存储，所有输入、scratch 和输出均记录当前 stream 的生命周期；
+跨 stream 消费者仍须建立正常的事件依赖。
+未构建、非目标设备、其他 TopK/专家范围使用原 Torch 路径，已存在但 ABI 不匹配的库会明确报错。
+安装可选库后使用新进程运行，以刷新设备能力缓存。
+Native 接收现成的按专家计数，不重建 TopK，也不加载单边通信。
+
 设备求解器实现相同的整数放置策略，包括 `target_load`、`replica_min_rows`、
 满足容量约束的小副本集中，以及保留复制边的再平衡。
 离线校准成本优化要求 CPU 规划器，设备后端会拒绝该选项。
@@ -611,6 +623,9 @@ Profiling 独立构造镜像；B=0 返回原有基础 runtime。
 仅记录 host 时间区间。
 该模式不启用 Torch/内部 profiling，不插入逐阶段设备 event，也不单独同步各区间。
 它报告 runtime 基础/镜像大小及观测到的缓存命中。
+原 Torch 计数路径还细分排序、重复/范围检查、标志归并、clamp、histogram 分配/下发和 payload 拼接。
+这些 wrapper 仅在独立诊断区间启用，正式计时不安装；子区间嵌套，不相加为完整步延迟。
+融合计数保留 `validation_and_counts` 外层区间，在独立 framework trace 中可见两个 AIV 任务。
 
 预取区间还细分为池租约与清零、credit 发布/等待下发、source 连续化、epoch 异步上传、
 copy stream 分叉/汇合、权重/ready put 和 ACK。

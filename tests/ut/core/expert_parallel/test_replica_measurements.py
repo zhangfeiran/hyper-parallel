@@ -22,6 +22,7 @@ from unittest.mock import patch
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import signal_transport
+from hyper_parallel.core.expert_parallel.hot_replica import routing
 from hyper_parallel.core.multicore.modules.mega_moe import function
 from tests.common.mark_utils import arg_mark
 from tests.torch.expert_parallel.hot_replica_measurements import HostMeasurements, _payload_bytes
@@ -30,6 +31,30 @@ from tests.torch.expert_parallel.hot_replica_measurements import HostMeasurement
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestReplicaMeasurements(unittest.TestCase):
     """Pool tensor views must not each claim the whole SHMEM allocation."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_count_observation_preserves_flags_and_adds_no_synchronization(self) -> None:
+        """
+        Feature: Scoped validation/count observation
+        Description: Observe strided invalid and duplicate routes with device events and synchronization forbidden.
+        Expectation: Preserve independent int64 payloads, restore operations, and nest only count subintervals.
+        """
+        ids = torch.tensor([[0, 0], [-1, 4], [1, 3]]).T.contiguous().T
+        sort = torch.Tensor.sort
+        with (patch.object(torch.npu, "Event", side_effect=AssertionError("Unexpected device event")),
+              patch.object(torch.npu, "synchronize", side_effect=AssertionError("Unexpected synchronization"))):
+            with HostMeasurements(device_intervals=False, count_details=True) as host:
+                result = routing._replica_count_payload(ids, 4)
+                with host.span("outside_counts"):
+                    ids.sort()
+        torch.testing.assert_close(result, torch.tensor([3, 1, 0, 2, 1], dtype=torch.int64))
+        self.assertIs(torch.Tensor.sort, sort)
+        children = [record for record in host.records if record["stage"].startswith("count_")]
+        self.assertTrue(children)
+        self.assertTrue(all(record["parent"] == "validation_and_counts" for record in children))
+        self.assertTrue(all("stream_interval_ms" not in record for record in host.records))
+        self.assertEqual(sum(record["stage"] == "count_topk_sort" for record in children), 1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
@@ -50,8 +75,14 @@ class TestReplicaMeasurements(unittest.TestCase):
         self.assertNotIn("stream_interval_ms", host.records[0])
         self.assertNotIn("events", host.records[0])
 
-    def test_shared_weight_gradient_backing_and_padding(self):
-        """Count BF16/FP32 payload independently of common padded storage."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_shared_weight_gradient_backing_and_padding(self) -> None:
+        """
+        Feature: Shared storage accounting
+        Description: Count BF16 weights and FP32 gradients sharing padded backing storage.
+        Expectation: Report tensor payload bytes independently from the full shared storage.
+        """
         backing = torch.empty(128, dtype=torch.uint8)
         weights = (backing[:16].view(torch.bfloat16), backing[16:32].view(torch.bfloat16))
         gradients = (backing[32:64].view(torch.float32), backing[64:96].view(torch.float32))
@@ -60,8 +91,14 @@ class TestReplicaMeasurements(unittest.TestCase):
         self.assertEqual(_payload_bytes(gradients), 64)
         self.assertEqual(_payload_bytes(weights + gradients), 96)
 
-    def test_duplicate_tensor_views_are_not_counted_twice(self):
-        """Repeated references count once while disjoint projections both count."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_duplicate_tensor_views_are_not_counted_twice(self) -> None:
+        """
+        Feature: Repeated tensor view accounting
+        Description: Count duplicate and disjoint slices from one tensor's backing storage.
+        Expectation: Count repeated slices once while retaining disjoint payloads.
+        """
         values = torch.empty(24, dtype=torch.float32)
         self.assertEqual(_payload_bytes((values[:8], values[:8], values[8:16])), 64)
         self.assertEqual(_payload_bytes(()), 0)

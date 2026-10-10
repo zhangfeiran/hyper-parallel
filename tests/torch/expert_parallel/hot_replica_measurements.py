@@ -32,16 +32,19 @@ from hyper_parallel.core.expert_parallel.hot_replica.device import DeviceExpertE
 from hyper_parallel.core.expert_parallel.hot_replica.pool import replica_pool
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.modules.mega_moe import function
+from tests.torch.expert_parallel.hot_replica_counts import CountMeasurements
 from tests.torch.expert_parallel.hot_replica_prefetch import PrefetchMeasurements
 
 
 class HostMeasurements:
     """Measure inclusive host spans and stream intervals in a diagnostic invocation."""
 
-    def __init__(self, *, device_intervals: bool = True, prefetch_details: bool = False) -> None:
+    def __init__(self, *, device_intervals: bool = True, prefetch_details: bool = False,
+                 count_details: bool = False) -> None:
         """Optionally omit device events for a lightweight host-only observation."""
         self.device_intervals = device_intervals
         self.prefetch_details = prefetch_details
+        self.count_details = count_details
         self.records = []
         self.stack = []
         self.patches = ExitStack()
@@ -139,6 +142,8 @@ class HostMeasurements:
         self.patches.enter_context(patch.object(function, "prefetch_weights", _prefetch))
         if self.prefetch_details:
             PrefetchMeasurements(self).install(self.patches)
+        if self.count_details:
+            CountMeasurements(self).install(self.patches)
         return self
 
     def __exit__(self, *args: Any) -> None:

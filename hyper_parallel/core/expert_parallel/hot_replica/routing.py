@@ -24,6 +24,7 @@ import torch.distributed as dist
 
 from .capacity import ExpertReplicaConfig
 from .cost import ExpertReplicaCostModel
+from .count_kernel import try_count_payload
 from .device import DeviceExpertExecutionPlan, ReplicaPlanSummary, build_device_expert_replica_plan
 from .device import validate_planner_backend
 from .plan import ExpertExecutionPlan
@@ -49,6 +50,13 @@ def stable_expert_order(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
 
     FP32 represents every expert ID exactly below 2**24. Token indices are never
     converted to floating point, so large token batches keep exact inverses.
+
+    Args:
+        ids: Logical expert IDs to order stably.
+        num_experts: Logical expert count determining the exact sorting key dtype.
+
+    Returns:
+        Integer permutation preserving the order of equal expert IDs.
     """
     keys = ids.float() if num_experts <= 2**24 else ids
     return torch.argsort(keys, stable=True)
@@ -97,6 +105,9 @@ def _gather_replica_counts(payload: torch.Tensor, size: int, group: object) -> t
 
 def _replica_count_payload(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
     """Keep route validation and logical counts in one collective payload."""
+    fused = try_count_payload(ids, num_experts)
+    if fused is not None:
+        return fused
     ordered = (ids.float() if num_experts <= 2**24 else ids).sort(dim=1).values
     invalid = ((ids < 0) | (ids >= num_experts)).any()
     invalid = invalid | (ordered[:, 1:] == ordered[:, :-1]).any()

@@ -19,19 +19,32 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CANN $ENV{ASCEND_HOME_PATH})
 if(NOT EXISTS "${CANN}/include/acl/acl.h")
-  message(FATAL_ERROR "Source the CANN set_env.sh before building the replica planner")
+  message(FATAL_ERROR
+    "Source the CANN set_env.sh before building the replica planner")
 endif()
 add_library(kernel OBJECT kernel.cpp)
-target_include_directories(kernel PRIVATE ${CANN}/compiler/tikcpp ${CANN}/compiler/tikcpp/tikcfw
-  ${CANN}/compiler/tikcpp/tikcfw/impl ${CANN}/compiler/tikcpp/tikcfw/interface
-  ${CANN}/include ${CANN}/include/experiment/runtime)
-target_compile_options(kernel PRIVATE -O2 -xcce --cce-aicore-arch=dav-c220-vec
-  -Wno-macro-redefined -Wno-ignored-attributes -DL2_CACHE_HINT -DTILING_KEY_VAR
-  "SHELL:-mllvm -cce-aicore-stack-size=0x8000" "SHELL:-mllvm -cce-aicore-function-stack-size=0x8000"
-  "SHELL:-mllvm -cce-aicore-addr-transform" "SHELL:-mllvm -cce-aicore-dcci-insert-for-scalar=false")
+add_library(count_kernel OBJECT count_kernel.cpp)
+foreach(target kernel count_kernel)
+  target_include_directories(${target} PRIVATE
+    ${CANN}/compiler/tikcpp
+    ${CANN}/compiler/tikcpp/tikcfw
+    ${CANN}/compiler/tikcpp/tikcfw/impl
+    ${CANN}/compiler/tikcpp/tikcfw/interface
+    ${CANN}/include ${CANN}/include/experiment/runtime)
+  target_compile_options(${target} PRIVATE
+    -O2 -xcce --cce-aicore-arch=dav-c220-vec
+    -Wno-macro-redefined -Wno-ignored-attributes
+    -DL2_CACHE_HINT -DTILING_KEY_VAR
+    "SHELL:-mllvm -cce-aicore-stack-size=0x8000"
+    "SHELL:-mllvm -cce-aicore-function-stack-size=0x8000"
+    "SHELL:-mllvm -cce-aicore-addr-transform"
+    "SHELL:-mllvm -cce-aicore-dcci-insert-for-scalar=false")
+endforeach()
 add_library(hyper_parallel_replica_planner SHARED $<TARGET_OBJECTS:kernel>)
-target_link_options(hyper_parallel_replica_planner PRIVATE --cce-fatobj-link)
-target_link_directories(hyper_parallel_replica_planner PRIVATE ${CANN}/lib64)
-target_link_libraries(hyper_parallel_replica_planner PRIVATE runtime ascendcl stdc++ m dl)
-
-install(TARGETS hyper_parallel_replica_planner LIBRARY DESTINATION .)
+add_library(hyper_parallel_replica_counts SHARED $<TARGET_OBJECTS:count_kernel>)
+foreach(target hyper_parallel_replica_planner hyper_parallel_replica_counts)
+  target_link_options(${target} PRIVATE --cce-fatobj-link)
+  target_link_directories(${target} PRIVATE ${CANN}/lib64)
+  target_link_libraries(${target} PRIVATE runtime ascendcl stdc++ m dl)
+  install(TARGETS ${target} LIBRARY DESTINATION .)
+endforeach()
