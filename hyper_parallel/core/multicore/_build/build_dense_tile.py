@@ -34,14 +34,28 @@ import torch
 from torch.utils.cpp_extension import load
 
 from hyper_parallel.core.multicore._build.build_dense import dense_build_identity
+from hyper_parallel.core.multicore.backends.dense_reference import ACCESS
+from hyper_parallel.core.multicore.backends.dense_tile import DenseSdkTiler
 
 CORE = Path(__file__).resolve().parents[1]
 SOURCES = ("ops/dense/dense_tile_abi.h", "ops/dense/dense_tile_kernel.cpp", "ops/dense/dense_tile_tiling.cpp",
            "ops/dense/dense_tile_launch.cpp", "_build/dense_tile/CMakeLists.txt", "_build/build_dense_tile.py",
            "compiler/dense_tile.py", "backends/dense_tile.py", "runtime/dense_tile.py", "runtime/dense_scratch.py")
+SOURCES += ("ops/dense/dense_access.h", "ops/dense/dense_reference_tiling.cpp", "backends/dense_reference.py",
+            "_build/query_dense_reference.py")
 SDK_LIBRARIES = ("libtiling_api.a", "libplatform.so", "libregister.so", "libascendc_runtime.a",
                  "libascendcl.so", "libruntime.so")
 SDK_VERSIONS = ("runtime", "bisheng-compiler", "asc-devkit", "metadef")
+REFERENCE_SDK_SOURCES = (
+    "python/site-packages/tbe/dsl/static_schedule/gemm_integrated_schedule.py",
+    "python/site-packages/tbe/dsl/static_schedule/gemm_integrated_schedule_util.py",
+    "python/site-packages/tbe/dsl/unify_schedule/gemm_tilingcase.py",
+    "python/site-packages/tbe/dsl/unify_schedule/cube_tilingcase.py",
+    "opp/built-in/op_impl/ai_core/tbe/kernel/ascend910b/ops_legacy/mat_mul/"
+    "MatMulV2_ND_ND_FP16_FP16_false_false_all.json",
+    "opp/built-in/op_impl/ai_core/tbe/kernel/ascend910b/ops_legacy/mat_mul/"
+    "MatMulV2_ND_ND_FP16_FP16_false_true_all.json",
+)
 
 
 def _hash(path):
@@ -83,16 +97,22 @@ def dense_tile_build_identity(cann_root: Path, soc: str) -> dict[str, object]:
             if path.is_file() and path.suffix in (".h", ".hpp", ".cpp", ".c", ".py", ".cmake", ".sh", ".txt"):
                 sdk_sources[str(path.relative_to(cann_root))] = _hash(path)
     versions = {}
+    for name in REFERENCE_SDK_SOURCES:
+        sdk_sources[name] = _hash(cann_root / name)
     for name in SDK_VERSIONS:
         path = cann_root / "share/info" / name / "version.info"
         if path.exists():
             versions[name] = path.read_text(encoding="utf-8")
     compiler = cann_root / f"{arch}-linux/ccec_compiler/bin/bisheng"
     npu = _npu_package()
+    libraries = {name: _hash(cann_root / "lib64" / name) for name in SDK_LIBRARIES}
+    for name in (f"op_tiling/lib/linux/{arch}/liboptiling.so", f"op_host/lib/linux/{arch}/libophost_legacy.so",
+                 f"op_host/lib/linux/{arch}/libophost_comm_legacy.so"):
+        relative = "opp/built-in/op_impl/ai_core/tbe/" + name
+        libraries[relative] = _hash(cann_root / relative)
     return {"format_version": 1, "soc": soc, "architecture": arch, "cann_root": str(cann_root),
             "sources": {name: _hash(CORE / name) for name in SOURCES}, "sdk_sources": sdk_sources,
-            "sdk_versions": versions, "sdk_libraries": {name: _hash(cann_root / "lib64" / name)
-                                                          for name in SDK_LIBRARIES},
+            "sdk_versions": versions, "sdk_libraries": libraries,
             "device_compiler": {"path": str(compiler), "sha256": _hash(compiler)},
             "torch_npu": importlib.metadata.version("torch-npu"),
             "torch_npu_library_sha256": _hash(npu / "lib/libtorch_npu.so"), "host": dense_build_identity(),
@@ -118,7 +138,7 @@ def verify_dense_tile_payload(manifest: Path, identity: dict[str, object]) -> di
         path = (manifest.parent / name).resolve()
         if not path.is_relative_to(manifest.parent) or _hash(path) != digest:
             raise ValueError("Resident dense artifact path or integrity mismatch")
-    required = {record["library"], record["tiling_library"], record["binary"]}
+    required = {record["library"], record["tiling_library"], record["reference_library"], record["binary"]}
     if not required.issubset(record["files"]):
         raise ValueError("Resident dense manifest omits a required native artifact")
     return record
@@ -165,6 +185,10 @@ def _build_payload(cann_root, directory, identity):
     build = _build_sdk(cann_root, directory, soc)
     archive = build / "lib/libhyper_parallel_dense_tile.a"
     binary = _extract_binary(archive, directory, soc)
+    tiler = build / "libhyper_parallel_dense_tiling.so"
+    tiling_bytes = DenseSdkTiler(tiler, soc).tiling_bytes
+    with (directory / "dense_tile_binary.inc").open("a", encoding="utf-8") as stream:
+        stream.write(f"constexpr uint32_t HP_DENSE_BANK_STRIDE = {tiling_bytes + ACCESS.size};\n")
     npu = _npu_package()
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     namespace = "hp_dense_tile_" + key[:24]
@@ -178,11 +202,12 @@ def _build_payload(cann_root, directory, identity):
     schema = getattr(torch.ops, namespace).launch.default._schema
     if schema.arguments[0].alias_info is not None or not schema.arguments[1].alias_info.is_write:
         raise ValueError("Resident dense native schema must preserve read-only inputs and declare output writes")
-    tiler = build / "libhyper_parallel_dense_tiling.so"
-    artifacts = (library, tiler, binary, archive, directory / "dense_tile_binary.inc")
+    reference = build / "libhyper_parallel_dense_reference.so"
+    artifacts = (library, tiler, reference, binary, archive, directory / "dense_tile_binary.inc")
     return {"format_version": 1, "execution_mode": "resident_dense_tile_candidate", "device_status": "unvalidated",
             "identity": identity, "namespace": namespace, "library": str(library.relative_to(directory)),
             "tiling_library": str(tiler.relative_to(directory)), "binary": str(binary.relative_to(directory)),
+            "reference_library": str(reference.relative_to(directory)),
             "files": {str(path.relative_to(directory)): _hash(path) for path in artifacts}}
 
 

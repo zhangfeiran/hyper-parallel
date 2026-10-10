@@ -40,12 +40,13 @@ from tests.common.mark_utils import arg_mark
 def _record(root):
     identity = {"sources": "synthetic-source", "soc": "synthetic-target"}
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-    files = {name: b"synthetic-artifact-" + name.encode() for name in ("launch.so", "tiling.so", "dense.bin")}
+    files = {name: b"synthetic-artifact-" + name.encode()
+             for name in ("launch.so", "tiling.so", "reference.so", "dense.bin")}
     for name, value in files.items():
         (root / name).write_bytes(value)
     record = {"format_version": 1, "execution_mode": "resident_dense_tile_candidate", "identity": identity,
               "namespace": "hp_dense_tile_" + key[:24], "library": "launch.so", "tiling_library": "tiling.so",
-              "binary": "dense.bin",
+              "binary": "dense.bin", "reference_library": "reference.so",
               "files": {name: hashlib.sha256(value).hexdigest() for name, value in files.items()}}
     manifest = root / "manifest.json"
     manifest.write_text(json.dumps(record), encoding="utf-8")
@@ -97,7 +98,7 @@ class TestDenseTilePayload(unittest.TestCase):
         Description: Change source identity, artifact bytes, namespace or mode in a synthetic manifest.
         Expectation: Only an intact, fully sealed payload is accepted, without loading a library.
         """
-        for failure in ("source", "library", "namespace", "mode", "omitted"):
+        for failure in ("source", "library", "namespace", "mode", "omitted", "reference"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 manifest, identity, record = _record(root)
@@ -110,8 +111,10 @@ class TestDenseTilePayload(unittest.TestCase):
                     record["namespace"] = "unowned"
                 elif failure == "mode":
                     record["execution_mode"] = "native_host_stream_adapter"
-                else:
+                elif failure == "omitted":
                     record["files"].pop("dense.bin")
+                else:
+                    record["files"].pop("reference.so")
                 manifest.write_text(json.dumps(record), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "identity|integrity|required"):
                     verify_dense_tile_payload(manifest, identity)

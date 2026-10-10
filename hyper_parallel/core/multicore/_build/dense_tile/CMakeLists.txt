@@ -38,3 +38,16 @@ target_link_directories(hyper_parallel_dense_tiling PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/lib64)
 target_link_libraries(hyper_parallel_dense_tiling PRIVATE
     tiling_api platform register)
+
+# SDK 的编译平台接口使用旧版 libstdc++ ABI，单独隔离于 Torch 启动器。
+add_library(hyper_parallel_dense_reference SHARED
+    ${HP_DENSE_SOURCE_ROOT}/dense_reference_tiling.cpp)
+target_compile_definitions(hyper_parallel_dense_reference PRIVATE
+    _GLIBCXX_USE_CXX11_ABI=0)
+target_include_directories(hyper_parallel_dense_reference PRIVATE
+    ${ASCEND_CANN_PACKAGE_PATH}/include)
+target_link_directories(hyper_parallel_dense_reference PRIVATE
+    ${ASCEND_CANN_PACKAGE_PATH}/lib64)
+target_link_libraries(hyper_parallel_dense_reference PRIVATE platform
+    "${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/ai_core/tbe/op_host/lib/linux/${CMAKE_SYSTEM_PROCESSOR}/libophost_comm_legacy.so")
+target_link_options(hyper_parallel_dense_reference PRIVATE "-Wl,-z,defs")

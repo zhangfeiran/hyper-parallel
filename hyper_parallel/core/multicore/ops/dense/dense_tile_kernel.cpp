@@ -5,6 +5,7 @@
 #include "asc/include/kernel_operator.h"
 #include "lib/matmul_intf.h"
 #include "dense/dense_tile_abi.h"
+#include "dense/dense_access.h"
 
 using AscendC::Adds;
 using AscendC::CacheLine;
@@ -39,6 +40,10 @@ using HyperParallelDense::DENSE_TILE_MAGIC;
 using HyperParallelDense::DENSE_TILE_VERSION;
 using HyperParallelDense::DenseTileHeader;
 using HyperParallelDense::DenseTileOperation;
+using HyperParallelDense::DenseMatrixAccess;
+using HyperParallelDense::MatrixKOffset;
+using HyperParallelDense::MatrixKState;
+using HyperParallelDense::MatrixSegmentEnd;
 using matmul::Matmul;
 using matmul::MatmulType;
 
@@ -57,6 +62,64 @@ __aicore__ inline Data LoadDescriptor(const __gm__ Data *source) {
   }
   return result;
 }
+
+#ifdef __DAV_C220_CUBE__
+__aicore__ inline void OrderedCopyA(const AscendC::LocalTensor<int8_t> &local, const __gm__ void *gm,
+                                   int row, int column, int use_m, int use_k, uint64_t tiling_ptr,
+                                   uint64_t state) {
+  const auto tiling = LoadDescriptor(reinterpret_cast<const __gm__ TCubeTiling *>(tiling_ptr));
+  GlobalTensor<bfloat16_t> source;
+  source.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(const_cast<__gm__ void *>(gm)));
+  auto target = local.ReinterpretCast<bfloat16_t>();
+  const uint32_t chunk = static_cast<uint32_t>(state);
+  const uint32_t stride = (use_m + 15) / 16 * 16;
+  for (uint32_t done = 0; done < use_k;) {
+    const uint32_t offset = column * tiling.baseK + done;
+    const uint32_t remaining = chunk - offset % chunk;
+    const uint32_t count = use_k - done < remaining ? use_k - done : remaining;
+    AscendC::Nd2NzParams copy{};
+    copy.ndNum = 1;
+    copy.nValue = use_m;
+    copy.dValue = count;
+    copy.srcDValue = tiling.Ka;
+    copy.dstNzC0Stride = stride;
+    copy.dstNzNStride = 1;
+    const uint64_t position = static_cast<uint64_t>(row * tiling.baseM) * tiling.Ka +
+                              MatrixKOffset(offset, tiling.Ka, state);
+    DataCopy(target[done * stride], source[position], copy);
+    done += count;
+  }
+}
+
+__aicore__ inline void OrderedCopyB(const AscendC::LocalTensor<int8_t> &local, const __gm__ void *gm,
+                                   int row, int column, int use_k, int use_n, uint64_t tiling_ptr,
+                                   uint64_t state) {
+  const auto tiling = LoadDescriptor(reinterpret_cast<const __gm__ TCubeTiling *>(tiling_ptr));
+  GlobalTensor<bfloat16_t> source;
+  source.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(const_cast<__gm__ void *>(gm)));
+  auto target = local.ReinterpretCast<bfloat16_t>();
+  const uint32_t chunk = static_cast<uint32_t>(state);
+  for (uint32_t done = 0; done < use_k;) {
+    const uint32_t offset = row * tiling.baseK + done;
+    const uint32_t remaining = chunk - offset % chunk;
+    const uint32_t count = use_k - done < remaining ? use_k - done : remaining;
+    AscendC::Nd2NzParams copy{};
+    copy.ndNum = 1;
+    copy.nValue = count;
+    copy.dValue = use_n;
+    copy.srcDValue = tiling.N;
+    copy.dstNzC0Stride = (use_k + 15) / 16 * 16;
+    copy.dstNzNStride = 1;
+    const uint64_t position = static_cast<uint64_t>(MatrixKOffset(offset, tiling.Ka, state)) * tiling.N +
+                              column * tiling.baseN;
+    DataCopy(target[done * 16], source[position], copy);
+    done += count;
+  }
+}
+
+using OrderedMatmul = Matmul<Matrix, Matrix, Matrix, Matrix, CFG_NORM,
+                             AscendC::MatmulCallBackFunc<nullptr, OrderedCopyA, OrderedCopyB>>;
+#endif
 
 class DenseTileWorker {
  public:
@@ -111,7 +174,7 @@ class DenseTileWorker {
   __aicore__ inline void Wait(uint32_t event, uint32_t count) {
     const uint32_t position = event * DENSE_EVENT_STRIDE;
     const __gm__ volatile int32_t *ready = counters_.GetPhyAddr(position);
-    // Other cores publish asynchronously; each poll must reload the GM value.
+    // 其他核异步发布事件，每次轮询必须重新读取 GM。
     while (true) {
       DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(counters_[position]);
       PipeBarrier<PIPE_ALL>();
@@ -183,24 +246,54 @@ class DenseTileWorker {
 
 #ifdef __DAV_C220_CUBE__
   __aicore__ inline void Matmul(const DenseTileOperation &operation, uint32_t index, uint32_t first, uint32_t rows) {
-    TPipe pipe;
-    TCubeTiling tiling;
-    const __gm__ int32_t *source = reinterpret_cast<const __gm__ int32_t *>(tilings_ + index * sizeof(TCubeTiling));
-    int32_t *target = reinterpret_cast<int32_t *>(&tiling);
-    for (uint32_t word = 0; word < sizeof(TCubeTiling) / sizeof(int32_t); ++word) {
-      target[word] = source[word];
+    GM_ADDR source = tilings_ + index * (sizeof(TCubeTiling) + sizeof(DenseMatrixAccess));
+    auto tiling = LoadDescriptor(reinterpret_cast<const __gm__ TCubeTiling *>(source));
+    const auto access =
+      LoadDescriptor(reinterpret_cast<const __gm__ DenseMatrixAccess *>(source + sizeof(TCubeTiling)));
+    const uint32_t extent = access.m_extent >= access.n_extent ? access.m_extent : access.n_extent;
+    if (access.k_chunk == 0 || access.close_shift != 0 || operation.transpose_right != 0 || extent < 4 ||
+        extent / 2 > operation.contracted / access.k_chunk) {
+      MatmulSegment<DenseMatmul>(operation, source, tiling, first, rows, 0, operation.columns, 0);
+      return;
     }
-    DenseMatmul mm;
+    // 分段继承原来的行任务及事件归属，仅在 SDK 访问顺序改变的位置切开矩阵。
+    const bool row_axis = access.m_extent >= access.n_extent;
+    for (uint32_t row = first; row < first + rows;) {
+      const uint32_t row_end = row_axis ? MatrixSegmentEnd(row, access.m_span, first + rows) : first + rows;
+      for (uint32_t column = 0; column < operation.columns;) {
+        const uint32_t column_end =
+          row_axis ? operation.columns : MatrixSegmentEnd(column, access.n_span, operation.columns);
+        const uint64_t state = MatrixKState(access, header_.rows, operation.columns, operation.contracted, row, column);
+        if (state == 0) {
+          MatmulSegment<DenseMatmul>(operation, source, tiling, row, row_end - row, column, column_end - column, 0);
+        } else {
+          MatmulSegment<OrderedMatmul>(operation, source, tiling, row, row_end - row, column, column_end - column, state);
+        }
+        column = column_end;
+      }
+      row = row_end;
+    }
+  }
+
+  template <typename MatrixKernel>
+  __aicore__ inline void MatmulSegment(const DenseTileOperation &operation, GM_ADDR source, TCubeTiling &tiling,
+                                      uint32_t first, uint32_t rows, uint32_t column, uint32_t columns,
+                                      uint64_t state) {
+    // SDK 只允许一个活动 TPipe；Matmul 在退出作用域时先于所属 pipe 析构。
+    TPipe pipe;
+    MatrixKernel mm;
     REGIST_MATMUL_OBJ(&pipe, workspace_, mm, &tiling);
     GlobalTensor<bfloat16_t> left, right, output;
     left.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(values_[operation.left]));
     right.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(values_[operation.right]));
     output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(values_[operation.output]));
     mm.SetOrgShape(header_.rows, operation.columns, operation.contracted);
-    mm.SetTail(rows, operation.columns, operation.contracted);
+    mm.SetTail(rows, columns, operation.contracted);
+    mm.SetUserDefInfo(reinterpret_cast<uint64_t>(source));
+    mm.SetSelfDefineData(state);
     mm.SetTensorA(left[static_cast<uint64_t>(first) * operation.contracted]);
-    mm.SetTensorB(right, operation.transpose_right != 0);
-    mm.IterateAll(output[static_cast<uint64_t>(first) * operation.columns]);
+    mm.SetTensorB(right[column], operation.transpose_right != 0);
+    mm.IterateAll(output[static_cast<uint64_t>(first) * operation.columns + column]);
     mm.End();
   }
 #else

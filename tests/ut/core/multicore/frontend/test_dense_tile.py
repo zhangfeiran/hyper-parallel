@@ -26,7 +26,7 @@ from torch.nn import functional
 
 import hyper_parallel.core.multicore.frontend as mc
 import hyper_parallel.core.multicore.language as ml
-from hyper_parallel.core.multicore.backends.dense_tile import DenseSdkTiler, HEADER, OPERATION, bind_dense_tiles
+from hyper_parallel.core.multicore.backends.dense_tile import ACCESS, DenseSdkTiler, HEADER, OPERATION, bind_dense_tiles
 from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePolicy, compile_dense_tiles, simulate_dense_tiles
 from hyper_parallel.core.multicore.frontend.examples.dense_ffn import dense_ffn
 from tests.common.mark_utils import arg_mark
@@ -148,7 +148,7 @@ class TestDenseTile(unittest.TestCase):
         Expectation: Compact SSA slots, primitive widths and two-vector joins match golden bytes.
         """
         binding = bind_dense_tiles(_plan(129, hidden=80, intermediate=131, cube_workers=2))
-        golden = struct.pack("<8I", 0x444E5331, 1, 129, 64, 2, 2, 3, 6)
+        golden = struct.pack("<8I", 0x444E5331, 2, 129, 64, 2, 2, 3, 6)
         golden += struct.pack("<7IiI", 0, 0, 1, 3, 262, 80, 0, -1, 1)
         golden += struct.pack("<7IiI", 1, 3, 0, 4, 131, 262, 0, 0, 1)
         golden += struct.pack("<7IiI", 0, 4, 2, 5, 80, 131, 0, 1, 2)
@@ -183,6 +183,7 @@ class TestDenseTile(unittest.TestCase):
         """
         tiler = DenseSdkTiler.__new__(DenseSdkTiler)
         tiler.soc, tiler.cube_workers, tiler.tiling_bytes = "test-target", 2, 200
+        tiler.reference = None
         calls = []
 
         def _generate(_soc, rows, tile, columns, contracted, transpose, block, capacity):
@@ -193,11 +194,12 @@ class TestDenseTile(unittest.TestCase):
         tiler.generate = _generate
         plan = _plan(129, cube_workers=2)
         bank = tiler.bank(plan, bind_dense_tiles(plan))
-        self.assertEqual(len(bank), 600)
-        self.assertEqual(bank[200:400], bytes(200))
+        stride = 200 + ACCESS.size
+        self.assertEqual(len(bank), 3 * stride)
+        self.assertEqual(bank[stride:2 * stride], bytes(stride))
         self.assertEqual(calls, [(129, 64, 12, 8, 0, 200), (129, 64, 8, 6, 0, 200)])
         empty = _plan(0, cube_workers=2)
-        self.assertEqual(tiler.bank(empty, bind_dense_tiles(empty)), bytes(600))
+        self.assertEqual(tiler.bank(empty, bind_dense_tiles(empty)), bytes(3 * stride))
         self.assertEqual(len(calls), 2)
         with self.assertRaisesRegex(ValueError, "hardware target"):
             oversubscribed = _plan(1, cube_workers=3)

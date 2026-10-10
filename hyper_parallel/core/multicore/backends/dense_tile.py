@@ -22,12 +22,13 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+from hyper_parallel.core.multicore.backends.dense_reference import ACCESS, DenseReferenceTiler, reference_access
 from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePlan
 
 HEADER = struct.Struct("<8I")
 OPERATION = struct.Struct("<7IiI")
 MAGIC = 0x444E5331
-VERSION = 1
+VERSION = 2
 EVENT_STRIDE_BYTES = 128
 
 
@@ -87,14 +88,17 @@ def bind_dense_tiles(plan: DenseTilePlan) -> DenseTileBinding:
 class DenseSdkTiler:
     """Generate the selected SDK's raw TCubeTiling through a sealed host library."""
 
-    def __init__(self, library: Path, soc: str) -> None:
+    def __init__(self, library: Path, soc: str, reference: DenseReferenceTiler | None = None) -> None:
         """Read target limits and raw tiling size without allocating device tensors.
 
         Args:
             library: Caller-verified host tiling shared library.
             soc: Exact SoC selected by the native build.
+            reference: 可选的隔离 SDK 参考查询，正式运行时由已验证产物创建。
         """
         self.soc = soc
+        self.reference = reference
+        self.reference_record = None
         self.library = ctypes.CDLL(str(Path(library).resolve()))
         query = self.library.hyper_parallel_dense_platform
         query.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint64),
@@ -120,9 +124,13 @@ class DenseSdkTiler:
             raise ValueError("Dense cube worker count exceeds the selected SDK hardware target")
         if binding != bind_dense_tiles(plan):
             raise ValueError("Dense SDK tiling binding differs from its SSA tile plan")
-        blocks = []
+        shapes = tuple(shape for shape in binding.matmul_shapes if shape is not None and plan.rows)
+        self.reference_record = self.reference.query(shapes) if self.reference is not None and shapes else None
+        results = iter(self.reference_record["results"] if self.reference_record is not None else ())
+        blocks, reasons = [], []
         for shape in binding.matmul_shapes:
             block = ctypes.create_string_buffer(self.tiling_bytes)
+            access, reason = bytes(ACCESS.size), "no_matrix"
             if shape is not None and plan.rows:
                 rows, columns, contracted, transpose = shape
                 tile_rows = min(rows, plan.policy.rows_per_tile)
@@ -130,7 +138,12 @@ class DenseSdkTiler:
                                        block, self.tiling_bytes)
                 if status != 0:
                     raise ValueError(f"Dense SDK matrix tiling failed for {shape}: status={status}")
-            blocks.append(block.raw)
+                reason = "no_reference_query"
+                if self.reference_record is not None:
+                    access, reason = reference_access(next(results), shape, self.cube_workers)
+            blocks.append(block.raw + access)
+            reasons.append(reason)
+        self.access_reasons = tuple(reasons)
         return b"".join(blocks)
 
     def export_manifest(self, binding: DenseTileBinding, bank: bytes) -> dict[str, object]:
@@ -140,6 +153,11 @@ class DenseSdkTiler:
             binding: Concrete device task descriptors.
             bank: Raw SDK tiling bank generated for those descriptors.
         """
+        expected = len(binding.matmul_shapes) * (self.tiling_bytes + ACCESS.size)
+        if len(bank) != expected:
+            raise ValueError("稠密 SDK tiling bank 的长度不符合访问参数 ABI")
         return {"soc": self.soc, "cube_workers": self.cube_workers, "workspace_bytes": self.workspace_bytes,
                 "tiling_bytes": self.tiling_bytes, "config_sha256": hashlib.sha256(binding.config).hexdigest(),
+                "access_bytes": ACCESS.size, "bank_stride_bytes": self.tiling_bytes + ACCESS.size,
+                "reference": self.reference_record, "access_reasons": self.access_reasons,
                 "bank_sha256": hashlib.sha256(bank).hexdigest()}

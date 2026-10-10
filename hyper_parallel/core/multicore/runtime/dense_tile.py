@@ -30,6 +30,7 @@ from hyper_parallel.core.multicore._build.build_dense_tile import (
     verify_dense_tile_payload,
 )
 from hyper_parallel.core.multicore.backends.dense_codegen import saved_value_ids
+from hyper_parallel.core.multicore.backends.dense_reference import DenseReferenceTiler
 from hyper_parallel.core.multicore.backends.dense_tile import DenseSdkTiler, bind_dense_tiles
 from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePolicy, compile_dense_tiles, simulate_dense_tiles
 from hyper_parallel.core.multicore.runtime.dense import DenseExecutable, DenseKernelPlan
@@ -91,6 +92,8 @@ class ResidentDenseExecutable(DenseExecutable):
         identity = dense_tile_build_identity(cann_root, soc)
         data, self.native_ops = _load(manifest, identity)
         tiler = DenseSdkTiler(manifest.parent / data["tiling_library"], soc)
+        tiler.reference = DenseReferenceTiler(cann_root, manifest.parent / data["reference_library"], soc,
+                                             tiler.cube_workers, torch.are_deterministic_algorithms_enabled())
         if policy is None:
             policy = _default_policy(plan, tiler.cube_workers)
         self.tile_plan = compile_dense_tiles(plan, policy)
