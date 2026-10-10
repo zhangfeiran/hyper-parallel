@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Framework-free launcher for actual Ascend dense FFN training validation."""
+"""不导入框架的 Ascend 稠密 FFN 训练验证启动器。"""
 
 from pathlib import Path
 
@@ -22,9 +22,9 @@ from tests.common.mark_utils import arg_mark
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_dense_ffn_training() -> None:
-    """Feature: Native dense FFN training.
-    Description: Compare outputs/gradients and checkpoint/close lifecycle on one Ascend NPU.
-    Expectation: Every component comparison and pending backward succeeds.
+    """Feature: 原生稠密 FFN 训练。
+    Description: 在单卡 Ascend NPU 上比较输出、梯度和 checkpoint/close 生命周期。
+    Expectation: 所有组件比较及关闭后待执行反向均通过。
     """
     torchrun_case(file_name=str(Path(__file__).with_name("_dense_ffn_impl.py")),
                   case_name="test_dense_ffn_training", master_port=29617, num_proc=1)
@@ -44,7 +44,7 @@ def test_dense_ffn_saved_buffers() -> None:
 def test_dense_backward_components() -> None:
     """Feature: 原生反向 worker。
     Description: 核对完整 K 权重梯度、SDK SwiGLUGrad、梯度累加和跨流队列。
-    Expectation: 与独立原生 autograd 一致，完整 FFN 的未绑定能力保持拒绝。
+    Expectation: 与独立原生 autograd 一致，完整 FFN 的全部输入梯度使用设备反向。
     """
     torchrun_case(file_name=str(Path(__file__).with_name("_dense_backward_impl.py")),
                   case_name="test_dense_backward_components", master_port=29620, num_proc=1)
@@ -54,7 +54,7 @@ def test_dense_backward_components() -> None:
 def test_dense_backward_autograd() -> None:
     """Feature: 常驻反向 autograd。
     Description: 验证真实梯度需求、保存值、retain_graph、保存钩子、跨流和关闭后反向。
-    Expectation: 已准入的完整梯度图执行设备反向，未绑定 FFN 保留原有完整 VJP。
+    Expectation: 已准入的完整梯度图执行设备反向，通用图的未绑定能力保留原有完整 VJP。
     """
     torchrun_case(file_name=str(Path(__file__).with_name("_dense_backward_autograd_impl.py")),
                   case_name="test_dense_backward_autograd", master_port=29621, num_proc=1)
@@ -62,9 +62,19 @@ def test_dense_backward_autograd() -> None:
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dense_ffn_fully_shard() -> None:
-    """Feature: Dense FFN FSDP integration.
-    Description: Validate gradients, changed shard weights, recompute and checkpoint restore on two NPUs.
-    Expectation: Independent SGD components remain aligned through repeated unshard/reshard cycles.
+    """Feature: 稠密 FFN FSDP 接入。
+    Description: 在双卡上验证梯度、分片权重更新、重计算和检查点恢复。
+    Expectation: 独立 SGD 组件在反复 unshard/reshard 后保持一致。
     """
     torchrun_case(file_name=str(Path(__file__).with_name("_dense_ffn_fsdp_impl.py")),
                   case_name="test_dense_ffn_fully_shard", master_port=29619, num_proc=2)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_dense_ffn_fully_shard_adamw() -> None:
+    """Feature: FSDP FP32 主参数 AdamW。
+    Description: 比较输出、梯度、BF16 参数、FP32 主参数、优化器矩及磁盘恢复后的独立训练。
+    Expectation: 完整设备反向无主机补算，恢复轨迹与未中断轨迹逐值一致。
+    """
+    torchrun_case(file_name=str(Path(__file__).with_name("_dense_ffn_fsdp_adamw_impl.py")),
+                  case_name="test_dense_ffn_fully_shard_adamw", master_port=29622, num_proc=2)

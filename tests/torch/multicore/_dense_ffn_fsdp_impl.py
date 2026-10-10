@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Two-card FSDP dense FFN gradient, changing-weight and checkpoint lifecycle validation."""
+"""双卡 FSDP 稠密 FFN 的梯度、权重更新和检查点生命周期验证。"""
 
 from __future__ import annotations
 
@@ -37,11 +37,17 @@ from hyper_parallel.core.multicore.runtime.dense_execution import DenseExecution
 
 class _SourceFFN(nn.Module):
     def __init__(self) -> None:
-        """Create the conventional weights before module replacement and sharding."""
+        """在模块替换和参数分片之前创建原始三投影权重。"""
         super().__init__()
         self.gate_proj = nn.Linear(64, 128, bias=False)
         self.up_proj = nn.Linear(64, 128, bias=False)
         self.down_proj = nn.Linear(128, 64, bias=False)
+
+
+def _execution_config() -> DenseExecutionConfig:
+    """使用当前 CANN 和调用方显式指定的原生构建缓存。"""
+    cache = os.environ.get("HP_FFN_CACHE_ROOT")
+    return DenseExecutionConfig(backend="resident_tiles", cache_root=Path(cache) if cache else None)
 
 
 def _full(value):
@@ -98,7 +104,7 @@ def _checkpoint_roundtrip(candidate, baseline, device):
 
 
 def test_dense_ffn_fully_shard() -> None:
-    """Exercise normal replacement-before-FSDP with independently updated packed parameters."""
+    """验证先替换后分片的正常入口及独立更新的打包参数。"""
     rank, world_size = int(os.environ.get("LOCAL_RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
     if world_size != 2:
         raise ValueError("Dense FSDP acceptance requires exactly two worker ranks")
@@ -111,7 +117,7 @@ def test_dense_ffn_fully_shard() -> None:
         torch.manual_seed(17)
         source = _SourceFFN().to(dtype=torch.bfloat16)
         candidate = MegaFFNAdapter(module=source,
-                                   context={"mega_ffn_execution": DenseExecutionConfig(backend="resident_tiles")})
+                                   context={"mega_ffn_execution": _execution_config()})
         candidate, baseline = candidate.to(device), SwiGLUMLP(module=source).to(device)
         policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32,
                                       output_dtype=torch.bfloat16, cast_forward_inputs=False)
