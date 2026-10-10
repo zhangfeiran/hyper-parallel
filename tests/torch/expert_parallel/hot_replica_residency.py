@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Untimed, caller-versioned residency opportunities on real unchanged transfers."""
+"""Untimed residency opportunities and actual saved-forward reuse on real leases."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.core.multicore.modules.mega_moe import function
 from tests.torch.expert_parallel.replica_residency import ResidentWeight, ResidencyLedger
@@ -35,7 +36,7 @@ class ResidencyAudit:
     """Shadow incoming weight writes in one serial shared execution workspace."""
 
     def __init__(self, resources: Any) -> None:
-        """Keep diagnostic metadata while the actual provider performs every write.
+        """Keep diagnostic metadata while preserving the provider's copy and reuse policy.
 
         Args:
             resources: Shared execution resources identifying the pool and heap generation.
@@ -107,6 +108,11 @@ class ResidencyAudit:
             successful = False
             try:
                 pool = context.__enter__()
+                generation = options.get("reuse_generation")
+                reused = bool(backward and generation is not None
+                              and getattr(pool, "weight_generation", None) is generation)
+                for _, _, record in pending:
+                    record["actual_data_copy"] = not reused
                 try:
                     yield pool
                 finally:
@@ -144,6 +150,17 @@ def _audit_backward(audit, output, gradient, layer, generation, name):
         output.backward(gradient)
 
 
+def _residency_summary(rows):
+    """Separate shadow opportunities from the provider's actual traffic decisions."""
+    return {"reason_counts": dict(Counter(row["reason"] for row in rows)),
+            "requested_weight_bytes": sum(row["payload_bytes"] for row in rows),
+            "potential_hit_bytes": sum(row["payload_bytes"] for row in rows if row["reason"] == "ordered_hit"),
+            "actual_weight_copy_bytes": sum(row["payload_bytes"] for row in rows if row["actual_data_copy"]),
+            "actual_weight_reused_bytes": sum(row["payload_bytes"] for row in rows if not row["actual_data_copy"]),
+            "potential_additional_reuse_bytes": sum(row["payload_bytes"] for row in rows
+                                                    if row["reason"] == "ordered_hit" and row["actual_data_copy"])}
+
+
 def audit_residency(modules: tuple, values: torch.Tensor, routes: dict,
                     probabilities: torch.Tensor, gradient: torch.Tensor) -> dict:
     """Measure potential hits across micro-batches, layer reuse and real weight updates.
@@ -156,8 +173,8 @@ def audit_residency(modules: tuple, values: torch.Tensor, routes: dict,
         gradient: Output cotangent matching the input shape.
 
     Returns:
-        Per-write opportunities and globally checked scenario summaries. Every
-        real weight copy remains enabled; ordered_hit is not a cache performance result.
+        Per-write opportunities and actual provider reuse, without changing its
+        policy. Shadow ordered_hit alone is not a production cache performance result.
     """
     first = modules[0]
     optimizers = [torch.optim.SGD(module.parameters(), lr=0.001) for module in modules]
@@ -170,7 +187,8 @@ def audit_residency(modules: tuple, values: torch.Tensor, routes: dict,
     warm_capacity = resources.workspace.capacity_floor
     warm_heap_generation = resources.heap_manager.epoch
     with ResidencyAudit(resources) as audit:
-        for name in ("same_version_microbatches", "cross_layer_shared_pool", "optimizer_update", "rotating_experts"):
+        for name in ("same_version_microbatches", "cross_layer_shared_pool", "checkpoint_recompute",
+                     "optimizer_update", "rotating_experts"):
             for optimizer in optimizers:
                 optimizer.zero_grad(set_to_none=True)
             values.grad = None
@@ -182,11 +200,7 @@ def audit_residency(modules: tuple, values: torch.Tensor, routes: dict,
                 raise AssertionError(f"Residency scenario grew storage: scenario={name}, storage={storage}, "
                                      f"expected={(warm_capacity, warm_heap_generation)}")
             rows = audit.records[start:]
-            reasons = Counter(row["reason"] for row in rows)
-            scenarios[name] = {"reason_counts": dict(reasons),
-                               "requested_weight_bytes": sum(row["payload_bytes"] for row in rows),
-                               "potential_hit_bytes": sum(row["payload_bytes"] for row in rows
-                                                          if row["reason"] == "ordered_hit")}
+            scenarios[name] = _residency_summary(rows)
         records = audit.records
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, scenarios)
@@ -198,13 +212,22 @@ def audit_residency(modules: tuple, values: torch.Tensor, routes: dict,
         raise AssertionError(f"Residency audit did not exercise required cases: reason_counts={dict(combined)}")
     return {"records": records, "scenarios": scenarios, "global_reason_counts": dict(combined),
             "warm_capacity": warm_capacity, "warm_heap_generation": warm_heap_generation,
-            "scope": "Untimed shadow audit with explicit diagnostic caller generations; all actual copies enabled. "
+            "scope": "Untimed audit with explicit diagnostic caller generations; provider policy unchanged. "
                      "Ordered candidates rely on the existing serial lease, not a host-completed cache proof. "
-                     "No bandwidth/latency saving or production weight-version integration is implemented."}
+                     "Actual saved-forward reuse is separate from additional shadow opportunities. "
+                     "Byte accounting alone does not establish a complete-step latency improvement."}
 
 
 def _audit_scenario(name, audit, modules, optimizers, values, ids, routes, probabilities, gradient):
     first, second = modules
+    if name == "checkpoint_recompute":
+        def _forward(inputs, expert_ids, scores):
+            suffix = "recompute-F" if torch.is_grad_enabled() else "F"
+            return _audit_forward(audit, first, inputs, expert_ids, scores, "layer-a", 0, f"{name}-{suffix}")
+
+        output = checkpoint(_forward, values, ids, probabilities, use_reentrant=True)
+        _audit_backward(audit, output, gradient, "layer-a", 0, f"{name}-B")
+        return
     if name == "optimizer_update":
         # The prior scenarios leave first's v0 in the shared slot. Update actual
         # owner parameters before advancing the diagnostic's authoritative version.
