@@ -253,25 +253,48 @@ def analyze_suite(suite: dict[str, object]) -> dict[str, object]:
         jobs.append((job, record))
     numerical = all(_numerical_passed(record) for job, record in jobs if job["mode"] == "validate")
     resident = all(_resident_candidate(record) for job, record in jobs if job["backend"] == "mega_ffn")
+    resident_backward = all(_resident_candidate(record, backward=True) for job, record in jobs
+                            if job["backend"] == "mega_ffn")
     comparisons = {baseline: performance_verdict(_performance_blocks(jobs, baseline, "control"),
                                                 _performance_blocks(jobs, baseline, "comparison"))
                    for baseline in ("common", "packed")}
     return {"identity": identity, "numerical_passed": numerical, "comparisons": comparisons,
             "resident_forward_present": resident,
-            "performance_passed": numerical and resident
+            "resident_backward_present": resident_backward,
+            "performance_passed": numerical and resident and resident_backward
             and all(entry["performance_passed"] for entry in comparisons.values()),
             "scope": "Fixed-data random-initialized dense-Qwen training; FSDP and long convergence are separate"}
 
 
-def _resident_candidate(record):
+def _resident_candidate(record, *, backward=False):
     payloads = record.get("native_payloads", {})
     if record["mode"] == "validate":
         payloads = payloads.get("candidate", {})
     layers = record["workload"].get("config", {}).get("num_layers", 0)
     if layers <= 0 or set(payloads) != {f"layers.{index}.mlp" for index in range(layers)}:
         return False
+    if backward:
+        return all(entries and all(_resident_backward_entry(entry) for entry in entries)
+                   for entries in payloads.values())
     return all(entries and all(entry.get("native", {}).get("execution_mode") == "resident_dense_tile_candidate"
                                for entry in entries) for entries in payloads.values())
+
+
+def _resident_backward_entry(entry):
+    native = entry.get("native") or {}
+    runtime = native.get("backward_runtime") or {}
+    calls = runtime.get("native_calls")
+    host_calls = runtime.get("host_calls")
+    payloads = runtime.get("native_payloads")
+    if (native.get("backward_execution_mode") != "resident_dense_backward"
+            or type(calls) not in (int,) or calls <= 0 or type(host_calls) not in (int,) or host_calls != 0
+            or runtime.get("unbound_capabilities") != [] or not isinstance(payloads, list) or not payloads):
+        return False
+    return all(payload.get("execution_mode") == "resident_backward_candidate"
+               and payload.get("plan", {}).get("input_mask") == [True, True, True]
+               and all(value is True for value in payload["plan"]["input_mask"])
+               and payload.get("plan", {}).get("output_mask") == [True]
+               and all(value is True for value in payload["plan"]["output_mask"]) for payload in payloads)
 
 
 def _numerical_passed(record):

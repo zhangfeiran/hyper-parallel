@@ -45,7 +45,8 @@ SOURCES += ("ops/dense/dense_access.h", "ops/dense/dense_reference_tiling.cpp", 
             "_build/query_dense_reference.py")
 SOURCES += ("ops/dense/dense_backward_abi.h", "ops/dense/dense_backward_kernel.cpp",
             "ops/dense/dense_backward_vector.h", "compiler/dense_backward.py", "compiler/dense_backward_tiles.py",
-            "backends/dense_backward.py", "runtime/dense_backward.py")
+            "backends/dense_backward.py", "runtime/dense_backward.py", "runtime/dense_backward_router.py",
+            "runtime/dense_payload.py")
 SDK_LIBRARIES = ("libtiling_api.a", "libplatform.so", "libregister.so", "libascendc_runtime.a",
                  "libascendcl.so", "libruntime.so", "libunified_dlog.so", "libc_sec.so")
 SDK_VERSIONS = ("runtime", "bisheng-compiler", "asc-devkit", "metadef")

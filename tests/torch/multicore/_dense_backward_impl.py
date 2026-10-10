@@ -32,8 +32,8 @@ from hyper_parallel.core.multicore.runtime.dense_native import NativeSwiGLU
 
 def _program(kind, rows, hidden, columns):
     signature = {"x": ml.Tensor[ml.bf16, (rows, hidden)]}
-    if kind in ("linear", "linear_transpose", "glu_linear", "ffn"):
-        weight_shape = (columns, hidden) if kind == "linear_transpose" else (hidden, columns)
+    if kind in ("linear", "linear_transpose", "glu_linear", "ffn", "shared", "shared_transpose"):
+        weight_shape = (columns, hidden) if kind in ("linear_transpose", "shared_transpose") else (hidden, columns)
         signature["weight"] = ml.Tensor[ml.bf16, weight_shape]
     if kind == "ffn":
         signature["down"] = ml.Tensor[ml.bf16, (columns // 2, hidden)]
@@ -41,6 +41,13 @@ def _program(kind, rows, hidden, columns):
         "linear": "def program(x, weight):\n    return ml.matmul(x, weight)\n",
         "linear_transpose": ("def program(x, weight):\n"
                              "    return ml.matmul(x, weight, transpose_right=True)\n"),
+        "shared": ("def program(x, weight):\n    first = ml.matmul(x, weight)\n"
+                   "    second = ml.matmul(x, weight)\n    third = ml.matmul(x, weight)\n"
+                   "    return first, second, third\n"),
+        "shared_transpose": ("def program(x, weight):\n    first = ml.matmul(x, weight, transpose_right=True)\n"
+                             "    second = ml.matmul(x, weight, transpose_right=True)\n"
+                             "    third = ml.matmul(x, weight, transpose_right=True)\n"
+                             "    return first, second, third\n"),
         "glu_linear": ("def program(x, weight):\n    packed = ml.matmul(x, weight)\n"
                        f"    return ml.swiglu_dense(packed, intermediate_size={columns // 2})\n"),
         "ffn": ("def program(x, weight, down):\n    packed = ml.matmul(x, weight)\n"
@@ -65,6 +72,9 @@ def _reference(kind, inputs):
         return (value @ inputs[1],), ()
     if kind == "linear_transpose":
         return (value @ inputs[1].t(),), ()
+    if kind in ("shared", "shared_transpose"):
+        weight = inputs[1].t() if kind == "shared_transpose" else inputs[1]
+        return tuple(value @ weight for _ in range(3)), ()
     if kind in ("glu_linear", "ffn"):
         packed = value @ inputs[1]
         active = NativeSwiGLU.apply(packed)
@@ -209,6 +219,11 @@ def test_dense_backward_components() -> None:
         _append_case(rows, destination, "glu_linear", tokens, 17 if tokens < 1024 else 1024,
                      38 if tokens < 1024 else 8192, (False, True), (True,),
                      policies[index % 2], cache_root, 1991 + index, streams=tokens == 129)
+    for tokens in (0, 7, 129):
+        _append_case(rows, destination, "shared", tokens, 513, 37, (False, True), (True, True, True),
+                     policies[0], cache_root, 2491 + tokens)
+    _append_case(rows, destination, "shared_transpose", 0, 37, 513, (False, True), (True, True, True),
+                 policies[0], cache_root, 2591)
     for index, kind in enumerate(("glu", "chain", "duplicate", "fanout")):
         masks = ((True,),) if kind in ("glu", "chain") else (
             (True, True), (True, False), (False, True), (False, False))

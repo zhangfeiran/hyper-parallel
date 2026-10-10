@@ -33,7 +33,12 @@ def _suite(root):
         record = {"complete": True, "mode": job["mode"], "backend": job["backend"],
                   "identity": {"source": "fixed", "device": "synthetic"},
                   "workload": {"tokens": "fixed", "config": {"num_layers": 2}}}
-        payloads = {f"layers.{layer}.mlp": [{"native": {"execution_mode": "resident_dense_tile_candidate"}}]
+        payloads = {f"layers.{layer}.mlp": [{"native": {"execution_mode": "resident_dense_tile_candidate",
+                     "backward_execution_mode": "resident_dense_backward",
+                     "backward_runtime": {"native_calls": 100, "host_calls": 0, "unbound_capabilities": [],
+                                          "native_payloads": [{"execution_mode": "resident_backward_candidate",
+                                                               "plan": {"input_mask": [True, True, True],
+                                                                        "output_mask": [True]}}]}}}]
                     for layer in range(2)} if job["backend"] == "mega_ffn" else {}
         if job["mode"] == "validate":
             checks = {name: {"passed": True} for name in
@@ -58,6 +63,46 @@ def _suite(root):
 
 class TestDenseAcceptance(unittest.TestCase):
     """Reject partial, contaminated or noisy evidence before claiming improvements."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_host_backward_or_partial_masks_cannot_clear_training_acceptance(self):
+        """Feature: 完整设备反向的收益准入。
+        Description: 保留正确前向、轨迹和计时，修改反向方式或删减真实梯度需求。
+        Expectation: 主机、混合、缺失或部分反向均不能放行完整训练收益。
+        """
+        for failure in ("host", "mixed", "missing", "partial", "undefined", "no_calls", "truthy_input",
+                        "truthy_output", "boolean_host", "boolean_native"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                suite = _suite(Path(directory))
+                path = Path(suite["jobs"][1]["result"])
+                record = json.loads(path.read_text(encoding="utf-8"))
+                native = record["native_payloads"]["candidate"]["layers.0.mlp"][0]["native"]
+                runtime = native["backward_runtime"]
+                if failure == "host":
+                    native["backward_execution_mode"] = "native_host_stream_adapter"
+                elif failure == "mixed":
+                    runtime["host_calls"] = 1
+                elif failure == "missing":
+                    runtime["native_payloads"] = []
+                elif failure == "partial":
+                    runtime["native_payloads"][0]["plan"]["input_mask"] = [False, True, True]
+                elif failure == "undefined":
+                    runtime["native_payloads"][0]["plan"]["output_mask"] = [False]
+                elif failure == "no_calls":
+                    runtime["native_calls"] = 0
+                elif failure == "truthy_input":
+                    runtime["native_payloads"][0]["plan"]["input_mask"] = [1, True, True]
+                elif failure == "truthy_output":
+                    runtime["native_payloads"][0]["plan"]["output_mask"] = [1]
+                elif failure == "boolean_host":
+                    runtime["host_calls"] = False
+                else:
+                    runtime["native_calls"] = True
+                path.write_text(json.dumps(record), encoding="utf-8")
+                result = acceptance.analyze_suite(suite)
+                self.assertTrue(result["resident_forward_present"])
+                self.assertFalse(result["resident_backward_present"])
+                self.assertFalse(result["performance_passed"])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_independent_blocks_and_native_controls(self):

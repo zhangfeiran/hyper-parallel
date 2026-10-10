@@ -22,6 +22,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 from unittest.mock import patch
 
 import torch
@@ -54,6 +55,26 @@ def _record(root):
     return manifest, identity, record
 
 
+class _CpuBackwardRouter:
+    def __init__(self, callback: Callable) -> None:
+        """保留原有 CPU 数值 VJP。"""
+        self.callback = callback
+
+    def __call__(self, inputs: tuple[torch.Tensor, ...], saved: tuple[torch.Tensor, ...],
+                 gradients: tuple[torch.Tensor | None, ...], _input_mask: tuple[bool, ...]
+                 ) -> tuple[torch.Tensor | None, ...]:
+        """仅适配 autograd 调用边界，不替代设备数值验证。"""
+        return self.callback(inputs, saved, gradients)
+
+    def close(self) -> None:
+        """CPU 协议替身不持有设备缓存。"""
+
+    @staticmethod
+    def statistics() -> dict[str, object]:
+        """显式标记仅用于 CPU 调用协议。"""
+        return {"execution_mode": "cpu_protocol_double"}
+
+
 def _cpu_protocol(rows):
     spec = DenseSpec({"T": rows, "H": 8, "PackedI": 12, "I": 6})
     plan = dense_ffn.plan(spec, intermediate_size=6)
@@ -81,6 +102,8 @@ def _cpu_protocol(rows):
         return [dp @ gate_up.t(), x.t() @ dp, hidden.t() @ dy]
 
     executable.vjp = SimpleNamespace(native_ops=SimpleNamespace(backward=SimpleNamespace(default=_vjp)))
+    executable.backward_router = _CpuBackwardRouter(_vjp)
+    executable.native_identity = {}
     return executable
 
 

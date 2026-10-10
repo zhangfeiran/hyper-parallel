@@ -27,6 +27,7 @@ from hyper_parallel.core.multicore.backends.dense_tile import DenseSdkTiler
 from hyper_parallel.core.multicore.compiler.dense_backward_tiles import (
     DenseBackwardTilePlan,
     compile_dense_backward_tiles,
+    row_local_dependency,
     simulate_dense_backward_tiles,
 )
 
@@ -51,9 +52,14 @@ class DenseBackwardBinding:
     tile_shapes: tuple[tuple[int, int], ...]
     required_capabilities: tuple[str, ...]
 
+    def unbound_capabilities(self) -> tuple[str, ...]:
+        """按稳定顺序返回尚未实现的设备能力，不吞掉调度或绑定错误。"""
+        supported = {"matmul_nn", "matmul_tn", "swiglu_grad", "add", "zero"}
+        return tuple(sorted(set(self.required_capabilities) - supported))
+
     def admit_native(self) -> None:
         """设备能力必须全部实现；右转置及转置输出尚未放行。"""
-        unsupported = set(self.required_capabilities) - {"matmul_nn", "matmul_tn", "swiglu_grad", "add", "zero"}
+        unsupported = self.unbound_capabilities()
         if unsupported:
             raise ValueError(f"Dense resident backward has unbound native capabilities: {sorted(unsupported)}")
 
@@ -81,7 +87,7 @@ def _dependencies(plan, region, producers, aliases):
         parent = producers.get(_resolved(value, aliases))
         if parent is None or not parent.events:
             continue
-        result.add((parent.events[0], len(parent.events), parent.signals, int(parent.phase == region.phase == 0)))
+        result.add((parent.events[0], len(parent.events), parent.signals, int(row_local_dependency(region, parent))))
     return tuple(sorted(result))
 
 
@@ -151,12 +157,15 @@ class DenseBackwardSdkTiler:
         self.generate.argtypes = [ctypes.c_char_p, *([ctypes.c_uint32] * 7), ctypes.c_void_p, ctypes.c_uint32]
         self.generate.restype = ctypes.c_int
 
-    def bank(self, binding: DenseBackwardBinding) -> bytes:
+    def bank(self, plan: DenseBackwardTilePlan, binding: DenseBackwardBinding) -> bytes:
         """在设备地址建立前检查全部能力，生成逐操作原始 tiling。
 
         Args:
+            plan: 真实调用所需的规范反向工作队列。
             binding: 规范反向 SSA 的描述符，不包含调用方张量地址。
         """
+        if binding != bind_dense_backward_tiles(plan):
+            raise ValueError("Dense backward SDK binding differs from its canonical worker plan")
         binding.admit_native()
         workers = HEADER.unpack_from(binding.config)[3]
         if workers > self.sdk.cube_workers:

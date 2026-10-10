@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Resident forward candidate with invocation-owned state and explicit native VJP."""
+"""常驻前向、真实保存状态及按完整梯度图选择的 autograd 反向。"""
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -27,43 +26,20 @@ from hyper_parallel.core.multicore._build.build_dense import build_dense_payload
 from hyper_parallel.core.multicore._build.build_dense_tile import (
     build_dense_tile_payload,
     dense_tile_build_identity,
-    verify_dense_tile_payload,
 )
 from hyper_parallel.core.multicore.backends.dense_codegen import saved_value_ids
 from hyper_parallel.core.multicore.backends.dense_reference import DenseReferenceTiler
 from hyper_parallel.core.multicore.backends.dense_tile import DenseSdkTiler, bind_dense_tiles
 from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePolicy, compile_dense_tiles, simulate_dense_tiles
 from hyper_parallel.core.multicore.runtime.dense import DenseExecutable, DenseKernelPlan
+from hyper_parallel.core.multicore.runtime.dense_backward_router import DenseBackwardRouter
 from hyper_parallel.core.multicore.runtime.dense_compiled import CompiledDenseExecutable
+from hyper_parallel.core.multicore.runtime.dense_payload import load_dense_payload
 from hyper_parallel.core.multicore.runtime.dense_saved import DenseSavedUse, shared_dense_saved
 from hyper_parallel.core.multicore.runtime.dense_scratch import shared_dense_scratch
 
-_LOADED: dict[str, str] = {}
-
-
-def _load(manifest, identity):
-    data = verify_dense_tile_payload(manifest, identity)
-    library = (manifest.parent / data["library"]).resolve()
-    fingerprint = hashlib.sha256(manifest.read_bytes()).hexdigest()
-    namespace = data["namespace"]
-    if namespace in _LOADED and _LOADED[namespace] != fingerprint:
-        raise ValueError("A different resident dense payload owns this operator namespace")
-    if (namespace not in _LOADED and getattr(getattr(torch.ops, namespace), "launch", None) is not None
-            and str(library) not in torch.ops.loaded_libraries):
-        raise ValueError("An unowned resident dense operator namespace is already registered")
-    torch.ops.load_library(str(library))
-    _LOADED[namespace] = fingerprint
-    return data, getattr(torch.ops, namespace)
-
-
 class ResidentDenseExecutable(DenseExecutable):
-    """Experimental mixed AIC/AIV forward; native provider calls implement backward.
-
-    The forward executes all admitted row-local primitives in one device launch.
-    Backward still uses the independent, generated current-stream VJP. Each call
-    owns its intermediates; stream-isolated scratch is reused and parameters are borrowed.
-    No device correctness or speedup is implied by successful native compilation.
-    """
+    """常驻前向及完整梯度图选择；未绑定能力的调用沿用原有完整主机 VJP。"""
 
     def __init__(self, plan: DenseKernelPlan, device: torch.device, *, cann_root: Path, cache_root: Path,
                  soc: str, policy: DenseTilePolicy | None = None) -> None:
@@ -83,7 +59,7 @@ class ResidentDenseExecutable(DenseExecutable):
         cache_root = Path(cache_root).resolve()
         manifest = build_dense_tile_payload(cann_root, cache_root / "resident", soc)
         identity = dense_tile_build_identity(cann_root, soc)
-        data, self.native_ops = _load(manifest, identity)
+        data, self.native_ops = load_dense_payload(manifest, identity)
         tiler = DenseSdkTiler(manifest.parent / data["tiling_library"], soc)
         tiler.reference = DenseReferenceTiler(cann_root, manifest.parent / data["reference_library"], soc,
                                              tiler.cube_workers, torch.are_deterministic_algorithms_enabled())
@@ -103,6 +79,8 @@ class ResidentDenseExecutable(DenseExecutable):
         self.ready.record(torch.get_device_module(self.device).current_stream(self.device))
         self.saved_ids = saved_value_ids(plan)
         self.vjp = CompiledDenseExecutable(plan, self.device, build_dense_payload(plan, cache_root / "vjp"))
+        self.backward_router = DenseBackwardRouter(plan, self.device, self.vjp.native_ops.backward.default,
+                                                   cann_root=cann_root, cache_root=cache_root, soc=soc, policy=policy)
         public_ids = {value.id for value in plan.ir.outputs}
         self.saved_shapes = {value_id: dict(plan.value_types)[value_id].shape for value_id in self.saved_ids
                              if value_id not in public_ids}
@@ -113,15 +91,17 @@ class ResidentDenseExecutable(DenseExecutable):
                                 "scratch": {"reuse": "device_shared_per_stream", "max_cached_streams": 2,
                                             "saved_values": "storage_alias_guarded"},
                                 "saved_buffers": {"reuse": "after_last_storage_alias", "max_cached_invocations": 2},
-                                "backward_execution_mode": "native_host_stream_adapter",
+                                "backward_execution_mode": "not_executed",
+                                "backward_runtime": self.backward_router.statistics(),
                                 "backward_payload": self.vjp.native_identity}
 
     def _bytes(self, value):
         return torch.frombuffer(bytearray(value), dtype=torch.uint8).clone().to(self.device)
 
     def close(self) -> None:
-        """Release cached kernel scratch while preserving each pending invocation's backward values."""
+        """释放前向与反向缓存所有权，保持已保存调用的待执行反向有效。"""
         super().close()
+        self.backward_router.close()
         self.scratch.release_owner(self)
         self.saved_pool.release_owner(self)
 
@@ -192,19 +172,23 @@ class _ResidentDenseFunction(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx: Any, *output_grads: torch.Tensor | None) -> tuple[object, ...]:
-        """Apply independent provider VJPs to the exact resident forward cache.
+        """根据真实需求选择完整设备反向或原主机 VJP，读取实际保存状态。
 
         Args:
-            ctx: Retained forward invocation, valid even after module close.
-            *output_grads: Public output cotangents, including unused tuple outputs.
+            ctx: 即使模块已关闭，也仍然有效的前向调用状态。
+            *output_grads: 实际输出余切，包括未使用公共输出的 None。
         """
         tensors = ctx.saved_tensors
         if ctx.saved_use is not None:
             device = ctx.executable.device
             stream = None if device.type == "cpu" else torch.get_device_module(device).current_stream(device)
             ctx.saved_use.consume(tensors[ctx.input_count:], stream)
-        gradients = ctx.executable.vjp.native_ops.backward.default(
-            list(tensors[:ctx.input_count]), list(tensors[ctx.input_count:]), list(output_grads))
+        gradients = ctx.executable.backward_router(tuple(tensors[:ctx.input_count]),
+                                                   tuple(tensors[ctx.input_count:]), tuple(output_grads),
+                                                   tuple(ctx.needs_input_grad[1:]))
+        runtime = ctx.executable.backward_router.statistics()
+        ctx.executable.native_identity["backward_execution_mode"] = runtime["execution_mode"]
+        ctx.executable.native_identity["backward_runtime"] = runtime
         if len(gradients) != ctx.input_count:
             raise RuntimeError("Resident dense VJP returned an invalid input-gradient contract")
         return (None, *(gradient if needed else None for gradient, needed in

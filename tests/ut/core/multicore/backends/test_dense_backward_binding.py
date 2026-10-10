@@ -206,10 +206,13 @@ class TestDenseBackwardBinding(unittest.TestCase):
         tiler.generate = _generate
         plan = _linear(1024, hidden=131, output=73, input_mask=(False, True))
         binding = bind_dense_backward_tiles(plan)
-        bank = tiler.bank(binding)
+        bank = tiler.bank(plan, binding)
         self.assertEqual(calls, [(131, 64, 73, 32, 1024, 1, 0)])
         self.assertEqual(len(bank), 224)
         self.assertEqual(tiler.export_manifest(binding, bank)["matrix_access"], "sequential_sdk_unproved")
         with self.assertRaisesRegex(ValueError, "unbound"):
-            tiler.bank(bind_dense_backward_tiles(_ffn(65)))
+            unsupported = _ffn(65)
+            tiler.bank(unsupported, bind_dense_backward_tiles(unsupported))
+        with self.assertRaisesRegex(ValueError, "canonical"):
+            tiler.bank(plan, replace(binding, matmul_shapes=((131, 73, 512, True, False),)))
         self.assertEqual(len(calls), 1)

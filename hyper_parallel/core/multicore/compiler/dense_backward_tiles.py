@@ -80,6 +80,8 @@ def _geometry(node, row_values):
     if node.matrix is not None:
         rows, columns, contracted = node.matrix[:3]
         kind = "zero" if contracted == 0 else "matmul"
+        if kind == "zero":
+            rows, columns = node.output.type.shape
     else:
         rows, columns = node.output.type.shape
         kind = "swiglu_grad" if node.kind == "swiglu_input_grad" else "gradient_add"
@@ -119,13 +121,27 @@ def _regions(backward, policy, row_values, defined):
     return tuple(regions), producers, tuple(aliases), event_count
 
 
+def row_local_dependency(region: DenseBackwardRegion, parent: DenseBackwardRegion) -> bool:
+    """证明消费者可只等待同一逻辑行，完整收缩仍等待全部 token。
+
+    Args:
+        region: 消费者的实际输出矩形。
+        parent: 生产者的实际输出矩形；非空转置输出仍为原始矩阵域。
+    """
+    if region.phase == parent.phase == 0:
+        return True
+    return (region.kind == "gradient_add" and region.phase == parent.phase
+            and (region.rows, region.columns) == (parent.rows, parent.columns)
+            and (not parent.transpose_output or parent.kind == "zero"))
+
+
 def _dependencies(node, region, tile, regions, producers, defined):
     result = set()
     for value in node.inputs:
         if value not in defined or producers.get(value) is None:
             continue
         parent = regions[producers[value]]
-        events = (parent.events[tile],) if region.phase == parent.phase == 0 else parent.events
+        events = (parent.events[tile],) if row_local_dependency(region, parent) else parent.events
         result.update((event, parent.signals) for event in events)
     return tuple(sorted(result))
 

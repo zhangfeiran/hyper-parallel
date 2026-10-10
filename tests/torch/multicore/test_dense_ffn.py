@@ -50,6 +50,16 @@ def test_dense_backward_components() -> None:
                   case_name="test_dense_backward_components", master_port=29620, num_proc=1)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+def test_dense_backward_autograd() -> None:
+    """Feature: 常驻反向 autograd。
+    Description: 验证真实梯度需求、保存值、retain_graph、保存钩子、跨流和关闭后反向。
+    Expectation: 已准入的完整梯度图执行设备反向，未绑定 FFN 保留原有完整 VJP。
+    """
+    torchrun_case(file_name=str(Path(__file__).with_name("_dense_backward_autograd_impl.py")),
+                  case_name="test_dense_backward_autograd", master_port=29621, num_proc=1)
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dense_ffn_fully_shard() -> None:
     """Feature: Dense FFN FSDP integration.

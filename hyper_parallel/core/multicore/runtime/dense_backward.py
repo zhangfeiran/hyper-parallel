@@ -32,7 +32,7 @@ from hyper_parallel.core.multicore.compiler.dense_backward_tiles import compile_
 from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePolicy
 from hyper_parallel.core.multicore.runtime.dense import DenseKernelPlan
 from hyper_parallel.core.multicore.runtime.dense_scratch import shared_dense_scratch
-from hyper_parallel.core.multicore.runtime.dense_tile import _load
+from hyper_parallel.core.multicore.runtime.dense_payload import load_dense_payload
 
 
 class ResidentDenseBackward:
@@ -62,13 +62,13 @@ class ResidentDenseBackward:
         self.binding = bind_dense_backward_tiles(self.tile_plan)
         self.binding.admit_native()
         manifest = build_dense_tile_payload(cann_root, Path(cache_root) / "resident", soc)
-        data, self.native_ops = _load(manifest, dense_tile_build_identity(cann_root, soc))
+        data, self.native_ops = load_dense_payload(manifest, dense_tile_build_identity(cann_root, soc))
         tiler = DenseBackwardSdkTiler(manifest.parent / data["tiling_library"], soc)
         if policy is None:
             policy = DenseTilePolicy(cube_workers=min(24, tiler.sdk.cube_workers))
             self.tile_plan = compile_dense_backward_tiles(self.backward, policy, output_mask, input_mask)
             self.binding = bind_dense_backward_tiles(self.tile_plan)
-        bank = tiler.bank(self.binding)
+        bank = tiler.bank(self.tile_plan, self.binding)
         self.config = self._bytes(self.binding.config)
         self.tilings = self._bytes(bank)
         self.ones = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device=device)
