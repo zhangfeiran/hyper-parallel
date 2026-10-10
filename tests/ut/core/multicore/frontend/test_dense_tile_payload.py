@@ -32,6 +32,7 @@ from hyper_parallel.core.multicore.backends.dense_codegen import saved_value_ids
 from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePolicy, compile_dense_tiles
 from hyper_parallel.core.multicore.frontend.examples.dense_ffn import dense_ffn
 from hyper_parallel.core.multicore.runtime.dense import DenseExecutable, DenseSpec
+from hyper_parallel.core.multicore.runtime.dense_scratch import DenseScratchPool
 from hyper_parallel.core.multicore.runtime.dense_tile import ResidentDenseExecutable
 from tests.common.mark_utils import arg_mark
 
@@ -58,6 +59,8 @@ def _cpu_protocol(rows):
     DenseExecutable.__init__(executable, plan, torch.device("cpu"))
     executable.tile_plan = compile_dense_tiles(plan, DenseTilePolicy(cube_workers=1))
     executable.saved_ids = saved_value_ids(plan)
+    executable.scratch = DenseScratchPool(torch.device("cpu"), len(plan.value_types),
+                                         executable.tile_plan.event_count * 32, 8)
 
     def _vjp(inputs, saved, gradients):
         x, gate_up, down = inputs

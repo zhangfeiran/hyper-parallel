@@ -34,6 +34,7 @@ from hyper_parallel.core.multicore.backends.dense_tile import DenseSdkTiler, bin
 from hyper_parallel.core.multicore.compiler.dense_tile import DenseTilePolicy, compile_dense_tiles, simulate_dense_tiles
 from hyper_parallel.core.multicore.runtime.dense import DenseExecutable, DenseKernelPlan
 from hyper_parallel.core.multicore.runtime.dense_compiled import CompiledDenseExecutable
+from hyper_parallel.core.multicore.runtime.dense_scratch import shared_dense_scratch
 
 _LOADED: dict[str, str] = {}
 
@@ -66,7 +67,7 @@ class ResidentDenseExecutable(DenseExecutable):
 
     The forward executes all admitted row-local primitives in one device launch.
     Backward still uses the independent, generated current-stream VJP. Each call
-    owns its intermediates, event counters and workspace; parameters are borrowed.
+    owns its intermediates; stream-isolated scratch is reused and parameters are borrowed.
     No device correctness or speedup is implied by successful native compilation.
     """
 
@@ -97,6 +98,8 @@ class ResidentDenseExecutable(DenseExecutable):
         self.binding = bind_dense_tiles(self.tile_plan)
         bank = tiler.bank(self.tile_plan, self.binding)
         self.workspace_bytes = tiler.workspace_bytes
+        self.scratch = shared_dense_scratch(self.device, len(self.binding.value_ids),
+                                           self.tile_plan.event_count * 32, self.workspace_bytes, self)
         self.config = self._bytes(self.binding.config)
         self.tilings = self._bytes(bank)
         self.ones = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device=self.device)
@@ -106,11 +109,18 @@ class ResidentDenseExecutable(DenseExecutable):
         self.vjp = CompiledDenseExecutable(plan, self.device, build_dense_payload(plan, cache_root / "vjp"))
         self.native_identity = {**data, "tile_plan": self.tile_plan.export_manifest(),
                                 "tiling": tiler.export_manifest(self.binding, bank),
+                                "scratch": {"reuse": "device_shared_per_stream", "max_cached_streams": 2,
+                                            "saved_values": "invocation_owned"},
                                 "backward_execution_mode": "native_host_stream_adapter",
                                 "backward_payload": self.vjp.native_identity}
 
     def _bytes(self, value):
         return torch.frombuffer(bytearray(value), dtype=torch.uint8).clone().to(self.device)
+
+    def close(self) -> None:
+        """Release cached kernel scratch while preserving each pending invocation's backward values."""
+        super().close()
+        self.scratch.release_owner(self)
 
     def __call__(self, *inputs: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Launch one private invocation without caching current weight addresses.
@@ -122,7 +132,7 @@ class ResidentDenseExecutable(DenseExecutable):
         return _ResidentDenseFunction.apply(self, *inputs)
 
     def forward_values(self, inputs: tuple[torch.Tensor, ...]) -> dict[int, torch.Tensor]:
-        """Allocate private values, joins and workspace and enqueue the resident kernel.
+        """Allocate private values and enqueue the resident kernel using stream-owned scratch.
 
         Args:
             inputs: Exact contiguous caller-owned tokens and weights for this call.
@@ -140,14 +150,14 @@ class ResidentDenseExecutable(DenseExecutable):
         stream = torch.get_device_module(self.device).current_stream(self.device)
         stream.wait_event(self.ready)
         tensors = [values[value_id] for value_id in self.binding.value_ids]
-        pointers = torch.tensor([tensor.data_ptr() for tensor in tensors], dtype=torch.int64).to(self.device)
-        events = torch.zeros(self.tile_plan.event_count * 32, dtype=torch.int32, device=self.device)
-        workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=self.device)
-        overflow = torch.zeros(8, dtype=torch.uint8, device=self.device)
         inputs = [values[value.id] for value in self.plan.ir.inputs]
         outputs = [values[buffer.value_id] for buffer in self.plan.buffers]
-        self.native_ops.launch.default(inputs, outputs, pointers, self.config, self.tilings, events, self.ones,
-                                       workspace, overflow, self.tile_plan.policy.cube_workers)
+        with self.scratch.lease(stream, pointers=len(tensors),
+                                event_elements=self.tile_plan.event_count * 32) as scratch:
+            scratch.prepare(tuple(tensor.data_ptr() for tensor in tensors))
+            self.native_ops.launch.default(inputs, outputs, scratch.pointers, self.config, self.tilings,
+                                           scratch.events, self.ones, scratch.workspace, scratch.overflow,
+                                           self.tile_plan.policy.cube_workers)
 
 
 class _ResidentDenseFunction(torch.autograd.Function):

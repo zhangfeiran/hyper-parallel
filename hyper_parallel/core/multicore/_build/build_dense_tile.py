@@ -38,7 +38,7 @@ from hyper_parallel.core.multicore._build.build_dense import dense_build_identit
 CORE = Path(__file__).resolve().parents[1]
 SOURCES = ("ops/dense/dense_tile_abi.h", "ops/dense/dense_tile_kernel.cpp", "ops/dense/dense_tile_tiling.cpp",
            "ops/dense/dense_tile_launch.cpp", "_build/dense_tile/CMakeLists.txt", "_build/build_dense_tile.py",
-           "compiler/dense_tile.py", "backends/dense_tile.py", "runtime/dense_tile.py")
+           "compiler/dense_tile.py", "backends/dense_tile.py", "runtime/dense_tile.py", "runtime/dense_scratch.py")
 SDK_LIBRARIES = ("libtiling_api.a", "libplatform.so", "libregister.so", "libascendc_runtime.a",
                  "libascendcl.so", "libruntime.so")
 SDK_VERSIONS = ("runtime", "bisheng-compiler", "asc-devkit", "metadef")

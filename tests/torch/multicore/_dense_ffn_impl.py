@@ -83,6 +83,38 @@ def _stream_case(hidden, intermediate, seed, device):
                        weights, baseline, cotangent)
 
 
+def _stream_rows(cases, assignments, outputs, references, scratch_reuse=False):
+    rows = []
+    for case, lane, output, reference in zip(cases, assignments, outputs, references):
+        torch.testing.assert_close(output, reference, rtol=0.02, atol=0.002)
+        pairs = ((case.value.grad, case.reference_value.grad),
+                 (case.weights[0].grad, case.baseline.linear_fc1.weight.grad.t()),
+                 (case.weights[1].grad, case.baseline.linear_fc2.weight.grad.t()))
+        for actual, expected in pairs:
+            torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
+        row = {"tokens": case.value.shape[0], "hidden": case.value.shape[1],
+               "intermediate": case.weights[1].shape[0], "stream_lane": lane,
+               "nondefault_stream": True, "borrowed_weights": True, "close_before_backward": True,
+               "input_versions_preserved": True,
+               "output_max_abs": float((output.float() - reference.float()).abs().max()),
+               "gradient_max_abs": [float((actual.float() - expected.float()).abs().max())
+                                    for actual, expected in pairs]}
+        if scratch_reuse:
+            row.update(scratch_reuse=True, private_scratch_fallback=lane == 2)
+        rows.append(row)
+    return rows
+
+
+def _stream_backward(cases, assignments, streams, outputs, references, initial):
+    for case, lane, output, reference in zip(cases, assignments, outputs, references):
+        with torch.npu.stream(streams[lane]):
+            output.backward(case.cotangent)
+            reference.backward(case.cotangent)
+    for stream in streams:
+        initial.wait_stream(stream)
+    initial.synchronize()
+
+
 def _alternate_streams(hidden, intermediate, device):
     candidate = MegaFFN(hidden, intermediate, create_parameters=False,
                        execution=DenseExecutionConfig(backend="resident_tiles"))
@@ -101,27 +133,47 @@ def _alternate_streams(hidden, intermediate, device):
             raise AssertionError("Dense resident forward must preserve caller input/weight versions")
         payloads = candidate.execution_manifest()
         candidate.close()
-        for case, stream, output, reference in zip(cases, streams, outputs, references):
-            with torch.npu.stream(stream):
-                output.backward(case.cotangent)
-                reference.backward(case.cotangent)
+        assignments = tuple(range(len(streams)))
+        _stream_backward(cases, assignments, streams, outputs, references, initial)
+        rows = _stream_rows(cases, assignments, outputs, references)
+        return rows, payloads
+    finally:
+        candidate.close()
+        for stream in streams:
             initial.wait_stream(stream)
         initial.synchronize()
-        rows = []
-        for lane, (case, output, reference) in enumerate(zip(cases, outputs, references)):
-            torch.testing.assert_close(output, reference, rtol=0.02, atol=0.002)
-            pairs = ((case.value.grad, case.reference_value.grad),
-                     (case.weights[0].grad, case.baseline.linear_fc1.weight.grad.t()),
-                     (case.weights[1].grad, case.baseline.linear_fc2.weight.grad.t()))
-            for actual, expected in pairs:
-                torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
-            rows.append({"tokens": 129, "hidden": hidden, "intermediate": intermediate, "stream_lane": lane,
-                         "nondefault_stream": True, "borrowed_weights": True, "close_before_backward": True,
-                         "input_versions_preserved": True,
-                         "output_max_abs": float((output.float() - reference.float()).abs().max()),
-                         "gradient_max_abs": [float((actual.float() - expected.float()).abs().max())
-                                              for actual, expected in pairs]})
-        return rows, payloads
+
+
+def _scratch_reuse(hidden, intermediate, device):
+    candidate = MegaFFN(hidden, intermediate, create_parameters=False,
+                       execution=DenseExecutionConfig(backend="resident_tiles"))
+    cases = [_stream_case(hidden, intermediate, seed, device) for seed in range(801, 807)]
+    initial = torch.npu.current_stream(device)
+    streams = [torch.npu.Stream(device=device) for _ in range(3)]
+    assignments = (0, 1, 0, 2, 1, 0)
+    outputs, references = [], []
+    versions = [tuple(value._version for value in (case.value, *case.weights)) for case in cases]
+    try:
+        for case, lane in zip(cases, assignments):
+            stream = streams[lane]
+            stream.wait_stream(initial)
+            with torch.npu.stream(stream):
+                outputs.append(candidate(case.value, weights=case.weights))
+                references.append(case.baseline(case.reference_value))
+        # Inspect actual storage ownership independently of numerical agreement.
+        executable = candidate._executables[(129, device)]  # pylint: disable=protected-access
+        statistics = executable.scratch.statistics()
+        if (statistics["cached_streams"], statistics["allocations"], statistics["reuses"]) != (2, 3, 3):
+            raise AssertionError(f"Scratch cache did not stay bounded while reusing streams: {statistics}")
+        if [tuple(value._version for value in (case.value, *case.weights)) for case in cases] != versions:
+            raise AssertionError("Scratch reuse changed caller input/weight versions")
+        payloads = candidate.execution_manifest()
+        candidate.close()
+        if executable.scratch.statistics()["cached_bytes"] != 0:
+            raise AssertionError("Dense close retained cached scratch storage")
+        _stream_backward(cases, assignments, streams, outputs, references, initial)
+        rows = _stream_rows(cases, assignments, outputs, references, scratch_reuse=True)
+        return rows, payloads, statistics
     finally:
         candidate.close()
         for stream in streams:
@@ -178,13 +230,17 @@ def test_dense_ffn_training() -> None:
         stream_rows, stream_payloads = _alternate_streams(hidden, intermediate, device)
         rows.extend(stream_rows)
         payloads.extend(stream_payloads)
+    scratch_rows, scratch_payloads, scratch_statistics = _scratch_reuse(64, 128, device)
+    rows.extend(scratch_rows)
+    payloads.extend(scratch_payloads)
     destination = os.environ.get("HP_FFN_EVIDENCE_DIR")
     if destination:
         directory = Path(destination)
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "component.json").write_text(json.dumps({"torch": torch.__version__,
                                                             "torch_npu": torch_npu.__version__,
-                                                            "cases": rows, "native_payloads": payloads},
+                                                            "cases": rows, "native_payloads": payloads,
+                                                            "scratch_reuse": scratch_statistics},
                                                            indent=2) + "\n", encoding="utf-8")
 
 

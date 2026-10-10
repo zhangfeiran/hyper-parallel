@@ -104,17 +104,29 @@ submits through TorchNPU's task queue in stream order.
 Backward currently reads the exact resident invocation's packed/activation cache
 through the independently generated native provider VJP. Weight gradients retain
 their full token contraction; they are not summed from rounded BF16 tile partials.
-Intermediates, events and workspace belong to each invocation. Checkpoint and
-close use the same module lifecycle as the host backend. Cached metadata has an
-initialization event and all device storage is recorded on the launch stream.
+Intermediates belong to each invocation and remain intact for pending backward.
+Pointer tables, event counters, workspace and overflow storage use a bounded
+per-stream scratch cache shared across layers and token shapes on one device.
+Pointer/event capacity grows to the high watermark and views retain each
+descriptor's exact lengths. Each launch refreshes current tensor addresses and
+resets joins on that stream. Different streams have distinct slots; overlapping
+host calls and streams beyond the two-slot cache use private temporary storage.
+Executables register weak ownership; the last close drops cached scratch while
+queued native launches retain their storage.
+Checkpoint and close use the same module lifecycle as the host backend. Cached
+metadata has an initialization event and all device storage is recorded on the
+launch stream.
 
 Native build/package/load, real host SDK tiling, CPU queue replay and saved-state
 protocol tests have passed. The one-card resident component matrix also passed
 BF16 output and gradient comparisons for empty/tail inputs, checkpoint, pending
 backward after close and two nondefault streams. The two-card BF16 FSDP/SGD
 component gate also passed. Independent complete-model numerical/performance
-acceptance remains separate. Resident backward, scratch-buffer reuse and
-device tuning remain pending; retained forward buffers are intentionally not
+acceptance remains separate. Kernel scratch reuse has passed CPU protocol and
+device cases with changing borrowed weights, repeated streams, private fallback
+and close before backward. The extended component matrix and two-card FSDP/SGD
+regression both passed with shared scratch. Resident backward, intermediate-buffer reuse
+and device tuning remain pending; retained forward buffers are intentionally not
 aliased while backward needs them. CPU native execution is a reference.
 
 The installed `npu_ffn` interface restricts gated activations to FP16 inference;
