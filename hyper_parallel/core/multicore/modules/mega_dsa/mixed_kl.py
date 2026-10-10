@@ -38,6 +38,31 @@ def mixed_kl_workspace_bytes(tokens: int, heads: int) -> int:
     return 20 * per_core + 512 + tokens * 128 * 4
 
 
+def mixed_kl_key_partials(retained: torch.Tensor, *, tokens: int, heads: int) -> torch.Tensor:
+    """Expose the locked non-deterministic KL index-K plane before its BF16 output conversion.
+
+    Args:
+        retained: Invocation-owned contiguous uint8 workspace for the completed
+            init/compute/post phases, with the exact prepared capacity.
+        tokens: Complete global key count, not the local query count.
+        heads: Prepared main attention head count, 32 or 64.
+
+    Returns:
+        FP32 [tokens,128] view sharing the retained storage. The view retains
+        that storage after the result wrapper is released. Read it on the
+        submission stream or wait for that stream's completion event first.
+        Callers retaining gradients independently of workspace mutations must
+        clone or scale this view into their own saved tensors.
+    """
+    required = mixed_kl_workspace_bytes(tokens, heads)
+    if (retained.dtype != torch.uint8 or retained.ndim != 1 or not retained.is_contiguous()
+            or retained.numel() != required or retained.storage_offset() % 4):
+        raise ValueError("KL FP32 key export requires the exact prepared contiguous byte workspace")
+    key_bytes = tokens * 128 * 4
+    # Locked non-deterministic phases keep loss counters before the final FP32 scatter-add plane.
+    return retained[required - key_bytes:required].view(torch.float32).reshape(tokens, 128)
+
+
 @dataclass(frozen=True)
 class MixedKlResult:
     """Owned raw index derivatives and unnormalized KL, plus explicit phase evidence."""
@@ -46,6 +71,15 @@ class MixedKlResult:
     loss: torch.Tensor
     traces: tuple[torch.Tensor, ...]
     retained: torch.Tensor
+    main_heads: int | None = None
+
+    @property
+    def key_partials(self) -> torch.Tensor:
+        """Return the invocation-owned FP32 key plane; auxiliary scaling and owner sum remain external."""
+        if (len(self.gradients) != 3 or self.gradients[1].ndim != 2 or self.gradients[1].shape[1] != 128
+                or self.main_heads is None):
+            raise ValueError("KL key export requires producer-prepared key shape and main-head metadata")
+        return mixed_kl_key_partials(self.retained, tokens=self.gradients[1].shape[0], heads=self.main_heads)
 
 
 def _submit_mixed_kl(main, index, indices, lengths, stats, config, scale):
@@ -69,7 +103,7 @@ def _submit_mixed_kl(main, index, indices, lengths, stats, config, scale):
             query_rope.detach(), key_rope.detach()[:, None],
             lengths, lengths, config, traces[phase], retained, scale, phase,
             gradients[0], gradients[1][:, None], gradients[2], loss)
-    return MixedKlResult(gradients, loss.reshape(()), traces, retained)
+    return MixedKlResult(gradients, loss.reshape(()), traces, retained, query.shape[1])
 
 
 class MixedDsaKlProbe:

@@ -14,6 +14,7 @@
 # ============================================================================
 """CPU ownership/lifetime checks for selected-KL retained phase submission."""
 
+import gc
 import unittest
 from unittest.mock import patch
 
@@ -90,3 +91,42 @@ class TestMixedKl(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "non-deterministic"):
                 self._run(1)
         self.assertEqual(self.phases, [])
+
+
+class TestKlFp32KeyExport(unittest.TestCase):
+    """Byte-plane admission and storage ownership are independent of Native numerical proof."""
+
+    def test_fp32_plane_preserves_values_before_bf16_and_survives_wrapper_release(self):
+        """FP32 partials retain sub-BF16 contributions and ordinary invocation-owned storage."""
+        for heads in (32, 64):
+            with self.subTest(heads=heads):
+                required = mixed_kl.mixed_kl_workspace_bytes(3, heads)
+                retained = torch.empty(required, dtype=torch.uint8)
+                offset = required - 3 * 128 * 4
+                retained[offset - 64:offset].fill_(0xA5)
+                expected = torch.arange(3 * 128, dtype=torch.float32).reshape(3, 128) / 1024 + 256
+                retained[offset:].copy_(expected.contiguous().view(torch.uint8).flatten())
+                derivatives = (torch.zeros(1, 64, 128), expected.bfloat16(), torch.zeros(1, 64))
+                result = mixed_kl.MixedKlResult(derivatives, torch.zeros(()), (), retained, heads)
+                partials = result.key_partials
+                self.assertEqual(partials.dtype, torch.float32)
+                self.assertEqual(partials.untyped_storage().data_ptr(), retained.untyped_storage().data_ptr())
+                torch.testing.assert_close(partials, expected, rtol=0, atol=0)
+                self.assertFalse(torch.equal(partials, derivatives[1].float()))
+                self.assertTrue(bool((retained[offset - 64:offset] == 0xA5).all()))
+                del result, retained
+                gc.collect()
+                torch.testing.assert_close(partials, expected, rtol=0, atol=0)
+
+    def test_wrong_geometry_dtype_and_unaligned_storage_reject(self):
+        """Wrong head counts and byte views cannot silently decode another scratch region."""
+        required = mixed_kl.mixed_kl_workspace_bytes(2, 64)
+        retained = torch.empty(required, dtype=torch.uint8)
+        variants = ((retained, 2, 32), (retained, 1, 64), (retained[:-1], 2, 64),
+                    (torch.empty(2, dtype=torch.float32), 2, 64), (retained.reshape(2, -1), 2, 64),
+                    (torch.empty(required + 1, dtype=torch.uint8)[1:], 2, 64))
+        for workspace, tokens, heads in variants:
+            with self.subTest(tokens=tokens, heads=heads, shape=workspace.shape), self.assertRaises(ValueError):
+                mixed_kl.mixed_kl_key_partials(workspace, tokens=tokens, heads=heads)
+        with self.assertRaisesRegex(ValueError, "metadata"):
+            _ = mixed_kl.MixedKlResult((), torch.zeros(()), (), retained).key_partials

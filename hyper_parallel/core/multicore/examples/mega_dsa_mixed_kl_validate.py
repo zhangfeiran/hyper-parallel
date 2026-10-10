@@ -82,6 +82,11 @@ def _case(report, heads, lengths, device, weight_dtype):
         torch.npu.synchronize()
         for repeat, result in enumerate(retained):
             baseline, oracle_values, stock = fixtures[repeat][3:]
+            key_partials = result.key_partials
+            torch.testing.assert_close(key_partials.bfloat16(), result.gradients[1], rtol=0, atol=0)
+            key_partial_oracle = _metrics(key_partials, oracle_values[1])
+            if not (key_partial_oracle["relative_l2"] <= .02 or key_partial_oracle["max_abs"] <= 2e-5):
+                raise RuntimeError(f"mixed KL FP32 key partial oracle mismatch: {key_partial_oracle}")
             actual = (*result.gradients, result.loss)
             native_metrics, fp32_metrics = [], []
             for name, value, expected, independent in zip(
@@ -95,6 +100,10 @@ def _case(report, heads, lengths, device, weight_dtype):
                     "native_backend": "omni" if weight_dtype == torch.bfloat16 else "stock",
                     "native": native_metrics, "fp32": fp32_metrics,
                     "stock": [_metrics(value, expected) for value, expected in zip(actual, stock)],
+                    "key_fp32_export": {"dtype": str(key_partials.dtype), "shape": list(key_partials.shape),
+                                        "aliases_retained": (key_partials.untyped_storage().data_ptr()
+                                                             == result.retained.untyped_storage().data_ptr()),
+                                        "bf16_cast_bits_exact": True, "oracle": key_partial_oracle},
                     "trace": probe.validate_trace(result, tuple(trace.cpu() for trace in result.traces))}
             report["cases"].append(case)
             if not all(item["pointwise_pass"] for item in case["stock"]):
