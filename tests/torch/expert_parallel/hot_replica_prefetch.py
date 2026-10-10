@@ -26,6 +26,7 @@ from unittest.mock import patch
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica.pool import ReplicaPool
+from hyper_parallel.core.expert_parallel.hot_replica import signal_transport
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import SignalReplicaTransport
 from hyper_parallel.core.multicore import shmem
 
@@ -102,7 +103,8 @@ class PrefetchMeasurements:
         Args:
             patches: Scope that restores every original callable on exit.
         """
-        ordinary = ((torch, "tensor", "prefetch_epoch_tensor"),
+        ordinary = ((signal_transport, "_async_device_bytes", "prefetch_epoch_upload"),
+                    (torch, "tensor", "prefetch_epoch_tensor"),
                     (torch.Tensor, "contiguous", "prefetch_source_contiguous"),
                     (torch.Tensor, "zero_", "prefetch_zero_enqueue"),
                     (torch.Tensor, "fill_", "prefetch_fill_enqueue"),

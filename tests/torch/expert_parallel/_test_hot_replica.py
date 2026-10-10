@@ -209,7 +209,7 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
 
 def _cross_stream_deferred(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,
                            reference, replica_planner, *, runtime_version=2):
-    """Check per-launch tails and image ownership on two streams with reverse backward."""
+    """Check leased image reuse and per-launch tails on two streams with reverse backward."""
     function = importlib.import_module("hyper_parallel.core.multicore.modules.mega_moe.function")
     launches, snapshots, images = [], [], []
 
@@ -252,8 +252,9 @@ def _check_runtime_direction(records, runtime_version, direction):
     """Require two actual streams and the expected image and epoch ownership."""
     if len(records) != 2 or len({item["stream"] for item in records}) != 2:
         raise AssertionError(f"Expected two actual {direction} streams: {records}")
-    expected_images = 1 if runtime_version == 2 else 2
-    if len({item["image_pointer"] for item in records}) != expected_images:
+    # The workspace lease orders dynamic suffix updates after the prior consumer;
+    # each launch's snapshot and numerical result must still retain its own epoch.
+    if len({item["image_pointer"] for item in records}) != 1:
         raise AssertionError(f"Unexpected {direction} runtime image ownership: {records}")
     tails = [bytes.fromhex(item["suffix"]) for item in records]
     if any(int.from_bytes(tail[4:8], "little") != runtime_version for tail in tails):
