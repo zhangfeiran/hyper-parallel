@@ -1689,3 +1689,62 @@ nonzero native KL retains nine phases and the explicit reference fixture uses fu
 transfer. Source, activated payload and actually loaded library hashes are recorded
 with the per-rank evidence. These results do not close the full-model BF16 gap or
 establish complete-step speedup; full transfer remains the default.
+
+## Compact local-query indexer preparation
+
+[Local query layout](local_query.py) packs caller-local rows in sequence/global-position
+order, stores genuine local cumulative query counts and sequence-relative logical
+positions, and restores native output to caller order. Empty sequence buckets retain
+repeated cumulative values; an empty owner has zero query/weight/position rows.
+Prepared metadata is checked for both mutation and tensor replacement before native
+loading. The local indexer probe performs no Q/index-Q/weight collective and reads
+canonical complete index K.
+
+The existing mixed-indexer operator accepts an optional query-position tensor. Its
+arch22 vector mask uses each row's explicit position plus one, preserving exact
+causal candidates for interior and zigzag rows. For sorted distinct positions p_i
+in a sequence of length L with m local queries, p_i <= L-m+i: the existing right-down
+Cube work partition is conservative and never omits a true candidate. This first
+implementation retains those conservative key scans; it does not yet implement
+position-aware cost partitioning or streaming index K.
+
+Local LI main/merge retain the reserved mixed team's two device phase closures and
+scratch reuse. Empty owners skip arithmetic while participating in both closures,
+with no fabricated query row or length. Actual CANN 9.1/Ascend910b build and execution
+accept zero-row query/weight/output descriptors while closing both phases. The
+full-query product backend remains the accepted training path.
+The framework-free local-indexer launchers cover concurrent CP1/CP2/CP4 ownership,
+packed empty buckets, explicit interior positions, BF16/FP32 weights and native
+K2048 truncation. This preparatory probe has no SHMEM transport or autograd, and
+therefore does not establish local-query LM+KL training acceptance.
+
+The complete local-query path still requires selected membership over local rows,
+SFA/main backward with empty-owner ready/ACK, local loss contributions without a
+replicated 1/CP factor, and index-K FP32 partial owner sums before casting. Sparse
+gradient membership must follow selected indices rather than zero-valued gradients.
+CP8/CP×TP, model stability, coexistence and complete-step performance remain open.
+
+
+The local LI CP1/CP2/CP4 matrices pass seven rank reports and 350 scenarios, with
+700 forwards and same-stream scratch reuse. They include 140 long-history cases,
+175 FP32-weight cases (70 long), 50 empty-owner cases, groups 1/7/19 and 82,098
+rows whose exact causal bound is strictly smaller than right-down. All tested
+selected sets and BF16 values match full stock LI exactly; independent explicit
+position/random-short and analytic-long oracles pass. Empty owners allocate zero
+arithmetic scratch. No local query/weight collective is performed by the probe.
+
+The rebuilt payload passes 36 full-LI short/long regression cases, 48 standalone
+six-phase arithmetic cases and fresh full/selected CP4 training regressions. Each
+training mode passes 80 positive scenarios, four expected reference FP32-KL
+rejections and 500 native pointwise gradient comparisons. Four supplementary CP4
+identity reports capture the actual framework bridge and host libraries, alongside
+per-rank numerical evidence. Source/payload/library hashes match; patch context
+normalization preserves all five assembled LI source files byte-for-byte. Fourteen
+unaffected device objects keep their previous hashes. CPU regression passes 209
+tests and 362 subtests; lint, edited native formatting, launcher import isolation,
+documentation links and the AGENTS catalog pass.
+
+These are local-indexer and existing-training regression results. They do not prove
+local-query SFA/KL/backward, reduced end-to-end memory, full-model BF16 acceptance
+or training-step speedup. Those remaining contracts follow the implementation
+sequence above; the original multi-card CP and fused-execution goal remains active.

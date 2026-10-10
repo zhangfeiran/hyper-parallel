@@ -27,13 +27,13 @@ OP_TYPE_REGISTER(HyperDsaMixedIndexer);
 }
 using l0op::HyperDsaMixedIndexerOpTypeId;
 
-extern "C" aclnnStatus aclnnHyperDsaMixedIndexerGetWorkspaceSize(
-    const aclTensor *query, const aclTensor *key, const aclTensor *weights,
-    const aclTensor *actualQuery, const aclTensor *actualKv, const aclTensor *config,
-    const aclTensor *trace, const aclTensor *retained, int64_t mergePhase,
-    const aclTensor *indices, const aclTensor *values, uint64_t *workspaceSize, aclOpExecutor **executor) {
+namespace {
+aclnnStatus BuildIndexer(const aclTensor *query, const aclTensor *key, const aclTensor *weights,
+                         const aclTensor *actualQuery, const aclTensor *actualKv, const aclTensor *config,
+                         const aclTensor *trace, const aclTensor *retained, int64_t mergePhase,
+                         const aclTensor *indices, const aclTensor *values, uint64_t *workspaceSize,
+                         aclOpExecutor **executor, const aclTensor *queryPositions) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
-  L2_DFX_PHASE_1(aclnnHyperDsaMixedIndexer, DFX_IN(query, key, weights, config), DFX_OUT(indices, values));
   auto owner = CREATE_EXECUTOR();
   CHECK_RET(owner.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
   auto *queryCont = l0op::Contiguous(query, owner.get());
@@ -62,7 +62,8 @@ extern "C" aclnnStatus aclnnHyperDsaMixedIndexerGetWorkspaceSize(
   auto launch = [&](aclOpExecutor *executor) {
     return ADD_TO_LAUNCHER_LIST_AICORE(
       HyperDsaMixedIndexer,
-      OP_INPUT(queryCont, keyCont, weightsCont, actualQueryCont, actualKvCont, blockTable, config, trace, retained),
+      OP_INPUT(queryCont, keyCont, weightsCont, actualQueryCont, actualKvCont, blockTable, config, trace, retained,
+               queryPositions),
       OP_OUTPUT(indicesMutable, valuesMutable),
       OP_ATTR(layout, layout, sparseCount, mode, preTokens, nextTokens, returnValues, mergePhase));
   };
@@ -75,8 +76,40 @@ extern "C" aclnnStatus aclnnHyperDsaMixedIndexerGetWorkspaceSize(
   return ACLNN_SUCCESS;
 }
 
-extern "C" aclnnStatus aclnnHyperDsaMixedIndexer(
-    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+}  // namespace
+
+extern "C" aclnnStatus aclnnHyperDsaMixedIndexerGetWorkspaceSize(const aclTensor *query, const aclTensor *key,
+                                                                 const aclTensor *weights, const aclTensor *actualQuery,
+                                                                 const aclTensor *actualKv, const aclTensor *config,
+                                                                 const aclTensor *trace, const aclTensor *retained,
+                                                                 int64_t mergePhase, const aclTensor *indices,
+                                                                 const aclTensor *values, uint64_t *workspaceSize,
+                                                                 aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaMixedIndexer, DFX_IN(query, key, weights, config), DFX_OUT(indices, values));
+  return BuildIndexer(query, key, weights, actualQuery, actualKv, config, trace, retained, mergePhase, indices, values,
+                      workspaceSize, executor, nullptr);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaLocalIndexerGetWorkspaceSize(const aclTensor *query, const aclTensor *key,
+                                                                 const aclTensor *weights, const aclTensor *actualQuery,
+                                                                 const aclTensor *actualKv, const aclTensor *config,
+                                                                 const aclTensor *trace, const aclTensor *retained,
+                                                                 const aclTensor *queryPositions,
+                                                                 const aclTensor *indices, const aclTensor *values,
+                                                                 uint64_t *workspaceSize, aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaLocalIndexer, DFX_IN(query, key, weights, config), DFX_OUT(indices, values));
+  return BuildIndexer(query, key, weights, actualQuery, actualKv, config, trace, retained, 2, indices, values,
+                      workspaceSize, executor, queryPositions);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaLocalIndexer(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                 aclrtStream stream) {
+  L2_DFX_PHASE_2(aclnnHyperDsaLocalIndexer);
+  return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaMixedIndexer(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                 aclrtStream stream) {
   L2_DFX_PHASE_2(aclnnHyperDsaMixedIndexer);
   return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
 }

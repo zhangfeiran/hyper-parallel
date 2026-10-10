@@ -88,7 +88,8 @@ void ConfigureIo(gert::OpTilingContextBuilder &builder, std::array<gert::Tensor,
   const std::vector<gert::Tensor *> sfaOutputs = {&outputs[2], &outputs[3], &outputs[4]};
   if (indexer) {
     builder.OpType(ge::AscendString("HyperDsaMixedIndexer"))
-        .IOInstanceNum({1, 1, 1, 1, 1, 0, 1, 1, 1}, {1, 1}).InputTensors(liInputs).OutputTensors(liOutputs);
+        .IOInstanceNum({1, 1, 1, 1, 1, 0, 1, 1, 1, 0}, {1, 1})
+        .InputTensors(liInputs).OutputTensors(liOutputs);
     IndexerAttrs(builder);
   } else {
     builder.OpType(ge::AscendString("HyperDsaMixedTile"))

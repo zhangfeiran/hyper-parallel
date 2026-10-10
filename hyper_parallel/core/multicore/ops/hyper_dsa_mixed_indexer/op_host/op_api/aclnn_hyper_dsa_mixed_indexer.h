@@ -21,13 +21,24 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-ACLNN_API aclnnStatus aclnnHyperDsaMixedIndexerGetWorkspaceSize(
-    const aclTensor *query, const aclTensor *key, const aclTensor *weights,
-    const aclTensor *actualQuery, const aclTensor *actualKv, const aclTensor *config,
-    const aclTensor *trace, const aclTensor *retained, int64_t mergePhase,
-    const aclTensor *indices, const aclTensor *values, uint64_t *workspaceSize, aclOpExecutor **executor);
-ACLNN_API aclnnStatus aclnnHyperDsaMixedIndexer(
-    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
+ACLNN_API aclnnStatus aclnnHyperDsaMixedIndexerGetWorkspaceSize(const aclTensor *query, const aclTensor *key,
+                                                                const aclTensor *weights, const aclTensor *actualQuery,
+                                                                const aclTensor *actualKv, const aclTensor *config,
+                                                                const aclTensor *trace, const aclTensor *retained,
+                                                                int64_t mergePhase, const aclTensor *indices,
+                                                                const aclTensor *values, uint64_t *workspaceSize,
+                                                                aclOpExecutor **executor);
+ACLNN_API aclnnStatus aclnnHyperDsaMixedIndexer(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                aclrtStream stream);
+ACLNN_API aclnnStatus aclnnHyperDsaLocalIndexerGetWorkspaceSize(const aclTensor *query, const aclTensor *key,
+                                                                const aclTensor *weights, const aclTensor *actualQuery,
+                                                                const aclTensor *actualKv, const aclTensor *config,
+                                                                const aclTensor *trace, const aclTensor *retained,
+                                                                const aclTensor *queryPositions,
+                                                                const aclTensor *indices, const aclTensor *values,
+                                                                uint64_t *workspaceSize, aclOpExecutor **executor);
+ACLNN_API aclnnStatus aclnnHyperDsaLocalIndexer(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                aclrtStream stream);
 #ifdef __cplusplus
 }
 #endif

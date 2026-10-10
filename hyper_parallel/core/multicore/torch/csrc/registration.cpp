@@ -49,6 +49,10 @@ void register_dsa_probes(torch::Library& m) {
     "Tensor(p!) arena, Tensor metadata, Tensor requests, Tensor(q!) transport_trace, "
     "Tensor selected_rows, Tensor(r!) membership, Tensor(s!) selected_requests, Tensor(t!) selected_counts) "
     "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(j!), Tensor(k!))");
+  m.def("dsa_local_indexer_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_local_indexer_out(Tensor query, Tensor key, Tensor weights, Tensor actual_query, Tensor actual_kv, "
+        "Tensor config, Tensor(c!) trace, Tensor(d!) retained, Tensor query_positions, "
+        "Tensor(a!) indices, Tensor(b!) values) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!))");
   m.def("dsa_mixed_kl_version() -> int", []() -> int64_t { return 1; });
   m.def("dsa_mixed_kl_out(Tensor query, Tensor key, Tensor index_query, Tensor index_key, Tensor weight, "
         "Tensor indices, Tensor maximum, Tensor sum, Tensor query_rope, Tensor key_rope, "

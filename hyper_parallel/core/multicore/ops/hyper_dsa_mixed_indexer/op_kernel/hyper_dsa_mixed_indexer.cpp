@@ -43,25 +43,25 @@ __aicore__ inline uint32_t PhysicalGroup() {
 }
 
 __aicore__ inline bool ValidConfig(GlobalTensor<int64_t> &config, uint32_t groups, uint32_t physicalCount) {
-  return config.GetValue(0) == kMixedMagic && config.GetValue(1) == 1 &&
-         groups > 0 && groups < physicalCount && config.GetValue(3) == 1;
+  return config.GetValue(0) == kMixedMagic && config.GetValue(1) == 1 && groups > 0 && groups < physicalCount &&
+         config.GetValue(3) == 1;
 }
-template<typename TileType>
-__aicore__ inline void RunPhase(
-    __gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
-    __gm__ uint8_t *actualQuery, __gm__ uint8_t *actualKv, __gm__ uint8_t *blockTable,
-    __gm__ uint8_t *indices, __gm__ uint8_t *values, __gm__ uint8_t *retained, const LITilingData *data,
-    GlobalTensor<int64_t> &trace, uint32_t group, uint32_t groups, uint32_t physicalCount, bool mergePhase) {
+template <typename TileType>
+__aicore__ inline void RunPhase(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
+                                __gm__ uint8_t *actualQuery, __gm__ uint8_t *actualKv, __gm__ uint8_t *blockTable,
+                                __gm__ uint8_t *indices, __gm__ uint8_t *values, __gm__ uint8_t *retained,
+                                const LITilingData *data, GlobalTensor<int64_t> &trace, uint32_t group, uint32_t groups,
+                                uint32_t physicalCount, bool mergePhase, __gm__ uint8_t *queryPositions) {
   uint32_t count = 0;
   uint32_t checksum = 0;
   uint32_t ldCount = 0;
   for (uint32_t logical = group; logical < physicalCount; logical += groups) {
     const uint32_t ticket = Dispatch(trace, group * kGroupWords, logical);
-    {
+    if (data->queryTokens != 0) {
       TPipe pipe;
       LIKernel::LightningIndexerKernel<TileType> tile;
-      tile.Init(query, key, weights, actualQuery, actualKv, blockTable, indices, values,
-                retained, data, &pipe, ticket, physicalCount, group, physicalCount, mergePhase);
+      tile.Init(query, key, weights, actualQuery, actualKv, blockTable, indices, values, retained, data, &pipe, ticket,
+                physicalCount, group, physicalCount, mergePhase, queryPositions);
       ldCount += tile.IsLdPartition() ? 1 : 0;
       tile.ProcessPhase(mergePhase);
     }
@@ -96,16 +96,17 @@ __aicore__ inline void ClosePhase(GlobalTensor<int64_t> &trace, uint32_t groups,
 
 }  // namespace
 
-
-template<int DT_Q, int DT_K, int DT_OUT, int PAGE_ATTENTION, int LAYOUT_T, int K_LAYOUT_T, int DT_W_FLAG>
-__global__ __aicore__ void hyper_dsa_mixed_indexer(
-    __gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
-    __gm__ uint8_t *actualQuery, __gm__ uint8_t *actualKv, __gm__ uint8_t *blockTable,
-    __gm__ uint8_t *runtimeConfig, __gm__ uint8_t *groupTrace, __gm__ uint8_t *retained,
-    __gm__ uint8_t *indices, __gm__ uint8_t *values, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling) {
+template <int DT_Q, int DT_K, int DT_OUT, int PAGE_ATTENTION, int LAYOUT_T, int K_LAYOUT_T, int DT_W_FLAG>
+__global__ __aicore__ void hyper_dsa_mixed_indexer(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
+                                                   __gm__ uint8_t *actualQuery, __gm__ uint8_t *actualKv,
+                                                   __gm__ uint8_t *blockTable, __gm__ uint8_t *runtimeConfig,
+                                                   __gm__ uint8_t *groupTrace, __gm__ uint8_t *retained,
+                                                   __gm__ uint8_t *queryPositions, __gm__ uint8_t *indices,
+                                                   __gm__ uint8_t *values, __gm__ uint8_t *workspace,
+                                                   __gm__ uint8_t *tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-  if constexpr (DT_Q != LI_TPL_BF16 || DT_K != LI_TPL_BF16 || PAGE_ATTENTION ||
-                LAYOUT_T != LI_LAYOUT_TND || K_LAYOUT_T != LI_LAYOUT_TND) {
+  if constexpr (DT_Q != LI_TPL_BF16 || DT_K != LI_TPL_BF16 || PAGE_ATTENTION || LAYOUT_T != LI_LAYOUT_TND ||
+                K_LAYOUT_T != LI_LAYOUT_TND) {
     return;
   }
   GlobalTensor<int64_t> config;
@@ -131,10 +132,10 @@ __global__ __aicore__ void hyper_dsa_mixed_indexer(
       continue;
     }
     const bool mergePhase = fused ? phase == 1 : tilingData.mergePhase != 0;
-    using TileType = LICommon::LIType<bfloat16_t, bfloat16_t, int32_t, false,
-        LICommon::LI_LAYOUT::TND, LICommon::LI_LAYOUT::TND, DT_W_FLAG>;
-    RunPhase<TileType>(query, key, weights, actualQuery, actualKv, blockTable, indices, values,
-                       retained, &tilingData, trace, group, groups, physicalCount, mergePhase);
+    using TileType = LICommon::LIType<bfloat16_t, bfloat16_t, int32_t, false, LICommon::LI_LAYOUT::TND,
+                                      LICommon::LI_LAYOUT::TND, DT_W_FLAG>;
+    RunPhase<TileType>(query, key, weights, actualQuery, actualKv, blockTable, indices, values, retained, &tilingData,
+                       trace, group, groups, physicalCount, mergePhase, queryPositions);
     if (fused) {
       ArriveAndWait(trace, group, groups, phase + 1);
     }

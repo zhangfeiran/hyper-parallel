@@ -72,6 +72,11 @@
             "purpose": "retain logical LI partial Top-K across reusable mixed groups and separate main/LD merge kernel phases"
           },
           {
+            "path": "hyper_parallel/core/multicore/ops/lightning_indexer_query_positions.patch",
+            "sha256": "226bbeddffce34874710e6c73c284fde94947ed83181512273fe5ee44914cd4e",
+            "purpose": "apply explicit sequence-relative causal positions to compact local-query LI with genuine empty query ownership"
+          },
+          {
             "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_grad_mixed.patch",
             "sha256": "8110811605ef4921a7a11081d0f7f1a5926c103effd26f7ea1493d7bcf38e4a9",
             "purpose": "separate SFA gradient initialization, physical mixed scratch and logical query/post partitions across three retained-workspace phases"

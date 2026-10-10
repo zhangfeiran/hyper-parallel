@@ -1,0 +1,135 @@
+diff --git a/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_kernel.h b/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_kernel.h
+index bb555f72..b8bb0be9 100644
+--- a/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_kernel.h
++++ b/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_kernel.h
+@@ -59,6 +59,7 @@ public:
+                                 __gm__ uint8_t *blockTable, __gm__ uint8_t *sparseIndices, __gm__ uint8_t *sparseValues,
+                                 __gm__ uint8_t *workspace, const LITilingData *__restrict tiling, TPipe *tPipe,
+                                 uint32_t logicalId, uint32_t logicalCount,
+-                                uint32_t scratchId, uint32_t scratchCount, bool mergePhase);
++                                uint32_t scratchId, uint32_t scratchCount, bool mergePhase,
++                                __gm__ uint8_t *queryPositions = nullptr);
+     __aicore__ inline void ProcessPhase(bool mergePhase);
+     __aicore__ inline bool IsLdPartition() const { return splitCoreInfo.isLD && aiCoreIdx < usedCoreNum; }
+@@ -403,7 +404,8 @@ __aicore__ inline void LightningIndexerKernel<LIT>::Init(__gm__ uint8_t *query,
+                                             __gm__ uint8_t *sparseValues,
+                                             __gm__ uint8_t *workspace, const LITilingData *__restrict tiling,
+                                             TPipe *tPipe, uint32_t logicalId, uint32_t logicalCount,
+-                                            uint32_t scratchId, uint32_t scratchCount, bool mergePhase)
++                                            uint32_t scratchId, uint32_t scratchCount, bool mergePhase,
++                                            __gm__ uint8_t *queryPositions)
+ {
+     aiCoreIdx = logicalId;
+     tmpBlockIdx = logicalId;
+@@ -440,5 +442,6 @@ __aicore__ inline void LightningIndexerKernel<LIT>::Init(__gm__ uint8_t *query,
+     if ASCEND_IS_AIV {
+         vectorService.InitParams(constInfo, tiling, tmpBlockIdx);
++        vectorService.InitQueryPositions(queryPositions);
+         indiceOutGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
+         valueOutGm.SetGlobalBuffer((__gm__ K_T *)sparseValues);
+         weightsGm.SetGlobalBuffer((__gm__ W_T *)weights);
+diff --git a/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_service_vector.h b/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_service_vector.h
+index 6d4e8985..0f84d960 100644
+--- a/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_service_vector.h
++++ b/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_service_vector.h
+@@ -61,6 +61,13 @@ public:
+     using MM1_OUT_T = float;
+
+     __aicore__ inline LightningIndexerServiceVector(){};
++    __aicore__ inline void InitQueryPositions(__gm__ uint8_t *positions)
++    {
++        hasQueryPositions_ = positions != nullptr;
++        if (hasQueryPositions_) {
++            queryPositionsGm_.SetGlobalBuffer((__gm__ int64_t *)positions);
++        }
++    }
+     __aicore__ inline void ProcessVec(const LICommon::RunInfo &info);
+     __aicore__ inline void ProcessLD();
+     __aicore__ inline void InitBuffers(TPipe *pipe);
+@@ -78,6 +85,8 @@ protected:
+     GlobalTensor<MM1_OUT_T> mm1ResGm;
+     GlobalTensor<float> vec1ResGm;
+     GlobalTensor<int64_t> vec1ParamGm;
++    GlobalTensor<int64_t> queryPositionsGm_;
++    bool hasQueryPositions_ = false;
+     GlobalTensor<W_T> weightsGm;
+     GlobalTensor<int32_t> indiceOutGm;
+     GlobalTensor<K_T> valueOutGm;
+@@ -310,8 +319,13 @@ __aicore__ inline void LightningIndexerServiceVector<LIT>::ProcessVec(const LICo
+         if (constInfo_.attenMaskFlag) {
+             cuRealAcSeq += 1;
+         }
+-        int32_t cuS2Len = cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq ? cuRealAcSeq - cuBaseS2Idx : s2BaseSize_;
+         int32_t cuS1Idx = cuS1BeginIdxPerAiv + innerS1Idx;
++        if (hasQueryPositions_) {
++            const uint64_t row = info.indiceOutOffset / constInfo_.sparseCount + cuS1Idx;
++            cuRealAcSeq = static_cast<int32_t>(Max(int64_t{0}, Min(
++                queryPositionsGm_.GetValue(row) + 1, static_cast<int64_t>(info.actS2Size))));
++        }
++        int32_t cuS2Len = cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq ? cuRealAcSeq - cuBaseS2Idx : s2BaseSize_;
+         if (cuRealAcSeq > 0 && cuS2Len > 0) {
+             int32_t cuS2LenVecAlign = CeilDiv(cuS2Len, s2BaseSize_) * s2BaseSize_;
+             int32_t mmUbStride = (cuS2LenVecAlign - info.actualSingleProcessSInnerSizeAlign) / B32_BLOCK_ALIGN_NUM;
+diff --git a/attention/lightning_indexer/op_host/lightning_indexer_def.cpp b/attention/lightning_indexer/op_host/lightning_indexer_def.cpp
+index eff89646..b9842c37 100644
+--- a/attention/lightning_indexer/op_host/lightning_indexer_def.cpp
++++ b/attention/lightning_indexer/op_host/lightning_indexer_def.cpp
+@@ -56,6 +56,8 @@ public:
+             .FormatList({ge::FORMAT_ND});
+         this->Input("tile_workspace").ParamType(REQUIRED).DataTypeList({ge::DT_UINT8})
+             .FormatList({ge::FORMAT_ND});
++        this->Input("query_positions").ParamType(OPTIONAL).DataTypeList({ge::DT_INT64})
++            .FormatList({ge::FORMAT_ND}).AutoContiguous();
+         this->Output("sparse_indices")
+             .ParamType(REQUIRED)
+             .DataTypeList({ge::DT_INT32})
+diff --git a/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp b/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
+index dfa09dc2..45adc631 100644
+--- a/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
++++ b/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
+@@ -879,7 +879,8 @@ ge::graphStatus LIInfoParser::CheckFeatureMlaNoQuantShape() const
+             return ge::GRAPH_FAILED);
+
+         uint32_t qTsize = opParamInfo_.query.shape->GetStorageShape().GetDim(0);
+-        OP_CHECK_IF(qTsize <= 0 && (qLayout_ == DataLayout::TND),
++        OP_CHECK_IF(qTsize <= 0 && (qLayout_ == DataLayout::TND) &&
++                    context_->GetOptionalInputDesc(9) == nullptr,
+             OP_LOGE_FOR_INVALID_SHAPESIZES_WITH_REASON(opName_, "query",
+                 std::to_string(qTsize).c_str(),
+                 "TND case input query dim 0 should be greater than 0"),
+@@ -994,7 +995,15 @@ ge::graphStatus LightningIndexerTiling::DoTiling(LITilingInfo *tilingInfo)
+                 "Mixed LI requires 20/40 cores, BF16 TND H64/K2048 and valid runtime metadata");
+         return ge::GRAPH_FAILED;
+     }
+-    const uint64_t required = LiCalcWorkspaceSize(ascendcPlatform, tilingInfo->s2Size, aicNum) -
++    const auto queryTokens = context_->GetRequiredInputShape(0)->GetStorageShape().GetDim(0);
++    const auto *positions = context_->GetOptionalInputShape(9);
++    if (context_->GetOptionalInputDesc(9) != nullptr &&
++        (positions == nullptr || positions->GetStorageShape().GetDimNum() != 1 ||
++         positions->GetStorageShape().GetShapeSize() != queryTokens ||
++         context_->GetOptionalInputDesc(9)->GetDataType() != ge::DT_INT64)) {
++        return ge::GRAPH_FAILED;
++    }
++    const uint64_t required = queryTokens == 0 ? 0 : LiCalcWorkspaceSize(ascendcPlatform, tilingInfo->s2Size, aicNum) -
+                               ascendcPlatform.GetLibApiWorkSpaceSize();
+     if (retained->GetStorageShape().GetShapeSize() < static_cast<int64_t>(required)) {
+         OP_LOGE(context_->GetNodeName(), "Mixed LI retained workspace is too small");
+@@ -1019,6 +1028,7 @@ ge::graphStatus LightningIndexerTiling::DoTiling(LITilingInfo *tilingInfo)
+     tilingData_.set_nextTokens(tilingInfo->nextTokens);
+     tilingData_.set_returnValue(tilingInfo->returnValue);
+     tilingData_.set_mergePhase(*phase);
++    tilingData_.set_queryTokens(queryTokens);
+     tilingData_.set_usedCoreNum(blockDim);
+     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
+     context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
+diff --git a/attention/lightning_indexer/op_host/lightning_indexer_tiling.h b/attention/lightning_indexer/op_host/lightning_indexer_tiling.h
+index e768699c..6a0406b6 100644
+--- a/attention/lightning_indexer/op_host/lightning_indexer_tiling.h
++++ b/attention/lightning_indexer/op_host/lightning_indexer_tiling.h
+@@ -97,5 +97,6 @@ TILING_DATA_FIELD_DEF(int64_t, preTokens)
+ TILING_DATA_FIELD_DEF(int64_t, nextTokens)
+ TILING_DATA_FIELD_DEF(uint32_t, returnValue)
+ TILING_DATA_FIELD_DEF(uint32_t, mergePhase)
++TILING_DATA_FIELD_DEF(uint64_t, queryTokens)
+ END_TILING_DATA_DEF
+ REGISTER_TILING_DATA_CLASS(HyperDsaMixedIndexer, LITilingData)
