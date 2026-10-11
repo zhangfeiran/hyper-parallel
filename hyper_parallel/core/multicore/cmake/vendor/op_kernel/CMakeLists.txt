@@ -50,6 +50,16 @@ npu_op_kernel_sources(ascendc_kernels
 
 if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
     npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE HyperDsaTpTileSum
+        KERNEL_DIR ./hyper_dsa_tp_tile_sum/op_kernel
+        KERNEL_FILE hyper_dsa_tp_tile_sum.cpp
+        COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+    )
+    npu_op_kernel_options(ascendc_kernels OP_TYPE HyperDsaTpTileSum OPTIONS
+        --cce-auto-sync=off -Wno-deprecated-declarations
+        -mllvm -cce-vf-remove-membar=false
+        -mllvm -cce-aicore-hoist-movemask=false)
+    npu_op_kernel_sources(ascendc_kernels
         OP_TYPE HyperDsaIndexGradReturn
         KERNEL_DIR ./hyper_dsa_index_grad_return/op_kernel
         KERNEL_FILE hyper_dsa_index_grad_return.cpp

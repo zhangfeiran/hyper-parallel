@@ -2488,3 +2488,38 @@ python -m torch.distributed.run --standalone --nproc-per-node=4 \
 审核结果在 `build/native/validation/mega-dsa-tp-collectives-20261011/collectives_audit.json`；
 这是 CPU FP64 通信与数学证据。native LI 的 pre-Top-K score 交换、native KL 的 teacher
 交换、真实 TP 模型接线和 NPU CP×TP 验收仍待实现；`FusedDsaCpAttention` 继续拒绝 TP。
+
+### Native TP tile 传输 probe
+
+[TpTileSumProbe](tp_tile_sum.py) 对应独立算子 `HyperDsaTpTileSum`，用于先验收 LI score 和
+KL teacher 交换所需的 bounded FP32 SUM 协议。它使用包含所有参与组的 SHMEM root，
+支持显式 TP subgroup-to-root PE mapping；inactive root 成员保持相同的 reserve/bind/free
+顺序。该 probe 当前独立于 LI/SFA/KL，不构成 native CP×TP attention 接线。
+
+每个 runnable vector slot 持有一个 source tile 与十条独立 control cache line：ready、
+geometry/invocation signature 和最多八个读者 ACK。slot 数最多 40，width 为八对齐的
+`8..2048` FP32 元素。slot 在下一轮写入前等待上一轮所有 ACK，peer 按固定 TP 顺序
+累加；最后一轮也等待所有读者结束。scratch 仅随 slots/width 增长，与 scan rounds
+无关；identity 包含 invocation、layer、microbatch、heap generation 和 ordered-row signature。
+
+准备后的 metadata 检查 Tensor version，单个 arena 的 epoch 单调递增，修改 metadata、
+重用旧 epoch、错误 dtype/shape、active autograd input 或缺少载荷 capability 都提前拒绝。
+运行取得 shared-root lease，并在当前 stream 记录完成事件。saved activation/output
+由 caller 持有；关闭时 root 全员同步并释放一个 arena。
+
+[mega_dsa_tp_tile_sum_validate.py](../../examples/mega_dsa_tp_tile_sum_validate.py) 准备四卡
+TP1、单个 `(1,3)` subgroup、两个 independent subgroups 和 TP4 矩阵，包含 slots/width
+`(1,8)/(7,512)/(40,2048)`、rounds `1/17/257`、跨 stream 的 nonzero→zero→nonzero
+复用、NaN/Inf 与最终 ready/ACK 检查。对照为固定 TP 顺序的 CPU FP32 SUM，阈值
+`rtol=0, atol=0, equal_nan=True`。矩阵的运行状态与冻结载荷记录在
+`build/native/validation/mega-dsa-tp-tile-sum-20261011/`。
+
+完整 native 构建及四卡传输矩阵已通过，共 378 个 rank-case；所有输出、zero replay 和
+最终 ready/ACK 检查通过，固定顺序 CPU FP32 SUM 精确一致。源码、95 个冻结载荷文件
+以及实际加载库 SHA 已核对，审核结果为 `tile_sum_audit.json`。构建使用同一套 CANN
+built-in 文件的本地 OPP 视图，首轮全局 vendor configuration 权限失败与首次 worker
+导入路径错误均单独归档。CPU megaDSA/SHMEM 回归通过 314 个测试、668 个 subtest。
+
+同一新载荷的真实 BF16 attention CP subgroup 回归任务独立记录在 `model_regression/`，
+其硬件结果尚待验收。以上传输通过不建立 native LI pre-Top-K/KL teacher 的集成验收，
+也不建立真实模型 CP×TP、完整 LM、长上下文数值或性能验收。

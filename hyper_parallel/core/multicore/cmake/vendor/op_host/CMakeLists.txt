@@ -19,6 +19,7 @@ set(DSA_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_mixed_tile/op_host)
 set(KL_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_mixed_kl/op_host)
 set(LOCAL_KL_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_local_mixed_kl/op_host)
 set(DSA_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_mixed_grad/op_host)
+set(TP_TILE_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_tp_tile_sum/op_host)
 set(INDEX_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_index_grad_return/op_host)
 set(DSA_CP_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_cp_attention/op_host)
 set(DSA_FUSED_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_dsa_fused_grad/op_host)
@@ -44,6 +45,7 @@ set(OP_SCHEMA_SOURCES
     ${KL_HOST}/hyper_dsa_mixed_kl_def.cpp
     ${LOCAL_KL_HOST}/hyper_dsa_local_mixed_kl_def.cpp
     ${KL_HOST}/sparse_lightning_indexer_grad_kl_loss_infershape.cpp
+    ${TP_TILE_HOST}/hyper_dsa_tp_tile_sum_def.cpp
     ${INDEX_GRAD_HOST}/hyper_dsa_index_grad_return_def.cpp
     ${DSA_CP_HOST}/hyper_dsa_cp_attention_def.cpp
     ${DSA_FUSED_GRAD_HOST}/hyper_dsa_fused_grad_def.cpp
@@ -64,6 +66,7 @@ set(OP_TILING_SOURCES
     ${KL_HOST}/hyper_dsa_mixed_kl_tiling.cpp
     ${LOCAL_KL_HOST}/hyper_dsa_local_mixed_kl_tiling.cpp
     ${KL_HOST}/arch22/sparse_lightning_indexer_grad_kl_loss_tiling_general.cpp
+    ${TP_TILE_HOST}/hyper_dsa_tp_tile_sum_tiling.cpp
     ${INDEX_GRAD_HOST}/hyper_dsa_index_grad_return_tiling.cpp
     ${DSA_CP_HOST}/hyper_dsa_cp_attention_tiling.cpp
     ${DSA_FUSED_GRAD_HOST}/hyper_dsa_fused_grad_tiling.cpp
@@ -91,6 +94,7 @@ npu_op_code_gen(
 set(ACLNN_SOURCES
     ${KL_HOST}/op_api/aclnn_hyper_dsa_mixed_kl.cpp
     ${LOCAL_KL_HOST}/op_api/aclnn_hyper_dsa_local_mixed_kl.cpp
+    ${TP_TILE_HOST}/op_api/aclnn_hyper_dsa_tp_tile_sum.cpp
     ${INDEX_GRAD_HOST}/op_api/aclnn_hyper_dsa_index_grad_return.cpp
     ${DSA_CP_HOST}/op_api/aclnn_hyper_dsa_cp_attention.cpp
     ${DSA_FUSED_GRAD_HOST}/op_api/aclnn_hyper_dsa_fused_grad.cpp
@@ -116,6 +120,7 @@ target_include_directories(cust_opapi PRIVATE
     ${DSA_TRAINING_HOST}/op_api
     ${DSA_FUSED_HOST}/op_api
     ${DSA_FUSED_GRAD_HOST}/op_api
+    ${TP_TILE_HOST}/op_api
     ${INDEX_GRAD_HOST}/op_api
     ${DSA_CP_HOST}/op_api
     ${BWD_HOST}/op_api
@@ -193,7 +198,8 @@ npu_op_package_add(${package_name}
     FILES
         ${KL_HOST}/op_api/aclnn_hyper_dsa_mixed_kl.h
         ${LOCAL_KL_HOST}/op_api/aclnn_hyper_dsa_local_mixed_kl.h
-        ${INDEX_GRAD_HOST}/op_api/aclnn_hyper_dsa_index_grad_return.h
+        ${TP_TILE_HOST}/op_api/aclnn_hyper_dsa_tp_tile_sum.h
+    ${INDEX_GRAD_HOST}/op_api/aclnn_hyper_dsa_index_grad_return.h
         ${DSA_CP_HOST}/op_api/aclnn_hyper_dsa_cp_attention.h
         ${DSA_FUSED_GRAD_HOST}/op_api/aclnn_hyper_dsa_fused_grad.h
         ${DSA_TRAINING_HOST}/op_api/aclnn_hyper_dsa_fused_training.h

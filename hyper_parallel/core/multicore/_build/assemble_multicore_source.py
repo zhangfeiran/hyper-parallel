@@ -242,7 +242,9 @@ def _compose_hyper_parallel_ops(
     _compose_fused_grad(source_root, transformer_copy)
     _compose_cp_attention(source_root, transformer_copy)
     shutil.copytree(_MULTICORE_OPS / "hyper_dsa_index_grad_return", source_root / "hyper_dsa_index_grad_return")
-    for name in ("hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad", "hyper_dsa_mixed_kl",
+    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_tp_tile_sum", source_root / "hyper_dsa_tp_tile_sum")
+    for name in ("hyper_dsa_tp_tile_sum", "hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad",
+                 "hyper_dsa_mixed_kl",
                  "hyper_dsa_local_mixed_kl",
                  "hyper_dsa_fused_forward", "hyper_dsa_fused_training", "hyper_dsa_fused_grad",
                  "hyper_dsa_cp_attention", "hyper_dsa_index_grad_return"):
@@ -256,6 +258,8 @@ def _compose_hyper_parallel_ops(
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_transport.h", runtime / "dsa_cp_transport.h")
         if name == "hyper_dsa_fused_grad":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_grad_transport.h", runtime / "dsa_cp_grad_transport.h")
+        if name == "hyper_dsa_tp_tile_sum":
+            shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_tp_tile_sum.h", runtime / "dsa_tp_tile_sum.h")
         if name == "hyper_dsa_index_grad_return":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_index_grad_transport.h",
                          runtime / "dsa_index_grad_transport.h")
