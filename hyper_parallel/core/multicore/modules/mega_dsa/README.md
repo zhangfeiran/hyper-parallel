@@ -2414,3 +2414,23 @@ FP64 absorbed/unabsorbed output 与 hidden/全部参数梯度、freeze/zero/eval
 错误声明提前失败及空 owner 的执行接线。硬件验收由
 [mega_dsa_fused_model_cp_validate.py](../../examples/mega_dsa_fused_model_cp_validate.py) 记录，
 对照独立 stock LI/SFA/KL 的完整模型路径；CPU 接线验收不代表 BF16 模型验收。
+
+真实 BF16 HP attention fixture 的 CP1/CP2 Native-to-Native 验收已通过，共 48 个模型
+rank-case。使用独立 stock lightning indexer 重新计算选择，再运行 stock SFA/KL 和原模型
+投影；逐项比较 caller-order output、KL、hidden、全部 11 个参数梯度、W_UK/W_UV，
+并比较真实 SGD 后参数。原 pointwise `rtol=.02, atol=2e-5` 与非零 relative L2 `.02`
+规则均通过，已比较字段的最大 relative L2 为 `0.005896421274430613`。
+覆盖 joint plain/retained/checkpoint、KL-only、freeze、zero coefficient、eval、zero
+auxiliary，以及 strided/empty ownership；CP2 的空 owner 仍完成执行与 backward。
+
+硬件接线发现并修正了 inactive-input 的 autograd 边：`lm_only` 在进入 custom Function
+前 detach 三个 index states，`kl_only` detach 四个 main states。原值仍供 LI 或 detached
+teacher 使用，关闭分支的梯度保持 absent，且不会向上游 native normalization backward
+提交 undefined cotangent。该修正不改变 active 分支的 Native 数值、归还协议或缩放。
+模型证据和前两次接线失败记录位于 `build/native/validation/mega-dsa-fused-model-20261011/`，
+审核结果为 `model_audit.json`。修正后的映射训练 smoke 另通过 48 个 rank-step；完整矩阵
+使用新源码身份在 `build/native/validation/mega-dsa-inactive-branches-20261011/` 重新验收。
+
+此模型证据是 13-token、hidden32、H32/Hi64 的真实 HP attention fixture 与独立 stock
+BF16 模型对照；它不清除历史 FP32 model-composition 验收的失败，也不代表完整 LM、
+预训练 checkpoint、H64/H128、CP×TP、长上下文或训练性能验收。

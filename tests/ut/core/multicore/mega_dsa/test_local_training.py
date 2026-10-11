@@ -14,8 +14,11 @@
 # ============================================================================
 """CPU objective scaling, isolation and saved-state contracts for local CP training."""
 
+from __future__ import annotations
+
 from dataclasses import replace
 from types import MethodType, SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import torch
@@ -35,6 +38,25 @@ from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
 from tests.ut.core.multicore.shmem.test_consumer import SharedRootFixture
 
 _CHECK_NATIVE_SUPPORT = local_training.FusedDsaLocalCpTrainingProbe.check_native_support
+
+
+class _RejectUndefinedBackward(torch.autograd.Function):
+    """Represent an upstream native backward that requires a real cotangent."""
+
+    @staticmethod
+    def forward(ctx: Any, source: torch.Tensor, calls: list) -> torch.Tensor:
+        """Keep a visible upstream edge and preserve undefined gradients."""
+        ctx.set_materialize_grads(False)
+        ctx.calls = calls
+        return source.clone()
+
+    @staticmethod
+    def backward(ctx: Any, cotangent: torch.Tensor | None) -> tuple[torch.Tensor, None]:
+        """Fail if an inactive branch incorrectly schedules a native backward."""
+        if cotangent is None:
+            raise RuntimeError("upstream native backward received an undefined cotangent")
+        ctx.calls.append(cotangent)
+        return cotangent, None
 
 
 class TestLocalTraining(SharedRootFixture):
@@ -220,6 +242,28 @@ class TestLocalTraining(SharedRootFixture):
                                     torch.testing.assert_close(
                                         loss.detach(), torch.tensor(7*coefficient*divisor/3 if ids else 0.),
                                         rtol=4*torch.finfo(torch.float32).eps, atol=0)
+
+    def test_inactive_projection_branches_do_not_schedule_native_backward(self):
+        """LM-only and KL-only preserve absent gradients without None entering native nodes."""
+        for mode in ("lm_only", "kl_only"):
+            with self.subTest(mode=mode):
+                layout, sources = self._inputs()
+                calls = [[] for _ in sources]
+                inputs = tuple(_RejectUndefinedBackward.apply(source, record)
+                               for source, record in zip(sources, calls))
+                probe = self._probe(mode=mode)
+                with patch.object(probe.backward_backend, "_backward_saved", side_effect=self._main_backward):
+                    output, loss = probe.forward(self.invocation, inputs[:4], inputs[4:], query_layout=layout)
+                    objective = output.sum() if mode == "lm_only" else loss
+                    gradients = torch.autograd.grad(objective, sources, allow_unused=True)
+                inactive = range(4, 7) if mode == "lm_only" else range(4)
+                active = range(4) if mode == "lm_only" else range(4, 7)
+                for field in inactive:
+                    self.assertEqual(calls[field], [])
+                    self.assertIsNone(gradients[field])
+                for field in active:
+                    self.assertEqual(len(calls[field]), 1)
+                    self.assertIsNotNone(gradients[field])
 
     def test_zero_coefficient_skips_raw_arithmetic_and_auxiliary_owner_exchange(self):
         """A common cold zero coefficient keeps zero index VJPs without global FP32 scratch or exchange."""

@@ -242,4 +242,10 @@ class FusedDsaLocalCpTrainingProbe:
             raise ValueError("local CP training requires four main and three index states")
         if not isinstance(query_layout, DsaLocalQueryLayout):
             raise ValueError("local CP training requires an explicit cold query layout")
+        # Inactive branches must not enqueue upstream native backward nodes with
+        # undefined cotangents; hard selection and the KL teacher are detached.
+        if self.mode == "lm_only":
+            index_states = tuple(tensor.detach() for tensor in index_states)
+        elif self.mode == "kl_only":
+            main_states = tuple(tensor.detach() for tensor in main_states)
         return _LocalCpTraining.apply(self, invocation, query_layout, *main_states, *index_states)
