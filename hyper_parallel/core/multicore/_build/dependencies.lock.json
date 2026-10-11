@@ -83,7 +83,7 @@
           },
           {
             "path": "hyper_parallel/core/multicore/ops/lightning_indexer_tp_scores.patch",
-            "sha256": "e8a3d98e6d8ac4551e11b7f7411ae56d64428edfbeb9c9274cde46b5333c7882",
+            "sha256": "aaa1ad628f1f959a83a29faee8c37dcdf5231eb5ae1835f126ee9ca399c08e1d",
             "purpose": "SUM TP index-head scores before tile Top-K using bounded ready/ACK exchange and identity-preserving local query positions"
           },
           {

@@ -29,7 +29,7 @@
 +                tpTransport_->SumNext(reduceOutInner, reduceOutBuff);
 +            }
 +#endif
- 
+
              LocalTensor<float> sortScoreUb = reduceOutBuff;
              LocalTensor<float> sortIndiceUb = reduceOutBuff[cuS2LenVecAlign];
 --- a/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_kernel.h
@@ -43,7 +43,7 @@
 +#endif
      __aicore__ inline void ProcessPhase(bool mergePhase);
      __aicore__ inline bool IsLdPartition() const { return splitCoreInfo.isLD && aiCoreIdx < usedCoreNum; }
- 
+
 --- a/attention/lightning_indexer/op_host/lightning_indexer_def.cpp
 +++ b/attention/lightning_indexer/op_host/lightning_indexer_def.cpp
 @@ -58,6 +58,10 @@
@@ -66,7 +66,7 @@
 +TILING_DATA_FIELD_DEF(uint64_t, tpArenaBytes)
  END_TILING_DATA_DEF
  REGISTER_TILING_DATA_CLASS(HyperDsaMixedIndexer, LITilingData)
- 
+
 --- a/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
 +++ b/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
 @@ -1003,6 +1003,19 @@
