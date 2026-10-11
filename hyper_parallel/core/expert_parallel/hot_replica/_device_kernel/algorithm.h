@@ -45,7 +45,7 @@ class Solver {
         headroom(targets + r) {}
 
   HOT_DEVICE int Run(HOT_OUTPUT int64_t *control, HOT_OUTPUT int32_t *dispatch, int64_t capacity, int64_t target,
-                     int64_t minimum) {
+                     int64_t minimum, int64_t admission = 0, int64_t saved_rows = 0) {
     int64_t sum = 0;
     // Bound products as well as sums; all ordinary TopK workloads fit far below this limit.
     const int64_t safe_count = INT64_MAX / (n * Max(e, r) * 4LL);
@@ -72,26 +72,43 @@ class Solver {
     int64_t average = (sum + r - 1) / r;
     target = Max(target, average);
     int64_t limit = capacity < 0 ? PruningCapacity(peak, average) : capacity;
-    if (b && peak > target) {
-      Construct(sum);
-      Refresh(copies);
-      int64_t current_peak = 0;
-      for (int k = 0; k < r; ++k) current_peak = Max(current_peak, loads[k]);
-      if (current_peak > peak) {
-        for (int k = 0; k < r; ++k)
-          for (int j = 0; j < e; ++j) copies[k * e + j] = j / h == k ? totals[j] : 0;
-        Refresh(copies);
-      }
-      Improve(target);
-      if (minimum) {
-        Prune(minimum, Min(peak, limit));
-        Rebalance();
-      }
+    if (b && peak > target && !(admission == 10000 && peak <= limit)) {
+      Balance(sum, target, minimum, peak, limit);
     }
+    Admit(admission, saved_rows, peak, limit);
     return Materialize(control, dispatch, capacity);
   }
 
  private:
+  HOT_DEVICE void Balance(int64_t sum, int64_t target, int64_t minimum, int64_t peak, int64_t limit) {
+    Construct(sum);
+    Refresh(copies);
+    int64_t current_peak = 0;
+    for (int k = 0; k < r; ++k) current_peak = Max(current_peak, loads[k]);
+    if (current_peak > peak) {
+      for (int k = 0; k < r; ++k)
+        for (int j = 0; j < e; ++j) copies[k * e + j] = j / h == k ? totals[j] : 0;
+      Refresh(copies);
+    }
+    Improve(target);
+    if (minimum) {
+      Prune(minimum, Min(peak, limit));
+      Rebalance();
+    }
+  }
+
+  HOT_DEVICE void Admit(int64_t admission, int64_t saved_rows, int64_t peak, int64_t limit) {
+    if ((!admission && !saved_rows) || peak > limit) return;
+    int64_t current_peak = 0;
+    for (int k = 0; k < r; ++k) current_peak = Max(current_peak, loads[k]);
+    // Quotient/remainder arithmetic avoids multiplying a large receive count by basis points.
+    const int64_t required = (peak / 10000) * admission + ((peak % 10000) * admission + 9999) / 10000;
+    if (peak - current_peak >= Max(required, saved_rows)) return;
+    for (int k = 0; k < r; ++k)
+      for (int j = 0; j < e; ++j) copies[k * e + j] = j / h == k ? totals[j] : 0;
+    Refresh(copies);
+  }
+
   HOT_DEVICE void Refresh(HOT_LOCAL int64_t *data) {
     for (int k = 0; k < r; ++k) {
       loads[k] = 0;

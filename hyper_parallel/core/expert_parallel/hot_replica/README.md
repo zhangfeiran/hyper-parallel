@@ -76,7 +76,7 @@ Push 仍按 `initial_capacity_factor` 初始分配，并按 `capacity_growth_fac
 Pull 继续使用按源 rank 大小分配的对称存储和 rank 本地接收临时空间。
 
 MegaMoe 的 `replica_min_rows` 默认值为 1024：在同一接收容量上界内，
-移除或合并服务行数较少的可选副本。设为零可恢复按 token 数平衡的放置策略，
+移除或合并服务行数较少的可选副本。设为零可取消这一小副本阈值，
 也可以根据矩阵及 token shape 校准阈值。Native 保留原有默认值零。
 容量约束要求的副本即使低于阈值也会保留，
 包括 B>=H、容量上界为 A 时的轻微不均衡路由。
@@ -90,6 +90,48 @@ MegaMoe 的 `replica_min_rows` 默认值为 1024：在同一接收容量上界�
 所有 rank 根据全局 plan 选择执行路径，包括没有本地 guest 工作的 rank。
 CPU 和设备规划器均支持该路径。
 
+## 副本收益准入
+
+`B` 是最多可用的副本槽位数，不要求每次调用都开副本。
+减少接收量并不一定能减少完整训练步骤耗时：副本还需要权重通信、FP32 梯度计算及回传。
+`replica_minimum_load_reduction=None` 因此采用保守的自动准入策略。
+对容量允许完全留在 home 的路由，最终 plan 必须同时满足预计接收峰值的**相对下降比例**和
+**绝对减少行数**；不满足就回到 home plan。检查发生在小副本整合及离线 cost refinement 之后。
+
+当前自动范围仅覆盖已测量的 BF16 Ascend910B、EP=4、E=24、K=8、B=1、H=5120、I=1792、push 配置：
+
+| 本地 tokens | 权重/梯度传输 | 最低峰值下降 | 最低减少行数 |
+| --- | --- | --- | --- |
+| 2048 | `shmem_signal_kernel_gradient` | 40% | 16384 |
+| 4096 | `shmem_signal_kernel_gradient` | 40% | 24576 |
+| 4096 | `p2p` | 40% | 32768 |
+
+未匹配的 shape、设备架构、传输或 pull 配置，默认直接绑定普通 B=0 执行资源，
+跳过副本计数、规划和通信，接收区使用普通 B=0 的理论容量上界。
+模块上的 `replica_slots_per_rank` 仍表示请求的最大预算，实际执行预算可为零。
+匹配范围内会逐次规划；副本资源已预留时，容量必需的副本仍保留。
+上述边界是完整 checkpoint F+B+AdamW 测量支持的保守启发式，不是所有环境的耗时保证。
+小副本行数阈值、目标负载及 receive capacity 仍独立生效。
+为了保持单次执行及 `Cmax`，home 峰值超过接收容量时不能直接删除副本，即使它不满足可选准入门槛。
+
+显式设置 `replica_minimum_load_reduction=0.0` 会替代自动范围，保留旧的可选副本策略；
+同时设 `replica_min_rows=0` 可恢复原始 token 平衡策略。
+显式设置其他 `[0, 1]` 内的值只指定相对门槛，不附加自动范围的绝对行数门槛。
+设为 `1.0` 禁用可选副本。所有 EP rank 必须使用相同配置。
+自动策略与显式策略不能共享同一执行资源组，以免将普通 workspace 用于需要副本的调用。
+准入策略在模块构造时指定；切换自动/显式策略需要新建模块及执行资源。
+低层 CPU/device planner 的 `minimum_load_reduction` 和 `minimum_saved_rows` 默认均为零，
+以保持直接调用及离线 solver oracle 的契约。
+
+设备 planner 使用共享库 ABI 4，包含两个准入参数；旧 planner 库必须重新构建。
+整数计数库仍使用 ABI 1，multicore 原生载荷不需要为这次准入更新重建。
+
+Native 未启用默认收益范围，`ExpertParallel(..., replica_slots_per_rank=1)` 使用普通 dispatch/combine，
+也不打包副本权重。Native 接收区按实际 all-to-all 数量动态分配，没有 MegaMoe 的固定副本容量约束。
+显式指定小于 `1.0` 的准入值才启用 native 热副本；若最终 plan 没有 guest，
+`GroupedExperts` 使用原始本地参数及普通计算，保留普通 backward。
+Native 仍仅支持 HCCL P2P，不使用单边通信或 MegaMoe 的 home 计算重叠能力。
+
 ## 训练与传输
 
 HCCL P2P 仅传输选中的 owner 到 guest 权重切片。
@@ -101,7 +143,7 @@ HCCL P2P 仅传输选中的 owner 到 guest 权重切片。
 不同层可以共享存储，池不会持有这些层的参数。
 Native 分别执行 home 和 guest GMM 段；multicore 使用版本化地址扩展选择 home/guest 矩阵及梯度输出。
 B=0 保留稠密内核 ABI。使用分离权重前，需要基于当前版本重新构建 multicore 原生载荷。
-Native 仍需要现有的 W1/W3 打包操作。
+Native 存在活动 guest 时需要 W1/W3 打包操作。
 
 普通 guest 分配不受 push 堆替换影响。
 设置 `MegaMoeExperts(..., replica_transport="shmem")` 可以启用单边权重 put 和 owner 侧 FP32 梯度 get。

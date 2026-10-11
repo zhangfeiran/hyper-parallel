@@ -22,7 +22,7 @@ from pathlib import Path
 
 import torch
 
-from .capacity import ExpertReplicaConfig
+from .capacity import ExpertReplicaConfig, _integer
 
 
 @lru_cache(maxsize=1)
@@ -38,9 +38,9 @@ def _planner_library() -> ctypes.CDLL:
         raise RuntimeError("Rebuild the shared device planner: missing ABI version") from error
     version.argtypes = []
     version.restype = ctypes.c_int
-    if version() != 2:
+    if version() != 4:
         raise RuntimeError("Rebuild the shared device planner: incompatible ABI version")
-    library.launch_planner.argtypes = ([ctypes.c_void_p] * 4 + [ctypes.c_int] * 3 + [ctypes.c_int64] * 3)
+    library.launch_planner.argtypes = ([ctypes.c_void_p] * 4 + [ctypes.c_int] * 3 + [ctypes.c_int64] * 5)
     library.launch_planner.restype = ctypes.c_int
     return library
 
@@ -56,14 +56,33 @@ def _validate_device(counts: torch.Tensor, config: ExpertReplicaConfig) -> None:
 
 def launch_device_planner(counts: torch.Tensor, config: ExpertReplicaConfig,
                           capacity: int | None, target: int | None,
-                          minimum_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+                          minimum_rows: int, admission_basis_points: int = 0,
+                          minimum_saved_rows: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch one task with invocation-owned buffers on the current NPU stream.
 
     Callers supply producer dependencies for counts. Stream recording keeps all
     launch arguments alive even if counts originated on another stream. The
     returned buffers have no dependency on a mutable graph replay workspace.
+
+    Args:
+        counts: Exact logical source histograms.
+        config: Expert topology and per-rank slot budget.
+        capacity: Hard receive bound, or None for the inferred capacity.
+        target: Soft desired receive rows.
+        minimum_rows: Soft minimum rows served by each guest copy.
+        admission_basis_points: Required fractional peak reduction in integer basis points.
+        minimum_saved_rows: Required absolute peak reduction for optional copies.
+
+    Returns:
+        Control and dispatch tensors retained by the caller.
     """
     _validate_device(counts, config)
+    if (isinstance(admission_basis_points, bool) or not isinstance(admission_basis_points, int)
+            or not 0 <= admission_basis_points <= 10000):
+        raise ValueError("Admission basis points must be an integer between zero and 10000")
+    _integer(minimum_saved_rows, "minimum_saved_rows", 0)
+    if minimum_saved_rows > torch.iinfo(torch.int64).max:
+        raise ValueError("minimum_saved_rows exceeds the device integer range")
     library = _planner_library()
     with torch.npu.device(counts.device):
         counts = counts.to(torch.int64).contiguous()
@@ -76,7 +95,8 @@ def launch_device_planner(counts: torch.Tensor, config: ExpertReplicaConfig,
             tensor.record_stream(stream)
         status = library.launch_planner(stream.npu_stream, counts.data_ptr(), control.data_ptr(), dispatch.data_ptr(),
                                         ranks, config.num_experts, config.replica_slots_per_rank,
-                                        -1 if capacity is None else capacity, target or 0, minimum_rows)
+                                        -1 if capacity is None else capacity, target or 0, minimum_rows,
+                                        admission_basis_points, minimum_saved_rows)
         if status:
             raise RuntimeError(f"Replica planner launch failed with ACL error {status}")
     return control, dispatch

@@ -266,7 +266,8 @@ def _check_runtime_direction(records, runtime_version, direction):
 
 
 def _cross_layer_pool(backend, budget, mesh, executor, reference, tokens, hidden, intermediate, top_k,
-                      replica_min_rows=0, replica_planner="cpu", cost_model=None):
+                      replica_min_rows=0, replica_planner="cpu", cost_model=None,
+                      minimum_load_reduction=0.0):
     """Two independent parameter owners share storage through reversed backward."""
     experts = mesh.size() * 6
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
@@ -280,6 +281,7 @@ def _cross_layer_pool(backend, budget, mesh, executor, reference, tokens, hidden
             ExpertParallel(replica_slots_per_rank=budget if hot and backend == "native" else 0,
                            replica_min_rows=replica_min_rows if hot else 0,
                            replica_planner=replica_planner if hot else "cpu",
+                           replica_minimum_load_reduction=minimum_load_reduction if hot else None,
                            replica_cost_model=cost_model if hot and backend == "native" else None).apply(module, mesh)
             modules.append(module)
         pairs.append(modules)
@@ -428,12 +430,18 @@ def _benchmark(candidate, executor, experts, tokens, hidden, top_k, iterations):
     return {"step_ms": measured, "iterations": iterations, "warmup": 3}
 
 
+def _requires_transfers(budget, minimum_rows, minimum_load_reduction):
+    """Require active copies only in fixtures that explicitly request the original policy."""
+    return budget > 0 and minimum_rows == 0 and minimum_load_reduction == 0
+
+
 def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         hidden: int = 128, intermediate: int = 128, top_k: int = 2,
         same_backend_reference: bool = False, replica_transport: str = "p2p",
         benchmark_iterations: int = 0, replica_min_rows: int = 0, replica_planner: str = "cpu",
         default_group: bool = False, fp32_reference: bool = False,
-        cost_model: ExpertReplicaCostModel | None = None, cross_stream: bool = False) -> None:
+        cost_model: ExpertReplicaCostModel | None = None, cross_stream: bool = False,
+        minimum_load_reduction: float = 0.0) -> None:
     """Compare full forward/backward with native B=0, preserving EP ownership."""
     if cross_stream and (backend == "native" or replica_transport not in ("p2p", "shmem_signal_sdma_projection")):
         raise ValueError("Runtime cross-stream acceptance requires MegaMoe P2P or projection")
@@ -458,6 +466,7 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
     ExpertParallel().apply(base, mesh)
     ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0,
                    replica_min_rows=replica_min_rows, replica_planner=replica_planner,
+                   replica_minimum_load_reduction=minimum_load_reduction,
                    replica_cost_model=cost_model if backend == "native" else None).apply(candidate, mesh)
     executor = None
     reference = "native_fp32" if fp32_reference else None
@@ -470,6 +479,7 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
                                  create_parameters=False, dispatch_mode=backend, replica_slots_per_rank=budget,
                                  replica_transport=replica_transport, replica_min_rows=replica_min_rows,
                                  replica_planner=replica_planner, replica_cost_model=cost_model,
+                                 replica_minimum_load_reduction=minimum_load_reduction,
                                  **options)
         if same_backend_reference:
             reference = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
@@ -536,7 +546,7 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
                 raise AssertionError("expected a real dynamic push growth event")
         deferred = _deferred_backward(
             base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference, replica_planner,
-            require_transfers=budget > 0 and replica_min_rows == 0)
+            require_transfers=_requires_transfers(budget, replica_min_rows, minimum_load_reduction))
         if rank == 0:
             print(json.dumps({"backend": backend, "B": budget, "deferred": deferred}), flush=True)
         if backend == "native" and any(
@@ -551,13 +561,13 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         if hidden <= 128:
             cross_layer = _cross_layer_pool(backend, budget, mesh, executor, reference,
                                            tokens, hidden, intermediate, top_k, replica_min_rows,
-                                           replica_planner, cost_model)
+                                           replica_planner, cost_model, minimum_load_reduction)
         signal_stress = None
         if replica_transport in SIGNAL_TRANSPORT_MODES and hidden <= 128:
             active_provider = resources.workspace.replica_provider
             signal_stress = _signal_stress(active_provider, mesh, hidden, intermediate, budget)
         kernel_wait = None
-        if (budget and replica_min_rows == 0 and
+        if (_requires_transfers(budget, replica_min_rows, minimum_load_reduction) and
                 replica_transport in ("shmem_signal_sdma_projection", "shmem_signal_kernel_gradient")):
             kernel_wait = _kernel_wait_stress(base, candidate, executor, experts, rank, device,
                                               tokens, hidden, top_k, reference, replica_planner)
@@ -567,6 +577,7 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         identity.update(torch_npu=torch_npu.__version__, ep_members=dist.get_process_group_ranks(mesh.get_group()),
                         backend=backend, budget=budget, shape=[tokens, hidden, intermediate, top_k],
                         requested_planner=replica_planner,
+                        minimum_load_reduction=minimum_load_reduction,
                         calibration=None if cost_model is None else asdict(cost_model),
                         actual_planner=results[0]["plan"]["planner"] if budget else "disabled",
                         requested_transport=replica_transport, reference=("native-fp32" if fp32_reference else
@@ -640,6 +651,8 @@ def main() -> None:
     parser.add_argument("--benchmark-iterations", type=int, default=0)
     parser.add_argument("--budget", type=int, default=1)
     parser.add_argument("--replica-min-rows", type=int, default=0)
+    parser.add_argument("--replica-minimum-load-reduction", type=float, default=0.0,
+                        help="Explicit zero keeps active-copy precision fixtures independent of automatic admission.")
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--intermediate", type=int, default=128)
@@ -659,7 +672,8 @@ def main() -> None:
             benchmark_iterations=args.benchmark_iterations, replica_min_rows=args.replica_min_rows,
             replica_planner=args.replica_planner, default_group=args.default_group, fp32_reference=args.fp32_reference,
             cross_stream=args.cross_stream, cost_model=None if args.cost_model is None else ExpertReplicaCostModel(
-                **json.loads(Path(args.cost_model).read_text(encoding="utf-8"))["model"]))
+                **json.loads(Path(args.cost_model).read_text(encoding="utf-8"))["model"]),
+            minimum_load_reduction=args.replica_minimum_load_reduction)
     finally:
         dist.destroy_process_group()
 

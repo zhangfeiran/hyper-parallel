@@ -124,6 +124,8 @@ def prepare_replica_route(
     *, target_load: int | None = None, minimum_replica_rows: int = 0,
     cost_model: ExpertReplicaCostModel | None = None, planner_backend: str = "cpu",
     compact_home: bool = False,
+    minimum_load_reduction: float = 0.0,
+    minimum_saved_rows: int = 0,
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
@@ -141,6 +143,8 @@ def prepare_replica_route(
         planner_backend: CPU or device placement implementation.
         compact_home: Keep logical IDs and counts when the global plan has no guests.
             The caller must execute that invocation with a home-only kernel topology.
+        minimum_load_reduction: Required receive-peak reduction for optional copies.
+        minimum_saved_rows: Required absolute receive-peak reduction for optional copies.
 
     Returns:
         Invocation-owned placement, physical IDs and dispatch counts.
@@ -161,7 +165,8 @@ def prepare_replica_route(
         device_plan = build_device_expert_replica_plan(
             matrix[:, :-1], config, capacity_limit=upper,
             target_load=min(upper, target_load) if target_load is not None else None,
-            minimum_replica_rows=minimum_replica_rows)
+            minimum_replica_rows=minimum_replica_rows, minimum_load_reduction=minimum_load_reduction,
+            minimum_saved_rows=minimum_saved_rows)
         device_plan.control[:1].bitwise_or_(matrix[:, -1].any().to(torch.int64))
         plan = device_plan.host_summary()
         if compact_home and not plan.transfers:
@@ -180,6 +185,8 @@ def prepare_replica_route(
         [row[:-1] for row in host], config.replica_slots_per_rank,
         target_load=min(upper, target_load) if target_load is not None else None,
         minimum_replica_rows=minimum_replica_rows, capacity_limit=upper, cost_model=cost_model,
+        minimum_load_reduction=minimum_load_reduction,
+        minimum_saved_rows=minimum_saved_rows,
     )
     if max(plan.destination_loads) > upper:
         raise RuntimeError("replica planner exceeded the theoretical receive bound")

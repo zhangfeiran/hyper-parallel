@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from .admission import reduction_basis_points
 from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
 from .cost import ExpertReplicaCostModel, refine_replica_quotas
@@ -283,10 +284,30 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
     return plan
 
 
+def _home_layout(counts, config):
+    """Create original owner quotas and rank loads from exact integer counts."""
+    totals = [sum(row[expert] for row in counts) for expert in range(config.num_experts)]
+    home = config.home_experts
+    copies = [{expert: totals[expert] for expert in range(rank * home, (rank + 1) * home)}
+              for rank in range(config.ep_size)]
+    return totals, [sum(row.values()) for row in copies], copies
+
+
+def _optional_plan_is_useful(copies, loads, limit, admission, minimum_saved_rows):
+    """Keep required placements and compare optional load reduction using integers."""
+    peak = max(loads)
+    if (not admission and not minimum_saved_rows) or peak > limit:
+        return True
+    candidate_peak = max(sum(row.values()) for row in copies)
+    saved = peak - candidate_peak
+    return saved >= minimum_saved_rows and saved * 10000 >= peak * admission
+
+
 def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica_slots_per_rank: int,
                               *, target_load: int | None = None, minimum_replica_rows: int = 0,
                               capacity_limit: int | None = None,
-                              cost_model: ExpertReplicaCostModel | None = None) -> ExpertExecutionPlan:
+                              cost_model: ExpertReplicaCostModel | None = None,
+                              minimum_load_reduction: float = 0.0, minimum_saved_rows: int = 0) -> ExpertExecutionPlan:
     """Build a bounded single-execution plan, then reduce residual imbalance.
 
     Args:
@@ -303,11 +324,17 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
 
         cost_model: Optional matching offline calibration for refining existing
             replica quotas. Uncalibrated row ranges retain the original policy.
+        minimum_load_reduction: Required reduction of the receive peak for optional
+            copies. Capacity-required copies are retained; zero preserves the original policy.
+        minimum_saved_rows: Required absolute receive-peak reduction for optional copies.
+            It covers fixed communication overhead independently of the fractional threshold.
 
     Returns:
         Immutable physical placement and exact per-source dispatch quotas.
     """
     _integer(minimum_replica_rows, "minimum_replica_rows", 0)
+    _integer(minimum_saved_rows, "minimum_saved_rows", 0)
+    admission = reduction_basis_points(minimum_load_reduction)
     if capacity_limit is not None:
         _integer(capacity_limit, "capacity_limit", 0)
     if cost_model is not None and not isinstance(cost_model, ExpertReplicaCostModel):
@@ -316,25 +343,24 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
     config = ExpertReplicaConfig(len(counts[0]), len(counts), replica_slots_per_rank)
     if target_load is not None:
         _integer(target_load, "target_load", 0)
-    expert_counts = [sum(row[expert] for row in counts) for expert in range(config.num_experts)]
+    expert_counts, loads, baseline = _home_layout(counts, config)
     if cost_model is not None and cost_model.ep_size != config.ep_size:
         raise ValueError("Replica cost model EP size does not match the plan")
-    home = config.home_experts
-    loads = [sum(expert_counts[rank * home:(rank + 1) * home]) for rank in range(config.ep_size)]
     average = (sum(loads) + config.ep_size - 1) // config.ep_size
     target = max(average, target_load or 0)
-    baseline = [{expert: expert_counts[expert] for expert in range(rank * home, (rank + 1) * home)}
-                for rank in range(config.ep_size)]
-    if not replica_slots_per_rank or max(loads) <= target:
+    limit = _pruning_capacity(counts, loads, config) if capacity_limit is None else capacity_limit
+    if (not replica_slots_per_rank or max(loads) <= target
+            or (admission == 10000 and max(loads) <= limit)):
         return _materialize(counts, baseline, config, capacity_limit)
     copies = _bounded_copies(loads, expert_counts, config)
     if max(sum(row.values()) for row in copies) > max(loads):
-        copies = baseline
+        copies = [dict(row) for row in baseline]
     _improve_copies(copies, config, target)
     _prune_small_copies(copies, counts, loads, config, minimum_replica_rows, capacity_limit)
     if minimum_replica_rows:
         _rebalance_existing_copies(copies, config)
     if cost_model is not None:
-        limit = _pruning_capacity(counts, loads, config) if capacity_limit is None else capacity_limit
         refine_replica_quotas(copies, counts, config, limit, cost_model)
+    if not _optional_plan_is_useful(copies, loads, limit, admission, minimum_saved_rows):
+        copies = baseline
     return _materialize(counts, copies, config, capacity_limit)

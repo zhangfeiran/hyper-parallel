@@ -22,6 +22,7 @@ from functools import cached_property
 import torch
 
 from .capacity import ExpertReplicaConfig, _integer
+from .admission import reduction_basis_points
 from .device_kernel import launch_device_planner
 from .plan import ExpertReplicaTransfer
 
@@ -88,16 +89,30 @@ class DeviceExpertExecutionPlan:
 @torch.no_grad()
 def build_device_expert_replica_plan(counts_by_source: torch.Tensor, config: ExpertReplicaConfig,
                                      *, capacity_limit: int | None = None, target_load: int | None = None,
-                                     minimum_replica_rows: int = 0) -> DeviceExpertExecutionPlan:
+                                     minimum_replica_rows: int = 0,
+                                     minimum_load_reduction: float = 0.0,
+                                     minimum_saved_rows: int = 0) -> DeviceExpertExecutionPlan:
     """Execute the shared integer policy on NPU without reading source counts.
 
     The fused solver matches CPU constructive placement, target-load preference,
     greedy improvement, capacity-safe small-copy consolidation and rebalancing.
     Each invocation owns its outputs, including when backward is deferred.
     Offline calibrated cost refinement is available only with the CPU planner.
+
+    Args:
+        counts_by_source: Exact source-rank histograms on the NPU.
+        config: Logical topology and replica slot budget.
+        capacity_limit: Hard maximum receive rows, or inferred capacity when None.
+        target_load: Soft desired receive rows.
+        minimum_replica_rows: Soft minimum rows served by each guest copy.
+        minimum_load_reduction: Required fractional peak reduction for optional copies.
+        minimum_saved_rows: Required absolute peak reduction for optional copies.
+
+    Returns:
+        Invocation-owned plan with exact per-source dispatch quotas.
     """
     for name, value in (("capacity_limit", capacity_limit), ("target_load", target_load),
-                        ("minimum_replica_rows", minimum_replica_rows)):
+                        ("minimum_replica_rows", minimum_replica_rows), ("minimum_saved_rows", minimum_saved_rows)):
         if value is not None:
             _integer(value, name, 0)
             if value > torch.iinfo(torch.int64).max:
@@ -107,7 +122,8 @@ def build_device_expert_replica_plan(counts_by_source: torch.Tensor, config: Exp
     if counts_by_source.dtype not in (torch.int32, torch.int64):
         raise ValueError("Device source counts require int32 or int64")
     control, dispatch = launch_device_planner(counts_by_source, config, capacity_limit, target_load,
-                                               minimum_replica_rows)
+                                               minimum_replica_rows,
+                                               reduction_basis_points(minimum_load_reduction), minimum_saved_rows)
     size = config.physical_experts
     shape = (config.ep_size, config.slots_per_rank)
     summary_size = 1 + 2 * size + config.ep_size * config.ep_size
@@ -118,7 +134,13 @@ def build_device_expert_replica_plan(counts_by_source: torch.Tensor, config: Exp
 
 
 def validate_planner_backend(backend: str, minimum_rows: int, cost_model: object) -> None:
-    """Reject unsupported host-only cost refinement before any communication."""
+    """Reject unsupported host-only cost refinement before any communication.
+
+    Args:
+        backend: CPU or device planner selection.
+        minimum_rows: Soft minimum rows served by a guest copy.
+        cost_model: Optional host calibration, unsupported by device planning.
+    """
     if backend not in ("cpu", "device"):
         raise ValueError("replica_planner must be cpu or device")
     _integer(minimum_rows, "replica_min_rows", 0)
