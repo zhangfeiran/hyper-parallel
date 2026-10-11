@@ -43,8 +43,9 @@ class TpTileSum {
         slots > 40 || slot >= slots || width <= 0 || width > 2048 || width % 8 != 0 || rounds <= 0 ||
         rounds >= (1LL << 32) || meta_.GetValue(6) != slots || meta_.GetValue(7) != width ||
         meta_.GetValue(10) != rounds || meta_.GetValue(8) < 0 || meta_.GetValue(9) < 0 || meta_.GetValue(8) % 64 != 0 ||
-        meta_.GetValue(9) % 64 != 0 || meta_.GetValue(8) + slots * width * 4 > meta_.GetValue(9) ||
-        meta_.GetValue(9) + slots * kTpSlotWords * 8 > arenaBytes) {
+        meta_.GetValue(9) % 64 != 0 || meta_.GetValue(8) > meta_.GetValue(9) || meta_.GetValue(9) > arenaBytes ||
+        slots * width * 4 > meta_.GetValue(9) - meta_.GetValue(8) ||
+        slots * kTpSlotWords * 8 > arenaBytes - meta_.GetValue(9)) {
       AscendC::Trap();
     }
     for (int32_t peer = 0; peer < 8; ++peer) {
@@ -78,6 +79,9 @@ class TpTileSum {
 
   __aicore__ inline void Sum(AscendC::LocalTensor<float> tile, AscendC::LocalTensor<float> scratch, int64_t round) {
 #ifndef __DAV_C220_CUBE__
+    if (round != completedRounds_ || round < 0 || round >= rounds_) {
+      AscendC::Trap();
+    }
     const int64_t sequence = epoch_ * (1LL << 32) + round + 1;
     if (round > 0) {
       WaitReaders(sequence - 1);
@@ -115,10 +119,19 @@ class TpTileSum {
       AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID7);
       PublishControl(remote, (2 + rank_) * 8, sequence);
     }
+    ++completedRounds_;
 #endif
   }
 
-  __aicore__ inline void Finish() { WaitReaders(epoch_ * (1LL << 32) + rounds_); }
+  __aicore__ inline void SumNext(AscendC::LocalTensor<float> tile, AscendC::LocalTensor<float> scratch) {
+    Sum(tile, scratch, completedRounds_);
+  }
+  __aicore__ inline void Finish() {
+    // LI partitions can consume fewer than the declared upper bound, including zero.
+    if (completedRounds_ > 0) {
+      WaitReaders(epoch_ * (1LL << 32) + completedRounds_);
+    }
+  }
 
  private:
   __aicore__ inline __gm__ uint8_t *Address(int32_t peer, int64_t offset) {
@@ -152,7 +165,7 @@ class TpTileSum {
   GlobalTensor<int64_t> meta_;
   int32_t rank_ = 0, size_ = 0;
   uint32_t slot_ = 0, width_ = 0;
-  int64_t epoch_ = 0, rounds_ = 0;
+  int64_t epoch_ = 0, rounds_ = 0, completedRounds_ = 0;
 };
 }  // namespace DsaMixed
 #endif

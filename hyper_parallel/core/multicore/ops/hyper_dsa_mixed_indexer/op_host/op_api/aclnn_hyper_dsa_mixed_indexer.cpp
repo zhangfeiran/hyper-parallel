@@ -32,7 +32,8 @@ aclnnStatus BuildIndexer(const aclTensor *query, const aclTensor *key, const acl
                          const aclTensor *actualQuery, const aclTensor *actualKv, const aclTensor *config,
                          const aclTensor *trace, const aclTensor *retained, int64_t mergePhase,
                          const aclTensor *indices, const aclTensor *values, uint64_t *workspaceSize,
-                         aclOpExecutor **executor, const aclTensor *queryPositions) {
+                         aclOpExecutor **executor, const aclTensor *queryPositions, const aclTensor *tpArena = nullptr,
+                         const aclTensor *tpMetadata = nullptr) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
   auto owner = CREATE_EXECUTOR();
   CHECK_RET(owner.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
@@ -63,7 +64,7 @@ aclnnStatus BuildIndexer(const aclTensor *query, const aclTensor *key, const acl
     return ADD_TO_LAUNCHER_LIST_AICORE(
       HyperDsaMixedIndexer,
       OP_INPUT(queryCont, keyCont, weightsCont, actualQueryCont, actualKvCont, blockTable, config, trace, retained,
-               queryPositions),
+               queryPositions, tpArena, tpMetadata),
       OP_OUTPUT(indicesMutable, valuesMutable),
       OP_ATTR(layout, layout, sparseCount, mode, preTokens, nextTokens, returnValues, mergePhase));
   };
@@ -111,5 +112,18 @@ extern "C" aclnnStatus aclnnHyperDsaLocalIndexer(void *workspace, uint64_t works
 extern "C" aclnnStatus aclnnHyperDsaMixedIndexer(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                  aclrtStream stream) {
   L2_DFX_PHASE_2(aclnnHyperDsaMixedIndexer);
+  return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaTpLocalIndexerGetWorkspaceSize(
+  const aclTensor *query, const aclTensor *key, const aclTensor *weights, const aclTensor *actualQuery,
+  const aclTensor *actualKv, const aclTensor *config, const aclTensor *trace, const aclTensor *retained,
+  const aclTensor *queryPositions, const aclTensor *tpArena, const aclTensor *tpMetadata, const aclTensor *indices,
+  const aclTensor *values, uint64_t *workspaceSize, aclOpExecutor **executor) {
+  return BuildIndexer(query, key, weights, actualQuery, actualKv, config, trace, retained, 2, indices, values,
+                      workspaceSize, executor, queryPositions, tpArena, tpMetadata);
+}
+extern "C" aclnnStatus aclnnHyperDsaTpLocalIndexer(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                   aclrtStream stream) {
   return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
 }

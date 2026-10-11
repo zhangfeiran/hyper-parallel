@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -106,6 +108,7 @@ class TpTileSumProbe:
         if tp_group is None:
             raise ValueError("native TP transport requires an explicit TP group")
         self.root = root
+        self.group = tp_group
         self.spec = specification
         self.participates = tp_group != dist.GroupMember.NON_GROUP_MEMBER
         self.members = tuple(dist.get_process_group_ranks(tp_group)) if self.participates else ()
@@ -160,10 +163,7 @@ class TpTileSumProbe:
         Native sums root-mapped peers in fixed TP order, acknowledges reads and
         waits for all final readers before releasing its source storage.
         """
-        if (self.closed or self.arena is None or not self.participates or invocation.probe is not self
-                or invocation.generation != self.root.generation or invocation.epoch <= self.last_epoch
-                or invocation.metadata._version != invocation.metadata_version):
-            raise ValueError("TP invocation must be live, matching and newer than prior work")
+        self.check_invocation(invocation)
         shape = (invocation.rounds, self.spec.slots, self.spec.width)
         if (partial.device != self.arena.device or partial.dtype != torch.float32 or partial.requires_grad
                 or not partial.is_contiguous() or partial.shape != shape):
@@ -173,13 +173,32 @@ class TpTileSumProbe:
         if version is None or version() != 1:
             raise RuntimeError("native payload lacks DSA TP tile SUM version 1")
         output = torch.empty_like(partial)
+        with self.lease(invocation):
+            torch.ops.hyper_parallel.dsa_tp_tile_sum_out(partial, self.arena, invocation.metadata, output)
+        return output
+
+    def check_invocation(self, invocation: TpTileSumInvocation) -> None:
+        """Reject stale identity/metadata before any native publication or root claim."""
+        if (self.closed or self.arena is None or not self.participates or invocation.probe is not self
+                or invocation.generation != self.root.generation or invocation.epoch <= self.last_epoch
+                or invocation.metadata._version != invocation.metadata_version):
+            raise ValueError("TP invocation must be live, matching and newer than prior work")
+
+    @contextmanager
+    def lease(self, invocation: TpTileSumInvocation) -> Iterator[None]:
+        """Claim one monotonic epoch for a native tile consumer, recording completion on release.
+
+        Native capability and tensor validation must finish before entering this
+        lease. A queued LI consumer can use fewer than its declared round bound;
+        it must acknowledge all actually published tiles before returning.
+        """
+        self.check_invocation(invocation)
         self.consumer.claim()
         try:
             self.last_epoch = invocation.epoch
-            torch.ops.hyper_parallel.dsa_tp_tile_sum_out(partial, self.arena, invocation.metadata, output)
+            yield
         finally:
             self.consumer.release()
-        return output
 
     def close(self) -> None:
         """Quiesce and free this arena collectively after matching TP/root completion."""

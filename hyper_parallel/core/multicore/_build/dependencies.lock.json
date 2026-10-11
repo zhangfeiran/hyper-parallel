@@ -82,6 +82,11 @@
             "purpose": "apply explicit sequence-relative causal positions to compact local-query LI with genuine empty query ownership"
           },
           {
+            "path": "hyper_parallel/core/multicore/ops/lightning_indexer_tp_scores.patch",
+            "sha256": "e8a3d98e6d8ac4551e11b7f7411ae56d64428edfbeb9c9274cde46b5333c7882",
+            "purpose": "SUM TP index-head scores before tile Top-K using bounded ready/ACK exchange and identity-preserving local query positions"
+          },
+          {
             "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_grad_mixed.patch",
             "sha256": "8110811605ef4921a7a11081d0f7f1a5926c103effd26f7ea1493d7bcf38e4a9",
             "purpose": "separate SFA gradient initialization, physical mixed scratch and logical query/post partitions across three retained-workspace phases"

@@ -103,6 +103,11 @@ void register_dsa_probes(torch::Library &m) {
   m.def("dsa_fused_grad_version() -> int", []() -> int64_t { return 2; });
   m.def("dsa_sparse_cp_grad_version() -> int", []() -> int64_t { return 1; });
   m.def("dsa_cp_root_mapping_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_tp_local_indexer_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_tp_local_indexer_out(Tensor query, Tensor key, Tensor weights, Tensor actual_query, "
+        "Tensor actual_kv, Tensor config, Tensor(a!) trace, Tensor(b!) retained, Tensor query_positions, "
+        "Tensor(c!) arena, Tensor metadata, Tensor(d!) indices, Tensor(e!) values) "
+        "-> (Tensor(d!), Tensor(e!), Tensor(a!), Tensor(b!))");
   m.def("dsa_tp_tile_sum_version() -> int", []() -> int64_t { return 1; });
   m.def("dsa_tp_tile_sum_out(Tensor partial, Tensor(a!) arena, Tensor metadata, "
         "Tensor(b!) summed) -> Tensor(b!)");

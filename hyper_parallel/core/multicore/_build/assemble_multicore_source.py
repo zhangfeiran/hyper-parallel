@@ -258,7 +258,7 @@ def _compose_hyper_parallel_ops(
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_transport.h", runtime / "dsa_cp_transport.h")
         if name == "hyper_dsa_fused_grad":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_grad_transport.h", runtime / "dsa_cp_grad_transport.h")
-        if name == "hyper_dsa_tp_tile_sum":
+        if name in ("hyper_dsa_tp_tile_sum", "hyper_dsa_mixed_indexer"):
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_tp_tile_sum.h", runtime / "dsa_tp_tile_sum.h")
         if name == "hyper_dsa_index_grad_return":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_index_grad_transport.h",

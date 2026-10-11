@@ -2521,5 +2521,56 @@ built-in 文件的本地 OPP 视图，首轮全局 vendor configuration 权限�
 导入路径错误均单独归档。CPU megaDSA/SHMEM 回归通过 314 个测试、668 个 subtest。
 
 同一新载荷的真实 BF16 attention CP subgroup 回归任务独立记录在 `model_regression/`，
-其硬件结果尚待验收。以上传输通过不建立 native LI pre-Top-K/KL teacher 的集成验收，
+现已通过 96 个模型 rank-case，原数值规则、选择集合、SGD、阶段数和载荷身份均匹配；
+审核结果为 `model_regression_audit.json`，对应 `25afe218` 的冻结传输载荷。以上传输通过
+不建立 native LI pre-Top-K/KL teacher 的集成验收，
 也不建立真实模型 CP×TP、完整 LM、长上下文数值或性能验收。
+
+### Native LI 的 pre-Top-K TP 汇总
+
+[TpLocalIndexerProbe](tp_indexer.py) 将 TP head SUM 接到锁定 LI vector tile 的
+`DoReduce` 与排序之间。原 Hi64 按 TP 分片，各 shard 补零到 native H64；只复制 caller
+原有的 signed BF16/FP32 merge weight，不增加 head/TP divisor 或其他缩放。每个候选
+tile 先通过 SHMEM 累加所有 TP partial scores，再进入原 Sort/Top-K 和 LD merge。
+不使用 local Top-K union，也不 all-gather heads 或完整 score 表。
+
+TP 传输状态持续跨越该 physical vector 的全部 logical tickets 和 query/key tiles；
+其 round 声明是上界。结束时只等待实际发布的最后一轮 ACK，零轮 slot 无须等待一个
+不存在的 ready。source/control arena 随 compute vector 数量增长，width 固定 512。
+原 mixed/local LI entry 的签名保持兼容，新增 `dsa_tp_local_indexer_out` 使用显式 arena
+和 metadata；其他 composite LI closures 保留不启用 TP hook 的路径。
+
+准备阶段要求完整有序的 replicated global index K，按 global query IDs 准备 compact
+Q 顺序、真实 packed cumulative lengths 和 sequence-relative positions，并在 TP group
+内核对同一 query/key/invocation 声明。CP membership 可以不同。输出将 native 的
+sequence-relative IDs 转成 `global_packed`，再恢复 caller 的 query row order。准备 tensor
+修改、旧 epoch、错误布局或缺少载荷 capability 都在提交前拒绝。空 owner 仍执行完整
+phase closure，保存 selection/output 与 reusable scratch 分离。
+
+[mega_dsa_tp_indexer_validate.py](../../examples/mega_dsa_tp_indexer_validate.py) 对照独立
+stock full-head LI，覆盖 CP4×TP1、CP2×TP2、CP1×TP4、strided/interior/empty query tiles、
+BF16/FP32 signed merge weights、1/7/19 compute groups 和重复执行。长历史使用 `(3,2113)`；
+4097-key 反例中，一个候选在两个 head shards 都排在 local K2048 之外，head SUM 后
+却成为全局第一。每个 case 检查选择集合、BF16 values、global causal/packed IDs、
+phase graph 和最终 ACK；需要 LD 证据的条件使用实际 query 的因果长度。
+
+新载荷完整 native 构建已通过，四卡 smoke 的 48 个 rank-case 已通过 stock 选择/值精确
+对照与协议检查；CPU megaDSA/SHMEM 回归通过 318 个测试、668 个 subtest。完整矩阵
+也已通过 864 个 rank-case，每 rank 216 个，所有 stock 选择集合和 BF16 values 精确一致；
+global causal/packed IDs、两阶段 closure、active slot 与最终 ACK 均通过。同载荷的
+tile SUM 回归通过 378 个 rank-case。审核文件为 `full_audit.json` 和
+`tile_regression_audit.json`，证据目录为
+`build/native/validation/mega-dsa-tp-indexer-20261011/`。这仍是使用 replicated global K
+的 native selection probe；TP KL teacher/predictor 汇总、共享梯度 TP 归还、真实模型
+CP×TP 和训练性能尚待接线验收。H64 补零是明确的原型计算开销，未建立性能收益。
+
+验证过程中保留了两类失败：LD 证据的触发条件起初使用全局长度，现改为当前 query
+tile 的实际因果长度；原 4097-key 反例有大量并列分数，TP-disabled local LI 与 full-Q
+stock 也选出不同 ID，但选中分数是精确 Top-K，4096 号全局第一仍正确。隔离诊断存于
+`tie_diagnosis/`，原 worker/report 存于 `failed-tied-stock-selection/`。严格集合对照
+使用精确二进制低位打破并列的反例：原 merge weights 保持不变，两个 local ranks 均为
+2049，全局 rank 为 1，全部 4097 个 FP32 global scores 唯一；证明存于
+`counterexample_proof.json`。该通过不建立并列边界与 stock 的 ID 集合严格等价契约。
+
+本次 LI 载荷的真实 BF16 attention CP subgroup 回归另排队验收，记录为
+`model_regression/`；不能以先前 `25afe218` 载荷的 96 个模型 case 替代。

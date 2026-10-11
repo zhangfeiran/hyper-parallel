@@ -39,6 +39,13 @@ ACLNN_API aclnnStatus aclnnHyperDsaLocalIndexerGetWorkspaceSize(const aclTensor 
                                                                 uint64_t *workspaceSize, aclOpExecutor **executor);
 ACLNN_API aclnnStatus aclnnHyperDsaLocalIndexer(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                 aclrtStream stream);
+ACLNN_API aclnnStatus aclnnHyperDsaTpLocalIndexerGetWorkspaceSize(
+  const aclTensor *query, const aclTensor *key, const aclTensor *weights, const aclTensor *actualQuery,
+  const aclTensor *actualKv, const aclTensor *config, const aclTensor *trace, const aclTensor *retained,
+  const aclTensor *queryPositions, const aclTensor *tpArena, const aclTensor *tpMetadata, const aclTensor *indices,
+  const aclTensor *values, uint64_t *workspaceSize, aclOpExecutor **executor);
+ACLNN_API aclnnStatus aclnnHyperDsaTpLocalIndexer(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                  aclrtStream stream);
 #ifdef __cplusplus
 }
 #endif

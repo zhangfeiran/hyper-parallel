@@ -1,0 +1,99 @@
+--- a/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_service_vector.h
++++ b/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_service_vector.h
+@@ -68,6 +68,9 @@
+             queryPositionsGm_.SetGlobalBuffer((__gm__ int64_t *)positions);
+         }
+     }
++#ifdef HYPER_DSA_TP_LI
++    __aicore__ inline void SetTpTransport(DsaMixed::TpTileSum *transport) { tpTransport_ = transport; }
++#endif
+     __aicore__ inline void ProcessVec(const LICommon::RunInfo &info);
+     __aicore__ inline void ProcessLD();
+     __aicore__ inline void InitBuffers(TPipe *pipe);
+@@ -87,6 +90,9 @@
+     GlobalTensor<int64_t> vec1ParamGm;
+     GlobalTensor<int64_t> queryPositionsGm_;
+     bool hasQueryPositions_ = false;
++#ifdef HYPER_DSA_TP_LI
++    DsaMixed::TpTileSum *tpTransport_ = nullptr;
++#endif
+     GlobalTensor<W_T> weightsGm;
+     GlobalTensor<int32_t> indiceOutGm;
+     GlobalTensor<K_T> valueOutGm;
+@@ -366,6 +372,11 @@
+             bool isS2End = cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq;
+             LIServiceVec::DoReduce(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], reduceOutInner, gRedCnt, s2BaseSize_);
+             outQueue_.FreeTensor(reduceCacheBuf);
++#ifdef HYPER_DSA_TP_LI
++            if (tpTransport_ != nullptr) {
++                tpTransport_->SumNext(reduceOutInner, reduceOutBuff);
++            }
++#endif
+ 
+             LocalTensor<float> sortScoreUb = reduceOutBuff;
+             LocalTensor<float> sortIndiceUb = reduceOutBuff[cuS2LenVecAlign];
+--- a/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_kernel.h
++++ b/attention/lightning_indexer/op_kernel/arch22/lightning_indexer_kernel.h
+@@ -61,6 +61,9 @@
+                                 uint32_t logicalId, uint32_t logicalCount,
+                                 uint32_t scratchId, uint32_t scratchCount, bool mergePhase,
+                                 __gm__ uint8_t *queryPositions = nullptr);
++#ifdef HYPER_DSA_TP_LI
++    __aicore__ inline void SetTpTransport(DsaMixed::TpTileSum *transport) { vectorService.SetTpTransport(transport); }
++#endif
+     __aicore__ inline void ProcessPhase(bool mergePhase);
+     __aicore__ inline bool IsLdPartition() const { return splitCoreInfo.isLD && aiCoreIdx < usedCoreNum; }
+ 
+--- a/attention/lightning_indexer/op_host/lightning_indexer_def.cpp
++++ b/attention/lightning_indexer/op_host/lightning_indexer_def.cpp
+@@ -58,6 +58,10 @@
+             .FormatList({ge::FORMAT_ND});
+         this->Input("query_positions").ParamType(OPTIONAL).DataTypeList({ge::DT_INT64})
+             .FormatList({ge::FORMAT_ND}).AutoContiguous();
++        this->Input("tp_arena").ParamType(OPTIONAL).DataTypeList({ge::DT_UINT8})
++            .FormatList({ge::FORMAT_ND});
++        this->Input("tp_metadata").ParamType(OPTIONAL).DataTypeList({ge::DT_INT64})
++            .FormatList({ge::FORMAT_ND});
+         this->Output("sparse_indices")
+             .ParamType(REQUIRED)
+             .DataTypeList({ge::DT_INT32})
+--- a/attention/lightning_indexer/op_host/lightning_indexer_tiling.h
++++ b/attention/lightning_indexer/op_host/lightning_indexer_tiling.h
+@@ -98,6 +98,7 @@
+ TILING_DATA_FIELD_DEF(uint32_t, returnValue)
+ TILING_DATA_FIELD_DEF(uint32_t, mergePhase)
+ TILING_DATA_FIELD_DEF(uint64_t, queryTokens)
++TILING_DATA_FIELD_DEF(uint64_t, tpArenaBytes)
+ END_TILING_DATA_DEF
+ REGISTER_TILING_DATA_CLASS(HyperDsaMixedIndexer, LITilingData)
+ 
+--- a/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
++++ b/attention/lightning_indexer/op_host/lightning_indexer_tiling.cpp
+@@ -1003,6 +1003,19 @@
+          context_->GetOptionalInputDesc(9)->GetDataType() != ge::DT_INT64)) {
+         return ge::GRAPH_FAILED;
+     }
++    const auto *tpArena = context_->GetOptionalInputShape(10);
++    const auto *tpMetadata = context_->GetOptionalInputShape(11);
++    const bool tp = context_->GetOptionalInputDesc(10) != nullptr;
++    if (tp != (context_->GetOptionalInputDesc(11) != nullptr) ||
++        (tp && (tpArena == nullptr || tpArena->GetStorageShape().GetDimNum() != 1 ||
++                tpArena->GetStorageShape().GetShapeSize() <= 0 ||
++                context_->GetOptionalInputDesc(10)->GetDataType() != ge::DT_UINT8 ||
++                tpMetadata == nullptr || tpMetadata->GetStorageShape().GetDimNum() != 1 ||
++                tpMetadata->GetStorageShape().GetShapeSize() != 24 ||
++                context_->GetOptionalInputDesc(11)->GetDataType() != ge::DT_INT64 ||
++                positions == nullptr || *phase != 2))) {
++        return ge::GRAPH_FAILED;
++    }
+     const uint64_t required = queryTokens == 0 ? 0 : LiCalcWorkspaceSize(ascendcPlatform, tilingInfo->s2Size, aicNum) -
+                               ascendcPlatform.GetLibApiWorkSpaceSize();
+     if (retained->GetStorageShape().GetShapeSize() < static_cast<int64_t>(required)) {
+@@ -1029,6 +1042,7 @@
+     tilingData_.set_returnValue(tilingInfo->returnValue);
+     tilingData_.set_mergePhase(*phase);
+     tilingData_.set_queryTokens(queryTokens);
++    tilingData_.set_tpArenaBytes(tp ? tpArena->GetStorageShape().GetShapeSize() : 0);
+     tilingData_.set_usedCoreNum(blockDim);
+     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
+     context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());

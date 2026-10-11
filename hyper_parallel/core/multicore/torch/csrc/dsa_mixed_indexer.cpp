@@ -112,9 +112,40 @@ Result dsa_local_indexer_npu(const at::Tensor &query, const at::Tensor &key, con
   return Result(indices, values, trace, retained);
 }
 
+Result dsa_tp_local_indexer_npu(const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
+                                const at::Tensor &actualQuery, const at::Tensor &actualKv, const at::Tensor &config,
+                                at::Tensor &trace, at::Tensor &retained, const at::Tensor &queryPositions,
+                                at::Tensor &arena, const at::Tensor &metadata, at::Tensor &indices,
+                                at::Tensor &values) {
+  const std::array<const at::Tensor *, 13> tensors{&query,    &key,     &weights,  &actualQuery,    &actualKv,
+                                                   &config,   &trace,   &retained, &queryPositions, &arena,
+                                                   &metadata, &indices, &values};
+  for (const auto *tensor : tensors) {
+    TORCH_CHECK(tensor->device() == query.device() && tensor->is_contiguous() && !tensor->requires_grad(),
+                "TP local LI requires detached contiguous tensors on one NPU");
+  }
+  check_states(query, key, weights, true);
+  check_runtime(query, actualQuery, actualKv, config, trace, retained, indices, values, 2, true);
+  TORCH_CHECK(queryPositions.sizes() == at::IntArrayRef({query.size(0)}) && queryPositions.scalar_type() == at::kLong &&
+                arena.scalar_type() == at::kByte && arena.dim() == 1 && arena.numel() > 0 &&
+                metadata.scalar_type() == at::kLong && metadata.sizes() == at::IntArrayRef({24}),
+              "TP local LI requires explicit local positions, bound uint8 arena and int64 metadata[24]");
+  for (const auto *output : {&trace, &retained, &indices, &values, &arena}) {
+    for (const auto *tensor : tensors) {
+      TORCH_CHECK(output == tensor || !output->is_alias_of(*tensor), "TP LI mutable buffers must not alias");
+    }
+  }
+  static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaTpLocalIndexer",
+                                                          "aclnnHyperDsaTpLocalIndexerGetWorkspaceSize");
+  hyper_parallel::multicore::execute_cached_op(api, query, key, weights, actualQuery, actualKv, config, trace, retained,
+                                               queryPositions, arena, metadata, indices, values);
+  return Result(indices, values, trace, retained);
+}
+
 }  // namespace
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("dsa_mixed_indexer_out", &dsa_mixed_indexer_npu);
+  m.impl("dsa_tp_local_indexer_out", &dsa_tp_local_indexer_npu);
   m.impl("dsa_local_indexer_out", &dsa_local_indexer_npu);
 }
