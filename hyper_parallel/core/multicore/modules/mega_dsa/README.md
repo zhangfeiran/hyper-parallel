@@ -2443,4 +2443,48 @@ Native VJP、实际 SGD、源码/加载载荷 SHA 均匹配，结果见新验收
 attention 对照扩到四卡共同 root 的 CP `(1,3)` 和 `(0,2)`。模型快照、数值检查和 SGD
 归约使用 CP group，root 全员负责 bind、完成/异常确认和 close。覆盖只有一个子组参与
 和两个子组分别执行、strided/empty ownership；两个子组使用不同的模型权重，以检查
-独立数据路径。该硬件矩阵另行验收，不能用先前 CP==root 的模型通过结果替代。
+独立数据路径。四卡硬件矩阵现已通过 96 个模型 rank-case；独立 stock 的选择集合、
+output/KL、hidden/全部参数梯度、W_UK/W_UV 与实际 SGD 更新均通过原数值规则。
+已比较字段的最大 relative L2 为 `0.0059023659705557344`。启用 KL 的 plain forward
+为九阶段，retained/checkpoint 两次 forward 均为九阶段，关闭 KL 为六阶段。源码身份、
+冻结载荷和实际加载库 SHA 已核对；证据为
+`build/native/validation/mega-dsa-mapped-model-20261011/model_audit.json`。
+该结果仍限于 13-token、hidden32、H32/Hi64 的 BF16 attention fixture，不代表完整 LM、
+独立 FP32 composition、CP×TP、长上下文、模型与 MoE 共存或性能验收。
+
+## TP head 汇总边界
+
+[DsaTpHeadCollectives](tp_collectives.py) 提供显式 Torch TP group 的数学/通信边界，
+暂未接入 native fused CP worker。准备阶段检查 TP peers 的 ordered query/candidate IDs、
+packed lengths 和 invocation 声明一致；CP group ranks 可以不同。执行不 all-gather heads。
+
+- `index_scores` 在每个候选 tile 内计算 local-head ReLU 与原模型的 signed merge weight，
+  以 FP32 SUM 汇总 TP score 后才交给全域 Top-K。`sum_selected_scores` 为每个 query 的
+  selected slots 提供同样的汇总与 VJP；TP peers 必须使用完全相同的 slot 顺序。
+- `teacher` 先逐 main head softmax，再 TP SUM head probabilities，最后 L1 normalize；
+  teacher detach，padding/跨序列/未来位置由 caller 提供的 validity 排除，空行贡献零。
+- score SUM 的 backward 是 identity：各 TP rank 对同一 replicated KL objective 各自
+  backward 一次，不再 SUM cotangent 或除 TP size。原 CP reducer divisor、loss coefficient
+  和 auxiliary upstream scale 各执行一次；该边界不自动改变 CP loss 契约。
+- `sum_shared_gradients` 在 CP owner return 后，将 compressed KV、K RoPE、index K 等
+  shared-field partials 打包为一个 FP32 TP SUM，再由 caller 接回原投影并 cast。None 保持
+  absent；所有 TP peers 的 presence mask 与 backward schedule 必须一致。
+
+[mega_dsa_tp_collectives_validate.py](../../examples/mega_dsa_tp_collectives_validate.py)
+用四进程 Gloo 验证 CP `(0,2)/(1,3)` × TP `(0,1)/(2,3)`，真实按 token/head 切分输入，
+逐 tile 汇总 score 后维护 exact Top-K；对照未分片 FP64 oracle 的选择、output/KL 和
+全部七类输入梯度。矩阵包含 strided/empty ownership、candidate tile `1/2/7`、
+coefficient `0/.37`、CP reducer divisor `1/2` 和 upstream `-2.5`，共 96 个 rank-case
+通过，数值阈值为 `rtol=1e-10, atol=1e-12`。独立单测另覆盖“各局部 Top-K 都未选择、
+head SUM 后却成为全局最佳”的反例，以及不同 head 数的 teacher 汇总顺序。
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  -m hyper_parallel.core.multicore.examples.mega_dsa_tp_collectives_validate \
+  --output /tmp/mega-dsa-cp2-tp2
+```
+
+审核结果在 `build/native/validation/mega-dsa-tp-collectives-20261011/collectives_audit.json`；
+这是 CPU FP64 通信与数学证据。native LI 的 pre-Top-K score 交换、native KL 的 teacher
+交换、真实 TP 模型接线和 NPU CP×TP 验收仍待实现；`FusedDsaCpAttention` 继续拒绝 TP。
