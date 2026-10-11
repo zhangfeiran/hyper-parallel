@@ -23,7 +23,7 @@ ir = activate.lower()
 print(ir.dump())
 ```
 
-可运行的 [Gate Route 示例](examples/gate_route.py) 遵循设计规定的顺序：softplus、sqrt、
+可运行的 [Gate 路由示例](examples/gate_route.py) 遵循设计规定的顺序：softplus、sqrt、
 不参与梯度计算的选择偏置、top-k、gather、归一化和缩放。在可编辑安装的工作区中运行：
 
 ```bash
@@ -67,7 +67,7 @@ python -m pytest -q tests/ut/core/multicore/frontend
 
 ## Gate WorkerPipeline 主机执行计划
 
-使用 `schedule=mc.WorkerPipeline()` 的受支持文本 Route 程序现在提供
+使用 `schedule=mc.WorkerPipeline()` 的受支持文本路由程序现在提供
 `Program.plan(signature, topology, **constants)`：
 
 ```python
@@ -84,7 +84,7 @@ profiled_runtime_bytes = plan.forward.profiled
 硬件拓扑独立于计算描述可用的 AIV 工作单元（worker）。生成计划不探测或读取设备。
 `from_source(..., schedule=mc.WorkerPipeline())` 对显式源码支持相同的计划 API。
 
-编译器证明图使用规范的 Route 原语定义和完整数据流：FP32 logits 和脱离梯度的偏置；softplus 后接 sqrt；
+编译器证明图使用规范的路由原语定义和完整数据流：FP32 logits 和脱离梯度的偏置；softplus 后接 sqrt；
 使用分数加偏置进行选择；最后一维的非排序 top-k；收集原始分数；k 大于 1 时使用行求和、
 `1.0e-20` 稳定常数（epsilon）和除法；最后缩放并输出 int64 索引。
 改变这些契约、增加额外操作或声明修改性效果都会被明确拒绝。
