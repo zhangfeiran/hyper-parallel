@@ -34,6 +34,7 @@ from hyper_parallel import DTensor, Shard, init_device_mesh
 from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.core.expert_parallel import ExpertParallel
 from hyper_parallel.core.expert_parallel.hot_replica import count_kernel, routing
+from hyper_parallel.core.expert_parallel.hot_replica.admission import resolve_replica_admission
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore._loader import get_multicore_paths
 from hyper_parallel.core.multicore.profiler import mega_kernel_profile
@@ -80,10 +81,13 @@ def _make_layer(args, mesh, index, backend=None, budget=None):
                                    ("w3", (home, args.intermediate, args.hidden)))}
     identity = {name: _digest(value) for name, value in weights.items()}
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
+    admission = ({"replica_minimum_load_reduction": args.replica_minimum_load_reduction}
+                 if budget else {})
     if backend == "native":
         with torch.device("meta"):
             module = GroupedExperts(args.hidden, args.intermediate, args.experts, use_grouped_mm=True)
-        ExpertParallel(replica_slots_per_rank=budget, replica_planner=args.replica_planner).apply(module, mesh)
+        ExpertParallel(replica_slots_per_rank=budget, replica_planner=args.replica_planner,
+                       replica_min_rows=args.replica_min_rows, **admission).apply(module, mesh)
         for name, value in weights.items():
             local = value.to(device)
             global_shape = (args.experts, *value.shape[1:])
@@ -91,11 +95,12 @@ def _make_layer(args, mesh, index, backend=None, budget=None):
     else:
         module = MegaMoeExperts(local_num_tokens=args.tokens, hidden_size=args.hidden,
                                 intermediate_size=args.intermediate, num_experts=args.experts, top_k=args.top_k,
-                                ep_size=size, ep_group=dist.group.WORLD, dispatch_mode="push",
-                                initial_capacity_factor=1.5, replica_slots_per_rank=budget,
+                                ep_size=size, ep_group=dist.group.WORLD, dispatch_mode=args.dispatch_mode,
+                                initial_capacity_factor=1.5 if args.dispatch_mode == "push" else None,
+                                replica_slots_per_rank=budget,
                                 replica_transport=args.replica_transport, replica_planner=args.replica_planner,
                                 replica_target_load=args.replica_target_load,
-                                replica_min_rows=args.replica_min_rows).to(
+                                replica_min_rows=args.replica_min_rows, **admission).to(
                                     device=device, dtype=torch.bfloat16)
         with torch.no_grad():
             module.gate_up_weight.copy_(torch.cat((weights["w1"].transpose(1, 2),
@@ -110,9 +115,9 @@ def _parameters(module):
 
 def _count_evidence(module, values):
     """Identify the supported count path and its separately built binary outside timing."""
-    if not module.replica_slots_per_rank:
-        return {"route_count_backend": "ordinary_counts"}
     spec = module._get_execution_resources(values).spec  # pylint: disable=protected-access
+    if not spec.replica_slots_per_rank:
+        return {"route_count_backend": "ordinary_counts"}
     enabled = ("try_count_payload" in routing._replica_count_payload.__code__.co_names
                and 1 <= spec.top_k <= 8 and spec.num_experts <= 256
                and count_kernel._counts_available(values.device))  # pylint: disable=protected-access
@@ -123,10 +128,20 @@ def _count_evidence(module, values):
 
 def _transport_evidence(module, values, expected):
     if not isinstance(module, MegaMoeExperts):
-        return {"actual_transport": "p2p", "route_count_backend": "native_counts"}
+        state = getattr(module, "_hot_replica_dispatch", None)
+        transfers = bool(state is not None and state.route.plan.transfers)
+        return {"actual_transport": "p2p", "route_count_backend": "native_counts",
+                "weight_gradient_dtype": "float32" if transfers else "bfloat16",
+                "ordinary_home_compute": not transfers}
     resources = module._get_execution_resources(values)  # pylint: disable=protected-access
     provider = resources.workspace.replica_provider
     execution_spec = resources.last_execution_plan.spec
+    admission, saved_rows = ((None, 0) if not resources.spec.replica_slots_per_rank else resolve_replica_admission(
+        module.replica_minimum_load_reduction, backend=module.dispatch_mode,
+        transport=resources.spec.replica_transport, tokens=module.local_num_tokens,
+        hidden=module.hidden_size, intermediate=module.intermediate_size,
+        experts=module.num_experts, ranks=module.ep_size, top_k=module.top_k,
+        budget=module.replica_slots_per_rank, device=values.device))
     evidence = {"actual_transport": resources.spec.replica_transport,
                 **_count_evidence(module, values),
                 "provider": type(provider).__name__,
@@ -136,6 +151,8 @@ def _transport_evidence(module, values, expected):
                 "overlap_home": getattr(provider, "overlap_home", False),
                 "planner_target_load": module.replica_target_load,
                 "planner_minimum_replica_rows": module.replica_min_rows,
+                "planner_minimum_load_reduction": admission,
+                "planner_minimum_saved_rows": saved_rows,
                 "execution_num_experts": execution_spec.num_experts,
                 "execution_replica_slots_per_rank": execution_spec.replica_slots_per_rank,
                 "weight_gradient_dtype": "float32" if execution_spec.replica_slots_per_rank else "bfloat16",
@@ -149,7 +166,7 @@ def _transport_evidence(module, values, expected):
         "kernel_w2_sdma_w13" if matrices == [1] else "sdma_parallel")
     if evidence["actual_transport"] != expected:
         raise AssertionError("Requested replica transport did not execute")
-    if module.replica_slots_per_rank and expected in (
+    if resources.spec.replica_slots_per_rank and expected in (
             "shmem_signal_kernel_gradient", "shmem_signal_kernel_gradient_adaptive"):
         if not evidence["kernel_gradients"] or not evidence["w2_ready_events"]:
             raise AssertionError("Kernel-gradient provider and W2 schedule were not enabled")
@@ -204,11 +221,32 @@ def _statistics(samples):
             "maximum": max(samples)}
 
 
+def _rank_route(args, alpha, seed):
+    """Rotate source expert IDs to cover unequal rank histograms without timed collectives."""
+    ids, scores, counts = make_dirichlet_route(RouteShape(args.tokens, args.experts, args.top_k), alpha, seed)
+    shift = args.rank_route_shift * dist.get_rank() % args.experts
+    return (ids + shift).remainder(args.experts), scores, counts.roll(shift)
+
+
+def _replica_evidence(args, layer, inputs, route, loads):
+    """Inspect the executed plan outside timing, including ordinary native dispatch."""
+    if not args.budget:
+        return None
+    output = _forward(layer, inputs.detach().requires_grad_(), *route[:2], route[2])
+    ordinary = (not layer._get_execution_resources(inputs).spec.replica_slots_per_rank  # pylint: disable=protected-access
+                if isinstance(layer, MegaMoeExperts) else getattr(layer, "_hot_replica_dispatch", None) is None)
+    if ordinary:
+        return {"destination_loads": loads, "slots": None, "transfers": 0, "ordinary_dispatch": True}
+    plan = saved_route(output).plan
+    return {"destination_loads": plan.destination_loads, "slots": plan.slot_to_logical,
+            "transfers": len(plan.transfers)}
+
+
 def _point(args, layers, inputs, gradient, optimizer, alpha, seed, directory):
-    shape = RouteShape(args.tokens, args.experts, args.top_k)
-    cpu_route = make_dirichlet_route(shape, alpha, seed)
+    cpu_route = _rank_route(args, alpha, seed)
     route = tuple(value.to(inputs[0].device) for value in cpu_route)
-    counts = cpu_route[2].long() * dist.get_world_size()
+    counts = torch.stack([cpu_route[2].long().roll(args.rank_route_shift * (source - dist.get_rank()))
+                          for source in range(dist.get_world_size())]).sum(0)
     loads = counts.reshape(dist.get_world_size(), -1).sum(1).tolist()
     route_hash = _digest(cpu_route[0])
     _step(layers, inputs, gradient, route, optimizer, validate=True)
@@ -249,13 +287,7 @@ def _point(args, layers, inputs, gradient, optimizer, alpha, seed, directory):
     optimizer_tensors = [value for state in optimizer.state.values()
                          for value in state.values() if isinstance(value, torch.Tensor)]
     _finite([value for layer in layers for value in _parameters(layer)] + optimizer_tensors)
-    evidence = None
-    if args.budget:
-        output = _forward(layers[0], inputs[0].detach().requires_grad_(), *route[:2], route[2])
-        plan = saved_route(output).plan
-        evidence = {"destination_loads": plan.destination_loads, "slots": plan.slot_to_logical,
-                    "transfers": len(plan.transfers)}
-        del output
+    evidence = _replica_evidence(args, layers[0], inputs[0], route, loads)
     result = {"alpha": alpha, "seed": seed, "route_sha256": route_hash, "expert_counts": counts.tolist(),
               "home_destination_loads": loads, "skew": max(loads) / statistics.mean(loads),
               "fwd_bwd_ms": _statistics([value[0] for value in samples]),
@@ -288,8 +320,7 @@ def _compare(actual, expected, label):
 
 def _diagnose(args, layer, inputs, gradient, optimizer, alpha, seed, directory):
     """Capture one checkpointed MoE layer separately from formal timing."""
-    route = tuple(value.to(inputs.device) for value in
-                  make_dirichlet_route(RouteShape(args.tokens, args.experts, args.top_k), alpha, seed))
+    route = tuple(value.to(inputs.device) for value in _rank_route(args, alpha, seed))
     _step([layer], [inputs], gradient, route, optimizer)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
@@ -343,7 +374,7 @@ def _accept(args, mesh, module, values, gradient, points):
             reference.zero_grad(set_to_none=True)
             module.zero_grad(set_to_none=True)
             ids, scores, counts = (value.to(values.device) for value in
-                                   make_dirichlet_route(RouteShape(args.tokens, args.experts, args.top_k), alpha, seed))
+                                   _rank_route(args, alpha, seed))
             actual_input, expected_input = [values.detach().clone().requires_grad_() for _ in range(2)]
             actual_scores, expected_scores = [scores.detach().clone().requires_grad_() for _ in range(2)]
             expected = _forward(reference, expected_input, ids, expected_scores, counts)
@@ -429,10 +460,17 @@ def run(args: argparse.Namespace) -> None:
                 layer.close()
 
 
+def _validate_rank_shift(parser, shift):
+    """Reject unsupported source rotations before initializing an NPU group."""
+    if shift < 0:
+        parser.error("rank-route-shift must be nonnegative")
+
+
 def main() -> None:
     """Configure one fresh-process variant; initialize devices only in workers."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("native", "megamoe"), required=True)
+    parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
     parser.add_argument("--budget", type=int, required=True)
     parser.add_argument("--layers", type=int, default=16)
     parser.add_argument("--tokens", type=int, default=4096)
@@ -447,8 +485,12 @@ def main() -> None:
                                                      "shmem_signal_kernel_gradient_adaptive"), default="p2p")
     parser.add_argument("--replica-target-load", type=int)
     parser.add_argument("--replica-min-rows", type=int, default=1024)
+    parser.add_argument("--replica-minimum-load-reduction", type=float,
+                        help="Override conservative admission; zero exercises the original optional-copy policy.")
     parser.add_argument("--diagnose", action="store_true", help="Capture separate single-layer diagnostic traces.")
     parser.add_argument("--pairs")
+    parser.add_argument("--rank-route-shift", type=int, default=0,
+                        help="Rotate logical IDs per source rank to measure unequal source histograms.")
     parser.add_argument("--accept", action="store_true")
     parser.add_argument("--result-dir", required=True)
     args = parser.parse_args()
@@ -456,6 +498,7 @@ def main() -> None:
         parser.error("native supports only p2p replica transport")
     if args.budget < 0 or args.replica_min_rows < 0:
         parser.error("budget and replica-min-rows must be nonnegative")
+    _validate_rank_shift(parser, args.rank_route_shift)
     if args.replica_target_load is not None and (args.backend != "megamoe" or args.replica_target_load <= 0):
         parser.error("replica-target-load must be positive and is supported only for megamoe")
     if args.diagnose and (args.backend != "megamoe" or args.accept or not args.budget):

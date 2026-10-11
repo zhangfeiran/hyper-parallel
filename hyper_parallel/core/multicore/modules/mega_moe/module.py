@@ -25,6 +25,9 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
+from hyper_parallel.core.expert_parallel.hot_replica.admission import (
+    reduction_basis_points, resolve_replica_admission,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
 from hyper_parallel.core.expert_parallel.hot_replica.device import validate_planner_backend
 from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
@@ -67,6 +70,25 @@ def _heap_layout(specification: dict[str, Any], element_size: int, capacity: int
         capacity = initial_receive_capacity(specification)
     signature = tuple(sorted((key, value) for key, value in specification.items() if key != "ep_group"))
     return _spec_workspace_bytes(specification, element_size, receive_capacity=capacity), signature, capacity
+
+
+def _resolve_replica_specification(specification: dict[str, Any], tensor: torch.Tensor) -> dict[str, Any]:
+    """Bind unmatched automatic policies to ordinary resources before heap accounting."""
+    if not specification.get("replica_automatic_admission", False):
+        return specification
+    # The heap registry uses object identity. Resolve once in the original object
+    # before it is reserved, including every still-lazy owner in this scope.
+    specification.pop("replica_automatic_admission")
+    admission, _ = resolve_replica_admission(
+        None, backend=specification["dispatch_mode"], transport=specification["replica_transport"],
+        tokens=specification["local_num_tokens"], hidden=specification["hidden_size"],
+        intermediate=specification["intermediate_size"], experts=specification["logical_num_experts"],
+        ranks=specification["ep_size"], top_k=specification["top_k"],
+        budget=specification["replica_slots_per_rank"], device=tensor.device)
+    if admission == 1.0:
+        specification["num_experts"] = specification["logical_num_experts"]
+        specification["replica_slots_per_rank"] = 0
+    return specification
 
 
 class _MegaMoeExecutionResources:
@@ -223,6 +245,7 @@ class MegaMoeExperts(MulticoreModule):
         replica_cost_model: ExpertReplicaCostModel | None = None,
         replica_planner: str = "cpu",
         replica_target_load: int | None = None,
+        replica_minimum_load_reduction: float | None = None,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -250,6 +273,9 @@ class MegaMoeExperts(MulticoreModule):
                 with one-sided MTE reads and ordered FP32 accumulation.
             replica_planner: Shared CPU or fused device replica quota policy.
             replica_target_load: Preferred received rows per rank, independent of buffer capacity.
+            replica_minimum_load_reduction: Required fractional receive-peak reduction for
+                optional replicas. None selects conservative measured admission ranges;
+                zero explicitly preserves token-balancing placement. All ranks must agree.
                 All EP ranks must agree. None uses current capacity for push and average load for pull.
                 Explicit positive values apply to either dispatch mode and retain lossless routing.
             replica_cost_model: Optional matching offline cost calibration shared by all EP ranks.
@@ -295,6 +321,10 @@ class MegaMoeExperts(MulticoreModule):
         self.replica_planner = replica_planner
         self.replica_min_rows = replica_min_rows
         self.replica_target_load = replica_target_load
+        if replica_minimum_load_reduction is not None:
+            reduction_basis_points(replica_minimum_load_reduction)
+        self.replica_minimum_load_reduction = replica_minimum_load_reduction
+        self.replica_transport = replica_transport
         if replica_cost_model is not None:
             if not isinstance(replica_cost_model, ExpertReplicaCostModel):
                 raise ValueError("replica_cost_model must be an ExpertReplicaCostModel")
@@ -318,6 +348,9 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
         }
+        automatic_admission = bool(replica_slots_per_rank and replica_minimum_load_reduction is None)
+        if automatic_admission:
+            specification["replica_automatic_admission"] = True
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
         super().__init__(
@@ -517,15 +550,22 @@ class MegaMoeExperts(MulticoreModule):
                 replica_route = None
                 execution_plan = resources.plan
                 execution_spec = resources.spec
-                if self.replica_slots_per_rank:
+                if self.replica_slots_per_rank and resources.spec.replica_slots_per_rank:
                     target_load = self.replica_target_load
                     if target_load is None and not pull:
                         target_load = resources.workspace.capacity_floor
+                    admission, saved_rows = resolve_replica_admission(
+                        self.replica_minimum_load_reduction, backend=self.dispatch_mode,
+                        transport=self.replica_transport, tokens=self.local_num_tokens,
+                        hidden=self.hidden_size, intermediate=self.intermediate_size,
+                        experts=self.num_experts, ranks=self.ep_size, top_k=self.top_k,
+                        budget=self.replica_slots_per_rank, device=hidden_flat.device)
                     replica_route = prepare_replica_route(
                         topk_ids, self.replica_config, self._ep_group,
                         target_load=target_load,
                         minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
                         planner_backend=self.replica_planner,
+                        minimum_load_reduction=admission, minimum_saved_rows=saved_rows,
                         compact_home=resources.home_plan is not None,
                     )
                     if replica_route.home_only:
@@ -580,8 +620,9 @@ class MegaMoeExperts(MulticoreModule):
     ) -> _MegaMoeExecutionResources:
         """Create the plan and workspace owned by this resource group."""
         return _MegaMoeExecutionResources(
-            self._resource_group.specification,
+            _resolve_replica_specification(self._resource_group.specification, tensor),
             tensor,
             shared=shared,
-            active_specifications=active_specifications,
+            active_specifications=tuple(_resolve_replica_specification(specification, tensor)
+                                        for specification in active_specifications),
         )

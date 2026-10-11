@@ -326,11 +326,15 @@ class GroupedExperts(nn.Module):
         w3 = self.w3.to_local() if isinstance(self.w3, DTensor) else self.w3
 
         replica_dispatch = getattr(self, "_hot_replica_dispatch", None)
-        if replica_dispatch is not None:
+        if replica_dispatch is not None and replica_dispatch.route.plan.transfers:
             packed = torch.cat((w1, w3), dim=1).transpose(1, 2).contiguous()
             output = native_replica_experts(
                 x, packed, w2.transpose(1, 2).contiguous(), num_tokens_per_expert, replica_dispatch.route)
             return output if scores is None else output * scores.to(output.dtype).unsqueeze(-1)
+
+        if replica_dispatch is not None:
+            # Empty guest slots are dispatch padding; ordinary experts retain their BF16 backward.
+            num_tokens_per_expert = num_tokens_per_expert[:w1.shape[0]]
 
         if not self.use_grouped_mm:
             return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert, scores)

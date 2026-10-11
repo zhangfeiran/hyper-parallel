@@ -167,8 +167,14 @@ class TestMegaMoeExperts(unittest.TestCase):
                                    num_experts=4, top_k=2, ep_size=2, replica_target_load=target)
             create.assert_not_called()
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_replica_target_load_is_independent_of_capacity_in_push_and_pull(self) -> None:
-        """Preserve default routing targets and pass explicit targets without resizing buffers."""
+        """
+        description: Preserve default routing targets and pass explicit targets without resizing buffers.
+        expectation: Explicit targets and invocation graph switches preserve workspace ownership.
+        feature: Expert hot replica resource selection.
+        """
         hidden = torch.ones(128, 16, dtype=torch.bfloat16)
         ids = torch.zeros(128, 2, dtype=torch.int32)
         probabilities = torch.full((128, 2), 0.5)
@@ -178,7 +184,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
                                          num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
                                          replica_slots_per_rank=1, replica_target_load=target).bfloat16()
-                resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0), plan=SimpleNamespace(spec=object()),
+                resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0, replica_slots_per_rank=1),
+                                            plan=SimpleNamespace(spec=object()),
                                             home_plan=None,
                                             workspace=Mock(capacity_floor=384), ensure_capacity=Mock())
                 replica = SimpleNamespace(physical_ids=ids, counts_by_source=torch.zeros(2, 6), home_only=False)
@@ -201,8 +208,14 @@ class TestMegaMoeExperts(unittest.TestCase):
                 finally:
                     experts.close()
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_home_only_execution_can_switch_back_to_replica_graph(self) -> None:
-        """Keep physical storage while alternating globally empty and active guest plans."""
+        """
+        description: Alternate globally empty and active guest plans while retaining physical storage.
+        expectation: Explicit targets and invocation graph switches preserve workspace ownership.
+        feature: Expert hot replica resource selection.
+        """
         hidden = torch.ones(128, 16, dtype=torch.bfloat16)
         ids, probabilities = torch.zeros(128, 2, dtype=torch.int32), torch.full((128, 2), 0.5)
         for mode, budget in (("push", 1), ("push", 2), ("pull", 1), ("pull", 2)):
@@ -210,7 +223,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
                                          num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
                                          replica_slots_per_rank=budget).bfloat16()
-                spec = SimpleNamespace(rank_id=0)
+                spec = SimpleNamespace(rank_id=0, replica_slots_per_rank=budget)
                 resources = SimpleNamespace(spec=spec, plan=SimpleNamespace(spec=spec),
                                             home_plan=SimpleNamespace(spec=SimpleNamespace(rank_id=0)),
                                             workspace=Mock(capacity_floor=384, in_use=True), ensure_capacity=Mock())
@@ -221,7 +234,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                           patch.object(experts, "_get_execution_resources", return_value=resources),
                           patch.object(mega_moe_module, "prepare_replica_route") as prepare,
                           patch.object(mega_moe_module, "prepare_topk_route", return_value=route) as topk,
-                          patch.object(mega_moe_module, "execute_mega_moe_with_permutation", return_value=hidden) as execute,
+                          patch.object(mega_moe_module, "execute_mega_moe_with_permutation",
+                                       return_value=hidden) as execute,
                           patch.object(mega_moe_module, "restore_topk_output", return_value=hidden)):
                         for home_only in (True, False, True, False):
                             prepare.return_value = SimpleNamespace(physical_ids=ids, home_only=home_only,
