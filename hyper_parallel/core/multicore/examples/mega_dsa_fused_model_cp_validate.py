@@ -122,7 +122,7 @@ def _compare(peers, reference, meta, selection):
             "global_tokens": meta.global_valid_queries}
 
 
-def _sgd(model, gradients, peers, reference_model, reference_gradients):
+def _sgd(model, gradients, peers, reference_model, reference_gradients, *, group=None):
     metrics = {}
     reference_parameters = dict(reference_model.named_parameters())
     for (name, parameter), gradient in zip(model.named_parameters(), gradients[1:]):
@@ -130,7 +130,7 @@ def _sgd(model, gradients, peers, reference_model, reference_gradients):
         if active:
             reduced = (torch.zeros_like(parameter, dtype=torch.float32) if gradient is None
                        else gradient.detach().float().contiguous())
-            dist.all_reduce(reduced)
+            dist.all_reduce(reduced, group=group)
             parameter.grad = reduced.to(parameter.dtype)
         else:
             parameter.grad = None
@@ -207,11 +207,13 @@ def _case(report, workspace, backend, meta, template, mode, replay):
     reference_values = _collect(reference_model, reference_hidden, reference_output, reference_backend.last_loss,
                                 gradients=reference_gradients)
     payload = {"ids": ids, "values": values, "indices": captured[0].global_indices[:, 0].cpu()}
-    peers = [None]*dist.get_world_size()
-    dist.all_gather_object(peers, payload)
+    group = backend.layout.group
+    peers = [None]*dist.get_world_size(group)
+    dist.all_gather_object(peers, payload, group=group)
     proof = collective_validation_check(partial(_compare, peers, reference_values, global_meta,
-                                                reference_backend.last_selection.to_global_indices().cpu()))
-    optimizer = _sgd(model, gradients, peers, reference_model, reference_gradients)
+                                                reference_backend.last_selection.to_global_indices().cpu()),
+                                        group=group)
+    optimizer = _sgd(model, gradients, peers, reference_model, reference_gradients, group=group)
     case = {"pattern": meta.layout_id, "mode": mode, "replay": replay, **proof, "sgd": optimizer,
             "native_phase_counts": [len(result.phase_traces) for result in captured]}
     case["passed"] = case["passed"] and optimizer["passed"]

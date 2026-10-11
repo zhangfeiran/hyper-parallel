@@ -2434,3 +2434,13 @@ teacher 使用，关闭分支的梯度保持 absent，且不会向上游 native 
 此模型证据是 13-token、hidden32、H32/Hi64 的真实 HP attention fixture 与独立 stock
 BF16 模型对照；它不清除历史 FP32 model-composition 验收的失败，也不代表完整 LM、
 预训练 checkpoint、H64/H128、CP×TP、长上下文或训练性能验收。
+
+inactive-input 接线修正后的完整映射训练矩阵也已通过 13824 个 rank-step，阶段图、
+Native VJP、实际 SGD、源码/加载载荷 SHA 均匹配，结果见新验收目录 `full_audit.json`。
+旧矩阵和旧模型验收保留各自源码身份，不混用运行期间修改的验证脚本。
+
+[mega_dsa_mapped_model_validate.py](../../examples/mega_dsa_mapped_model_validate.py) 将真实
+attention 对照扩到四卡共同 root 的 CP `(1,3)` 和 `(0,2)`。模型快照、数值检查和 SGD
+归约使用 CP group，root 全员负责 bind、完成/异常确认和 close。覆盖只有一个子组参与
+和两个子组分别执行、strided/empty ownership；两个子组使用不同的模型权重，以检查
+独立数据路径。该硬件矩阵另行验收，不能用先前 CP==root 的模型通过结果替代。
