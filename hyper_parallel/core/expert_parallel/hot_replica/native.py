@@ -125,7 +125,18 @@ class _NativeReplicaExperts(torch.autograd.Function):
 
 def native_replica_experts(inputs: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor,
                            counts: torch.Tensor, route: ReplicaRoute) -> torch.Tensor:
-    """Execute packed weights [H,D,2I], [H,I,D] with native NPU kernels."""
+    """Execute packed weights [H,D,2I], [H,I,D] with native NPU kernels.
+
+    Args:
+        inputs: BF16 expert-major NPU token rows.
+        weight1: Original owner's packed gate/up matrices.
+        weight2: Original owner's down matrices.
+        counts: Physical expert row counts.
+        route: Invocation-owned placement and source quotas.
+
+    Returns:
+        Expert-major BF16 outputs with gradients returned to original owners.
+    """
     if inputs.device.type != "npu" or inputs.dtype != torch.bfloat16:
         raise ValueError("native hot replicas currently require BF16 NPU inputs")
     return _NativeReplicaExperts.apply(inputs, weight1, weight2, counts, route)
@@ -146,7 +157,9 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
                              group: object,
                              *, minimum_replica_rows: int = 0,
                              cost_model: ExpertReplicaCostModel | None = None,
-                             planner_backend: str = "cpu") -> tuple[tuple, NativeReplicaDispatch]:
+                             planner_backend: str = "cpu",
+                             minimum_load_reduction: float = 0.0,
+                             minimum_saved_rows: int = 0) -> tuple[tuple, NativeReplicaDispatch]:
     """Dispatch existing native expert-major inputs through shared replicas.
 
     Args:
@@ -156,6 +169,8 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
         minimum_replica_rows: Minimum useful row count for a guest copy.
         cost_model: Optional calibrated model for CPU quota refinement.
         planner_backend: CPU or device placement implementation.
+        minimum_load_reduction: Required receive-peak reduction for optional copies.
+        minimum_saved_rows: Required absolute receive-peak reduction for optional copies.
 
     Returns:
         Dispatched inputs and invocation-owned inverse metadata for combine.
@@ -169,7 +184,9 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
     device_plan = None
     if planner_backend == "device":
         device_plan = build_device_expert_replica_plan(gathered, config,
-                                                       minimum_replica_rows=minimum_replica_rows)
+                                                       minimum_replica_rows=minimum_replica_rows,
+                                                       minimum_load_reduction=minimum_load_reduction,
+                                                       minimum_saved_rows=minimum_saved_rows)
         plan = device_plan.host_summary()
         slots, repeats = device_plan.source_runs(rank)
         send_splits = list(plan.rank_splits[rank])
@@ -179,7 +196,9 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
     else:
         host = gathered.cpu().tolist()
         plan = build_expert_replica_plan(host, config.replica_slots_per_rank,
-                                         minimum_replica_rows=minimum_replica_rows, cost_model=cost_model)
+                                         minimum_replica_rows=minimum_replica_rows, cost_model=cost_model,
+                                         minimum_load_reduction=minimum_load_reduction,
+                                         minimum_saved_rows=minimum_saved_rows)
         runs = sorted((expert, slot, plan.dispatch_counts[rank][slot])
                       for slot, expert in enumerate(plan.physical_to_logical) if expert >= 0)
         slots = torch.tensor([slot for _, slot, _ in runs], device=values.device)
@@ -206,7 +225,15 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
 
 
 def combine_native_replicas(output: torch.Tensor, state: NativeReplicaDispatch) -> torch.Tensor:
-    """Restore original logical expert-major rows before model unpermutation."""
+    """Restore original logical expert-major rows before model unpermutation.
+
+    Args:
+        output: Local physical expert output rows.
+        state: This invocation's inverse token exchange and ordering metadata.
+
+    Returns:
+        Source rank outputs in their original logical expert-major order.
+    """
     rank_major = torch.empty_like(output)
     rank_major[state.recv_order] = output
     combined = differentiable_all_to_all_single(

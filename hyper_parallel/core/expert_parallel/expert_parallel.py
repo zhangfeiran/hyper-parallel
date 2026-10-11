@@ -45,6 +45,7 @@ import torch
 from torch.nn import Module
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
+from hyper_parallel.core.expert_parallel.hot_replica.admission import reduction_basis_points
 from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
 from hyper_parallel.core.expert_parallel.hot_replica.device import validate_planner_backend
 from hyper_parallel.core.expert_parallel.hot_replica.native import (
@@ -1103,7 +1104,7 @@ class ExpertParallel(BaseExpertParallel):
     def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False,
                  *, replica_slots_per_rank: int = 0,
                  replica_min_rows: int = 0, replica_cost_model: Optional[ExpertReplicaCostModel] = None,
-                 replica_planner: str = "cpu") -> None:
+                 replica_planner: str = "cpu", replica_minimum_load_reduction: Optional[float] = None) -> None:
         """Initialize ExpertParallel.
 
         Args:
@@ -1113,6 +1114,11 @@ class ExpertParallel(BaseExpertParallel):
             replica_min_rows: Soft minimum rows per copied expert. Zero retains token balancing.
                 Smaller copies remain when required by the receive bound. Calibrate this
                 threshold for the intended shape; all EP ranks must use the same value.
+            replica_minimum_load_reduction: Required fractional receive-peak reduction for
+                optional replicas. None conservatively uses ordinary native dispatch
+                because no native latency range is enabled by default. One also uses
+                ordinary dispatch; native receives have no fixed replica capacity.
+                Zero explicitly preserves token-balancing placement.
             token_dispatcher: Token dispatch strategy. Supported values are
                 ``"all_to_all"`` and ``"deredundency"``.
             async_combine: If ``True``, use asynchronous combine all-to-all
@@ -1126,6 +1132,10 @@ class ExpertParallel(BaseExpertParallel):
         validate_planner_backend(replica_planner, replica_min_rows, replica_cost_model)
         self.replica_planner = replica_planner
         self.replica_min_rows = replica_min_rows
+        if replica_minimum_load_reduction is not None:
+            reduction_basis_points(replica_minimum_load_reduction)
+        self.replica_minimum_load_reduction = replica_minimum_load_reduction
+        self._replicas_enabled = bool(replica_slots_per_rank and replica_minimum_load_reduction not in (None, 1.0))
         if replica_cost_model is not None and (not isinstance(replica_cost_model, ExpertReplicaCostModel)
                                               or replica_cost_model.backend != "native"):
             raise ValueError("Native replicas require a native ExpertReplicaCostModel")
@@ -1161,7 +1171,7 @@ class ExpertParallel(BaseExpertParallel):
         # (which uses self._token_dispatcher) and break deredundency.
         # Dispatch state belongs to the module, matching the existing EP hook contract.
         # pylint: disable=W0212
-        if self.replica_slots_per_rank:
+        if self._replicas_enabled:
             config = ExpertReplicaConfig(inputs[1].numel(), device_mesh.size(), self.replica_slots_per_rank)
             if self.replica_cost_model is not None:
                 self.replica_cost_model.validate_execution(
@@ -1169,7 +1179,7 @@ class ExpertParallel(BaseExpertParallel):
             routed, state = dispatch_native_replicas(
                 inputs, config, device_mesh.get_group(),
                 minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
-                planner_backend=self.replica_planner)
+                planner_backend=self.replica_planner, minimum_load_reduction=self.replica_minimum_load_reduction)
             module._hot_replica_dispatch = state
             return routed
         dispatch_result = self._token_dispatcher.dispatch(module, inputs, device_mesh)
@@ -1211,7 +1221,7 @@ class ExpertParallel(BaseExpertParallel):
         """
         # Read dispatch context from module attribute set by _token_dispatch.
         # pylint: disable=W0212
-        if self.replica_slots_per_rank:
+        if self._replicas_enabled:
             return combine_native_replicas(routed_output, module._hot_replica_dispatch)
         ctx = getattr(module, "_ep_dispatch_ctx", None)
         if ctx is None:
