@@ -24,6 +24,7 @@ import torch
 
 from hyper_parallel.core.multicore.backends.ascend import BackendEmission, emit_plan
 from hyper_parallel.core.multicore.compiler.dense import compile_dense_plan
+from hyper_parallel.core.multicore.compiler.events import attach_event_graphs
 from hyper_parallel.core.multicore.compiler.mhc import match_mhc_region
 from hyper_parallel.core.multicore.compiler.moe import match_moe_region
 from hyper_parallel.core.multicore.compiler.pipeline import compile_worker_pipeline
@@ -162,8 +163,10 @@ class Program:
             if self.registry.schema(operation.logical_name, operation.version) is not canonical:
                 raise ValueError("Compatibility plans require canonical registered primitive schemas")
         if isinstance(self.schedule, TaskDAG):
-            return self._task_dag_plan(ir, signature, topology)
-        return compile_worker_pipeline(ir, self.schedule, dict(signature or {}), topology or HardwareSpec())
+            plan = self._task_dag_plan(ir, signature, topology)
+        else:
+            plan = compile_worker_pipeline(ir, self.schedule, dict(signature or {}), topology or HardwareSpec())
+        return plan if isinstance(plan, DenseKernelPlan) else attach_event_graphs(plan)
 
     def compile(self, signature: Mapping[str, int] | MegaMoeSpec | MhcSpec | DenseSpec | None = None,
                 topology: HardwareSpec | None = None, **constants: object) -> BackendEmission:

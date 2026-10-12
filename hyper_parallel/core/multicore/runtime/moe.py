@@ -23,6 +23,7 @@ from dataclasses import dataclass, fields
 from typing import Any
 
 from hyper_parallel.core.multicore.compiler.moe import MoeRecipe
+from hyper_parallel.core.multicore.ir.events import EventGraphIR
 from hyper_parallel.core.multicore.ir.program import SourceSpan
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
     prepare_w13_overlap_schedule,
@@ -66,6 +67,7 @@ class MoeKernelPlan:
     forward: TaskDAGImage
     backward: TaskDAGImage
     backward_no_replica: TaskDAGImage | None
+    event_graphs: tuple[EventGraphIR, ...] = ()
 
     def materialize(self, device: Any) -> Any:
         """Materialize through the existing MoE tiling/profiling bridge.

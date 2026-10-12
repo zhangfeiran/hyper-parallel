@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from hyper_parallel.core.multicore.backends.dense import dense_artifacts
+from hyper_parallel.core.multicore.backends.events import lower_event_fields
 from hyper_parallel.core.multicore.backends.launchers import generated_files as launcher_files, launcher_manifest
 from hyper_parallel.core.multicore.backends.schema import (
     cpp_calls,
@@ -30,6 +31,7 @@ from hyper_parallel.core.multicore.backends.schema import (
     python_schema,
 )
 from hyper_parallel.core.multicore.backends.workers import generated_files, worker_manifest
+from hyper_parallel.core.multicore.compiler.events import build_event_graphs
 from hyper_parallel.core.multicore.ir.program import ProgramIR
 from hyper_parallel.core.multicore.runtime.abi import family_abi
 from hyper_parallel.core.multicore.runtime.dense import DenseKernelPlan
@@ -95,8 +97,10 @@ def emit_plan(plan: KernelPlan | MoeKernelPlan | MhcKernelPlan | DenseKernelPlan
     if family not in {"gate", "mhc", "moe"}:
         raise ValueError("Ascend emission requires a supported native family")
     definition_key = _hash(_json(_definition(ir, family)))
-    images = _images(plan)
+    graphs = plan.event_graphs or build_event_graphs(plan)
+    images = _images(plan, graphs)
     plan_key = _hash(_json({"definition": definition_key, "static": plan.export_manifest(),
+                           "events": [graph.export_manifest() for graph in graphs],
                            "images": {name: _hash(content) for name, content in images.items()}}))
     calls = json.loads((CORE / "runtime/native_calls.json").read_text())
     bindings = {name: entry for name, entry in calls["entries"].items() if entry["family"] == family}
@@ -105,16 +109,21 @@ def emit_plan(plan: KernelPlan | MoeKernelPlan | MhcKernelPlan | DenseKernelPlan
              "bindings/native_calls.py": python_calls().encode(),
              "bindings/native_calls.hpp": cpp_calls().encode(), "bindings/schema.json": _json(bindings),
              "plan.json": _json(plan.export_manifest()), "source_map.json": _json(json.loads(plan.explain())),
+             **{f"events/{graph.direction}.json": _json(graph.export_manifest()) for graph in graphs},
              **images}
-    files["workers/manifest.json"] = _json(worker_manifest(family))
-    files.update({f"workers/{path.name}": text.encode() for path, text in generated_files().items()
-                  if path.name.startswith(family + "_")})
+    files.update(_worker_artifacts(family))
     files["launchers/manifest.json"] = _json(launcher_manifest(family))
     names = set(bindings)
     files.update({f"launchers/{path.name}": text.encode() for path, text in launcher_files().items()
                   if path.name == "launcher_types.hpp" or any(path.name.startswith(name + "_") for name in names)})
     return BackendEmission(plan, definition_key, plan_key,
                            tuple(EmittedFile(name, content) for name, content in sorted(files.items())))
+
+
+def _worker_artifacts(family):
+    return {"workers/manifest.json": _json(worker_manifest(family)),
+            **{f"workers/{path.name}": text.encode() for path, text in generated_files().items()
+               if path.name.startswith(family + "_")}}
 
 
 def _definition(ir, family):
@@ -124,17 +133,19 @@ def _definition(ir, family):
         operation.pop("call_chain")
     inputs = ("backends/schema.py", "backends/ascend.py", "backends/workers.py", "backends/contexts.py",
               "backends/launchers.py", "runtime/bindings.py",
-              "runtime/native_calls.json", "runtime/worker_calls.json")
-    return {"generator_version": 1, "target": "ascend", "semantic": semantic,
+              "runtime/native_calls.json", "runtime/worker_calls.json", "ir/events.py",
+              "compiler/events.py", "backends/events.py")
+    return {"generator_version": 2, "target": "ascend", "semantic": semantic,
             "abi": family_abi(family).export_manifest(),
             "generator_inputs": {name: _hash((CORE / name).read_bytes()) for name in inputs}}
 
 
-def _images(plan):
+def _images(plan, graphs):
     result = {}
+    event_graphs = {graph.direction: graph for graph in graphs}
     for direction in ("forward", "backward", "backward_no_replica"):
         image = getattr(plan, direction, None)
         if image is not None:
-            result[f"schedule/{direction}.bin"] = image.normal
-            result[f"schedule/{direction}.profiled.bin"] = image.profiled
+            result[f"schedule/{direction}.bin"] = lower_event_fields(event_graphs[direction], image.normal)
+            result[f"schedule/{direction}.profiled.bin"] = lower_event_fields(event_graphs[direction], image.profiled)
     return result

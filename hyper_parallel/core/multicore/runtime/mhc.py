@@ -36,6 +36,7 @@ from hyper_parallel.core.multicore.compiler._mhc_forward import (
     resolve_token_tile,
 )
 from hyper_parallel.core.multicore.compiler.mhc import MhcRecipe
+from hyper_parallel.core.multicore.ir.events import EventGraphIR
 from hyper_parallel.core.multicore.profiler.profiling import (
     _apply_mega_kernel_profile_graph,
     _prepare_mega_kernel_runtime_config,
@@ -95,6 +96,7 @@ class MhcKernelPlan:
     grad_token_tile: int
     ring_slots: int
     macro_join: tuple[tuple[int, ...], ...]
+    event_graphs: tuple[EventGraphIR, ...] = ()
 
     def materialize(self, device: str = "npu:0", *, payload_root: Any = None) -> MhcExecutable:
         """Bind native MHC resources after family/artifact and device checks.

@@ -20,6 +20,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from hyper_parallel.core.multicore.ir.events import EventGraphIR
 from hyper_parallel.core.multicore.ir.schedule import PipelineScheduleIR, PipelineStage
 from hyper_parallel.core.multicore.runtime.abi import FamilyABI, NativeManifest
 from hyper_parallel.core.multicore.runtime.gate import GateExecutable
@@ -60,6 +61,7 @@ class KernelPlan:
     scale: float
     token_count: int
     expert_count: int
+    event_graphs: tuple[EventGraphIR, ...] = ()
 
     def materialize(self, device: str = "npu:0", *, payload_root: Path | None = None) -> GateExecutable:
         """Bind the plan to a verified Gate payload and device.
