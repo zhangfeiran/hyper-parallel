@@ -108,6 +108,11 @@ def _replica_count_payload(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
     fused = try_count_payload(ids, num_experts)
     if fused is not None:
         return fused
+    return _torch_replica_count_payload(ids, num_experts)
+
+
+def _torch_replica_count_payload(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Validate and count exactly when the optional native counter is unavailable."""
     ordered = (ids.float() if num_experts <= 2**24 else ids).sort(dim=1).values
     invalid = ((ids < 0) | (ids >= num_experts)).any()
     invalid = invalid | (ordered[:, 1:] == ordered[:, :-1]).any()

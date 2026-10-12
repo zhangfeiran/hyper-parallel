@@ -33,6 +33,31 @@ class TestReplicaCountKernel(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
+    def test_device_selection_requires_binary_and_compatible_architecture(self) -> None:
+        """
+        Feature: A2/A3 count availability
+        Description: Inspect supported and unrelated device names with and without an installed binary.
+        Expectation: Only compatible devices with a binary enable the counter; missing binaries skip device queries.
+        """
+        count_kernel._counts_available.cache_clear()
+        self.addCleanup(count_kernel._counts_available.cache_clear)
+        device = torch.device("cpu")
+        cases = (("Ascend910B1", True), ("Ascend910B4", True), ("Ascend910_9382", True),
+                 ("Ascend910_9391", True), ("Ascend910", False), ("Ascend950", False),
+                 ("Ascend310P", False))
+        for name, expected in cases:
+            with self.subTest(device=name):
+                count_kernel._counts_available.cache_clear()
+                with (patch.object(Path, "is_file", return_value=True),
+                      patch.object(torch.npu, "get_device_name", return_value=name)):
+                    self.assertEqual(count_kernel._counts_available(device), expected)
+        count_kernel._counts_available.cache_clear()
+        with (patch.object(Path, "is_file", return_value=False),
+              patch.object(torch.npu, "get_device_name", side_effect=AssertionError("Unexpected device query"))):
+            self.assertFalse(count_kernel._counts_available(device))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_unsupported_inputs_keep_torch_without_loading_a_library(self) -> None:
         """
         Feature: Optional fused counts boundary

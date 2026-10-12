@@ -25,13 +25,14 @@ _BLOCKS = 32
 _MAXIMUM_EXPERTS = 256
 _MAXIMUM_TOP_K = 8
 _STRIDE_ALIGNMENT = 64
+_DEVICE_PREFIXES = ("Ascend910B", "Ascend910_93")
 
 
 @lru_cache(maxsize=8)
 def _counts_available(device: torch.device) -> bool:
     """Check the installed binary and target architecture once per device."""
     path = Path(__file__).parent / "_device_kernel" / "libhyper_parallel_replica_counts.so"
-    return path.is_file() and torch.npu.get_device_name(device).startswith("Ascend910B")
+    return path.is_file() and torch.npu.get_device_name(device).startswith(_DEVICE_PREFIXES)
 
 
 @lru_cache(maxsize=1)
@@ -62,7 +63,7 @@ def _validate_input(ids: torch.Tensor, num_experts: int) -> None:
 
 
 def try_count_payload(ids: torch.Tensor, num_experts: int) -> Optional[torch.Tensor]:
-    """Use the installed Ascend910B counter for supported inputs, or return None.
+    """Use the installed A2/A3 counter for supported inputs, or return None.
 
     Args:
         ids: Logical expert matrix; this function never initializes a non-NPU backend.

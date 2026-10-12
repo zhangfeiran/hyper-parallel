@@ -390,12 +390,20 @@ def _accept(args, mesh, module, values, gradient, points):
     return results
 
 
+def _configure_count_backend(backend: str) -> None:
+    """Select the count implementation once in a fresh benchmark worker."""
+    if backend == "torch":
+        # Keep the fallback selectable in fresh workers for matched count ablations.
+        routing._replica_count_payload = routing._torch_replica_count_payload  # pylint: disable=protected-access
+
+
 def run(args: argparse.Namespace) -> None:
     """Run a persistent layer sweep, keeping diagnostics outside timing.
 
     Args:
         args: Training shape, replica settings, acceptance and diagnostic options.
     """
+    _configure_count_backend(args.replica_count_backend)
     rank, size = dist.get_rank(), dist.get_world_size()
     directory = Path(args.result_dir) / f"rank{rank}"
     directory.mkdir(parents=True, exist_ok=False)
@@ -477,6 +485,8 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--measured", type=int, default=7)
     parser.add_argument("--replica-planner", choices=("cpu", "device"), default="cpu")
+    parser.add_argument("--replica-count-backend", choices=("auto", "torch"), default="auto",
+                        help="Use the installed supported counter, or force Torch for a matched count ablation.")
     parser.add_argument("--replica-transport", choices=("p2p", "shmem_signal_kernel_gradient",
                                                      "shmem_signal_kernel_gradient_adaptive"), default="p2p")
     parser.add_argument("--replica-target-load", type=int)

@@ -479,7 +479,8 @@ CPU plan 的派生数据仅缓存在不可变 plan 上；设备元数据和权�
 在 `ExpertParallel` 或 `MegaMoeExperts` 上设置 `replica_planner="device"` 可选择设备规划器，
 默认仍为 `"cpu"`。
 
-共享构建还包含可选的 Ascend 910B 路由计数库 `libhyper_parallel_replica_counts.so`。
+共享构建还包含可选的 A2/A3 路由计数库 `libhyper_parallel_replica_counts.so`。
+设备名称为 `Ascend910B*` 或 `Ascend910_93*` 时，使用同一 `dav-c220-vec` 编译目标。
 库已安装、输入为 int64、TopK 在 1–8 且逻辑专家数在 1–256 时，
 CPU 和设备规划器之前的路由校验/计数会自动使用两个顺序执行的 AIV 任务。
 分块任务逐行校验范围和重复 ID，生成 int64 partial；归并任务输出原布局的精确 histogram 和校验标志。
@@ -495,7 +496,7 @@ Native 接收现成的按专家计数，不重建 TopK，也不加载单边通�
 满足容量约束的小副本集中，以及保留复制边的再平衡。
 离线校准成本优化要求 CPU 规划器，设备后端会拒绝该选项。
 
-可选 Ascend 910B 内核独立于 multicore 和 SHMEM 构建。
+可选设备规划与路由计数内核独立于 multicore 和 SHMEM 构建。
 激活 CANN 环境后，在仓库根目录运行：
 
 ```bash
