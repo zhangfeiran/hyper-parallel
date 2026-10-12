@@ -136,12 +136,8 @@ def _transport_evidence(module, values, expected):
     resources = module._get_execution_resources(values)  # pylint: disable=protected-access
     provider = resources.workspace.replica_provider
     execution_spec = resources.last_execution_plan.spec
-    admission, saved_rows = ((None, 0) if not resources.spec.replica_slots_per_rank else resolve_replica_admission(
-        module.replica_minimum_load_reduction, backend=module.dispatch_mode,
-        transport=resources.spec.replica_transport, tokens=module.local_num_tokens,
-        hidden=module.hidden_size, intermediate=module.intermediate_size,
-        experts=module.num_experts, ranks=module.ep_size, top_k=module.top_k,
-        budget=module.replica_slots_per_rank, device=values.device))
+    admission, saved_rows = ((None, 0) if not resources.spec.replica_slots_per_rank else
+                             resolve_replica_admission(module.replica_minimum_load_reduction))
     evidence = {"actual_transport": resources.spec.replica_transport,
                 **_count_evidence(module, values),
                 "provider": type(provider).__name__,
@@ -486,7 +482,7 @@ def main() -> None:
     parser.add_argument("--replica-target-load", type=int)
     parser.add_argument("--replica-min-rows", type=int, default=1024)
     parser.add_argument("--replica-minimum-load-reduction", type=float,
-                        help="Override conservative admission; zero exercises the original optional-copy policy.")
+                        help="Required relative peak reduction (default 0.4); zero restores the earlier copy policy.")
     parser.add_argument("--diagnose", action="store_true", help="Capture separate single-layer diagnostic traces.")
     parser.add_argument("--pairs")
     parser.add_argument("--rank-route-shift", type=int, default=0,
