@@ -24,7 +24,7 @@ import torch
 from hyper_parallel.components.modules import moe
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.expert_parallel.hot_replica.admission import (
-    default_admission_profile, reduction_basis_points, resolve_replica_admission,
+    reduction_basis_points, resolve_replica_admission,
 )
 from hyper_parallel.core.expert_parallel.hot_replica import planner
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
@@ -33,47 +33,34 @@ from tests.common.mark_utils import arg_mark
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestReplicaAdmission(unittest.TestCase):
-    """Keep workload matching conservative without device-to-host decisions."""
-
-    def setUp(self) -> None:
-        """Keep cached architecture matches independent across tests."""
-        default_admission_profile.cache_clear()
-        self.addCleanup(default_admission_profile.cache_clear)
-        self.execution = {"backend": "push", "transport": "shmem_signal_kernel_gradient", "tokens": 4096,
-                          "hidden": 5120, "intermediate": 1792, "experts": 24, "ranks": 4, "top_k": 8,
-                          "budget": 1, "device": torch.device("npu:0")}
+    """Keep optional admission separate from the topology and capacity contract."""
 
     @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")
-    def test_matching_profile_and_architecture_are_required(self):
+    def test_default_admission_does_not_query_device(self):
         """
-        description: Only complete-step supported shapes and transports can admit optional copies.
-        expectation: Admission, integer conservation and ordinary compute contracts hold.
+        description: Resolve a route-level default without constructing a device-specific allowlist.
+        expectation: The default is a fractional gate with no absolute-row restriction.
         feature: Expert hot replica admission.
         """
-        with patch.object(torch.npu, "get_device_name", return_value="Ascend910B4") as device_name:
-            self.assertEqual(resolve_replica_admission(None, **self.execution), (0.4, 24576))
-            self.assertEqual(resolve_replica_admission(None, **{**self.execution, "tokens": 2048}), (0.4, 16384))
-            self.assertEqual(resolve_replica_admission(None, **{**self.execution, "transport": "p2p"}), (0.4, 32768))
-            device_name.assert_called()
-        with patch.object(torch.npu, "get_device_name", return_value="OtherNPU"):
-            default_admission_profile.cache_clear()
-            self.assertEqual(resolve_replica_admission(None, **self.execution), (1.0, 0))
+        with patch.object(torch.npu, "get_device_name", side_effect=AssertionError("device query")):
+            self.assertEqual(resolve_replica_admission(None), (0.4, 0))
 
     @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")
-    def test_unknown_identity_does_not_query_device(self):
+    def test_near_balanced_route_skips_optional_solver(self):
         """
-        description: Unmeasured shapes, pull, native and CPU reject optional copies immediately.
-        expectation: Admission, integer conservation and ordinary compute contracts hold.
+        description: Even perfect balance cannot satisfy the default reduction on a near-balanced route.
+        expectation: Return conserved home quotas without constructing optional copies.
         feature: Expert hot replica admission.
         """
-        for key, value in (("backend", "native"), ("backend", "pull"), ("tokens", 512), ("hidden", 1024),
-                           ("intermediate", 512), ("experts", 96), ("ranks", 8), ("top_k", 2), ("budget", 2),
-                           ("device", torch.device("cpu"))):
-            with self.subTest(key=key, value=value), patch.object(torch.npu, "get_device_name") as device_name:
-                self.assertEqual(resolve_replica_admission(None, **{**self.execution, key: value}), (1.0, 0))
-                device_name.assert_not_called()
+        counts = [[120, 100, 100, 100]] * 2
+        with patch.object(planner, "_bounded_copies", side_effect=AssertionError("optional solver")):
+            result = planner.build_expert_replica_plan(counts, 1, capacity_limit=500,
+                                                      minimum_load_reduction=resolve_replica_admission(None)[0])
+        result.validate()
+        self.assertEqual(result.transfers, ())
+        self.assertEqual(result.destination_loads, (440, 400))
 
     @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")
@@ -83,9 +70,8 @@ class TestReplicaAdmission(unittest.TestCase):
         expectation: Admission, integer conservation and ordinary compute contracts hold.
         feature: Expert hot replica admission.
         """
-        with patch.object(torch.npu, "get_device_name", side_effect=AssertionError("device query")):
-            self.assertEqual(resolve_replica_admission(0.0, **self.execution), (0.0, 0))
-            self.assertEqual(resolve_replica_admission(0.35001, **self.execution), (0.35001, 0))
+        self.assertEqual(resolve_replica_admission(0.0), (0.0, 0))
+        self.assertEqual(resolve_replica_admission(0.35001), (0.35001, 0))
         self.assertEqual(reduction_basis_points(0.35001), 3501)
         for value in (True, -0.1, 1.01, float("nan"), float("inf"), "0.4"):
             with self.subTest(value=value), self.assertRaises(ValueError):
@@ -101,9 +87,16 @@ class TestReplicaAdmission(unittest.TestCase):
         """
         counts = [[100, 100, 100, 0]] * 2
         worse = [{0: 200, 1: 200, 2: 200}, {2: 0, 3: 0}]
-        with patch.object(planner, "_bounded_copies", return_value=worse):
+
+        def _small_improvement(copies, *_args):
+            copies[0][0] -= 10
+            copies[1][0] = 10
+
+        with (patch.object(planner, "_bounded_copies", return_value=worse),
+              patch.object(planner, "_improve_copies", side_effect=_small_improvement) as improve):
             result = planner.build_expert_replica_plan(counts, 1, capacity_limit=400,
-                                                      minimum_load_reduction=0.9)
+                                                      minimum_load_reduction=0.2)
+        improve.assert_called_once()
         result.validate()
         self.assertEqual(result.transfers, ())
         self.assertEqual(result.destination_loads, (400, 200))
@@ -112,11 +105,11 @@ class TestReplicaAdmission(unittest.TestCase):
               essential_mark="essential")
     def test_native_default_uses_ordinary_dispatch_and_combine(self):
         """
-        description: B remains a budget while unmatched native runs use the exact B=0 dispatcher.
+        description: An explicit threshold of one disables optional native replicas.
         expectation: Admission, integer conservation and ordinary compute contracts hold.
         feature: Expert hot replica admission.
         """
-        for threshold in (None, 1.0):
+        for threshold in (1.0,):
             with self.subTest(threshold=threshold):
                 style = ExpertParallel(replica_slots_per_rank=1, replica_minimum_load_reduction=threshold)
                 module, mesh, context = SimpleNamespace(), MagicMock(), object()
@@ -132,6 +125,27 @@ class TestReplicaAdmission(unittest.TestCase):
                     module, actual[0], mesh, context)
                 self.assertEqual(style.replica_slots_per_rank, 1)
         self.assertTrue(ExpertParallel(replica_slots_per_rank=1, replica_minimum_load_reduction=0.0)._replicas_enabled)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_native_default_plans_replicas_for_each_route(self) -> None:
+        """
+        description: Keep native B=1 active and apply admission to each dispatch's counts.
+        expectation: Default dispatch invokes replica planning with the relative threshold.
+        feature: Route-based native replica admission.
+        """
+        style = ExpertParallel(replica_slots_per_rank=1)
+        mesh = MagicMock()
+        mesh.size.return_value = 2
+        module = SimpleNamespace()
+        inputs = (torch.randn(3, 8), torch.tensor([1, 2, 0, 0]))
+        state = object()
+        with patch("hyper_parallel.core.expert_parallel.expert_parallel.dispatch_native_replicas",
+                   return_value=(inputs, state)) as dispatch:
+            actual = style._token_dispatch(module, inputs, mesh)  # pylint: disable=protected-access
+        self.assertIs(actual, inputs)
+        self.assertIs(module._hot_replica_dispatch, state)
+        self.assertEqual(dispatch.call_args.kwargs["minimum_load_reduction"], 0.4)
 
     @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")
@@ -163,10 +177,10 @@ class TestReplicaAdmission(unittest.TestCase):
 
     @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")
-    def test_automatic_home_resources_are_resolved_before_heap_accounting(self):
+    def test_default_preserves_replica_resources_for_all_topologies(self):
         """
-        description: Unsupported automatic workloads bind ordinary resources without changing requested B.
-        expectation: Bound and active specifications agree; explicit policies keep their replica resources.
+        description: Default and explicit policies keep their requested physical topology and can share resources.
+        expectation: A near-balanced invocation cannot permanently disable future hotspot replicas.
         feature: Expert hot replica resource fallback.
         """
         options = {"local_num_tokens": 128, "hidden_size": 16, "intermediate_size": 8,
@@ -183,12 +197,41 @@ class TestReplicaAdmission(unittest.TestCase):
                 torch.zeros(1), shared=False, active_specifications=(original, other))
         bound = create.call_args.args[0]
         active = create.call_args.kwargs["active_specifications"]
-        self.assertEqual(bound["num_experts"], 4)
-        self.assertEqual(bound["replica_slots_per_rank"], 0)
+        self.assertEqual(bound["num_experts"], 6)
+        self.assertEqual(bound["replica_slots_per_rank"], 1)
         self.assertIs(bound, original)
         self.assertIs(bound, active[0])
         self.assertIs(active[1], other)
         self.assertEqual(automatic.replica_slots_per_rank, 1)
-        self.assertIs(mega_moe_module._resolve_replica_specification(original, torch.zeros(1)), original)
-        with self.assertRaises(ValueError):
-            mega_moe_module.MegaMoeExperts.share_execution_resources([automatic, explicit])
+        mega_moe_module.MegaMoeExperts.share_execution_resources([automatic, explicit])
+        self.assertIs(automatic._resource_group, explicit._resource_group)  # pylint: disable=protected-access
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_hot_route_remains_enabled_with_default_admission(self) -> None:
+        """
+        description: Admit an EP16/E96 hotspot without a shape or transport allowlist.
+        expectation: Optional copies remain active and meet the required load reduction.
+        feature: Route-based hotspot replica admission.
+        """
+        counts = [[4096] * 8 + [0] * 88] * 16
+        result = planner.build_expert_replica_plan(counts, 1, target_load=32768,
+                                                  minimum_replica_rows=1024, capacity_limit=393216,
+                                                  minimum_load_reduction=resolve_replica_admission(None)[0])
+        result.validate()
+        self.assertTrue(result.transfers)
+        self.assertLessEqual(max(result.destination_loads), 393216 * 0.6)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_near_balanced_capacity_required_replicas_are_retained(self) -> None:
+        """
+        description: Apply strict optional admission when a near-balanced home route exceeds capacity.
+        expectation: Mandatory copies remain active and obey the receive bound.
+        feature: Capacity-safe replica admission.
+        """
+        result = planner.build_expert_replica_plan([[120, 100, 100, 100]] * 2, 2, capacity_limit=420,
+                                                  minimum_load_reduction=resolve_replica_admission(None)[0])
+        result.validate()
+        self.assertTrue(result.transfers)
+        self.assertLessEqual(max(result.destination_loads), 420)

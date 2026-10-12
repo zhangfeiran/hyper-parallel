@@ -45,7 +45,7 @@ import torch
 from torch.nn import Module
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
-from hyper_parallel.core.expert_parallel.hot_replica.admission import reduction_basis_points
+from hyper_parallel.core.expert_parallel.hot_replica.admission import reduction_basis_points, resolve_replica_admission
 from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
 from hyper_parallel.core.expert_parallel.hot_replica.device import validate_planner_backend
 from hyper_parallel.core.expert_parallel.hot_replica.native import (
@@ -1115,10 +1115,9 @@ class ExpertParallel(BaseExpertParallel):
                 Smaller copies remain when required by the receive bound. Calibrate this
                 threshold for the intended shape; all EP ranks must use the same value.
             replica_minimum_load_reduction: Required fractional receive-peak reduction for
-                optional replicas. None conservatively uses ordinary native dispatch
-                because no native latency range is enabled by default. One also uses
-                ordinary dispatch; native receives have no fixed replica capacity.
-                Zero explicitly preserves token-balancing placement.
+                optional replicas. None requires a 40 percent reduction for each route.
+                One uses ordinary dispatch; native receives have no fixed replica capacity.
+                Zero preserves the earlier placement policy.
             token_dispatcher: Token dispatch strategy. Supported values are
                 ``"all_to_all"`` and ``"deredundency"``.
             async_combine: If ``True``, use asynchronous combine all-to-all
@@ -1135,7 +1134,7 @@ class ExpertParallel(BaseExpertParallel):
         if replica_minimum_load_reduction is not None:
             reduction_basis_points(replica_minimum_load_reduction)
         self.replica_minimum_load_reduction = replica_minimum_load_reduction
-        self._replicas_enabled = bool(replica_slots_per_rank and replica_minimum_load_reduction not in (None, 1.0))
+        self._replicas_enabled = bool(replica_slots_per_rank and replica_minimum_load_reduction != 1.0)
         if replica_cost_model is not None and (not isinstance(replica_cost_model, ExpertReplicaCostModel)
                                               or replica_cost_model.backend != "native"):
             raise ValueError("Native replicas require a native ExpertReplicaCostModel")
@@ -1179,7 +1178,8 @@ class ExpertParallel(BaseExpertParallel):
             routed, state = dispatch_native_replicas(
                 inputs, config, device_mesh.get_group(),
                 minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
-                planner_backend=self.replica_planner, minimum_load_reduction=self.replica_minimum_load_reduction)
+                planner_backend=self.replica_planner,
+                minimum_load_reduction=resolve_replica_admission(self.replica_minimum_load_reduction)[0])
             module._hot_replica_dispatch = state
             return routed
         dispatch_result = self._token_dispatcher.dispatch(module, inputs, device_mesh)
