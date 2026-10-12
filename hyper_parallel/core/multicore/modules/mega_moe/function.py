@@ -16,22 +16,30 @@
 
 from __future__ import annotations
 
+import struct
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
-import struct
 from typing import Any
 
 import torch
 import torch_npu
 
-from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
-from hyper_parallel.core.expert_parallel.hot_replica._metadata import _async_device_bytes, _copy_device_bytes
-
+from hyper_parallel.core.expert_parallel.hot_replica._metadata import (
+    _async_device_bytes,
+    _copy_device_bytes,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.transport import (
+    prefetch_weights,
+    return_gradients,
+)
 from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
+from .kernel_gradients import (
+    kernel_gradient_projections,
+    prepare_kernel_gradient_return,
+)
 from .plan import MegaMoePlan
-from .kernel_gradients import kernel_gradient_projections, prepare_kernel_gradient_return
 from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
 

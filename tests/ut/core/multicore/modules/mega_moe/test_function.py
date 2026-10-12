@@ -28,8 +28,6 @@ from hyper_parallel.core.multicore.modules.mega_moe import function as function_
 from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
 from tests.common.mark_utils import arg_mark
 
-from tests.common.mark_utils import arg_mark
-
 
 # The private autograd bridge and saved execution buffers are the contracts under test.
 class TestMegaMoeFunction(unittest.TestCase):
@@ -43,6 +41,8 @@ class TestMegaMoeFunction(unittest.TestCase):
         context = Mock()
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
+        context.replica_route = None
+        context.workspace.replica_provider = None
         execution = function_module._BackwardExecution(
             dispatch=torch.ones(1), grad_x=torch.ones(1), profile_call=Mock(),
             gmm_workspace=None, swiglu_workspace=None,
