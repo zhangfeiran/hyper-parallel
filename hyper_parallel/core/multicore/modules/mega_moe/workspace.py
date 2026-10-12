@@ -333,12 +333,17 @@ class MegaMoeWorkspace:
             tensor.untyped_storage().resize_(0)
             setattr(self, field_name, None)
 
-    def close(self) -> None:
-        """Synchronize, release all buffers, and reset the workspace."""
+    def close(self, *, for_rebuild: bool = False) -> None:
+        """Synchronize and release physical buffers.
+
+        Args:
+            for_rebuild: Preserve graph leases and reopen the logical workspace
+                after a managed, quiescent heap replacement.
+        """
         with self._access(), self.lock:
             if self.in_use:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
-            if not self.can_close():
+            if not for_rebuild and not self.can_close():
                 raise RuntimeError("cannot close MegaMoe workspace while backward graphs still need its buffers.")
             empty = all(tensor is None for tensor in (
                 self.source_buffer,
@@ -353,6 +358,7 @@ class MegaMoeWorkspace:
             self.closing = True
         # An empty rank must still participate when peers retain buffers after a failure.
         if all(_automatic.exchange(empty)):
+            self.closing = not for_rebuild
             return
         _automatic.collective_call(lambda: None if empty else torch.npu.synchronize(self.device))
         # Workspace teardown requires each collective barrier to complete before
@@ -365,3 +371,4 @@ class MegaMoeWorkspace:
         self.device = None
         self.completion_event = None
         self.used = False
+        self.closing = not for_rebuild

@@ -252,7 +252,7 @@ class MegaMoeHeapManager:
             old_bytes = self.heap_bytes
             try:
                 for index, (resource, _, _) in enumerate(allocated):
-                    self._stage(f"free_{index}", resource.workspace.close, timings)
+                    self._stage(f"free_{index}", lambda r=resource: r.workspace.close(for_rebuild=True), timings)
                 self._stage("reinitialize", lambda: timings.update(_lifecycle._reinitialize(heap_bytes)), timings)
                 for entry, capacity in zip(self.entries, capacities):
                     entry.capacity = capacity

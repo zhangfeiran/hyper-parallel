@@ -99,7 +99,9 @@ class _MegaMoeExecutionResources:
         return (
             "mega_moe", self.spec.local_num_tokens, self.spec.hidden_size,
             self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
-            self.spec.receive_capacity, self.spec.ep_size,
+            self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
+            self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
+            self.spec.dispatch_split, self.spec.combine_split,
         )
 
     def can_close(self) -> bool:
@@ -290,6 +292,10 @@ class MegaMoeExperts(MulticoreModule):
                     f"{name} must be a positive integer multiple of {_COMMUNICATION_SPLIT}, got {split!r}.")
             if local_num_tokens % split:
                 raise ValueError(f"local_num_tokens ({local_num_tokens}) must be divisible by {name} ({split}).")
+
+    def _root_group(self) -> Any:
+        """Keep lifecycle coordination within this module's EP group."""
+        return self._ep_group
 
     def _validate_tensors(self, hidden_states: torch.Tensor, expert_weights: tuple) -> None:
         """Validate activation and parameter metadata before acquiring resources."""

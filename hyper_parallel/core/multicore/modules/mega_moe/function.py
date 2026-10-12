@@ -549,7 +549,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             execution.profile_call.complete()
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
-            execution = replace(execution, intermediates=_BackwardIntermediates(
+            execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
                 execution.intermediates.grad_weight1,
                 execution.intermediates.grad_weight2,
                 None, None, None,

@@ -143,6 +143,35 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         self.manager.ensure_capacity(self.resource, 1)
         self.reinitialize.assert_called_once_with(expected)
 
+    def test_rebuild_preserves_graph_leases_and_reopens_workspace(self) -> None:
+        """Replace physical buffers while old graphs retain the logical workspace."""
+        workspace = self.resource.workspace
+        graph = Mock()
+        workspace.track_graph(graph)
+        workspace.expert_buffer = torch.empty(8, 4)
+        workspace.routed_buffer = torch.empty(8, 4)
+        workspace.completion_event = Mock()
+        workspace.dtype, workspace.device = torch.bfloat16, torch.device("cpu")
+        self.state["active_allocations"] = [
+            {"allocation_base": tensor.data_ptr()}
+            for tensor in (workspace.expert_buffer, workspace.routed_buffer)
+        ]
+
+        def reallocate(*_args: object) -> None:
+            """Require the workspace to accept its replacement allocation."""
+            self.assertFalse(workspace.closing)
+            self.assertIsNone(workspace.expert_buffer)
+            self.assertIsNone(workspace.routed_buffer)
+
+        with patch.object(workspace, "ensure", side_effect=reallocate) as ensure:
+            self.manager.ensure_capacity(self.resource, 40000)
+        ensure.assert_called_once_with(self.spec, torch.bfloat16, torch.device("cpu"))
+        self.assertIn(graph, workspace.graphs)
+        self.assertFalse(workspace.closing)
+        self.assertEqual(self.manager.epoch, 1)
+        with self.assertRaisesRegex(RuntimeError, "backward graphs"):
+            workspace.close()
+
     def test_partial_allocation_failure_never_publishes_new_epoch(self) -> None:
         """Prevent further launches after replacement allocation fails on a participating rank."""
         workspace = self.resource.workspace

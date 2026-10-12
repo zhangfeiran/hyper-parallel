@@ -23,7 +23,7 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
-from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_configs, _build_task_values
+from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import bind_mega_moe_spec
 
 
@@ -32,8 +32,8 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     def test_communication_splits_reach_both_graphs_and_isolate_sharing(self) -> None:
         """Propagate independent public split values without sharing incompatible plans."""
-        arguments = dict(local_num_tokens=512, hidden_size=16, intermediate_size=8,
-                         num_experts=4, top_k=2, create_parameters=False)
+        arguments = {"local_num_tokens": 512, "hidden_size": 16, "intermediate_size": 8,
+                     "num_experts": 4, "top_k": 2, "create_parameters": False}
         for mode in ("push", "pull"):
             for dispatch_split, combine_split in ((128, 128), (512, 512), (128, 512), (512, 128)):
                 with self.subTest(mode=mode, dispatch=dispatch_split, combine=combine_split):
@@ -47,7 +47,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                             SimpleNamespace(device="npu:0", dtype=torch.bfloat16),
                         )
                     self.assertEqual((spec.dispatch_split, spec.combine_split), (dispatch_split, combine_split))
-                    forward, _, backward, _ = _build_runtime_configs(spec, _build_task_values(spec))
+                    forward, _, backward, _ = _build_runtime_artifacts(spec)
                     for graph in (forward, backward):
                         self.assertEqual(graph.get_op("dispatch").split_value, dispatch_split)
                         self.assertEqual(graph.get_op("combine").split_value, combine_split)
@@ -55,7 +55,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                                           dispatch_split=dispatch_split, combine_split=combine_split)
                     self.addCleanup(same.close)
                     for key in ("dispatch_split", "combine_split"):
-                        splits = dict(dispatch_split=dispatch_split, combine_split=combine_split)
+                        splits = {"dispatch_split": dispatch_split, "combine_split": combine_split}
                         splits[key] = 512 if splits[key] == 128 else 128
                         other = MegaMoeExperts(**arguments, dispatch_mode=mode, **splits)
                         self.addCleanup(other.close)

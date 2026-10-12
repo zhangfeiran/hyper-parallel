@@ -48,7 +48,7 @@ extern "C" bool valid_ready_runtime(uint8_t *image, uint64_t bytes, uint64_t eve
 }
 
 extern "C" bool valid_expert_runtime(uint8_t *image, uint64_t bytes, uint64_t event_bytes, uint64_t local_experts) {
-  return isRuntimeStorageValid(image, bytes, event_bytes, 1, local_experts);
+  return Runtime::isRuntimeStorageValid(image, bytes, event_bytes, 1, local_experts);
 }
 
 extern "C" uint32_t read_ready_event(uint8_t *image) {
@@ -82,7 +82,7 @@ extern "C" void read_layout(uint8_t *image, uint32_t *result) {
 
 extern "C" void read_protocol_profile(uint8_t *image, uint32_t *result) {
   Runtime::ReadyHandshakeMeta meta;
-  getRuntime::ReadyHandshakeMeta(image, &meta);
+  Runtime::getReadyHandshakeMeta(image, &meta);
   result[0] = meta.ready_event;
   result[1] = meta.completion_event;
   result[2] = Runtime::isCycleProfileEnabled(image);

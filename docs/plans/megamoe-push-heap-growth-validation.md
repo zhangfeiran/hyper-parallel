@@ -1,32 +1,16 @@
-# MegaMoE push heap 在线扩容：实施与验证
+# MegaMoE push heap 在线扩容：历史验证记录
 
-日期：2026-09-21。分支：`feat/megamoe-push-heap-growth`。
-基线：`84519c6f055352d5627688f2a5e0601f306dbde7`。
-工作目录：`/home/feiran/hyper-parallel-megamoe-push-heap-growth`。
+本文保留 2026-09-21 的设备验证与测量边界，数据对应 `fa4c5fd0` 接口版本，
+基线为 `84519c6f055352d5627688f2a5e0601f306dbde7`。
+当前容量接口和重建契约见 [Multicore README](../../hyper_parallel/core/multicore/README.md)，
+运行参数见 [Qwen 示例](../../hyper_parallel/core/multicore/examples/mega_moe/README.md)。
+下文 static/grow 为历史实验标签；当前可将初始因子设为 EP 大小来预留 static 无损预算。
+历史结果不代表 rebase 后版本已经通过设备验证。
 
-本报告性能数据采集于 `fa4c5fd0` 接口版本。后续配置已收敛为 `dispatch_mode`，
-加上仅供 push 使用的 `initial_capacity_factor`（默认1.25）、`capacity_growth_factor`（默认1.25）。
-下文 static/grow 是原实验标签；当前要复现 static 无损预算，设置初始因子为 EP 大小。
-
-## 1. 已实现的行为
-
-- push 自动扩容，通过初始容量因子和增长因子配置；pull 不接受容量因子。
-- 复用既有 counts all-gather 的最大目的 rank 接收量；未溢出时不增加一次负载 collective。
-- 超限时按 `align128(max(实际需求, capacity_growth_factor × 当前容量))` 增长，保守上界为 `EP × T × K`；不缩容。
-- 同一 root 的所有 managed workspace 统一重建，包括共享层、独立 push/pull 和延迟绑定资源。
-- 同步设备、释放所有对称 allocations、finalize、fresh bootstrap、init、重新分配，最后发布新 epoch。
-- Python workspace 身份、专家权重和独立保存的 autograd 数据保留；旧物理 tensor storage 变为无效。
-- 显式 heap 环境变量是固定预算；几何增长余量放不下时先尝试最小必要容量。自动预算不写环境变量。
-- 预检查拒绝预算不足、未知 owner/allocation、活动租约和不一致布局。破坏性阶段失败后禁止继续调用。
-- Qwen runner 使用 `--initial-capacity-factor` 与 `--capacity-growth-factor`，记录真实 heap 和分阶段重建耗时。
-
-核心代码在 `mega_moe/heap_manager.py`，原 workspace、route、模块和 SHMEM lifecycle 只增加必要接入。
-native binding 增加可选显式 heap 字节参数；对重复的 allocation 诊断序列化做了小幅抽取以通过复杂度检查。
-
-## 2. 环境与验证结果
+## 环境与正确性
 
 单机8张 Ascend 910B3，每卡64 GiB；Torch 2.9.1、Torch-NPU 2.9.1、CANN 9.2。
-本 worktree 的独立 `build/venv` 已 editable 安装，导入路径指向本目录。
+历史 worktree 的独立 `build/venv` 已 editable 安装，导入路径指向所测目录。
 复用与基线一致的 native payload，单独重编译并安装修改后的 SHMEM binding/runtime。
 没有以另一个 worktree 的 Python 包代替本次实现。
 
@@ -48,7 +32,7 @@ Qwen 首步的最大绝对差：forward 为 `1.91e-6`，梯度为 `3.81e-6`，�
 实际测试中该顺序导致 vendor bootstrap 崩溃；现在严格 finalize 后生成 ID，并在单测中锁定调用顺序。
 每个 native 阶段通过原 HCCL root 收敛错误，再进入后续 collective。
 
-## 3. Qwen 固定参数稳态对照
+## Qwen 固定参数稳态对照
 
 规格：H5120 / I1792 / EP8 / E48 / seq4096 / topk8，2层，BF16。
 每种策略在独立进程中仅驻留一个模型；相同 seed、输入和初始参数。
@@ -73,7 +57,7 @@ Qwen 首步的最大绝对差：forward 为 `1.91e-6`，梯度为 `3.81e-6`，�
 进程退出期间监测器曾将正在消失的本任务 PID 标为 foreign，原始退出日志保留此记录；这些不在测量窗口。
 allocator peak 与 SHMEM heap 单独报告，不能将 heap 误计为 allocator 已追踪的内存。
 
-## 4. 逐步加重热点：稳态与扩容停顿
+## 逐步加重热点
 
 使用同样的专家规格，固定输入、专家权重、上游梯度和显式 top-k IDs，无优化器更新。
 每个 token 的8个 expert ID 互不重复；把越来越多 token 从均衡路由切到固定8个专家，构造热点。
@@ -101,7 +85,7 @@ bootstrap约9 ms、initialize约124 ms。该次发生在 workspace 首次分配�
 若每1000个 step 扩一次，则约2.3 ms/step。这是简单摊销估算，非实际长训结果。
 初始 factor 和增长 factor 应结合已知路由分布，避免训练早期频繁跨档。
 
-## 5. 边界与门禁状态
+## 边界与历史门禁状态
 
 - 只支持固定 shape、dtype、device、EP 成员和每个 root 串行调用，不支持图捕获或带旧地址的捕获图回放。
 - 不承诺重建后降低整网普通激活的负载开销；极端热点仍可能遇到物理 HBM OOM。
@@ -112,32 +96,7 @@ bootstrap约9 ms、initialize约124 ms。该次发生在 workspace 首次分配�
   `.agent/rules/unit-test.md` 的 unittest 约定不一致，且 check 在取消暂存后丢失增量行范围。
   本轮新代码通过仓库 pre-commit 对应的 pylint、lizard 和 Markdown 检查；不修改这些无关全局规则。
 
-## 6. 本地复查入口
-
-```bash
-source /usr/local/Ascend/cann/set_env.sh
-source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
-export LD_LIBRARY_PATH="$PWD/build/native/payload/hyper_parallel/core/multicore/shmem/lib/shmem:$LD_LIBRARY_PATH"
-export HYPER_PARALLEL_PLATFORM=torch
-build/venv/bin/python -m pytest -q tests/ut/core/multicore
-build/venv/bin/python -m pytest -q tests/torch/multicore/test_mega_moe.py \
-  -k 'heap_growth or local_capacity_lifetime or device_ready_lifecycle or subgroups'
-PYTHON_BIN="$PWD/build/venv/bin/python" \
-  bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
-  --dispatch-mode push --initial-capacity-factor 1.0 --capacity-growth-factor 1.5 \
-  --warmup-steps 1 --measured-steps 1
-```
-
-本地原始证据位于 `build/validation/heap-growth/`，属于未入库的测量制品：
-
-- `ut-final.log`、`regression-st.log`、`extended-st.log`、`final-st.log`、`p0-reinit.log`。
-- `qwen-grow-accuracy.json`：正常学习率下的首步精度与增长记录。
-- `qwen-static-fixed.json` / `qwen-grow-fixed.json`：固定参数的性能、路由和 allocator 内存。
-- 同名 `*-hbm.jsonl`：整卡 HBM 原始采样；`measure_qwen.py` / `run_suite.py` 为复现脚本。
-- `controlled-routes.json` / `controlled_routes.py`：连续热点逐 rank 计时、容量、增长阶段及对照脚本。
-- `checks-final.log`、`markdownlint-final.log`、`autogit-check.log`、`autogit-baseline-findings.log`。
-
-## 7. 配置收敛后复验
+## 历史配置接口复验
 
 配置已统一为 `dispatch_mode="push" | "pull"`；push 默认
 `initial_capacity_factor=1.25`、`capacity_growth_factor=1.25`，也支持显式覆盖。

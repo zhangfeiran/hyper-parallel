@@ -11,6 +11,7 @@
 #include "cann/host.h"
 
 #include <algorithm>
+#include <cstring>
 #include <iterator>
 #include <string>
 #include <string_view>

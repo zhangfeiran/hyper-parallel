@@ -134,7 +134,8 @@ C_new = min(EP * T * K, align128(max(R_max, ceil(capacity_growth_factor * C))))
 
 pull 的 SHMEM 仅包含 `T * K` 行发送区和返回区，接收区位于普通 HBM、按实际接收量分配。
 两种模式的计算中间张量和待反向保存的 dispatch、up-projection、activation 都按本 rank 实际接收量分配；
-零接收保留一行 ABI 占位。通信任务固定为128行。路由不丢 token，热点的普通 HBM 开销仍存在。
+零接收保留一行 ABI 占位。通信任务默认128行，可通过 `dispatch_split`、`combine_split` 分别配置。
+路由不丢 token，热点的普通 HBM 开销仍存在。
 
 共享层、独立的 push/pull workspace 和尚未绑定的层统一计入预算。
 逻辑 workspace 对象保持稳定，因此扩容前的 forward 支持延迟或重复 backward、checkpoint 重算及串行交替 stream。
@@ -158,9 +159,9 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.la
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
 两条路径已验证 non-reentrant checkpoint 和 `retain_graph=True`。默认由运行时托管 workspace，无需显式
 关闭。模块 GC 仅登记使用权释放，不执行 collective；下一个资源组
-首次 forward 时，所有 WORLD rank 一起核对资源表，只复用各 rank 都无成员且无待反向图的兼容
+首次 forward 时，所有 SHMEM Root rank 一起核对资源表，只复用各 rank 都无成员且无待反向图的兼容
 workspace，其余可回收的孤儿 workspace 当场释放。此协调不在已绑定模型的每步 forward 中执行。
-GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图引用仍会占用内存，固定 SHMEM 堆上限不变。
+GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图引用仍会占用内存，heap 受显式预算或物理 HBM 容量约束。
 
 自动清理适配在首次绑定时安装：拦截 Torch `ProcessGroup.shutdown`（旧版本使用
 `distributed_c10d._shutdown_backend`），在 WORLD 或 SHMEM Root 被关闭前先回收资源。
@@ -171,7 +172,7 @@ GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图�
 不承诺安全或及时退出，不从 signal handler 中执行 collective；SIGKILL 无法执行退出钩子。
 
 需要提前释放时，仍可调用原有 `MegaMoeExperts.close()`，示例中的 `model.close()` 保持逐层关闭；
-共享 workspace 在最后一个成员关闭时才释放，不释放普通模型参数。所有 WORLD rank 须在无在途
+共享 workspace 在最后一个成员关闭时才释放，不释放普通模型参数。所有 SHMEM Root rank 须在无在途
 调用及待反向图时同序关闭。关闭失败会保留句柄供安全条件下重试，部分关闭的模块不能再次执行。
 只有所有 rank 均成功后才移除资源记录；对称内存部分释放状态不一致或原生 shutdown 失败须重启。
 自动清理失败会阻止显式通信域销毁继续执行；进程退出时仅记录失败并继续框架退出流程，不能保证释放成功。

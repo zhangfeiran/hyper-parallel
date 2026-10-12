@@ -35,7 +35,12 @@ class TestMegaMoeFunction(unittest.TestCase):
         tensors = tuple(torch.ones(1) for _ in range(13))
         context = Mock()
         gradient = torch.ones(1)
-        execution = Mock()
+        context.plan.spec.dispatch_mode = "push"
+        execution = function_module._BackwardExecution(
+            dispatch=torch.ones(1), grad_x=torch.ones(1), profile_call=Mock(),
+            gmm_workspace=None, swiglu_workspace=None,
+            intermediates=function_module._BackwardIntermediates(*(torch.ones(1) for _ in range(5))),
+        )
         with (
             patch.object(type(context), "saved_tensors", create=True,
                          new_callable=PropertyMock, side_effect=[tensors, RuntimeError("duplicate unpack")]) as unpack,
@@ -243,12 +248,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             for tag in range(len(outputs), 0, -1):
                 self.assertTrue(torch.equal(outputs[tag - 1], torch.full((4, 4), float(tag + 40))))
                 outputs[tag - 1].sum().backward()
-                source = sources[tag - 1]
-                expected = torch.full_like(source, float(tag * (2 if permuted else 1)))
-                if input_grad:
-                    self.assertTrue(torch.equal(source.grad, expected))
-                else:
-                    self.assertIsNone(source.grad)
+                self._assert_input_gradient(sources[tag - 1], tag, permuted=permuted, input_grad=input_grad)
         self.assertTrue(torch.equal(weight1.grad, torch.full_like(weight1, 10.0)))
         self.assertTrue(torch.equal(weight2.grad, torch.full_like(weight2, 10.0)))
         self.assertEqual(mock_permutation.call_count, len(outputs) if permuted and input_grad else 0)
@@ -256,6 +256,16 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertEqual([call.args[0] for call in plan.backward_runtime.call_args_list], list(reversed(capacities)))
         self.assertEqual(workspace.claim.call_count, 8)
         self.assertEqual(workspace.release.call_count, 8)
+
+    def _assert_input_gradient(
+        self, source: torch.Tensor, tag: int, *, permuted: bool, input_grad: bool,
+    ) -> None:
+        """Check reduced token gradients or the frozen-input contract."""
+        if input_grad:
+            expected = torch.full_like(source, float(tag * (2 if permuted else 1)))
+            self.assertTrue(torch.equal(source.grad, expected))
+        else:
+            self.assertIsNone(source.grad)
 
 
 if __name__ == "__main__":
