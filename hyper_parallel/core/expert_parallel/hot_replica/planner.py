@@ -293,12 +293,11 @@ def _home_layout(counts, config):
     return totals, [sum(row.values()) for row in copies], copies
 
 
-def _optional_plan_is_useful(copies, loads, limit, admission, minimum_saved_rows):
+def _optional_peak_is_useful(candidate_peak, loads, limit, admission, minimum_saved_rows):
     """Keep required placements and compare optional load reduction using integers."""
     peak = max(loads)
     if (not admission and not minimum_saved_rows) or peak > limit:
         return True
-    candidate_peak = max(sum(row.values()) for row in copies)
     saved = peak - candidate_peak
     return saved >= minimum_saved_rows and saved * 10000 >= peak * admission
 
@@ -350,7 +349,7 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
     target = max(average, target_load or 0)
     limit = _pruning_capacity(counts, loads, config) if capacity_limit is None else capacity_limit
     if (not replica_slots_per_rank or max(loads) <= target
-            or (admission == 10000 and max(loads) <= limit)):
+            or not _optional_peak_is_useful(average, loads, limit, admission, minimum_saved_rows)):
         return _materialize(counts, baseline, config, capacity_limit)
     copies = _bounded_copies(loads, expert_counts, config)
     if max(sum(row.values()) for row in copies) > max(loads):
@@ -361,6 +360,7 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
         _rebalance_existing_copies(copies, config)
     if cost_model is not None:
         refine_replica_quotas(copies, counts, config, limit, cost_model)
-    if not _optional_plan_is_useful(copies, loads, limit, admission, minimum_saved_rows):
+    candidate_peak = max(sum(row.values()) for row in copies)
+    if not _optional_peak_is_useful(candidate_peak, loads, limit, admission, minimum_saved_rows):
         copies = baseline
     return _materialize(counts, copies, config, capacity_limit)

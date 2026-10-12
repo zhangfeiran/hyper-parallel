@@ -26,7 +26,6 @@ import torch.distributed as dist
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 
-
 _COMMUNICATION_SPLIT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
 

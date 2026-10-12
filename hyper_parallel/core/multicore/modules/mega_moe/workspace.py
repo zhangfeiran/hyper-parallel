@@ -26,9 +26,14 @@ from typing import Any
 
 import torch
 
-from hyper_parallel.core.expert_parallel.hot_replica.one_sided import OneSidedReplicaTransport
+from hyper_parallel.core.expert_parallel.hot_replica.one_sided import (
+    OneSidedReplicaTransport,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    SIGNAL_TRANSPORT_MODES, SignalReplicaTransport, signal_storage_bytes, signal_transport_options,
+    SIGNAL_TRANSPORT_MODES,
+    SignalReplicaTransport,
+    signal_storage_bytes,
+    signal_transport_options,
 )
 from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.scheduler.config import (

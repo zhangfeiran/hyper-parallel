@@ -72,7 +72,7 @@ class Solver {
     int64_t average = (sum + r - 1) / r;
     target = Max(target, average);
     int64_t limit = capacity < 0 ? PruningCapacity(peak, average) : capacity;
-    if (b && peak > target && !(admission == 10000 && peak <= limit)) {
+    if (b && peak > target && AdmitsPeak(average, admission, saved_rows, peak, limit)) {
       Balance(sum, target, minimum, peak, limit);
     }
     Admit(admission, saved_rows, peak, limit);
@@ -97,13 +97,17 @@ class Solver {
     }
   }
 
-  HOT_DEVICE void Admit(int64_t admission, int64_t saved_rows, int64_t peak, int64_t limit) {
-    if ((!admission && !saved_rows) || peak > limit) return;
-    int64_t current_peak = 0;
-    for (int k = 0; k < r; ++k) current_peak = Max(current_peak, loads[k]);
+  HOT_DEVICE bool AdmitsPeak(int64_t candidate, int64_t admission, int64_t saved_rows, int64_t peak, int64_t limit) {
+    if ((!admission && !saved_rows) || peak > limit) return true;
     // Quotient/remainder arithmetic avoids multiplying a large receive count by basis points.
     const int64_t required = (peak / 10000) * admission + ((peak % 10000) * admission + 9999) / 10000;
-    if (peak - current_peak >= Max(required, saved_rows)) return;
+    return peak - candidate >= Max(required, saved_rows);
+  }
+
+  HOT_DEVICE void Admit(int64_t admission, int64_t saved_rows, int64_t peak, int64_t limit) {
+    int64_t current_peak = 0;
+    for (int k = 0; k < r; ++k) current_peak = Max(current_peak, loads[k]);
+    if (AdmitsPeak(current_peak, admission, saved_rows, peak, limit)) return;
     for (int k = 0; k < r; ++k)
       for (int j = 0; j < e; ++j) copies[k * e + j] = j / h == k ? totals[j] : 0;
     Refresh(copies);
