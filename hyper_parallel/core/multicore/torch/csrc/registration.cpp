@@ -74,6 +74,20 @@ void register_dsa_probes(torch::Library &m) {
     "Tensor(u!) kl_retained, Tensor(f!) grad_query, Tensor(g!) grad_key, Tensor(h!) grad_weight, Tensor(i!) loss) "
     "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), "
     "Tensor(i!), Tensor(j!), Tensor(k!), Tensor(u!))");
+  m.def("dsa_tp_local_cp_training_version() -> int", []() -> int64_t { return 1; });
+  m.def(
+    "dsa_tp_local_cp_training_out(Tensor index_query, Tensor(m!) index_key, Tensor query, "
+    "Tensor(n!) compressed, Tensor query_rope, Tensor(o!) key_rope, Tensor weights, Tensor lengths, "
+    "Tensor config, Tensor(j!) trace, Tensor(k!) retained, int[] lengths_host, float scale, "
+    "Tensor(a!) indices, Tensor(b!) values, Tensor(c!) attention, Tensor(d!) maximum, Tensor(e!) sum, "
+    "Tensor(p!) arena, Tensor metadata, Tensor requests, Tensor(q!) transport_trace, "
+    "Tensor selected_rows, Tensor(r!) membership, Tensor(s!) selected_requests, Tensor(t!) selected_counts, "
+    "Tensor query_lengths, Tensor query_positions, Tensor query_ids, int[] kl_query_lengths, "
+    "Tensor(u!) kl_retained, Tensor(f!) grad_query, Tensor(g!) grad_key, Tensor(h!) grad_weight, Tensor(i!) loss, "
+    "Tensor(v!) tp_li_arena, Tensor tp_li_metadata, "
+    "Tensor(w!)? tp_kl_arena, Tensor? tp_kl_metadata, bool with_kl) "
+    "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!), "
+    "Tensor(i!), Tensor(j!), Tensor(k!), Tensor(u!))");
   m.def("dsa_local_indexer_version() -> int", []() -> int64_t { return 1; });
   m.def(
     "dsa_local_indexer_out(Tensor query, Tensor key, Tensor weights, Tensor actual_query, Tensor actual_kv, "
@@ -86,6 +100,11 @@ void register_dsa_probes(torch::Library &m) {
     "int[] actual_query, int[] actual_key, Tensor config, Tensor(e!) trace, Tensor(f!) retained, "
     "float scale, int phase, Tensor(a!) grad_query, Tensor(b!) grad_key, Tensor(c!) grad_weight, "
     "Tensor(d!) loss) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!))");
+  m.def("dsa_fp32_index_kl_version() -> int", []() -> int64_t { return 1; });
+  m.def("dsa_fp32_index_kl_out(Tensor query, Tensor key, Tensor weight, Tensor teacher, Tensor global_logits, "
+        "Tensor indices, int phase, Tensor(a!) local_logits, Tensor(b!) grad_query, Tensor(c!) grad_key, "
+        "Tensor(d!) grad_weight, Tensor(e!) loss, Tensor(f!) trace) -> "
+        "(Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!))");
   m.def("dsa_local_mixed_kl_version() -> int", []() -> int64_t { return 1; });
   m.def(
     "dsa_local_mixed_kl_out(Tensor query, Tensor key, Tensor index_query, Tensor index_key, Tensor weight, "
@@ -94,6 +113,14 @@ void register_dsa_probes(torch::Library &m) {
     "query_positions, "
     "float scale, int phase, Tensor(a!) grad_query, Tensor(b!) grad_key, Tensor(c!) grad_weight, "
     "Tensor(d!) loss) -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!))");
+  m.def("dsa_tp_local_mixed_kl_version() -> int", []() -> int64_t { return 1; });
+  m.def(
+    "dsa_tp_local_mixed_kl_out(Tensor query, Tensor key, Tensor index_query, Tensor index_key, Tensor weight, "
+    "Tensor indices, Tensor maximum, Tensor sum, Tensor query_rope, Tensor key_rope, "
+    "int[] actual_query, int[] actual_key, Tensor config, Tensor(e!) trace, Tensor(f!) retained, "
+    "Tensor query_positions, Tensor(g!) arena, Tensor metadata, float scale, int phase, "
+    "Tensor(a!) grad_query, Tensor(b!) grad_key, Tensor(c!) grad_weight, Tensor(d!) loss) "
+    "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!))");
   m.def("dsa_cp_attention_version() -> int", []() -> int64_t { return 2; });
   m.def(
     "dsa_cp_attention_out(Tensor query, Tensor(a!) compressed, Tensor query_rope, Tensor(b!) key_rope, "
@@ -101,6 +128,7 @@ void register_dsa_probes(torch::Library &m) {
     "Tensor requests, Tensor(e!) transport_trace, float scale, Tensor(f!) attention, Tensor(g!) maximum, "
     "Tensor(h!) sum) -> (Tensor(f!), Tensor(g!), Tensor(h!), Tensor(c!), Tensor(e!))");
   m.def("dsa_fused_grad_version() -> int", []() -> int64_t { return 2; });
+  m.def("dsa_group_partials_version() -> int", []() -> int64_t { return 1; });
   m.def("dsa_sparse_cp_grad_version() -> int", []() -> int64_t { return 1; });
   m.def("dsa_cp_root_mapping_version() -> int", []() -> int64_t { return 1; });
   m.def("dsa_tp_local_indexer_version() -> int", []() -> int64_t { return 1; });

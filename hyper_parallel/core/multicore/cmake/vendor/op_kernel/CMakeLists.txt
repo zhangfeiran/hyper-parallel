@@ -50,6 +50,15 @@ npu_op_kernel_sources(ascendc_kernels
 
 if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
     npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE HyperDsaFp32IndexKl
+        KERNEL_DIR ./hyper_dsa_fp32_index_kl/op_kernel
+        KERNEL_FILE hyper_dsa_fp32_index_kl.cpp
+        COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+    )
+    npu_op_kernel_options(ascendc_kernels OP_TYPE HyperDsaFp32IndexKl OPTIONS
+        --cce-auto-sync=off -Wno-deprecated-declarations
+    )
+    npu_op_kernel_sources(ascendc_kernels
         OP_TYPE HyperDsaTpTileSum
         KERNEL_DIR ./hyper_dsa_tp_tile_sum/op_kernel
         KERNEL_FILE hyper_dsa_tp_tile_sum.cpp

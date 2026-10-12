@@ -35,10 +35,14 @@ void check_extra_shapes(const at::Tensor &query, const at::Tensor &trace, const 
 }
 
 void check_grad_buffers(const at::Tensor &query, const Extras &extra) {
+  const auto &partials = *extra[5];
+  const bool shared = partials.sizes() == at::IntArrayRef({query.size(0), 1088});
+  const bool privateGroups = partials.dim() == 3 && partials.size(0) >= 2 && partials.size(0) <= 20 &&
+    partials.size(1) == query.size(0) && partials.size(2) == 1088;
   TORCH_CHECK(extra[4]->dim() == 2 && extra[4]->size(0) > 0 && extra[4]->size(1) == 576 &&
-                extra[4]->scalar_type() == at::kFloat && extra[5]->sizes() == at::IntArrayRef({query.size(0), 1088}) &&
-                extra[5]->scalar_type() == at::kFloat,
-              "fused SFA grad requires FP32 owner[capacity,576] and partials[T,1088]");
+                extra[4]->scalar_type() == at::kFloat && (shared || privateGroups) &&
+                partials.scalar_type() == at::kFloat,
+              "fused SFA grad requires FP32 owner[capacity,576] and partials[T,1088] or [groups+1,T,1088]");
 }
 
 void check_extra_storage(const hyper_parallel::multicore::DsaGradInputs &original, const Extras &extras) {

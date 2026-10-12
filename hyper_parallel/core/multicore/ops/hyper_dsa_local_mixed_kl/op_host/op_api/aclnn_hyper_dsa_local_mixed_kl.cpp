@@ -29,16 +29,16 @@ OP_TYPE_REGISTER(HyperDsaLocalMixedKl);
 using namespace op;
 using l0op::HyperDsaLocalMixedKlOpTypeId;
 
-extern "C" aclnnStatus aclnnHyperDsaLocalMixedKlGetWorkspaceSize(
-  const aclTensor *query, const aclTensor *key, const aclTensor *indexQuery, const aclTensor *indexKey,
-  const aclTensor *weight, const aclTensor *indices, const aclTensor *maximum, const aclTensor *sum,
-  const aclTensor *queryRope, const aclTensor *keyRope, const aclIntArray *actualQuery, const aclIntArray *actualKey,
-  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, const aclTensor *positions, double scale,
-  int64_t phase, const aclTensor *gradQuery, const aclTensor *gradKey, const aclTensor *gradWeight,
-  const aclTensor *loss, uint64_t *workspaceSize, aclOpExecutor **executor) {
+static aclnnStatus GetWorkspaceSize(const aclTensor *query, const aclTensor *key, const aclTensor *indexQuery,
+                                    const aclTensor *indexKey, const aclTensor *weight, const aclTensor *indices,
+                                    const aclTensor *maximum, const aclTensor *sum, const aclTensor *queryRope,
+                                    const aclTensor *keyRope, const aclIntArray *actualQuery,
+                                    const aclIntArray *actualKey, const aclTensor *config, const aclTensor *trace,
+                                    const aclTensor *retained, const aclTensor *positions, const aclTensor *tpArena,
+                                    const aclTensor *tpMetadata, double scale, int64_t phase,
+                                    const aclTensor *gradQuery, const aclTensor *gradKey, const aclTensor *gradWeight,
+                                    const aclTensor *loss, uint64_t *workspaceSize, aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
-  L2_DFX_PHASE_1(aclnnHyperDsaLocalMixedKl, DFX_IN(query, key, indexQuery, indexKey),
-                 DFX_OUT(gradQuery, gradKey, gradWeight, loss));
   auto owner = CREATE_EXECUTOR();
   CHECK_RET(owner.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
   const aclTensor *inputs[] = {query, key, indexQuery, indexKey, weight, indices, maximum, sum, queryRope, keyRope};
@@ -64,7 +64,7 @@ extern "C" aclnnStatus aclnnHyperDsaLocalMixedKlGetWorkspaceSize(
       HyperDsaLocalMixedKl,
       OP_INPUT(contiguousInputs[0], contiguousInputs[1], contiguousInputs[2], contiguousInputs[3], contiguousInputs[4],
                contiguousInputs[5], contiguousInputs[6], contiguousInputs[7], contiguousInputs[8], contiguousInputs[9],
-               actualQueryConst, actualKeyConst, config, trace, retained, positions),
+               actualQueryConst, actualKeyConst, config, trace, retained, positions, tpArena, tpMetadata),
       OP_OUTPUT(const_cast<aclTensor *>(contiguousOutputs[0]), const_cast<aclTensor *>(contiguousOutputs[1]),
                 const_cast<aclTensor *>(contiguousOutputs[2]), const_cast<aclTensor *>(contiguousOutputs[3])),
       OP_ATTR(scaleValue, layout, sparseMode, preTokens, nextTokens, phase));
@@ -83,5 +83,40 @@ extern "C" aclnnStatus aclnnHyperDsaLocalMixedKlGetWorkspaceSize(
 extern "C" aclnnStatus aclnnHyperDsaLocalMixedKl(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                  aclrtStream stream) {
   L2_DFX_PHASE_2(aclnnHyperDsaLocalMixedKl);
+  return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaLocalMixedKlGetWorkspaceSize(
+  const aclTensor *query, const aclTensor *key, const aclTensor *indexQuery, const aclTensor *indexKey,
+  const aclTensor *weight, const aclTensor *indices, const aclTensor *maximum, const aclTensor *sum,
+  const aclTensor *queryRope, const aclTensor *keyRope, const aclIntArray *actualQuery, const aclIntArray *actualKey,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, const aclTensor *positions, double scale,
+  int64_t phase, const aclTensor *gradQuery, const aclTensor *gradKey, const aclTensor *gradWeight,
+  const aclTensor *loss, uint64_t *workspaceSize, aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaLocalMixedKl, DFX_IN(query, key, indexQuery, indexKey),
+                 DFX_OUT(gradQuery, gradKey, gradWeight, loss));
+  return GetWorkspaceSize(query, key, indexQuery, indexKey, weight, indices, maximum, sum, queryRope, keyRope,
+                          actualQuery, actualKey, config, trace, retained, positions, nullptr, nullptr, scale, phase,
+                          gradQuery, gradKey, gradWeight, loss, workspaceSize, executor);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaTpLocalMixedKlGetWorkspaceSize(
+  const aclTensor *query, const aclTensor *key, const aclTensor *indexQuery, const aclTensor *indexKey,
+  const aclTensor *weight, const aclTensor *indices, const aclTensor *maximum, const aclTensor *sum,
+  const aclTensor *queryRope, const aclTensor *keyRope, const aclIntArray *actualQuery, const aclIntArray *actualKey,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, const aclTensor *positions,
+  const aclTensor *tpArena, const aclTensor *tpMetadata, double scale, int64_t phase, const aclTensor *gradQuery,
+  const aclTensor *gradKey, const aclTensor *gradWeight, const aclTensor *loss, uint64_t *workspaceSize,
+  aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaTpLocalMixedKl, DFX_IN(query, key, indexQuery, indexKey),
+                 DFX_OUT(gradQuery, gradKey, gradWeight, loss));
+  CHECK_RET(tpArena != nullptr && tpMetadata != nullptr && phase == 1, ACLNN_ERR_PARAM_INVALID);
+  return GetWorkspaceSize(query, key, indexQuery, indexKey, weight, indices, maximum, sum, queryRope, keyRope,
+                          actualQuery, actualKey, config, trace, retained, positions, tpArena, tpMetadata, scale, phase,
+                          gradQuery, gradKey, gradWeight, loss, workspaceSize, executor);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaTpLocalMixedKl(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                   aclrtStream stream) {
   return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
 }

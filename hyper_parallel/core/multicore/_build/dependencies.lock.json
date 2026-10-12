@@ -102,6 +102,11 @@
             "purpose": "use saved explicit sequence-relative query positions in local SFA gradient compute and scatter causal bounds"
           },
           {
+            "path": "hyper_parallel/core/multicore/ops/sparse_flash_attention_grad_group_partials.patch",
+            "sha256": "392bdb857c7b8c61e2a69e9487e4fedead309e9efbe635ef7b0428bc7b9bf59d",
+            "purpose": "allow fused backward compute groups to scatter into independent FP32 KV accumulators before ordered reduction"
+          },
+          {
             "path": "hyper_parallel/core/multicore/ops/sparse_lightning_indexer_kl_mixed.patch",
             "sha256": "0d8917cafe896e305e2f4b2f2f78c94499279a611ae8737b4b8362c3ec81e696",
             "purpose": "extract selected KL initialization, mixed physical scratch and logical query/post phases with retained FP32 loss/key partials"
@@ -110,6 +115,11 @@
             "path": "hyper_parallel/core/multicore/ops/sparse_lightning_indexer_kl_query_positions.patch",
             "sha256": "f8d057990f8716caafd80487a04b67f0fe5ec44564aadf4e6293eece4d6e57f8",
             "purpose": "use explicit compact query positions for KL teacher/predictor and scatter causal bounds"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/sparse_lightning_indexer_kl_tp_scores.patch",
+            "sha256": "9a87f0aefb6cff30cae8ab91bb82a409ef4f1424b9a241b56b46331816e03ca0",
+            "purpose": "SUM TP teacher probabilities before global head averaging and predictor logits before softmax, preserving local selected-KL VJP"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"

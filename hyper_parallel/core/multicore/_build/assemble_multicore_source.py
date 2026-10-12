@@ -243,6 +243,7 @@ def _compose_hyper_parallel_ops(
     _compose_cp_attention(source_root, transformer_copy)
     shutil.copytree(_MULTICORE_OPS / "hyper_dsa_index_grad_return", source_root / "hyper_dsa_index_grad_return")
     shutil.copytree(_MULTICORE_OPS / "hyper_dsa_tp_tile_sum", source_root / "hyper_dsa_tp_tile_sum")
+    shutil.copytree(_MULTICORE_OPS / "hyper_dsa_fp32_index_kl", source_root / "hyper_dsa_fp32_index_kl")
     for name in ("hyper_dsa_tp_tile_sum", "hyper_dsa_mixed_tile", "hyper_dsa_mixed_indexer", "hyper_dsa_mixed_grad",
                  "hyper_dsa_mixed_kl",
                  "hyper_dsa_local_mixed_kl",
@@ -258,7 +259,9 @@ def _compose_hyper_parallel_ops(
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_transport.h", runtime / "dsa_cp_transport.h")
         if name == "hyper_dsa_fused_grad":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_cp_grad_transport.h", runtime / "dsa_cp_grad_transport.h")
-        if name in ("hyper_dsa_tp_tile_sum", "hyper_dsa_mixed_indexer"):
+            shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_group_partials.h", runtime / "dsa_group_partials.h")
+        if name in ("hyper_dsa_tp_tile_sum", "hyper_dsa_mixed_indexer", "hyper_dsa_local_mixed_kl",
+                    "hyper_dsa_fused_training"):
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_tp_tile_sum.h", runtime / "dsa_tp_tile_sum.h")
         if name == "hyper_dsa_index_grad_return":
             shutil.copy2(_MULTICORE_OPS / "runtime" / "dsa_index_grad_transport.h",
@@ -413,11 +416,13 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe_grad" / "op_host" / "hyper_mega_moe_grad_def.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "hyper_mega_moe_grad.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
+        source_root / "hyper_dsa_fp32_index_kl" / "op_kernel" / "hyper_dsa_fp32_index_kl.cpp",
         source_root / "hyper_dsa_mixed_kl" / "op_kernel" / "hyper_dsa_mixed_kl.cpp",
         source_root / "hyper_dsa_local_mixed_kl" / "op_kernel" / "hyper_dsa_local_mixed_kl.cpp",
         source_root / "hyper_dsa_fused_forward" / "op_kernel" / "hyper_dsa_fused_forward.cpp",
         source_root / "hyper_dsa_fused_training" / "op_kernel" / "hyper_dsa_fused_training.cpp",
         source_root / "hyper_dsa_fused_grad" / "op_kernel" / "hyper_dsa_fused_grad.cpp",
+        source_root / "hyper_dsa_fused_grad" / "op_kernel" / "runtime" / "dsa_group_partials.h",
         source_root / "hyper_dsa_cp_attention" / "op_kernel" / "hyper_dsa_cp_attention.cpp",
         source_root / "hyper_dsa_index_grad_return" / "op_host" / "hyper_dsa_index_grad_return_tiling.h",
         source_root / "hyper_dsa_index_grad_return" / "op_kernel" / "hyper_dsa_index_grad_return.cpp",

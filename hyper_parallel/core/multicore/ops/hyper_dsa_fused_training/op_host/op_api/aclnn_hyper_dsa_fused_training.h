@@ -90,6 +90,21 @@ ACLNN_API aclnnStatus aclnnHyperDsaLocalCpTrainingGetWorkspaceSize(
   const aclIntArray *klQueryLengths, uint64_t *workspaceSize, aclOpExecutor **executor);
 ACLNN_API aclnnStatus aclnnHyperDsaLocalCpTraining(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                    aclrtStream stream);
+ACLNN_API aclnnStatus aclnnHyperDsaTpLocalCpTrainingGetWorkspaceSize(
+  const aclTensor *indexQuery, const aclTensor *indexKey, const aclTensor *query, const aclTensor *compressed,
+  const aclTensor *queryRope, const aclTensor *keyRope, const aclTensor *weights, const aclTensor *lengths,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, const aclTensor *klRetained,
+  const aclIntArray *klLengths, double scale, const aclTensor *indices, const aclTensor *values,
+  const aclTensor *attention, const aclTensor *maximum, const aclTensor *sum, const aclTensor *gradIndexQuery,
+  const aclTensor *gradIndexKey, const aclTensor *gradWeight, const aclTensor *loss, const aclTensor *arena,
+  const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace, const aclTensor *selectedRows,
+  const aclTensor *membership, const aclTensor *selectedRequests, const aclTensor *selectedCounts,
+  const aclTensor *queryLengths, const aclTensor *queryPositions, const aclTensor *queryIds,
+  const aclIntArray *klQueryLengths, const aclTensor *tpLiArena, const aclTensor *tpLiMetadata,
+  const aclTensor *tpKlArena, const aclTensor *tpKlMetadata, bool withKl, uint64_t *workspaceSize,
+  aclOpExecutor **executor);
+ACLNN_API aclnnStatus aclnnHyperDsaTpLocalCpTraining(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                     aclrtStream stream);
 #ifdef __cplusplus
 }
 #endif

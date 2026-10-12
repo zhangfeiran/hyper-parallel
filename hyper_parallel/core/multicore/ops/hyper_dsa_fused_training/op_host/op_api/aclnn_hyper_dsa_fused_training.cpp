@@ -33,7 +33,9 @@ aclnnStatus BuildFusedExecutor(const std::array<const aclTensor *, 8> &originalI
                                double scale, const std::array<const aclTensor *, 9> &destinations,
                                uint64_t *workspaceSize, aclOpExecutor **executor, bool withKl = true,
                                const aclTensor *queryLengths = nullptr, const aclTensor *queryPositions = nullptr,
-                               const aclTensor *queryIds = nullptr, const aclIntArray *klQueryLengths = nullptr) {
+                               const aclTensor *queryIds = nullptr, const aclIntArray *klQueryLengths = nullptr,
+                               const aclTensor *tpLiArena = nullptr, const aclTensor *tpLiMetadata = nullptr,
+                               const aclTensor *tpKlArena = nullptr, const aclTensor *tpKlMetadata = nullptr) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
   auto owner = CREATE_EXECUTOR();
   CHECK_RET(owner.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
@@ -60,7 +62,7 @@ aclnnStatus BuildFusedExecutor(const std::array<const aclTensor *, 8> &originalI
       OP_INPUT(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6], inputs[7], control[0],
                control[1], control[2], control[3], lengthsConst, control[4], control[5], control[6], control[7],
                control[8], control[9], control[10], control[11], queryLengths, queryPositions, queryIds,
-               queryLengthsConst),
+               queryLengthsConst, tpLiArena, tpLiMetadata, tpKlArena, tpKlMetadata),
       OP_OUTPUT(
         const_cast<aclTensor *>(outputs[0]), const_cast<aclTensor *>(outputs[1]), const_cast<aclTensor *>(outputs[2]),
         const_cast<aclTensor *>(outputs[3]), const_cast<aclTensor *>(outputs[4]), const_cast<aclTensor *>(outputs[5]),
@@ -195,6 +197,33 @@ extern "C" aclnnStatus aclnnHyperDsaLocalCpTrainingGetWorkspaceSize(
                             workspaceSize, executor, true, queryLengths, queryPositions, queryIds, klQueryLengths);
 }
 
+extern "C" aclnnStatus aclnnHyperDsaTpLocalCpTrainingGetWorkspaceSize(
+  const aclTensor *indexQuery, const aclTensor *indexKey, const aclTensor *query, const aclTensor *compressed,
+  const aclTensor *queryRope, const aclTensor *keyRope, const aclTensor *weights, const aclTensor *lengths,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, const aclTensor *klRetained,
+  const aclIntArray *klLengths, double scale, const aclTensor *indices, const aclTensor *values,
+  const aclTensor *attention, const aclTensor *maximum, const aclTensor *sum, const aclTensor *gradIndexQuery,
+  const aclTensor *gradIndexKey, const aclTensor *gradWeight, const aclTensor *loss, const aclTensor *arena,
+  const aclTensor *metadata, const aclTensor *requests, const aclTensor *transportTrace, const aclTensor *selectedRows,
+  const aclTensor *membership, const aclTensor *selectedRequests, const aclTensor *selectedCounts,
+  const aclTensor *queryLengths, const aclTensor *queryPositions, const aclTensor *queryIds,
+  const aclIntArray *klQueryLengths, const aclTensor *tpLiArena, const aclTensor *tpLiMetadata,
+  const aclTensor *tpKlArena, const aclTensor *tpKlMetadata, bool withKl, uint64_t *workspaceSize,
+  aclOpExecutor **executor) {
+  L2_DFX_PHASE_1(aclnnHyperDsaTpLocalCpTraining, DFX_IN(indexQuery, query, config), DFX_OUT(indices, attention));
+  CHECK_RET(
+    tpLiArena != nullptr && tpLiMetadata != nullptr &&
+      (withKl ? (tpKlArena != nullptr && tpKlMetadata != nullptr) : (tpKlArena == nullptr && tpKlMetadata == nullptr)),
+    ACLNN_ERR_PARAM_INVALID);
+  return BuildFusedExecutor({indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths},
+                            {config, trace, retained, klRetained, arena, metadata, requests, transportTrace,
+                             selectedRows, membership, selectedRequests, selectedCounts},
+                            klLengths, scale,
+                            {indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight, loss},
+                            workspaceSize, executor, withKl, queryLengths, queryPositions, queryIds, klQueryLengths,
+                            tpLiArena, tpLiMetadata, tpKlArena, tpKlMetadata);
+}
+
 extern "C" aclnnStatus aclnnHyperDsaFusedTraining(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                   aclrtStream stream) {
   L2_DFX_PHASE_2(aclnnHyperDsaFusedTraining);
@@ -228,5 +257,11 @@ extern "C" aclnnStatus aclnnHyperDsaLocalCpForward(void *workspace, uint64_t wor
 extern "C" aclnnStatus aclnnHyperDsaLocalCpTraining(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                     aclrtStream stream) {
   L2_DFX_PHASE_2(aclnnHyperDsaLocalCpTraining);
+  return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
+
+extern "C" aclnnStatus aclnnHyperDsaTpLocalCpTraining(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                      aclrtStream stream) {
+  L2_DFX_PHASE_2(aclnnHyperDsaTpLocalCpTraining);
   return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
 }

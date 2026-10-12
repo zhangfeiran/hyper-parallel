@@ -78,6 +78,14 @@ class HyperDsaLocalMixedKl : public OpDef {
       .DataType({ge::DT_INT64, ge::DT_INT64})
       .Format({ge::FORMAT_ND, ge::FORMAT_ND})
       .AutoContiguous();
+    this->Input("tp_arena")
+      .ParamType(OPTIONAL)
+      .DataType({ge::DT_UINT8, ge::DT_UINT8})
+      .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+    this->Input("tp_metadata")
+      .ParamType(OPTIONAL)
+      .DataType({ge::DT_INT64, ge::DT_INT64})
+      .Format({ge::FORMAT_ND, ge::FORMAT_ND});
     for (const char *output : {"d_query_index", "d_key_index"}) {
       this->Output(output)
         .ParamType(REQUIRED)

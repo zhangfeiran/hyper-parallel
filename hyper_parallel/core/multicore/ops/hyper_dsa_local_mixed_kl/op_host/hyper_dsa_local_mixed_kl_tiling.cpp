@@ -45,6 +45,17 @@ ge::graphStatus TilingHyperDsaLocalMixedKl(gert::TilingContext *context) {
     OP_LOGE(context->GetNodeName(), "local KL requires one explicit position per actual query");
     return ge::GRAPH_FAILED;
   }
+  const bool tp = context->GetOptionalInputDesc(16) != nullptr;
+  const auto *tpArena = context->GetOptionalInputShape(16);
+  const auto *tpMetadata = context->GetOptionalInputShape(17);
+  if (tp != (context->GetOptionalInputDesc(17) != nullptr) ||
+      (tp && (*phase != 1 || tpArena == nullptr || tpArena->GetStorageShape().GetDimNum() != 1 ||
+              tpArena->GetStorageShape().GetShapeSize() <= 0 ||
+              context->GetOptionalInputDesc(16)->GetDataType() != ge::DT_UINT8 || tpMetadata == nullptr ||
+              tpMetadata->GetStorageShape().GetDimNum() != 1 || tpMetadata->GetStorageShape().GetShapeSize() != 24 ||
+              context->GetOptionalInputDesc(17)->GetDataType() != ge::DT_INT64))) {
+    return ge::GRAPH_FAILED;
+  }
   SparseLightningIndexerGradKLLossTilingBase tile(context);
   if (tile.DoTiling() != ge::GRAPH_SUCCESS) {
     OP_LOGE(context->GetNodeName(), "locked KL child tiling failed");
@@ -67,6 +78,7 @@ ge::graphStatus TilingHyperDsaLocalMixedKl(gert::TilingContext *context) {
     return ge::GRAPH_FAILED;
   }
   data->mixedPhase = *phase;
+  data->tpArenaBytes = tp ? tpArena->GetStorageShape().GetShapeSize() : 0;
   context->SetBlockDim(20);
   context->SetTilingKey(0);
   context->GetRawTilingData()->SetDataSize(sizeof(*data));

@@ -22,13 +22,13 @@
 namespace {
 using Result = std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>;
 
-Result dsa_local_mixed_kl_npu(const at::Tensor &query, const at::Tensor &key, const at::Tensor &indexQuery,
-                              const at::Tensor &indexKey, const at::Tensor &weight, const at::Tensor &indices,
-                              const at::Tensor &maximum, const at::Tensor &sum, const at::Tensor &queryRope,
-                              const at::Tensor &keyRope, at::IntArrayRef actualQuery, at::IntArrayRef actualKey,
-                              const at::Tensor &config, at::Tensor &trace, at::Tensor &retained,
-                              const at::Tensor &positions, double scale, int64_t phase, at::Tensor &gradQuery,
-                              at::Tensor &gradKey, at::Tensor &gradWeight, at::Tensor &loss) {
+Result RunLocalKl(const at::Tensor &query, const at::Tensor &key, const at::Tensor &indexQuery,
+                  const at::Tensor &indexKey, const at::Tensor &weight, const at::Tensor &indices,
+                  const at::Tensor &maximum, const at::Tensor &sum, const at::Tensor &queryRope,
+                  const at::Tensor &keyRope, at::IntArrayRef actualQuery, at::IntArrayRef actualKey,
+                  const at::Tensor &config, at::Tensor &trace, at::Tensor &retained, const at::Tensor &positions,
+                  double scale, int64_t phase, at::Tensor &gradQuery, at::Tensor &gradKey, at::Tensor &gradWeight,
+                  at::Tensor &loss, at::Tensor *arena, const at::Tensor *metadata) {
   const std::array<const at::Tensor *, 18> tensors = {
     &query,   &key,    &indexQuery, &indexKey, &weight,    &indices, &maximum,    &sum,  &queryRope,
     &keyRope, &config, &trace,      &retained, &gradQuery, &gradKey, &gradWeight, &loss, &positions};
@@ -89,13 +89,59 @@ Result dsa_local_mixed_kl_npu(const at::Tensor &query, const at::Tensor &key, co
       TORCH_CHECK(output == tensor || !output->is_alias_of(*tensor), "mixed KL mutable buffers must not alias");
     }
   }
-  static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaLocalMixedKl",
-                                                          "aclnnHyperDsaLocalMixedKlGetWorkspaceSize");
-  hyper_parallel::multicore::execute_cached_op(api, query, key, indexQuery, indexKey, weight, indices, maximum, sum,
-                                               queryRope, keyRope, actualQuery, actualKey, config, trace, retained,
-                                               positions, scale, phase, gradQuery, gradKey, gradWeight, loss);
+  if (arena != nullptr) {
+    TORCH_CHECK(metadata != nullptr && phase == 1, "TP KL exchange is valid only in compute phase");
+    TORCH_CHECK(arena->device() == query.device() && arena->is_contiguous() && !arena->requires_grad() &&
+                  arena->dim() == 1 && arena->numel() > 0 && arena->scalar_type() == at::kByte &&
+                  metadata->device() == query.device() && metadata->is_contiguous() && !metadata->requires_grad() &&
+                  metadata->sizes() == at::IntArrayRef({24}) && metadata->scalar_type() == at::kLong &&
+                  !arena->is_alias_of(*metadata),
+                "TP KL requires detached contiguous arena and int64[24] metadata");
+    for (const auto *tensor : tensors) {
+      TORCH_CHECK(!arena->is_alias_of(*tensor) && !metadata->is_alias_of(*tensor),
+                  "TP KL transport must not alias math or runtime tensors");
+    }
+    static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaTpLocalMixedKl",
+                                                            "aclnnHyperDsaTpLocalMixedKlGetWorkspaceSize");
+    hyper_parallel::multicore::execute_cached_op(
+      api, query, key, indexQuery, indexKey, weight, indices, maximum, sum, queryRope, keyRope, actualQuery, actualKey,
+      config, trace, retained, positions, *arena, *metadata, scale, phase, gradQuery, gradKey, gradWeight, loss);
+  } else {
+    static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaLocalMixedKl",
+                                                            "aclnnHyperDsaLocalMixedKlGetWorkspaceSize");
+    hyper_parallel::multicore::execute_cached_op(api, query, key, indexQuery, indexKey, weight, indices, maximum, sum,
+                                                 queryRope, keyRope, actualQuery, actualKey, config, trace, retained,
+                                                 positions, scale, phase, gradQuery, gradKey, gradWeight, loss);
+  }
   return Result(gradQuery, gradKey, gradWeight, loss, trace, retained);
+}
+Result dsa_local_mixed_kl_npu(const at::Tensor &query, const at::Tensor &key, const at::Tensor &indexQuery,
+                              const at::Tensor &indexKey, const at::Tensor &weight, const at::Tensor &indices,
+                              const at::Tensor &maximum, const at::Tensor &sum, const at::Tensor &queryRope,
+                              const at::Tensor &keyRope, at::IntArrayRef actualQuery, at::IntArrayRef actualKey,
+                              const at::Tensor &config, at::Tensor &trace, at::Tensor &retained,
+                              const at::Tensor &positions, double scale, int64_t phase, at::Tensor &gradQuery,
+                              at::Tensor &gradKey, at::Tensor &gradWeight, at::Tensor &loss) {
+  return RunLocalKl(query, key, indexQuery, indexKey, weight, indices, maximum, sum, queryRope, keyRope, actualQuery,
+                    actualKey, config, trace, retained, positions, scale, phase, gradQuery, gradKey, gradWeight, loss,
+                    nullptr, nullptr);
+}
+
+Result dsa_tp_local_mixed_kl_npu(const at::Tensor &query, const at::Tensor &key, const at::Tensor &indexQuery,
+                                 const at::Tensor &indexKey, const at::Tensor &weight, const at::Tensor &indices,
+                                 const at::Tensor &maximum, const at::Tensor &sum, const at::Tensor &queryRope,
+                                 const at::Tensor &keyRope, at::IntArrayRef actualQuery, at::IntArrayRef actualKey,
+                                 const at::Tensor &config, at::Tensor &trace, at::Tensor &retained,
+                                 const at::Tensor &positions, at::Tensor &arena, const at::Tensor &metadata,
+                                 double scale, int64_t phase, at::Tensor &gradQuery, at::Tensor &gradKey,
+                                 at::Tensor &gradWeight, at::Tensor &loss) {
+  return RunLocalKl(query, key, indexQuery, indexKey, weight, indices, maximum, sum, queryRope, keyRope, actualQuery,
+                    actualKey, config, trace, retained, positions, scale, phase, gradQuery, gradKey, gradWeight, loss,
+                    &arena, &metadata);
 }
 }  // namespace
 
-TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) { m.impl("dsa_local_mixed_kl_out", &dsa_local_mixed_kl_npu); }
+TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
+  m.impl("dsa_local_mixed_kl_out", &dsa_local_mixed_kl_npu);
+  m.impl("dsa_tp_local_mixed_kl_out", &dsa_tp_local_mixed_kl_npu);
+}

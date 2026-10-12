@@ -27,6 +27,8 @@ TILING_DATA_FIELD_DEF_STRUCT(LITilingData, li);
 TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionTilingDataMla, sfa);
 TILING_DATA_FIELD_DEF(uint64_t, withKl);
 TILING_DATA_FIELD_DEF_ARR(uint64_t, (sizeof(SparseLightningIndexerGradKLLossTilingData) + 7) / 8, kl);
+TILING_DATA_FIELD_DEF(uint64_t, tpLiArenaBytes);
+TILING_DATA_FIELD_DEF(uint64_t, tpKlArenaBytes);
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(HyperDsaFusedTraining, DsaFusedTrainingTilingData)
 }  // namespace optiling

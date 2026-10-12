@@ -268,7 +268,8 @@ ge::graphStatus ComposeKl(gert::TilingContext *context, DsaFusedTrainingTilingDa
     return ge::GRAPH_FAILED;
   }
   const size_t capacity = (sizeof(SparseLightningIndexerGradKLLossTilingData) + 7) / 8 * 8;
-  auto *destination = static_cast<uint8_t *>(context->GetRawTilingData()->GetData()) + data.GetDataSize() - capacity;
+  auto *destination = static_cast<uint8_t *>(context->GetRawTilingData()->GetData()) + data.GetDataSize() - capacity -
+                      2 * sizeof(uint64_t);
   std::memcpy(destination, child->GetRawTilingData()->GetData(), sizeof(SparseLightningIndexerGradKLLossTilingData));
   return ge::GRAPH_SUCCESS;
 }
@@ -302,6 +303,29 @@ ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
       return ge::GRAPH_FAILED;
     }
   }
+  const bool tp = context->GetOptionalInputDesc(25) != nullptr;
+  const bool tpKl = context->GetOptionalInputDesc(27) != nullptr;
+  if (tp != (context->GetOptionalInputDesc(26) != nullptr) || tpKl != (context->GetOptionalInputDesc(28) != nullptr) ||
+      (tp && (!local || !selected || context->GetOptionalInputDesc(13) == nullptr || tpKl != withKl)) ||
+      (tpKl && !tp)) {
+    return ge::GRAPH_FAILED;
+  }
+  uint64_t tpBytes[2] = {0, 0};
+  for (size_t index = 0; index < 2; ++index) {
+    const size_t input = 25 + index * 2;
+    if (context->GetOptionalInputDesc(input) == nullptr) {
+      continue;
+    }
+    const auto *arena = context->GetOptionalInputShape(input);
+    const auto *metadata = context->GetOptionalInputShape(input + 1);
+    if (arena == nullptr || arena->GetStorageShape().GetDimNum() != 1 || arena->GetStorageShape().GetShapeSize() <= 0 ||
+        context->GetOptionalInputDesc(input)->GetDataType() != ge::DT_UINT8 || metadata == nullptr ||
+        metadata->GetStorageShape().GetDimNum() != 1 || metadata->GetStorageShape().GetShapeSize() != 24 ||
+        context->GetOptionalInputDesc(input + 1)->GetDataType() != ge::DT_INT64) {
+      return ge::GRAPH_FAILED;
+    }
+    tpBytes[index] = arena->GetStorageShape().GetShapeSize();
+  }
   DsaFusedTrainingTilingData data;
   auto *raw = context->GetRawTilingData();
   if (raw == nullptr || raw->GetCapacity() < data.GetDataSize()) {
@@ -333,8 +357,9 @@ ge::graphStatus TilingDsaFusedTraining(gert::TilingContext *context) {
                         (context->GetInputDesc(6)->GetDataType() == ge::DT_FLOAT ? 1 : 0));
   const uint64_t klEnabled = withKl ? 1 : 0;
   const size_t klCapacity = (sizeof(SparseLightningIndexerGradKLLossTilingData) + 7) / 8 * 8;
-  std::memcpy(static_cast<uint8_t *>(raw->GetData()) + data.GetDataSize() - klCapacity - sizeof(uint64_t), &klEnabled,
-              sizeof(klEnabled));
+  std::memcpy(static_cast<uint8_t *>(raw->GetData()) + data.GetDataSize() - klCapacity - 3 * sizeof(uint64_t),
+              &klEnabled, sizeof(klEnabled));
+  std::memcpy(static_cast<uint8_t *>(raw->GetData()) + data.GetDataSize() - sizeof(tpBytes), tpBytes, sizeof(tpBytes));
   raw->SetDataSize(data.GetDataSize());
   return ge::GRAPH_SUCCESS;
 }

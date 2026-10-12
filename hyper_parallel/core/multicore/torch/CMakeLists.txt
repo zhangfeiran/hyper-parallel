@@ -91,6 +91,7 @@ add_library(hyper_parallel_mega_moe_torch SHARED
     csrc/dsa_mixed_indexer.cpp
     csrc/dsa_mixed_grad.cpp
     csrc/dsa_mixed_kl.cpp
+    csrc/dsa_fp32_index_kl.cpp
     csrc/dsa_local_mixed_kl.cpp
     csrc/mega_moe.cpp
     csrc/mega_moe_grad.cpp

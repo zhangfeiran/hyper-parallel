@@ -1,0 +1,90 @@
+--- a/attention/sparse_lightning_indexer_grad_kl_loss/op_kernel/arch22/sparse_lightning_indexer_grad_kl_loss_vector.h
++++ b/attention/sparse_lightning_indexer_grad_kl_loss/op_kernel/arch22/sparse_lightning_indexer_grad_kl_loss_vector.h
+@@ -62,6 +62,13 @@
+             queryPositionsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(positions));
+         }
+     }
++#ifdef HYPER_DSA_TP_KL
++    __aicore__ inline void SetTpTransport(DsaMixed::TpTileSum *transport, uint32_t tpSize)
++    {
++        tpTransport_ = transport;
++        tpSize_ = tpSize;
++    }
++#endif
+     __aicore__ inline void AllocEventID();
+     __aicore__ inline void FreeEventID();
+
+@@ -89,5 +96,9 @@
+     __aicore__ inline void ProcessDeterVector2(SLIGradKLLossRunInfo &runInfo);
+
+ private:
++#ifdef HYPER_DSA_TP_KL
++    DsaMixed::TpTileSum *tpTransport_ = nullptr;
++    uint32_t tpSize_ = 1;
++#endif
+     // =============== vector 0 functions ==============
+     template <event_t IdStart, bool gatherRope>
+@@ -1060,7 +1071,21 @@
+         }
+     }
+     PipeBarrier<PIPE_V>();
++#ifdef HYPER_DSA_TP_KL
++    if (tpTransport_ != nullptr) {
++        // The unused tail must not publish stale UB contents to the next rank.
++        const uint32_t valid = static_cast<uint32_t>(CeilDiv(runInfo.kRealSize, 8) * 8);
++        if (valid < topKSize) {
++            AscendC::Duplicate(reduceSumPResUb[valid], 0.0f, topKSize - valid);
++        }
++        PipeBarrier<PIPE_V>();
++        tpTransport_->SumNext(reduceSumPResUb, sharedTBuf.GetWithOffset<T>(topKSize, 0));
++    }
++    const int64_t globalHeads = static_cast<int64_t>(constInfo.gSizeQuery) * static_cast<int64_t>(tpSize_);
++    float gRec = 1.0f / static_cast<float>(globalHeads);
++#else
+     float gRec = 1.0f / static_cast<float>(static_cast<int64_t>(constInfo.gSizeQuery));
++#endif
+     AscendC::Muls(reduceSumPResUb, reduceSumPResUb, gRec, topKSize);
+     PipeBarrier<PIPE_V>();
+     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventVToMte3InnerVecP);
+@@ -1157,6 +1182,16 @@
+         PipeBarrier<PIPE_V>();
+     }
+
++#ifdef HYPER_DSA_TP_KL
++    if (tpTransport_ != nullptr) {
++        if (realKSizeAlign < topKSize) {
++            AscendC::Duplicate(reduceSumYResUb[realKSizeAlign], 0.0f, topKSize - realKSizeAlign);
++        }
++        PipeBarrier<PIPE_V>();
++        tpTransport_->SumNext(reduceSumYResUb, sharedTBuf.GetWithOffset<T>(topKSize, 0));
++    }
++#endif
++
+     SoftMaxShapeInfo softmaxShapeInfoData = {
+         static_cast<uint32_t>(1),
+         static_cast<uint32_t>(realKSizeAlign),
+--- a/attention/sparse_lightning_indexer_grad_kl_loss/op_kernel/arch22/sparse_lightning_indexer_grad_kl_loss_base.h
++++ b/attention/sparse_lightning_indexer_grad_kl_loss/op_kernel/arch22/sparse_lightning_indexer_grad_kl_loss_base.h
+@@ -68,6 +68,12 @@
+     __aicore__ inline void InitConstInfo();
+     __aicore__ inline void InitBuffer(TPipe *pipe);
+     __aicore__ inline void InitWorkspace(__gm__ uint8_t *workspace);
++#ifdef HYPER_DSA_TP_KL
++    __aicore__ inline void SetTpTransport(DsaMixed::TpTileSum *transport, uint32_t tpSize)
++    {
++        vectorService.SetTpTransport(transport, tpSize);
++    }
++#endif
+     __aicore__ inline void SetQueryPositions(__gm__ uint8_t *positions)
+     {
+         hasQueryPositions_ = positions != nullptr;
+--- a/attention/sparse_lightning_indexer_grad_kl_loss/op_kernel/arch22/sparse_lightning_indexer_grad_kl_loss_tiling.h
++++ b/attention/sparse_lightning_indexer_grad_kl_loss/op_kernel/arch22/sparse_lightning_indexer_grad_kl_loss_tiling.h
+@@ -139,6 +139,7 @@
+     SLIGradKLLossInitOutputParams initOutputParams;
+     SLIGradKLLossVecApiParams vectorParams;
+     uint64_t mixedPhase = 0;
++    uint64_t tpArenaBytes = 0;
+ };
+
+ } // namespace optiling

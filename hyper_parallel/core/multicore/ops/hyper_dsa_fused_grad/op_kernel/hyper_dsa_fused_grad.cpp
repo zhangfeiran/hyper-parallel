@@ -16,6 +16,7 @@
 #include "arch22/sparse_flash_attention_grad_bs1_basic.h"
 #include "runtime/dsa_mixed_group.h"
 #include "runtime/dsa_cp_grad_transport.h"
+#include "runtime/dsa_group_partials.h"
 
 using namespace AscendC;   // NOLINT(build/namespaces)
 using namespace DsaMixed;  // NOLINT(build/namespaces)
@@ -81,7 +82,7 @@ __aicore__ inline void EmptyQueryPhase(const Buffers &buffers, const SparseFlash
 
 __aicore__ inline void ComputePhase(const Buffers &buffers, const SparseFlashAttentionGradBasicTilingData *data,
                                     GlobalTensor<int64_t> &trace, uint32_t phase, uint32_t group, uint32_t groups,
-                                    uint32_t physicalCount) {
+                                    uint32_t physicalCount, __gm__ uint8_t *privateKv) {
   uint32_t count = 0, checksum = 0;
   for (uint32_t logical = group; logical < physicalCount; logical += groups) {
     const uint32_t ticket = Dispatch(trace, group * kGroupWords, logical);
@@ -91,6 +92,7 @@ __aicore__ inline void ComputePhase(const Buffers &buffers, const SparseFlashAtt
       EmptyQueryPhase(buffers, data, ticket, physicalCount, phase);
     } else {
       SFAG_BASIC::SelectedAttentionGradBasic<TileType> tile;
+      tile.SetKvPartials(privateKv);
       tile.Process(buffers.query, buffers.key, buffers.value, buffers.out, buffers.gradOut, buffers.maximum,
                    buffers.sum, buffers.indices, buffers.actualQuery, buffers.actualKv, buffers.queryRope,
                    buffers.keyRope, buffers.gradQuery, buffers.gradKey, buffers.gradValue, buffers.gradQueryRope,
@@ -104,7 +106,7 @@ __aicore__ inline void ComputePhase(const Buffers &buffers, const SparseFlashAtt
 }
 
 __aicore__ inline void Run(const Buffers &buffers, CpGradTransport &transport, __gm__ uint8_t *runtimeConfig,
-                           __gm__ uint8_t *groupTrace, __gm__ uint8_t *tiling) {
+                           __gm__ uint8_t *groupTrace, __gm__ uint8_t *tiling, __gm__ uint8_t *partials) {
   GlobalTensor<int64_t> config;
   config.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(runtimeConfig), 4);
   const uint32_t groups = static_cast<uint32_t>(config.GetValue(2));
@@ -120,7 +122,14 @@ __aicore__ inline void Run(const Buffers &buffers, CpGradTransport &transport, _
   if (group > groups) {
     return;
   }
-  GET_TILING_DATA_WITH_STRUCT(SparseFlashAttentionGradBasicTilingData, data, tiling);
+  GET_TILING_DATA_WITH_STRUCT(DsaFusedGradTilingData, fusedData, tiling);
+  const auto &data = fusedData.grad;
+  const bool privateKv = fusedData.privateGroups != 0;
+  if (privateKv && fusedData.privateGroups != groups) {
+    return;
+  }
+  GroupPartials groupPartials;
+  groupPartials.Init(partials, data.opInfo.S2, groups);
   for (uint32_t phase = 0; phase < 3; ++phase) {
     GlobalTensor<int64_t> trace;
     trace.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(groupTrace) + phase * physicalCount * kGroupWords,
@@ -131,13 +140,30 @@ __aicore__ inline void Run(const Buffers &buffers, CpGradTransport &transport, _
           transport.Prepare();
         }
         if (GetSubBlockIdx() == 0 && phase == 2) {
+          if (privateKv) {
+            groupPartials.Reduce(buffers.retained, data.postTilingData.dkWorkSpaceOffset,
+                                 data.postTilingData.dvWorkSpaceOffset);
+            PublishControl(trace, groups * kGroupWords + kMemberWords + 10, phase + 1);
+          }
           transport.Progress(buffers.retained, data.postTilingData.dkWorkSpaceOffset,
                              data.postTilingData.dvWorkSpaceOffset);
         }
       }
       ClosePhase(trace, groups, phase + 1);
     } else {
-      ComputePhase(buffers, &data, trace, phase, group, groups, physicalCount);
+      if (privateKv) {
+        if ASCEND_IS_AIV {
+          if (phase == 0) {
+            groupPartials.Clear(group, GetSubBlockIdx());
+          }
+        }
+        if (phase == 2) {
+          // Post-cast readers consume the merged workspace only after the reserved vector publishes it.
+          while (ReadVisible(trace, groups * kGroupWords + kMemberWords + 10) != phase + 1) {}
+        }
+      }
+      ComputePhase(buffers, &data, trace, phase, group, groups, physicalCount,
+                   privateKv ? groupPartials.Group(group) : nullptr);
     }
   }
 }
@@ -157,5 +183,5 @@ extern "C" __global__ __aicore__ void hyper_dsa_fused_grad(
                   gradKey, gradValue,   gradQueryRope, gradKeyRope, queryPositions};
   CpGradTransport transport;
   transport.Init(arena, metadata, requests, transportTrace, partials, ownerGradient);
-  Run(buffers, transport, runtimeConfig, groupTrace, tiling);
+  Run(buffers, transport, runtimeConfig, groupTrace, tiling, partials);
 }

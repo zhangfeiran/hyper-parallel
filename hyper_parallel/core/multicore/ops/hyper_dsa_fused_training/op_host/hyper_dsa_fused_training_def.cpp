@@ -136,6 +136,11 @@ class HyperDsaFusedTraining : public OpDef {
       .Format({ge::FORMAT_ND, ge::FORMAT_ND})
       .ValueDepend(REQUIRED)
       .AutoContiguous();
+    const char *tpInputs[] = {"tp_li_arena", "tp_li_metadata", "tp_kl_arena", "tp_kl_metadata"};
+    for (size_t index = 0; index < 4; ++index) {
+      const auto dtype = index % 2 == 0 ? ge::DT_UINT8 : ge::DT_INT64;
+      this->Input(tpInputs[index]).ParamType(OPTIONAL).DataType({dtype, dtype}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
+    }
     this->Attr("scale").AttrType(REQUIRED).Float();
     this->Attr("with_kl").AttrType(OPTIONAL).Bool(true);
     this->AICore().AddConfig("ascend910b");

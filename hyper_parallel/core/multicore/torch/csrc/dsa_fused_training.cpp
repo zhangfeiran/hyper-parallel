@@ -16,6 +16,7 @@
 #include <array>
 #include <cmath>
 #include <tuple>
+#include <vector>
 #include "csrc/cached_op_api.h"
 
 namespace {
@@ -327,21 +328,23 @@ std::tuple<TensorRef, TensorRef, TensorRef, TensorRef, TensorRef, TensorRef, Ten
     queryLengths, queryPositions, queryIds);
   return {indices, values, attention, maximum, sum, trace, retained};
 }
-Result local_cp_training_npu(const at::Tensor &indexQuery, at::Tensor &indexKey, const at::Tensor &query,
-                             at::Tensor &compressed, const at::Tensor &queryRope, at::Tensor &keyRope,
-                             const at::Tensor &weights, const at::Tensor &lengths, const at::Tensor &config,
-                             at::Tensor &trace, at::Tensor &retained, at::IntArrayRef klLengths, double scale,
-                             at::Tensor &indices, at::Tensor &values, at::Tensor &attention, at::Tensor &maximum,
-                             at::Tensor &sum, at::Tensor &arena, const at::Tensor &metadata, const at::Tensor &requests,
-                             at::Tensor &transportTrace, const at::Tensor &selectedRows, at::Tensor &membership,
-                             at::Tensor &selectedRequests, at::Tensor &selectedCounts, const at::Tensor &queryLengths,
-                             const at::Tensor &queryPositions, const at::Tensor &queryIds,
-                             at::IntArrayRef klQueryLengths, at::Tensor &klRetained, at::Tensor &gradIndexQuery,
-                             at::Tensor &gradIndexKey, at::Tensor &gradWeight, at::Tensor &loss) {
+Result RunLocalCpTraining(const at::Tensor &indexQuery, at::Tensor &indexKey, const at::Tensor &query,
+                          at::Tensor &compressed, const at::Tensor &queryRope, at::Tensor &keyRope,
+                          const at::Tensor &weights, const at::Tensor &lengths, const at::Tensor &config,
+                          at::Tensor &trace, at::Tensor &retained, at::IntArrayRef klLengths, double scale,
+                          at::Tensor &indices, at::Tensor &values, at::Tensor &attention, at::Tensor &maximum,
+                          at::Tensor &sum, at::Tensor &arena, const at::Tensor &metadata, const at::Tensor &requests,
+                          at::Tensor &transportTrace, const at::Tensor &selectedRows, at::Tensor &membership,
+                          at::Tensor &selectedRequests, at::Tensor &selectedCounts, const at::Tensor &queryLengths,
+                          const at::Tensor &queryPositions, const at::Tensor &queryIds, at::IntArrayRef klQueryLengths,
+                          at::Tensor &klRetained, at::Tensor &gradIndexQuery, at::Tensor &gradIndexKey,
+                          at::Tensor &gradWeight, at::Tensor &loss, bool withKl, at::Tensor *tpLiArena,
+                          const at::Tensor *tpLiMetadata, const c10::optional<at::Tensor> &tpKlArena,
+                          const c10::optional<at::Tensor> &tpKlMetadata) {
   const Tensors tensors{&indexQuery, &indexKey, &query, &compressed,     &queryRope,    &keyRope,    &weights,
                         &lengths,    &config,   &trace, &retained,       &klRetained,   &indices,    &values,
                         &attention,  &maximum,  &sum,   &gradIndexQuery, &gradIndexKey, &gradWeight, &loss};
-  check_fused_inputs(tensors, scale, 9, true, true);
+  check_fused_inputs(tensors, scale, withKl ? 9 : 6, withKl, true);
   check_selected(tensors, {&arena, &metadata, &requests, &transportTrace, &selectedRows, &membership, &selectedRequests,
                            &selectedCounts});
   check_lengths(klLengths, indexKey, lengths);
@@ -374,16 +377,89 @@ Result local_cp_training_npu(const at::Tensor &indexQuery, at::Tensor &indexKey,
       TORCH_CHECK(!tensor->is_alias_of(*extra), "local metadata must not alias transport/request buffers");
     }
   }
-  static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaLocalCpTraining",
-                                                          "aclnnHyperDsaLocalCpTrainingGetWorkspaceSize");
-  hyper_parallel::multicore::execute_cached_op(
-    api, indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths, config, trace, retained,
-    klRetained, klLengths, scale, indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight,
-    loss, arena, metadata, requests, transportTrace, selectedRows, membership, selectedRequests, selectedCounts,
-    queryLengths, queryPositions, queryIds, klQueryLengths);
+  if (tpLiArena != nullptr) {
+    TORCH_CHECK(tpLiMetadata != nullptr && tpKlArena.has_value() == withKl && tpKlMetadata.has_value() == withKl,
+                "fused TP requires LI transport and a KL transport pair exactly when KL is enabled");
+    std::vector<const at::Tensor *> transport{tpLiArena, tpLiMetadata};
+    if (withKl) {
+      transport.push_back(&tpKlArena.value());
+      transport.push_back(&tpKlMetadata.value());
+    }
+    const std::array<const at::Tensor *, 11> extra{&arena,        &metadata,       &requests,         &transportTrace,
+                                                   &selectedRows, &membership,     &selectedRequests, &selectedCounts,
+                                                   &queryLengths, &queryPositions, &queryIds};
+    for (size_t index = 0; index < transport.size(); ++index) {
+      const auto *tensor = transport[index];
+      TORCH_CHECK(tensor->device() == query.device() && tensor->is_contiguous() && !tensor->requires_grad() &&
+                    (index % 2 == 0 ? (tensor->dim() == 1 && tensor->numel() > 0 && tensor->scalar_type() == at::kByte)
+                                    : (tensor->sizes() == at::IntArrayRef({24}) && tensor->scalar_type() == at::kLong)),
+                  "fused TP requires detached uint8 arenas and int64[24] metadata on the prepared NPU");
+      for (const auto *original : tensors) {
+        TORCH_CHECK(!tensor->is_alias_of(*original), "TP transport must not alias arithmetic buffers");
+      }
+      for (const auto *original : extra) {
+        TORCH_CHECK(!tensor->is_alias_of(*original), "TP transport must not alias CP transport or local metadata");
+      }
+      for (size_t previous = 0; previous < index; ++previous) {
+        TORCH_CHECK(!tensor->is_alias_of(*transport[previous]), "TP transport arenas/metadata must not alias");
+      }
+    }
+    static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaTpLocalCpTraining",
+                                                            "aclnnHyperDsaTpLocalCpTrainingGetWorkspaceSize");
+    hyper_parallel::multicore::execute_cached_op(
+      api, indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths, config, trace, retained,
+      klRetained, klLengths, scale, indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight,
+      loss, arena, metadata, requests, transportTrace, selectedRows, membership, selectedRequests, selectedCounts,
+      queryLengths, queryPositions, queryIds, klQueryLengths, *tpLiArena, *tpLiMetadata, tpKlArena, tpKlMetadata,
+      withKl);
+  } else {
+    static const hyper_parallel::multicore::CachedOpApi api("aclnnHyperDsaLocalCpTraining",
+                                                            "aclnnHyperDsaLocalCpTrainingGetWorkspaceSize");
+    hyper_parallel::multicore::execute_cached_op(
+      api, indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths, config, trace, retained,
+      klRetained, klLengths, scale, indices, values, attention, maximum, sum, gradIndexQuery, gradIndexKey, gradWeight,
+      loss, arena, metadata, requests, transportTrace, selectedRows, membership, selectedRequests, selectedCounts,
+      queryLengths, queryPositions, queryIds, klQueryLengths);
+  }
   return {indices,      values,     attention, maximum, sum,      gradIndexQuery,
           gradIndexKey, gradWeight, loss,      trace,   retained, klRetained};
 }
+Result local_cp_training_npu(const at::Tensor &indexQuery, at::Tensor &indexKey, const at::Tensor &query,
+                             at::Tensor &compressed, const at::Tensor &queryRope, at::Tensor &keyRope,
+                             const at::Tensor &weights, const at::Tensor &lengths, const at::Tensor &config,
+                             at::Tensor &trace, at::Tensor &retained, at::IntArrayRef klLengths, double scale,
+                             at::Tensor &indices, at::Tensor &values, at::Tensor &attention, at::Tensor &maximum,
+                             at::Tensor &sum, at::Tensor &arena, const at::Tensor &metadata, const at::Tensor &requests,
+                             at::Tensor &transportTrace, const at::Tensor &selectedRows, at::Tensor &membership,
+                             at::Tensor &selectedRequests, at::Tensor &selectedCounts, const at::Tensor &queryLengths,
+                             const at::Tensor &queryPositions, const at::Tensor &queryIds,
+                             at::IntArrayRef klQueryLengths, at::Tensor &klRetained, at::Tensor &gradIndexQuery,
+                             at::Tensor &gradIndexKey, at::Tensor &gradWeight, at::Tensor &loss) {
+  return RunLocalCpTraining(
+    indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths, config, trace, retained, klLengths,
+    scale, indices, values, attention, maximum, sum, arena, metadata, requests, transportTrace, selectedRows,
+    membership, selectedRequests, selectedCounts, queryLengths, queryPositions, queryIds, klQueryLengths, klRetained,
+    gradIndexQuery, gradIndexKey, gradWeight, loss, true, nullptr, nullptr, c10::nullopt, c10::nullopt);
+}
+
+Result tp_local_cp_training_npu(
+  const at::Tensor &indexQuery, at::Tensor &indexKey, const at::Tensor &query, at::Tensor &compressed,
+  const at::Tensor &queryRope, at::Tensor &keyRope, const at::Tensor &weights, const at::Tensor &lengths,
+  const at::Tensor &config, at::Tensor &trace, at::Tensor &retained, at::IntArrayRef klLengths, double scale,
+  at::Tensor &indices, at::Tensor &values, at::Tensor &attention, at::Tensor &maximum, at::Tensor &sum,
+  at::Tensor &arena, const at::Tensor &metadata, const at::Tensor &requests, at::Tensor &transportTrace,
+  const at::Tensor &selectedRows, at::Tensor &membership, at::Tensor &selectedRequests, at::Tensor &selectedCounts,
+  const at::Tensor &queryLengths, const at::Tensor &queryPositions, const at::Tensor &queryIds,
+  at::IntArrayRef klQueryLengths, at::Tensor &klRetained, at::Tensor &gradIndexQuery, at::Tensor &gradIndexKey,
+  at::Tensor &gradWeight, at::Tensor &loss, at::Tensor &tpLiArena, const at::Tensor &tpLiMetadata,
+  const c10::optional<at::Tensor> &tpKlArena, const c10::optional<at::Tensor> &tpKlMetadata, bool withKl) {
+  return RunLocalCpTraining(
+    indexQuery, indexKey, query, compressed, queryRope, keyRope, weights, lengths, config, trace, retained, klLengths,
+    scale, indices, values, attention, maximum, sum, arena, metadata, requests, transportTrace, selectedRows,
+    membership, selectedRequests, selectedCounts, queryLengths, queryPositions, queryIds, klQueryLengths, klRetained,
+    gradIndexQuery, gradIndexKey, gradWeight, loss, withKl, &tpLiArena, &tpLiMetadata, tpKlArena, tpKlMetadata);
+}
+
 }  // namespace
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
@@ -393,4 +469,5 @@ TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("dsa_selected_cp_forward_out", &selected_cp_forward_npu);
   m.impl("dsa_local_cp_forward_out", &local_cp_forward_npu);
   m.impl("dsa_local_cp_training_out", &local_cp_training_npu);
+  m.impl("dsa_tp_local_cp_training_out", &tp_local_cp_training_npu);
 }

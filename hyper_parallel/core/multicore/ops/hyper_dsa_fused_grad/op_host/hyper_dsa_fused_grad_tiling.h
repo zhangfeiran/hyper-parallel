@@ -17,6 +17,11 @@
 #include "tiling/tiling_api.h"
 #include "grad_tiling_data.h"  // NOLINT(build/include_subdir)
 namespace optiling {
-REGISTER_TILING_DATA_CLASS(HyperDsaFusedGrad, SparseFlashAttentionGradBasicTilingData)
+REGISTER_TILING_DATA_CLASS(SparseFlashAttentionGradBasicTilingDataOp, SparseFlashAttentionGradBasicTilingData)
+BEGIN_TILING_DATA_DEF(DsaFusedGradTilingData)
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionGradBasicTilingData, grad);
+TILING_DATA_FIELD_DEF(uint64_t, privateGroups);
+END_TILING_DATA_DEF
+REGISTER_TILING_DATA_CLASS(HyperDsaFusedGrad, DsaFusedGradTilingData)
 }
 #endif  // HYPER_PARALLEL_CORE_MULTICORE_OPS_HYPER_DSA_FUSED_GRAD_OP_HOST_HYPER_DSA_FUSED_GRAD_TILING_H_

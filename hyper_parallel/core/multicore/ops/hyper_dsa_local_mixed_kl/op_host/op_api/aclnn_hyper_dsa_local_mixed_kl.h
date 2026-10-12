@@ -26,5 +26,16 @@ ACLNN_API aclnnStatus aclnnHyperDsaLocalMixedKlGetWorkspaceSize(
   const aclTensor *loss, uint64_t *workspaceSize, aclOpExecutor **executor);
 ACLNN_API aclnnStatus aclnnHyperDsaLocalMixedKl(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                 aclrtStream stream);
+
+ACLNN_API aclnnStatus aclnnHyperDsaTpLocalMixedKlGetWorkspaceSize(
+  const aclTensor *query, const aclTensor *key, const aclTensor *indexQuery, const aclTensor *indexKey,
+  const aclTensor *weight, const aclTensor *indices, const aclTensor *maximum, const aclTensor *sum,
+  const aclTensor *queryRope, const aclTensor *keyRope, const aclIntArray *actualQuery, const aclIntArray *actualKey,
+  const aclTensor *config, const aclTensor *trace, const aclTensor *retained, const aclTensor *positions,
+  const aclTensor *tpArena, const aclTensor *tpMetadata, double scale, int64_t phase, const aclTensor *gradQuery,
+  const aclTensor *gradKey, const aclTensor *gradWeight, const aclTensor *loss, uint64_t *workspaceSize,
+  aclOpExecutor **executor);
+ACLNN_API aclnnStatus aclnnHyperDsaTpLocalMixedKl(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                                  aclrtStream stream);
 }
 #endif  // HYPER_PARALLEL_MULTICORE_ACLNN_HYPER_DSA_LOCAL_MIXED_KL_H_

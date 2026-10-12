@@ -13,6 +13,8 @@
  * limitations under the License.
  */
 #include "kernel_operator.h"
+#include "runtime/dsa_tp_tile_sum.h"
+#define HYPER_DSA_TP_KL
 #include "arch22/sparse_lightning_indexer_grad_kl_loss_base.h"
 #include "runtime/dsa_mixed_group.h"
 
@@ -24,8 +26,8 @@ extern "C" __global__ __aicore__ void hyper_dsa_local_mixed_kl(
   __gm__ uint8_t *weight, __gm__ uint8_t *indices, __gm__ uint8_t *maximum, __gm__ uint8_t *sum,
   __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope, __gm__ uint8_t *actualQuery, __gm__ uint8_t *actualKey,
   __gm__ uint8_t *runtimeConfig, __gm__ uint8_t *groupTrace, __gm__ uint8_t *retained, __gm__ uint8_t *positions,
-  __gm__ uint8_t *gradQuery, __gm__ uint8_t *gradKey, __gm__ uint8_t *gradWeight, __gm__ uint8_t *loss,
-  __gm__ uint8_t *workspace, __gm__ uint8_t *tiling) {
+  __gm__ uint8_t *tpArena, __gm__ uint8_t *tpMetadata, __gm__ uint8_t *gradQuery, __gm__ uint8_t *gradKey,
+  __gm__ uint8_t *gradWeight, __gm__ uint8_t *loss, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
   REGISTER_TILING_DEFAULT(optiling::SparseLightningIndexerGradKLLossTilingData);
   GlobalTensor<int64_t> config, trace;
@@ -45,6 +47,17 @@ extern "C" __global__ __aicore__ void hyper_dsa_local_mixed_kl(
     return;
   }
   GET_TILING_DATA_WITH_STRUCT(optiling::SparseLightningIndexerGradKLLossTilingData, data, tiling);
+  TpTileSum tpTransport;
+  uint32_t tpSize = 1;
+  if ASCEND_IS_AIV {
+    if (data.tpArenaBytes != 0) {
+      GlobalTensor<int64_t> meta;
+      meta.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(tpMetadata), 24);
+      tpSize = static_cast<uint32_t>(meta.GetValue(4));
+      tpTransport.Init(tpArena, tpMetadata, data.tpArenaBytes, group * 2 + GetSubBlockIdx(), meta.GetValue(10),
+                       groups * 2, 2048);
+    }
+  }
   uint32_t count = 0, checksum = 0;
   for (uint32_t logical = group; logical < physicalCount; logical += groups) {
     const uint32_t ticket = Dispatch(trace, group * kGroupWords, logical);
@@ -57,10 +70,20 @@ extern "C" __global__ __aicore__ void hyper_dsa_local_mixed_kl(
                 actualKey, gradQuery, gradKey, gradWeight, loss, retained, &data, &pipe, ticket, group, physicalCount,
                 data.mixedPhase);
       tile.SetQueryPositions(positions);
+      if ASCEND_IS_AIV {
+        if (data.tpArenaBytes != 0) {
+          tile.SetTpTransport(&tpTransport, tpSize);
+        }
+      }
       tile.ProcessPhase();
     }
     ++count;
     checksum += ticket + 1;
     Complete(trace, group * kGroupWords, count, checksum, ticket);
+  }
+  if ASCEND_IS_AIV {
+    if (data.tpArenaBytes != 0) {
+      tpTransport.Finish();
+    }
   }
 }

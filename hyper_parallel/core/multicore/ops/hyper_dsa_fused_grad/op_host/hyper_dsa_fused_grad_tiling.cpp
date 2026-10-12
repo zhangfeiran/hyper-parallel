@@ -80,7 +80,27 @@ void Configure(gert::TilingContext *context, gert::OpTilingContextBuilder &build
     .AppendAttr(false)
     .AppendAttr(int64_t{1});
 }
-ge::graphStatus EmptyQueryTiling(gert::TilingContext *context, const std::array<gert::Tensor, 15> &inputs) {
+ge::graphStatus PrivateGroups(gert::TilingContext *context, uint64_t &groups) {
+  const auto *shape = context->GetRequiredInputShape(20);
+  const auto *keys = context->GetRequiredInputShape(1);
+  if (shape == nullptr || keys == nullptr) {
+    return ge::GRAPH_FAILED;
+  }
+  const auto &partials = shape->GetStorageShape();
+  const int64_t tokens = keys->GetStorageShape().GetDim(0);
+  groups = 0;
+  if (partials.GetDimNum() == 2 && partials.GetDim(0) == tokens && partials.GetDim(1) == 1088) {
+    return ge::GRAPH_SUCCESS;
+  }
+  if (partials.GetDimNum() != 3 || partials.GetDim(0) < 2 || partials.GetDim(0) > 20 ||
+      partials.GetDim(1) != tokens || partials.GetDim(2) != 1088) {
+    return ge::GRAPH_FAILED;
+  }
+  groups = partials.GetDim(0) - 1;
+  return ge::GRAPH_SUCCESS;
+}
+ge::graphStatus EmptyQueryTiling(gert::TilingContext *context, const std::array<gert::Tensor, 15> &inputs,
+                                uint64_t privateGroups) {
   const auto &query = inputs[0].GetStorageShape();
   const auto &key = inputs[1].GetStorageShape();
   if (query.GetDimNum() != 3 || query.GetDim(0) != 0 || query.GetDim(2) != 512 ||
@@ -98,11 +118,12 @@ ge::graphStatus EmptyQueryTiling(gert::TilingContext *context, const std::array<
   if (platform.GetCoreNumAic() != 20 || platform.GetCoreNumAiv() != 40) {
     return ge::GRAPH_FAILED;
   }
-  SparseFlashAttentionGradBasicTilingData data;
-  data.opInfo.set_S1(0);
-  data.opInfo.set_S2(keys);
-  data.postTilingData.set_dkWorkSpaceOffset(0);
-  data.postTilingData.set_dvWorkSpaceOffset(keyBytes);
+  DsaFusedGradTilingData data;
+  data.grad.opInfo.set_S1(0);
+  data.grad.opInfo.set_S2(keys);
+  data.grad.postTilingData.set_dkWorkSpaceOffset(0);
+  data.grad.postTilingData.set_dvWorkSpaceOffset(keyBytes);
+  data.set_privateGroups(privateGroups);
   auto *raw = context->GetRawTilingData();
   auto *sizes = context->GetWorkspaceSizes(1);
   if (raw == nullptr || raw->GetCapacity() < data.GetDataSize() || sizes == nullptr) {
@@ -131,6 +152,10 @@ ge::graphStatus TilingDsaFusedGrad(gert::TilingContext *context) {
   if (inputs[13].GetStorageShape().GetShapeSize() != 3 * 20 * 64) {
     return ge::GRAPH_FAILED;
   }
+  uint64_t privateGroups = 0;
+  if (PrivateGroups(context, privateGroups) != ge::GRAPH_SUCCESS) {
+    return ge::GRAPH_FAILED;
+  }
   const bool local = context->GetOptionalInputDesc(21) != nullptr;
   if (local) {
     const auto *positions = context->GetOptionalInputShape(21);
@@ -140,7 +165,7 @@ ge::graphStatus TilingDsaFusedGrad(gert::TilingContext *context) {
       return ge::GRAPH_FAILED;
     }
     if (inputs[0].GetStorageShape().GetDim(0) == 0) {
-      return EmptyQueryTiling(context, inputs);
+      return EmptyQueryTiling(context, inputs, privateGroups);
     }
   }
   gert::Tensor trace(gert::StorageShape({20, 64}, {20, 64}), gert::StorageFormat(), ge::DT_INT64);
@@ -160,11 +185,15 @@ ge::graphStatus TilingDsaFusedGrad(gert::TilingContext *context) {
   }
   const auto *raw = child->GetRawTilingData();
   auto *target = context->GetRawTilingData();
-  if (raw == nullptr || target == nullptr || target->GetCapacity() < raw->GetDataSize()) {
+  DsaFusedGradTilingData data;
+  data.set_privateGroups(privateGroups);
+  if (raw == nullptr || target == nullptr || target->GetCapacity() < data.GetDataSize() ||
+      raw->GetDataSize() != data.grad.GetDataSize()) {
     return ge::GRAPH_FAILED;
   }
+  data.SaveToBuffer(target->GetData(), target->GetCapacity());
   std::memcpy(target->GetData(), raw->GetData(), raw->GetDataSize());
-  target->SetDataSize(raw->GetDataSize());
+  target->SetDataSize(data.GetDataSize());
   context->GetWorkspaceSizes(1)[0] = child->GetWorkspaceSizes(1)[0];
   context->SetBlockDim(20);
   context->SetScheduleMode(1);
