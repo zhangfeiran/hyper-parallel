@@ -125,6 +125,24 @@ class TestTpTileSumProbe(SharedRootFixture):
         self.assertIsNone(self.root.lease_owner)
         self.ops.dsa_tp_tile_sum_out.assert_not_called()
 
+    def test_fused_consumer_uses_existing_root_lease_and_rejects_reuse(self):
+        """One completion event protects TP storage borrowed by a CP submission."""
+        invocation = self._prepare()
+        owner = self.consumers[0]
+        owner.bind()
+        with self.assertRaisesRegex(ValueError, 'active owner lease'):
+            self.probe.consume_in_root_lease(invocation, owner)
+        self.assertEqual(self.probe.last_epoch, 0)
+        owner.claim()
+        self.probe.consume_in_root_lease(invocation, owner)
+        self.assertIs(self.root.lease_owner, owner)
+        self.assertEqual(self.probe.last_epoch, 1)
+        with self.assertRaisesRegex(ValueError, 'newer'):
+            self.probe.consume_in_root_lease(invocation, owner)
+        owner.release()
+        self.assertIsNone(self.root.lease_owner)
+        self.assertTrue(self.root.used)
+
     def test_inactive_member_allocates_and_closes_but_cannot_prepare(self):
         """Root-wide allocation order includes ranks outside the executing TP group."""
         inactive = TpTileSumProbe(self.root, 'inactive', TpTileSumSpec(1, 8),

@@ -26,6 +26,7 @@ import torch.distributed as dist
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.shmem.consumer import (
     SharedShmemRoot,
+    ShmemConsumer,
     ShmemConsumerSpec,
     allocation_budget,
 )
@@ -90,6 +91,7 @@ class TpTileSumInvocation:
     generation: int
     metadata: torch.Tensor
     metadata_version: int
+    identity: tuple[int, ...] = ()
 
 
 class TpTileSumProbe:
@@ -154,7 +156,7 @@ class TpTileSumProbe:
         if identity[3] != self.root.generation:
             raise ValueError("TP metadata heap generation must match the bound root")
         metadata = torch.tensor(words, dtype=torch.int64, device=self.arena.device)
-        return TpTileSumInvocation(self, rounds, epoch, self.root.generation, metadata, metadata._version)
+        return TpTileSumInvocation(self, rounds, epoch, self.root.generation, metadata, metadata._version, identity)
 
     def run(self, partial: torch.Tensor, invocation: TpTileSumInvocation) -> torch.Tensor:
         """Queue detached FP32 tile reductions, returning an ordinary caller-owned output.
@@ -183,6 +185,19 @@ class TpTileSumProbe:
                 or invocation.generation != self.root.generation or invocation.epoch <= self.last_epoch
                 or invocation.metadata._version != invocation.metadata_version):
             raise ValueError("TP invocation must be live, matching and newer than prior work")
+
+    def consume_in_root_lease(self, invocation: TpTileSumInvocation, owner: ShmemConsumer) -> None:
+        """Consume an epoch under a fused caller's existing root lease.
+
+        The caller queues one kernel using both consumers' arenas. Its completion
+        event protects every arena; this method neither claims nor releases the
+        root. Validate all arithmetic and transport arguments before consuming.
+        """
+        if owner.root is not self.root or self.root.lease_owner is not owner:
+            raise ValueError("fused TP submission requires an active owner lease on the same root")
+        with owner.access():
+            self.check_invocation(invocation)
+            self.last_epoch = invocation.epoch
 
     @contextmanager
     def lease(self, invocation: TpTileSumInvocation) -> Iterator[None]:

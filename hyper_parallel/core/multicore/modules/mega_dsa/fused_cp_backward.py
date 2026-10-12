@@ -36,6 +36,7 @@ from hyper_parallel.core.multicore.modules.mega_dsa.mixed_attention import (
     mixed_sfa_grad_workspace_bytes,
 )
 from hyper_parallel.core.multicore.modules.mega_dsa.mixed_tile import (
+    MixedSfaSchedule,
     validate_device_phase_closure,
     validate_mixed_trace,
 )
@@ -65,7 +66,8 @@ class FusedCpBackwardResult:
 class FusedDsaCpBackwardProbe:
     """Use local Q cotangents, original gradient math and peer-exclusive FP32 inbox stripes."""
 
-    def __init__(self, forward: FusedDsaCpForwardProbe, *, sparse_return: bool = False) -> None:
+    def __init__(self, forward: FusedDsaCpForwardProbe, *, sparse_return: bool = False,
+                 schedule: MixedSfaSchedule | None = None, group_private_partials: bool = False) -> None:
         """Reuse collectively prepared geometry and declare a common gradient-return protocol.
 
         Args:
@@ -74,15 +76,26 @@ class FusedDsaCpBackwardProbe:
                 and omit numerically zero merged main-gradient rows. FP32 sums
                 retain sender order. This optional protocol supports CP up to
                 eight and requires the sparse-return native capability.
+            schedule: Optional independently declared backward compute schedule.
+                Defaults to the forward schedule. Forward state and LI/KL
+                transport geometry remain unchanged; backward requires rounds=1.
+            group_private_partials: Use private FP32 KV accumulators per compute
+                group and a fixed-order reduction before post/owner return.
         """
         self.backend = forward
         self.workspace = forward.workspace
         error = None
+        chosen = forward.schedule if schedule is None else schedule
         if not isinstance(sparse_return, bool):
             error = "sparse gradient return must be a boolean"
+        elif not isinstance(group_private_partials, bool):
+            error = "group-private partials must be a boolean"
         elif sparse_return and forward.layout.cp_size > 8:
             error = "sparse gradient return supports CP sizes up to eight"
-        declaration = (sparse_return, error)
+        elif not isinstance(chosen, MixedSfaSchedule) or chosen.rounds != 1:
+            error = "backward requires a MixedSfaSchedule with rounds=1"
+        schedule_words = ((chosen.compute_groups, chosen.rounds) if isinstance(chosen, MixedSfaSchedule) else None)
+        declaration = (sparse_return, error, schedule_words, group_private_partials)
         declarations = [declaration]
         if forward.layout.cp_size > 1:
             declarations = [None] * forward.layout.cp_size
@@ -92,8 +105,19 @@ class FusedDsaCpBackwardProbe:
             raise ValueError("; ".join(errors))
         if any(value[0] != sparse_return for value in declarations):
             raise ValueError("CP members disagree on sparse gradient return")
+        if any(len(value) != 4 or value[2] != schedule_words for value in declarations):
+            raise ValueError("CP members disagree on backward schedule")
+        if any(value[3] != group_private_partials for value in declarations):
+            raise ValueError("CP members disagree on group-private partials")
+        self.group_private_partials = group_private_partials
+        self._group_private_declaration = group_private_partials
         self.sparse_return = sparse_return
         self._sparse_declaration = sparse_return
+        self.schedule = chosen
+        self._schedule_declaration = chosen
+        self.config = (forward.config if chosen == forward.schedule else chosen.runtime_config(forward.layout.device))
+        self._config_identity = self.config
+        self._config_version = self.config._version
         meta = forward.layout.batch_meta
         offsets = tuple(meta.token_local_offsets[token] for token in meta.kv_global_ids)
         self.local_owner_order = torch.tensor(offsets, dtype=torch.long, device=forward.layout.device)
@@ -104,6 +128,14 @@ class FusedDsaCpBackwardProbe:
         _load_native()
         if torch.ops.hyper_parallel.dsa_fused_grad_version() != 2:
             raise RuntimeError("fused CP backward requires adapter ABI 2; rebuild this checkout's payload")
+
+    @staticmethod
+    def check_group_partials_native_support() -> None:
+        """Require the explicit private-group capability before publication or acquiring a lease."""
+        _load_native()
+        version = getattr(torch.ops.hyper_parallel, "dsa_group_partials_version", None)
+        if version is None or version() != 1:
+            raise RuntimeError("group-private gradients require adapter ABI 1; rebuild this checkout's payload")
 
     def backward(self, forward: FusedCpForwardResult, grad_output: torch.Tensor) -> FusedCpBackwardResult:
         """Return Q, shared compressed-KV, Q-RoPE and K-RoPE gradients in original local orders.
@@ -123,19 +155,34 @@ class FusedDsaCpBackwardProbe:
         if version is None or version() != 1:
             raise RuntimeError("local CP backward requires adapter ABI 1; rebuild this checkout's payload")
 
-    def backward_local(self, forward: FusedCpForwardResult, grad_output: torch.Tensor) -> FusedCpBackwardResult:
+    def backward_local(self, forward: FusedCpForwardResult, grad_output: torch.Tensor, *,
+                       defer_owner_cast: bool = False) -> FusedCpBackwardResult:
         """Return main-attention gradients for actual local Q, including empty tiles.
 
         Query cotangents use caller order and stay local. Complete-key FP32
         partials are returned to owners before casting; this raw baseline still
         uses complete owner return and has no KL or autograd installation.
+        With defer_owner_cast=True, shared C/K-RoPE gradients remain FP32 for
+        a subsequent TP SUM; query-head gradients retain their native dtype.
         """
-        return self._backward_saved(forward.saved, tuple(forward.output.shape), grad_output, local_queries=True)
+        return self._backward_saved(forward.saved, tuple(forward.output.shape), grad_output, local_queries=True,
+                                    defer_owner_cast=defer_owner_cast)
 
     def _backward_saved(self, saved: FusedCpSavedAttention | None, shape: tuple,
-                        grad_output: torch.Tensor, *, local_queries: bool = False) -> FusedCpBackwardResult:
+                        grad_output: torch.Tensor, *, local_queries: bool = False,
+                        defer_owner_cast: bool = False) -> FusedCpBackwardResult:
+        if (not isinstance(self.group_private_partials, bool)
+                or self.group_private_partials != self._group_private_declaration):
+            raise ValueError("group-private partials were modified; prepare a new probe")
+        if self.group_private_partials:
+            self.check_group_partials_native_support()
+        if not isinstance(defer_owner_cast, bool):
+            raise TypeError("owner cast deferral must be a boolean")
         if not isinstance(self.sparse_return, bool) or self.sparse_return != self._sparse_declaration:
             raise ValueError("gradient return mode was modified; prepare a new probe")
+        if (self.schedule != self._schedule_declaration or self.config is not self._config_identity
+                or self.config._version != self._config_version):
+            raise ValueError("backward schedule or runtime configuration was modified; prepare a new probe")
         if self.sparse_return:
             _load_native()
             version = getattr(torch.ops.hyper_parallel, "dsa_sparse_cp_grad_version", None)
@@ -163,7 +210,8 @@ class FusedDsaCpBackwardProbe:
         invocation = self.workspace.prepare(saved.batch_meta)
         self.backend.check_mapping_support()
         with self.workspace.lease(invocation, direction="backward"):
-            return self._submit(saved, grad_output, invocation, local_queries=local_queries)
+            return self._submit(saved, grad_output, invocation, local_queries=local_queries,
+                                defer_owner_cast=defer_owner_cast)
 
     def _metadata(self, meta, epoch: int) -> torch.Tensor:
         offsets = {name: offset for name, offset, _, _ in self.workspace.layout}
@@ -177,7 +225,8 @@ class FusedDsaCpBackwardProbe:
         return torch.tensor(self.workspace.transport_metadata(values, meta), dtype=torch.int64).to(
             self.backend.layout.device, non_blocking=True)
 
-    def _submit(self, saved, grad_output, invocation, *, local_queries=False) -> FusedCpBackwardResult:
+    def _submit(self, saved, grad_output, invocation, *, local_queries=False,
+                defer_owner_cast=False) -> FusedCpBackwardResult:
         query, compressed, query_rope, key_rope = saved.states
         local = self.backend.layout.local_query_ids
         layout = saved.local_query_layout if local_queries else None
@@ -195,7 +244,10 @@ class FusedDsaCpBackwardProbe:
         retained = torch.empty(required, dtype=torch.uint8, device=query.device)
         owner = torch.full((self.workspace.spec.owner_gradient_tokens, 576), float("nan"),
                            dtype=torch.float32, device=query.device)
-        partials = torch.full((compressed.shape[0], 1088), float("nan"), dtype=torch.float32, device=query.device)
+        partial_shape = ((self.schedule.compute_groups+1, compressed.shape[0], 1088)
+                         if self.group_private_partials else (compressed.shape[0], 1088))
+        partial_storage = torch.full(partial_shape, float("nan"), dtype=torch.float32, device=query.device)
+        partials = partial_storage[0] if self.group_private_partials else partial_storage
         epoch = self.workspace.next_transport_epoch(invocation)
         metadata = self._metadata(saved.batch_meta, epoch)
         lengths = self.backend.native_layout.length_tensor
@@ -205,17 +257,17 @@ class FusedDsaCpBackwardProbe:
         native(
             query, compressed[:, None], compressed[:, None], saved.indices, full_grad,
             *saved.forward, layout.query_lengths if local_queries else lengths, lengths,
-            query_rope, key_rope[:, None], self.backend.config,
+            query_rope, key_rope[:, None], self.config,
             traces, retained, self.backend.scale, *gradients, self.workspace.arena,
-            metadata, self.backend.requests, transport_trace, owner, partials, *positions)
+            metadata, self.backend.requests, transport_trace, owner, partial_storage, *positions)
         restored = owner.index_select(0, self.local_owner_order)
         owner_fp32 = (restored[:, :512].contiguous(), restored[:, 512:].contiguous())
         query_gradients = (tuple(layout.restore(gradients[index]) for index in (0, 3)) if local_queries
                            else tuple(gradients[index].index_select(0, local) for index in (0, 3)))
-        local_gradients = (query_gradients[0], owner_fp32[0].bfloat16(),
-                           query_gradients[1], owner_fp32[1].bfloat16())
+        owner_gradients = owner_fp32 if defer_owner_cast else tuple(tensor.bfloat16() for tensor in owner_fp32)
+        local_gradients = (query_gradients[0], owner_gradients[0], query_gradients[1], owner_gradients[1])
         return FusedCpBackwardResult(local_gradients, owner_fp32, gradients, partials, tuple(traces.unbind()),
-                                      transport_trace, retained, epoch, (metadata,))
+                                      transport_trace, retained, epoch, (metadata, self.config, partial_storage))
 
     def validate_trace(self, result: FusedCpBackwardResult, snapshots: tuple[torch.Tensor, ...],
                        transport: torch.Tensor) -> dict:
@@ -224,8 +276,19 @@ class FusedDsaCpBackwardProbe:
             raise ValueError("gradient transport evidence requires an explicit CPU int64 [32] snapshot")
         if len(snapshots) != 3:
             raise ValueError("fused CP gradients require initialize/compute/post phase snapshots")
-        phases = validate_device_phase_closure(snapshots, self.backend.schedule)
-        compute = tuple(validate_mixed_trace(trace, self.backend.schedule) for trace in phases)
+        if self.group_private_partials:
+            checked = []
+            for phase, snapshot in enumerate(snapshots):
+                if snapshot.device.type != "cpu" or snapshot.dtype != torch.int64 or snapshot.shape != (20, 64):
+                    raise ValueError("group-partial readiness requires explicit CPU int64 [20,64] snapshots")
+                if int(snapshot[self.schedule.compute_groups, 26]) != (3 if phase == 2 else 0):
+                    raise ValueError("group-private partials lack ordered reduction readiness")
+                value = snapshot.clone()
+                value[self.schedule.compute_groups, 26] = 0
+                checked.append(value)
+            snapshots = tuple(checked)
+        phases = validate_device_phase_closure(snapshots, self.schedule)
+        compute = tuple(validate_mixed_trace(trace, self.schedule) for trace in phases)
         meta = self.backend.layout.batch_meta
         size, local, total = len(meta.cp_ranks), len(meta.kv_global_ids), meta.global_valid_queries
         sparse = None
@@ -262,7 +325,9 @@ class FusedDsaCpBackwardProbe:
         return {"compute": compute, "phase_order": ["initialize", "compute", "post_and_owner_return"],
                 "ready_write_ack": True, "epoch": result.epoch, "remote_sent_bytes": expected[5],
                 "remote_received_bytes": expected[7], "fp32_owner_order": list(range(size)),
-                "dk_dv_workspace_offsets": offsets, "sparse_return": sparse}
+                "dk_dv_workspace_offsets": offsets, "sparse_return": sparse,
+                "group_private_partials": self.group_private_partials,
+                "group_partial_ready": self.group_private_partials}
 
 
 def _save_attention(ctx, backend, states, index_states, result):
@@ -377,5 +442,5 @@ class FusedDsaCpAttentionProbe:
         if len(main_states) != 4 or len(index_states) != 3:
             raise ValueError("local CP attention requires four main and three index states")
         if not isinstance(query_layout, DsaLocalQueryLayout):
-            raise ValueError("local CP attention requires its cold prepared query layout")
+            raise TypeError("local CP attention requires its cold prepared query layout")
         return _FusedLocalCpAttention.apply(self.backward_backend, invocation, *main_states, index_states, query_layout)

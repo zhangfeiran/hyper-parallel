@@ -50,6 +50,9 @@ from hyper_parallel.core.multicore.modules.mega_dsa.selected_requests import (
     validate_selected_requests,
     validate_selected_training_traces,
 )
+from hyper_parallel.core.multicore.modules.mega_dsa.tp_tile_sum import (
+    TpTileSumInvocation,
+)
 from hyper_parallel.core.multicore.modules.mega_dsa.workspace import (
     DsaWorkspaceInvocation,
     MegaDsaWorkspace,
@@ -131,7 +134,7 @@ class FusedCpForwardResult:
     kl_gradients: tuple[torch.Tensor, ...] = ()
     kl_loss: torch.Tensor | None = None
     selected_requests: tuple[torch.Tensor, ...] = ()
-    _runtime_buffers: tuple[torch.Tensor, ...] = field(default=(), repr=False, compare=False)
+    _runtime_buffers: tuple[torch.Tensor | TpTileSumInvocation, ...] = field(default=(), repr=False, compare=False)
     index_versions: tuple[int, ...] = field(default=(), repr=False, compare=False)
     kl_key_partials: torch.Tensor | None = field(default=None, repr=False, compare=False)
     kl_retained: torch.Tensor | None = field(default=None, repr=False, compare=False)
@@ -223,7 +226,8 @@ class FusedDsaCpForwardProbe:
     def forward_local(self, invocation: DsaWorkspaceInvocation, main_states: tuple[torch.Tensor, ...],
                       index_states: tuple[torch.Tensor, ...], *,
                       query_layout: DsaLocalQueryLayout | None = None,
-                      selected_kl: bool = False) -> FusedCpForwardResult:
+                      selected_kl: bool = False,
+                      tp_invocations: tuple[TpTileSumInvocation, ...] = ()) -> FusedCpForwardResult:
         """Fuse local LI, selected main-KV pull, SFA and optional selected KL without Q replication.
 
         The prepared tile may be empty. Every member submits the same protocol:
@@ -264,10 +268,36 @@ class FusedDsaCpForwardProbe:
             if version is None or version() != 1:
                 raise RuntimeError("local fused KL requires adapter ABI 1; rebuild this checkout's payload")
         self.check_mapping_support()
+        if tp_invocations:
+            self._check_tp_invocations(tp_invocations, selected_kl, invocation)
         with self.workspace.lease(invocation, direction="forward"):
-            return self._submit_local(invocation, main_states, index_states, local, selected_kl=selected_kl)
+            for tp in tp_invocations:
+                tp.probe.consume_in_root_lease(tp, self.workspace.consumer)
+            return self._submit_local(invocation, main_states, index_states, local,
+                                      selected_kl=selected_kl, tp_invocations=tp_invocations)
 
-    def _submit_local(self, invocation, main_states, index_states, local, *, selected_kl=False) -> FusedCpForwardResult:
+    def _check_tp_invocations(self, invocations, selected_kl, invocation):
+        if len(invocations) != (2 if selected_kl else 1):
+            raise ValueError("fused TP requires LI transport and KL transport exactly when KL is enabled")
+        if any(not isinstance(tp, TpTileSumInvocation) for tp in invocations):
+            raise ValueError("fused TP requires prepared transport invocations")
+        first = invocations[0]
+        meta = invocation.batch_meta
+        expected = (meta.invocation, meta.layer, meta.microbatch, meta.heap_generation)
+        for index, tp in enumerate(invocations):
+            tp.probe.check_invocation(tp)
+            if (tp.probe.root is not self.workspace.root or tp.probe.spec.slots != 2*self.schedule.compute_groups
+                    or tp.probe.spec.width != (512 if index == 0 else 2048)
+                    or tp.epoch != first.epoch or tp.identity != first.identity or len(tp.identity) != 5
+                    or tp.identity[:4] != expected
+                    or tp.probe.members != first.probe.members):
+                raise ValueError("fused TP transports require matching root, slots, epoch, identity and TP members")
+        version = getattr(torch.ops.hyper_parallel, "dsa_tp_local_cp_training_version", None)
+        if version is None or version() != 1:
+            raise RuntimeError("fused CP TP requires adapter ABI 1; rebuild this checkout's payload")
+
+    def _submit_local(self, invocation, main_states, index_states, local, *, selected_kl=False,
+                      tp_invocations=()) -> FusedCpForwardResult:
         query, compressed, query_rope, key_rope = main_states
         index_query, index_key, weights = index_states
         packed = tuple(local.pack(tensor) for tensor in (index_query, query, query_rope, weights))
@@ -290,8 +320,9 @@ class FusedDsaCpForwardProbe:
         epoch = self.workspace.next_transport_epoch(invocation)
         metadata = self._metadata(invocation, epoch)
         extra, kl_gradients, kl_loss, kl_partials, kl_retained = (), (), None, None, None
-        native = (torch.ops.hyper_parallel.dsa_local_cp_training_out if selected_kl
-                  else torch.ops.hyper_parallel.dsa_local_cp_forward_out)
+        native = (torch.ops.hyper_parallel.dsa_tp_local_cp_training_out if tp_invocations else
+                  torch.ops.hyper_parallel.dsa_local_cp_training_out if selected_kl else
+                  torch.ops.hyper_parallel.dsa_local_cp_forward_out)
         if selected_kl:
             kl_retained = torch.empty(mixed_kl_workspace_bytes(tokens, self.heads) if queries else 0,
                                       dtype=torch.uint8, device=device)
@@ -299,6 +330,17 @@ class FusedDsaCpForwardProbe:
             kl_loss = torch.zeros(1, dtype=torch.float32, device=device)
             extra = (local.cumulative_queries, kl_retained, kl_gradients[0], kl_gradients[1][:, None],
                      kl_gradients[2], kl_loss)
+        if tp_invocations:
+            if not selected_kl:
+                kl_retained = torch.empty(0, dtype=torch.uint8, device=device)
+                inactive = tuple(torch.empty(0, dtype=tensor.dtype, device=device)
+                                 for tensor in (packed[0], keys[0], packed[3]))
+                loss = torch.empty(0, dtype=torch.float32, device=device)
+                extra = (local.cumulative_queries, kl_retained, inactive[0], inactive[1], inactive[2], loss)
+            li = tp_invocations[0]
+            kl = tp_invocations[1] if selected_kl else None
+            extra += (li.probe.arena, li.metadata, kl.probe.arena if kl else None,
+                      kl.metadata if kl else None, selected_kl)
         native(
             packed[0], keys[0], packed[1], keys[1], packed[2], keys[2], packed[3], local.key_lengths, self.config,
             trace, retained, self.native_layout.cumulative_lengths, self.scale, indices, values, output,
@@ -321,7 +363,7 @@ class FusedDsaCpForwardProbe:
                                         tuple(trace.unbind()), transport_trace, epoch, saved,
                                         (packed[0], keys[0][:, 0], packed[3]),
                                         selected_requests=(table, counts, membership),
-                                        _runtime_buffers=(metadata, retained),
+                                        _runtime_buffers=(metadata, retained, *tp_invocations),
                                         kl_gradients=kl_gradients, kl_loss=kl_loss,
                                         kl_key_partials=kl_partials, kl_retained=kl_retained,
                                         index_versions=tuple(tensor._version for tensor in
@@ -334,7 +376,7 @@ class FusedDsaCpForwardProbe:
                                     tuple(trace.unbind()), transport_trace, epoch, saved,
                                     (packed[0], keys[0][:, 0], packed[3]),
                                     selected_requests=(table, counts, membership),
-                                    _runtime_buffers=(metadata, retained),
+                                    _runtime_buffers=(metadata, retained, *tp_invocations),
                                     kl_gradients=kl_gradients, kl_loss=kl_loss,
                                     kl_key_partials=kl_partials, kl_retained=kl_retained,
                                     index_versions=tuple(tensor._version for tensor in

@@ -15,6 +15,7 @@
 """Saved state, local permutation, FP32 owner restoration and leased CP backward."""
 
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -75,6 +76,135 @@ class TestFusedCpBackward(SharedRootFixture):
         output = layout.restore(forward[0]) if ids else forward[0]
         return replace(self.forward, output=output, saved=saved)
 
+    def test_group_private_native_storage_preserves_canonical_partials_and_lifetime(self):
+        """Local and empty Q share complete-key storage while native group scratch stays alive."""
+        def _execute(group_count, captured, *args):
+            storage = args[26]
+            self.assertEqual(storage.shape, (group_count+1, 3, 1088))
+            self.assertEqual(storage.dtype, torch.float32)
+            captured.append(storage)
+            storage[0].fill_(2.5)
+            storage[1:].fill_(9.)
+            args[16].fill_(2.)
+            args[19].fill_(3.)
+            args[25].fill_(1.003)
+
+        for groups, ids in ((1, (2, 0)), (7, (2, 0)), (7, ())):
+            with self.subTest(groups=groups, ids=ids):
+                forward = self._local_forward(ids)
+                backend = fused_cp_backward.FusedDsaCpBackwardProbe(
+                    self.forward_backend, schedule=MixedSfaSchedule(groups), group_private_partials=True)
+                submitted = []
+
+                with patch.object(fused_cp_backward, '_load_native'), \
+                        patch.object(torch.ops.hyper_parallel, 'dsa_group_partials_version',
+                                     return_value=1, create=True), \
+                        patch.object(torch.ops.hyper_parallel, 'dsa_local_cp_grad_version',
+                                     return_value=1, create=True), \
+                        patch.object(torch.ops.hyper_parallel, 'dsa_local_cp_grad_out',
+                                     side_effect=partial(_execute, groups, submitted), create=True):
+                    result = backend.backward_local(forward, forward.output, defer_owner_cast=True)
+                self.assertEqual(result.partials.shape, (3, 1088))
+                torch.testing.assert_close(result.partials, torch.full((3, 1088), 2.5))
+                self.assertTrue(any(value is submitted[0] for value in result._runtime_buffers))
+                self.assertIs(result.gradients[1], result.owner_fp32[0])
+                self.assertEqual(result.gradients[0].shape[0], len(ids))
+                forward.saved.validate_versions()
+
+    def test_group_private_declaration_capability_and_mutation_reject_before_lease(self):
+        """Peers agree on the storage protocol and unsupported or changed configurations cannot launch."""
+        for flag in (1, None, 'true'):
+            with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, 'must be a boolean'):
+                fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, group_private_partials=flag)
+
+        def _disagree(peers, declaration, **_kwargs):
+            peers[:] = [declaration, (*declaration[:3], not declaration[3])]
+
+        with patch.object(self.forward_backend.layout, 'cp_size', 2), \
+                patch.object(fused_cp_backward.dist, 'all_gather_object', side_effect=_disagree), \
+                self.assertRaisesRegex(ValueError, 'disagree on group-private'):
+            fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, group_private_partials=True)
+        backend = fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, group_private_partials=True)
+        with patch.object(fused_cp_backward, '_load_native'), \
+                patch.object(torch.ops.hyper_parallel, 'dsa_group_partials_version', return_value=0, create=True), \
+                patch.object(self.workspace, 'lease') as lease, self.assertRaisesRegex(RuntimeError, 'adapter ABI 1'):
+            backend.backward(self.forward, self.forward.output)
+        lease.assert_not_called()
+        backend.group_private_partials = False
+        with patch.object(self.workspace, 'lease') as lease, self.assertRaisesRegex(ValueError, 'were modified'):
+            backend.backward(self.forward, self.forward.output)
+        lease.assert_not_called()
+
+    def test_group_private_trace_requires_merge_ready_without_mutating_snapshots(self):
+        """A valid third-phase merge release is mandatory and other phase records remain strictly checked."""
+        backend = fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, group_private_partials=True)
+        traces = self._phase_traces()
+        traces[2][7, 26] = 3
+        original = tuple(trace.clone() for trace in traces)
+        transport = torch.zeros(32, dtype=torch.int64)
+        transport[:12] = torch.tensor([2, 2, 1, 1, 8448, 0, 8448, 0, 100, 120, 130, 150])
+        transport[20:22] = torch.tensor([512, 7424])
+        result = fused_cp_backward.FusedCpBackwardResult((), (), (), torch.empty(0), (), transport,
+                                                         torch.empty(13568, dtype=torch.uint8), 2)
+        proof = backend.validate_trace(result, tuple(traces), transport)
+        self.assertTrue(proof['group_partial_ready'])
+        for trace, expected in zip(traces, original):
+            torch.testing.assert_close(trace, expected, rtol=0, atol=0)
+        for phase, value in ((0, 3), (1, 3), (2, 0), (2, 2), (2, 4)):
+            broken = [trace.clone() for trace in traces]
+            broken[phase][7, 26] = value
+            with self.subTest(phase=phase, value=value), self.assertRaisesRegex(ValueError, 'readiness'):
+                backend.validate_trace(result, tuple(broken), transport)
+        with self.assertRaisesRegex(ValueError, 'progress vector'):
+            self.backend.validate_trace(result, tuple(traces), transport)
+
+    def test_independent_backward_schedule_preserves_saved_forward_and_uses_its_own_config(self):
+        """A g1 backward consumes the same g7 saved forward without editing its config or activation versions."""
+        forward = self._local_forward((2, 0))
+        original_config = self.forward_backend.config.clone()
+        backend = fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, schedule=MixedSfaSchedule(1))
+
+        def _execute(*args):
+            self.assertIs(args[12], backend.config)
+            self.assertEqual(int(args[12][2]), 1)
+            self.assertEqual(self.forward_backend.schedule.compute_groups, 7)
+            args[16].fill_(2)
+            args[19].fill_(3)
+            args[25].fill_(1.003)
+
+        with patch.object(fused_cp_backward, "_load_native"), \
+                patch.object(torch.ops.hyper_parallel, "dsa_local_cp_grad_version", return_value=1, create=True), \
+                patch.object(torch.ops.hyper_parallel, "dsa_local_cp_grad_out", side_effect=_execute, create=True):
+            result = backend.backward_local(forward, forward.output, defer_owner_cast=True)
+        self.assertIs(result.gradients[1], result.owner_fp32[0])
+        torch.testing.assert_close(self.forward_backend.config, original_config, rtol=0, atol=0)
+        forward.saved.validate_versions()
+        self.assertTrue(any(value is backend.config for value in result._runtime_buffers))
+
+    def test_backward_schedule_mutation_and_collective_disagreement_reject_before_lease(self):
+        """Cold schedule declaration and config version guard apply to independent backward execution."""
+        for schedule in (1, MixedSfaSchedule(1, rounds=2)):
+            with self.subTest(schedule=schedule), self.assertRaisesRegex(ValueError, 'rounds=1'):
+                fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, schedule=schedule)
+
+        def _disagree(peers, declaration, **_kwargs):
+            peers[:] = [declaration, (declaration[0], None, (2, 1))]
+
+        with patch.object(self.forward_backend.layout, 'cp_size', 2), \
+                patch.object(fused_cp_backward.dist, 'all_gather_object', side_effect=_disagree), \
+                self.assertRaisesRegex(ValueError, 'disagree on backward schedule'):
+            fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, schedule=MixedSfaSchedule(1))
+        backend = fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, schedule=MixedSfaSchedule(1))
+        backend.config.add_(1)
+        with patch.object(self.workspace, 'lease') as lease, self.assertRaisesRegex(ValueError, 'configuration'):
+            backend.backward(self.forward, self.forward.output)
+        lease.assert_not_called()
+        backend = fused_cp_backward.FusedDsaCpBackwardProbe(self.forward_backend, schedule=MixedSfaSchedule(1))
+        backend.schedule = MixedSfaSchedule(2)
+        with patch.object(self.workspace, 'lease') as lease, self.assertRaisesRegex(ValueError, 'schedule'):
+            backend.backward(self.forward, self.forward.output)
+        lease.assert_not_called()
+
     def test_local_backward_keeps_real_q_and_complete_key_partials_after_reprepare(self):
         """A saved subset restores caller Q and owner K orders without query replication."""
         for ids in ((2, 0), ()):
@@ -86,7 +216,7 @@ class TestFusedCpBackward(SharedRootFixture):
                 cotangent = cotangent[:, None, None].expand(-1, 32, 512).clone()
                 epochs = []
 
-                def _execute(*args):
+                def _execute(*args, ids=ids, layout=layout, cotangent=cotangent, record_epoch=epochs.append):
                     self.assertEqual(len(args), 28)
                     self.assertIs(self.root.lease_owner, self.workspace.consumer)
                     self.assertEqual(args[0].shape[0], len(ids))
@@ -97,7 +227,7 @@ class TestFusedCpBackward(SharedRootFixture):
                     torch.testing.assert_close(args[4], layout.pack(cotangent))
                     if not ids:
                         self.assertEqual(args[14].numel(), 13312)
-                    epochs.append(int(args[22][2]))
+                    record_epoch(int(args[22][2]))
                     args[16].copy_(args[4] * 2)
                     args[19].fill_(3)
                     args[17].fill_(999)
@@ -121,6 +251,27 @@ class TestFusedCpBackward(SharedRootFixture):
                 self.assertNotEqual(first.partials.data_ptr(), second.partials.data_ptr())
                 self.assertIsNone(self.root.lease_owner)
                 forward.saved.validate_versions()
+
+    def test_owner_cast_can_be_deferred_for_shared_tp_sum(self):
+        """Shared owner fields retain small FP32 residuals while local Q gradients stay BF16."""
+        forward = self._local_forward((2, 0))
+        cotangent = torch.ones_like(forward.output)
+        def _execute(*args):
+            args[16].fill_(2)
+            args[19].fill_(3)
+            args[25].fill_(1.003)
+        with patch.object(fused_cp_backward, "_load_native"), \
+                patch.object(torch.ops.hyper_parallel, "dsa_local_cp_grad_version", return_value=1, create=True), \
+                patch.object(torch.ops.hyper_parallel, "dsa_local_cp_grad_out", side_effect=_execute, create=True):
+            result = self.backend.backward_local(forward, cotangent, defer_owner_cast=True)
+        self.assertIs(result.gradients[1], result.owner_fp32[0])
+        self.assertIs(result.gradients[3], result.owner_fp32[1])
+        self.assertEqual(result.gradients[0].dtype, torch.bfloat16)
+        self.assertEqual(result.gradients[2].dtype, torch.bfloat16)
+        torch.testing.assert_close(result.gradients[1]-1, torch.full_like(result.owner_fp32[0], .003),
+                                   rtol=0, atol=1e-7)
+        with self.assertRaisesRegex(TypeError, 'boolean'):
+            self.backend.backward_local(forward, cotangent, defer_owner_cast=1)
 
     def test_local_admission_rejects_mutated_layout_and_stale_payload_before_lease(self):
         """Native availability cannot bypass saved positions or consume an epoch on failure."""
@@ -242,12 +393,13 @@ class TestFusedCpBackward(SharedRootFixture):
                                   for factor, tensor in enumerate(main, start=2))
                 invocation = self.workspace.prepare(result.saved.batch_meta)
 
-                def _forward(_invocation, states, index_states, *, query_layout):
+                def _forward(_invocation, states, index_states, *, query_layout, layout=layout, result=result):
                     self.assertIs(query_layout, layout)
                     self.assertTrue(all(not tensor.requires_grad for tensor in (*states, *index_states)))
                     return result
 
-                def _backward(saved, shape, cotangent, *, local_queries):
+                def _backward(saved, shape, cotangent, *, local_queries, result=result, layout=layout,
+                              gradients=gradients):
                     self.assertTrue(local_queries)
                     self.assertEqual(shape, tuple(result.output.shape))
                     self.assertFalse(cotangent.requires_grad)
