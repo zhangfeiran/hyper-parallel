@@ -42,7 +42,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.routing import (
     prepare_replica_route,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    SIGNAL_TRANSPORT_MODES,
+    KERNEL_GRADIENT_TRANSPORT,
 )
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capacity
@@ -283,16 +283,8 @@ class MegaMoeExperts(MulticoreModule):
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
             replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
-            replica_transport: "p2p", barrier-based "shmem", direct "shmem_signal",
-                or mapped-peer "shmem_signal_sdma" copies. "shmem_signal_sdma_parallel"
-                prefetches weights concurrently on one stream per target peer.
-                "shmem_signal_sdma_bidir" also reads gradients on separate projection
-                streams, caching at most one full FP32 expert gradient per provider.
-                "shmem_signal_sdma_overlap" lets home compute precede guest-weight readiness.
-                "shmem_signal_sdma_projection" waits per projection, prefetching W13
-                first in forward and W2 first in backward.
-                "shmem_signal_kernel_gradient" uses idle kernel AIV workers for W2 return
-                with one-sided MTE reads and ordered FP32 accumulation.
+            replica_transport: "p2p" or "shmem_signal_kernel_gradient". The latter uses
+                projection-ready SDMA weights and fused FP32 gradient return.
             replica_planner: Shared CPU or fused device replica quota policy.
             replica_target_load: Preferred received rows per rank, independent of buffer capacity.
                 All EP ranks must agree. None uses current capacity for push and average load for pull.
@@ -323,11 +315,8 @@ class MegaMoeExperts(MulticoreModule):
                 PP/DP groups bootstrap independently; one process can have only
                 one ordered EP membership active in SHMEM at a time.
         """
-        if replica_transport not in ("p2p", "shmem", *SIGNAL_TRANSPORT_MODES):
-            raise ValueError("Unsupported replica_transport; expected p2p, shmem, shmem_signal, "
-                             "shmem_signal_sdma, shmem_signal_sdma_parallel, shmem_signal_sdma_bidir "
-                             "shmem_signal_sdma_overlap, shmem_signal_sdma_projection "
-                             "or shmem_signal_kernel_gradient")
+        if replica_transport not in ("p2p", KERNEL_GRADIENT_TRANSPORT):
+            raise ValueError("Unsupported replica_transport; expected p2p or shmem_signal_kernel_gradient")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         _integer(replica_min_rows, "replica_min_rows", 0)
         if replica_target_load is not None:

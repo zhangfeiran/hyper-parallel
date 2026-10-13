@@ -15,21 +15,27 @@
 """Offline conservative replica calibration using actual FP32 partial execution."""
 
 import argparse
-from dataclasses import asdict, replace
-from datetime import timedelta
 import json
 import os
-from pathlib import Path
 import statistics
 import time
+from dataclasses import asdict, replace
+from datetime import timedelta
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch_npu
 
-from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaCostModel, build_expert_replica_plan
+from hyper_parallel.core.expert_parallel.hot_replica import (
+    ExpertReplicaCostModel,
+    build_expert_replica_plan,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
-from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
+from hyper_parallel.core.expert_parallel.hot_replica.transport import (
+    prefetch_weights,
+    return_gradients,
+)
 from hyper_parallel.core.multicore import MegaMoeExperts
 from tests.common.port_utils import allocate_port
 from tests.torch.expert_parallel.hot_replica_checks import execution_identity
@@ -185,7 +191,7 @@ def main() -> None:
     """Run calibration in a fresh four-rank process, separate from timed ablations."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("push", "pull"), default="push")
-    parser.add_argument("--replica-transport", default="shmem_signal_sdma_projection")
+    parser.add_argument("--replica-transport", choices=("p2p", "shmem_signal_kernel_gradient"), default="p2p")
     parser.add_argument("--hidden", type=int, default=5120)
     parser.add_argument("--intermediate", type=int, default=1792)
     parser.add_argument("--maximum-rows", type=int, default=2048)

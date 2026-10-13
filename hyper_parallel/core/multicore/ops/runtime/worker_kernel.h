@@ -90,17 +90,15 @@ class KernelWorkerBase {
     }
     const uint64_t base_bytes = getAtomicAddValuesOffset(runtimeConfigPtr) + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
     if (runtime_bytes != base_bytes) {
-      if (runtime_bytes != base_bytes + 48 && runtime_bytes != base_bytes + 64 &&
-          runtime_bytes != base_bytes + 72 && runtime_bytes != base_bytes + 80) {
+      if (runtime_bytes != base_bytes + 48 && runtime_bytes != base_bytes + 72 &&
+          runtime_bytes != base_bytes + 80) {
         AscendC::Trap();
       }
       __gm__ uint64_t *extension = reinterpret_cast<__gm__ uint64_t *>(runtimeConfigPtr + base_bytes);
-      // v3 shares one ready per slot; v4 publishes W13 and W2 independently.
       const bool kernel_gradients = runtime_bytes == base_bytes + 80;
-      const bool projection_ready = kernel_gradients || runtime_bytes == base_bytes + 72;
-      const bool overlap = projection_ready || runtime_bytes == base_bytes + 64;
-      const uint64_t magic = kernel_gradients ? 0x0000000553505754ULL : projection_ready ? 0x0000000453505754ULL :
-                             (overlap ? 0x0000000353505754ULL : 0x0000000253505754ULL);
+      const bool projection_ready = runtime_bytes != base_bytes + 48;
+      const uint64_t magic = kernel_gradients ? 0x0000000553505754ULL :
+                             projection_ready ? 0x0000000453505754ULL : 0x0000000253505754ULL;
       if (extension[0] != magic || extension[1] == 0 || extension[1] >= local_experts) {
         AscendC::Trap();
       }
@@ -108,13 +106,13 @@ class KernelWorkerBase {
       for (uint32_t index = 0; index < 4; ++index) {
         replica_matrix_bases_[index] = reinterpret_cast<GM_ADDR>(extension[index + 2]);
       }
-      if (overlap) {
-        const uint64_t epoch = extension[projection_ready ? 8 : 7];
+      if (projection_ready) {
+        const uint64_t epoch = extension[8];
         if (epoch == 0 || epoch > INT32_MAX) {
           AscendC::Trap();
         }
         for (uint32_t index = 0; index < 2; ++index) {
-          const uint64_t address = extension[6 + (projection_ready ? index : 0)];
+          const uint64_t address = extension[6 + index];
           if (address == 0 || address % DATA_CACHE_LINE_SIZE != 0) {
             AscendC::Trap();
           }

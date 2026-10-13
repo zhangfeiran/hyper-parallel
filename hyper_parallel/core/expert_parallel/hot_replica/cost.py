@@ -16,10 +16,10 @@
 
 from __future__ import annotations
 
+import math
 from bisect import bisect_left
 from dataclasses import dataclass
 from functools import cached_property
-import math
 
 from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
@@ -87,6 +87,8 @@ class ExpertReplicaCostModel:
             raise ValueError("Replica cost calibration requires float32 weight partials")
         if self.backend not in ("native", "push", "pull") or not isinstance(self.transport, str) or not self.transport:
             raise ValueError("Cost model requires native, push or pull and a transport mode")
+        if self.transport not in ("p2p", "shmem_signal_kernel_gradient"):
+            raise ValueError("Cost model requires p2p or shmem_signal_kernel_gradient")
         if self.backend == "native" and self.transport != "p2p":
             raise ValueError("Native cost models require HCCL p2p")
         for name in ("hidden_size", "intermediate_size", "ep_size"):

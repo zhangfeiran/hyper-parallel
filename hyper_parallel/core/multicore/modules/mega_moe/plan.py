@@ -22,8 +22,10 @@ from typing import Any
 
 import numpy as np
 import torch
-from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import KERNEL_GRADIENT_TRANSPORT_MODES
 
+from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
+    KERNEL_GRADIENT_TRANSPORT,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import (
     build_config_for_rank as build_backward_config,
 )
@@ -31,8 +33,10 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
-    can_reuse_backward_dispatch, replica_w2_ready_events,
-    prepare_w13_overlap_schedule, replica_w13_ready_events,
+    can_reuse_backward_dispatch,
+    prepare_w13_overlap_schedule,
+    replica_w2_ready_events,
+    replica_w13_ready_events,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
@@ -52,11 +56,13 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
-from hyper_parallel.core.multicore.profiler.profiling import (
-    _PreparedMegaKernelRuntime,
-    _prepare_mega_kernel_runtime_config,
+from hyper_parallel.core.multicore.profiler.profiler import (
+    _enable_runtime_config_tensor,
 )
-from hyper_parallel.core.multicore.profiler.profiler import _enable_runtime_config_tensor
+from hyper_parallel.core.multicore.profiler.profiling import (
+    _prepare_mega_kernel_runtime_config,
+    _PreparedMegaKernelRuntime,
+)
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
 from .spec import MegaMoeSpec
@@ -170,7 +176,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
         spec.rank_id,
         spec.num_cube_cores,
     )
-    if overlap_w13 and spec.replica_slots_per_rank and spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES:
+    if overlap_w13 and spec.replica_slots_per_rank and spec.replica_transport == KERNEL_GRADIENT_TRANSPORT:
         prepare_w13_overlap_schedule(backward_data, spec.local_experts, spec.num_cube_cores)
     return forward_graph, forward_data, backward_graph, backward_data
 
@@ -200,7 +206,11 @@ def _prepare_runtimes(
         "device": device,
         "device_id": device_id,
     }
-    return tuple(_prepare_mega_kernel_runtime_config(config, **options) for config in configs)
+    gradient_records = (2 * (spec.ep_size - 1) * spec.replica_slots_per_rank
+                        if spec.replica_transport == KERNEL_GRADIENT_TRANSPORT else 0)
+    return tuple(_prepare_mega_kernel_runtime_config(
+        config, replica_gradient_records=gradient_records if index else 0, **options,
+    ) for index, config in enumerate(configs))
 
 
 def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
@@ -216,7 +226,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec, overlap_w13=False)
     original_reuse = can_reuse_backward_dispatch(backward_config, spec.local_experts, spec.num_cube_cores)
     configs = (forward_config, backward_config)
-    if spec.replica_slots_per_rank and spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES:
+    if spec.replica_slots_per_rank and spec.replica_transport == KERNEL_GRADIENT_TRANSPORT:
         overlap_config = deepcopy(backward_config)
         if (prepare_w13_overlap_schedule(overlap_config, spec.local_experts, spec.num_cube_cores)
                 and replica_w2_ready_events(overlap_config, spec.local_experts, spec.num_cube_cores)

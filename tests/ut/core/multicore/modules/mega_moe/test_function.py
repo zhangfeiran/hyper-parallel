@@ -82,7 +82,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             self.assertEqual(repeated[base.numel() - 1].item(), 93)
             self.assertEqual(base[-1].item(), 15)
             weights, gradients = (torch.empty(1), torch.empty(2)), (torch.empty(3), torch.empty(4))
-            pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=None, projection_ready=None)
+            pool = SimpleNamespace(weights=weights, gradients=gradients, projection_ready=None)
             active = function_module._split_runtime(base, pool, 6, cache=cache)
             self.assertIsNot(active, first)
             self.assertIs(function_module._split_runtime(base, pool, 6, cache=cache), active)
@@ -103,26 +103,21 @@ class TestMegaMoeFunction(unittest.TestCase):
     def test_dynamic_runtime_descriptors_update_suffix_without_resetting_scratch(self) -> None:
         """
         Feature: Dynamic runtime ownership
-        Description: Advance v3, v4 and v5 epochs while reusing a serial workspace image.
+        Description: Advance forward and backward projection epochs while reusing a serial workspace image.
         Expectation: Update the suffix while retaining the kernel's writable scratch.
         """
         base = torch.arange(16, dtype=torch.uint8)
         weights, gradients = (torch.empty(1), torch.empty(2)), (torch.empty(3), torch.empty(4))
         descriptor = torch.empty(16, dtype=torch.uint8)
-        for version in (3, 4, 5):
+        for version in (4, 5):
             cache = {}
-            ready = (4096, 1) if version == 3 else None
-            projection = None if version == 3 else ((4096, 8192), 1)
-            pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=ready,
-                                   projection_ready=projection)
+            pool = SimpleNamespace(weights=weights, gradients=gradients,
+                                   projection_ready=((4096, 8192), 1))
             options = {"backward": True, "gradient_return": descriptor} if version == 5 else {}
             with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream", autospec=True):
                 first = function_module._split_runtime(base, pool, 6, cache=cache, **options)
                 first[base.numel() - 1] = 93
-                if version == 3:
-                    pool.weight_ready = (4096, 2)
-                else:
-                    pool.projection_ready = ((4096, 8192), 2)
+                pool.projection_ready = ((4096, 8192), 2)
                 if version == 5:
                     options["gradient_return"] = descriptor.clone()
                 second = function_module._split_runtime(base, pool, 6, cache=cache, **options)
@@ -141,13 +136,13 @@ class TestMegaMoeFunction(unittest.TestCase):
         base, cache = torch.arange(16, dtype=torch.uint8), {}
         pool = SimpleNamespace(weights=(torch.empty(1), torch.empty(2)),
                                gradients=(torch.empty(3), torch.empty(4)),
-                               weight_ready=(4096, 1), projection_ready=None)
+                               projection_ready=None)
         with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream"):
             first = function_module._split_runtime(base, pool, 6, cache=cache)
-            pool.weight_ready, pool.projection_ready = None, ((4096, 8192), 2)
+            pool.projection_ready = ((4096, 8192), 2)
             second = function_module._split_runtime(base, pool, 6, cache=cache)
         self.assertIsNot(first, second)
-        self.assertEqual(second.numel() - first.numel(), 8)
+        self.assertEqual(second.numel() - first.numel(), 24)
         self.assertEqual(len(cache), 1)
 
     def test_home_only_runtime_keeps_split_addressing_without_guest_pointers(self) -> None:
@@ -162,31 +157,26 @@ class TestMegaMoeFunction(unittest.TestCase):
                              (0x53505754, 2, 6, 0, 0, 0, 0))
         self.assertIs(function_module._split_runtime(base, None, 6), base)
 
-    def test_split_runtime_preserves_v2_and_encodes_deferred_ready_v3(self) -> None:
-        """Only deferred consumers receive the per-slot device ready base and epoch."""
+    def test_split_runtime_p2p_encodes_home_and_guest_pointers(self) -> None:
+        """P2P weights are ready before launch; backward adds the FP32 guest addresses."""
         base = torch.arange(16, dtype=torch.uint8)
-        weights = (torch.empty(1), torch.empty(2))
-        gradients = (torch.empty(3), torch.empty(4))
-        for ready, backward in product((None, (4096, 17)), (False, True)):
-            with self.subTest(ready=ready, backward=backward):
-                pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=ready, projection_ready=None)
-                with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream"):
-                    result = function_module._split_runtime(  # pylint: disable=protected-access
-                        base, pool, 6, backward=backward)
-                torch.testing.assert_close(result[:16], base)
-                data = bytes(result[16:].tolist())
-                values = struct.unpack("<II5Q" if ready is None else "<II7Q", data)
-                pointers = tuple(g.data_ptr() for g in gradients) if backward else (0, 0)
-                expected = (0x53505754, 2 if ready is None else 3, 6, *(w.data_ptr() for w in weights), *pointers)
-                self.assertEqual(values, expected + (() if ready is None else ready))
+        weights, gradients = (torch.empty(1), torch.empty(2)), (torch.empty(3), torch.empty(4))
+        pool = SimpleNamespace(weights=weights, gradients=gradients, projection_ready=None)
+        for backward in (False, True):
+            with self.subTest(backward=backward), patch.object(torch.npu, "current_stream"), \
+                    patch.object(torch.Tensor, "record_stream"):
+                result = function_module._split_runtime(base, pool, 6, backward=backward)
+            pointers = tuple(g.data_ptr() for g in gradients) if backward else (0, 0)
+            torch.testing.assert_close(result[:16], base)
+            self.assertEqual(struct.unpack("<II5Q", bytes(result[16:].tolist())),
+                             (0x53505754, 2, 6, *(w.data_ptr() for w in weights), *pointers))
 
     def test_split_runtime_encodes_independent_projection_ready_v4(self) -> None:
         """Pass distinct W13/W2 cache-line bases and one epoch to forward/backward."""
         base = torch.arange(16, dtype=torch.uint8)
         weights = (torch.empty(1), torch.empty(2))
         gradients = (torch.empty(3), torch.empty(4))
-        pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=None,
-                               projection_ready=((4096, 8192), 23))
+        pool = SimpleNamespace(weights=weights, gradients=gradients, projection_ready=((4096, 8192), 23))
         for backward in (False, True):
             with self.subTest(backward=backward), patch.object(torch.npu, "current_stream"), \
                     patch.object(torch.Tensor, "record_stream"):
@@ -202,8 +192,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         weights = (torch.empty(1), torch.empty(2))
         gradients = (torch.empty(3), torch.empty(4))
         descriptor = torch.empty(128, dtype=torch.uint8)
-        pool = SimpleNamespace(weights=weights, gradients=gradients, weight_ready=None,
-                               projection_ready=((4096, 8192), 23))
+        pool = SimpleNamespace(weights=weights, gradients=gradients, projection_ready=((4096, 8192), 23))
         with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream"):
             result = function_module._split_runtime(base, pool, 6, backward=True, gradient_return=descriptor)
         torch.testing.assert_close(result[:16], base)

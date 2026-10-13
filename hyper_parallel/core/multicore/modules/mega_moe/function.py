@@ -36,7 +36,6 @@ from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .kernel_gradients import (
-    kernel_gradient_projections,
     prepare_kernel_gradient_return,
 )
 from .plan import MegaMoePlan
@@ -356,11 +355,10 @@ def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool =
     # An enabled replica graph still needs per-home-expert GMM addressing.
     # Empty global plans cannot read guest matrices, so their pointers stay null.
     if pool is None:
-        ready, projection_ready = None, None
+        projection_ready = None
         values = (home, 0, 0, 0, 0)
     else:
         pointers = (0, 0) if not backward else tuple(value.data_ptr() for value in pool.gradients)
-        ready = pool.weight_ready
         values = (home, *(value.data_ptr() for value in pool.weights), *pointers)
         projection_ready = getattr(pool, "projection_ready", None)
     if projection_ready is not None:
@@ -371,9 +369,8 @@ def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool =
                 if gradient_return is not None else
                 struct.pack("<II8Q", 0x53505754, 4, *values, *bases, epoch))
     else:
-        data = (struct.pack("<II5Q", 0x53505754, 2, *values) if ready is None else
-                struct.pack("<II7Q", 0x53505754, 3, *values, *ready))
-    return _runtime_image(base, data, cache, static=projection_ready is None and ready is None)
+        data = struct.pack("<II5Q", 0x53505754, 2, *values)
+    return _runtime_image(base, data, cache, static=projection_ready is None)
 
 
 def _runtime_image(base: torch.Tensor, data: bytes,
@@ -638,10 +635,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                                  reuse_generation=ctx.replica_weight_generation))
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
             permutation_inputs = permutation_inputs[:1]
-            projections = (kernel_gradient_projections(ctx.replica_route,
-                                                      adaptive=getattr(provider, "adaptive_gradients", False))
-                           if getattr(provider, "kernel_gradients", False) else ())
-            kernel_w13 = 0 in projections
+            kernel_return = has_replica_transfers and getattr(provider, "kernel_gradients", False)
+            kernel_w13 = kernel_return and bool(plan.replica_w13_events)
             execution = _prepare_backward_execution(
                 workspace,
                 plan,
@@ -654,7 +649,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,
                 None if pool is None else pool.gradients[1],
                 gradient_w13=execution.intermediates.grad_weight1 if kernel_w13 else None,
-                guest_w13=None if pool is None else pool.gradients[0]) if 1 in projections else None
+                guest_w13=None if pool is None else pool.gradients[0]) if kernel_return else None
             _launch_backward_kernel(plan, saved, source, execution, pool,
                                     None if early_return is None else early_return.metadata)
             if provider is not None and hasattr(provider, "last_kernel_gradient_matrices"):
