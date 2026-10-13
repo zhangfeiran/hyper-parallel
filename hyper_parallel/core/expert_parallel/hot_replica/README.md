@@ -126,15 +126,8 @@ transport、schedule 和 FP32 partial dtype，拒绝配置不匹配或旧 schema
 原策略；没有实测依据时不扣除假设的 home overlap。两轮确定性搜索保留 B 预算和 source 守恒。
 模型的 rank score 缓存只存在于一次求解内，不代表权重驻留缓存。
 
-校准入口为 `tests/torch/expert_parallel/_benchmark_replica_calibration.py`，仅支持 EP4 的
-MegaMoe push/pull。它输出原始样本和 `cost-model.json`，用 launch/control-inclusive F/B 与
-暴露的双投影通信成本拟合保守模型。校准采用一个 home 专家，目标可能有六个，仍需完整步骤验证。
-所有 EP rank 应加载同一个文件，再传入 `ExpertReplicaCostModel(**payload["model"])`。
-
-```bash
-torchrun --nproc-per-node=4 tests/torch/expert_parallel/_benchmark_replica_calibration.py \
-  --backend push --replica-transport p2p --result-dir /tmp/replica-calibration
-```
+离线实测数据由调用方提供；所有 EP rank 应加载同一个文件，再传入
+`ExpertReplicaCostModel(**payload["model"])`。模型的预测需要用完整步骤基准验证。
 
 ## 验证与基准
 
@@ -145,7 +138,7 @@ python3 -m pytest -q tests/ut/core/expert_parallel tests/ut/core/multicore
 ```
 
 NPU 系统测试通过轻量 launcher 启动四个 rank，覆盖两种最终传输、两种规划器、push/pull、
-数值与 SGD 状态、逆序 backward、共享层、跨流、heap 增长及 collective 路由校验。
+数值与 SGD 状态、逆序 backward、跨流、heap 增长及 collective 路由校验。
 实际 case 矩阵与命令见 [专家并行测试](../../../../tests/torch/expert_parallel/README.md)。
 
 完整步骤基准只保留 `tests/torch/expert_parallel/_benchmark_hot_replica.py`：

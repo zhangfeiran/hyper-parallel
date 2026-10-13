@@ -65,7 +65,7 @@ pytest tests/torch/expert_parallel/test_combinations.py -v -k "test_2card_group"
 | --- | --- |
 | Native × CPU/device × P2P | 普通 EP hooks、FP32 参考、TopK 边界和逆序 backward |
 | push/pull × CPU/device × P2P/kernel_gradient | 输出、dx、router dW、专家 dW、SGD 参数及 momentum |
-| 同一训练 case 内 | balanced/hot 切换、保留两个 forward、跨层和跨流重用、push heap 增长 |
+| 同一训练 case 内 | balanced/hot 切换、保留两个 forward、跨流重用、push heap 增长 |
 | count/route/device boundaries | 精确 int64 计数、无效路由 collective 拒绝、设备求解与 CPU 对齐 |
 
 ```bash
@@ -79,5 +79,5 @@ worker 在 `HP_HOT_REPLICA_RESULTS`（默认 `./logs/hot_replica`）下按 case�
 实际 plan、数值误差、执行/载荷 identity 和生命周期证据。主动复制夹具显式关闭收益门槛，
 避免 balanced 的默认 home 计划绕过待验证协议。
 
-性能入口各保留一个：`_benchmark_hot_replica.py` 测量 warmed F+B+AdamW，
-`_benchmark_replica_calibration.py` 生成离线模型。参数、范围与完整步骤比较方法见热副本说明。
+性能入口保留 `_benchmark_hot_replica.py`，测量 warmed F+B+AdamW。
+参数、范围与完整步骤比较方法见热副本说明。

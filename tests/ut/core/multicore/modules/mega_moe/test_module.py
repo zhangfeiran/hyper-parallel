@@ -33,6 +33,8 @@ from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from tests.common.mark_utils import arg_mark
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_parallel.core.multicore.modules.mega_moe.workspace import MegaMoeWorkspace
+from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeExperts(unittest.TestCase):

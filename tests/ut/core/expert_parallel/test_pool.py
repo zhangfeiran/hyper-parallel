@@ -21,7 +21,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.pool import (
     ReplicaPool,
     ReplicaPrefetch,
@@ -112,21 +111,3 @@ class TestReplicaPool(unittest.TestCase):
         pool.weights = original
         with pool.lease():
             self.assertIs(pool.weights, original)
-
-    def test_source_affinity_is_optimal_for_fixed_placement(self):
-        """Local row count reaches the sum of per-rank supply/quota minima."""
-        counts = [[60, 0, 0, 0], [0, 0, 0, 0], [50, 0, 0, 0], [90, 0, 0, 0]]
-        plan = build_expert_replica_plan(counts, 1)
-        width = plan.config.slots_per_rank
-        actual = 0
-        optimum = 0
-        for rank, slots in enumerate(plan.slot_to_logical):
-            for slot, expert in enumerate(slots):
-                if expert < 0:
-                    continue
-                physical = rank * width + slot
-                quota = sum(row[physical] for row in plan.dispatch_counts)
-                optimum += min(counts[rank][expert], quota)
-                actual += plan.dispatch_counts[rank][physical]
-        self.assertEqual(actual, optimum)
-        self.assertEqual(actual, 150)

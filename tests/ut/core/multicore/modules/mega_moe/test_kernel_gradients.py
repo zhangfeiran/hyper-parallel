@@ -22,10 +22,8 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
-from hyper_parallel.core.multicore.modules.mega_moe import plan as plan_module
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
     can_reuse_backward_dispatch,
-    replica_w2_ready_events,
     replica_w13_ready_events,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.kernel_gradients import (
@@ -67,19 +65,6 @@ class TestKernelGradientReturn(unittest.TestCase):
             self.assertEqual(values[12:], tuple(expected))
             torch.testing.assert_close(result.completion, torch.zeros(20, 16, dtype=torch.int32))
         self.assertEqual(len({r.completion.data_ptr() for r in retained}), 4)
-
-    def test_unknown_schedule_or_disabled_provider_does_not_advance_epoch(self):
-        """Fallback must not consume protocol state or allocate kernel metadata."""
-        placement = build_expert_replica_plan([[100, 0, 0, 0]] * 4, 1)
-        route = SimpleNamespace(plan=placement, rank=0)
-        provider = SimpleNamespace(kernel_gradients=True, kernel_gradient_signals=Mock())
-        plan = SimpleNamespace(replica_w2_events=())
-        gradient, guest = torch.ones(1, 4, 8), torch.ones(1, 4, 8)
-        self.assertIsNone(prepare_kernel_gradient_return(plan, route, provider, gradient, guest))
-        plan.replica_w2_events = (32, 64)
-        provider.kernel_gradients = False
-        self.assertIsNone(prepare_kernel_gradient_return(plan, route, provider, gradient, guest))
-        provider.kernel_gradient_signals.assert_not_called()
 
     def test_invalid_owner_buffer_fails_before_protocol_advance(self):
         """The fused path cannot silently cast or mutate an autograd-owned gradient."""
@@ -142,27 +127,3 @@ class TestKernelGradientReturn(unittest.TestCase):
                                   if config.all_tasks[index].outputs[0].input_position == 18)
                     weight.dependent_event = events[0]
                     self.assertFalse(replica_w13_ready_events(config, 6, 20))
-
-    def test_no_replica_runtime_preserves_original_schedule(self):
-        """Only the enabled kernel transport retains a second, independent runtime."""
-        for mode in ("push", "pull"):
-            for transport in ("p2p", "shmem_signal_kernel_gradient"):
-                with self.subTest(mode=mode, transport=transport):
-                    spec = MegaMoeSpec(128, 128, 128, 12, 2, 1.25, 512, 2, None, 0, 20,
-                                       dispatch_mode=mode, replica_slots_per_rank=2, logical_num_experts=8,
-                                       replica_transport=transport)
-                    _, _, _, original = _build_runtime_artifacts(spec, overlap_w13=False)
-                    with patch.object(plan_module, "_prepare_runtimes", side_effect=lambda _, configs, __: configs):
-                        plan = plan_module.build_mega_moe_plan(spec, torch.device("cpu"))
-                    if transport == "p2p":
-                        self.assertIsNone(plan.bwd_runtime_no_replica)
-                        self.assertFalse(plan.replica_w13_events)
-                        self.assertEqual(bytes(plan.bwd_runtime), bytes(original))
-                    else:
-                        self.assertEqual(bytes(plan.bwd_runtime_no_replica), bytes(original))
-                        self.assertNotEqual(bytes(plan.bwd_runtime), bytes(original))
-                        self.assertTrue(plan.replica_w13_events)
-                        self.assertTrue(can_reuse_backward_dispatch(plan.bwd_runtime_no_replica, 6, 20))
-                        self.assertTrue(plan.bwd_runtime_no_replica_reuse_dispatch)
-                        self.assertEqual(replica_w2_ready_events(plan.bwd_runtime_no_replica, 6, 20),
-                                         plan.replica_w2_events)

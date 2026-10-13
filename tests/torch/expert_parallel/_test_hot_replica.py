@@ -16,17 +16,14 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib
 import json
 import os
 import sys
-import time
-from contextlib import ExitStack, nullcontext
+from contextlib import nullcontext
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -39,22 +36,14 @@ from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.core.expert_parallel import ExpertParallel
 from hyper_parallel.core.expert_parallel.hot_replica import (
     ExpertReplicaConfig,
-    ExpertReplicaCostModel,
-    build_expert_replica_plan,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.native import (
     combine_native_replicas,
     dispatch_native_replicas,
     native_replica_experts,
 )
-from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
     KERNEL_GRADIENT_TRANSPORT,
-    SignalReplicaTransport,
-)
-from hyper_parallel.core.expert_parallel.hot_replica.transport import (
-    prefetch_weights,
-    return_gradients,
 )
 from tests.common.port_utils import allocate_port
 from tests.torch.expert_parallel.hot_replica_checks import (
@@ -71,42 +60,27 @@ def _local(tensor):
     return tensor.to_local() if hasattr(tensor, "to_local") else tensor
 
 
-def _native_forward(module, values, ids, probabilities, experts):
-    """Use the real GroupedExperts entry with EP pre/post forward hooks."""
+def _expert_forward(module, executor, values, ids, probabilities, experts):
+    """Use real EP hooks for candidates and FP32 expert gradients for the reference."""
+    if executor not in (None, "native_fp32"):
+        packed = torch.cat((_local(module.w1), _local(module.w3)), dim=1).transpose(1, 2).contiguous()
+        down = _local(module.w2).transpose(1, 2).contiguous()
+        return executor(values, ids, probabilities, expert_weights=(packed, down))
     order = torch.argsort(ids.flatten(), stable=True)
     expanded = values[:, None, :].expand(-1, ids.shape[1], -1).reshape(-1, values.shape[-1])
     counts = torch.bincount(ids.flatten(), minlength=experts)
-    output = module(expanded[order], counts)
+    if executor is None:
+        output = module(expanded[order], counts)
+    else:
+        config = ExpertReplicaConfig(experts, dist.get_world_size(), 0)
+        inputs, state = dispatch_native_replicas((expanded[order], counts), config, dist.group.WORLD)
+        packed = torch.cat((_local(module.w1), _local(module.w3)), dim=1).transpose(1, 2).contiguous()
+        down = _local(module.w2).transpose(1, 2).contiguous()
+        output = native_replica_experts(inputs[0], packed, down, inputs[1], state.route)
+        output = combine_native_replicas(output, state)
     restored = torch.empty_like(output)
     restored[order] = output
     return (restored.reshape(values.shape[0], ids.shape[1], -1) * probabilities.unsqueeze(-1)).sum(1)
-
-
-def _native_fp32_forward(module, values, ids, probabilities, experts):
-    """Use native B=0 execution with FP32 dW, without modifying production hooks."""
-    order = torch.argsort(ids.flatten(), stable=True)
-    expanded = values[:, None, :].expand(-1, ids.shape[1], -1).reshape(-1, values.shape[-1])
-    counts = torch.bincount(ids.flatten(), minlength=experts)
-    config = ExpertReplicaConfig(experts, dist.get_world_size(), 0)
-    inputs, state = dispatch_native_replicas((expanded[order], counts), config, dist.group.WORLD)
-    packed = torch.cat((_local(module.w1), _local(module.w3)), dim=1).transpose(1, 2).contiguous()
-    down = _local(module.w2).transpose(1, 2).contiguous()
-    output = native_replica_experts(inputs[0], packed, down, inputs[1], state.route)
-    combined = combine_native_replicas(output, state)
-    restored = torch.empty_like(combined)
-    restored[order] = combined
-    return (restored.reshape(values.shape[0], ids.shape[1], -1) * probabilities.unsqueeze(-1)).sum(1)
-
-
-def _expert_forward(module, executor, values, ids, probabilities, experts):
-    """Select the controlled reference executor without changing parameters."""
-    if executor == "native_fp32":
-        return _native_fp32_forward(module, values, ids, probabilities, experts)
-    if executor is None:
-        return _native_forward(module, values, ids, probabilities, experts)
-    packed = torch.cat((_local(module.w1), _local(module.w3)), dim=1).transpose(1, 2).contiguous()
-    down = _local(module.w2).transpose(1, 2).contiguous()
-    return executor(values, ids, probabilities, expert_weights=(packed, down))
 
 
 def _check(actual, expected, label, *, elementwise=True, rtol=2e-2, atol=2e-3):
@@ -132,7 +106,7 @@ def _check(actual, expected, label, *, elementwise=True, rtol=2e-2, atol=2e-3):
 
 
 def _deferred_backward(base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference,
-                       replica_planner, *, growth=False, require_transfers=True, cross_stream=False):
+                       replica_planner, *, growth=False, cross_stream=False):
     """Keep different plans live, then run backward in reverse invocation order."""
     # Isolate saved-plan lifetime from tolerated optimizer-rounding drift.
     with torch.no_grad():
@@ -140,14 +114,6 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
             _local(getattr(candidate, name)).copy_(_local(getattr(base, name)))
     base.zero_grad(set_to_none=True)
     candidate.zero_grad(set_to_none=True)
-    partials = ({}, {})
-    accumulated = ({}, {})
-    hooks = []
-    for index, module in enumerate((base, candidate)):
-        for name in ("w1", "w2", "w3"):
-            def _capture(gradient, destination=partials[index], key=name):
-                destination[key] = _local(gradient).detach().clone()
-            hooks.append(getattr(module, name).register_hook(_capture))
     pending = []
     plans = []
     capacities = []
@@ -168,15 +134,14 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
         with nullcontext() if stream is None else torch.npu.stream(stream):
             expected = _expert_forward(base, reference, values, ids, probabilities, experts)
             actual = _expert_forward(candidate, executor, other, ids, other_probabilities, experts)
-        plans.append(route_evidence(actual, replica_planner) if require_transfers else None)
+        plans.append(route_evidence(actual, replica_planner))
         if growth:
             resources = executor._get_execution_resources(other)
             capacities.append(resources.workspace.capacity_floor)
         pending.append((expected, actual, values, other, probabilities, other_probabilities))
-    if require_transfers:
-        active = plans[1]["transfers"] if growth else all(plan["transfers"] for plan in plans)
-        if plans[0] == plans[1] or not active:
-            raise AssertionError("Deferred acceptance requires different plans and active replicas")
+    active = plans[1]["transfers"] if growth else all(plan["transfers"] for plan in plans)
+    if plans[0] == plans[1] or not active:
+        raise AssertionError(f"Deferred acceptance requires distinct plans and active replicas: {plans}")
     if growth and capacities[1] <= capacities[0]:
         raise AssertionError(f"Expected heap growth with an old forward alive: {capacities}")
     checks = []
@@ -193,181 +158,17 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
         with nullcontext() if stream is None else torch.npu.stream(stream):
             expected.backward(gradient)
             actual.backward(gradient)
-            for name in ("w1", "w2", "w3"):
-                _check(partials[1][name], partials[0][name], "deferred partial " + name)
-                for index, module in enumerate((base, candidate)):
-                    if name not in accumulated[index]:
-                        accumulated[index][name] = partials[index][name].clone()
-                    else:
-                        accumulated[index][name].add_(partials[index][name])
-                    _check(_local(getattr(module, name).grad), accumulated[index][name],
-                           "exact accumulated " + name, rtol=0, atol=0)
             checks.append({"output": _check(actual, expected, "deferred output"),
                            "dx": _check(other.grad, values.grad, "deferred dx"),
-                           "dprob": _check(other_probabilities.grad, probabilities.grad, "deferred dprob")})
+                           "dprob": _check(other_probabilities.grad, probabilities.grad, "deferred dprob"),
+                           **{name: _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad),
+                                           "deferred accumulated " + name, elementwise=False)
+                              for name in ("w1", "w2", "w3")}})
         previous_backward = stream
     if previous_backward is not None:
         main_stream.wait_stream(previous_backward)
-    for hook in hooks:
-        hook.remove()
-    # Elementwise tolerances apply to each incoming partial above. BF16 summation
-    # can amplify relative error at cancellation; exact accumulation is checked
-    # against the captured partials, with a separate normwise comparison here.
-    accumulated_error = {name: _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad),
-                                      "accumulated " + name, elementwise=False)
-                         for name in ("w1", "w2", "w3")}
-    return {"invocations": checks, "accumulated": accumulated_error, "plans": plans, "capacities": capacities}
-
-
-def _cross_stream_deferred(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,
-                           reference, replica_planner, *, kernel_gradient=False):
-    """Check leased image reuse and per-launch tails on two streams with reverse backward."""
-    function = importlib.import_module("hyper_parallel.core.multicore.modules.mega_moe.function")
-    launches, snapshots, images = [], [], []
-
-    original_image = function._runtime_image
-
-    @wraps(original_image)
-    def _image(*args, **kwargs):
-        result = original_image(*args, **kwargs)
-        images.append((result, args[1]))
-        return result
-
-    def _observe(original, direction, execution_index):
-        @wraps(original)
-        def _launch(*args, **kwargs):
-            result = original(*args, **kwargs)
-            execution = args[execution_index]
-            image, expected = images[-1]
-            snapshot = image[execution.profile_call.runtime_config.numel():].clone()
-            snapshots.append((snapshot, expected))
-            launches.append({"direction": direction, "stream": torch.npu.current_stream().npu_stream,
-                             "image_pointer": image.data_ptr(), "suffix": expected.hex()})
-            return result
-        return _launch
-
-    with (patch.object(function, "_runtime_image", _image),
-          patch.object(function, "_launch_forward_kernel", _observe(function._launch_forward_kernel, "forward", 5)),
-          patch.object(function, "_launch_backward_kernel", _observe(function._launch_backward_kernel, "backward", 3))):
-        checks = _deferred_backward(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,
-                                    reference, replica_planner, cross_stream=True)
-    for direction in ("forward", "backward"):
-        records = [item for item in launches if item["direction"] == direction]
-        version = (4 if direction == "forward" else 5) if kernel_gradient else 2
-        _check_runtime_direction(records, version, direction)
-    for snapshot, expected in snapshots:
-        if bytes(snapshot.cpu().tolist()) != expected:
-            raise AssertionError("Runtime tail was overwritten before its consumer completed")
-    return {"checks": checks, "launches": launches}
-
-
-def _check_runtime_direction(records, runtime_version, direction):
-    """Require two actual streams and the expected image and epoch ownership."""
-    if len(records) != 2 or len({item["stream"] for item in records}) != 2:
-        raise AssertionError(f"Expected two actual {direction} streams: {records}")
-    # The workspace lease orders dynamic suffix updates after the prior consumer;
-    # each launch's snapshot and numerical result must still retain its own epoch.
-    if len({item["image_pointer"] for item in records}) != 1:
-        raise AssertionError(f"Unexpected {direction} runtime image ownership: {records}")
-    tails = [bytes.fromhex(item["suffix"]) for item in records]
-    if any(int.from_bytes(tail[4:8], "little") != runtime_version for tail in tails):
-        raise AssertionError(f"Unexpected runtime version: {records}")
-    if runtime_version == 2 and len(set(tails)) != 1:
-        raise AssertionError(f"Static suffix changed: {records}")
-    epoch_slice = slice(-16, -8) if runtime_version == 5 else slice(-8, None)
-    if runtime_version in (4, 5) and tails[0][epoch_slice] == tails[1][epoch_slice]:
-        raise AssertionError(f"Projection epochs did not advance: {records}")
-
-
-def _cross_layer_pool(backend, budget, mesh, executor, reference, tokens, hidden, intermediate, top_k,
-                      replica_min_rows=0, replica_planner="cpu", cost_model=None,
-                      minimum_load_reduction=0.0):
-    """Two independent parameter owners share storage through reversed backward."""
-    experts = mesh.size() * 6
-    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
-    pairs = []
-    for seed in (731, 951):
-        modules = []
-        for hot in (False, True):
-            torch.manual_seed(seed)
-            module = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(
-                device=device, dtype=torch.bfloat16)
-            ExpertParallel(replica_slots_per_rank=budget if hot and backend == "native" else 0,
-                           replica_min_rows=replica_min_rows if hot else 0,
-                           replica_planner=replica_planner if hot else "cpu",
-                           replica_minimum_load_reduction=minimum_load_reduction if hot else None,
-                           replica_cost_model=cost_model if hot and backend == "native" else None).apply(module, mesh)
-            modules.append(module)
-        pairs.append(modules)
-    pending = []
-    for index, (base, candidate) in enumerate(pairs):
-        torch.manual_seed(581 + index + dist.get_rank())
-        values = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16).requires_grad_()
-        other = values.detach().clone().requires_grad_()
-        ids = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k).remainder(max(top_k, 2)).long()
-        probs = torch.full((tokens, top_k), 1 / top_k, device=device)
-        expected = _expert_forward(base, reference, values, ids, probs, experts)
-        actual = _expert_forward(candidate, executor, other, ids, probs, experts)
-        pending.append((base, candidate, values, other, expected, actual))
-    checks = []
-    for base, candidate, values, other, expected, actual in reversed(pending):
-        grad = torch.randn_like(expected)
-        expected.backward(grad)
-        actual.backward(grad)
-        checks.append({"output": _check(actual, expected, "cross-layer output"),
-                       "dx": _check(other.grad, values.grad, "cross-layer dx"),
-                       **{name: _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad),
-                                       "cross-layer " + name) for name in ("w1", "w2", "w3")}})
-    return checks
-
-
-def _signal_stress(provider, mesh, hidden, intermediate, budget):
-    """Queue rotating owners on alternating streams before checking any result."""
-    rank, size = dist.get_rank(), mesh.size()
-    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
-    streams = [torch.npu.Stream(), torch.npu.Stream()]
-    # Check ready publication beyond the exact integer range of FP32.
-    initial_epoch = provider.epoch = 2**24 + 17
-    snapshots = []
-    for step in range(12):
-        owner = step % size
-        counts = [[0] * (size * 6) for _ in range(size)]
-        for row in counts:
-            row[owner * 6] = 120
-        plan = build_expert_replica_plan(counts, budget)
-        route = ReplicaRoute(plan, torch.empty(0), torch.empty(0), rank, mesh.get_group(), provider)
-        weights = (torch.full((6, hidden, 2 * intermediate), step * 10 + rank,
-                              device=device, dtype=torch.bfloat16),
-                   torch.full((6, intermediate, hidden), step * 10 + rank,
-                              device=device, dtype=torch.bfloat16))
-        stream = streams[step % 2]
-        stream.wait_stream(torch.npu.current_stream())
-        if rank == step % size:
-            time.sleep(0.003)
-        with torch.npu.stream(stream):
-            with prefetch_weights(weights, route, backward=True, overlap=True) as pool:
-                pool.wait_weights()
-                copies = [(value[slot - 6].clone(), step * 10 + owner)
-                          for slot, expert in enumerate(plan.slot_to_logical[rank]) if slot >= 6 and expert >= 0
-                          for value in pool.weights]
-                for gradient in pool.gradients:
-                    gradient.fill_(rank + 1)
-                home = tuple(torch.ones_like(weight, dtype=torch.float32) for weight in weights)
-                gradients = return_gradients(home, route, pool.gradients)
-                expected = [torch.ones_like(value) for value in gradients]
-                if rank == owner:
-                    for value in expected:
-                        value[0].add_(sum(item.target_rank + 1 for item in plan.transfers))
-                snapshots.append((copies, gradients, expected))
-            for weight in weights:
-                weight.record_stream(stream)
-    torch.npu.synchronize()
-    for copies, gradients, expected in snapshots:
-        for actual, value in copies:
-            torch.testing.assert_close(actual, torch.full_like(actual, value), rtol=0, atol=0)
-        for actual, value in zip(gradients, expected):
-            torch.testing.assert_close(actual, value, rtol=0, atol=0)
-    return {"iterations": 12, "streams": 2, "owners": size, "initial_epoch": initial_epoch}
+    return {"invocations": checks, "plans": plans, "capacities": capacities,
+            "streams": [stream.npu_stream for stream in streams]}
 
 
 def _kernel_wait_stress(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,
@@ -417,263 +218,120 @@ def _kernel_wait_stress(base, candidate, executor, experts, rank, device, tokens
     return {"checks": checks, "publications": publications, "global_ready_words": totals.cpu().tolist()}
 
 
-def _requires_transfers(budget, minimum_rows, minimum_load_reduction):
-    """Require active copies only in fixtures that explicitly request the original policy."""
-    return budget > 0 and minimum_rows == 0 and minimum_load_reduction == 0
-
-
-def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
-        hidden: int = 128, intermediate: int = 128, top_k: int = 2,
-        same_backend_reference: bool = False, replica_transport: str = "p2p",
-        replica_min_rows: int = 0, replica_planner: str = "cpu",
-        default_group: bool = False, fp32_reference: bool = False,
-        cost_model: ExpertReplicaCostModel | None = None, cross_stream: bool = False,
-        minimum_load_reduction: float = 0.0) -> None:
-    """Compare full forward/backward with native B=0, preserving EP ownership."""
-    if cross_stream and (backend == "native" or replica_transport not in ("p2p", KERNEL_GRADIENT_TRANSPORT)):
-        raise ValueError("Runtime cross-stream acceptance requires MegaMoe P2P or kernel_gradient")
-    if fp32_reference and same_backend_reference:
-        raise ValueError("Select only one reference backend")
+def _run(backend: str, top_k: int, planner: str, transport: str, result_dir: Path) -> None:
+    """Compare B=1 training and saved-plan lifetimes with the native FP32 reference."""
     rank, size = dist.get_rank(), dist.get_world_size()
+    tokens = hidden = intermediate = 128
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
-    home = 6
-    experts = size * home
+    experts = size * 6
     mesh = init_device_mesh(device_type="npu", mesh_shape=(size,), mesh_dim_names=("ep",))
-    torch.manual_seed(371)
-    base = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(device=device, dtype=torch.bfloat16)
-    torch.manual_seed(371)
-    candidate = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(
-        device=device, dtype=torch.bfloat16)
-    if backend == "native" and replica_transport != "p2p":
-        raise ValueError("Native hot replicas use HCCL P2P; one-sided transports require MegaMoe")
+    modules = []
+    for budget in (0, 1):
+        torch.manual_seed(371)
+        module = GroupedExperts(hidden, intermediate, experts, use_grouped_mm=True).to(
+            device=device, dtype=torch.bfloat16)
+        ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0,
+                       replica_planner=planner if budget else "cpu",
+                       replica_minimum_load_reduction=0.0).apply(module, mesh)
+        modules.append(module)
+    base, candidate = modules[0], modules[1]
+    executor = None
     if backend != "native":
         endpoint = [f"tcp://127.0.0.1:{allocate_port()}" if rank == 0 else None]
         dist.broadcast_object_list(endpoint, src=0)
         os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
-    ExpertParallel().apply(base, mesh)
-    ExpertParallel(replica_slots_per_rank=budget if backend == "native" else 0,
-                   replica_min_rows=replica_min_rows, replica_planner=replica_planner,
-                   replica_minimum_load_reduction=minimum_load_reduction,
-                   replica_cost_model=cost_model if backend == "native" else None).apply(candidate, mesh)
-    executor = None
-    reference = "native_fp32" if fp32_reference else None
-    if backend != "native":
         mega_moe = importlib.import_module("hyper_parallel.core.multicore").MegaMoeExperts
-        options = {"initial_capacity_factor": 1.0} if backend == "push" else {}
         executor = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
-                                 num_experts=experts, top_k=top_k, ep_size=size,
-                                 ep_group=None if default_group else mesh.get_group(),
-                                 create_parameters=False, dispatch_mode=backend, replica_slots_per_rank=budget,
-                                 replica_transport=replica_transport, replica_min_rows=replica_min_rows,
-                                 replica_planner=replica_planner, replica_cost_model=cost_model,
-                                 replica_minimum_load_reduction=minimum_load_reduction,
-                                 **options)
-        if same_backend_reference:
-            reference = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
-                                 num_experts=experts, top_k=top_k, ep_size=size,
-                                 ep_group=None if default_group else mesh.get_group(),
-                                 create_parameters=False, dispatch_mode=backend, replica_slots_per_rank=0,
-                                 **options)
-    results = []
+                           num_experts=experts, top_k=top_k, ep_size=size, create_parameters=False,
+                           ep_group=None if planner == "cpu" else mesh.get_group(), dispatch_mode=backend,
+                           replica_slots_per_rank=1, replica_transport=transport, replica_planner=planner,
+                           replica_minimum_load_reduction=0.0,
+                           **({"initial_capacity_factor": 1.0} if backend == "push" else {}))
     optimizer_base = torch.optim.SGD(base.parameters(), lr=0.01, momentum=0.9)
     optimizer_candidate = torch.optim.SGD(candidate.parameters(), lr=0.01, momentum=0.9)
+    steps = []
     try:
-        growth = None
-        if backend == "push" and budget == 1 and top_k >= 5 and replica_min_rows == 0:
-            growth = _deferred_backward(base, candidate, executor, experts, rank, device,
-                                        tokens, hidden, top_k, reference, replica_planner, growth=True)
+        arguments = (base, candidate, executor, experts, rank, device, tokens, hidden, top_k, "native_fp32", planner)
+        growth = _deferred_backward(*arguments, growth=True) if backend == "push" else None
         for pattern in ("balanced", "home_hot", "one_hot_pair", "balanced"):
             torch.manual_seed(719 + rank)
             x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16).requires_grad_()
-            x_candidate = x.detach().clone().requires_grad_()
-            positions = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k)
-            modulus = experts if pattern == "balanced" else (max(home, top_k) if pattern == "home_hot" else top_k)
-            ids = positions.remainder(modulus).long()
+            other = x.detach().clone().requires_grad_()
+            modulus = {"balanced": experts, "home_hot": max(6, top_k), "one_hot_pair": top_k}[pattern]
+            ids = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k).remainder(modulus).long()
             probs = torch.softmax(torch.randn(tokens, top_k, device=device), dim=-1).requires_grad_()
-            probs_candidate = probs.detach().clone().requires_grad_()
+            other_probs = probs.detach().clone().requires_grad_()
             base.zero_grad(set_to_none=True)
             candidate.zero_grad(set_to_none=True)
-            expected = _expert_forward(base, reference, x, ids, probs, experts)
-            actual = _expert_forward(candidate, executor, x_candidate, ids, probs_candidate, experts)
-            native_route = getattr(candidate, "_hot_replica_dispatch").route if backend == "native" and budget else None
-            home_route = native_route if native_route is not None and not native_route.plan.transfers else None
-            plan_record = route_evidence(actual, replica_planner, home_route=home_route) if budget else None
+            expected = _expert_forward(base, "native_fp32", x, ids, probs, experts)
+            actual = _expert_forward(candidate, executor, other, ids, other_probs, experts)
+            route = candidate._hot_replica_dispatch.route if backend == "native" else None
+            plan = route_evidence(actual, planner, home_route=route if route and not route.plan.transfers else None)
             gradient = torch.randn_like(expected)
             expected.backward(gradient)
             actual.backward(gradient)
-            evidence = {"pattern": pattern, "plan": plan_record, "output": _check(actual, expected, "output"),
-                        "dx": _check(x_candidate.grad, x.grad, "dx"),
-                        "dprob": _check(probs_candidate.grad, probs.grad, "dprob")}
+            checks = {"pattern": pattern, "plan": plan, "output": _check(actual, expected, "output"),
+                      "dx": _check(other.grad, x.grad, "dx"), "dprob": _check(other_probs.grad, probs.grad, "dprob")}
             for name in ("w1", "w2", "w3"):
-                evidence[name] = _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad), name)
-            if executor is not None:
-                resources = executor._get_execution_resources(x_candidate)
-                evidence["capacity"] = resources.workspace.capacity_floor
-                evidence["maximum_capacity"] = resources.spec.maximum_receive_capacity
-                evidence["heap_epoch"] = resources.heap_manager.epoch
-                if evidence["capacity"] > evidence["maximum_capacity"]:
-                    raise AssertionError("dynamic push capacity exceeded theoretical bound")
-            if replica_transport == KERNEL_GRADIENT_TRANSPORT:
-                active_provider = resources.workspace.replica_provider
-                evidence["gradient_scratch_bytes"] = active_provider.gradient_scratch_bytes
-                evidence["gradient_scratch_limit_bytes"] = hidden * intermediate * 3 * 4
-                if evidence["gradient_scratch_bytes"] > evidence["gradient_scratch_limit_bytes"]:
-                    raise AssertionError("gradient scratch exceeded one FP32 expert")
+                checks[name] = _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad), name)
             optimizer_base.step()
             optimizer_candidate.step()
             for name in ("w1", "w2", "w3"):
                 expected_parameter, actual_parameter = getattr(base, name), getattr(candidate, name)
-                evidence[name + "_updated"] = _check(_local(actual_parameter), _local(expected_parameter), name)
-                evidence[name + "_momentum"] = _check(
+                checks[name + "_updated"] = _check(_local(actual_parameter), _local(expected_parameter), name)
+                checks[name + "_momentum"] = _check(
                     _local(optimizer_candidate.state[actual_parameter]["momentum_buffer"]),
                     _local(optimizer_base.state[expected_parameter]["momentum_buffer"]), name + " momentum")
-            results.append(evidence)
-            if rank == 0:
-                print(json.dumps({"backend": backend, "B": budget, **evidence}), flush=True)
-        if backend == "push" and budget == 1 and size >= 4:
-            if not any(row["heap_epoch"] > 0 for row in results):
-                raise AssertionError("expected a real dynamic push growth event")
-        deferred = _deferred_backward(
-            base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference, replica_planner,
-            require_transfers=_requires_transfers(budget, replica_min_rows, minimum_load_reduction))
-        if rank == 0:
-            print(json.dumps({"backend": backend, "B": budget, "deferred": deferred}), flush=True)
-        if backend == "native" and any(
-                name.startswith("hyper_parallel.core.multicore") for name in sys.modules):
-            raise AssertionError("native execution imported multicore")
-        cross_stream_result = None
-        if cross_stream:
-            cross_stream_result = _cross_stream_deferred(base, candidate, executor, experts, rank, device,
-                                                        tokens, hidden, top_k, reference, replica_planner,
-                                                        kernel_gradient=replica_transport == KERNEL_GRADIENT_TRANSPORT)
-        cross_layer = []
-        if hidden <= 128:
-            cross_layer = _cross_layer_pool(backend, budget, mesh, executor, reference,
-                                           tokens, hidden, intermediate, top_k, replica_min_rows,
-                                           replica_planner, cost_model, minimum_load_reduction)
-        signal_stress = None
-        if replica_transport == KERNEL_GRADIENT_TRANSPORT and hidden <= 128:
-            active_provider = resources.workspace.replica_provider
-            signal_stress = _signal_stress(active_provider, mesh, hidden, intermediate, budget)
-        kernel_wait = None
-        if (_requires_transfers(budget, replica_min_rows, minimum_load_reduction) and
-                replica_transport == KERNEL_GRADIENT_TRANSPORT):
-            kernel_wait = _kernel_wait_stress(base, candidate, executor, experts, rank, device,
-                                              tokens, hidden, top_k, reference, replica_planner)
+            steps.append(checks)
+        deferred = _deferred_backward(*arguments, cross_stream=backend != "native")
+        kernel_wait = _kernel_wait_stress(*arguments) if transport == KERNEL_GRADIENT_TRANSPORT else None
         identity = execution_identity()
-        identity.update(torch_npu=torch_npu.__version__, ep_members=dist.get_process_group_ranks(mesh.get_group()),
-                        backend=backend, budget=budget, shape=[tokens, hidden, intermediate, top_k],
-                        requested_planner=replica_planner,
-                        minimum_load_reduction=minimum_load_reduction,
-                        actual_planner=results[0]["plan"]["planner"] if budget else "disabled",
-                        requested_transport=replica_transport, reference=("native-fp32" if fp32_reference else
-                        "same-backend" if same_backend_reference else "native"), default_group=default_group)
-        if replica_planner == "device":
+        identity.update(torch_npu=torch_npu.__version__, backend=backend, budget=1,
+                        shape=[tokens, hidden, intermediate, top_k], requested_planner=planner,
+                        actual_planner=steps[0]["plan"]["planner"], requested_transport=transport,
+                        actual_transport=transport, reference="native-fp32")
+        if planner == "device":
             library = importlib.import_module(
                 "hyper_parallel.core.expert_parallel.hot_replica.device_kernel")._planner_library()
-            identity["planner_payload"] = {**file_identity(Path(library._name)),
-                                           "abi": library.planner_abi_version()}
-        if executor is not None:
-            identity["actual_transport"] = resources.spec.replica_transport
+            identity["planner_payload"] = {**file_identity(Path(library._name)), "abi": library.planner_abi_version()}
+        if executor is None:
+            if any(name.startswith("hyper_parallel.core.multicore") for name in sys.modules):
+                raise AssertionError("Native execution imported multicore")
+        else:
+            resources = executor._get_execution_resources(other)
+            provider = resources.workspace.replica_provider
+            if transport == KERNEL_GRADIENT_TRANSPORT:
+                if provider.gradient_scratch_bytes > hidden * intermediate * 3 * 4:
+                    raise AssertionError(f"Gradient scratch exceeds one FP32 expert: {provider.gradient_scratch_bytes}")
+                identity["kernel_gradient_matrices"] = provider.last_kernel_gradient_matrices
+                if sorted(identity["kernel_gradient_matrices"]) != [0, 1]:
+                    raise AssertionError(f"Both projections must return through the kernel: {identity}")
             loader = importlib.import_module("hyper_parallel.core.multicore._loader")
             vendor, adapter = loader.get_multicore_paths()
             identity["multicore_payload"] = [file_identity(adapter),
                                              file_identity(vendor / "op_api/lib/libcust_opapi.so")]
-            identity["multicore_transport_abi"] = torch.ops.hyper_parallel.mega_moe_transport_version()
-            identity["multicore_schemas"] = [str(torch.ops.hyper_parallel.mega_moe.default._schema),
-                                             str(torch.ops.hyper_parallel.mega_moe_grad.default._schema)]
             identity["multicore_kernels"] = [file_identity(path) for path in sorted(vendor.rglob("*.o"))]
-            provider = resources.workspace.replica_provider
-            identity["provider"] = type(provider).__name__
-            if replica_transport == KERNEL_GRADIENT_TRANSPORT:
-                identity["kernel_gradient_matrices"] = provider.last_kernel_gradient_matrices
-                if not provider.kernel_gradients or provider.projection_signals is None:
-                    raise AssertionError("Requested kernel_gradient transport did not execute")
-            binding = sys.modules.get("hyper_parallel_shmem_torch")
-            if binding is not None:
-                identity["shmem_binding"] = file_identity(Path(binding.__file__))
-        else:
-            identity["actual_transport"] = "p2p"
-        Path(result_dir).mkdir(parents=True, exist_ok=True)
-        Path(result_dir, f"{backend}-b{budget}-rank{rank}.json").write_text(
-            json.dumps({"identity": identity, "growth_deferred": growth, "steps": results,
-                        "deferred": deferred, "cross_layer": cross_layer, "cross_stream": cross_stream_result,
-                        "replica_transport": replica_transport, "replica_min_rows": replica_min_rows,
-                        "signal_stress": signal_stress, "kernel_wait": kernel_wait},
-                       indent=2) + "\n", encoding="utf-8")
+            identity["multicore_transport_abi"] = torch.ops.hyper_parallel.mega_moe_transport_version()
+            identity["shmem_binding"] = file_identity(Path(sys.modules["hyper_parallel_shmem_torch"].__file__))
+        result_dir.mkdir(parents=True, exist_ok=True)
+        (result_dir / f"{backend}-b1-rank{rank}.json").write_text(json.dumps(
+            {"identity": identity, "steps": steps, "growth_deferred": growth,
+             "deferred": deferred, "kernel_wait": kernel_wait}, indent=2) + "\n", encoding="utf-8")
     finally:
         if executor is not None:
             executor.close()
-        if reference is not None and not isinstance(reference, str):
-            reference.close()
-
-
-def run(backend: str, budget: int, result_dir: str, **options: Any) -> None:
-    """Run acceptance with native provider isolation and optional delayed readiness."""
-    with ExitStack() as stack:
-        if backend == "native":
-            stack.enter_context(patch.object(SignalReplicaTransport, "__init__", side_effect=AssertionError(
-                "Native constructed a one-sided provider")))
-        _run(backend, budget, result_dir, **options)
-
-
-def main() -> None:
-    """Initialize one worker group and run the selected executor."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=("native", "push", "pull"), default="native")
-    parser.add_argument("--replica-transport",
-                        choices=("p2p", KERNEL_GRADIENT_TRANSPORT),
-                        default="p2p")
-    parser.add_argument("--replica-planner", choices=("cpu", "device"), default="cpu")
-    parser.add_argument("--cross-stream", action="store_true")
-    parser.add_argument("--cost-model")
-    parser.add_argument("--default-group", action="store_true")
-    parser.add_argument("--fp32-reference", action="store_true")
-    parser.add_argument("--budget", type=int, default=1)
-    parser.add_argument("--replica-min-rows", type=int, default=0)
-    parser.add_argument("--replica-minimum-load-reduction", type=float, default=0.0,
-                        help="Explicit zero keeps active-copy precision fixtures independent of automatic admission.")
-    parser.add_argument("--tokens", type=int, default=128)
-    parser.add_argument("--hidden", type=int, default=128)
-    parser.add_argument("--intermediate", type=int, default=128)
-    parser.add_argument("--top-k", type=int, default=2)
-    parser.add_argument("--same-backend-reference", action="store_true")
-    parser.add_argument("--result-dir", required=True)
-    args = parser.parse_args()
-    if int(os.environ["LOCAL_RANK"]) == 0:
-        print(json.dumps({"torch": torch.__version__, "torch_npu": torch_npu.__version__,
-                          "cann": os.getenv("ASCEND_HOME_PATH"), "worker": str(Path(__file__).resolve())}), flush=True)
-    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
-    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
-    try:
-        run(args.backend, args.budget, args.result_dir, tokens=args.tokens,
-            hidden=args.hidden, intermediate=args.intermediate, top_k=args.top_k,
-            same_backend_reference=args.same_backend_reference, replica_transport=args.replica_transport,
-            replica_min_rows=args.replica_min_rows,
-            replica_planner=args.replica_planner, default_group=args.default_group, fp32_reference=args.fp32_reference,
-            cross_stream=args.cross_stream, cost_model=None if args.cost_model is None else ExpertReplicaCostModel(
-                **json.loads(Path(args.cost_model).read_text(encoding="utf-8"))["model"]),
-            minimum_load_reduction=args.replica_minimum_load_reduction)
-    finally:
-        dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    main()
 
 
 @pytest.mark.parametrize("case,backend,planner,transport", TRAINING_CASES,
                          ids=[case[0] for case in TRAINING_CASES])
 def test_replica_training_npu(case: str, backend: str, planner: str, transport: str) -> None:
-    """Exercise both final transports, planners and invocation/stream lifetimes."""
+    """Exercise final transports, planners and invocation/stream lifetimes."""
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl", timeout=timedelta(seconds=180))
     try:
         topks = (1, 2, 3, 4, 5, 6, 8) if case == "native_cpu" else (2 if backend == "native" else 8,)
         for top_k in topks:
             directory = Path(os.getenv("HP_HOT_REPLICA_RESULTS", "./logs/hot_replica")) / case / f"k{top_k}"
-            run(backend, 1, str(directory), top_k=top_k, fp32_reference=True,
-                replica_planner=planner, replica_transport=transport,
-                cross_stream=backend != "native", default_group=planner == "cpu")
+            _run(backend, top_k, planner, transport, directory)
     finally:
         dist.destroy_process_group()

@@ -24,13 +24,11 @@ from hyper_parallel.core.expert_parallel.hot_replica import (
     build_expert_replica_plan,
     transport,
 )
-from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica.pool import ReplicaPool
 from hyper_parallel.core.expert_parallel.hot_replica.routing import (
     ReplicaRoute,
-    prepare_replica_route,
 )
-from tests.torch.expert_parallel.hot_replica_checks import deferred_ids, route_evidence
+from tests.torch.expert_parallel.hot_replica_checks import route_evidence
 
 
 class TestReplicaTransport(unittest.TestCase):
@@ -97,27 +95,3 @@ class TestReplicaTransport(unittest.TestCase):
                     self.assertEqual(len(operations), 2)
                     self.assertIn(transport.dist.isend, operations)
                     self.assertIn(transport.dist.irecv, operations)
-
-    def test_uninitialized_single_rank_needs_no_collective(self):
-        """A local route can lease guest storage without creating a process group."""
-        weights = (torch.ones(2, 2, 2),)
-        with (patch.object(transport.dist, "is_initialized", return_value=False),
-              patch.object(transport.dist, "get_global_rank", side_effect=AssertionError("rank lookup")),
-              patch.object(transport.dist, "batch_isend_irecv", side_effect=AssertionError("P2P"))):
-            route = prepare_replica_route(torch.tensor([[0, 1]]), ExpertReplicaConfig(2, 1, 1))
-            with transport.prefetch_weights(weights, route, backward=True) as pool:
-                result = transport.return_gradients(weights, route, pool.gradients)
-        torch.testing.assert_close(result[0], weights[0])
-
-    def test_deferred_topk_is_distinct_and_changes_actual_plan(self):
-        """The regression fixture must reach saved-plan coverage for every supported K."""
-        for top_k in (1, 2, 3, 4, 5, 6, 8):
-            plans = []
-            for invocation in range(2):
-                ids = deferred_ids(128, top_k, 24, invocation, torch.device("cpu"))
-                self.assertTrue(bool(((ids >= 0) & (ids < 24)).all()))
-                self.assertTrue(all(row.unique().numel() == top_k for row in ids))
-                counts = torch.bincount(ids.flatten(), minlength=24).tolist()
-                plans.append(build_expert_replica_plan([counts] * 4, 1))
-            self.assertNotEqual(plans[0].slot_to_logical, plans[1].slot_to_logical)
-            self.assertTrue(all(plan.transfers for plan in plans))

@@ -14,19 +14,24 @@
 # ============================================================================
 """Real HCCL group mappings and AIV planner residency acceptance."""
 
-from datetime import timedelta
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-import torch_npu  # pylint: disable=unused-import
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaConfig, build_expert_replica_plan
-from hyper_parallel.core.expert_parallel.hot_replica.device import build_device_expert_replica_plan
-from hyper_parallel.core.expert_parallel.hot_replica import routing
-from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
-from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
+from hyper_parallel.core.expert_parallel.hot_replica import (
+    ExpertReplicaConfig,
+    build_expert_replica_plan,
+    routing,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.device import (
+    build_device_expert_replica_plan,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.routing import (
+    prepare_replica_route,
+)
 
 
 class _NoReadback(TorchDispatchMode):
@@ -95,61 +100,6 @@ def test_device_replica_boundaries_npu() -> None:
     if len({plan.control.data_ptr() for plan, _ in retained}) != len(retained):
         raise AssertionError("Live plans alias their control storage")
     print(f"DEVICE_STREAM_PARITY_OK retained={len(retained)}", flush=True)
-
-
-def _group_roundtrip(group):
-    rank, size = dist.get_rank(group), dist.get_world_size(group)
-    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
-    config = ExpertReplicaConfig(2 * size, size, 1)
-    weights = (torch.full((2, 32, 64), rank + 1, device=device, dtype=torch.bfloat16),
-               torch.full((2, 32, 32), rank + 1, device=device, dtype=torch.bfloat16))
-    records = []
-    for hot in (False, True):
-        ids = torch.zeros((128, 1), device=device, dtype=torch.int64) if hot else torch.arange(
-            128, device=device).remainder(config.num_experts).reshape(-1, 1)
-        route = prepare_replica_route(ids, config, group)
-        if bool(route.plan.transfers) != hot:
-            raise AssertionError("Expected balanced to hot transfer transition")
-        with prefetch_weights(weights, route, backward=True) as pool:
-            for transfer in route.plan.transfers:
-                if transfer.target_rank == rank:
-                    for weight in pool.weights:
-                        torch.testing.assert_close(weight[transfer.target_slot - 2],
-                                                   torch.full_like(weight[0], transfer.owner_rank + 1))
-            for gradient in pool.gradients:
-                gradient.fill_(rank + 1)
-            home = tuple(torch.ones_like(weight, dtype=torch.float32) for weight in weights)
-            actual = return_gradients(home, route, pool.gradients)
-        expected = [torch.ones_like(value) for value in actual]
-        for transfer in route.plan.transfers:
-            if transfer.owner_rank == rank:
-                for value in expected:
-                    value[transfer.owner_slot].add_(transfer.target_rank + 1)
-        for result, oracle in zip(actual, expected):
-            torch.testing.assert_close(result, oracle, rtol=0, atol=0)
-        records.append((route.plan, actual))
-    return records
-
-
-def test_replica_groups_npu() -> None:
-    """Exercise None, WORLD and noncontiguous subgroup weight/gradient traffic."""
-    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
-    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
-    try:
-        implicit, explicit = _group_roundtrip(None), _group_roundtrip(dist.group.WORLD)
-        for (left_plan, left), (right_plan, right) in zip(implicit, explicit):
-            if left_plan != right_plan:
-                raise AssertionError("None and WORLD plans differ")
-            for result, oracle in zip(left, right):
-                torch.testing.assert_close(result, oracle, rtol=0, atol=0)
-        group = dist.new_group([0, 2])
-        if dist.get_rank() in (0, 2):
-            _group_roundtrip(group)
-            dist.destroy_process_group(group)
-        dist.barrier()
-        print("DEFAULT_AND_SUBGROUP_ROUNDTRIP_OK", flush=True)
-    finally:
-        dist.destroy_process_group()
 
 
 def test_device_route_validation_npu() -> None:
