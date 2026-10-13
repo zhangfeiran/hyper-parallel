@@ -75,6 +75,7 @@ class ShmemHeapManager:
                                          value=(configured, str(tensor.dtype), tuple(item[1] for item in reservations)))
 
     def _configure(self, configured: str | None) -> None:
+        """Validate the explicit heap limit and select the initial physical heap budget."""
         required = self.required_bytes([entry.layout for entry in self.entries])
         if configured is not None:
             try:
