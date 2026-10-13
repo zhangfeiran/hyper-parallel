@@ -26,6 +26,7 @@ from hyper_parallel.core.multicore import _automatic
 from hyper_parallel.core.multicore.modules import module as module_api
 from hyper_parallel.core.multicore.modules.mega_moe.function import _release_completed_graph
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import MegaMoeWorkspace
+from tests.common.mark_utils import arg_mark
 
 # pylint: disable=protected-access
 
@@ -90,13 +91,17 @@ class TestLifecycle(unittest.TestCase):
         member.close()
         self.assertEqual(resources.close.call_count, 2)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_remote_failure_keeps_successful_rank_registered(self):
-        """Peer resource/runtime failures retain retry ownership without double release."""
+        """Feature: remote failure keeps successful rank registered.
+        Description: Report remote failure after local resource or runtime close succeeds.
+        Expectation: Peer resource/runtime failures retain retry ownership without double release.
+        """
         for stage in (1, 2):
             member, resources = self._bind()
             release = self.manager.runtime_release = Mock()
-            self.assertEqual(module_api._retained_runtime_reference(release), 1)
-            self.assertEqual(module_api._retained_runtime_reference(Mock()), 0)
+            self.assertFalse(self.manager._runtime_released)
             failures = Mock(side_effect=[None] * (stage - 1) + ["remote failed"])
             with patch.object(_automatic, "exchange", side_effect=lambda value, failures=failures: [
                     value, failures() if value is None else value]):
@@ -104,12 +109,12 @@ class TestLifecycle(unittest.TestCase):
                     member.close()
             self.assertFalse(member._resource_closed)
             self.assertIs(self.manager.runtime_release, release)
-            self.assertEqual(module_api._retained_runtime_reference(release), int(stage == 1))
+            self.assertEqual(self.manager._runtime_released, stage == 2)
             member.close()
             release.assert_called_once_with()
             self.assertEqual(resources.close.call_count, 3 - stage)
             self.assertFalse(self.manager._groups)
-            self.assertEqual(module_api._retained_runtime_reference(release), 0)
+            self.assertIsNone(self.manager.runtime_release)
 
     def test_retained_graph_and_partial_free(self):
         """A retained graph blocks close; retry never repeats a successful free."""

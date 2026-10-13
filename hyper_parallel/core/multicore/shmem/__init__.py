@@ -29,7 +29,8 @@ from ._api import (
     wait_signal,
 )
 from ._debug import debug_state
-from ._lifecycle import acquire, release
+from ._heap_manager import get_heap_manager
+from ._lifecycle import acquire, release, retain_runtime, root_members
 
 __all__ = [
     "acquire",
@@ -39,9 +40,12 @@ __all__ = [
     "empty",
     "free",
     "get",
+    "get_heap_manager",
     "host_barrier",
     "put",
     "release",
+    "retain_runtime",
+    "root_members",
     "signal",
     "wait_signal",
 ]

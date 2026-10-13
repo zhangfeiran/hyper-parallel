@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import weakref
 from collections.abc import Mapping
@@ -41,14 +40,8 @@ from .spec import MegaMoeSpec, _resolve_receive_capacity
 _GMM_WORKSPACE_BYTES = 512
 _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
-# Physical SHMEM pages need 2 MiB alignment; the larger virtual-address
-# reservation granularity does not constrain the physical payload size.
-_HEAP_GRANULARITY_BYTES = 2 * 1024 * 1024
-
-
-def _round_up(value: int, granularity: int) -> int:
-    """Round ``value`` up to a positive ``granularity``."""
-    return (value + granularity - 1) // granularity * granularity
+_SYMMETRIC_FIELDS = ("source_buffer", "expert_buffer", "routed_buffer",
+                     "forward_event_counters", "backward_event_counters")
 
 
 def _spec_workspace_bytes(
@@ -71,56 +64,6 @@ def _spec_workspace_bytes(
     )
     event_bytes = event_workspace_bytes(specification["ep_size"], specification["num_experts"])
     return tensor_bytes + 2 * event_bytes + 4 * (_WORKSPACE_ALIGNMENT - 1)
-
-
-def configure_symmetric_heap(
-    active_specifications: tuple[Any, ...],
-    tensor: torch.Tensor,
-    *,
-    write_environment: bool = True,
-) -> int:
-    """Size the fixed SHMEM heap once for all active resource groups.
-
-    Args:
-        active_specifications: Specifications for every live compatible resource group.
-        tensor: First input tensor used to determine element size.
-        write_environment: Preserve legacy environment publication for standalone callers.
-
-    Returns:
-        Configured symmetric heap size in bytes.
-
-    Raises:
-        ValueError: If the configured heap size is invalid.
-        RuntimeError: If an explicit heap is smaller than the required workspace.
-    """
-    required_bytes = sum(
-        _spec_workspace_bytes(specification, tensor.element_size()) for specification in active_specifications
-    )
-    required_bytes = _round_up(required_bytes, _HEAP_GRANULARITY_BYTES)
-    configured = os.getenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE")
-    if configured is None:
-        if write_environment:
-            os.environ["HYPER_PARALLEL_SHMEM_HEAP_SIZE"] = str(required_bytes)
-        return required_bytes
-    try:
-        configured_bytes = int(configured)
-    except ValueError as error:
-        raise ValueError(
-            "HYPER_PARALLEL_SHMEM_HEAP_SIZE must be a positive integer number of bytes, "
-            f"got {configured!r}."
-        ) from error
-    if configured_bytes <= 0:
-        raise ValueError(
-            f"HYPER_PARALLEL_SHMEM_HEAP_SIZE must be positive, got {configured_bytes}."
-        )
-    if configured_bytes < required_bytes:
-        raise RuntimeError(
-            "HYPER_PARALLEL_SHMEM_HEAP_SIZE is too small for active MegaMoe resources: "
-            f"configured {configured_bytes} bytes, requires at least {required_bytes} bytes."
-        )
-    if configured_bytes % _HEAP_GRANULARITY_BYTES:
-        raise ValueError("HYPER_PARALLEL_SHMEM_HEAP_SIZE must be a multiple of the 2 MiB SHMEM physical page size.")
-    return configured_bytes
 
 
 @dataclass
@@ -151,6 +94,12 @@ class MegaMoeWorkspace:
     heap_manager: Any | None = field(default=None, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
+
+    def heap_state(self) -> tuple[set[int], bool, bool]:
+        """Report symmetric pointers, active use and whether physical buffers exist."""
+        tensors = (getattr(self, name) for name in _SYMMETRIC_FIELDS)
+        pointers = {tensor.data_ptr() for tensor in tensors if tensor is not None}
+        return pointers, self.in_use, self.completion_event is not None
 
     def track_graph(self, context: Any) -> None:
         """Retain a weak lease while this context can still run backward.

@@ -134,12 +134,26 @@ Runtime在初始化时冻结当前NPU设备；`empty`、`barrier`、`signal`、`
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `HYPER_PARALLEL_SHMEM_HEAP_SIZE` | 1073741824（1 GiB） | 每进程堆字节数，正整数；生命周期内固定，修改值随下一生命周期首次`acquire()`生效 |
+| `HYPER_PARALLEL_SHMEM_HEAP_SIZE` | 1073741824（1 GiB） | 直接 `acquire()` 的默认堆字节数；托管堆按下述预算规则初始化和重建 |
 | `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | 普通 WORLD / 单进程初始化的 endpoint；子组及 MegaMoE 显式 heap 初始化使用独立 unique ID |
 | `SHMEM_UID_SOCK_IFNAME` | CANN automatic selection | Optional host interface for subgroup UID bootstrap; it must be reachable by all group members across nodes |
 | `HYPER_PARALLEL_SHMEM_TIMEOUT_SEC` | 120 | Runtime 超时秒数 |
 | `HYPER_PARALLEL_SHMEM_DATA_ENGINE` | `mte` | 数据搬移引擎，首版仅支持 `mte` |
 | `HYPER_PARALLEL_SHMEM_LOG_LEVEL` | 未设置即 `2` | Runtime 日志级别：`0`=Debug（最详细；`shmem.empty` 额外在 stderr 输出直接调用点，泄漏的 Allocation 可经 `allocation_base` 回溯到代码行）、`1`=Info、`2`=Error（仅错误）；非法值回退 `2` |
+
+## 托管堆协调
+
+组件内的 `_heap_manager.py` 管理 root 的字节预留、owner 绑定、预算、epoch 和集体重建。
+使用者提供确定性布局、allocation 地址及释放/恢复操作；协调器不解释专家容量或业务 buffer 字段。
+尚未绑定的资源也计入预算；重建保留使用者的逻辑对象，只替换物理 allocation。
+
+MegaMoe 未设置堆环境变量时，按所有资源需求向上取整到 2 MiB，增长时不写入环境变量。
+显式配置同时作为初始大小和扩容上限，必须为正整数、2 MiB 对齐且足够容纳需求。
+直接 `acquire(heap_size_bytes=N)` 的有效大小由参数覆盖环境配置；native 仍先校验环境变量。
+修改环境变量不会改变已经初始化的堆或托管协调器的预算。
+
+Runtime 自身登记自动资源池保留的 root 引用。重建前必须核对所有引用和 allocation 均已纳管，
+没有活跃调用且各 rank 布局一致；释放旧堆之前的失败保留原资源，破坏旧堆后的失败禁止继续使用。
 
 ## 安全性
 

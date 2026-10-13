@@ -224,7 +224,7 @@ def _check_unknown_owner(mega: MegaMoeExperts, shape: baseline.MoeShape) -> None
     if baseline.RANK == 0:
         shmem.acquire()
     try:
-        resources.heap_manager.ensure_capacity(resources, shape.local_num_tokens * shape.top_k + 1)
+        resources.ensure_capacity(shape.local_num_tokens * shape.top_k + 1)
     except RuntimeError as error:
         assert "unmanaged SHMEM owner" in str(error), error
     else:

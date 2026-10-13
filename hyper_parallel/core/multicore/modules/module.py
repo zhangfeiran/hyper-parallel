@@ -228,20 +228,6 @@ class _MulticoreResourceManager:
 _RESOURCE_MANAGER = _MulticoreResourceManager()
 
 
-def _retained_runtime_reference(release: Callable[[], None]) -> int:
-    """Count the pool's live root reference for the matching release callback.
-
-    Args:
-        release: Runtime-specific release operation registered by the owning module.
-
-    Returns:
-        One while the automatic pool owns that runtime, otherwise zero.
-    """
-    # This helper reports the private pool pin rather than inferring it from native owner counts.
-    return int(_RESOURCE_MANAGER.runtime_release is release
-               and not _RESOURCE_MANAGER._runtime_released)  # pylint: disable=protected-access
-
-
 class MulticoreModule(torch.nn.Module):
     """Base class for Torch modules that lazily own multicore resources."""
 
