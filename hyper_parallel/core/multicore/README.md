@@ -68,9 +68,15 @@ experts = MegaMoeExperts(
 output = experts(hidden_states, topk_ids, topk_weights)
 ```
 
+`ep_group` may also be a PP/DP-local EP subgroup: pass its size as `ep_size`.
+MegaMoE uses group-local expert ownership and does not take a TP-size argument.
+Subgroups exchange independent CANN bootstrap IDs internally and do not use a
+shared WORLD rendezvous port. See the [SHMEM lifecycle](docs/shmem.md) for
+cross-node interface selection and group-local shutdown requirements.
+
 ### 输入与权重
 
-- EP 必须覆盖整个默认 world；每 rank 的 token 数 `T` 固定且为 128 的倍数，专家数 `E` 可被 EP 整除。
+- EP may be WORLD or a subgroup; per-rank token count `T` is fixed and a multiple of 128, and `E` is divisible by EP.
   执行计划采用静态 tiling，构造后的 `T/H/I/E/K/EP` 固定；其他 shape、芯片及后端需单独验证。
 - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
   ID 使用全局专家编号。
@@ -78,7 +84,10 @@ output = experts(hidden_states, topk_ids, topk_weights)
   省略时内部统计；传入时由调用方保证与当前 ID 一致。contiguous INT32 可直接使用，
   INT64 或非连续输入会转换。
 - 本地参数布局为 `gate_up_weight: [E/EP, H, 2I]`、`down_weight: [E/EP, I, H]`。
-  普通 gate/up/down 权重转换时，gate、up 分别转置后在末维拼接，down 转置最后两维。
+  内部在进入自定义 autograd Function 前对两份权重调用 `.contiguous()`：连续权重直接复用原存储，
+  转置、切片等非连续权重会逐次复制为连续布局，并通过 autograd 将梯度回传到调用方的原始权重。
+  执行器不缓存外部权重的连续副本；非连续布局每次调用都会产生复制开销。
+  普通 gate/up/down 权重转换时，gate、up 分别转置后在末维拼接，down 转置最后两维即可。
 
 Router 已有精确计数时，可直接传入：
 
@@ -91,20 +100,56 @@ output = experts(
 )
 ```
 
-### 容量
+### 通信模式与容量
 
-`expert_capacity_factor=None` 是默认值，接收容量为 `EP * T * K` 向上对齐到 128，保证 lossless。
-该容量用于各 rank 对称分配的 SHMEM 接收区。计算中间张量和待反向保存的 dispatch、
-up-projection、activation 按本 rank 本次实际接收量分配；无接收时保留一行 ABI 占位。
-源端 permute/combine 输出仍为 `T * K` 行。每次 forward 保存独立的接收数据和容量，支持后续路由变化。
+构造时通过 `dispatch_mode="push"`（默认）或 `dispatch_mode="pull"` 选择 dispatch；
+两种模式的 combine 均使用 PUT。模式必须在所有 EP rank 上一致，运行中不可修改。
+不同模式可以在同一进程中串行使用，但不能共享同一 workspace。
 
-分配前将已交换的各 rank 负载一次读取到 Host，同时用于本地定尺寸和全局溢出检查。
-这也适用于默认 lossless 模式，会增加一次 Device-to-Host 等待，以减少计算和保存区的容量余量。
-SHMEM heap 的预留仍由配置接收容量决定，不会随本次实际接收量缩小。
+push 默认从较小的接收容量开始，在路由溢出时在线扩容；配置只有两个 push 专用因子：
 
-显式设置不小于 1 的有限 factor 时，容量改为 `ceil(T * K * factor)` 再对齐。
-超过容量时，所有 EP rank 在进入 native kernel 前报 `capacity overflow`。
-应根据显存和路由负载选择容量，确保显式容量覆盖实际接收量。
+| 参数 | push 默认值 | 作用 |
+| --- | --- | --- |
+| `initial_capacity_factor` | `1.25` | 初始接收容量相对于本地 `T * K` 路由行数的倍数 |
+| `capacity_growth_factor` | `1.25` | 超限时相对于当前接收容量的增长倍数；`1.0` 表示仅满足当次需求 |
+
+两个因子都要求为有限数且不小于1。省略或传入 `None` 表示采用 push 默认值。
+pull 不需要容量因子，显式传入任一数值都会报错。旧 `expert_capacity_factor` 和 `capacity_policy` 参数已移除。
+
+```python
+# Pass these keywords alongside the model's fixed shape and EP topology.
+push_options = dict(dispatch_mode="push", initial_capacity_factor=1.25, capacity_growth_factor=1.25)
+pull_options = dict(dispatch_mode="pull")
+```
+
+初始容量为 `align128(ceil(initial_capacity_factor * T * K))`，不超过 `EP * T * K` 的保守无损上界。
+需要一次性预留最坏情况时，将 `initial_capacity_factor` 设为 EP 大小。
+当最大目的 rank 接收量 `R_max` 超过当前容量 `C` 时：
+
+```text
+C_new = min(EP * T * K, align128(max(R_max, ceil(capacity_growth_factor * C))))
+```
+
+同一 EP root 的所有 rank 完成在途工作，释放全部受管对称 buffer，finalize 旧 runtime，
+再使用 fresh bootstrap ID 初始化更大的 heap 并重建 workspace，继续本次 forward；回落时不缩容。
+该路径复用已有路由 counts，未溢出的 forward 不增加负载 collective。
+增长倍数作用于接收容量，不是整个 heap；返回区仍固定为 `T * K` 行，总 heap 向上取整到2 MiB。
+
+pull 的 SHMEM 仅包含 `T * K` 行发送区和返回区，接收区位于普通 HBM、按实际接收量分配。
+两种模式的计算中间张量和待反向保存的 dispatch、up-projection、activation 都按本 rank 实际接收量分配；
+零接收保留一行 ABI 占位。通信任务默认128行，可通过 `dispatch_split`、`combine_split` 分别配置。
+路由不丢 token，热点的普通 HBM 开销仍存在。
+
+共享层、独立的 push/pull workspace 和尚未绑定的层统一计入预算。
+逻辑 workspace 对象保持稳定，因此扩容前的 forward 支持延迟或重复 backward、checkpoint 重算及串行交替 stream。
+每个 root 要求串行执行；push 不支持图捕获，同一 root 下的其他层也不能保留使用旧地址的捕获图。
+外部持有的专家参数不属于 heap，扩容不会移动它们。
+
+若显式设置 `HYPER_PARALLEL_SHMEM_HEAP_SIZE`，物理 heap 直接按此固定预算初始化；push 只在预算内增加逻辑容量。
+当增长余量放不下、而实际需求能放下时，退到最小必要容量。预算不足、未知 owner/allocation 或活动租约
+会在销毁前阻止扩容；开始释放后若重建失败，runtime 不可继续使用，需退出并重启训练进程。
+自动预算不写入环境变量；实际大小读取 `shmem.debug_state()["config"]["heap_size_bytes"]`。
+扩容有一次性同步和初始化开销，可通过增加初始因子或增长因子减少重建次数。
 
 ### 资源共享与关闭
 
@@ -115,11 +160,11 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.la
 ```
 
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
-checkpoint/recompute 和 `retain_graph=True` 暂未验证。默认由运行时托管 workspace，无需显式
+两条路径已验证 non-reentrant checkpoint 和 `retain_graph=True`。默认由运行时托管 workspace，无需显式
 关闭。模块 GC 仅登记使用权释放，不执行 collective；下一个资源组
-首次 forward 时，所有 WORLD rank 一起核对资源表，只复用各 rank 都无成员且无待反向图的兼容
+首次 forward 时，所有 SHMEM Root rank 一起核对资源表，只复用各 rank 都无成员且无待反向图的兼容
 workspace，其余可回收的孤儿 workspace 当场释放。此协调不在已绑定模型的每步 forward 中执行。
-GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图引用仍会占用内存，固定 SHMEM 堆上限不变。
+GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图引用仍会占用内存，heap 受显式预算或物理 HBM 容量约束。
 
 自动清理适配在首次绑定时安装：拦截 Torch `ProcessGroup.shutdown`（旧版本使用
 `distributed_c10d._shutdown_backend`），在 WORLD 或 SHMEM Root 被关闭前先回收资源。
@@ -130,7 +175,7 @@ GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图�
 不承诺安全或及时退出，不从 signal handler 中执行 collective；SIGKILL 无法执行退出钩子。
 
 需要提前释放时，仍可调用原有 `MegaMoeExperts.close()`，示例中的 `model.close()` 保持逐层关闭；
-共享 workspace 在最后一个成员关闭时才释放，不释放普通模型参数。所有 WORLD rank 须在无在途
+共享 workspace 在最后一个成员关闭时才释放，不释放普通模型参数。所有 SHMEM Root rank 须在无在途
 调用及待反向图时同序关闭。关闭失败会保留句柄供安全条件下重试，部分关闭的模块不能再次执行。
 只有所有 rank 均成功后才移除资源记录；对称内存部分释放状态不一致或原生 shutdown 失败须重启。
 自动清理失败会阻止显式通信域销毁继续执行；进程退出时仅记录失败并继续框架退出流程，不能保证释放成功。
@@ -139,6 +184,8 @@ SHMEM Python层以进程级引用计数统一管理Runtime生命周期。每个M
 内部`shmem.acquire()`，关闭时在workspace释放全部对称Tensor后调用一次`shmem.release()`；
 `share_execution_resources`的相同配置层共享同一组及workspace，因此只形成一个资源组SHMEM引用。
 资源池另外持有一个Runtime引用，使不同配置的孤儿workspace替换不会触发Runtime反复终结/重建；
+该引用存活时保留原 heap manager；更大模型首次绑定会根据实际物理 heap 容量集体扩容，
+包括旧 owner 已全部回收后的 push 或 pull 模型替换。
 显式关闭全部已绑定资源或自动关停时释放该引用。非最后一个
 `release()`只减少本地计数，进程内最后一个引用才执行跨rank关闭（仅丢弃模块对象不会触发释放）。未来
 MegaMHC、MegaDSA等Multicore特性复用同一SHMEM Runtime时，也通过同一配对接口共享这套进程级计数，

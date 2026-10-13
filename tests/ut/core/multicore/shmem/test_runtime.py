@@ -19,10 +19,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 from hyper_parallel.core.multicore.shmem import _lifecycle
+from tests.common.mark_utils import arg_mark
 
 
+# These tests deliberately inspect the private state machine and mocked native entry points.
 class TestRuntimeLifecycle(unittest.TestCase):
     """Validate lifecycle coordination without Torch distributed or NPU hardware."""
+
+    # pylint: disable=protected-access
 
     def setUp(self) -> None:
         """Install deterministic framework and Native boundaries."""
@@ -34,12 +38,17 @@ class TestRuntimeLifecycle(unittest.TestCase):
             get_process_group_ranks=Mock(return_value=[0, 1]),
             get_rank=Mock(return_value=0),
             barrier=Mock(),
+            broadcast_object_list=Mock(),
+            all_gather_object=Mock(
+                side_effect=lambda output, value, **_kw: output.__setitem__(slice(None), [value] * 2)),
         )
         self.torch = SimpleNamespace(npu=SimpleNamespace(synchronize=Mock()))
         self.native = SimpleNamespace(
             _initialize=Mock(),
+            _get_unique_id=Mock(return_value=b"group-bootstrap"),
             _validate_shutdown=Mock(),
             _shutdown=Mock(),
+            _debug_state=Mock(return_value={"config": {"heap_size_bytes": 128}}),
         )
         self.framework_patch = patch.object(_lifecycle, "_torch_modules", return_value=(self.torch, self.dist))
         self.native_patch = patch.object(_lifecycle, "_load_native", return_value=self.native)
@@ -53,9 +62,12 @@ class TestRuntimeLifecycle(unittest.TestCase):
     @staticmethod
     def _reset_runtime() -> None:
         """Reset private process state after each isolated test."""
+        _lifecycle._retained_users = 0  # pylint: disable=protected-access
         _lifecycle._users = 0  # pylint: disable=protected-access
         _lifecycle._root_group = None  # pylint: disable=protected-access
         _lifecycle._root_uses_distributed = None  # pylint: disable=protected-access
+        _lifecycle._root_ranks = None  # pylint: disable=protected-access
+        _lifecycle._root_size = None  # pylint: disable=protected-access
         _lifecycle._shutdown_failed = False  # pylint: disable=protected-access
 
     def test_single_process_runtime_is_reference_counted(self) -> None:
@@ -108,12 +120,49 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.dist.get_process_group_ranks.side_effect = ranks
         _lifecycle.acquire(self.world)
 
-        with self.assertRaisesRegex(RuntimeError, "complete Torch WORLD"):
+        with self.assertRaisesRegex(RuntimeError, "different ordered membership"):
             _lifecycle.acquire(different_group)
 
         self.native._initialize.assert_called_once_with(0, 2)
         self.assertEqual(_lifecycle._reference_count(), 1)  # pylint: disable=protected-access
         _lifecycle.release()
+
+    def test_subgroup_uses_local_coordinates_and_isolated_bootstrap(self) -> None:
+        """Keep root/peer bootstrap group-local and propagate root failure without a reference."""
+        group = object()
+        self.dist.get_process_group_ranks.return_value = [2, 5]
+        self.dist.get_world_size.return_value = 8
+        for rank, failure in ((0, None), (1, None), (0, RuntimeError("UID unavailable"))):
+            self.dist.get_rank.return_value = rank
+            self.native._get_unique_id.side_effect = failure
+            self.native._initialize.reset_mock()
+            self.dist.broadcast_object_list.side_effect = (
+                lambda payload, peer_rank=rank, **unused_kwargs:
+                payload.__setitem__(0, b"group-bootstrap") if peer_rank else None)
+            if failure:
+                with self.assertRaisesRegex(RuntimeError, "UID unavailable"):
+                    _lifecycle.acquire(group)
+                self.native._initialize.assert_not_called()
+            else:
+                _lifecycle.acquire(group)
+                self.native._initialize.assert_called_once_with(rank, 2, b"group-bootstrap")
+                _lifecycle._host_barrier()  # pylint: disable=protected-access
+                _lifecycle.release()
+                self.dist.barrier.assert_called_with(group=group)
+            self.assertEqual(_lifecycle._reference_count(), 0)  # pylint: disable=protected-access
+            payload = [None, f"RuntimeError: {failure}"] if failure else [b"group-bootstrap", None]
+            self.dist.broadcast_object_list.assert_called_with(
+                payload, src=2, group=group)
+
+    def test_nonmember_is_rejected_before_any_collective(self) -> None:
+        """Reject nonmembers locally instead of entering a foreign EP collective."""
+        self.dist.get_rank.return_value = -1
+        with self.assertRaisesRegex(RuntimeError, "must belong"):
+            _lifecycle.acquire(object())
+        self.dist.barrier.assert_not_called()
+        self.dist.broadcast_object_list.assert_not_called()
+        self.dist.get_process_group_ranks.assert_not_called()
+        self.native._initialize.assert_not_called()
 
     def test_distributed_state_change_is_rejected(self) -> None:
         """Keep the framework mode fixed throughout one active lifecycle."""
@@ -249,10 +298,92 @@ class TestRuntimeLifecycle(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Native shutdown failure"):
             _lifecycle.acquire()
 
+    def test_explicit_heap_and_collective_reinitialize(self) -> None:
+        """Keep references and obtain a fresh bootstrap ID only after finalization."""
+        for invalid in (True, 0, -1, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _lifecycle.acquire(heap_size_bytes=invalid)
+        _lifecycle.acquire(heap_size_bytes=64)
+        self.native._initialize.assert_called_once_with(0, 2, b"group-bootstrap", 64)
+        _lifecycle.acquire(heap_size_bytes=128)
+        with self.assertRaisesRegex(RuntimeError, "smaller"):
+            _lifecycle.acquire(heap_size_bytes=256)
+        ordered = Mock()
+        for name in ("_validate_shutdown", "_shutdown", "_get_unique_id", "_initialize"):
+            ordered.attach_mock(getattr(self.native, name), name)
+        self.native._get_unique_id.return_value = b"fresh-bootstrap"
+        timings = _lifecycle._reinitialize(256)
+        self.assertEqual(ordered.mock_calls, [call._validate_shutdown(), call._shutdown(),
+                                            call._get_unique_id(), call._initialize(0, 2, b"fresh-bootstrap", 256)])
+        self.assertEqual(set(timings), {"finalize_ms", "bootstrap_ms", "initialize_ms"})
+        self.assertEqual(_lifecycle._reference_count(), 2)
+        self.assertIs(_lifecycle._root_group, self.world)
+        _lifecycle.release()
+        _lifecycle.release()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_reinitialize_converges_peer_failure_before_next_stage(self) -> None:
+        """Feature: reinitialize converges peer failure before next stage.
+        Description: Report a peer finalize failure before obtaining a new bootstrap ID.
+        Expectation: Stop before bootstrap on a peer finalize failure and poison all later API use.
+        """
+        _lifecycle.acquire()
+        self.dist.all_gather_object.side_effect = (
+            lambda output, value, **_kw: output.__setitem__(slice(None),
+                                                          [value, (value[0], "peer finalize failed")]
+                                                          if self.native._shutdown.called else [value] * 2))
+        with self.assertRaisesRegex(RuntimeError, "peer finalize failed"):
+            _lifecycle._reinitialize(256)
+        self.native._get_unique_id.assert_not_called()
+        self.assertEqual(self.native._initialize.call_count, 1)
+        self.assertEqual(_lifecycle._reference_count(), 1)
+        self.assertTrue(_lifecycle._shutdown_failed)
+        for operation in (_lifecycle.acquire, _lifecycle.release,
+                          _lifecycle._runtime_access(Mock())):
+            with self.assertRaises(RuntimeError):
+                operation()
+
     def test_release_without_reference_is_rejected(self) -> None:
         """Expose an unmatched release instead of silently underflowing the user count."""
         with self.assertRaisesRegex(RuntimeError, "no active reference"):
             _lifecycle.release()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_retained_reference_commits_only_after_success(self) -> None:
+        """Feature: retained reference commits only after success.
+        Description: Retain a root pin and fail its final release before retrying.
+        Expectation: Distinguish a registered root pin from ordinary owners and retain failed-release ownership.
+        """
+        _lifecycle.acquire()
+        release_pin = _lifecycle.retain_runtime(self.world)
+        self.assertEqual(_lifecycle._retained_users, 1)
+        self.assertEqual(_lifecycle._reference_count(), 2)
+        _lifecycle.release()
+        self.native._validate_shutdown.side_effect = RuntimeError("busy")
+        with self.assertRaisesRegex(RuntimeError, "busy"):
+            release_pin()
+        self.assertEqual(_lifecycle._retained_users, 1)
+        self.assertEqual(_lifecycle._reference_count(), 1)
+        self.native._validate_shutdown.side_effect = None
+        release_pin()
+        self.assertEqual(_lifecycle._retained_users, 0)
+        self.assertEqual(_lifecycle._reference_count(), 0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_explicit_default_group_does_not_select_the_active_subgroup(self) -> None:
+        """Feature: Default-root collective selection.
+        Description: Check WORLD layout while another subgroup owns the native Runtime.
+        Expectation: Explicit None selects WORLD; an omitted group selects the active root.
+        """
+        subgroup = object()
+        with patch.object(_lifecycle, "_root_group", subgroup):
+            _lifecycle._reconfiguration_stage(Mock(), group=None, value="world layout")
+            self.assertIsNone(self.dist.all_gather_object.call_args.kwargs["group"])
+            _lifecycle._reconfiguration_stage(Mock())
+            self.assertIs(self.dist.all_gather_object.call_args.kwargs["group"], subgroup)
 
 
 if __name__ == "__main__":

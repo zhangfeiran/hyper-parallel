@@ -99,6 +99,9 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
         tsv: Task split values for the target topology.
         rank_id: Rank-local identifier.
         num_cube_cores: Available cube-core count.
+
+    Returns:
+        Validated runtime image including transport handshakes and profiler metadata.
     """
     cfg = allocate_graph_config(graph, tsv)
     cfg.num_workers    = 2 * num_cube_cores   # NUM_WORKERS_VECTOR = 2 × NUM_WORKERS_CUBE
@@ -117,7 +120,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     swiglu_op   = graph.get_op("swiglu")
     combine_op  = graph.get_op("combine")
     add_terminate(cfg, tsv, combine_op.task_num // tsv.ep * tsv.ep)
-    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_op.task_num)
+    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_op.task_num, combine_op.task_num)
     add_dynamic_data(cfg, tsv, dynamic_input_position=6)
 
     cfg.task_num = task_num_all

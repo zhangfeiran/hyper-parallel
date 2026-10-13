@@ -153,7 +153,7 @@ class _MulticoreResourceManager:
 
     @staticmethod
     def _exchange(value: Any) -> list[Any]:
-        """Exchange lifecycle metadata on the complete distributed world."""
+        """Exchange lifecycle metadata on the registered communication root."""
         return _automatic.exchange(value)
 
     def close_groups(self, groups: Iterable[_ExecutionResourceGroup] | None = None) -> None:
@@ -349,9 +349,9 @@ class MulticoreModule(torch.nn.Module):
         binding = self._execution_binding(tensor)
         if group.resources is None:
             group.module_type = type(self)
+            _automatic.register(_RESOURCE_MANAGER.close_groups, self._root_group())
             _RESOURCE_MANAGER.recycle(group, binding, self._resource_signature(tensor))
         if group.resources is None:
-            _automatic.register(_RESOURCE_MANAGER.close_groups, self._root_group())
             active_specs = _RESOURCE_MANAGER.active_specifications(group.scope_key)
             group.resources = self._create_execution_resources(
                 tensor,

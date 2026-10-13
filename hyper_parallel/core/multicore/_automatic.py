@@ -27,15 +27,16 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def exchange(value: Any) -> list[Any]:
-    """Exchange cold-path lifecycle metadata across the complete world.
+    """Exchange cold-path lifecycle metadata across the registered root.
 
     Args:
         value: Picklable local lifecycle state.
     """
     if not dist.is_initialized():
         return [value]
-    values = [None] * dist.get_world_size()
-    dist.all_gather_object(values, value)
+    group = _CLEANUP.root_group
+    values = [None] * dist.get_world_size(group)
+    dist.all_gather_object(values, value, group=group)
     return values
 
 
@@ -64,6 +65,7 @@ class _Cleanup:
         self.callback: Optional[Callable[[], None]] = None
         self.dependencies: set[Any] = set()
         self.installed = False
+        self.root_group: Any = None
 
     def close(self) -> None:
         """Keep both the callback and communication available if release fails."""
@@ -119,8 +121,9 @@ def register(callback: Callable[[], None], root_group: Any) -> None:
 
     Args:
         callback: Collective release operation; failures must preserve ownership.
-        root_group: SHMEM Root dependency, in addition to WORLD metadata exchange.
+        root_group: SHMEM Root dependency and lifecycle metadata group.
     """
     _CLEANUP.install()
+    _CLEANUP.root_group = root_group
     _CLEANUP.callback = callback
     _CLEANUP.dependencies.update(group for group in (root_group, dist.group.WORLD) if group is not None)
