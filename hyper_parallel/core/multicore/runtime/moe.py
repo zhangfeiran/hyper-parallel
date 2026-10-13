@@ -19,10 +19,11 @@ from __future__ import annotations
 import json
 import struct
 from copy import deepcopy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 from hyper_parallel.core.multicore.compiler.moe import MoeRecipe
+from hyper_parallel.core.multicore.compiler.events import attach_event_graphs
 from hyper_parallel.core.multicore.ir.events import EventGraphIR
 from hyper_parallel.core.multicore.ir.program import SourceSpan
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
@@ -79,7 +80,25 @@ class MoeKernelPlan:
             Existing MegaMoePlan, consumed by the original autograd/workspace path.
         """
         verify_moe_native()
-        return build_mega_moe_plan(self.spec, device, forward_graph_factory=self.recipe.build_graph)
+        plan = build_mega_moe_plan(self.spec, device, forward_graph_factory=self.recipe.build_graph,
+                                  runtime_config_validator=self.validate_runtime_configs)
+        sources = tuple(graph.count_source for graph in self.event_graphs[:2])
+        return replace(plan, count_sources=sources)
+
+    def validate_runtime_configs(self, configs: tuple[Any, ...]) -> None:
+        """设备拷贝前核对重建镜像，防止执行计划绕过前端动态域与事件绑定。
+
+        Args:
+            configs: 既有 materialize 路径重建的前向、反向与可选回退配置。
+        """
+        images = tuple(image for image in (self.forward, self.backward, self.backward_no_replica) if image is not None)
+        if len(images) != len(configs) or attach_event_graphs(self).event_graphs != self.event_graphs:
+            raise ValueError("MoE materialization differs from the compiled bounded event plan")
+        for image, config in zip(images, configs):
+            runtime = _prepare_mega_kernel_runtime_config(
+                config, tensor_factory=bytes, profile_tensor_factory=bytes, rank=self.spec.rank_id, device_id=0)
+            if runtime.normal_tensor != image.normal:
+                raise ValueError("MoE materialization rebuilt a different native runtime image")
 
     def export_manifest(self) -> dict[str, object]:
         """Export capacities, physical bindings, source identity and the explicit backward boundary."""
@@ -122,11 +141,11 @@ def compile_moe_plan(recipe: MoeRecipe, spec: MegaMoeSpec) -> MoeKernelPlan:
         overlap = deepcopy(regular)
         if prepare_w13_overlap_schedule(overlap, spec.local_experts, spec.num_cube_cores):
             backward, fallback = overlap, regular
-    return MoeKernelPlan(
+    return attach_event_graphs(MoeKernelPlan(
         recipe, spec, _image(forward, forward_graph, recipe, False, spec),
         _image(backward, backward_graph, recipe, True, spec),
         _image(fallback, backward_graph, recipe, True, spec) if fallback is not None else None,
-    )
+    ))
 
 
 def _image(config, graph, recipe, backward, spec):

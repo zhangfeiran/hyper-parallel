@@ -4,7 +4,7 @@
 [MegaFFN 训练接入](MEGAFFN.md)。
 
 MoE、MHC 和 Gate 的统一任务域、事件张量与静态依赖验证见
-[静态任务域与事件张量 IR](EVENT_TENSORS.md)。
+[任务域与事件张量 IR](EVENT_TENSORS.md)。
 
 这里实现了 2026-10-07 AST 设计中的语义前端基础，覆盖带类型的源码捕获、基于身份的原语规范（schema）、
 ProgramIR、CPU 参考解释执行、Gate WorkerPipeline 计划，以及 MoE/MHC TaskDAG 计划。

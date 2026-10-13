@@ -21,6 +21,8 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from math import prod
 
+from hyper_parallel.core.multicore.ir.dynamic_events import MoeCountSourceIR, MoeTaskDomainIR
+
 
 def domain_size(shape: tuple[int, ...]) -> int:
     """校验静态任务域并返回元素数；零维长度表示空域。
@@ -149,6 +151,7 @@ class TaskGridIR:
     waits: EventIndexMap
     notifies: EventIndexMap
     notification: str = "local"
+    dynamic_domain: MoeTaskDomainIR | None = None
 
     def __post_init__(self) -> None:
         count = domain_size(self.shape)
@@ -162,6 +165,9 @@ class TaskGridIR:
             raise ValueError("Event maps must share their task grid domain")
         if self.notification not in ("local", "native_transport"):
             raise ValueError("Unknown task event publication scope")
+        if self.dynamic_domain is not None and (
+                self.dynamic_domain.shape != self.shape or self.notification != "local"):
+            raise ValueError("MoE dynamic work domains require matching local task grids")
 
 
 @dataclass(frozen=True)
@@ -208,6 +214,7 @@ class EventGraphIR:
     queues: tuple[WorkerQueueIR, ...]
     boundaries: tuple[EventBoundaryIR, ...] = ()
     worker_counts: tuple[tuple[str, int], ...] = ()
+    count_source: MoeCountSourceIR | None = None
 
     def __post_init__(self) -> None:
         if self.family not in ("gate", "mhc", "moe") or self.direction not in (
@@ -225,6 +232,16 @@ class EventGraphIR:
         self._check_queues()
         self._check_counts()
         self._check_workers()
+        self._check_dynamic_domains()
+
+    def _check_dynamic_domains(self) -> None:
+        domains = tuple(grid.dynamic_domain for grid in self.grids if grid.dynamic_domain is not None)
+        if domains and (self.family != "moe" or self.count_source is None):
+            raise ValueError("Dynamic task domains require a MoE prefix count source")
+        if self.count_source is not None and (self.family != "moe" or not domains):
+            raise ValueError("MoE count sources require dynamic task domains")
+        if any(domain.shape[0] != self.count_source.expert_count for domain in domains):
+            raise ValueError("Dynamic task experts differ from the count source")
 
     def _check_workers(self) -> None:
         if not isinstance(self.worker_counts, tuple):
@@ -319,7 +336,27 @@ class EventGraphIR:
             progress = True
         return progress
 
+    def resolve_dynamic_events(self, prefix: tuple[int, ...]) -> dict[str, object]:
+        """用显式主机计数快照解析有效工作与预留事件，空任务保留等待和通知。
+
+        Args:
+            prefix: 原生 group_list 的诊断快照；本方法不会读取设备张量。
+        """
+        if self.count_source is None:
+            raise ValueError("Dynamic event resolution requires a bounded MoE count source")
+        grids = {}
+        counts = self.count_source.counts(prefix)
+        for grid in self.grids:
+            if grid.dynamic_domain is not None:
+                spans = grid.dynamic_domain.row_intervals(self.count_source, prefix)
+                grids[grid.name] = {"row_intervals": spans, "active_work": tuple(begin < end for begin, end in spans),
+                                    "waits": grid.waits.values(), "notifies": grid.notifies.values()}
+        return {"count_validation": "explicit_host_snapshot", "expert_counts": counts, "grids": grids,
+                "empty_task_notification": "preserve_reserved_tasks"}
+
     def export_manifest(self) -> dict[str, object]:
         """导出可审查的任务域、事件映射与边界，不声称设备放行。"""
-        return {"format_version": 1, "status": "static_compatibility_ir", "counter_semantics": "zero_to_threshold",
+        status = "bounded_dynamic_compatibility_ir" if self.count_source is not None else "static_compatibility_ir"
+        return {"format_version": 2, "status": status, "counter_semantics": "zero_to_threshold",
+                "empty_task_notification": "preserve_reserved_tasks",
                 **asdict(self)}

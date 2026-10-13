@@ -19,8 +19,10 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
+from hyper_parallel.core.multicore.backends.dynamic_events import bind_moe_dynamic_events
 from hyper_parallel.core.multicore.ir.events import EventGraphIR
 from hyper_parallel.core.multicore.runtime.abi import FamilyABI, family_abi
+from hyper_parallel.core.multicore.runtime.mhc_abi import FAST_DEPENDENCY_POLL_INTERVAL_US, MhcTaskType
 
 INVALID_EVENT = 0xFFFFFFFF
 
@@ -146,6 +148,9 @@ def lower_event_fields(graph: EventGraphIR, template: bytes) -> bytes:
         template: 保存数值任务、队列、通信与性能记录内容的原生镜像。
     """
     view = decode_event_wire(graph.family, template)
+    if graph.count_source is not None:
+        if bind_moe_dynamic_events(graph, template, view, graph.count_source) != graph:
+            raise ValueError("MoE dynamic event mapping differs from the native reserved task contract")
     _check_placement(graph, view, template)
     bindings = _bindings(graph)
     if graph.mode == "worker_pipeline" and graph.event_tensor is not None:
@@ -214,3 +219,26 @@ def lower_mhc_worker_queues(graph: EventGraphIR, template: bytes) -> bytes:
         for index, task in enumerate(actual.get(("vector", worker), ())):
             struct.pack_into("<i", data, offset + (worker + index * workers) * 4, task)
     return lower_event_fields(graph, bytes(data))
+
+
+def lower_mhc_final_polling(graph: EventGraphIR, template: bytes) -> bytes:
+    """对实验队列的 Final 使用原生已有短轮询字段，不改数值、通知或阈值。
+
+    Args:
+        graph: 已降级并校验所有权的 MHC 反向事件图。
+        template: 对应队列的普通或 profiling 镜像。
+    """
+    if graph.family != "mhc" or graph.direction != "backward" or graph.boundaries:
+        raise ValueError("Fast dependency polling requires a local MHC backward graph")
+    view = decode_event_wire("mhc", template)
+    lower_event_fields(graph, template)
+    finals = tuple(task for grid in graph.grids if grid.name == "mhc_grad_prev_x_and_post"
+                   for task in grid.native_tasks)
+    if not finals or any(view.task_types[task] != MhcTaskType.TASK_MHC_GRAD_PREV_X_AND_POST for task in finals):
+        raise ValueError("Fast dependency polling requires the native MHC Final task operation")
+    data = bytearray(template)
+    task_abi = view.abi.structure("TaskDescC")
+    for task in finals:
+        offset = view.task_offset + task * task_abi.size + task_abi.offset("extra_value_2")
+        struct.pack_into("<I", data, offset, FAST_DEPENDENCY_POLL_INTERVAL_US)
+    return bytes(data)

@@ -365,6 +365,7 @@ def _launch_forward_kernel(
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
+    plan.validate_group_list(metadata.group_list, routed_tokens.device)
     multicore_ops.mega_moe_with_profile_buffer(
         execution.dispatch,
         metadata.dispatch_target_off * spec.hidden_size,
@@ -408,6 +409,7 @@ def _launch_backward_kernel(
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
+    plan.validate_group_list(saved.group_list, grad_output.device, backward=True)
     gradients = execution.intermediates
     multicore_ops.mega_moe_grad_with_profile_buffer(
         execution.dispatch,
@@ -447,6 +449,15 @@ def _launch_backward_kernel(
         spec.hidden_size,
         spec.local_num_tokens,
     )
+
+
+def _claim_forward_workspace(workspace, spec, routed_tokens, workspace_claimed):
+    if workspace_claimed:
+        if not workspace.in_use:
+            raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
+    else:
+        workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
+        workspace.claim()
 
 
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
@@ -498,12 +509,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 permutation_inputs = (unpermute_mapping,)
         ctx.has_permutation = permutation is not None
         ctx.has_unpermute = topk_weights is not None
-        if workspace_claimed:
-            if not workspace.in_use:
-                raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
-        else:
-            workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
-            workspace.claim()
+        _claim_forward_workspace(workspace, spec, routed_tokens, workspace_claimed)
         has_replica_transfers = ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers)
         profile_call = None
         leases = ExitStack()

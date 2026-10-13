@@ -23,7 +23,8 @@ from tests.common.mark_utils import arg_mark
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="onecard", essential_mark="essential")
-@pytest.mark.parametrize("event_schedule", ["compatibility", "mhc_backward_overlap"])
+@pytest.mark.parametrize("event_schedule", ["compatibility", "mhc_backward_overlap", "mhc_backward_wavefront",
+                                            "mhc_backward_wavefront_fast"])
 def test_ast_mhc_device(event_schedule: str) -> None:
     """Feature: AST MHC device admission.
 

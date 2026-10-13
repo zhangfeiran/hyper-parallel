@@ -154,22 +154,27 @@ class TestMegaMoeFunction(unittest.TestCase):
             with self.subTest(pull=pull):
                 self._check_deferred_backward(permuted=False, pull=pull, empty_replica_route=True)
 
-    def _check_deferred_backward(
-        self, *, permuted: bool, input_grad: bool = True, reuse: bool = False, pull: bool = False,
-        empty_replica_route: bool = False,
-    ) -> None:
-        """Exercise delayed backward with an optional input permutation boundary."""
+    @staticmethod
+    def _deferred_plan(pull, reuse, empty_replica_route):
         spec = SimpleNamespace(replica_slots_per_rank=int(empty_replica_route), hidden_size=4,
                                intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
                                dispatch_mode="pull" if pull else "push")
-        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=reuse)
+        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=reuse, validate_group_list=Mock())
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
         runtime = SimpleNamespace(normal_tensor=torch.empty(16, dtype=torch.uint8) if empty_replica_route else None)
         plan.fwd_runtime = runtime
         plan.bwd_runtime = runtime
+        return plan
+
+    def _check_deferred_backward(
+        self, *, permuted: bool, input_grad: bool = True, reuse: bool = False, pull: bool = False,
+        empty_replica_route: bool = False,
+    ) -> None:
+        """Exercise delayed backward with an optional input permutation boundary."""
+        plan = self._deferred_plan(pull, reuse, empty_replica_route)
         workspace = Mock(
             replica_inbox=None,
             replica_provider=None,

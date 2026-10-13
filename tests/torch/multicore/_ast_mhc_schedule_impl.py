@@ -100,7 +100,7 @@ def run_benchmark(policy: str, result_dir: str, iterations: int = 20, warmup: in
     """测量独立训练轨迹、完整 step 和已分配 HBM，不混用 profiling 时间。
 
     Args:
-        policy: compatibility 或 mhc_backward_overlap。
+        policy: compatibility、mhc_backward_overlap 或 mhc_backward_wavefront。
         result_dir: 当前独立进程的结果目录。
         iterations: 每个计时块的完整 step 数。
         warmup: 计时前的完整 step 数。
@@ -123,7 +123,9 @@ def run_benchmark(policy: str, result_dir: str, iterations: int = 20, warmup: in
 def main() -> None:
     """在已激活匹配原生产物的独立设备进程中执行。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--policy", choices=("compatibility", "mhc_backward_overlap"), required=True)
+    parser.add_argument("--policy", choices=("compatibility", "mhc_backward_overlap", "mhc_backward_wavefront",
+                                             "mhc_backward_wavefront_fast"),
+                        required=True)
     parser.add_argument("--result-dir", required=True)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)

@@ -63,6 +63,8 @@ from hyper_parallel.core.multicore.profiler.profiling import (
 )
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
+from hyper_parallel.core.multicore.ir.dynamic_events import MoeCountSourceIR
+
 from .spec import MegaMoeSpec
 
 
@@ -85,6 +87,18 @@ class MegaMoePlan:
     replica_w2_events: tuple[int, ...] = ()
     replica_w13_events: tuple[int, ...] = ()
     bwd_runtime_no_replica: _PreparedMegaKernelRuntime | None = None
+    count_sources: tuple[MoeCountSourceIR, ...] = ()
+
+    def validate_group_list(self, tensor: torch.Tensor, device: Any, *, backward: bool = False) -> None:
+        """为 AST 计划校验借用计数张量的元数据；计数值留在设备上。
+
+        Args:
+            tensor: 现有路由产生并交给 worker 的 group_list。
+            device: 当前 kernel 的输入设备。
+            backward: 选择反向 ABI 计数来源。
+        """
+        if self.count_sources:
+            self.count_sources[int(backward)].validate_device_binding(tensor, device)
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -210,6 +224,7 @@ def _prepare_runtimes(
 
 def build_mega_moe_plan(
     spec: MegaMoeSpec, device: Any, *, forward_graph_factory: Callable | None = None,
+    runtime_config_validator: Callable | None = None,
 ) -> MegaMoePlan:
     """Build trimmed dense forward/backward runtime images without fusion slots.
 
@@ -217,6 +232,7 @@ def build_mega_moe_plan(
         spec: Validated local-token and expert topology specification.
         device: NPU device receiving serialized descriptors and tiling tensors.
         forward_graph_factory: Optional compiler-provided graph preserving the native fill/finalize contract.
+        runtime_config_validator: Optional frontend check before copying rebuilt runtime images to the device.
 
     Returns:
         Rank-local forward and backward runtime resources.
@@ -230,6 +246,8 @@ def build_mega_moe_plan(
         if prepare_w13_overlap_schedule(overlap_config, spec.local_experts, spec.num_cube_cores):
             configs = (forward_config, overlap_config, backward_config)
             backward_config = overlap_config
+    if runtime_config_validator is not None:
+        runtime_config_validator(configs)
     fwd_runtime, bwd_runtime, *fallback = _prepare_runtimes(spec, configs, device)
     gmm_options = {
         "hidden_size": spec.hidden_size,

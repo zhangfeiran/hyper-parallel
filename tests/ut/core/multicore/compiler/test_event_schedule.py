@@ -36,6 +36,63 @@ def _owners(image):
 class TestEventSchedule(unittest.TestCase):
     """受限队列变换不会改变数值任务、计数和 scratch 的 worker 归属。"""
 
+    def test_fast_wavefront_changes_only_final_poll_fields(self):
+        """普通/profiling 描述符仅在 Final 的已有 extra_value_2 字段改变轮询间隔。"""
+        spec = MhcSpec(12000, 128, 20, 96, 96)
+        normal = mhc_boundary.plan(spec, event_schedule="mhc_backward_wavefront")
+        fast = mhc_boundary.plan(spec, event_schedule="mhc_backward_wavefront_fast")
+        self.assertEqual(normal.event_graphs, fast.event_graphs,
+                         f"actual_graphs={len(fast.event_graphs)}, expected_graphs={len(normal.event_graphs)}")
+        self.assertEqual(normal.forward, fast.forward, "actual_forward=fast, expected_original_forward")
+        finals = next(grid for grid in fast.event_graphs[1].grids if grid.name == "mhc_grad_prev_x_and_post")
+        for old, new in ((normal.backward.normal, fast.backward.normal),
+                         (normal.backward.profiled, fast.backward.profiled)):
+            view = decode_event_wire("mhc", old)
+            abi = view.abi.structure("TaskDescC")
+            restored = bytearray(new)
+            for task in finals.native_tasks:
+                offset = view.task_offset + task * abi.size + abi.offset("extra_value_2")
+                self.assertEqual(int.from_bytes(new[offset:offset + 4], "little"), 5,
+                                 f"actual_task={task}, expected_poll_units=5")
+                restored[offset:offset + 4] = old[offset:offset + 4]
+            self.assertEqual(bytes(restored), old, f"actual_bytes={len(restored)}, expected_bytes={len(old)}")
+        for index, task in enumerate(fast.backward.tasks):
+            old = normal.backward.tasks[index]
+            self.assertEqual(task[:-1], old[:-1], f"actual={task}, expected={old}")
+            self.assertEqual(task[-1], 5 if index in finals.native_tasks else old[-1],
+                             f"actual={task[-1]}, expected_original_or_fast_poll")
+
+    def test_wavefront_covers_all_producers_before_releasing_final(self):
+        """各 Final 依赖的宏块须在本波 Prepare 域内全部预留，尾波保留所有任务。"""
+        for tiles in range(40, 81):
+            with self.subTest(tiles=tiles):
+                spec = MhcSpec(tiles * 64 - 1, 128, 20, 64, 64)
+                original = mhc_boundary.plan(spec)
+                candidate = mhc_boundary.plan(spec, event_schedule="mhc_backward_wavefront")
+                graph = candidate.event_graphs[1]
+                self.assertEqual(graph.simulate()["counters"], original.event_graphs[1].simulate()["counters"],
+                                 f"actual_tiles={tiles}, expected_all_counters_preserved")
+                self.assertEqual(candidate.backward.tasks, original.backward.tasks,
+                                 f"actual_tiles={tiles}, expected_all_descriptors_preserved")
+                old, new = _owners(original.backward), _owners(candidate.backward)
+                for owner, tasks in old.items():
+                    self.assertEqual(set(new[owner]), set(tasks), f"actual={new[owner]}, expected={tasks}")
+
+    def test_wavefront_handles_macro_joins_and_small_topologies(self):
+        """波次划分覆盖大宏块、不同 Vector 数、尾 tile，以及不足一波的场景。"""
+        for cores, tokens, tile in ((5, 11, 32), (20, 41, 32), (24, 129, 64), (20, 12000, 96),
+                                    (20, 12000, 512)):
+            with self.subTest(cores=cores, tokens=tokens, tile=tile):
+                spec = MhcSpec(tokens, 128, cores, tile, tile)
+                emission = mhc_boundary.compile(spec, event_schedule="mhc_backward_wavefront")
+                plan = emission.plan
+                files = {item.path: item.content for item in emission.files}
+                self.assertEqual(files["schedule/backward.bin"], plan.backward.normal,
+                                 f"actual_bytes={len(files['schedule/backward.bin'])}, "
+                                 f"expected_bytes={len(plan.backward.normal)}")
+                self.assertEqual(plan.event_schedule, "mhc_backward_wavefront",
+                                 f"actual={plan.event_schedule}, expected=mhc_backward_wavefront")
+
     def test_tail_tiles_and_ownership_remain_valid(self):
         """覆盖不同拓扑、整波与非整波、尾部，以及多种 token tile。"""
         for cores, tokens, tile in ((5, 10, 32), (20, 40, 32), (20, 41, 32), (24, 129, 64),

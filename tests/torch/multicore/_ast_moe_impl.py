@@ -28,6 +28,7 @@ import torch.distributed as dist
 
 from hyper_parallel.core import multicore
 from hyper_parallel.core.multicore.frontend.examples.moe_region import moe_region
+from hyper_parallel.core.multicore.ir.dynamic_events import MoeCountSourceIR
 from hyper_parallel.core.multicore.runtime.moe_native import verify_moe_native
 from tests.torch.expert_parallel import _test_hot_replica as replica
 from tests.torch.multicore import _test_mega_moe as legacy
@@ -48,6 +49,33 @@ def _compare(actual, expected):
         torch.testing.assert_close(value, reference, rtol=2e-2, atol=2e-3)
         errors[field.name] = float((value.float() - reference.float()).abs().max())
     return errors
+
+
+def _run_ast_with_dynamic_evidence(ast, hidden, ids, probabilities, counts, gradient):
+    bindings = []
+    original = MoeCountSourceIR.validate_device_binding
+
+    def _capture(source, tensor, device):
+        original(source, tensor, device)
+        bindings.append((source, tensor))
+
+    with patch.object(MoeCountSourceIR, "validate_device_binding", _capture):
+        result = legacy.run_layer(ast, hidden, ids, probabilities, counts, gradient)
+    plan = ast._get_execution_resources(hidden).frontend_plan
+    if len(bindings) != 2 or bindings[0][1].data_ptr() != bindings[1][1].data_ptr():
+        raise AssertionError("Forward/backward did not borrow the same native device prefix tensor")
+    evidence = []
+    for graph, (source, tensor) in zip(plan.event_graphs[:2], bindings):
+        prefix = tuple(tensor.detach().cpu().tolist())
+        domains = {}
+        for grid in graph.grids:
+            if grid.dynamic_domain is not None:
+                spans = grid.dynamic_domain.row_intervals(source, prefix)
+                domains[grid.name] = {"active": sum(begin < end for begin, end in spans),
+                                      "reserved": len(spans), "notifications": len(grid.notifies.values())}
+        evidence.append({"direction": graph.direction, "prefix": prefix, "counts": source.counts(prefix),
+                         "domains": domains})
+    return result, evidence
 
 
 def _region_case(mode, limit):
@@ -73,7 +101,7 @@ def _region_case(mode, limit):
         for pattern in ("balanced", "zero_token_experts", "skew", "single_destination", "balanced"):
             ids, probabilities, counts = legacy._make_fixed_route(shape, pattern)
             expected = legacy.run_layer(native, hidden, ids, probabilities, counts, gradient)
-            actual = legacy.run_layer(ast, hidden, ids, probabilities, counts, gradient)
+            actual, dynamic = _run_ast_with_dynamic_evidence(ast, hidden, ids, probabilities, counts, gradient)
             errors = _compare(actual, expected)
             if limit is None:
                 oracle = legacy.run_layer(common, hidden, ids, probabilities, counts, gradient)
@@ -87,7 +115,7 @@ def _region_case(mode, limit):
             records.append({"pattern": pattern, "errors_against_native": errors,
                             "capacity": resources.workspace.capacity_floor,
                             "heap_epoch": resources.heap_manager.epoch,
-                            "program_fingerprint": current})
+                            "program_fingerprint": current, "dynamic_events": dynamic})
     finally:
         ast.close()
         native.close()

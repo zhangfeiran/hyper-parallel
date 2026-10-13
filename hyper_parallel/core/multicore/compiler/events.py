@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
+from hyper_parallel.core.multicore.backends.dynamic_events import bind_moe_dynamic_events, moe_count_source
 from hyper_parallel.core.multicore.backends.events import decode_event_wire, lower_event_fields
 from hyper_parallel.core.multicore.ir.events import (
     EventBoundaryIR,
@@ -140,6 +141,8 @@ def build_event_graphs(plan: Any) -> tuple[EventGraphIR, ...]:
             graph = EventGraphIR(family, direction, "fixed_stride", tensor, grids,
                                  _dag_queues(image, grids, view), boundaries,
                                  tuple(zip(("cube", "vector", "mix"), workers)))
+            if family == "moe":
+                graph = bind_moe_dynamic_events(graph, image.normal, view, moe_count_source(plan.spec, direction))
         for wire in (image.normal, image.profiled):
             if lower_event_fields(graph, wire) != wire:
                 raise ValueError(f"{family} {direction} event lowering changed the original native contract")

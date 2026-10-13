@@ -97,7 +97,7 @@ def _case(tokens, hidden, tile, seed, root, event_schedule="compatibility"):
 
 
 def _lifecycle(root, event_schedule="compatibility"):
-    tokens = 2593 if event_schedule == "mhc_backward_overlap" else 128
+    tokens = 2593 if event_schedule != "compatibility" else 128
     reference = _inputs(tokens, 128, 72)
     cores = torch.npu.get_device_limit(0)["cube_core_num"]
     plan = mhc_boundary.plan(MhcSpec(tokens, 128, cores), event_schedule=event_schedule)

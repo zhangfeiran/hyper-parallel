@@ -1,12 +1,12 @@
-# 静态任务域与事件张量 IR
+# 任务域与事件张量 IR
 
 MoE、MHC 和 Gate 的 `Program.plan()` 现在包含 `event_graphs`。
 它把既有兼容性计划中的任务域、生产者通知、消费者等待和执行队列转换为同一组不可变 IR，
 并校验这些事件规则能够降级回各算子族的原始运行时镜像。
 
 设计参考 [Event Tensor 论文](https://arxiv.org/html/2604.13327v2)。
-当前实现是静态兼容性接入：从已有算子族计划提取依赖，尚未从普通 SSA 自动生成完整事件任务图，
-也没有新增设备动态队列或运行时符号形状支持。
+当前实现从已有算子族计划提取依赖，支持 MHC 受限静态队列变换和 MoE 前缀计数驱动的有效工作域。
+尚未从普通 SSA 自动生成完整事件任务图，也没有新增设备动态队列或任意运行时索引函数。
 
 ## 查看事件图
 
@@ -40,6 +40,8 @@ MoE 有副本回退时还会生成 `events/backward_no_replica.json`。
 | `WorkerQueueIR` | 固定 Cube、Vector 或 Mix worker 的任务 FIFO |
 | `EventBoundaryIR` | 原生通信、握手、副本协议或外部调用边界 |
 | `EventGraphIR` | 一个算子族执行方向的任务、事件、队列与边界集合 |
+| `MoeCountSourceIR` | 原生 `group_list` 的输入别名、专家数和专家/总接收行数上界 |
+| `MoeTaskDomainIR` | 专家 × Cube lane 或专家 × Vector tile 的动态有效工作范围 |
 
 任务引用由 grid 编号与域内线性坐标组成。多维任务坐标可通过 `EventIndexMap.at()` 查询事件。
 图校验拒绝映射空洞、域外事件、重复或遗漏任务、不足的本地生产者计数，以及越界 worker。
@@ -94,6 +96,24 @@ RMSNormGrad 的 task 模式不使用确定性 reduction workspace；Prepare 和 
 当前设备测量中，部分长 token 形状出现完整 step 退化，因此该策略保留为显式实验选择。
 更早的局部消费者或更好的仿真进展不能作为默认采用条件。
 
+第二种实验策略 `mhc_backward_wavefront` 按完整 Vector worker 波次推进 Prepare，
+然后安排依赖已覆盖宏块的 Final。它通过原有事件映射计算每个 Final 需要的 Prepare 前缀，
+保留跨 worker 等待和 Cube 的固定 FIFO，不逐项交错 Prepare/Final。
+这一策略旨在减少提前等待的消费者阻塞后续生产者的机会。
+与 `mhc_backward_overlap` 一样，它需要显式指定，并遵守相同的所有权、scratch 和进展检查。
+
+```python
+plan = mhc_boundary.plan(spec, event_schedule="mhc_backward_wavefront")
+# 参数模块和完整 step 测量入口也接受同一策略名称。
+```
+
+`mhc_backward_wavefront_fast` 在同一波次队列上，只把 Final 描述符的 `extra_value_2` 设为已有短轮询值 `5`。
+它不修改原生 kernel；事件、通知阈值、数值描述符的其余字段和原始前向队列均保留。
+当前封存 worker 的单位是 `50` 个 system cycle，值 `5` 对应约 `250` 个 system cycle 的刷新间隔；
+默认 Vector 值 `150` 对应 `7500` 个 system cycle。
+已有常量名 `FAST_DEPENDENCY_POLL_INTERVAL_US` 不表示当前 worker 按微秒进行换算。
+降低轮询间隔可能增加计数器读取流量，因此同样需要通过数值、完整 step 和 HBM 验收。
+
 ### MoE
 
 图保留 push/pull 通信发布、入场 ready、pull 退场 completion 和副本协议边界。
@@ -101,15 +121,54 @@ RMSNormGrad 的 task 模式不使用确定性 reduction workspace；Prepare 和 
 `simulate()` 不自动补齐这些边界；调用方必须显式提供所需外部计数假设，返回结果也会记录这些假设。
 这只能证明在给定假设下的本地 FIFO 进展，不能代替跨 rank 通信完成或设备数值验证。
 
-动态 `group_list` 仍由现有原生组件消费。
-当前 IR 尚不表达运行时 `topk` 索引、动态消费者任务范围或设备 push/pop 队列。
+#### 受限动态事件映射
+
+MoE 的 GMM、SwiGLU 和 SwiGLUGrad grid 使用二维任务坐标 `(expert, lane_or_tile)`。
+对应事件以 `base + floor(flat_index / tasks_per_expert) * step` 表达，
+每个专家的核组共享事件，权重梯度阶段仍可通知原有全局汇合事件。
+前向计数输入槽 `6`、`10` 是同一 `group_list` 的别名；反向和副本回退使用槽 `19`。
+
+`group_list[e] - group_list[e-1]` 决定专家的有效行数，首个专家从零开始。
+Vector tile 的区间从专家前缀加 `tile * rows_per_task` 开始，并由专家末尾截断。
+GMM 的区间表示整个专家数据域；Cube lane 在该区间内的分工仍归原生 tiling。
+有效行数为零时，该预留任务不执行数值工作，但仍保留原来的等待、通知和汇合计数。
+IR 不把无效数值工作转换为删除队列任务，也不按有效 tile 数缩小事件阈值。
+
+```python
+from hyper_parallel.core.multicore.frontend.examples.moe_region import moe_region
+
+# spec 是已绑定的 MegaMoeSpec；这里示例假定当前 rank 有两个专家。
+plan = moe_region.plan(spec)
+graph = plan.event_graphs[0]
+resolved = graph.resolve_dynamic_events((1, 130))
+print(resolved["grids"]["swiglu"]["row_intervals"])
+print(resolved["grids"]["swiglu"]["active_work"])
+print(graph.grids[1].waits.at((1, 0)))
+# 主机快照仅用于诊断；设备执行不调用此解析接口，不拷回计数。
+```
+
+绑定时校验原生 `DYNAMIC_DSV3_MOE` 头、输入位置、专家数、连续任务索引、GMM Cube lane 数、
+Vector tile 覆盖能力，以及每个专家共享的原生等待/通知映射。
+主机快照解析还拒绝非单调计数、专家行数越界和总接收容量越界。
+事件 lowering 保留通信、握手、原生 scratch、profile 字段和普通/profiling 两份镜像的契约。
+
+AST 模块资源路径同样构造这些事件图。
+`MoeKernelPlan.materialize()` 在设备拷贝前校验既有桥接路径重建的配置与编译镜像一致，
+因此动态 IR 不会只留在导出 JSON 中。
+前向和反向 launch 为借用的 `group_list` 检查 int64、连续性、长度和执行设备；
+热路径不调用 `.item()`、`.cpu()` 或 `.tolist()`，计数内容仍由原生路由和 worker 消费。
+这一元数据检查不构成对设备计数内容的独立运行时验证；设备内容的容量约束继续由既有路由协议保证。
+
+这次扩展支持固定容量内的动态有效工作范围和原生专家事件映射。
+运行时 `topk` 任意索引、按有效任务数改变通知阈值、重排通信任务、设备 push/pop 队列仍需新的 lowering。
 
 ## 验证与后续扩展
 
 CPU 回归验证事件域、汇合计数、队列进展、原生镜像一致性和产物缓存。
 原有 Gate、MHC、MoE 设备用例分别验证前向、梯度、流及资源生命周期。
-CPU 进展检查、原生代码构建和设备数值放行是独立证据，静态事件 IR 不声明性能收益。
+CPU 进展检查、原生代码构建和设备数值放行是独立证据，事件 IR 不声明性能收益。
 
 后续扩展应继续在相同数值任务上比较静态队列变换与同步粒度，
-再为 MoE 增加受限运行时索引、任务触发范围和适合目标 NPU 的队列协议。
+MoE 下一步可在现有前缀差和 tile 截断之外增加经过原生绑定证明的索引操作及任务触发范围，
+再实现适合目标 NPU 的队列协议。
 新的任务放置需要证明原生任务能力、scratch 所有权和生产者进展条件。
