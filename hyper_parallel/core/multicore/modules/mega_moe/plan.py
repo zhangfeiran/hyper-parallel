@@ -28,12 +28,6 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data im
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.backward.hotspot import (
-    HOTSPOT_LOAD_FACTOR,
-    HOTSPOT_MIN_ROWS,
-    build_hotspot_config,
-    supports_hotspot_schedule,
-)
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
 from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
@@ -79,21 +73,6 @@ class MegaMoePlan:
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
-    hotspot_bwd_runtime: _PreparedMegaKernelRuntime | None = None
-
-    def backward_runtime(self, received_rows: int) -> _PreparedMegaKernelRuntime:
-        """Choose using this microbatch's saved shape, without a device-to-host read.
-
-        Args:
-            received_rows: Actual saved dispatch rows, not symmetric heap capacity.
-
-        Returns:
-            Joined runtime for large hotspots, otherwise the original runtime.
-        """
-        threshold = max(HOTSPOT_MIN_ROWS, HOTSPOT_LOAD_FACTOR * self.spec.routed_slots)
-        if self.hotspot_bwd_runtime is not None and received_rows >= threshold:
-            return self.hotspot_bwd_runtime
-        return self.bwd_runtime
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -183,7 +162,7 @@ def _prepare_runtimes(
     forward_config: Any,
     backward_config: Any,
     device: Any,
-) -> tuple[_PreparedMegaKernelRuntime, _PreparedMegaKernelRuntime, _PreparedMegaKernelRuntime | None]:
+) -> tuple[_PreparedMegaKernelRuntime, _PreparedMegaKernelRuntime]:
     """Materialize profiler-aware forward and backward runtime images."""
     device_id = device.index
     if device_id is None:
@@ -203,15 +182,9 @@ def _prepare_runtimes(
         "rank": spec.rank_id,
         "device_id": device_id,
     }
-    hotspot_runtime = None
-    if supports_hotspot_schedule(spec):
-        hotspot_runtime = _prepare_mega_kernel_runtime_config(
-            build_hotspot_config(backward_config, _build_task_values(spec), spec.num_cube_cores), **options,
-        )
     return (
         _prepare_mega_kernel_runtime_config(forward_config, **options),
         _prepare_mega_kernel_runtime_config(backward_config, **options),
-        hotspot_runtime,
     )
 
 
@@ -226,7 +199,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         Rank-local forward and backward runtime resources.
     """
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec)
-    fwd_runtime, bwd_runtime, hotspot_runtime = _prepare_runtimes(spec, forward_config, backward_config, device)
+    fwd_runtime, bwd_runtime = _prepare_runtimes(spec, forward_config, backward_config, device)
     gmm_options = {
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
@@ -235,7 +208,6 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     }
     return MegaMoePlan(
         spec=spec,
-        hotspot_bwd_runtime=hotspot_runtime,
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
         ),

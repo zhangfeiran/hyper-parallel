@@ -232,7 +232,7 @@ def _prepare_backward_execution(
     try:
         events = workspace.prepare_event_counters(forward=False)
         profile_call = prepare_mega_kernel_call(
-            plan.backward_runtime(saved.dispatch.shape[0]),
+            plan.bwd_runtime,
             direction="backward",
             fallback_event_counters=events,
         )
