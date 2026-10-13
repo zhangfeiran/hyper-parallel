@@ -21,8 +21,11 @@ from unittest.mock import Mock, call, patch
 from hyper_parallel.core.multicore.shmem import _lifecycle
 
 
+# These tests deliberately inspect the private state machine and mocked native entry points.
 class TestRuntimeLifecycle(unittest.TestCase):
     """Validate lifecycle coordination without Torch distributed or NPU hardware."""
+
+    # pylint: disable=protected-access
 
     def setUp(self) -> None:
         """Install deterministic framework and Native boundaries."""
@@ -132,7 +135,8 @@ class TestRuntimeLifecycle(unittest.TestCase):
             self.native._get_unique_id.side_effect = failure
             self.native._initialize.reset_mock()
             self.dist.broadcast_object_list.side_effect = (
-                lambda payload, **_kw: payload.__setitem__(0, b"group-bootstrap") if rank else None)
+                lambda payload, peer_rank=rank, **unused_kwargs:
+                payload.__setitem__(0, b"group-bootstrap") if peer_rank else None)
             if failure:
                 with self.assertRaisesRegex(RuntimeError, "UID unavailable"):
                     _lifecycle.acquire(group)

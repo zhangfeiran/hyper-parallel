@@ -32,8 +32,11 @@ from hyper_parallel.core.multicore.shmem import _lifecycle
 from tests.common.mark_utils import arg_mark
 
 
+# Resource-pool and native-lifecycle state are intentional subjects of these ownership tests.
 class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
+
+    # pylint: disable=protected-access
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -81,8 +84,9 @@ class TestMegaMoeExperts(unittest.TestCase):
         state = {"config": {"heap_size_bytes": 0}, "active_allocations": []}
         native = Mock()
 
-        def initialize(_rank: int, _size: int, _unique_id: bytes, heap_bytes: int) -> None:
+        def initialize(unused_rank: int, unused_size: int, unused_unique_id: bytes, heap_bytes: int) -> None:
             """Publish the physical size selected by actual initialization or rebuild."""
+            del unused_rank, unused_size, unused_unique_id
             state["config"]["heap_size_bytes"] = heap_bytes
 
         def debug_state() -> dict:
@@ -314,11 +318,13 @@ class TestMegaMoeExperts(unittest.TestCase):
         """Reject incompatible symmetric allocations before initializing SHMEM."""
         spec = SimpleNamespace(ep_size=2, ep_group=object())
         for mismatch in (None, "shape", "order", "heap", "dtype"):
-            def _gather(layouts, layout, **_kwargs):
+            def _gather(layouts, layout, *, mismatch_case=mismatch, **unused_kwargs):
+                """Bind the mismatch to this collective stub before another iteration starts."""
+                del unused_kwargs
                 dtype, heap, shapes = layout
                 changes = {"shape": (dtype, heap, ((), shapes[1])), "order": (dtype, heap, shapes[::-1]),
                            "heap": (dtype, "different", shapes), "dtype": ("torch.float16", heap, shapes)}
-                layouts[:] = [layout, changes.get(mismatch, layout)]
+                layouts[:] = [layout, changes.get(mismatch_case, layout)]
             with patch.object(mega_moe_module.dist, "all_gather_object", side_effect=_gather):
                 args = (({"hidden_size": 16}, {"hidden_size": 32}), torch.empty(0), spec)
                 if mismatch is None:

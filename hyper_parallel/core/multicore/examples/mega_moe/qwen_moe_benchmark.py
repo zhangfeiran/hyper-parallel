@@ -617,6 +617,8 @@ def _measure_backend(
     managers = {}
     for layer in workload.model.layers:
         if isinstance(layer.mlp.experts, MegaMoeExperts):
+            # Capacity-growth records belong to the internal shared execution-resource group.
+            # pylint: disable-next=protected-access
             manager = layer.mlp.experts._resource_group.resources.heap_manager
             managers[id(manager)] = manager
     state = shmem.debug_state() if managers else {}

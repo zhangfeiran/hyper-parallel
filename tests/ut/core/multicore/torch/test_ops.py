@@ -24,8 +24,11 @@ from hyper_parallel.core.multicore._loader import NativeComponentUnavailableErro
 from hyper_parallel.core.multicore.torch import ops
 
 
+# Registration-cache and alias-ABI checks require Torch's private operator schema and loader.
 class TestTorchOps(unittest.TestCase):
     """Native initialization is cached, but Torch itself is imported normally."""
+
+    # pylint: disable=protected-access
 
     def tearDown(self) -> None:
         """Never retain a mocked native-registration cache between tests."""

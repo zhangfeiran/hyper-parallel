@@ -81,7 +81,8 @@ def test_mega_moe_model_replacement_and_layouts() -> None:
         source, upstream = baseline.make_data(shape)
         ids, probs, counts = baseline.make_balanced_route(shape)
         baseline.run_layer(small, source, ids, probs, counts, upstream)
-        old_resources = small._resource_group.resources
+        # Manager identity is an internal ownership invariant across model replacement.
+        old_resources = small._resource_group.resources  # pylint: disable=protected-access
         old_bytes = shmem.debug_state()["config"]["heap_size_bytes"]
         del small, common
         gc.collect()
@@ -89,7 +90,7 @@ def test_mega_moe_model_replacement_and_layouts() -> None:
         larger, reference = baseline.new_layers(larger_shape, dispatch_mode=mode)
         try:
             _check_strided_layer(larger, reference, larger_shape)
-            resources = larger._resource_group.resources
+            resources = larger._resource_group.resources  # pylint: disable=protected-access
             state = shmem.debug_state()
             assert resources.heap_manager is old_resources.heap_manager, f"rank={baseline.RANK}: manager replaced"
             assert resources.heap_manager.epoch == 1, f"rank={baseline.RANK}: epoch={resources.heap_manager.epoch}"
@@ -183,11 +184,11 @@ def test_mega_moe_local_capacity_lifetime() -> None:
             for reuse in (False, True):
                 resources.plan = replace(resources.plan, reuse_backward_dispatch=reuse)
 
-                def _backward(*args):
+                def _backward(*args, expected_reuse=reuse, kernel=original):
                     """Check receive-buffer ownership at the native boundary."""
-                    assert (args[0].data_ptr() == args[12].data_ptr()) == reuse
+                    assert (args[0].data_ptr() == args[12].data_ptr()) == expected_reuse
                     assert args[17].data_ptr() != args[0].data_ptr()
-                    return original(*args)
+                    return kernel(*args)
 
                 with patch.object(ops, "mega_moe_grad_with_profile_buffer", side_effect=_backward):
                     for patterns in pairs:
@@ -215,6 +216,8 @@ def test_mega_moe_local_capacity_lifetime() -> None:
 
 def _check_unknown_owner(mega: MegaMoeExperts, shape: baseline.MoeShape) -> None:
     """Converge one rank's unmanaged reference and preserve every old buffer."""
+    # Force the private lazy bind so the failure probe has live transport buffers.
+    # pylint: disable-next=protected-access
     resources = mega._get_execution_resources(baseline.make_data(shape)[0])
     resources.workspace.ensure(resources.spec, torch.bfloat16, baseline.DEVICE)
     before = resources.workspace.expert_buffer
@@ -283,14 +286,15 @@ def test_mega_moe_heap_growth() -> None:
     observations = []
     old_buffers = []
 
-    def observe(_module: torch.nn.Module, _args: tuple, _output: torch.Tensor) -> None:
+    def observe(unused_module: torch.nn.Module, unused_args: tuple, unused_output: torch.Tensor) -> None:
         """Record the physical heap and retain one stale tensor for invalidation checks.
 
         Args:
-            _module: Layer invoking the hook.
-            _args: Forward positional inputs.
-            _output: Completed forward output.
+            unused_module: Layer invoking the hook.
+            unused_args: Forward positional inputs.
+            unused_output: Completed forward output.
         """
+        del unused_module, unused_args, unused_output
         resources = mega._resource_group.resources  # pylint: disable=protected-access
         observations.append((resources.heap_manager.epoch, resources.workspace.expert_capacity,
                              shmem.debug_state()["config"]["heap_size_bytes"]))

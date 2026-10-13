@@ -26,8 +26,11 @@ from hyper_parallel.core.multicore.modules.mega_moe.workspace import MegaMoeWork
 from tests.common.mark_utils import arg_mark
 
 
+# Failure-injection tests inspect the private rebuild protocol and native reference count.
 class TestMegaMoeHeapManager(unittest.TestCase):
     """Exercise capacity planning, ownership checks and live workspace rebinding."""
+
+    # pylint: disable=protected-access
 
     def setUp(self) -> None:
         """Bind a CPU-only root with mocked native and NPU lifecycle operations."""

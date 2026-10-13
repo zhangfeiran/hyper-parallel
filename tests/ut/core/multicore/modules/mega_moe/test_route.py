@@ -96,13 +96,14 @@ class TestMegaMoeRoute(unittest.TestCase):
                 workspace = SimpleNamespace(in_use=True, source_buffer=torch.empty_like(expected))
 
                 def permute(tokens: torch.Tensor, indices: torch.Tensor,
-                            output: torch.Tensor, mapping: torch.Tensor) -> None:
+                            output: torch.Tensor, mapping: torch.Tensor,
+                            expected_hidden: torch.Tensor = hidden) -> None:
                     """Emulate the native layout contract and its caller-owned outputs."""
                     self.assertTrue(tokens.is_contiguous())
                     self.assertTrue(indices.is_contiguous())
-                    torch.testing.assert_close(tokens, hidden)
-                    if hidden.is_contiguous():
-                        self.assertEqual(tokens.data_ptr(), hidden.data_ptr())
+                    torch.testing.assert_close(tokens, expected_hidden)
+                    if expected_hidden.is_contiguous():
+                        self.assertEqual(tokens.data_ptr(), expected_hidden.data_ptr())
                     output.copy_(tokens.repeat_interleave(2, dim=0))
                     mapping.copy_(torch.arange(4, dtype=torch.int32))
 

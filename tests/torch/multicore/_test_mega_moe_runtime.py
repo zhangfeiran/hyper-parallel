@@ -149,6 +149,8 @@ def test_mega_moe_subgroups() -> None:
                 assert not list(layer.parameters())
                 if mode == "grow":
                     expected_epoch = int(step == 1 and baseline.RANK % 2 == 0)
+                    # The coordinator epoch is private evidence of subgroup-local reconstruction.
+                    # pylint: disable-next=protected-access
                     assert layer._resource_group.resources.heap_manager.epoch == expected_epoch
         finally:
             layer.close()

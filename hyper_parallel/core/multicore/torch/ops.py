@@ -54,7 +54,8 @@ def _load_native() -> None:
         torch.ops.load_library(str(adapter_path))
         if torch.ops.hyper_parallel.mega_moe_transport_version() != 1:
             raise RuntimeError("adapter transport ABI mismatch; rebuild the Torch adapter")
-        schema = torch.ops.hyper_parallel.mega_moe_grad.default._schema
+        # Torch exposes operator alias metadata through this private schema attribute.
+        schema = torch.ops.hyper_parallel.mega_moe_grad.default._schema  # pylint: disable=protected-access
         dispatch_alias = schema.arguments[0].alias_info.before_set
         input_grad_alias = schema.arguments[12].alias_info.before_set
         if not dispatch_alias or dispatch_alias != input_grad_alias:

@@ -384,7 +384,8 @@ __aicore__ inline bool isRuntimeTailValid(__gm__ uint8_t *tiling, uint64_t runti
   uint64_t capacity = getRuntimeTaskCapacity(tiling);
   uint64_t events = getRuntimeEventCapacity(tiling);
   uint64_t prefix = sizeof(RuntimeHeader) + events * (INT32_T_SIZE + sizeof(EventDesc)) +
-                    capacity * (sizeof(TaskDesc) + TASK_AICORE_INDEX_TYPE_COUNT * INT32_T_SIZE) + 4 * INT32_T_SIZE + sizeof(DynamicData);
+                    capacity * (sizeof(TaskDesc) + TASK_AICORE_INDEX_TYPE_COUNT * INT32_T_SIZE) +
+                    4 * INT32_T_SIZE + sizeof(DynamicData);
   if (prefix >= RUNTIME_ADDRESS_SPACE_BYTES || runtime_bytes < prefix) {
     return false;
   }

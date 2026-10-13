@@ -142,10 +142,6 @@ class MegaMoeExperts(MulticoreModule):
         shmem.acquire(self._ep_group)
         manager.runtime_release = shmem.release
 
-    def _root_group(self) -> Any:
-        """Identify the actual Root communicator needed during teardown."""
-        return self._ep_group if self._ep_group is not None else super()._root_group()
-
     def __init__(
         self,
         *,
@@ -215,20 +211,8 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
         }
-        compatibility_key = (
-            local_num_tokens,
-            hidden_size,
-            intermediate_size,
-            num_experts,
-            top_k,
-            initial_capacity_factor,
-            ep_size,
-            id(ep_group),
-            dispatch_mode,
-            capacity_growth_factor,
-            dispatch_split,
-            combine_split,
-        )
+        compatibility_key = tuple(
+            id(value) if name == "ep_group" else value for name, value in specification.items())
         super().__init__(
             resource_specification=specification,
             resource_compatibility_key=compatibility_key,

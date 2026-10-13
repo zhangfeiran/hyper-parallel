@@ -83,9 +83,10 @@ def _subgroup_unique_id(native: Any, dist: Any, group: Any, rank: int, ranks: tu
     payload = [None, None]
     root_error = None
     if rank == 0:
+        # Relay every vendor bootstrap failure so peers cannot wait indefinitely for a root ID.
         try:
             payload[0] = native._get_unique_id()  # pylint: disable=protected-access
-        except Exception as error:  # All group members must observe a root bootstrap failure.
+        except Exception as error:  # pylint: disable=broad-exception-caught
             root_error = error
             payload[1] = f"{type(error).__name__}: {error}"
     dist.broadcast_object_list(payload, src=ranks[0], group=group)
@@ -214,9 +215,10 @@ def _reconfiguration_stage(operation: Any) -> float:
     """Converge stage errors before any rank enters the next vendor collective."""
     started = time.perf_counter()
     error = None
+    # Every vendor failure must reach the same consensus before peers enter another collective.
     try:
         operation()
-    except Exception as exception:
+    except Exception as exception:  # pylint: disable=broad-exception-caught
         error = f"{type(exception).__name__}: {exception}"
     errors = [error]
     if _root_uses_distributed:

@@ -28,8 +28,11 @@ from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunc
 from tests.common.mark_utils import arg_mark
 
 
+# The private autograd bridge and saved execution buffers are the contracts under test.
 class TestMegaMoeFunction(unittest.TestCase):
     """Exercise real autograd contexts with mocked communication and kernels."""
+
+    # pylint: disable=protected-access
 
     def test_backward_unpacks_saved_tensors_once(self) -> None:
         """Checkpoint unpack hooks must only be consumed once per backward call."""

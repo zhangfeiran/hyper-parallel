@@ -237,7 +237,9 @@ def _retained_runtime_reference(release: Callable[[], None]) -> int:
     Returns:
         One while the automatic pool owns that runtime, otherwise zero.
     """
-    return int(_RESOURCE_MANAGER.runtime_release is release and not _RESOURCE_MANAGER._runtime_released)
+    # This helper reports the private pool pin rather than inferring it from native owner counts.
+    return int(_RESOURCE_MANAGER.runtime_release is release
+               and not _RESOURCE_MANAGER._runtime_released)  # pylint: disable=protected-access
 
 
 class MulticoreModule(torch.nn.Module):

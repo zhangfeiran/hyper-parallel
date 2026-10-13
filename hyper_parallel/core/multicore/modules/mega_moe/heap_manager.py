@@ -193,6 +193,7 @@ class MegaMoeHeapManager:
             self._rebuild(capacities, self._budget(required))
 
     def _consensus(self, value: Any, error: str | None = None) -> None:
+        """Converge rank-local errors and verify the next collective stage agrees."""
         payload = (value, error)
         peers = [payload]
         if len(self.members) > 1:
@@ -205,7 +206,9 @@ class MegaMoeHeapManager:
             raise RuntimeError("MegaMoe heap layout, epoch or capacity differs across EP ranks")
 
     def _preflight(self, capacities: list[int], heap_bytes: int) -> None:
+        """Check ownership and layout on every rank before destroying any buffers."""
         error = None
+        # Runtime probes can raise arbitrary vendor errors; peers must still reach consensus.
         try:
             state = shmem.debug_state()
             if state["reference_count"] != len(self.resources) + _retained_runtime_reference(shmem.release):
@@ -223,7 +226,7 @@ class MegaMoeHeapManager:
                 raise RuntimeError("unmanaged SHMEM allocation prevents heap growth")
             if torch.npu.is_current_stream_capturing():
                 raise RuntimeError("MegaMoe heap growth is unavailable during graph capture")
-        except Exception as exception:
+        except Exception as exception:  # pylint: disable=broad-exception-caught
             error = f"{type(exception).__name__}: {exception}"
         layout = tuple((tuple(sorted((key, value) for key, value in entry.specification.items() if key != "ep_group")),
                         capacity, entry.resource is not None,
@@ -232,17 +235,19 @@ class MegaMoeHeapManager:
         self._consensus((self.epoch, heap_bytes, layout), error)
 
     def _stage(self, name: str, operation: Any, timings: dict[str, float]) -> None:
+        """Report any stage failure collectively before advancing to the next operation."""
         start = time.perf_counter()
         error = None
         try:
             operation()
-        except Exception as exception:
+        except Exception as exception:  # pylint: disable=broad-exception-caught
             error = f"{name}: {type(exception).__name__}: {exception}"
         self._consensus(name, error)
         timings[name] = (time.perf_counter() - start) * 1000
 
     def _rebuild(self, capacities: list[int], heap_bytes: int) -> None:
-        with _lifecycle._reconfiguration():
+        """Rebuild managed buffers through SHMEM's private coordinated lifecycle."""
+        with _lifecycle._reconfiguration():  # pylint: disable=protected-access
             start = time.perf_counter()
             self._preflight(capacities, heap_bytes)
             timings = {}
@@ -256,7 +261,9 @@ class MegaMoeHeapManager:
             try:
                 for index, (resource, _, _) in enumerate(allocated):
                     self._stage(f"free_{index}", lambda r=resource: r.workspace.close(for_rebuild=True), timings)
-                self._stage("reinitialize", lambda: timings.update(_lifecycle._reinitialize(heap_bytes)), timings)
+                # Only this coordinator can rebuild SHMEM while preserving its live root references.
+                self._stage("reinitialize", lambda: timings.update(
+                    _lifecycle._reinitialize(heap_bytes)), timings)  # pylint: disable=protected-access
                 for entry, capacity in zip(self.entries, capacities):
                     entry.capacity = capacity
                     if entry.resource is not None:
@@ -273,7 +280,7 @@ class MegaMoeHeapManager:
                                             "stages_ms": timings, "total_ms": (time.perf_counter() - start) * 1000})
             except Exception:
                 self.state = "failed"
-                _lifecycle._invalidate_runtime()
+                _lifecycle._invalidate_runtime()  # pylint: disable=protected-access
                 raise
             finally:
                 self._rebuild_thread = None
