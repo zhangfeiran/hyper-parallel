@@ -18,7 +18,6 @@ from __future__ import annotations
 
 __all__ = ["MegaMoeExperts"]
 
-import os
 from typing import Any
 
 import torch
@@ -28,11 +27,13 @@ from hyper_parallel.core.multicore import shmem
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
-from .heap_manager import get_heap_manager, root_members
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
-from .spec import _COMMUNICATION_SPLIT, _resolve_capacity_factors, bind_mega_moe_spec
-from .workspace import MegaMoeWorkspace
+from .spec import (
+    _COMMUNICATION_SPLIT, _grow_receive_capacity, _resolve_capacity_factors,
+    _resolve_receive_capacity, bind_mega_moe_spec,
+)
+from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
 
 def _create_mega_moe_parameters(
     local_experts: int,
@@ -52,20 +53,14 @@ def _create_mega_moe_parameters(
     return gate_up_weight, down_weight
 
 
-def _validate_resource_layout(specifications: tuple[Any, ...], tensor: torch.Tensor, spec: Any) -> None:
-    """Agree on every symmetric allocation before initializing the heap."""
-    if spec.ep_size == 1:
-        return
-    layout = (
-        str(tensor.dtype),
-        os.getenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE"),
-        tuple(tuple(sorted((key, value) for key, value in item.items() if key != "ep_group"))
-              for item in specifications),
-    )
-    layouts = [None] * spec.ep_size
-    dist.all_gather_object(layouts, layout, group=spec.ep_group)
-    if any(peer_layout != layout for peer_layout in layouts):
-        raise ValueError("MegaMoe static shapes, heap configuration and allocation order must match on all EP ranks.")
+def _heap_layout(specification: dict[str, Any], element_size: int, capacity: int | None = None) -> tuple[Any, ...]:
+    """Describe byte demand and deterministic configuration with an opaque capacity payload."""
+    if capacity is None:
+        capacity = _resolve_receive_capacity(specification["initial_capacity_factor"],
+                                             specification["local_num_tokens"] * specification["top_k"],
+                                             specification["ep_size"])
+    signature = tuple(sorted((key, value) for key, value in specification.items() if key != "ep_group"))
+    return _spec_workspace_bytes(specification, element_size, receive_capacity=capacity), signature, capacity
 
 
 class _MegaMoeExecutionResources:
@@ -81,18 +76,66 @@ class _MegaMoeExecutionResources:
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
-        _validate_resource_layout(active_specifications, tensor, self.spec)
-        self.heap_manager = get_heap_manager(self.spec, tensor, active_specifications)
+        self.specification = specification
+        self.dtype, self.device, self.element_size = tensor.dtype, tensor.device, tensor.element_size()
+        reservations = tuple((item, _heap_layout(item, self.element_size)) for item in active_specifications)
+        self.heap_manager = shmem.get_heap_manager(
+            self.spec.ep_group, tensor, reservations,
+            allow_rebuild=any(item.get("dispatch_mode", "push") == "push" for item in active_specifications))
         shmem.acquire(self.spec.ep_group, heap_size_bytes=self.heap_manager.heap_bytes)
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
             self.workspace = MegaMoeWorkspace(shared=shared)
-            self.heap_manager.bind(self, specification)
+            self.workspace.capacity_floor = self.heap_manager.bind(self, specification)
+            self.workspace.heap_manager = self.heap_manager
+            self._record_capacities()
         except Exception:
             shmem.release()
             raise
         self._closed = False
         self._workspace_closed = False
+
+    def ensure_capacity(self, maximum_received_slots: int) -> None:
+        """Submit a larger layout, falling back to minimum capacity within an explicit budget.
+
+        Args:
+            maximum_received_slots: Maximum destination load from the root count exchange.
+        """
+        if maximum_received_slots <= self.workspace.capacity_floor:
+            return
+        with self.heap_manager.access():
+            capacity, minimum = _grow_receive_capacity(self.spec, self.workspace.capacity_floor, maximum_received_slots)
+            layout = _heap_layout(self.specification, self.element_size, capacity)
+            layouts = [layout if entry.resource is self else entry.layout for entry in self.heap_manager.entries]
+            if (self.heap_manager.heap_limit is not None
+                    and self.heap_manager.required_bytes(layouts) > self.heap_manager.heap_limit):
+                layout = _heap_layout(self.specification, self.element_size, minimum)
+            self.heap_manager.replace(self, layout)
+            self._record_capacities()
+
+    def _record_capacities(self) -> None:
+        if self.heap_manager.growth_records and "capacities" not in self.heap_manager.growth_records[-1]:
+            capacities = [entry.layout[2] for entry in self.heap_manager.entries]
+            self.heap_manager.growth_records[-1]["capacities"] = capacities
+
+    def heap_state(self) -> tuple[set[int], bool, bool]:
+        """Expose workspace ownership to the root heap coordinator."""
+        return self.workspace.heap_state()
+
+    def release_heap(self) -> None:
+        """Release physical buffers while retaining the workspace and graph leases."""
+        self.workspace.close(for_rebuild=True)
+
+    def restore_heap(self, capacity: int, allocated: bool) -> None:
+        """Apply the new capacity and restore buffers only for previously allocated owners.
+
+        Args:
+            capacity: Target receive rows selected by the capacity policy.
+            allocated: Whether this owner had physical buffers before the rebuild.
+        """
+        self.workspace.capacity_floor = capacity
+        if allocated:
+            self.workspace.ensure(self.spec, self.dtype, self.device)
 
     def lifecycle_signature(self) -> tuple[Any, ...]:
         """Identify allocations independently of process-local group addresses."""
@@ -139,8 +182,7 @@ class MegaMoeExperts(MulticoreModule):
     def _retain_runtime(self, manager: Any) -> None:
         """Pin SHMEM while the resource pool can replace orphan workspaces."""
         # Keep SHMEM initialized when replacing the last orphan with a new shape.
-        shmem.acquire(self._ep_group)
-        manager.runtime_release = shmem.release
+        manager.runtime_release = shmem.retain_runtime(self._ep_group)
 
     def _root_group(self) -> Any:
         """Identify the actual Root communicator needed during teardown."""
@@ -232,7 +274,7 @@ class MegaMoeExperts(MulticoreModule):
         super().__init__(
             resource_specification=specification,
             resource_compatibility_key=compatibility_key,
-            resource_scope_key=("mega_moe", root_members(ep_group) if dist.is_initialized() else id(ep_group)),
+            resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
         self.local_num_tokens = local_num_tokens
         self.hidden_size = hidden_size
@@ -430,7 +472,7 @@ class MegaMoeExperts(MulticoreModule):
                     workspace=resources.workspace,
                 )
             if not pull:
-                resources.heap_manager.ensure_capacity(resources, route.maximum_received_slots)
+                resources.ensure_capacity(route.maximum_received_slots)
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,

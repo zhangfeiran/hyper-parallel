@@ -25,7 +25,7 @@ import threading
 import time
 from contextlib import contextmanager
 from functools import wraps
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from .. import _automatic
 from ._runtime import _load_native, _torch_modules
@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 
 _lock = threading.RLock()
 _users = 0
+_retained_users = 0
+_ACTIVE_ROOT = object()
 _root_group: Any | None = None
 _root_uses_distributed: bool | None = None
 _root_size: int | None = None
@@ -76,6 +78,37 @@ def _describe_root(root_group: Any, dist: Any) -> tuple[int, tuple[int, ...]]:
             f"current process must belong to the SHMEM Root Group: root_rank={root_rank}, ranks={global_ranks}"
         )
     return root_rank, global_ranks
+
+
+def root_members(group: ProcessGroup | None) -> tuple[int, ...]:
+    """Return ordered SHMEM membership without relying on ProcessGroup identity.
+
+    Args:
+        group: Root process group, or None for the default root.
+    """
+    _, dist = _torch_modules()
+    return _describe_root(dist.group.WORLD if group is None else group, dist)[1] if dist.is_initialized() else (0,)
+
+
+def retain_runtime(group: ProcessGroup | None) -> Callable[[], None]:
+    """Acquire a registered root pin and return its paired release operation.
+
+    Args:
+        group: Root process group to retain until automatic cleanup.
+    """
+    global _retained_users  # pylint: disable=global-statement
+    with _lock:
+        acquire(group)
+        _retained_users += 1
+    return _release_retained_runtime
+
+
+def _release_retained_runtime() -> None:
+    """Commit pin removal only after its Runtime reference is released successfully."""
+    global _retained_users  # pylint: disable=global-statement
+    with _lock:
+        release()
+        _retained_users -= 1
 
 
 def _subgroup_unique_id(native: Any, dist: Any, group: Any, rank: int, ranks: tuple[int, ...]) -> bytes:
@@ -210,21 +243,32 @@ def _reconfiguration():
         yield
 
 
-def _reconfiguration_stage(operation: Any) -> float:
-    """Converge stage errors before any rank enters the next vendor collective."""
+def _reconfiguration_stage(operation: Any, *, group: Any = _ACTIVE_ROOT, value: Any = None) -> float:
+    """Converge stage errors and layout before entering the next collective."""
     started = time.perf_counter()
     error = None
+    failure = None
     try:
         operation()
-    except Exception as exception:
+        if callable(value):
+            value = value()
+    except Exception as exception:  # pylint: disable=broad-exception-caught
+        failure = exception
         error = f"{type(exception).__name__}: {exception}"
-    errors = [error]
-    if _root_uses_distributed:
-        _, dist = _torch_modules()
-        errors = [None] * _root_size
-        dist.all_gather_object(errors, error, group=_root_group)
-    if any(item is not None for item in errors):
-        raise RuntimeError(f"SHMEM reconfiguration stage failed: {errors}")
+        value = None
+    payload = (value, error)
+    peers = [payload]
+    _, dist = _torch_modules()
+    if dist.is_initialized():
+        selected_group = _root_group if group is _ACTIVE_ROOT else group
+        peers = [None] * dist.get_world_size(selected_group)
+        dist.all_gather_object(peers, payload, group=selected_group)
+    if any(item[1] is not None for item in peers):
+        if len(peers) == 1 and isinstance(failure, ValueError):
+            raise failure
+        raise RuntimeError(f"SHMEM reconfiguration failed: {peers}")
+    if any(item[0] != value for item in peers):
+        raise RuntimeError("SHMEM layout, epoch or configuration differs across EP ranks")
     return (time.perf_counter() - started) * 1000
 
 

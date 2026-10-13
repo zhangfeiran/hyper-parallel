@@ -549,6 +549,11 @@ Torch adapter 是由 CMake 构建、通过 `torch.ops.load_library()` 加载的 
 
 ## 8. Native ABI
 
+SHMEM 的 `_heap_manager.py` 统一管理字节预算、资源预留和集体堆替换，`_lifecycle.py` 管理 native
+初始化、bootstrap 和引用。MegaMoe 的 `spec.py` 计算容量，`workspace.py` 管理物理 buffer 与 graph
+lease，`module.py` 的执行资源对象提交布局和容量请求；SHMEM 不依赖模型代码。配置规则见
+[SHMEM 文档](shmem.md#托管堆协调)。
+
 用户使用方式、输入约束、容量和资源生命周期由组件 [README](../README.md) 统一说明。本节只记录
 `MegaMoeExperts` 内部调用的正反向 native ABI。
 

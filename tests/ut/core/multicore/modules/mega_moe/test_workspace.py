@@ -31,6 +31,8 @@ from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
     _spec_workspace_bytes,
 )
 from hyper_parallel.core.multicore.scheduler.config import event_workspace_bytes
+from hyper_parallel.core.multicore.shmem._heap_manager import ShmemHeapManager
+from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
@@ -81,8 +83,13 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             384,
         )
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_heap_rounding_preserves_transport_capacity(self) -> None:
-        """Round the full push receive/return capacity to physical pages for all resource groups."""
+        """Feature: heap rounding preserves transport capacity.
+        Description: Calculate push and pull layouts for multiple roots and resource groups.
+        Expectation: Round the full push receive/return capacity to physical pages for all resource groups.
+        """
         reference = torch.empty(0, dtype=torch.bfloat16)
         for ep in (4, 8):
             for factor, expected_mib in ((ep, (ep + 1) * 320 + 2), (1.25, 722), (1.5, 802)):
@@ -90,25 +97,32 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                     with self.subTest(ep=ep, factor=factor, groups=groups), patch.dict(os.environ, {}, clear=True):
                         spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
                                 "ep_size": ep, "initial_capacity_factor": factor}
-                        actual = workspace_module.configure_symmetric_heap((spec,) * groups, reference)
+                        actual = ShmemHeapManager(None, reference, tuple(
+                            (object(), (_spec_workspace_bytes(spec, 2), (), None)) for _ in range(groups))).heap_bytes
                         self.assertEqual(actual, (groups * (expected_mib - 2) + 2) * 1024**2)
-                        os.environ.pop("HYPER_PARALLEL_SHMEM_HEAP_SIZE")
                         spec["dispatch_mode"] = "pull"
-                        actual = workspace_module.configure_symmetric_heap((spec,) * groups, reference)
+                        actual = ShmemHeapManager(None, reference, tuple(
+                            (object(), (_spec_workspace_bytes(spec, 2), (), None)) for _ in range(groups))).heap_bytes
                         self.assertEqual(actual, (groups * 640 + 2) * 1024**2)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_explicit_heap_requires_sufficient_aligned_capacity(self) -> None:
-        """Accept page-aligned capacity while rejecting undersized and partial physical pages."""
+        """Feature: explicit heap requires sufficient aligned capacity.
+        Description: Configure aligned, undersized, partial-page and zero budgets.
+        Expectation: Accept page-aligned capacity while rejecting undersized and partial physical pages.
+        """
         spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
                 "ep_size": 4, "initial_capacity_factor": 4.0}
         reference = torch.empty(0, dtype=torch.bfloat16)
         for mib, error in ((1602, None), (1664, None), (1600, RuntimeError), (1603, ValueError), (0, ValueError)):
             with self.subTest(mib=mib), patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_HEAP_SIZE": str(mib * 1024**2)}):
                 if error is None:
-                    self.assertEqual(workspace_module.configure_symmetric_heap((spec,), reference), mib * 1024**2)
+                    manager = ShmemHeapManager(None, reference, ((spec, (_spec_workspace_bytes(spec, 2), (), None)),))
+                    self.assertEqual(manager.heap_bytes, mib * 1024**2)
                 else:
                     with self.assertRaises(error):
-                        workspace_module.configure_symmetric_heap((spec,), reference)
+                        ShmemHeapManager(None, reference, ((spec, (_spec_workspace_bytes(spec, 2), (), None)),))
 
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Retain expanded event storage when allocating through the SHMEM API."""

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 from hyper_parallel.core.multicore.shmem import _lifecycle
+from tests.common.mark_utils import arg_mark
 
 
 class TestRuntimeLifecycle(unittest.TestCase):
@@ -58,6 +59,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
     @staticmethod
     def _reset_runtime() -> None:
         """Reset private process state after each isolated test."""
+        _lifecycle._retained_users = 0  # pylint: disable=protected-access
         _lifecycle._users = 0  # pylint: disable=protected-access
         _lifecycle._root_group = None  # pylint: disable=protected-access
         _lifecycle._root_uses_distributed = None  # pylint: disable=protected-access
@@ -315,12 +317,17 @@ class TestRuntimeLifecycle(unittest.TestCase):
         _lifecycle.release()
         _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_reinitialize_converges_peer_failure_before_next_stage(self) -> None:
-        """Stop before bootstrap on a peer finalize failure and poison all later API use."""
+        """Feature: reinitialize converges peer failure before next stage.
+        Description: Report a peer finalize failure before obtaining a new bootstrap ID.
+        Expectation: Stop before bootstrap on a peer finalize failure and poison all later API use.
+        """
         _lifecycle.acquire()
         self.dist.all_gather_object.side_effect = (
             lambda output, value, **_kw: output.__setitem__(slice(None),
-                                                          [value, "peer finalize failed"]
+                                                          [value, (value[0], "peer finalize failed")]
                                                           if self.native._shutdown.called else [value] * 2))
         with self.assertRaisesRegex(RuntimeError, "peer finalize failed"):
             _lifecycle._reinitialize(256)
@@ -337,6 +344,42 @@ class TestRuntimeLifecycle(unittest.TestCase):
         """Expose an unmatched release instead of silently underflowing the user count."""
         with self.assertRaisesRegex(RuntimeError, "no active reference"):
             _lifecycle.release()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_retained_reference_commits_only_after_success(self) -> None:
+        """Feature: retained reference commits only after success.
+        Description: Retain a root pin and fail its final release before retrying.
+        Expectation: Distinguish a registered root pin from ordinary owners and retain failed-release ownership.
+        """
+        _lifecycle.acquire()
+        release_pin = _lifecycle.retain_runtime(self.world)
+        self.assertEqual(_lifecycle._retained_users, 1)
+        self.assertEqual(_lifecycle._reference_count(), 2)
+        _lifecycle.release()
+        self.native._validate_shutdown.side_effect = RuntimeError("busy")
+        with self.assertRaisesRegex(RuntimeError, "busy"):
+            release_pin()
+        self.assertEqual(_lifecycle._retained_users, 1)
+        self.assertEqual(_lifecycle._reference_count(), 1)
+        self.native._validate_shutdown.side_effect = None
+        release_pin()
+        self.assertEqual(_lifecycle._retained_users, 0)
+        self.assertEqual(_lifecycle._reference_count(), 0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_explicit_default_group_does_not_select_the_active_subgroup(self) -> None:
+        """Feature: Default-root collective selection.
+        Description: Check WORLD layout while another subgroup owns the native Runtime.
+        Expectation: Explicit None selects WORLD; an omitted group selects the active root.
+        """
+        subgroup = object()
+        with patch.object(_lifecycle, "_root_group", subgroup):
+            _lifecycle._reconfiguration_stage(Mock(), group=None, value="world layout")
+            self.assertIsNone(self.dist.all_gather_object.call_args.kwargs["group"])
+            _lifecycle._reconfiguration_stage(Mock())
+            self.assertIs(self.dist.all_gather_object.call_args.kwargs["group"], subgroup)
 
 
 if __name__ == "__main__":
