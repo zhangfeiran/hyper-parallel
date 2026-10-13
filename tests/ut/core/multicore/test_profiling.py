@@ -50,7 +50,6 @@ from hyper_parallel.core.multicore.profiler.profiling import (
     GRAPH_STAGE_DESC_BASE,
     MAX_PROFILE_BUFFER_BYTES,
     _ProfileSpec,
-    MAX_RECORDS_PER_CORE,
     _apply_mega_kernel_profile_graph,
     _calculate_profile_layout,
     _duration_trace_event,

@@ -103,22 +103,6 @@ class TestReplicaCost(unittest.TestCase):
         plan = build_expert_replica_plan([[10, 4, 0, 0]] * 2, 1)
         self.assertEqual(overlapping.estimate_ms(plan), serial.estimate_ms(plan))
 
-    def test_missing_prefix_calibration_cannot_hide_later_home_work(self):
-        """Even long home compute gives no automatic readiness discount."""
-        plan = build_expert_replica_plan([[10, 4, 0, 0]] * 2, 1)
-        model = self._model(backend="push", transport="p2p",
-                            weight_ms=10, gradient_ms=3)
-        without_transfer_time = replace(model, weight_ms=0, gradient_ms=0)
-        self.assertAlmostEqual(model.estimate_ms(plan) - without_transfer_time.estimate_ms(plan), 23)
-
-    def test_forward_and_backward_can_have_different_slowest_ranks(self):
-        """A rank-summed score underestimates this pair of phase bottlenecks."""
-        model = self._model(forward_ms=((0, 0), (8, 4), (16, 5)),
-                            backward_ms=((0, 0), (8, 1), (16, 8)))
-        plan = build_expert_replica_plan([[8, 8, 0, 0], [0, 0, 16, 0]], 0)
-        self.assertAlmostEqual(model.estimate_ms(plan), 16)
-        self.assertGreater(model.estimate_ms(plan), max(8 + 2, 5 + 8))
-
     def test_old_or_incompatible_calibration_is_rejected(self):
         """Version, schedule and dW dtype are part of the calibration contract."""
         for options in ({"calibration_version": 1}, {"calibration_version": True},

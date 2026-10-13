@@ -149,6 +149,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         with patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
                 shape, dtype=kw["dtype"])), patch.object(workspace_module.shmem, "free"):
             workspace._allocate_replica_storage(spec)
+            self.assertEqual(workspace.heap_state()[0], {workspace.replica_inbox.data_ptr()})
             previous = workspace.replica_provider
             previous.epoch = 17
             workspace._free_symmetric_tensors()

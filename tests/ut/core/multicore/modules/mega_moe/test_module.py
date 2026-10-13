@@ -23,14 +23,36 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
-from tests.common.mark_utils import arg_mark
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_parallel.core.multicore.modules.mega_moe.workspace import MegaMoeWorkspace
+from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
 
     # pylint: disable=protected-access
+
+    def test_replica_capacity_bound_survives_managed_heap_migration(self) -> None:
+        """Reject impossible routes before reuse and clamp geometric growth to the replica bound."""
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources.specification = {"local_num_tokens": 4096, "top_k": 8, "hidden_size": 5120,
+                                   "num_experts": 48, "ep_size": 8, "initial_capacity_factor": 1.0}
+        resources.element_size = 2
+        resources.workspace = MegaMoeWorkspace(shared=True)
+        resources.heap_manager = Mock(access=nullcontext, heap_limit=None, entries=[], growth_records=[])
+        for upper, current, received, expected in ((32768, 65536, 32769, None), (40960, 32768, 40000, 40960)):
+            with self.subTest(upper=upper):
+                resources.spec = SimpleNamespace(maximum_receive_capacity=upper, capacity_growth_factor=10.0)
+                resources.workspace.capacity_floor = current
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, "lossless token bound"):
+                        resources.ensure_capacity(received)
+                    resources.heap_manager.replace.assert_not_called()
+                else:
+                    resources.ensure_capacity(received)
+                    layout = mega_moe_module._heap_layout(resources.specification, 2, expected)
+                    resources.heap_manager.replace.assert_called_once_with(resources, layout)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

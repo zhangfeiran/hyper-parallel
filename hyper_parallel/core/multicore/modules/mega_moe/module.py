@@ -52,8 +52,11 @@ from .function import execute_mega_moe_with_permutation
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
-    _COMMUNICATION_SPLIT, _grow_receive_capacity, _resolve_capacity_factors,
-    bind_mega_moe_spec, initial_receive_capacity,
+    _COMMUNICATION_SPLIT,
+    _grow_receive_capacity,
+    _resolve_capacity_factors,
+    bind_mega_moe_spec,
+    initial_receive_capacity,
 )
 from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
 
