@@ -31,7 +31,11 @@ class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
 
     def test_collective_signature_ignores_process_local_group_addresses(self) -> None:
-        """Equal rank configurations remain compatible with distinct local group handles."""
+        """Feature: Collective resource compatibility.
+
+        Description: Compare equal configurations with distinct process-local group handles.
+        Expectation: Local compatibility keys differ, while collective signatures match.
+        """
         arguments = {"local_num_tokens": 512, "hidden_size": 16, "intermediate_size": 8,
                      "num_experts": 4, "top_k": 2, "ep_size": 2, "create_parameters": False}
         tensor = SimpleNamespace(dtype=torch.bfloat16)
@@ -43,7 +47,11 @@ class TestMegaMoeExperts(unittest.TestCase):
         self.assertEqual(layers[0]._resource_signature(tensor), layers[1]._resource_signature(tensor))
 
     def test_collective_signature_checks_every_static_configuration_field(self) -> None:
-        """Catch peer configuration drift, including each independently configured split."""
+        """Feature: Collective configuration validation.
+
+        Description: Change each static configuration field, including both communication splits.
+        Expectation: Every configuration change produces a different collective signature.
+        """
         arguments = {"local_num_tokens": 512, "hidden_size": 16, "intermediate_size": 8,
                      "num_experts": 4, "top_k": 2, "ep_size": 2, "create_parameters": False}
         tensor = SimpleNamespace(dtype=torch.bfloat16)

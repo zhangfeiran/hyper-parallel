@@ -97,7 +97,11 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 self.assertEqual(self.manager.state, "ready")
 
     def test_automatic_root_reference_is_managed_but_external_owners_are_rejected(self) -> None:
-        """Grow with the resource pool's root pin without accepting additional users."""
+        """Feature: Managed heap ownership.
+
+        Description: Grow with an automatic root pin, then introduce another external owner.
+        Expectation: The managed pin permits growth, while the extra owner preserves the old heap.
+        """
         with patch.object(manager_module, "_retained_runtime_reference", return_value=1):
             self.state["reference_count"] = 2
             self.manager.ensure_capacity(self.resource, 40000)

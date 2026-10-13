@@ -234,10 +234,12 @@ def test_mega_moe_heap_growth() -> None:
         assert old_buffers[0].untyped_storage().nbytes() == 0
         if pending:
             _check_companions(pending, lazy, lazy_reference, small)
-        assert shmem.debug_state()["reference_count"] == 1 + len(companions)
+        # Count the shared execution owner, the automatic root pin, and each companion.
+        reference_count = shmem.debug_state()["reference_count"]
+        assert reference_count == 2 + len(companions), reference_count
         resources = mega._resource_group.resources  # pylint: disable=protected-access
         write_evidence({"variant": variant, "observations": observations,
-                        "growth": resources.heap_manager.growth_records})
+                        "growth": resources.heap_manager.growth_records, "reference_count": reference_count})
     finally:
         for handle in handles:
             handle.remove()
