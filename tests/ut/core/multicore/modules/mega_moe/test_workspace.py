@@ -34,11 +34,21 @@ from hyper_parallel.core.multicore.scheduler.config import event_workspace_bytes
 from hyper_parallel.core.multicore.shmem._heap_manager import ShmemHeapManager
 from tests.common.mark_utils import arg_mark
 
-from tests.common.mark_utils import arg_mark
-
 
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
+
+    def test_partial_replica_teardown_rejects_mismatched_ranks_before_free(self) -> None:
+        """An inbox surviving only on one rank cannot enter a collective free."""
+        workspace = MegaMoeWorkspace(shared=True)
+        workspace.closing = True
+        workspace.replica_inbox = torch.empty(64, dtype=torch.uint8)
+        with patch.object(workspace_module._automatic, "exchange", return_value=[(False,) * 6]), \
+                patch.object(workspace_module.shmem, "free") as free:
+            with self.assertRaisesRegex(RuntimeError, "partial symmetric teardown"):
+                workspace._free_symmetric_tensors()
+        free.assert_not_called()
+        self.assertIsNotNone(workspace.replica_inbox)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
@@ -124,46 +134,31 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                     with self.assertRaises(error):
                         ShmemHeapManager(None, reference, ((spec, (_spec_workspace_bytes(spec, 2), (), None)),))
 
-    def test_replica_inbox_is_part_of_heap_budget(self) -> None:
-        """RMA adds only the B-slot FP32 inbox and its allocation alignment."""
-        specification = {"local_num_tokens": 128, "top_k": 2, "hidden_size": 5120,
-                         "intermediate_size": 1792, "num_experts": 28, "ep_size": 4,
-                         "logical_num_experts": 24, "replica_slots_per_rank": 1, "initial_capacity_factor": 1.0}
-        before = workspace_module._spec_workspace_bytes(specification, 2)
-        specification["replica_transport"] = "shmem"
-        after = workspace_module._spec_workspace_bytes(specification, 2)
-        self.assertEqual(after - before, 5120 * 1792 * 2 * 4 + 511)
-
     def test_signal_storage_budget_and_rebuild_reset(self) -> None:
         """Heap replacement drops the old provider's address views and epoch."""
         specification = {"local_num_tokens": 128, "top_k": 2, "hidden_size": 5120,
                          "intermediate_size": 1792, "num_experts": 28, "ep_size": 4,
                          "logical_num_experts": 24, "replica_slots_per_rank": 1, "initial_capacity_factor": 1.0}
         before = workspace_module._spec_workspace_bytes(specification, 2)
-        for mode in ("shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel", "shmem_signal_sdma_bidir",
-                     "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection",
-                     "shmem_signal_kernel_gradient"):
-            specification["replica_transport"] = mode
-            after = workspace_module._spec_workspace_bytes(specification, 2)
-            ready_bytes = 2 * 64 if mode in ("shmem_signal_sdma_projection",
-                                            "shmem_signal_kernel_gradient") else 0
-            self.assertEqual(after - before, 5120 * 1792 * 3 * 6 + 5 * 4 * 64 + ready_bytes + 511)
-            spec = SimpleNamespace(hidden_size=8, intermediate_size=4, ep_size=4,
-                                   replica_slots_per_rank=1, replica_transport=mode)
-            workspace = MegaMoeWorkspace(shared=True)
-            with patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
-                    shape, dtype=kw["dtype"])), patch.object(workspace_module.shmem, "free"):
-                workspace._allocate_replica_storage(spec)
-                previous = workspace.replica_provider
-                previous.epoch = 17
-                workspace._free_symmetric_tensors()
-                self.assertIsNone(workspace.replica_provider)
-                self.assertIsNone(workspace.replica_inbox)
-                workspace._allocate_replica_storage(spec)
-                self.assertIsNot(workspace.replica_provider, previous)
-                self.assertEqual(workspace.replica_provider.epoch, 0)
-                self.assertIsNone(workspace.replica_provider.pool)
-                self.assertEqual(workspace.replica_provider.gradient_scratch_bytes, 0)
+        specification["replica_transport"] = "shmem_signal_kernel_gradient"
+        after = workspace_module._spec_workspace_bytes(specification, 2)
+        self.assertEqual(after - before, 5120 * 1792 * 3 * 6 + 5 * 4 * 64 + 2 * 64 + 511)
+        spec = SimpleNamespace(hidden_size=8, intermediate_size=4, ep_size=4,
+                               replica_slots_per_rank=1, replica_transport="shmem_signal_kernel_gradient")
+        workspace = MegaMoeWorkspace(shared=True)
+        with patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
+                shape, dtype=kw["dtype"])), patch.object(workspace_module.shmem, "free"):
+            workspace._allocate_replica_storage(spec)
+            previous = workspace.replica_provider
+            previous.epoch = 17
+            workspace._free_symmetric_tensors()
+            self.assertIsNone(workspace.replica_provider)
+            self.assertIsNone(workspace.replica_inbox)
+            workspace._allocate_replica_storage(spec)
+            self.assertIsNot(workspace.replica_provider, previous)
+            self.assertEqual(workspace.replica_provider.epoch, 0)
+            self.assertIsNone(workspace.replica_provider.pool)
+            self.assertEqual(workspace.replica_provider.gradient_scratch_bytes, 0)
 
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Retain expanded event storage when allocating through the SHMEM API."""

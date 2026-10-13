@@ -19,8 +19,12 @@ from __future__ import annotations
 import struct
 import unittest
 
-from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
-from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
+    build_backward_graph,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
+    build_forward_graph,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.profiling import (
     MEGA_MOE_PROFILE_OWNER_LABEL,
     _configure_mega_moe_profile_metadata,
@@ -30,12 +34,12 @@ from hyper_parallel.core.multicore.profiler.profiling import (
     GRAPH_STAGE_DESC_BASE,
     MAX_PROFILE_BUFFER_BYTES,
     MAX_RECORDS_PER_CORE,
-    _ProfileSpec,
     _apply_mega_kernel_profile_graph,
     _calculate_profile_layout,
     _duration_trace_event,
     _get_mega_kernel_profile_metadata,
     _prepare_mega_kernel_runtime_config,
+    _ProfileSpec,
     _resolve_cycle_frequency_mhz,
     _round_up_record_capacity,
     _set_mega_kernel_profile_metadata,
@@ -332,6 +336,22 @@ class TestMegaKernelProfilingMetadata(unittest.TestCase):
 
 class TestMegaKernelProfileLayout(unittest.TestCase):
     """Validate exact bounded AIC/AIV buffer sizing."""
+
+    def test_reserved_gradient_workers_cover_high_fanout(self) -> None:
+        """Both W2/W13 emit one record per replica outside the vector task queue."""
+        runtime_config = _runtime_config(128)
+        runtime_config.num_workers = 48
+        for peers in (7, 31, 63):
+            with self.subTest(peers=peers):
+                runtime = _prepare_mega_kernel_runtime_config(
+                    runtime_config, tensor_factory=lambda data: data, profile_tensor_factory=lambda data: data,
+                    rank=0, device_id=0, replica_gradient_records=2 * peers,
+                )
+                self.assertGreaterEqual(runtime_config.aiv_profile_record_capacity, 2 * peers)
+                self.assertIsNotNone(runtime.normal_tensor)
+        for invalid in (-1, True, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "nonnegative integer"):
+                _calculate_profile_layout(runtime_config, replica_gradient_records=invalid)
 
     def test_layout_rounds_busiest_workers_to_sixteen_records(self):
         """Mirror Device round-robin assignment for AIC and AIV independently."""

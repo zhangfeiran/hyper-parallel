@@ -18,9 +18,9 @@ from __future__ import annotations
 
 __all__ = []
 
+import struct
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-import struct
 from threading import Lock
 from typing import Any
 
@@ -38,7 +38,6 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode
 from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
-
 
 CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
 VECTOR_SLOT_COUNT = NUM_WORKERS_VECTOR
@@ -221,9 +220,12 @@ def _max_worker_record_count(
     return max(worker_record_counts)
 
 
-def _calculate_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
+def _calculate_profile_layout(runtime_config: RuntimeConfigC, *, replica_gradient_records: int = 0) -> _ProfileLayout:
     """Reproduce Device task distribution and size AIC/AIV slots from the busiest worker."""
     _validate_runtime_config(runtime_config)
+    if (isinstance(replica_gradient_records, bool) or not isinstance(replica_gradient_records, int)
+            or replica_gradient_records < 0):
+        raise ValueError("replica_gradient_records must be a nonnegative integer")
     num_workers = int(runtime_config.num_workers)
     if num_workers < 0 or num_workers % 2 != 0 or num_workers > VECTOR_SLOT_COUNT:
         raise ValueError(
@@ -242,6 +244,8 @@ def _calculate_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
         int(runtime_config.task_index_num[1]),
         active_worker_count,
     )
+    # Reserved gradient workers bypass the task queue and record both projections.
+    aiv_required_records = max(aiv_required_records, replica_gradient_records)
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,
@@ -250,9 +254,9 @@ def _calculate_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
     )
 
 
-def _configure_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
+def _configure_profile_layout(runtime_config: RuntimeConfigC, *, replica_gradient_records: int = 0) -> _ProfileLayout:
     """Calculate and serialize the bounded AIC/AIV record capacities."""
-    layout = _calculate_profile_layout(runtime_config)
+    layout = _calculate_profile_layout(runtime_config, replica_gradient_records=replica_gradient_records)
     runtime_config.aic_profile_record_capacity = layout.aic_record_capacity
     runtime_config.aiv_profile_record_capacity = layout.aiv_record_capacity
     return layout
@@ -460,6 +464,7 @@ class _PreparedMegaKernelRuntime:
         profile_tensor_factory: Callable[[Any], Any],
         rank: int,
         device_id: int,
+        replica_gradient_records: int = 0,
     ) -> None:
         """Prepare immutable metadata and the default disabled Device tensor."""
         _validate_runtime_config(runtime_config)
@@ -471,7 +476,7 @@ class _PreparedMegaKernelRuntime:
         self._rank = rank
         self._device_id = device_id
         self._metadata = _get_mega_kernel_profile_metadata(runtime_config)
-        self._layout = _configure_profile_layout(runtime_config)
+        self._layout = _configure_profile_layout(runtime_config, replica_gradient_records=replica_gradient_records)
         runtime_config.cycle_profiling_enabled = 0
         self._normal_tensor = tensor_factory(serialize_runtime_config(runtime_config))
         self._profile_tensor = None
@@ -545,6 +550,7 @@ def _prepare_mega_kernel_runtime_config(
     profile_tensor_factory: Callable[[Any], Any],
     rank: int,
     device_id: int,
+    replica_gradient_records: int = 0,
 ) -> _PreparedMegaKernelRuntime:
     """Prepare fast/profiled RuntimeConfig variants without exposing ABI details."""
     return _PreparedMegaKernelRuntime(
@@ -553,6 +559,7 @@ def _prepare_mega_kernel_runtime_config(
         profile_tensor_factory=profile_tensor_factory,
         rank=rank,
         device_id=device_id,
+        replica_gradient_records=replica_gradient_records,
     )
 
 

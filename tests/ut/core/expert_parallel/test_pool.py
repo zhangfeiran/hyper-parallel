@@ -16,13 +16,17 @@
 
 import gc
 import unittest
-from unittest.mock import MagicMock, patch
 import weakref
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
-from hyper_parallel.core.expert_parallel.hot_replica.pool import ReplicaPool, ReplicaPrefetch, replica_pool
+from hyper_parallel.core.expert_parallel.hot_replica.pool import (
+    ReplicaPool,
+    ReplicaPrefetch,
+    replica_pool,
+)
 from tests.common.mark_utils import arg_mark
 
 
@@ -34,14 +38,17 @@ class _Group:
 class TestReplicaPool(unittest.TestCase):
     """Exercise the pool independently of accelerator and collective setup."""
 
-    def test_whole_slot_prefetch_keeps_its_original_callback_contract(self):
-        """Legacy no-argument ready callbacks run once even for matrix-specific reads."""
-        pool = ReplicaPool((torch.ones(1, 2, 2),), 1)
+    def test_projection_prefetch_waits_once_per_matrix(self):
+        """Join each projection once, including a final whole-slot wait."""
+        pool = ReplicaPool((torch.ones(1, 2, 2), torch.ones(1, 2, 1)), 1)
         waited = []
-        prefetched = ReplicaPrefetch(pool, lambda: waited.append(True), (4096, 17))
+        prefetched = ReplicaPrefetch(pool, waited.append, projection_ready=((4096, 8192), 17))
+        prefetched.wait_weights(0)
         prefetched.wait_weights(0)
         prefetched.wait_weights()
-        self.assertEqual(waited, [True])
+        self.assertEqual(waited, [0, 1])
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            prefetched.wait_weights(2)
 
     def test_layer_reuse_and_group_lifetime(self):
         """Different layers reuse B storage without pinning parameters or groups."""

@@ -51,6 +51,17 @@ class TestMegaMoeExperts(unittest.TestCase):
         mock_create_parameters.assert_called_once_with(2, 16, 8)
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_removed_replica_transports_fail_before_allocation(self, create_parameters: Mock) -> None:
+        """Reject obsolete protocols even when the replica budget is disabled."""
+        for mode in ("shmem", "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel",
+                     "shmem_signal_sdma_bidir", "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection",
+                     "shmem_signal_kernel_gradient_adaptive"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "Unsupported replica_transport"):
+                MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                               num_experts=4, top_k=2, ep_size=2, replica_transport=mode)
+        create_parameters.assert_not_called()
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_constructor_rejects_invalid_static_values_before_allocation(
         self,
         mock_create_parameters: Mock,
