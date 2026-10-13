@@ -31,6 +31,7 @@ import torch.distributed as dist
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.shmem import _lifecycle
 
+from ..module import _retained_runtime_reference
 from .spec import _align_capacity, _resolve_receive_capacity
 from .workspace import _HEAP_GRANULARITY_BYTES, _round_up, _spec_workspace_bytes, configure_symmetric_heap
 
@@ -205,7 +206,7 @@ class MegaMoeHeapManager:
         error = None
         try:
             state = shmem.debug_state()
-            if state["reference_count"] != len(self.resources):
+            if state["reference_count"] != len(self.resources) + _retained_runtime_reference(shmem.release):
                 raise RuntimeError("unmanaged SHMEM owner prevents heap growth")
             pointers = set()
             for resource in self.resources:

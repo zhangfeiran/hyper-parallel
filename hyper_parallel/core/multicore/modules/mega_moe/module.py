@@ -131,7 +131,9 @@ class MegaMoeExperts(MulticoreModule):
 
     def _resource_signature(self, tensor: Any) -> Any:
         """Compare static configuration without process-local group identities."""
-        return (super()._resource_signature(tensor), self._resource_group.compatibility_key[:-1],
+        configuration = tuple(sorted((name, value) for name, value in self._resource_group.specification.items()
+                                     if name != "ep_group"))
+        return (super()._resource_signature(tensor), configuration,
                 self._resource_group.shared)
 
     def _retain_runtime(self, manager: Any) -> None:

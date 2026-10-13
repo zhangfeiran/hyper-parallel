@@ -95,6 +95,8 @@ class TestLifecycle(unittest.TestCase):
         for stage in (1, 2):
             member, resources = self._bind()
             release = self.manager.runtime_release = Mock()
+            self.assertEqual(module_api._retained_runtime_reference(release), 1)
+            self.assertEqual(module_api._retained_runtime_reference(Mock()), 0)
             failures = Mock(side_effect=[None] * (stage - 1) + ["remote failed"])
             with patch.object(_automatic, "exchange", side_effect=lambda value, failures=failures: [
                     value, failures() if value is None else value]):
@@ -102,10 +104,12 @@ class TestLifecycle(unittest.TestCase):
                     member.close()
             self.assertFalse(member._resource_closed)
             self.assertIs(self.manager.runtime_release, release)
+            self.assertEqual(module_api._retained_runtime_reference(release), int(stage == 1))
             member.close()
             release.assert_called_once_with()
             self.assertEqual(resources.close.call_count, 3 - stage)
             self.assertFalse(self.manager._groups)
+            self.assertEqual(module_api._retained_runtime_reference(release), 0)
 
     def test_retained_graph_and_partial_free(self):
         """A retained graph blocks close; retry never repeats a successful free."""

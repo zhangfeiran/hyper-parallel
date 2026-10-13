@@ -30,6 +30,35 @@ from hyper_parallel.core.multicore.modules.mega_moe.spec import bind_mega_moe_sp
 class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
 
+    def test_collective_signature_ignores_process_local_group_addresses(self) -> None:
+        """Equal rank configurations remain compatible with distinct local group handles."""
+        arguments = {"local_num_tokens": 512, "hidden_size": 16, "intermediate_size": 8,
+                     "num_experts": 4, "top_k": 2, "ep_size": 2, "create_parameters": False}
+        tensor = SimpleNamespace(dtype=torch.bfloat16)
+        with patch.object(mega_moe_module.dist, "is_initialized", return_value=False):
+            layers = [MegaMoeExperts(**arguments, ep_group=object()) for _ in range(2)]
+        for layer in layers:
+            self.addCleanup(layer.close)
+        self.assertNotEqual(layers[0]._resource_group.compatibility_key, layers[1]._resource_group.compatibility_key)
+        self.assertEqual(layers[0]._resource_signature(tensor), layers[1]._resource_signature(tensor))
+
+    def test_collective_signature_checks_every_static_configuration_field(self) -> None:
+        """Catch peer configuration drift, including each independently configured split."""
+        arguments = {"local_num_tokens": 512, "hidden_size": 16, "intermediate_size": 8,
+                     "num_experts": 4, "top_k": 2, "ep_size": 2, "create_parameters": False}
+        tensor = SimpleNamespace(dtype=torch.bfloat16)
+        with patch.object(mega_moe_module.dist, "is_initialized", return_value=False):
+            first = MegaMoeExperts(**arguments)
+            self.addCleanup(first.close)
+            for name, value in (("local_num_tokens", 1024), ("hidden_size", 32), ("intermediate_size", 16),
+                                ("num_experts", 8), ("top_k", 1), ("ep_size", 1),
+                                ("initial_capacity_factor", 2.0), ("capacity_growth_factor", 2.0),
+                                ("dispatch_split", 256), ("combine_split", 256), ("dispatch_mode", "pull")):
+                with self.subTest(field=name):
+                    changed = MegaMoeExperts(**{**arguments, name: value})
+                    self.addCleanup(changed.close)
+                    self.assertNotEqual(first._resource_signature(tensor), changed._resource_signature(tensor))
+
     def test_communication_splits_reach_both_graphs_and_isolate_sharing(self) -> None:
         """Propagate independent public split values without sharing incompatible plans."""
         arguments = {"local_num_tokens": 512, "hidden_size": 16, "intermediate_size": 8,

@@ -96,6 +96,19 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 self.reinitialize.assert_not_called()
                 self.assertEqual(self.manager.state, "ready")
 
+    def test_automatic_root_reference_is_managed_but_external_owners_are_rejected(self) -> None:
+        """Grow with the resource pool's root pin without accepting additional users."""
+        with patch.object(manager_module, "_retained_runtime_reference", return_value=1):
+            self.state["reference_count"] = 2
+            self.manager.ensure_capacity(self.resource, 40000)
+            self.assertEqual(self.manager.epoch, 1)
+            self.reinitialize.assert_called_once()
+            self.state["reference_count"] = 3
+            with self.assertRaisesRegex(RuntimeError, "unmanaged SHMEM owner"):
+                self.manager.ensure_capacity(self.resource, 60000)
+            self.assertEqual(self.manager.epoch, 1)
+            self.reinitialize.assert_called_once()
+
     def test_peer_manifest_mismatch_precedes_teardown(self) -> None:
         """A rank disagreement must not free any still-valid symmetric tensor."""
         self.manager.members = (0, 1)
