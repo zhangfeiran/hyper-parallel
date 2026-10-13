@@ -332,11 +332,11 @@ def _launch_forward_kernel(
         routed_tokens.contiguous(),
         metadata.dispatch_src_off * spec.hidden_size,
         metadata.dispatch_size * spec.hidden_size,
-        weight1.contiguous(),
+        weight1,
         metadata.group_list,
         execution.intermediates.up_proj,
         execution.intermediates.activation,
-        weight2.contiguous(),
+        weight2,
         metadata.group_list,
         execution.intermediates.down_proj,
         execution.combine,
@@ -585,8 +585,8 @@ def execute_mega_moe(
 
     Args:
         routed_tokens: Expert-major token rows.
-        weight1: Local gate and up-projection weights.
-        weight2: Local down-projection weights.
+        weight1: Local gate and up-projection weights; noncontiguous layouts are copied.
+        weight2: Local down-projection weights; noncontiguous layouts are copied.
         route: Route offsets, sizes and group metadata.
         plan: Shape-specific forward and backward descriptors.
         workspace: Reusable directional execution buffers.
@@ -594,7 +594,10 @@ def execute_mega_moe(
     Returns:
         Expert-major output rows with independent storage.
     """
-    return _MegaMoeFunction.apply(routed_tokens, weight1, weight2, route, plan, workspace, None, None, False)
+    # Record layout copies outside Function.forward so gradients reach the caller's original weights.
+    return _MegaMoeFunction.apply(
+        routed_tokens, weight1.contiguous(), weight2.contiguous(), route, plan, workspace, None, None, False,
+    )
 
 
 def execute_mega_moe_with_permutation(
@@ -614,8 +617,8 @@ def execute_mega_moe_with_permutation(
     Args:
         hidden_states: Original flattened token rows.
         topk_ids: Expert IDs used to prepare the routed rows.
-        weight1: Local gate and up-projection weights.
-        weight2: Local down-projection weights.
+        weight1: Local gate and up-projection weights; noncontiguous layouts are copied.
+        weight2: Local down-projection weights; noncontiguous layouts are copied.
         route: Rows and metadata prepared without recording autograd operations.
         plan: Shape-specific native descriptors.
         workspace: Reusable communication buffers.
@@ -629,8 +632,8 @@ def execute_mega_moe_with_permutation(
     """
     return _MegaMoeFunction.apply(
         hidden_states,
-        weight1,
-        weight2,
+        weight1.contiguous(),
+        weight2.contiguous(),
         route.metadata,
         plan,
         workspace,

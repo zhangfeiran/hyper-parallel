@@ -347,8 +347,8 @@ def test_mega_moe_heap_growth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, v
 def test_mega_moe_model_replacement_and_layouts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Feature: Model replacement and tensor layout contracts.
 
-    Description: Replace a collected model and exercise strided inputs and invalid external weights in both modes.
-    Expectation: The physical heap grows and all accepted outputs, gradients and updates match common EP.
+    Description: Replace a collected model and exercise strided inputs and external weights in both modes.
+    Expectation: The physical heap grows and all outputs, original-parameter gradients and updates match common EP.
     """
     _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_model_replacement_and_layouts", 2,
                            "_test_mega_moe_memory.py")

@@ -25,6 +25,7 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import function as function_module
 from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
+from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeFunction(unittest.TestCase):
@@ -73,6 +74,18 @@ class TestMegaMoeFunction(unittest.TestCase):
         """Compute expert weight gradients without an unused token reduction."""
         self._check_deferred_backward(permuted=True, input_grad=False, reuse=True)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_noncontiguous_weights_preserve_original_parameter_gradients(self) -> None:
+        """Feature: Automatic expert-weight layout conversion.
+
+        Description: Submit transposed and sliced weights through both autograd entry points.
+        Expectation: Kernels and saved state use contiguous weights and original parameters receive gradients.
+        """
+        for permuted, layout in product((False, True), ("transpose", "slice")):
+            with self.subTest(permuted=permuted, layout=layout):
+                self._check_deferred_backward(permuted=permuted, weight_layout=layout)
+
     def test_pull_dispatch_skips_only_the_exact_source_self_copy(self) -> None:
         """Use pre-permuted SHMEM directly while preserving ordinary-source staging."""
         spec = SimpleNamespace(dispatch_mode="pull", hidden_size=4)
@@ -87,8 +100,22 @@ class TestMegaMoeFunction(unittest.TestCase):
         function_module._dispatch_and_source(spec, workspace, rows, 3)
         torch.testing.assert_close(source, rows)
 
+    @staticmethod
+    def _make_weight_views(layout: str) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Create leaf parameters and the requested expert-weight views."""
+        shapes = {"contiguous": ((2, 4, 4), (2, 2, 4)),
+                  "transpose": ((2, 4, 4), (2, 4, 2)),
+                  "slice": ((2, 4, 8), (2, 2, 8))}
+        bases = tuple(torch.ones(shape, requires_grad=True) for shape in shapes[layout])
+        if layout == "transpose":
+            return bases, tuple(base.transpose(-1, -2) for base in bases)
+        if layout == "slice":
+            return bases, tuple(base[:, :, ::2] for base in bases)
+        return bases, bases
+
     def _check_deferred_backward(
         self, *, permuted: bool, input_grad: bool = True, reuse: bool = False, pull: bool = False,
+        weight_layout: str = "contiguous",
     ) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
@@ -112,8 +139,8 @@ class TestMegaMoeFunction(unittest.TestCase):
             gmm_workspace=torch.empty(1),
             swiglu_grad_workspace=torch.empty(1),
         )
-        weight1 = torch.ones(2, 4, 4, requires_grad=True)
-        weight2 = torch.ones(2, 2, 4, requires_grad=True)
+        (weight1_base, weight2_base), (weight1, weight2) = self._make_weight_views(weight_layout)
+        forward_weights = []
         down_pointers = []
         dispatch_pointers = []
         backward_capacities = []
@@ -152,6 +179,12 @@ class TestMegaMoeFunction(unittest.TestCase):
 
         def forward_kernel(*args: Any) -> None:
             """Fill every output with a call-specific sentinel."""
+            self.assertTrue(args[5].is_contiguous())
+            self.assertTrue(args[9].is_contiguous())
+            forward_weights.append((args[5], args[9]))
+            if weight_layout == "contiguous":
+                self.assertIs(args[5], weight1)
+                self.assertIs(args[9], weight2)
             dispatch, source = args[0], args[2]
             up_proj, activation, down_proj, combine = args[7], args[8], args[11], args[12]
             tag = source[0, 0].item()
@@ -169,6 +202,11 @@ class TestMegaMoeFunction(unittest.TestCase):
 
         def backward_kernel(*args: Any) -> None:
             """Check saved values before emulating the in-place gradient outputs."""
+            packed_weight1, packed_weight2 = forward_weights.pop()
+            self.assertIs(args[11], packed_weight1)
+            self.assertIs(args[7], packed_weight2)
+            self.assertTrue(args[18].is_contiguous())
+            self.assertTrue(args[6].is_contiguous())
             saved_dispatch = args[17]
             capacity = saved_dispatch.shape[0]
             backward_capacities.append(capacity)
@@ -235,6 +273,8 @@ class TestMegaMoeFunction(unittest.TestCase):
                     setattr(route, name, torch.zeros(4, dtype=torch.int64))
                 output = _forward(source, route)
                 saved = output.grad_fn.saved_tensors
+                self.assertIs(saved[3], forward_weights[-1][0])
+                self.assertIs(saved[4], forward_weights[-1][1])
                 self.assertEqual(len(saved), 13 if permuted and input_grad else 12)
                 self.assertTrue(all(t.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
                                     for t in saved))
@@ -248,8 +288,11 @@ class TestMegaMoeFunction(unittest.TestCase):
                 self.assertTrue(torch.equal(outputs[tag - 1], torch.full((4, 4), float(tag + 40))))
                 outputs[tag - 1].sum().backward()
                 self._assert_input_gradient(sources[tag - 1], tag, permuted=permuted, input_grad=input_grad)
-        self.assertTrue(torch.equal(weight1.grad, torch.full_like(weight1, 10.0)))
-        self.assertTrue(torch.equal(weight2.grad, torch.full_like(weight2, 10.0)))
+        for base in (weight1_base, weight2_base):
+            expected_grad = torch.full_like(base, 10.0)
+            if weight_layout == "slice":
+                expected_grad[:, :, 1::2] = 0
+            torch.testing.assert_close(base.grad, expected_grad)
         self.assertEqual(mock_permutation.call_count, len(outputs) if permuted and input_grad else 0)
         self.assertEqual(backward_capacities, list(reversed(capacities)))
         self.assertEqual(workspace.claim.call_count, 8)

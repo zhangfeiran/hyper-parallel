@@ -333,8 +333,6 @@ class MegaMoeExperts(MulticoreModule):
             )
         if weight1.dtype != hidden_states.dtype or weight2.dtype != hidden_states.dtype:
             raise TypeError("expert weights and hidden states must all use BF16.")
-        if not weight1.is_contiguous() or not weight2.is_contiguous():
-            raise ValueError("MegaMoe expert weights must be contiguous.")
 
     def _validate_forward_inputs(
         self,
@@ -391,8 +389,8 @@ class MegaMoeExperts(MulticoreModule):
             hidden_states: Tensor ending in ``hidden_size``.
             topk_ids: Global expert IDs shaped ``[local_num_tokens, top_k]``.
             topk_weights: Router weights with the same shape as ``topk_ids``.
-            expert_weights: Contiguous current unsharded weights owned by an outer module;
-                never cached by this executor.
+            expert_weights: Current unsharded weights owned by an outer module; noncontiguous
+                layouts are copied with autograd tracking, never cached by this executor.
             tokens_per_expert: Optional trusted exact global-expert histogram.
                 Supplying Router-produced counts skips histogram recomputation.
 

@@ -30,28 +30,29 @@ from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_ev
 
 
 def _check_strided_layer(layer: MegaMoeExperts, common: torch.nn.Module, shape: baseline.MoeShape) -> None:
-    """Compare strided input gradients and reject strided weights before binding."""
+    """Compare strided inputs and external-weight views, including original-parameter updates."""
     source, upstream = baseline.make_data(shape)
     ids, probs, counts = baseline.make_balanced_route(shape)
-    bad_down = layer.down_weight.transpose(-1, -2).contiguous().transpose(-1, -2)
-    try:
-        layer(source, ids, probs, expert_weights=(layer.gate_up_weight, bad_down))
-    except ValueError as error:
-        assert "contiguous" in str(error), f"unexpected weight-layout error: {error}"
-    else:
-        raise AssertionError("Noncontiguous external weights must fail before native execution")
-    assert layer._resource_group.resources is None, f"rank={baseline.RANK}: invalid weights bound resources"
+    gate_up_base = layer.gate_up_weight.detach().transpose(-1, -2).contiguous().requires_grad_(True)
+    down_base = torch.zeros((shape.local_experts, shape.intermediate_size, shape.hidden_size * 2),
+                            dtype=source.dtype, device=source.device)
+    down_base[:, :, ::2].copy_(layer.down_weight.detach())
+    down_base.requires_grad_(True)
+    weight1, weight2 = gate_up_base.transpose(-1, -2), down_base[:, :, ::2]
+    assert not weight1.is_contiguous() and not weight2.is_contiguous(), "external weights must exercise views"
     expected = baseline.run_layer(common, source, ids, probs, counts, upstream)
     storage = torch.empty((shape.local_num_tokens, shape.hidden_size * 2), dtype=source.dtype, device=source.device)
     storage[:, ::2].copy_(source)
     hidden = storage[:, ::2].detach().requires_grad_(True)
     route_weights = probs.detach().requires_grad_(True)
-    actual = layer(hidden, ids, route_weights, tokens_per_expert=counts)
+    actual = layer(hidden, ids, route_weights, tokens_per_expert=counts, expert_weights=(weight1, weight2))
     actual.backward(upstream)
-    torch.optim.SGD(layer.parameters(), lr=1e-3).step()
+    torch.optim.SGD((gate_up_base, down_base), lr=1e-3).step()
     torch.npu.synchronize()
-    grad1, grad2 = baseline.expert_weight_gradients(layer)
-    weight1, weight2 = baseline.expert_weights(layer)
+    grad1, grad2 = gate_up_base.grad.transpose(-1, -2), down_base.grad[:, :, ::2]
+    assert layer.gate_up_weight.grad is None and layer.down_weight.grad is None, "owned weights must remain unused"
+    assert torch.count_nonzero(down_base.grad[:, :, 1::2]).item() == 0, "unused slice entries received gradients"
+    assert torch.count_nonzero(down_base[:, :, 1::2]).item() == 0, "unused slice entries changed during SGD"
     pairs = (
         ("output", actual, expected.output),
         ("input gradient", hidden.grad, expected.input_grad),
@@ -68,8 +69,8 @@ def _check_strided_layer(layer: MegaMoeExperts, common: torch.nn.Module, shape: 
 def test_mega_moe_model_replacement_and_layouts() -> None:
     """Feature: Model replacement and caller tensor layouts.
 
-    Description: Replace a collected model with a larger push or pull model and use strided activations.
-    Expectation: Retained heaps grow, invalid weights fail early, and all gradients and updates match common EP.
+    Description: Replace a collected model with a larger push or pull model and use strided activations and weights.
+    Expectation: Retained heaps grow and all outputs, original-parameter gradients and updates match common EP.
     """
     os.environ.pop("HYPER_PARALLEL_SHMEM_HEAP_SIZE", None)
     records = []
@@ -95,7 +96,9 @@ def test_mega_moe_model_replacement_and_layouts() -> None:
             assert state["config"]["heap_size_bytes"] > old_bytes, f"rank={baseline.RANK}: heap did not grow"
             records.append({"mode": mode, "old_heap_bytes": old_bytes,
                             "heap_bytes": state["config"]["heap_size_bytes"], "epoch": 1,
-                            "strided_activations_match": True, "strided_weights_rejected": True})
+                            "strided_activations_match": True, "strided_weights_match": True,
+                            "original_parameter_gradients_and_updates_match": True,
+                            "unused_slice_entries_unchanged": True})
         finally:
             larger.close()
         assert shmem.debug_state()["state"] == "Uninitialized", f"rank={baseline.RANK}: runtime stayed active"

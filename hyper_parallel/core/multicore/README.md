@@ -84,8 +84,10 @@ cross-node interface selection and group-local shutdown requirements.
   省略时内部统计；传入时由调用方保证与当前 ID 一致。contiguous INT32 可直接使用，
   INT64 或非连续输入会转换。
 - 本地参数布局为 `gate_up_weight: [E/EP, H, 2I]`、`down_weight: [E/EP, I, H]`。
-  两份权重都必须连续，逐次 forward 检查布局元数据；外部 `expert_weights` 不会由执行器自动复制。
-  普通 gate/up/down 权重转换时，gate、up 分别转置后在末维拼接，down 转置最后两维并调用 `.contiguous()`。
+  内部在进入自定义 autograd Function 前对两份权重调用 `.contiguous()`：连续权重直接复用原存储，
+  转置、切片等非连续权重会逐次复制为连续布局，并通过 autograd 将梯度回传到调用方的原始权重。
+  执行器不缓存外部权重的连续副本；非连续布局每次调用都会产生复制开销。
+  普通 gate/up/down 权重转换时，gate、up 分别转置后在末维拼接，down 转置最后两维即可。
 
 Router 已有精确计数时，可直接传入：
 

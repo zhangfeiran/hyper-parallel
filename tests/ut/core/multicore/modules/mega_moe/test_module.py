@@ -37,11 +37,11 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_noncontiguous_external_weights_fail_before_binding(self) -> None:
-        """Feature: External expert-weight layout validation.
+    def test_noncontiguous_external_weights_pass_metadata_validation(self) -> None:
+        """Feature: External expert-weight layout compatibility.
 
         Description: Supply transposed and sliced weights with valid shapes.
-        Expectation: Each noncontiguous weight fails before runtime binding or routing.
+        Expectation: Shape-compatible noncontiguous weights pass input validation.
         """
         layer = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
                                num_experts=4, top_k=2, create_parameters=False)
@@ -55,17 +55,13 @@ class TestMegaMoeExperts(unittest.TestCase):
             (weight1, weight2.transpose(-1, -2).contiguous().transpose(-1, -2)),
             (torch.ones(4, 16, 32, dtype=torch.bfloat16)[:, :, ::2], weight2),
         )
-        with (
-            patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
-            patch.object(layer, "_get_execution_resources") as bind,
-            patch.object(mega_moe_module, "prepare_topk_route") as prepare,
-        ):
+        with patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True):
             layer._validate_tensors(hidden, (weight1, weight2))
             for index, weights in enumerate(cases):
-                with self.subTest(case=index), self.assertRaisesRegex(ValueError, "contiguous"):
-                    layer(hidden, ids, probs, expert_weights=weights)
-        bind.assert_not_called()
-        prepare.assert_not_called()
+                with self.subTest(case=index):
+                    actual = layer._validate_forward_inputs(hidden, ids, probs, None, weights)
+                    self.assertEqual(actual.data_ptr(), hidden.data_ptr())
+                    torch.testing.assert_close(actual, hidden)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
