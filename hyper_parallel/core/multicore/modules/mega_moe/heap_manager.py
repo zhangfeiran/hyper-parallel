@@ -116,7 +116,9 @@ class MegaMoeHeapManager:
             if required <= self.heap_bytes:
                 return
             try:
-                if not any(entry.specification.get("dispatch_mode", "push") == "push" for entry in self.entries):
+                if self.resources and not any(
+                    entry.specification.get("dispatch_mode", "push") == "push" for entry in self.entries
+                ):
                     raise RuntimeError("Create all pull MegaMoe resources before initializing the heap")
                 target = self._budget(required)
                 self._rebuild(capacities, target)
@@ -286,7 +288,9 @@ def get_heap_manager(spec: Any, tensor: torch.Tensor, specifications: tuple[Any,
         specifications: All live specifications in deterministic resource order.
     """
     global _MANAGER  # pylint: disable=global-statement
-    if _MANAGER is None or not _MANAGER.resources:
+    # The automatic root pin can outlive the last owner during model replacement.
+    # Keep its physical heap budget so reserve() can grow the still-active runtime.
+    if _MANAGER is None or (not _MANAGER.resources and not _retained_runtime_reference(shmem.release)):
         _MANAGER = MegaMoeHeapManager(spec, tensor, specifications)
     if _MANAGER.members != root_members(spec.ep_group) or _MANAGER.device != tensor.device:
         raise RuntimeError("MegaMoe heap requires one device and ordered SHMEM root per process")

@@ -23,6 +23,7 @@ import torch
 from hyper_parallel.core.multicore.modules.mega_moe import heap_manager as manager_module
 from hyper_parallel.core.multicore.modules.mega_moe.heap_manager import MegaMoeHeapManager
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import MegaMoeWorkspace
+from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeHeapManager(unittest.TestCase):
@@ -60,6 +61,59 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 with self.subTest(received=received):
                     self.manager.ensure_capacity(self.resource, received)
                     rebuild.assert_called_with([capacity], heap_mib * 1024**2)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_orphan_replacement_grows_the_retained_physical_heap(self) -> None:
+        """Feature: Larger model replacement after the last owner is retired.
+
+        Description: Bind push and pull layouts while only the automatic root reference remains.
+        Expectation: Reuse the existing manager and rebuild the actual smaller heap before binding.
+        """
+        self.manager.remove(self.resource)
+        tensor = torch.empty(0, dtype=torch.bfloat16)
+        for mode in ("push", "pull"):
+            specification = dict(self.specification, hidden_size=6144, dispatch_mode=mode,
+                                 initial_capacity_factor=1.0 if mode == "push" else None,
+                                 capacity_growth_factor=1.5 if mode == "push" else None)
+            spec = SimpleNamespace(**specification, ep_group=None)
+            expected = 770 * 1024**2
+            with (
+                self.subTest(mode=mode),
+                patch.object(manager_module, "_MANAGER", self.manager),
+                patch.object(manager_module, "_retained_runtime_reference", return_value=1),
+            ):
+                selected = manager_module.get_heap_manager(spec, tensor, (specification,))
+            self.assertIs(selected, self.manager)
+            self.reinitialize.assert_called_once_with(expected)
+            self.assertEqual(selected.heap_bytes, expected)
+            self.assertEqual(selected.epoch, 1)
+            self.assertEqual(len(selected.entries), 1)
+            self.manager.entries.clear()
+            self.manager.heap_bytes = self.state["config"]["heap_size_bytes"]
+            self.manager.epoch = 0
+            self.reinitialize.reset_mock()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_closed_runtime_replaces_the_empty_manager(self) -> None:
+        """Feature: Fresh root lifecycle after complete shutdown.
+
+        Description: Request a smaller layout once the automatic root reference is released.
+        Expectation: Start with a new manager and initial budget without rebuilding the closed runtime.
+        """
+        self.manager.remove(self.resource)
+        specification = dict(self.specification, local_num_tokens=128, top_k=1, hidden_size=16)
+        spec = SimpleNamespace(**specification, ep_group=None)
+        with (
+            patch.object(manager_module, "_MANAGER", self.manager),
+            patch.object(manager_module, "_retained_runtime_reference", return_value=0),
+        ):
+            selected = manager_module.get_heap_manager(spec, torch.empty(0, dtype=torch.bfloat16), (specification,))
+        self.assertIsNot(selected, self.manager)
+        self.assertEqual(selected.heap_bytes, 2 * 1024**2)
+        self.assertEqual(selected.epoch, 0)
+        self.reinitialize.assert_not_called()
 
     def test_configurable_growth_multiplier(self) -> None:
         """Honor minimal growth, custom headroom and the lossless bound even for huge factors."""

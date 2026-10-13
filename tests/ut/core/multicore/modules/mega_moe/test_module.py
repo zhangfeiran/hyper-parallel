@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for the model-facing MegaMoe module."""
 
+import gc
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -21,14 +22,119 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
+from hyper_parallel.core.multicore.modules import module as module_api
+from hyper_parallel.core.multicore.modules.mega_moe import heap_manager as heap_module
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import bind_mega_moe_spec
+from hyper_parallel.core.multicore.shmem import _lifecycle
+from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_noncontiguous_external_weights_fail_before_binding(self) -> None:
+        """Feature: External expert-weight layout validation.
+
+        Description: Supply transposed and sliced weights with valid shapes.
+        Expectation: Each noncontiguous weight fails before runtime binding or routing.
+        """
+        layer = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                               num_experts=4, top_k=2, create_parameters=False)
+        self.addCleanup(layer.close)
+        hidden = torch.ones(128, 16, dtype=torch.bfloat16)
+        ids, probs = torch.zeros(128, 2, dtype=torch.int32), torch.full((128, 2), 0.5)
+        weight1 = torch.ones(4, 16, 16, dtype=torch.bfloat16)
+        weight2 = torch.ones(4, 8, 16, dtype=torch.bfloat16)
+        cases = (
+            (weight1.transpose(-1, -2), weight2),
+            (weight1, weight2.transpose(-1, -2).contiguous().transpose(-1, -2)),
+            (torch.ones(4, 16, 32, dtype=torch.bfloat16)[:, :, ::2], weight2),
+        )
+        with (
+            patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+            patch.object(layer, "_get_execution_resources") as bind,
+            patch.object(mega_moe_module, "prepare_topk_route") as prepare,
+        ):
+            layer._validate_tensors(hidden, (weight1, weight2))
+            for index, weights in enumerate(cases):
+                with self.subTest(case=index), self.assertRaisesRegex(ValueError, "contiguous"):
+                    layer(hidden, ids, probs, expert_weights=weights)
+        bind.assert_not_called()
+        prepare.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_larger_model_binds_after_old_model_gc(self) -> None:
+        """Feature: Automatic heap ownership across model replacement.
+
+        Description: Collect the only old model and bind a larger push or pull model.
+        Expectation: The actual root pin survives eviction and the larger heap is rebuilt before acquire.
+        """
+        for mode in ("push", "pull"):
+            with self.subTest(mode=mode):
+                self._check_gc_heap_replacement(mode)
+
+    def _check_gc_heap_replacement(self, mode: str) -> None:
+        """Exercise the real resource pool and lifecycle with mocked hardware calls."""
+        manager = module_api._MulticoreResourceManager()
+        state = {"config": {"heap_size_bytes": 0}, "active_allocations": []}
+        native = Mock()
+
+        def initialize(_rank: int, _size: int, _unique_id: bytes, heap_bytes: int) -> None:
+            """Publish the physical size selected by actual initialization or rebuild."""
+            state["config"]["heap_size_bytes"] = heap_bytes
+
+        def debug_state() -> dict:
+            """Use the actual acquire/release reference count in the ownership preflight."""
+            return {**state, "reference_count": _lifecycle._reference_count()}
+
+        native._initialize.side_effect = initialize
+        native._debug_state.side_effect = debug_state
+        with (
+            patch.object(module_api, "_RESOURCE_MANAGER", manager),
+            patch.object(heap_module, "_MANAGER", None),
+            patch.object(_lifecycle, "_users", 0),
+            patch.object(_lifecycle, "_shutdown_failed", False),
+            patch.object(_lifecycle, "_root_uses_distributed", None),
+            patch.object(_lifecycle, "_root_size", None),
+            patch.object(_lifecycle, "_root_group", None),
+            patch.object(_lifecycle, "_root_ranks", None),
+            patch.object(_lifecycle, "_load_native", return_value=native),
+            patch.object(mega_moe_module.dist, "is_initialized", return_value=False),
+            patch.object(module_api._automatic, "register"),
+            patch.object(torch.npu, "get_device_limit", return_value={"cube_core_num": 24}),
+            patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
+            patch.object(torch.npu, "synchronize"),
+            patch.object(mega_moe_module, "build_mega_moe_plan", return_value=Mock()),
+            patch.object(mega_moe_module.shmem, "debug_state", side_effect=debug_state),
+            patch.dict(heap_module.os.environ, {}, clear=True),
+        ):
+            tensor = SimpleNamespace(dtype=torch.bfloat16, device=torch.device("npu:0"), element_size=lambda: 2)
+            small = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                                   num_experts=4, top_k=1, create_parameters=False, dispatch_mode=mode)
+            old = small._get_execution_resources(tensor)
+            self.assertEqual(old.heap_manager.heap_bytes, 2 * 1024**2)
+            del small
+            gc.collect()
+            large = MegaMoeExperts(local_num_tokens=512, hidden_size=1024, intermediate_size=8,
+                                   num_experts=4, top_k=1, create_parameters=False, dispatch_mode=mode)
+            try:
+                resources = large._get_execution_resources(tensor)
+                self.assertIs(resources.heap_manager, old.heap_manager)
+                self.assertEqual(resources.heap_manager.heap_bytes, 4 * 1024**2)
+                self.assertEqual(resources.heap_manager.epoch, 1)
+                self.assertEqual(_lifecycle._reference_count(), 2)
+                self.assertEqual(native._initialize.call_count, 2)
+                native._shutdown.assert_called_once_with()
+            finally:
+                large.close()
+            self.assertEqual(_lifecycle._reference_count(), 0)
+            self.assertEqual(native._shutdown.call_count, 2)
 
     def test_collective_signature_ignores_process_local_group_addresses(self) -> None:
         """Feature: Collective resource compatibility.

@@ -340,3 +340,15 @@ def test_mega_moe_heap_growth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, v
     monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
     monkeypatch.setenv("HP_MEGA_MOE_GROWTH_CASE", variant)
     _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_heap_growth", 2, "_test_mega_moe_memory.py")
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="unessential")
+def test_mega_moe_model_replacement_and_layouts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Feature: Model replacement and tensor layout contracts.
+
+    Description: Replace a collected model and exercise strided inputs and invalid external weights in both modes.
+    Expectation: The physical heap grows and all accepted outputs, gradients and updates match common EP.
+    """
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_model_replacement_and_layouts", 2,
+                           "_test_mega_moe_memory.py")

@@ -181,7 +181,7 @@ def _permute_topk_input_out(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Keep the inverse mapping owned while writing rows into leased SHMEM."""
     mapping = torch.empty(topk_ids.numel(), dtype=torch.int32, device=topk_ids.device)
-    multicore_ops.moe_token_permute_out(hidden_states, topk_ids.contiguous(), output, mapping)
+    multicore_ops.moe_token_permute_out(hidden_states.contiguous(), topk_ids.contiguous(), output, mapping)
     return output, mapping
 
 

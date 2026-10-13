@@ -14,6 +14,7 @@
 # ============================================================================
 """Device regression for local-capacity buffers with outstanding forwards."""
 
+import gc
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -26,6 +27,79 @@ from hyper_parallel.core.multicore import MegaMoeExperts, profiler as multicore_
 from hyper_parallel.core.multicore.torch import ops
 from tests.torch.multicore import _test_mega_moe as baseline
 from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
+
+
+def _check_strided_layer(layer: MegaMoeExperts, common: torch.nn.Module, shape: baseline.MoeShape) -> None:
+    """Compare strided input gradients and reject strided weights before binding."""
+    source, upstream = baseline.make_data(shape)
+    ids, probs, counts = baseline.make_balanced_route(shape)
+    bad_down = layer.down_weight.transpose(-1, -2).contiguous().transpose(-1, -2)
+    try:
+        layer(source, ids, probs, expert_weights=(layer.gate_up_weight, bad_down))
+    except ValueError as error:
+        assert "contiguous" in str(error), f"unexpected weight-layout error: {error}"
+    else:
+        raise AssertionError("Noncontiguous external weights must fail before native execution")
+    assert layer._resource_group.resources is None, f"rank={baseline.RANK}: invalid weights bound resources"
+    expected = baseline.run_layer(common, source, ids, probs, counts, upstream)
+    storage = torch.empty((shape.local_num_tokens, shape.hidden_size * 2), dtype=source.dtype, device=source.device)
+    storage[:, ::2].copy_(source)
+    hidden = storage[:, ::2].detach().requires_grad_(True)
+    route_weights = probs.detach().requires_grad_(True)
+    actual = layer(hidden, ids, route_weights, tokens_per_expert=counts)
+    actual.backward(upstream)
+    torch.optim.SGD(layer.parameters(), lr=1e-3).step()
+    torch.npu.synchronize()
+    grad1, grad2 = baseline.expert_weight_gradients(layer)
+    weight1, weight2 = baseline.expert_weights(layer)
+    pairs = (
+        ("output", actual, expected.output),
+        ("input gradient", hidden.grad, expected.input_grad),
+        ("route gradient", route_weights.grad, expected.route_weight_grad),
+        ("gate/up gradient", grad1, expected.gate_up_weight_grad),
+        ("down gradient", grad2, expected.down_weight_grad),
+        ("gate/up update", weight1, expected.gate_up_weight),
+        ("down update", weight2, expected.down_weight),
+    )
+    for name, observed, reference in pairs:
+        baseline.assert_close(f"strided {name}", observed, reference)
+
+
+def test_mega_moe_model_replacement_and_layouts() -> None:
+    """Feature: Model replacement and caller tensor layouts.
+
+    Description: Replace a collected model with a larger push or pull model and use strided activations.
+    Expectation: Retained heaps grow, invalid weights fail early, and all gradients and updates match common EP.
+    """
+    os.environ.pop("HYPER_PARALLEL_SHMEM_HEAP_SIZE", None)
+    records = []
+    for mode in ("push", "pull"):
+        start_shmem_lifetime()
+        shape = baseline.MoeShape()
+        small, common = baseline.new_layers(shape, dispatch_mode=mode)
+        source, upstream = baseline.make_data(shape)
+        ids, probs, counts = baseline.make_balanced_route(shape)
+        baseline.run_layer(small, source, ids, probs, counts, upstream)
+        old_resources = small._resource_group.resources
+        old_bytes = shmem.debug_state()["config"]["heap_size_bytes"]
+        del small, common
+        gc.collect()
+        larger_shape = replace(shape, local_num_tokens=512, hidden_size=1024)
+        larger, reference = baseline.new_layers(larger_shape, dispatch_mode=mode)
+        try:
+            _check_strided_layer(larger, reference, larger_shape)
+            resources = larger._resource_group.resources
+            state = shmem.debug_state()
+            assert resources.heap_manager is old_resources.heap_manager, f"rank={baseline.RANK}: manager replaced"
+            assert resources.heap_manager.epoch == 1, f"rank={baseline.RANK}: epoch={resources.heap_manager.epoch}"
+            assert state["config"]["heap_size_bytes"] > old_bytes, f"rank={baseline.RANK}: heap did not grow"
+            records.append({"mode": mode, "old_heap_bytes": old_bytes,
+                            "heap_bytes": state["config"]["heap_size_bytes"], "epoch": 1,
+                            "strided_activations_match": True, "strided_weights_rejected": True})
+        finally:
+            larger.close()
+        assert shmem.debug_state()["state"] == "Uninitialized", f"rank={baseline.RANK}: runtime stayed active"
+    write_evidence({"model_replacement_and_layouts": records})
 
 
 def _route(shape: baseline.MoeShape, pattern: str) -> tuple:

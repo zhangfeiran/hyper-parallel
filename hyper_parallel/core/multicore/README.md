@@ -84,7 +84,8 @@ cross-node interface selection and group-local shutdown requirements.
   省略时内部统计；传入时由调用方保证与当前 ID 一致。contiguous INT32 可直接使用，
   INT64 或非连续输入会转换。
 - 本地参数布局为 `gate_up_weight: [E/EP, H, 2I]`、`down_weight: [E/EP, I, H]`。
-  普通 gate/up/down 权重转换时，gate、up 分别转置后在末维拼接，down 转置最后两维。
+  两份权重都必须连续，逐次 forward 检查布局元数据；外部 `expert_weights` 不会由执行器自动复制。
+  普通 gate/up/down 权重转换时，gate、up 分别转置后在末维拼接，down 转置最后两维并调用 `.contiguous()`。
 
 Router 已有精确计数时，可直接传入：
 
@@ -181,6 +182,8 @@ SHMEM Python层以进程级引用计数统一管理Runtime生命周期。每个M
 内部`shmem.acquire()`，关闭时在workspace释放全部对称Tensor后调用一次`shmem.release()`；
 `share_execution_resources`的相同配置层共享同一组及workspace，因此只形成一个资源组SHMEM引用。
 资源池另外持有一个Runtime引用，使不同配置的孤儿workspace替换不会触发Runtime反复终结/重建；
+该引用存活时保留原 heap manager；更大模型首次绑定会根据实际物理 heap 容量集体扩容，
+包括旧 owner 已全部回收后的 push 或 pull 模型替换。
 显式关闭全部已绑定资源或自动关停时释放该引用。非最后一个
 `release()`只减少本地计数，进程内最后一个引用才执行跨rank关闭（仅丢弃模块对象不会触发释放）。未来
 MegaMHC、MegaDSA等Multicore特性复用同一SHMEM Runtime时，也通过同一配对接口共享这套进程级计数，
