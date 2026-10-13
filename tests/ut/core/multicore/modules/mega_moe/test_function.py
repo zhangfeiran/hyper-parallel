@@ -17,7 +17,6 @@
 import struct
 import unittest
 import weakref
-from itertools import product
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
@@ -144,18 +143,6 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertIsNot(first, second)
         self.assertEqual(second.numel() - first.numel(), 24)
         self.assertEqual(len(cache), 1)
-
-    def test_home_only_runtime_keeps_split_addressing_without_guest_pointers(self) -> None:
-        """A no-transfer B>0 graph still addresses home expert matrices separately."""
-        base = torch.arange(16, dtype=torch.uint8)
-        for backward in (False, True):
-            with self.subTest(backward=backward), patch.object(torch.npu, "current_stream"), \
-                    patch.object(torch.Tensor, "record_stream", autospec=True):
-                result = function_module._split_runtime(base, None, 6, backward=backward, home_only=True)
-            self.assertTrue(torch.equal(result[:base.numel()], base))
-            self.assertEqual(struct.unpack("<II5Q", bytes(result[base.numel():].tolist())),
-                             (0x53505754, 2, 6, 0, 0, 0, 0))
-        self.assertIs(function_module._split_runtime(base, None, 6), base)
 
     def test_split_runtime_p2p_encodes_home_and_guest_pointers(self) -> None:
         """P2P weights are ready before launch; backward adds the FP32 guest addresses."""

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -33,7 +32,6 @@ from hyper_parallel.core.multicore.modules.mega_moe.route import (
     prepare_topk_route,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
-from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeRoute(unittest.TestCase):

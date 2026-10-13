@@ -33,7 +33,6 @@ from hyper_parallel.core.multicore.profiler.profiling import (
     DEFAULT_STAGE_NAMES,
     GRAPH_STAGE_DESC_BASE,
     MAX_PROFILE_BUFFER_BYTES,
-    MAX_RECORDS_PER_CORE,
     _apply_mega_kernel_profile_graph,
     _calculate_profile_layout,
     _duration_trace_event,
@@ -41,7 +40,6 @@ from hyper_parallel.core.multicore.profiler.profiling import (
     _prepare_mega_kernel_runtime_config,
     _ProfileSpec,
     _resolve_cycle_frequency_mhz,
-    _round_up_record_capacity,
     _set_mega_kernel_profile_metadata,
 )
 from hyper_parallel.core.multicore.scheduler.config import (
