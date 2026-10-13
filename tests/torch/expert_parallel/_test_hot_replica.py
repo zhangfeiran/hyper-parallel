@@ -17,19 +17,19 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack, nullcontext
-from dataclasses import asdict
-from functools import wraps
-from typing import Any
-from unittest.mock import patch
 import importlib
-import sys
 import json
 import os
+import sys
 import time
+from contextlib import ExitStack, nullcontext
 from datetime import timedelta
+from functools import wraps
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch_npu
@@ -38,20 +38,32 @@ from hyper_parallel import init_device_mesh
 from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.core.expert_parallel import ExpertParallel
 from hyper_parallel.core.expert_parallel.hot_replica import (
-    ExpertReplicaConfig, ExpertReplicaCostModel, build_expert_replica_plan,
+    ExpertReplicaConfig,
+    ExpertReplicaCostModel,
+    build_expert_replica_plan,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.native import (
-    dispatch_native_replicas, combine_native_replicas, native_replica_experts,
+    combine_native_replicas,
+    dispatch_native_replicas,
+    native_replica_experts,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    SIGNAL_TRANSPORT_MODES, SignalReplicaTransport,
+    KERNEL_GRADIENT_TRANSPORT,
+    SignalReplicaTransport,
 )
-from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_weights, return_gradients
+from hyper_parallel.core.expert_parallel.hot_replica.transport import (
+    prefetch_weights,
+    return_gradients,
+)
 from tests.common.port_utils import allocate_port
 from tests.torch.expert_parallel.hot_replica_checks import (
-    deferred_ids, execution_identity, file_identity, route_evidence,
+    deferred_ids,
+    execution_identity,
+    file_identity,
+    route_evidence,
 )
+from tests.torch.expert_parallel.test_hot_replica import TRAINING_CASES
 
 
 def _local(tensor):
@@ -208,7 +220,7 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
 
 
 def _cross_stream_deferred(base, candidate, executor, experts, rank, device, tokens, hidden, top_k,
-                           reference, replica_planner, *, runtime_version=2):
+                           reference, replica_planner, *, kernel_gradient=False):
     """Check leased image reuse and per-launch tails on two streams with reverse backward."""
     function = importlib.import_module("hyper_parallel.core.multicore.modules.mega_moe.function")
     launches, snapshots, images = [], [], []
@@ -241,7 +253,8 @@ def _cross_stream_deferred(base, candidate, executor, experts, rank, device, tok
                                     reference, replica_planner, cross_stream=True)
     for direction in ("forward", "backward"):
         records = [item for item in launches if item["direction"] == direction]
-        _check_runtime_direction(records, runtime_version, direction)
+        version = (4 if direction == "forward" else 5) if kernel_gradient else 2
+        _check_runtime_direction(records, version, direction)
     for snapshot, expected in snapshots:
         if bytes(snapshot.cpu().tolist()) != expected:
             raise AssertionError("Runtime tail was overwritten before its consumer completed")
@@ -261,7 +274,8 @@ def _check_runtime_direction(records, runtime_version, direction):
         raise AssertionError(f"Unexpected runtime version: {records}")
     if runtime_version == 2 and len(set(tails)) != 1:
         raise AssertionError(f"Static suffix changed: {records}")
-    if runtime_version == 4 and tails[0][-8:] == tails[1][-8:]:
+    epoch_slice = slice(-16, -8) if runtime_version == 5 else slice(-8, None)
+    if runtime_version in (4, 5) and tails[0][epoch_slice] == tails[1][epoch_slice]:
         raise AssertionError(f"Projection epochs did not advance: {records}")
 
 
@@ -403,33 +417,6 @@ def _kernel_wait_stress(base, candidate, executor, experts, rank, device, tokens
     return {"checks": checks, "publications": publications, "global_ready_words": totals.cpu().tolist()}
 
 
-def _benchmark(candidate, executor, experts, tokens, hidden, top_k, iterations):
-    """Measure fresh-process warmed forward/backward plus SGD on a fixed hot route."""
-    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
-    torch.manual_seed(712 + dist.get_rank())
-    values = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device).requires_grad_()
-    ids = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k).remainder(max(6, top_k)).long()
-    probabilities = torch.full((tokens, top_k), 1 / top_k, device=device)
-    gradient = torch.randn_like(values) / tokens
-    optimizer = torch.optim.SGD(candidate.parameters(), lr=0.001, momentum=0.9)
-    measured = []
-    for iteration in range(iterations + 3):
-        optimizer.zero_grad(set_to_none=True)
-        values.grad = None
-        dist.barrier()
-        torch.npu.synchronize()
-        start = time.perf_counter()
-        output = _expert_forward(candidate, executor, values, ids, probabilities, experts)
-        output.backward(gradient)
-        optimizer.step()
-        torch.npu.synchronize()
-        elapsed = torch.tensor([(time.perf_counter() - start) * 1000], device=device)
-        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
-        if iteration >= 3:
-            measured.append(float(elapsed.cpu()[0]))
-    return {"step_ms": measured, "iterations": iterations, "warmup": 3}
-
-
 def _requires_transfers(budget, minimum_rows, minimum_load_reduction):
     """Require active copies only in fixtures that explicitly request the original policy."""
     return budget > 0 and minimum_rows == 0 and minimum_load_reduction == 0
@@ -438,13 +425,13 @@ def _requires_transfers(budget, minimum_rows, minimum_load_reduction):
 def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         hidden: int = 128, intermediate: int = 128, top_k: int = 2,
         same_backend_reference: bool = False, replica_transport: str = "p2p",
-        benchmark_iterations: int = 0, replica_min_rows: int = 0, replica_planner: str = "cpu",
+        replica_min_rows: int = 0, replica_planner: str = "cpu",
         default_group: bool = False, fp32_reference: bool = False,
         cost_model: ExpertReplicaCostModel | None = None, cross_stream: bool = False,
         minimum_load_reduction: float = 0.0) -> None:
     """Compare full forward/backward with native B=0, preserving EP ownership."""
-    if cross_stream and (backend == "native" or replica_transport not in ("p2p", "shmem_signal_sdma_projection")):
-        raise ValueError("Runtime cross-stream acceptance requires MegaMoe P2P or projection")
+    if cross_stream and (backend == "native" or replica_transport not in ("p2p", KERNEL_GRADIENT_TRANSPORT)):
+        raise ValueError("Runtime cross-stream acceptance requires MegaMoe P2P or kernel_gradient")
     if fp32_reference and same_backend_reference:
         raise ValueError("Select only one reference backend")
     rank, size = dist.get_rank(), dist.get_world_size()
@@ -508,7 +495,9 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             candidate.zero_grad(set_to_none=True)
             expected = _expert_forward(base, reference, x, ids, probs, experts)
             actual = _expert_forward(candidate, executor, x_candidate, ids, probs_candidate, experts)
-            plan_record = route_evidence(actual, replica_planner) if budget else None
+            native_route = getattr(candidate, "_hot_replica_dispatch").route if backend == "native" and budget else None
+            home_route = native_route if native_route is not None and not native_route.plan.transfers else None
+            plan_record = route_evidence(actual, replica_planner, home_route=home_route) if budget else None
             gradient = torch.randn_like(expected)
             expected.backward(gradient)
             actual.backward(gradient)
@@ -524,7 +513,7 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
                 evidence["heap_epoch"] = resources.heap_manager.epoch
                 if evidence["capacity"] > evidence["maximum_capacity"]:
                     raise AssertionError("dynamic push capacity exceeded theoretical bound")
-            if replica_transport in SIGNAL_TRANSPORT_MODES:
+            if replica_transport == KERNEL_GRADIENT_TRANSPORT:
                 active_provider = resources.workspace.replica_provider
                 evidence["gradient_scratch_bytes"] = active_provider.gradient_scratch_bytes
                 evidence["gradient_scratch_limit_bytes"] = hidden * intermediate * 3 * 4
@@ -556,29 +545,26 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
         if cross_stream:
             cross_stream_result = _cross_stream_deferred(base, candidate, executor, experts, rank, device,
                                                         tokens, hidden, top_k, reference, replica_planner,
-                                                        runtime_version=2 if replica_transport == "p2p" else 4)
+                                                        kernel_gradient=replica_transport == KERNEL_GRADIENT_TRANSPORT)
         cross_layer = []
         if hidden <= 128:
             cross_layer = _cross_layer_pool(backend, budget, mesh, executor, reference,
                                            tokens, hidden, intermediate, top_k, replica_min_rows,
                                            replica_planner, cost_model, minimum_load_reduction)
         signal_stress = None
-        if replica_transport in SIGNAL_TRANSPORT_MODES and hidden <= 128:
+        if replica_transport == KERNEL_GRADIENT_TRANSPORT and hidden <= 128:
             active_provider = resources.workspace.replica_provider
             signal_stress = _signal_stress(active_provider, mesh, hidden, intermediate, budget)
         kernel_wait = None
         if (_requires_transfers(budget, replica_min_rows, minimum_load_reduction) and
-                replica_transport in ("shmem_signal_sdma_projection", "shmem_signal_kernel_gradient")):
+                replica_transport == KERNEL_GRADIENT_TRANSPORT):
             kernel_wait = _kernel_wait_stress(base, candidate, executor, experts, rank, device,
                                               tokens, hidden, top_k, reference, replica_planner)
-        timing = None if not benchmark_iterations else _benchmark(
-            candidate, executor, experts, tokens, hidden, top_k, benchmark_iterations)
         identity = execution_identity()
         identity.update(torch_npu=torch_npu.__version__, ep_members=dist.get_process_group_ranks(mesh.get_group()),
                         backend=backend, budget=budget, shape=[tokens, hidden, intermediate, top_k],
                         requested_planner=replica_planner,
                         minimum_load_reduction=minimum_load_reduction,
-                        calibration=None if cost_model is None else asdict(cost_model),
                         actual_planner=results[0]["plan"]["planner"] if budget else "disabled",
                         requested_transport=replica_transport, reference=("native-fp32" if fp32_reference else
                         "same-backend" if same_backend_reference else "native"), default_group=default_group)
@@ -599,15 +585,10 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             identity["multicore_kernels"] = [file_identity(path) for path in sorted(vendor.rglob("*.o"))]
             provider = resources.workspace.replica_provider
             identity["provider"] = type(provider).__name__
-            if replica_transport in SIGNAL_TRANSPORT_MODES:
-                identity["provider_options"] = {"overlap_home": provider.overlap_home,
-                                                "projection_ready": provider._projection_ready,
-                                                "kernel_gradients": provider.kernel_gradients}
-                expected_projection = replica_transport in (
-                    "shmem_signal_sdma_projection", "shmem_signal_kernel_gradient")
-                if (provider._projection_ready != expected_projection or
-                        provider.kernel_gradients != (replica_transport == "shmem_signal_kernel_gradient")):
-                    raise AssertionError("Requested signal transport did not execute")
+            if replica_transport == KERNEL_GRADIENT_TRANSPORT:
+                identity["kernel_gradient_matrices"] = provider.last_kernel_gradient_matrices
+                if not provider.kernel_gradients or provider.projection_signals is None:
+                    raise AssertionError("Requested kernel_gradient transport did not execute")
             binding = sys.modules.get("hyper_parallel_shmem_torch")
             if binding is not None:
                 identity["shmem_binding"] = file_identity(Path(binding.__file__))
@@ -618,7 +599,7 @@ def _run(backend: str, budget: int, result_dir: str, *, tokens: int = 128,
             json.dumps({"identity": identity, "growth_deferred": growth, "steps": results,
                         "deferred": deferred, "cross_layer": cross_layer, "cross_stream": cross_stream_result,
                         "replica_transport": replica_transport, "replica_min_rows": replica_min_rows,
-                        "signal_stress": signal_stress, "kernel_wait": kernel_wait, "timing": timing},
+                        "signal_stress": signal_stress, "kernel_wait": kernel_wait},
                        indent=2) + "\n", encoding="utf-8")
     finally:
         if executor is not None:
@@ -641,14 +622,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("native", "push", "pull"), default="native")
     parser.add_argument("--replica-transport",
-                        choices=("p2p", "shmem", *SIGNAL_TRANSPORT_MODES),
+                        choices=("p2p", KERNEL_GRADIENT_TRANSPORT),
                         default="p2p")
     parser.add_argument("--replica-planner", choices=("cpu", "device"), default="cpu")
     parser.add_argument("--cross-stream", action="store_true")
     parser.add_argument("--cost-model")
     parser.add_argument("--default-group", action="store_true")
     parser.add_argument("--fp32-reference", action="store_true")
-    parser.add_argument("--benchmark-iterations", type=int, default=0)
     parser.add_argument("--budget", type=int, default=1)
     parser.add_argument("--replica-min-rows", type=int, default=0)
     parser.add_argument("--replica-minimum-load-reduction", type=float, default=0.0,
@@ -669,7 +649,7 @@ def main() -> None:
         run(args.backend, args.budget, args.result_dir, tokens=args.tokens,
             hidden=args.hidden, intermediate=args.intermediate, top_k=args.top_k,
             same_backend_reference=args.same_backend_reference, replica_transport=args.replica_transport,
-            benchmark_iterations=args.benchmark_iterations, replica_min_rows=args.replica_min_rows,
+            replica_min_rows=args.replica_min_rows,
             replica_planner=args.replica_planner, default_group=args.default_group, fp32_reference=args.fp32_reference,
             cross_stream=args.cross_stream, cost_model=None if args.cost_model is None else ExpertReplicaCostModel(
                 **json.loads(Path(args.cost_model).read_text(encoding="utf-8"))["model"]),
@@ -682,98 +662,18 @@ if __name__ == "__main__":
     main()
 
 
-def test_native_hot_replica_npu() -> None:
-    """Exercise native EP with no multicore import or payload."""
-    _pytest_case("native")
-
-
-def test_push_hot_replica_npu() -> None:
-    """Exercise push replication and real dynamic heap growth."""
-    _pytest_case("push")
-
-
-def test_pull_hot_replica_npu() -> None:
-    """Exercise pull replication without receive-heap growth."""
-    _pytest_case("pull")
-
-
-def _pytest_case(backend: str, **options) -> None:
+@pytest.mark.parametrize("case,backend,planner,transport", TRAINING_CASES,
+                         ids=[case[0] for case in TRAINING_CASES])
+def test_replica_training_npu(case: str, backend: str, planner: str, transport: str) -> None:
+    """Exercise both final transports, planners and invocation/stream lifetimes."""
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl", timeout=timedelta(seconds=180))
     try:
-        run(backend, 1, os.getenv("HP_HOT_REPLICA_RESULTS", "./logs/hot_replica"), **options)
+        topks = (1, 2, 3, 4, 5, 6, 8) if case == "native_cpu" else (2 if backend == "native" else 8,)
+        for top_k in topks:
+            directory = Path(os.getenv("HP_HOT_REPLICA_RESULTS", "./logs/hot_replica")) / case / f"k{top_k}"
+            run(backend, 1, str(directory), top_k=top_k, fp32_reference=True,
+                replica_planner=planner, replica_transport=transport,
+                cross_stream=backend != "native", default_group=planner == "cpu")
     finally:
         dist.destroy_process_group()
-
-
-def test_native_device_hot_replica_npu() -> None:
-    """Run native device planning with ordinary P2P and no multicore load."""
-    _pytest_case("native", replica_planner="device", fp32_reference=True)
-
-
-def test_push_default_group_npu() -> None:
-    """Reach actual default-group P2P after balanced warmup."""
-    _pytest_case("push", default_group=True, fp32_reference=True)
-
-
-def test_pull_default_group_npu() -> None:
-    """Exercise default-group P2P in the pull forward and backward."""
-    _pytest_case("pull", default_group=True, fp32_reference=True)
-
-
-def test_push_device_projection_npu() -> None:
-    """Validate actual device planning and projection execution."""
-    _pytest_case("push", replica_planner="device", replica_transport="shmem_signal_sdma_projection",
-                 top_k=8, fp32_reference=True)
-
-
-def test_push_device_kernel_gradient_npu() -> None:
-    """Validate actual device planning and kernel_gradient execution."""
-    _pytest_case("push", replica_planner="device", replica_transport="shmem_signal_kernel_gradient",
-                 top_k=8, fp32_reference=True)
-
-
-def test_pull_device_projection_npu() -> None:
-    """Validate actual device planning and projection execution."""
-    _pytest_case("pull", replica_planner="device", replica_transport="shmem_signal_sdma_projection",
-                 top_k=8, fp32_reference=True)
-
-
-def test_pull_device_kernel_gradient_npu() -> None:
-    """Validate actual device planning and kernel_gradient execution."""
-    _pytest_case("pull", replica_planner="device", replica_transport="shmem_signal_kernel_gradient",
-                 top_k=8, fp32_reference=True)
-
-
-def test_native_deferred_topk_npu() -> None:
-    """Retain real native plans and reverse backward for every reviewed TopK."""
-    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
-    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
-    try:
-        for top_k in (1, 2, 3, 4, 5, 6, 8):
-            directory = Path(os.getenv("HP_HOT_REPLICA_RESULTS", "./logs/hot_replica")) / f"k{top_k}"
-            run("native", 1, str(directory), top_k=top_k, fp32_reference=True)
-    finally:
-        dist.destroy_process_group()
-
-
-def test_push_static_runtime_streams_npu() -> None:
-    """Reuse static v2 images across streams and reversed backward in push."""
-    _pytest_case("push", top_k=8, fp32_reference=True, cross_stream=True)
-
-
-def test_pull_static_runtime_streams_npu() -> None:
-    """Reuse static v2 images across streams and reversed backward in pull."""
-    _pytest_case("pull", top_k=8, fp32_reference=True, cross_stream=True)
-
-
-def test_push_projection_runtime_lifetime_npu() -> None:
-    """Verify independent v4 epochs on two streams with retained push plans."""
-    _pytest_case("push", top_k=8, fp32_reference=True, cross_stream=True,
-                 replica_transport="shmem_signal_sdma_projection")
-
-
-def test_pull_projection_runtime_lifetime_npu() -> None:
-    """Verify independent v4 epochs on two streams with retained pull plans."""
-    _pytest_case("pull", top_k=8, fp32_reference=True, cross_stream=True,
-                 replica_transport="shmem_signal_sdma_projection")

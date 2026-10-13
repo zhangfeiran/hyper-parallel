@@ -26,14 +26,10 @@ from typing import Any
 
 import torch
 
-from hyper_parallel.core.expert_parallel.hot_replica.one_sided import (
-    OneSidedReplicaTransport,
-)
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    SIGNAL_TRANSPORT_MODES,
+    KERNEL_GRADIENT_TRANSPORT,
     SignalReplicaTransport,
     signal_storage_bytes,
-    signal_transport_options,
 )
 from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.scheduler.config import (
@@ -89,12 +85,11 @@ def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
     mode = specification.get("replica_transport", "p2p")
     if not budget or mode == "p2p":
         return 0
+    if mode != KERNEL_GRADIENT_TRANSPORT:
+        raise ValueError("Unsupported replica_transport; expected p2p or shmem_signal_kernel_gradient")
     hidden, intermediate = specification["hidden_size"], specification["intermediate_size"]
-    if mode in SIGNAL_TRANSPORT_MODES:
-        return signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)), budget,
-                                    specification["ep_size"], 2,
-                                    projection_ready=signal_transport_options(mode)["projection_ready"])
-    return budget * hidden * intermediate * 2 * 4
+    return signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)), budget,
+                                specification["ep_size"], 2)
 
 
 def _spec_workspace_bytes(
@@ -368,20 +363,11 @@ class MegaMoeWorkspace:
     def _allocate_replica_storage(self, spec: MegaMoeSpec) -> None:
         """Recreate provider state with the new symmetric heap generation."""
         shapes = ((spec.hidden_size, 2 * spec.intermediate_size), (spec.intermediate_size, spec.hidden_size))
-        options = (signal_transport_options(spec.replica_transport)
-                   if spec.replica_transport in SIGNAL_TRANSPORT_MODES else None)
-        size = (signal_storage_bytes(shapes, spec.replica_slots_per_rank, spec.ep_size, 2,
-                                     projection_ready=options["projection_ready"])
-                if options is not None else
-                spec.replica_slots_per_rank * spec.hidden_size * spec.intermediate_size * 2 * 4)
+        size = signal_storage_bytes(shapes, spec.replica_slots_per_rank, spec.ep_size, 2)
         if self.replica_inbox is None:
             self.replica_inbox = shmem.empty((size,), dtype=torch.uint8, alignment=_WORKSPACE_ALIGNMENT)
-        if options is not None:
-            self.replica_provider = SignalReplicaTransport(shmem, self.replica_inbox,
-                                                          spec.replica_slots_per_rank, spec.ep_size,
-                                                          **options)
-        else:
-            self.replica_provider = OneSidedReplicaTransport(shmem, self.replica_inbox)
+        self.replica_provider = SignalReplicaTransport(shmem, self.replica_inbox,
+                                                      spec.replica_slots_per_rank, spec.ep_size)
 
     def prepare_event_counters(self, *, forward: bool) -> Any:
         """Reset per-call counters while preserving the ready generation."""
@@ -437,9 +423,7 @@ class MegaMoeWorkspace:
     def _free_symmetric_tensors(self) -> None:
         """Free each unique SHMEM allocation and invalidate its tensor view."""
         if self.closing:
-            remaining = tuple(tensor is not None for tensor in (
-                self.source_buffer, self.expert_buffer, self.routed_buffer,
-                self.forward_event_counters, self.backward_event_counters))
+            remaining = tuple(getattr(self, name) is not None for name in _SYMMETRIC_FIELDS)
             peers = _collective.exchange(
                 remaining,
                 group=self._root_group(),
@@ -448,14 +432,7 @@ class MegaMoeWorkspace:
             if any(peer != remaining for peer in peers):
                 raise RuntimeError("partial symmetric teardown differs across ranks; restart the process")
         self.replica_provider = None
-        for field_name in (
-            "source_buffer",
-            "expert_buffer",
-            "routed_buffer",
-            "forward_event_counters",
-            "backward_event_counters",
-            "replica_inbox",
-        ):
+        for field_name in _SYMMETRIC_FIELDS:
             tensor = getattr(self, field_name)
             if tensor is None:
                 continue
@@ -491,16 +468,8 @@ class MegaMoeWorkspace:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
             if not self.can_close():
                 raise RuntimeError("cannot close MegaMoe workspace while backward graphs still need its buffers.")
-            empty = all(tensor is None for tensor in (
-                self.source_buffer,
-                self.expert_buffer,
-                self.routed_buffer,
-                self.forward_event_counters,
-                self.backward_event_counters,
-                self.gmm_workspace,
-                self.swiglu_grad_workspace,
-                self.completion_event,
-                self.replica_inbox,
+            empty = all(getattr(self, name) is None for name in (
+                *_SYMMETRIC_FIELDS, "gmm_workspace", "swiglu_grad_workspace", "completion_event",
             )) and not self.replica_runtime_images
             root_group = self._root_group()
             self.closing = True

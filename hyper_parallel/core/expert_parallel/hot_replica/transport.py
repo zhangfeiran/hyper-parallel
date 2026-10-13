@@ -49,7 +49,7 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
     The lease spans all consumers, including gradient return in backward.
     With overlap=True, an enabled provider may defer guest readiness. Call
     wait_weights(matrix_index) before each guest projection read, or honor the
-    weight_ready/projection_ready metadata in a fused kernel.
+    projection_ready metadata in a fused kernel.
 
     A backward may pass the opaque weight_generation saved from its own forward
     view, after autograd checks the saved parameter versions. Every rank must use
@@ -60,7 +60,7 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
         raise ValueError("Replica weights may be reused only by their saved backward context")
     provider = route.transport if provider is None else provider
     if provider is not None and callable(getattr(provider, "lease", None)):
-        options = {"overlap": True} if overlap and getattr(provider, "overlap_home", False) else {}
+        options = {"overlap": True} if overlap else {}
         if reuse_generation is not None:
             options["reuse_generation"] = reuse_generation
         with provider.lease(weights, route, backward=backward, **options) as pool:

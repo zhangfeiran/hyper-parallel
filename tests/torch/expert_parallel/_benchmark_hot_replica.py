@@ -12,247 +12,156 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Fresh-process replica ablation with separate cold, warm and diagnostic steps."""
+"""Fresh-process replica F+B+AdamW samples with untimed plan and payload evidence."""
 
 import argparse
-from dataclasses import asdict
-from datetime import timedelta
 import json
 import os
-from pathlib import Path
-import statistics
 import time
+from datetime import timedelta
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch_npu
+from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaCostModel
+from hyper_parallel.core.expert_parallel.hot_replica.device_kernel import (
+    _planner_library,
+)
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore._loader import get_multicore_paths
-from hyper_parallel.core.multicore.profiler import mega_kernel_profile
 from tests.common.port_utils import allocate_port
-from tests.torch.expert_parallel.hot_replica_checks import execution_identity, file_identity, saved_route
-from tests.torch.expert_parallel.hot_replica_measurements import HostMeasurements, memory_snapshot
-from tests.torch.expert_parallel.hot_replica_residency import audit_residency
+from tests.torch.expert_parallel.hot_replica_checks import (
+    execution_identity,
+    file_identity,
+    route_evidence,
+)
 
 
-def _routes(tokens, top_k, experts, device):
-    positions = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k)
-    hot = positions.remainder(top_k).long()
-    return {"balanced": [positions.remainder(experts).long()], "home_hot": [hot],
-            "rotating_hot": [(hot + offset).remainder(experts) for offset in range(0, experts, 6)]}
-
-
-def _plan(output, planner, budget, cost_model):
-    if not budget:
-        return {"planner": "disabled", "dw_dtype": "bfloat16"}
-    route = saved_route(output)
-    actual = "device" if route.device_plan is not None else "cpu"
-    if actual != planner:
-        raise AssertionError(f"Expected {planner}, executed {actual}")
-    return {"planner": actual, "dw_dtype": "bfloat16" if route.home_only else "float32",
-            "execution_budget": 0 if route.home_only else budget, "slots": route.plan.slot_to_logical,
-            "counts": route.plan.destination_counts, "transfers": len(route.plan.transfers),
-            "score_ms": None if cost_model is None else cost_model.estimate_ms(route.plan)}
-
-
-def _measure(module, optimizer, values, ids, probabilities, gradient, *, inspect=False, cost_model=None):
+def _step(module, optimizer, values, ids, probabilities, gradient, *, recompute=False, inspect=False):
     optimizer.zero_grad(set_to_none=True)
     values.grad = None
     dist.barrier()
     torch.npu.synchronize()
     start = time.perf_counter()
-    output = module(values, ids, probabilities)
-    plan = _plan(output, module.replica_planner, module.replica_slots_per_rank, cost_model) if inspect else None
-    memory = memory_snapshot(module, values, output) if inspect else None
-    output.backward(gradient)
+    plans = []
+
+    def _capture(_module, _inputs, output):
+        if torch.is_grad_enabled():
+            plans.append(route_evidence(output, module.replica_planner))
+
+    handle = module.register_forward_hook(_capture) if inspect and module.replica_slots_per_rank else None
+    try:
+        # Reentrant recompute owns its new plan if push capacity grew after the first forward.
+        output = (checkpoint(module, values, ids, probabilities, use_reentrant=True) if recompute else
+                  module(values, ids, probabilities))
+        output.backward(gradient)
+    finally:
+        if handle is not None:
+            handle.remove()
+    plan = plans[-1] if plans else None
     optimizer.step()
     torch.npu.synchronize()
     local_ms = (time.perf_counter() - start) * 1000
     maximum = torch.tensor([local_ms], device=values.device)
     dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
-    return {"rank_max_step_ms": float(maximum.cpu()[0]), "local_step_ms": local_ms,
-            "plan": plan, "forward_memory": memory}
-
-
-def _diagnose(module, optimizer, values, ids, probabilities, gradient, directory, audit):
-    optimizer.zero_grad(set_to_none=True)
-    values.grad = None
-    dist.barrier()
-    torch.npu.synchronize()
-    plan, forward_memory = audit["plan"], audit["forward_memory"]
-    with torch_npu.profiler.profile(activities=[torch_npu.profiler.ProfilerActivity.CPU,
-                                                torch_npu.profiler.ProfilerActivity.NPU]) as outer:
-        with mega_kernel_profile(detailed_task_names=True) as internal, HostMeasurements() as host:
-            output = module(values, ids, probabilities)
-            output.backward(gradient)
-            optimizer.step()
-            torch.npu.synchronize()
-    outer.export_chrome_trace(str(directory / "framework.json"))
-    trace = internal.export_chrome_trace(directory / "internal.json")
-    if trace["megaKernelCycleTrace"]["droppedRecordCount"]:
-        raise AssertionError("Diagnostic trace dropped records")
-    wait_records = 0
-    for event in trace["traceEvents"]:
-        args = event.get("args", {})
-        if args.get("task_stage") == "ReplicaWeightReadyWait":
-            wait_records += 1
-            expert = plan["slots"][dist.get_rank()][6 + args["replica_slot"]]
-            args.update(logical_expert=expert, owner_peer=expert // 6, layer="benchmark_experts",
-                        direction="forward" if args["consumer_stage"] in ("GMM1", "GMM2") else "backward")
-    if module.replica_slots_per_rank and module._get_execution_resources(values).spec.replica_transport in (
-            "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection", "shmem_signal_kernel_gradient"):
-        if any(plan["counts"][dist.get_rank()][6:]) and not wait_records:
-            raise AssertionError("Guest compute has no weight-ready trace; verify the loaded kernel payload")
-    (directory / "internal.json").write_text(json.dumps(trace) + "\n", encoding="utf-8")
-    return {"host_spans": host.records, "plan": plan, "forward_memory": forward_memory,
-            "scope": "Inclusive host/stream diagnostic spans can overlap and include queue gaps; "
-                     "use framework kernel records for device execution, not their sum as step latency."}
-
-
-def _host_breakdown(module, optimizer, values, ids, probabilities, gradient):
-    records = []
-    for _ in range(5):
-        optimizer.zero_grad(set_to_none=True)
-        values.grad = None
-        dist.barrier()
-        torch.npu.synchronize()
-        with HostMeasurements(device_intervals=False, prefetch_details=True, count_details=True) as host:
-            output = module(values, ids, probabilities)
-            output.backward(gradient)
-            optimizer.step()
-        torch.npu.synchronize()
-        records.append(host.records)
-    return {"samples": records, "scope": "Untimed host-only inclusive spans; no Torch/internal profiler or "
-                                         "per-stage device events. Spans nest and must not be summed as step latency."}
-
-
-def _make_module(args, calibration, device, size):
-    return MegaMoeExperts(local_num_tokens=args.tokens, hidden_size=args.hidden,
-                          intermediate_size=args.intermediate, num_experts=size * 6, top_k=args.top_k,
-                          ep_size=size, ep_group=dist.group.WORLD, dispatch_mode=args.backend,
-                          replica_slots_per_rank=args.budget, replica_transport=args.replica_transport,
-                          replica_min_rows=args.replica_min_rows, replica_target_load=args.replica_target_load,
-                          replica_planner=args.replica_planner, replica_cost_model=calibration).to(
-                              device=device, dtype=torch.bfloat16)
-
-
-def _residency_audit(args, calibration, device, size, values, routes, probabilities, gradient):
-    modules = tuple(_make_module(args, calibration, device, size) for _ in range(2))
-    MegaMoeExperts.share_execution_resources(modules)
-    try:
-        return audit_residency(modules, values, routes, probabilities, gradient)
-    finally:
-        for module in modules:
-            module.close()
-
-
-def _warm_pattern(args, module, optimizer, values, ids_list, probabilities, gradient, calibration):
-    for index in range(args.warmup):
-        _measure(module, optimizer, values, ids_list[index % len(ids_list)], probabilities, gradient)
-    torch.npu.reset_peak_memory_stats()
-    before = memory_snapshot(module, values)
-    samples = [_measure(module, optimizer, values, ids_list[index % len(ids_list)], probabilities, gradient)
-               for index in range(args.iterations)]
-    after = memory_snapshot(module, values)
-    if before["capacity"] != after["capacity"] or before["heap_epoch"] != after["heap_epoch"]:
-        raise AssertionError("Warm timing included a heap growth")
-    plans = [_measure(module, optimizer, values, ids, probabilities, gradient, inspect=True, cost_model=calibration)
-             for ids in ids_list]
-    return {"samples": samples, "median_ms": statistics.median(row["rank_max_step_ms"] for row in samples),
-            "memory_before": before, "memory_after": after,
-            "torch_peak_plus_constant_heap": after["torch_peak_allocated"] + after["shmem_heap_reserved"],
-            "torch_reserved_peak_plus_constant_heap": after["torch_peak_reserved"] + after["shmem_heap_reserved"],
-            "plans": plans}
+    if inspect:
+        if module.replica_slots_per_rank and plan is None:
+            raise AssertionError("Audit did not observe the gradient-enabled forward plan")
+        if not torch.isfinite(output).all() or not torch.isfinite(values.grad).all():
+            raise AssertionError("Benchmark produced nonfinite outputs or input gradients")
+        provider = module._get_execution_resources(values).workspace.replica_provider
+        if plan is not None:
+            plan["kernel_gradient_matrices"] = getattr(provider, "last_kernel_gradient_matrices", ())
+    return {"local_step_ms": local_ms, "rank_max_step_ms": float(maximum.cpu()[0]), "plan": plan}
 
 
 def run(args: argparse.Namespace) -> None:
-    """Run one shape/variant per process, keeping profiling out of timed samples.
-
-    Args:
-        args: Benchmark shape, transport, planner and diagnostic options.
-    """
+    """Separate cold/audit calls from warmed samples and record every rank."""
     rank, size = dist.get_rank(), dist.get_world_size()
+    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
     endpoint = [f"tcp://127.0.0.1:{allocate_port()}" if rank == 0 else None]
     dist.broadcast_object_list(endpoint, src=0)
     os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
-    directory = Path(args.result_dir) / f"rank{rank}"
-    directory.mkdir(parents=True, exist_ok=True)
-    calibration = None
-    if args.cost_model:
-        calibration = ExpertReplicaCostModel(**json.loads(Path(args.cost_model).read_text(encoding="utf-8"))["model"])
-    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
-    torch.manual_seed(917 + rank)
-    module = _make_module(args, calibration, device, size)
-    values = torch.randn(args.tokens, args.hidden, device=device, dtype=torch.bfloat16).requires_grad_()
-    probabilities = torch.full((args.tokens, args.top_k), 1 / args.top_k, device=device)
-    gradient = torch.randn_like(values) / args.tokens
-    optimizer = torch.optim.SGD(module.parameters(), lr=0.001, momentum=0.9)
-    routes = _routes(args.tokens, args.top_k, size * 6, device)
+    calibration = None if args.cost_model is None else ExpertReplicaCostModel(
+        **json.loads(Path(args.cost_model).read_text(encoding="utf-8"))["model"])
+    torch.manual_seed(715)
+    module = MegaMoeExperts(
+        local_num_tokens=args.tokens, hidden_size=args.hidden, intermediate_size=args.intermediate,
+        num_experts=size * 6, top_k=args.top_k, ep_size=size, ep_group=dist.group.WORLD,
+        dispatch_mode=args.backend, replica_slots_per_rank=args.budget, replica_transport=args.replica_transport,
+        replica_min_rows=args.replica_min_rows, replica_target_load=args.replica_target_load,
+        replica_planner=args.replica_planner, replica_cost_model=calibration,
+        replica_minimum_load_reduction=args.replica_minimum_load_reduction,
+    ).to(device=device, dtype=torch.bfloat16)
     try:
-        cold = []
-        for pattern in ("balanced", "home_hot"):
-            cold.append({"pattern": pattern, **_measure(module, optimizer, values, routes[pattern][0],
-                                                        probabilities, gradient),
-                         "memory": memory_snapshot(module, values)})
-        results = {}
-        for pattern, ids_list in routes.items():
-            results[pattern] = _warm_pattern(args, module, optimizer, values, ids_list,
-                                             probabilities, gradient, calibration)
-        diagnostic = None
-        if args.diagnose:
-            diagnostic = _diagnose(module, optimizer, values, routes[args.diagnose_pattern][0], probabilities, gradient,
-                                   directory, results[args.diagnose_pattern]["plans"][0])
-        host_breakdown = None
-        if args.host_breakdown:
-            host_breakdown = {pattern: _host_breakdown(module, optimizer, values, routes[pattern][0],
-                                                       probabilities, gradient)
-                              for pattern in ("balanced", "home_hot")}
-        residency = None if not args.residency_audit else _residency_audit(
-            args, calibration, device, size, values, routes, probabilities, gradient)
-        vendor, adapter = get_multicore_paths()
+        torch.manual_seed(712 + rank)
+        values = torch.randn(args.tokens, args.hidden, device=device, dtype=torch.bfloat16).requires_grad_()
+        gradient = torch.randn_like(values) / args.tokens
+        probabilities = torch.full((args.tokens, args.top_k), 1 / args.top_k, device=device)
+        positions = torch.arange(args.tokens * args.top_k, device=device).reshape(args.tokens, args.top_k)
+        ids = positions.remainder(size * 6 if args.route == "balanced" else args.top_k).long()
+        optimizer = torch.optim.AdamW(module.parameters(), lr=0.001)
+
+        def _execute(iteration, *, inspect=False):
+            route = ids if args.route != "rotating_hot" else (ids + 6 * (iteration % size)).remainder(size * 6)
+            return _step(module, optimizer, values, route, probabilities, gradient,
+                         recompute=args.checkpoint, inspect=inspect)
+
+        cold = _execute(0, inspect=True)
+        for iteration in range(args.warmup):
+            _execute(iteration)
+        torch.npu.reset_peak_memory_stats()
+        samples = [_execute(iteration) for iteration in range(args.iterations)]
+        memory = {"peak_allocated_bytes": torch.npu.max_memory_allocated(),
+                  "peak_reserved_bytes": torch.npu.max_memory_reserved()}
+        audit = _execute(0, inspect=True)
         identity = execution_identity()
-        identity.update(torch_npu=torch_npu.__version__, configuration=vars(args),
+        vendor, adapter = get_multicore_paths()
+        payloads = [adapter, vendor / "op_api/lib/libcust_opapi.so", *sorted(vendor.rglob("*.o"))]
+        identity.update(torch_npu=torch_npu.__version__, rank=rank, ep_size=size,
                         ep_members=dist.get_process_group_ranks(dist.group.WORLD),
-                        adapter=file_identity(adapter), kernels=[file_identity(p) for p in sorted(vendor.rglob("*.o"))],
+                        payload=[file_identity(path) for path in payloads],
                         transport_abi=torch.ops.hyper_parallel.mega_moe_transport_version())
-        (directory / "result.json").write_text(json.dumps({"identity": identity, "cold": cold, "warm": results,
-                                                          "diagnostic": diagnostic, "host_breakdown": host_breakdown,
-                                                          "residency": residency,
-                                                          "calibration":
-                                                          None if calibration is None else asdict(calibration)},
-                                                         indent=2) + "\n", encoding="utf-8")
-        if rank == 0:
-            print(json.dumps({pattern: value["median_ms"] for pattern, value in results.items()}), flush=True)
+        if args.replica_planner == "device" and args.budget:
+            library = _planner_library()
+            identity["planner_payload"] = {**file_identity(Path(library._name)), "abi": library.planner_abi_version()}
+        directory = Path(args.result_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"rank{rank}.json").write_text(json.dumps(
+            {"identity": identity, "configuration": vars(args), "cold": cold, "samples": samples,
+             "audit": audit, "memory": memory, "scope": "Warmed F+B+AdamW; cold/audit calls are excluded. "
+                 "Run fresh-process A/B/B/A with identical route, seed and ownership."}, indent=2) + "\n",
+            encoding="utf-8")
     finally:
         module.close()
 
 
 def main() -> None:
-    """Select the production variant without modifying constructors or schedules."""
+    """Run one frozen configuration per fresh distributed process."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("push", "pull"), default="push")
-    parser.add_argument("--budget", type=int, default=1)
-    parser.add_argument("--replica-transport", default="p2p")
+    parser.add_argument("--replica-transport", choices=("p2p", "shmem_signal_kernel_gradient"), default="p2p")
     parser.add_argument("--replica-planner", choices=("cpu", "device"), default="cpu")
+    parser.add_argument("--route", choices=("balanced", "hot", "rotating_hot"), default="hot")
+    parser.add_argument("--budget", type=int, default=1)
     parser.add_argument("--replica-min-rows", type=int, default=1024)
     parser.add_argument("--replica-target-load", type=int)
-    parser.add_argument("--tokens", type=int, default=512)
+    parser.add_argument("--replica-minimum-load-reduction", type=float)
+    parser.add_argument("--cost-model")
+    parser.add_argument("--checkpoint", action="store_true")
+    parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--hidden", type=int, default=5120)
     parser.add_argument("--intermediate", type=int, default=1792)
     parser.add_argument("--top-k", type=int, default=8)
-    parser.add_argument("--iterations", type=int, default=20)
-    parser.add_argument("--warmup", type=int, default=4)
-    parser.add_argument("--cost-model")
-    parser.add_argument("--host-breakdown", action="store_true")
-    parser.add_argument("--residency-audit", action="store_true")
-    parser.add_argument("--diagnose", action="store_true")
-    parser.add_argument("--diagnose-pattern", choices=("balanced", "home_hot"), default="home_hot")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--result-dir", required=True)
     args = parser.parse_args()
-    if args.iterations < 2 or args.warmup < 1:
-        raise ValueError("Benchmark requires at least two measured and one warmup iteration")
+    if args.warmup < 1 or args.iterations < 1:
+        raise ValueError("Benchmark requires at least one warmup and measured step")
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl", timeout=timedelta(seconds=180))
     try:

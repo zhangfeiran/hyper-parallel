@@ -37,7 +37,6 @@ from hyper_parallel.core.multicore.scheduler.config import (
 from hyper_parallel.core.multicore.diagnostics.common.graph import _scheduled_task_ids
 from hyper_parallel.core.multicore.diagnostics.common.runtime import DiagnosticMode, PreparedDiagnosticRuntime
 
-
 CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
 VECTOR_SLOT_COUNT = NUM_WORKERS_VECTOR
 CORE_SLOT_COUNT = CUBE_SLOT_COUNT + VECTOR_SLOT_COUNT
@@ -273,7 +272,7 @@ def _calculate_aiv_pipeline_profile_layout(
 
 
 def _calculate_event_driven_profile_layout(
-    runtime_config: RuntimeConfigC, vector_worker_stride: int = 2,
+    runtime_config: RuntimeConfigC, vector_worker_stride: int = 2, *, replica_gradient_records: int = 0,
 ) -> _ProfileLayout:
     """Size AIC/AIV slots for event-driven task queues using the busiest worker."""
     num_workers = int(runtime_config.num_workers)
@@ -294,6 +293,8 @@ def _calculate_event_driven_profile_layout(
         int(runtime_config.task_index_num[1]),
         num_workers // vector_worker_stride,
     )
+    # Reserved gradient workers bypass the task queue and record both projections.
+    aiv_required_records = max(aiv_required_records, replica_gradient_records)
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,
@@ -303,22 +304,29 @@ def _calculate_event_driven_profile_layout(
 
 
 def _calculate_profile_layout(
-    runtime_config: RuntimeConfigC, metadata: _ProfileMetadata | None = None,
+    runtime_config: RuntimeConfigC, metadata: _ProfileMetadata | None = None, *,
+    replica_gradient_records: int = 0,
 ) -> _ProfileLayout:
     """Select the profile layout algorithm for the configured task execution mode."""
     _validate_runtime_config(runtime_config)
+    if (isinstance(replica_gradient_records, bool) or not isinstance(replica_gradient_records, int)
+            or replica_gradient_records < 0):
+        raise ValueError("replica_gradient_records must be a nonnegative integer")
     if metadata is None:
         metadata = _ProfileMetadata("MegaKernel", "Owner", {}, {}, _TaskExecutionMode.EVENT_DRIVEN)
     if metadata.execution_mode is _TaskExecutionMode.AIV_PIPELINE:
         return _calculate_aiv_pipeline_profile_layout(runtime_config)
     if metadata.execution_mode is _TaskExecutionMode.EVENT_DRIVEN:
-        return _calculate_event_driven_profile_layout(runtime_config, metadata.vector_worker_stride)
+        return _calculate_event_driven_profile_layout(
+            runtime_config, metadata.vector_worker_stride, replica_gradient_records=replica_gradient_records)
     raise ValueError(f"unsupported task execution mode: {metadata.execution_mode!r}")
 
 
-def _configure_profile_layout(runtime_config: RuntimeConfigC, metadata: _ProfileMetadata) -> _ProfileLayout:
+def _configure_profile_layout(
+    runtime_config: RuntimeConfigC, metadata: _ProfileMetadata, *, replica_gradient_records: int = 0,
+) -> _ProfileLayout:
     """Calculate and serialize the bounded AIC/AIV record capacities."""
-    layout = _calculate_profile_layout(runtime_config, metadata)
+    layout = _calculate_profile_layout(runtime_config, metadata, replica_gradient_records=replica_gradient_records)
     runtime_config.aic_profile_record_capacity = layout.aic_record_capacity
     runtime_config.aiv_profile_record_capacity = layout.aiv_record_capacity
     return layout
@@ -373,7 +381,8 @@ class _PreparedProfileRuntime:
             self._metadata.task_stage_names, _TaskExecutionMode(runtime.spec.execution_mode),
             runtime.spec.vector_worker_stride,
         )
-        self._layout = _configure_profile_layout(runtime_config, self._metadata)
+        self._layout = _configure_profile_layout(
+            runtime_config, self._metadata, replica_gradient_records=runtime.spec.extra_aiv_records)
         self._rank = runtime.rank
         self._device_id = runtime.device_id
         self._host_config = runtime_config

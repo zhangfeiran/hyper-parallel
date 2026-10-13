@@ -14,21 +14,40 @@
 # ============================================================================
 """P2P peer mapping and legal deferred-route regression tests."""
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan, transport
-from hyper_parallel.core.expert_parallel.hot_replica.pool import ReplicaPool
-from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, prepare_replica_route
+from hyper_parallel.core.expert_parallel.hot_replica import (
+    build_expert_replica_plan,
+    transport,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
-from tests.torch.expert_parallel.hot_replica_checks import deferred_ids
+from hyper_parallel.core.expert_parallel.hot_replica.pool import ReplicaPool
+from hyper_parallel.core.expert_parallel.hot_replica.routing import (
+    ReplicaRoute,
+    prepare_replica_route,
+)
+from tests.torch.expert_parallel.hot_replica_checks import deferred_ids, route_evidence
 
 
 class TestReplicaTransport(unittest.TestCase):
     """Exercise both directions with default and noncontiguous group ranks."""
+
+    def test_native_home_route_evidence_still_checks_planner_and_replica_presence(self):
+        """Ordinary home experts need no replica autograd node, while active copies do."""
+        output = torch.ones(1, requires_grad=True).square()
+        plan = build_expert_replica_plan([[1, 0], [0, 1]], 1)
+        route = ReplicaRoute(plan, torch.empty(0), torch.empty(0), 0, None)
+        self.assertEqual(route_evidence(output, "cpu", home_route=route)["transfers"], 0)
+        with self.assertRaisesRegex(AssertionError, "executed cpu"):
+            route_evidence(output, "device", home_route=route)
+        route = ReplicaRoute(build_expert_replica_plan([[20, 0], [20, 0]], 1),
+                             torch.empty(0), torch.empty(0), 0, None)
+        with self.assertRaisesRegex(AssertionError, "cannot bypass"):
+            route_evidence(output, "cpu", home_route=route)
 
     def test_saved_backward_generation_reaches_only_the_provider_lease(self):
         """Retain the forward token while rejecting caller-selected forward reuse."""

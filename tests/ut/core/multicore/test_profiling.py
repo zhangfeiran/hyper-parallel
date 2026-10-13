@@ -40,7 +40,7 @@ from hyper_parallel.core.multicore.modules.mega_gate.plan import (
     MEGA_GATE_AIV_WORKER_CAPACITY, MEGA_GATE_ROUTE_TASK_TYPES, MEGA_GATE_ROUTE_GRAD_TASK_TYPES,
     MEGA_GATE_ROUTE_GRAD_K1_TASK_TYPES, _build_pipeline_runtime_config, build_mega_gate_plan,
 )
-from hyper_parallel.core.multicore.diagnostics.profiler.cycle_trace import DEFAULT_STAGE_NAMES, _duration_trace_event
+from hyper_parallel.core.multicore.diagnostics.profiler.cycle_trace import DEFAULT_STAGE_NAMES, MAX_RECORDS_PER_CORE, _duration_trace_event
 from tests.common.mark_utils import arg_mark
 
 
@@ -218,6 +218,22 @@ class TestDiagnosticMetadata(unittest.TestCase):
 
 class TestMegaKernelProfileLayout(unittest.TestCase):
     """Validate exact bounded AIC/AIV buffer sizing."""
+
+    def test_reserved_gradient_workers_cover_high_fanout(self) -> None:
+        """Both W2/W13 emit one record per replica outside the vector task queue."""
+        runtime_config = _runtime_config(128)
+        runtime_config.num_workers = 48
+        for peers in (7, 31, 63):
+            with self.subTest(peers=peers):
+                runtime = _prepare_mega_kernel_runtime_config(
+                    runtime_config, tensor_factory=lambda data: data, profile_tensor_factory=lambda data: data,
+                    rank=0, device_id=0, replica_gradient_records=2 * peers,
+                )
+                self.assertGreaterEqual(runtime_config.aiv_profile_record_capacity, 2 * peers)
+                self.assertIsNotNone(runtime.normal_tensor)
+        for invalid in (-1, True, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "nonnegative integer"):
+                _calculate_profile_layout(runtime_config, replica_gradient_records=invalid)
 
     def test_layout_rounds_busiest_workers_to_sixteen_records(self):
         """Mirror Device round-robin assignment for AIC and AIV independently."""

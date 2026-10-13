@@ -84,6 +84,7 @@ def prepare_mega_kernel_diagnostics(
     owner_context: Any = None,
     execution_mode: str = "event_driven", vector_worker_stride: int = 2,
     graph_adapter: Callable[[Any, RuntimeConfigC], ComputeGraph] | None = None,
+    extra_aiv_records: int = 0,
 ) -> MegaKernelDiagnostics:
     """Prepare only normal execution storage and defer all diagnostic graph work.
 
@@ -102,6 +103,7 @@ def prepare_mega_kernel_diagnostics(
         owner_context: Business context passed unchanged to the owner callback.
         execution_mode: Event-driven queues or a broadcast ``aiv_pipeline``.
         vector_worker_stride: Two for paired MoE workers, one for all AIV workers.
+        extra_aiv_records: Per-worker records emitted outside the scheduled task queue.
         graph_adapter: Optional lazy business-owned binding of graph ports to the
             real native ABI. It receives a private Host config; ordinary storage
             and the caller's graph must remain unchanged.
@@ -127,6 +129,9 @@ def prepare_mega_kernel_diagnostics(
         """
         return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone().to(device=resolved_device)
 
+    if (isinstance(extra_aiv_records, bool) or not isinstance(extra_aiv_records, int)
+            or extra_aiv_records < 0):
+        raise ValueError("extra_aiv_records must be a nonnegative integer")
     if execution_mode not in ("event_driven", "aiv_pipeline"):
         raise ValueError(f"invalid execution mode: {execution_mode!r}")
     if vector_worker_stride not in (1, 2):
@@ -134,7 +139,7 @@ def prepare_mega_kernel_diagnostics(
     runtime = PreparedDiagnosticRuntime(
         graph, runtime_config, DiagnosticSpec(
             kernel_name, owner_label, owner_resolver, owner_context,
-            execution_mode, vector_worker_stride, graph_adapter,
+            execution_mode, vector_worker_stride, graph_adapter, extra_aiv_records,
         ),
         parameter_count=parameter_count, tensor_factory=tensor_factory, rank=rank, device_id=device_id,
     )

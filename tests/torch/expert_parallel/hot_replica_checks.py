@@ -14,11 +14,13 @@
 # ============================================================================
 """Shared correctness fixtures; importing these helpers never initializes devices."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import torch
 
@@ -50,9 +52,11 @@ def saved_route(output: torch.Tensor) -> ReplicaRoute:
     raise AssertionError("Candidate output has no saved replica route")
 
 
-def route_evidence(output: torch.Tensor, planner: str) -> dict:
+def route_evidence(output: torch.Tensor, planner: str, *, home_route: ReplicaRoute | None = None) -> dict:
     """Fail if the requested planner was bypassed, and describe its actual plan."""
-    route = saved_route(output)
+    if home_route is not None and home_route.plan.transfers:
+        raise AssertionError("A home-only route cannot bypass saved replica-plan checks")
+    route = saved_route(output) if home_route is None else home_route
     actual = "device" if route.device_plan is not None else "cpu"
     if actual != planner:
         raise AssertionError(f"Requested planner {planner}, executed {actual}")

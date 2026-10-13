@@ -14,11 +14,14 @@
 # ============================================================================
 """Deterministic cost-guided quota selection with independent capacity checks."""
 
-from dataclasses import replace
 import random
 import unittest
+from dataclasses import replace
 
-from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaCostModel, build_expert_replica_plan
+from hyper_parallel.core.expert_parallel.hot_replica import (
+    ExpertReplicaCostModel,
+    build_expert_replica_plan,
+)
 
 
 class TestReplicaCost(unittest.TestCase):
@@ -94,7 +97,7 @@ class TestReplicaCost(unittest.TestCase):
             build_expert_replica_plan([[1, 1]], 1, cost_model=model)
         with self.assertRaises(ValueError):
             build_expert_replica_plan([[1, 1]], 1, cost_model=object())
-        overlapping = replace(model, backend="push", transport="shmem_signal_sdma_projection",
+        overlapping = replace(model, backend="push", transport="p2p",
                               schedule="fixed_queue_v1", weight_ms=10)
         serial = replace(overlapping, backend="native", transport="p2p", schedule="native_grouped_v1")
         plan = build_expert_replica_plan([[10, 4, 0, 0]] * 2, 1)
@@ -103,7 +106,7 @@ class TestReplicaCost(unittest.TestCase):
     def test_missing_prefix_calibration_cannot_hide_later_home_work(self):
         """Even long home compute gives no automatic readiness discount."""
         plan = build_expert_replica_plan([[10, 4, 0, 0]] * 2, 1)
-        model = self._model(backend="push", transport="shmem_signal_sdma_projection",
+        model = self._model(backend="push", transport="p2p",
                             weight_ms=10, gradient_ms=3)
         without_transfer_time = replace(model, weight_ms=0, gradient_ms=0)
         self.assertAlmostEqual(model.estimate_ms(plan) - without_transfer_time.estimate_ms(plan), 23)
