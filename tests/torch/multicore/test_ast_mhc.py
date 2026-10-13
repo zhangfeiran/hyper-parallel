@@ -16,15 +16,18 @@
 
 import importlib
 
+import pytest
+
 from tests.common.mark_utils import arg_mark
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="onecard", essential_mark="essential")
-def test_ast_mhc_device() -> None:
+@pytest.mark.parametrize("event_schedule", ["compatibility", "mhc_backward_overlap"])
+def test_ast_mhc_device(event_schedule: str) -> None:
     """Feature: AST MHC device admission.
 
     Description: Check numerical, stream, cache ownership and profile contracts.
     Expectation: All five outputs and nine gradients meet the original precision gate.
     """
-    importlib.import_module("tests.torch.multicore._ast_mhc_impl").run_acceptance()
+    importlib.import_module("tests.torch.multicore._ast_mhc_impl").run_acceptance(event_schedule)

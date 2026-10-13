@@ -134,7 +134,7 @@ def _definition(ir, family):
     inputs = ("backends/schema.py", "backends/ascend.py", "backends/workers.py", "backends/contexts.py",
               "backends/launchers.py", "runtime/bindings.py",
               "runtime/native_calls.json", "runtime/worker_calls.json", "ir/events.py",
-              "compiler/events.py", "backends/events.py")
+              "compiler/events.py", "compiler/event_schedule.py", "backends/events.py")
     return {"generator_version": 2, "target": "ascend", "semantic": semantic,
             "abi": family_abi(family).export_manifest(),
             "generator_inputs": {name: _hash((CORE / name).read_bytes()) for name in inputs}}

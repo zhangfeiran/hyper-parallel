@@ -97,6 +97,7 @@ class MhcKernelPlan:
     ring_slots: int
     macro_join: tuple[tuple[int, ...], ...]
     event_graphs: tuple[EventGraphIR, ...] = ()
+    event_schedule: str = "compatibility"
 
     def materialize(self, device: str = "npu:0", *, payload_root: Any = None) -> MhcExecutable:
         """Bind native MHC resources after family/artifact and device checks.
@@ -115,6 +116,7 @@ class MhcKernelPlan:
             "program_fingerprint": self.recipe.fingerprint, "schedule": "shifted_mhc_v1",
             "spec": asdict(self.spec), "token_tile": self.token_tile,
             "grad_token_tile": self.grad_token_tile, "ring_slots": self.ring_slots,
+            "event_schedule": self.event_schedule,
             "ring_bytes": self.ring_slots * self.token_tile * 4 * hidden * 4,
             "ring_reuse": "NormCast(i) waits for Projection(i-ring_slots)",
             "semantic_fork": [["mhc_post", "mhc_norm_cast"], ["mhc_post", "mhc_input_mix"]],

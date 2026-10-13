@@ -117,9 +117,13 @@ def _bindings(graph):
     return result
 
 
+def _native_queues(graph):
+    return {(queue.resource, queue.worker): tuple(graph.grids[number].native_tasks[index]
+                                                 for number, index in queue.tasks) for queue in graph.queues}
+
+
 def _check_placement(graph, view, template):
-    actual = {(queue.resource, queue.worker): tuple(graph.grids[number].native_tasks[index]
-                                                   for number, index in queue.tasks) for queue in graph.queues}
+    actual = _native_queues(graph)
     counts = dict(graph.worker_counts)
     if graph.mode == "worker_pipeline":
         expected = {("vector", worker): view.queues[1] for worker in range(counts.get("vector", 0))}
@@ -164,3 +168,49 @@ def lower_event_fields(graph: EventGraphIR, template: bytes) -> bytes:
             offset = view.task_offset + native * task_abi.size + task_abi.offset(name)
             struct.pack_into("<I", data, offset, INVALID_EVENT if event is None else event)
     return bytes(data)
+
+
+def _check_mhc_ownership(graph, view, template):
+    counts = dict(graph.worker_counts)
+    workers = _field(template, view.abi.structure("RuntimeConfigC").offset("num_workers"))
+    if counts != {"cube": workers // 2, "vector": workers, "mix": workers // 2}:
+        raise ValueError("Worker queue transformation cannot change native topology")
+    actual = _native_queues(graph)
+    for resource, queue in zip(("cube", "vector", "mix"), view.queues):
+        for worker in range(counts[resource]):
+            expected = queue[worker::counts[resource]]
+            selected = actual.get((resource, worker), ())
+            if resource == "vector":
+                if len(selected) != len(expected) or set(selected) != set(expected):
+                    raise ValueError("Worker queue transformation must preserve per-worker task ownership")
+            elif selected != expected:
+                raise ValueError("Worker queue transformation cannot reorder Cube or Mix tasks")
+    return actual, workers
+
+
+def lower_mhc_worker_queues(graph: EventGraphIR, template: bytes) -> bytes:
+    """降级 MHC 反向的同 worker 队列变换；事件和数值描述符必须保持不变。
+
+    Args:
+        graph: 已通过固定 FIFO 进展检查的 MHC 反向事件图。
+        template: 变换前的普通或 profiling 镜像。
+    """
+    if graph.family != "mhc" or graph.direction != "backward" or graph.boundaries:
+        raise ValueError("Worker queue transformations require a local MHC backward graph")
+    if any(grid.notification != "local" for grid in graph.grids):
+        raise ValueError("MHC worker queue transformations require local event publication")
+    view = decode_event_wire("mhc", template)
+    actual, workers = _check_mhc_ownership(graph, view, template)
+    if _bindings(graph) != dict(enumerate(zip(view.waits, view.notifies))):
+        raise ValueError("Worker queue transformation cannot change native event mappings")
+    if graph.event_tensor is None or graph.event_tensor.wait_counts != view.thresholds:
+        raise ValueError("Worker queue transformation cannot change native event thresholds")
+    graph.simulate()
+    data = bytearray(template)
+    offset = view.queue_offset + 16 + view.task_capacity * 4
+    if _field(template, view.queue_offset + 4) != len(view.queues[1]):
+        raise ValueError("Worker queue transformation cannot move inactive termination descriptors")
+    for worker in range(workers):
+        for index, task in enumerate(actual.get(("vector", worker), ())):
+            struct.pack_into("<i", data, offset + (worker + index * workers) * 4, task)
+    return lower_event_fields(graph, bytes(data))

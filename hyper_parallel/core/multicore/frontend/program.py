@@ -24,6 +24,7 @@ import torch
 
 from hyper_parallel.core.multicore.backends.ascend import BackendEmission, emit_plan
 from hyper_parallel.core.multicore.compiler.dense import compile_dense_plan
+from hyper_parallel.core.multicore.compiler.event_schedule import apply_event_schedule
 from hyper_parallel.core.multicore.compiler.events import attach_event_graphs
 from hyper_parallel.core.multicore.compiler.mhc import match_mhc_region
 from hyper_parallel.core.multicore.compiler.moe import match_moe_region
@@ -143,6 +144,7 @@ class Program:
         self,
         signature: Mapping[str, int] | MegaMoeSpec | MhcSpec | DenseSpec | None = None,
         topology: HardwareSpec | None = None,
+        *, event_schedule: str = "compatibility",
         **constants: object,
     ) -> KernelPlan | MoeKernelPlan | MhcKernelPlan | DenseKernelPlan:
         """Compile a supported family region or dense primitive DAG into a host plan.
@@ -150,6 +152,7 @@ class Program:
         Args:
             signature: Symbolic Gate dimensions or a bound MegaMoeSpec/MhcSpec/DenseSpec for TaskDAG.
             topology: Physical worker availability, independent of computation.
+            event_schedule: 显式静态事件调度策略，默认保留兼容性队列。
             **constants: Declared constexpr specializations, such as k, scale or limit.
 
         Returns:
@@ -166,21 +169,27 @@ class Program:
             plan = self._task_dag_plan(ir, signature, topology)
         else:
             plan = compile_worker_pipeline(ir, self.schedule, dict(signature or {}), topology or HardwareSpec())
-        return plan if isinstance(plan, DenseKernelPlan) else attach_event_graphs(plan)
+        if isinstance(plan, DenseKernelPlan):
+            if event_schedule != "compatibility":
+                raise ValueError("Dense plans do not support event schedule transformations")
+            return plan
+        return apply_event_schedule(attach_event_graphs(plan), event_schedule)
 
     def compile(self, signature: Mapping[str, int] | MegaMoeSpec | MhcSpec | DenseSpec | None = None,
-                topology: HardwareSpec | None = None, **constants: object) -> BackendEmission:
+                topology: HardwareSpec | None = None, *, event_schedule: str = "compatibility",
+                **constants: object) -> BackendEmission:
         """Generate schema, typed bindings, schedule images and source maps through one backend.
 
         Args:
             signature: Symbolic dimensions or a bound native family specification.
             topology: Physical worker availability for Gate row ownership.
+            event_schedule: 与 plan() 相同的显式静态事件调度策略。
             **constants: Declared constexpr specializations.
 
         Returns:
             Source-only emission with separate definition, static plan and artifact identities.
         """
-        plan = self.plan(signature, topology, **constants)
+        plan = self.plan(signature, topology, event_schedule=event_schedule, **constants)
         return emit_plan(plan, self.lower(**constants))
 
     def _task_dag_plan(self, ir, signature, topology):

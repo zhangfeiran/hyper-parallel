@@ -62,6 +62,38 @@ MoE 有副本回退时还会生成 `events/backward_no_replica.json`。
 `simulate()` 验证固定 FIFO 的本地进展；它不模拟指令、缓存可见性、设备流或实际数值。
 即使全部通知数足够，等待任务排在其本核生产者之前仍可能死锁，因此必须检查队列进展。
 
+MHC 反向现在支持显式实验策略 `mhc_backward_overlap`：
+
+```python
+from hyper_parallel.core.multicore.frontend.examples.mhc_boundary import mhc_boundary
+from hyper_parallel.core.multicore.runtime.mhc_spec import MhcSpec
+
+spec = MhcSpec(12000, 128, num_cube_cores=20, token_tile=64, grad_token_tile=64)
+plan = mhc_boundary.plan(spec, event_schedule="mhc_backward_overlap")
+emission = mhc_boundary.compile(spec, event_schedule="mhc_backward_overlap")
+print(plan.export_manifest()["event_schedule"])
+# 设备执行和生成文件使用相同的已变换队列。
+```
+
+参数持有模块同样支持 `HyperMegaMhc(128, event_schedule="mhc_backward_overlap")`。
+模块策略在构造时固定；无反向的调用使用原始前向队列，训练调用和 checkpoint replay 使用选中的反向队列。
+
+默认 `event_schedule="compatibility"` 保留原始队列。
+实验策略在每个 Vector worker 内保留初始化和全部 RMSNormGrad，然后交错其 Prepare 和 Final 任务。
+原始固定步长布局可能把同一 tile 的各个阶段分配到不同 worker；
+交错过程保留每个任务的原始归属，并通过原有事件等待处理跨 worker 依赖。
+
+受限队列 lowering 拒绝跨 worker 任务迁移、Cube/Mix 重排、事件或阈值变化，以及不能推进的固定 FIFO。
+它只改写反向 Vector 队列索引，原生数值描述符、profiling 布局、正向 ring 和各事件均保持原契约。
+RMSNormGrad 的 task 模式不使用确定性 reduction workspace；Prepare 和 PhiRms 的数据按 token 范围划分，
+局部 TPipe 在任务结束时释放。共享参数梯度仍由原有初始化事件和原子归约保护。
+
+这一策略允许已完成宏块的 Final 与后续 Prepare 重叠。
+依赖仿真的首个 Final 进展只证明重叠机会；采用策略前应检查实际形状的数值、完整 step 和 HBM。
+`tests/torch/multicore/_ast_mhc_schedule_impl.py` 提供独立训练轨迹、完整前向/反向/SGD step 和 HBM 的测量入口。
+当前设备测量中，部分长 token 形状出现完整 step 退化，因此该策略保留为显式实验选择。
+更早的局部消费者或更好的仿真进展不能作为默认采用条件。
+
 ### MoE
 
 图保留 push/pull 通信发布、入场 ready、pull 退场 completion 和副本协议边界。
@@ -78,6 +110,6 @@ CPU 回归验证事件域、汇合计数、队列进展、原生镜像一致性�
 原有 Gate、MHC、MoE 设备用例分别验证前向、梯度、流及资源生命周期。
 CPU 进展检查、原生代码构建和设备数值放行是独立证据，静态事件 IR 不声明性能收益。
 
-后续扩展应先在相同数值任务上比较静态队列变换与同步粒度，
+后续扩展应继续在相同数值任务上比较静态队列变换与同步粒度，
 再为 MoE 增加受限运行时索引、任务触发范围和适合目标 NPU 的队列协议。
 新的任务放置需要证明原生任务能力、scratch 所有权和生产者进展条件。

@@ -77,13 +77,14 @@ def _profiles(executable, root, label):
     return {"records": len(records), "dropped": 0, "directions": sorted(directions)}
 
 
-def _case(tokens, hidden, tile, seed, root):
+def _case(tokens, hidden, tile, seed, root, event_schedule="compatibility"):
     reference = _inputs(tokens, hidden, seed)
     values = tuple(value.detach().npu().requires_grad_() for value in reference)
     expected = _oracle(reference)
     gradients = tuple(torch.randn_like(value) * 0.1 for value in expected)
     cores = torch.npu.get_device_limit(0)["cube_core_num"]
-    executable = mhc_boundary.plan(MhcSpec(tokens, hidden, cores, tile, tile)).materialize()
+    executable = mhc_boundary.plan(MhcSpec(tokens, hidden, cores, tile, tile),
+                                   event_schedule=event_schedule).materialize()
     actual = executable(*values, profile=True)
     forward = {name: _metric(output, oracle) for name, output, oracle in zip(_OUTPUT_NAMES, actual, expected)}
     torch.autograd.backward(expected, gradients)
@@ -95,10 +96,11 @@ def _case(tokens, hidden, tile, seed, root):
             "backward": backward, "profile": profiling}
 
 
-def _lifecycle(root):
-    reference = _inputs(128, 128, 72)
+def _lifecycle(root, event_schedule="compatibility"):
+    tokens = 2593 if event_schedule == "mhc_backward_overlap" else 128
+    reference = _inputs(tokens, 128, 72)
     cores = torch.npu.get_device_limit(0)["cube_core_num"]
-    plan = mhc_boundary.plan(MhcSpec(128, 128, cores))
+    plan = mhc_boundary.plan(MhcSpec(tokens, 128, cores), event_schedule=event_schedule)
     executable = plan.materialize()
     streams = (torch.npu.Stream(), torch.npu.Stream())
     initial = torch.npu.current_stream()
@@ -125,7 +127,16 @@ def _lifecycle(root):
             pass
         else:
             raise AssertionError("Closed MHC accepted a new forward")
-    model = HyperMegaMhc(128, device="npu:0")
+    checkpoint_data = _checkpoint_steps(reference, event_schedule)
+    data = {"tokens": tokens, "event_schedule": event_schedule,
+            "pending_forwards": 2, "streams": 2, "closed_pending_backward": True,
+            "missing_output_gradients": True, **checkpoint_data}
+    (root / "lifecycle.json").write_text(json.dumps(data, indent=2) + "\n")
+    return data
+
+
+def _checkpoint_steps(reference, event_schedule):
+    model = HyperMegaMhc(128, device="npu:0", event_schedule=event_schedule)
     values = tuple(value.detach().npu().requires_grad_() for value in reference[:5])
     optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
     before = model.phi.detach().clone()  # pylint: disable=not-callable
@@ -139,17 +150,16 @@ def _lifecycle(root):
     if model.take_profiles():
         raise AssertionError("Disabled profiling created buffers")
     model.close()
-    data = {"pending_forwards": 2, "streams": 2, "closed_pending_backward": True,
-            "missing_output_gradients": True, "checkpoint_steps": 2, "optimizer_updated": True,
-            "disabled_profile_buffers": 0}
-    (root / "lifecycle.json").write_text(json.dumps(data, indent=2) + "\n")
-    return data
+    return {"checkpoint_steps": 2, "optimizer_updated": True, "disabled_profile_buffers": 0}
 
 
-def run_acceptance() -> None:
+def run_acceptance(event_schedule: str = "compatibility") -> None:
     """Validate the fixed native MHC numerical and ownership contracts.
 
     Evidence is written to HP_AST_MHC_RESULTS when specified.
+
+    Args:
+        event_schedule: 待验证的显式事件调度策略。
     """
     torch.npu.set_device(0)
     root = Path(os.environ.get("HP_AST_MHC_RESULTS", "/tmp/hp-ast-mhc-results"))
@@ -159,13 +169,14 @@ def run_acceptance() -> None:
         (40, 5760, 32), (12000, 128, 96))
     records = []
     for index, (tokens, hidden, tile) in enumerate(cases):
-        record = _case(tokens, hidden, tile, 17 + index, root)
+        record = _case(tokens, hidden, tile, 17 + index, root, event_schedule)
         records.append(record)
         print(json.dumps(record), flush=True)
     data = {"checkout": hyper_parallel.__file__, "torch": torch.__version__, "torch_npu": torch_npu.__version__,
-            "precision_gate": {"relative_l2_max": 0.02, "cosine_min": 0.999}, "cases": records}
+            "precision_gate": {"relative_l2_max": 0.02, "cosine_min": 0.999}, "cases": records,
+            "event_schedule": event_schedule}
     if not os.environ.get("HP_AST_MHC_SMOKE"):
-        data["lifecycle"] = _lifecycle(root)
+        data["lifecycle"] = _lifecycle(root, event_schedule)
     (root / "acceptance.json").write_text(json.dumps(data, indent=2) + "\n")
 
 

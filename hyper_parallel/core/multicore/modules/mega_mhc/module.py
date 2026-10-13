@@ -32,7 +32,8 @@ class HyperMegaMhc(torch.nn.Module):
 
     def __init__(self, hidden_size: int, *, hc_eps: float = 1e-6, norm_eps: float = 1e-6,
                  num_iters: int = 20, token_tile: int = 32, device: Any = None,
-                 program: Program = mhc_boundary, payload_root: Path | None = None) -> None:
+                 program: Program = mhc_boundary, payload_root: Path | None = None,
+                 event_schedule: str = "compatibility") -> None:
         """Initialize the original four-stream parameter shapes and dtypes.
 
         Args:
@@ -44,6 +45,7 @@ class HyperMegaMhc(torch.nn.Module):
             device: Initial parameter device; CPU construction does not load native code.
             program: Compatible shifted five-output AST region.
             payload_root: Isolated MHC payload, or the activated environment default.
+            event_schedule: 模块生命周期内固定的反向事件调度；默认使用兼容性队列。
         """
         super().__init__()
         MhcSpec(48, hidden_size, token_tile=token_tile)
@@ -51,8 +53,10 @@ class HyperMegaMhc(torch.nn.Module):
         self.hidden_size, self.token_tile = hidden_size, token_tile
         self.hc_eps, self.norm_eps, self.num_iters = hc_eps, norm_eps, num_iters
         self.payload_root = payload_root
+        self._event_schedule = event_schedule
         self._constexprs = {"hc_eps": hc_eps, "norm_eps": norm_eps, "num_iters": num_iters}
-        program.plan(MhcSpec(48, hidden_size, token_tile=token_tile), **self._constexprs)
+        program.plan(MhcSpec(48, hidden_size, token_tile=token_tile),
+                     event_schedule=event_schedule, **self._constexprs)
         options = {"device": device, "dtype": torch.float32}
         self.phi = torch.nn.Parameter(torch.empty((24, 4 * hidden_size), **options))
         self.alpha = torch.nn.Parameter(torch.ones(3, **options))
@@ -61,6 +65,11 @@ class HyperMegaMhc(torch.nn.Module):
         torch.nn.init.normal_(self.phi, mean=0.0, std=(4 * hidden_size) ** -0.5)
         self._executables: dict[tuple[int, torch.device, bool], MhcExecutable] = {}
         self._closed = False
+
+    @property
+    def event_schedule(self) -> str:
+        """返回构造时固定的策略，防止已缓存的描述符与调用方选择不一致。"""
+        return self._event_schedule
 
     def forward(self, previous_output: torch.Tensor, residual: torch.Tensor,
                 previous_pre_mix: torch.Tensor, previous_post_mix: torch.Tensor,
@@ -87,7 +96,8 @@ class HyperMegaMhc(torch.nn.Module):
         if key not in self._executables:
             cores = torch.npu.get_device_limit(residual.device.index)["cube_core_num"]
             spec = MhcSpec(rows, self.hidden_size, cores, self.token_tile, self.token_tile, need_backward)
-            plan = self.program.plan(spec, **self._constexprs)
+            policy = self.event_schedule if need_backward else "compatibility"
+            plan = self.program.plan(spec, event_schedule=policy, **self._constexprs)
             self._executables[key] = plan.materialize(str(residual.device), payload_root=self.payload_root)
         return self._executables[key](*values, profile=profile)
 
