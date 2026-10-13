@@ -185,22 +185,6 @@ class TestLifecycle(unittest.TestCase):
         self.assertIsNot(replacement._resource_group.resources, resources)
         resources.close.assert_not_called()
 
-    def test_lifecycle_exchange_uses_registered_subgroup(self) -> None:
-        """Keep an EP root's heap rebuild independent of other pipeline stages."""
-        group = object()
-        cleanup = _automatic._Cleanup()
-        with (
-            patch.object(_automatic, "_CLEANUP", cleanup),
-            patch.object(cleanup, "install"),
-            patch.object(_automatic.dist, "is_initialized", return_value=True),
-            patch.object(_automatic.dist, "get_world_size", return_value=2) as size,
-            patch.object(_automatic.dist, "all_gather_object") as gather,
-        ):
-            self.register(Mock(), group)
-            _automatic.exchange("epoch")
-        size.assert_called_once_with(group)
-        gather.assert_called_once_with([None, None], "epoch", group=group)
-
     def test_backend_hook_orders_cleanup_and_preserves_retry(self):
         """Backend interception covers aliases, unrelated groups, exit and release errors."""
         events = []

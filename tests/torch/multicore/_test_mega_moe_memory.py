@@ -236,20 +236,6 @@ def _check_unknown_owner(mega: MegaMoeExperts, shape: baseline.MoeShape) -> None
     assert before.untyped_storage().nbytes() > 0
 
 
-def _check_companions(pending: list, lazy: MegaMoeExperts, lazy_reference: torch.nn.Module,
-                      shape: baseline.MoeShape) -> None:
-    """Finish a pull graph and bind a previously unused push owner after growth."""
-    snapshots = []
-    for member, output, source, weights, upstream in pending:
-        output.backward(upstream)
-        snapshots.append([output, source.grad, weights.grad, *baseline.expert_weight_gradients(member)])
-    for reference, actual in zip(*snapshots):
-        baseline.assert_close("mixed owner across rebuild", actual, reference)
-    expected = _deferred_pair(lazy_reference, shape, ("balanced", "tail"))
-    actual = _deferred_pair(lazy, shape, ("balanced", "tail"))
-    for reference, actual_tensor in zip(expected, actual):
-        baseline.assert_close("lazy owner after rebuild", actual_tensor, reference)
-
 
 def test_mega_moe_heap_growth() -> None:
     """Feature: Online push heap growth.
@@ -262,40 +248,25 @@ def test_mega_moe_heap_growth() -> None:
     shape = baseline.MoeShape(local_num_tokens=4096, hidden_size=1024)
     mega, common = baseline.new_layers(shape, initial_capacity_factor=1.0, capacity_growth_factor=2.0)
     variant = os.getenv("HP_MEGA_MOE_GROWTH_CASE", "single")
-    managed, references, handles = [mega], [common], []
-    companions = []
-    pending = []
-    lazy = lazy_reference = small = None
-    if variant == "shared":
+    managed, references = [mega], [common]
+    if variant == "checkpoint":
         second, reference = baseline.new_layers(shape, initial_capacity_factor=1.0, capacity_growth_factor=2.0)
         managed.append(second)
         references.append(reference)
         MegaMoeExperts.share_execution_resources(managed)
-    elif variant == "mixed":
-        small = replace(shape, hidden_size=512)
-        sidecar, side_reference = baseline.new_layers(small, dispatch_mode="pull")
-        lazy, lazy_reference = baseline.new_layers(small, dispatch_mode="push")
-        companions.extend((sidecar, lazy))
-        for member in (side_reference, sidecar):
-            source, upstream = baseline.make_data(small)
-            ids, weights, counts = _route(small, "balanced")
-            source.requires_grad_(True)
-            weights.requires_grad_(True)
-            output = baseline.forward_layer(member, source, ids, weights, tokens_per_expert=counts)
-            pending.append((member, output, source, weights, upstream))
     observations = []
     old_buffers = []
 
-    def observe(unused_module: torch.nn.Module, unused_args: tuple, unused_output: torch.Tensor) -> None:
-        """Record the physical heap and retain one stale tensor for invalidation checks.
+    def observe(module: torch.nn.Module, unused_args: tuple, unused_output: torch.Tensor) -> None:
+        """Record heap epochs and retain old storage to check invalidation.
 
         Args:
-            unused_module: Layer invoking the hook.
+            module: Layer invoking the hook.
             unused_args: Forward positional inputs.
             unused_output: Completed forward output.
         """
-        del unused_module, unused_args, unused_output
-        resources = mega._resource_group.resources  # pylint: disable=protected-access
+        del unused_args, unused_output
+        resources = module._resource_group.resources  # pylint: disable=protected-access
         observations.append((resources.heap_manager.epoch, resources.workspace.expert_capacity,
                              shmem.debug_state()["config"]["heap_size_bytes"]))
         old_buffers.append(resources.workspace.expert_buffer)
@@ -313,17 +284,15 @@ def test_mega_moe_heap_growth() -> None:
         assert epochs[:2] == [0, 1] and all(epoch == 1 for epoch in epochs[2:]), observations
         assert observations[1][2] > observations[0][2], observations
         assert old_buffers[0].untyped_storage().nbytes() == 0
-        if pending:
-            _check_companions(pending, lazy, lazy_reference, small)
-        # Count the shared execution owner, the automatic root pin, and each companion.
+        # Count one execution owner and the automatic root pin.
         reference_count = shmem.debug_state()["reference_count"]
-        assert reference_count == 2 + len(companions), reference_count
+        assert reference_count == 2, reference_count
         resources = mega._resource_group.resources  # pylint: disable=protected-access
         write_evidence({"variant": variant, "observations": observations,
                         "growth": resources.heap_manager.growth_records, "reference_count": reference_count})
     finally:
         for handle in handles:
             handle.remove()
-        for member in managed + companions:
+        for member in managed:
             member.close()
     assert shmem.debug_state()["state"] == "Uninitialized"

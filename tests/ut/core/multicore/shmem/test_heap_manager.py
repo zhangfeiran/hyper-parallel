@@ -66,27 +66,48 @@ class TestShmemHeapManager(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_fixed_reservations_roll_back_and_owner_probe_errors_are_collective(self) -> None:
-        """Feature: fixed reservations roll back and owner probe errors are collective.
-        Description: Add a larger fixed reservation, then fail an owner state probe.
-        Expectation: Preserve a fixed root layout and old heap when an owner cannot report its state.
+    def test_growth_preflight_and_failed_rebuild(self) -> None:
+        """Feature: Heap replacement failure boundaries.
+        Description: Reject unsafe ownership and then fail the native rebuild.
+        Expectation: Preflight preserves the old heap; a failed rebuild blocks further execution.
         """
         key = object()
         dist = SimpleNamespace(is_initialized=lambda: False)
         with (patch.object(_lifecycle, "_torch_modules", return_value=(torch, dist)),
               patch.object(_lifecycle, "_retained_users", 0), patch.object(_lifecycle, "_shutdown_failed", False),
               patch.dict(_heap_manager.os.environ, {}, clear=True),
+              patch.object(torch.npu, "synchronize") as synchronize,
+              patch.object(torch.npu, "is_current_stream_capturing", return_value=False) as capture,
+              patch.object(_lifecycle, "_reinitialize", side_effect=RuntimeError("native rebuild failed")) as rebuild,
               patch.object(_heap_manager, "debug_state", return_value={"config": {"heap_size_bytes": 2 * 1024**2},
-                                                                      "reference_count": 1, "active_allocations": []})):
+                                                                      "reference_count": 1,
+                                                                      "active_allocations": []}) as debug):
             manager = _heap_manager.ShmemHeapManager(None, torch.empty(0), ((key, (512, (), None)),))
             owner = Mock()
             manager.bind(owner, key)
             with self.assertRaisesRegex(RuntimeError, "fixed SHMEM layout"):
                 manager.reserve(((object(), (4 * 1024**2, (), None)),), allow_rebuild=False)
             self.assertEqual(len(manager.entries), 1)
-            owner.heap_state.side_effect = RuntimeError("owner probe failed")
-            with self.assertRaisesRegex(RuntimeError, "owner probe failed"):
-                manager.replace(owner, (4 * 1024**2, (), None))
+            for error in ("owner probe failed", "unmanaged SHMEM owner", "unmanaged SHMEM allocation",
+                          "active workspace lease", "graph capture", "explicit heap budget", "sync failed"):
+                with self.subTest(error=error):
+                    owner.heap_state.side_effect = RuntimeError(error) if error == "owner probe failed" else None
+                    owner.heap_state.return_value = (set(), error == "active workspace lease", False)
+                    debug.return_value["reference_count"] = 2 if error == "unmanaged SHMEM owner" else 1
+                    debug.return_value["active_allocations"] = (
+                        [{"allocation_base": 1234}] if error == "unmanaged SHMEM allocation" else [])
+                    capture.return_value = error == "graph capture"
+                    manager.heap_limit = 2 * 1024**2 if error == "explicit heap budget" else None
+                    synchronize.side_effect = RuntimeError(error) if error == "sync failed" else None
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        manager.replace(owner, (4 * 1024**2, (), None))
+                    self.assertEqual((manager.state, manager.epoch, manager.heap_bytes), ("ready", 0, 2 * 1024**2))
             owner.release_heap.assert_not_called()
-            self.assertEqual(manager.state, "ready")
-            self.assertEqual(manager.epoch, 0)
+            rebuild.assert_not_called()
+            synchronize.side_effect = None
+            with self.assertRaisesRegex(RuntimeError, "native rebuild failed"):
+                manager.replace(owner, (4 * 1024**2, (), None))
+            self.assertEqual((manager.state, manager.epoch), ("failed", 0))
+            self.assertTrue(_lifecycle._shutdown_failed)
+            with self.assertRaisesRegex(RuntimeError, "heap is failed"), manager.access():
+                self.fail("A failed manager allowed execution")

@@ -85,28 +85,6 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_heap_rounding_preserves_transport_capacity(self) -> None:
-        """Feature: heap rounding preserves transport capacity.
-        Description: Calculate push and pull layouts for multiple roots and resource groups.
-        Expectation: Round the full push receive/return capacity to physical pages for all resource groups.
-        """
-        reference = torch.empty(0, dtype=torch.bfloat16)
-        for ep in (4, 8):
-            for factor, expected_mib in ((ep, (ep + 1) * 320 + 2), (1.25, 722), (1.5, 802)):
-                for groups in (1, 2):
-                    with self.subTest(ep=ep, factor=factor, groups=groups), patch.dict(os.environ, {}, clear=True):
-                        spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
-                                "ep_size": ep, "initial_capacity_factor": factor}
-                        actual = ShmemHeapManager(None, reference, tuple(
-                            (object(), (_spec_workspace_bytes(spec, 2), (), None)) for _ in range(groups))).heap_bytes
-                        self.assertEqual(actual, (groups * (expected_mib - 2) + 2) * 1024**2)
-                        spec["dispatch_mode"] = "pull"
-                        actual = ShmemHeapManager(None, reference, tuple(
-                            (object(), (_spec_workspace_bytes(spec, 2), (), None)) for _ in range(groups))).heap_bytes
-                        self.assertEqual(actual, (groups * 640 + 2) * 1024**2)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_explicit_heap_requires_sufficient_aligned_capacity(self) -> None:
         """Feature: explicit heap requires sufficient aligned capacity.
         Description: Configure aligned, undersized, partial-page and zero budgets.

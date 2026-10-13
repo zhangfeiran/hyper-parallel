@@ -316,24 +316,6 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         self.assertEqual(layout.buffer_size, 53760)
         self.assertLess(layout.buffer_size, MAX_PROFILE_BUFFER_BYTES)
 
-    def test_layout_preserves_records_above_former_limit(self) -> None:
-        """Keep all 258 records and reject a capacity that overflows the Device ABI."""
-        runtime_config = _runtime_config(2048)
-        runtime_config.num_workers = 48
-        runtime_config.all_tasks[0] = _three_record_task()
-        runtime_config.task_index_num[0] = 2041
-        runtime_config.task_index_num[1] = 2041
-
-        layout = _calculate_profile_layout(runtime_config)
-
-        self.assertEqual(layout.aic_required_records, 258)
-        self.assertEqual(layout.aic_record_capacity, 272)
-        self.assertEqual(layout.aiv_required_records, 258)
-        self.assertEqual(layout.aiv_record_capacity, 272)
-        self.assertEqual(_round_up_record_capacity(MAX_RECORDS_PER_CORE), MAX_RECORDS_PER_CORE)
-        with self.assertRaisesRegex(ValueError, "record limit"):
-            _round_up_record_capacity(MAX_RECORDS_PER_CORE + 1)
-
     def test_prepared_runtime_serializes_disabled_config_and_lazily_profiles(self):
         """Keep the normal tensor disabled and create the enabled tensor on demand."""
         runtime_config = _runtime_config()

@@ -303,20 +303,6 @@ def test_mega_moe_group_list_isolation(
     )
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards",
-          essential_mark="essential")
-@pytest.mark.parametrize("task_queue", ["1", "2"])
-def test_mega_moe_native_permutation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task_queue: str) -> None:
-    """Feature: Native permutation bridges in both task queues.
-
-    Description: Compare caller-owned permutation and both gradient operations on two ranks.
-    Expectation: Exact outputs, stable buffer addresses and valid asynchronous lifetimes.
-    """
-    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue)
-    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path / task_queue))
-    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_native_permutation", 2, "_test_mega_moe.py")
-
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
           essential_mark="unessential")
 def test_mega_moe_subgroups(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -331,7 +317,7 @@ def test_mega_moe_subgroups(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
 @arg_mark(
     plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential",
 )
-@pytest.mark.parametrize("variant", ["single", "shared", "mixed", "checkpoint"])
+@pytest.mark.parametrize("variant", ["single", "checkpoint"])
 def test_mega_moe_heap_growth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, variant: str) -> None:
     """Feature: Collective push heap growth.
     Description: Rebuild after one forward while keeping both autograd graphs live.

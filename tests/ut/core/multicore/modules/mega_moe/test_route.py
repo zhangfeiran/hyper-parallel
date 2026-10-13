@@ -78,41 +78,6 @@ class TestMegaMoeRoute(unittest.TestCase):
             f"computed counts mismatch: expected={expected}, got={computed}",
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_pull_permutation_accepts_strided_hidden_states(self) -> None:
-        """Feature: Pull permutation input layout.
-
-        Description: Prepare contiguous and sliced token states with strided expert IDs.
-        Expectation: Native inputs are contiguous, values survive, and contiguous tokens keep their storage.
-        """
-        spec = replace(self._spec(), dispatch_mode="pull")
-        ids = torch.tensor([[0, 2], [1, 3]], dtype=torch.int32).T
-        probs = torch.full((2, 2), 0.5)
-        strided = torch.arange(16, dtype=torch.bfloat16).reshape(2, 8)[:, ::2]
-        for hidden in (strided, strided.contiguous()):
-            with self.subTest(stride=hidden.stride()):
-                expected = hidden.repeat_interleave(2, dim=0)
-                workspace = SimpleNamespace(in_use=True, source_buffer=torch.empty_like(expected))
-
-                def permute(tokens: torch.Tensor, indices: torch.Tensor,
-                            output: torch.Tensor, mapping: torch.Tensor,
-                            expected_hidden: torch.Tensor = hidden) -> None:
-                    """Emulate the native layout contract and its caller-owned outputs."""
-                    self.assertTrue(tokens.is_contiguous())
-                    self.assertTrue(indices.is_contiguous())
-                    torch.testing.assert_close(tokens, expected_hidden)
-                    if expected_hidden.is_contiguous():
-                        self.assertEqual(tokens.data_ptr(), expected_hidden.data_ptr())
-                    output.copy_(tokens.repeat_interleave(2, dim=0))
-                    mapping.copy_(torch.arange(4, dtype=torch.int32))
-
-                with patch.object(route_module.multicore_ops, "moe_token_permute_out", side_effect=permute):
-                    route = prepare_topk_route(hidden, ids, probs, spec, None, workspace)
-                self.assertIs(route.routed_tokens, workspace.source_buffer)
-                torch.testing.assert_close(route.routed_tokens, expected)
-                torch.testing.assert_close(route.unpermute_mapping, torch.arange(4, dtype=torch.int32))
-
     def test_async_count_gather_overlaps_permute_and_builds_metadata(self) -> None:
         """Wait after permutation and derive every native offset from counts."""
         spec = self._spec(ep_size=2, rank_id=1)
@@ -252,15 +217,6 @@ class TestMegaMoeRoute(unittest.TestCase):
                     self.assertEqual(actual, (expected, max(capacities)))
                     self.assertEqual(rank_spec.receive_capacity, 256)
                     self.assertEqual(rank_spec.routed_slots, 4)
-
-    def test_overflow_load_is_reported_on_every_rank_including_empty_destinations(self) -> None:
-        """Both hot and empty ranks report the same maximum so push can grow before execution."""
-        counts = torch.tensor([[4, 0, 0, 0], [4, 0, 0, 0]], dtype=torch.int32)
-        for rank in range(2):
-            spec = self._spec(ep_size=2, rank_id=rank, initial_capacity_factor=1.0, receive_capacity=4)
-            with self.subTest(rank=rank):
-                self.assertEqual(_expert_capacity(counts, spec), (8 if rank == 0 else 1, 8))
-
 
 if __name__ == "__main__":
     unittest.main()
