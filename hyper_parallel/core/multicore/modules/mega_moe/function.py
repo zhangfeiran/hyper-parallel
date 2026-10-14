@@ -36,6 +36,10 @@ from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
 
 
+# Four token schedules can each retain forward, backward and fallback images.
+_RUNTIME_IMAGE_CACHE_SIZE = 12
+
+
 @dataclass(frozen=True)
 class _ForwardIntermediates:
     """Forward tensors owned by one autograd invocation."""
@@ -378,13 +382,13 @@ def _runtime_image(base: torch.Tensor, data: bytes,
                    cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None, *, static: bool) -> torch.Tensor:
     """Reuse images and update dynamic suffixes inside the serial workspace lease."""
     # The serial workspace lease orders both writable scratch and dynamic suffix updates.
-    previous = None if cache is None else cache.get(id(base))
+    previous = None if cache is None else cache.pop(id(base), None)
     if previous is not None and previous[0] is base and (previous[1] == data or
                                                        (not static and len(previous[1]) == len(data))):
         result = previous[2]
         if previous[1] != data:
             _copy_device_bytes(data, result[base.numel():])
-            cache[id(base)] = (base, data, result)
+        cache[id(base)] = (base, data, result)
         result.record_stream(torch.npu.current_stream(base.device))
         return result
     metadata = _async_device_bytes(data, base.device)
@@ -392,6 +396,9 @@ def _runtime_image(base: torch.Tensor, data: bytes,
     result.record_stream(torch.npu.current_stream(base.device))
     if cache is not None:
         cache[id(base)] = (base, data, result)
+        while len(cache) > _RUNTIME_IMAGE_CACHE_SIZE:
+            # Recorded streams protect pending kernels; live callers retain their own image.
+            del cache[next(iter(cache))]
     return result
 
 

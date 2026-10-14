@@ -110,6 +110,33 @@ class TestMegaMoeFunction(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
+    def test_dynamic_runtime_images_evict_without_invalidating_live_images(self) -> None:
+        """Feature: Bounded runtime images.
+        Description: Cycle through more schedules than the cache can retain.
+        Expectation: Evict cold descriptors while preserving live images and hot reuse.
+        """
+        cache = {}
+        bases = [torch.full((16,), value, dtype=torch.uint8) for value in range(25)]
+        with patch.object(torch.npu, "current_stream"), patch.object(torch.Tensor, "record_stream", autospec=True):
+            first = function_module._split_runtime(bases[0], None, 6, home_only=True, cache=cache)
+            for base in bases[1:12]:
+                function_module._split_runtime(base, None, 6, home_only=True, cache=cache)
+            self.assertIs(function_module._split_runtime(bases[0], None, 6, home_only=True, cache=cache), first)
+            function_module._split_runtime(bases[12], None, 6, home_only=True, cache=cache)
+            self.assertEqual(len(cache), 12)
+            self.assertIn(id(bases[0]), cache)
+            self.assertNotIn(id(bases[1]), cache)
+            for base in bases[13:]:
+                function_module._split_runtime(base, None, 6, home_only=True, cache=cache)
+            self.assertEqual(len(cache), 12)
+            self.assertNotIn(id(bases[0]), cache)
+            torch.testing.assert_close(first[:16], bases[0])
+            rebuilt = function_module._split_runtime(bases[0], None, 6, home_only=True, cache=cache)
+            self.assertIsNot(rebuilt, first)
+            torch.testing.assert_close(rebuilt, first)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_dynamic_runtime_descriptors_update_suffix_without_resetting_scratch(self) -> None:
         """
         Feature: Dynamic runtime ownership
