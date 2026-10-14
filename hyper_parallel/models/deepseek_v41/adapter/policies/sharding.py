@@ -14,6 +14,8 @@
 # ============================================================================
 """Declare parameter sharding and FSDP wrapping policies."""
 
+from __future__ import annotations
+
 from typing import Any
 
 
@@ -41,50 +43,33 @@ def build_parameter_sharding_rules() -> list[tuple[list[str] | str, Any]]:
     ]
 
 
-def _get_visual_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
-    """Return V4.1 visual execution units with bounded unshard size."""
-    module_by_fqn = dict(model.named_modules())
-    vision_blocks = tuple(
-        module_fqn
-        for module_fqn in module_by_fqn
-        if module_fqn.startswith("model.vision.blocks.")
-        and module_fqn.count(".") == 3
-    )
-    aligner = (
-        ("model.aligner",)
-        if module_by_fqn.get("model.aligner") is not None
-        else ()
-    )
-    return vision_blocks + aligner
-
-
 def get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
-    """Return visual units and homogeneous-mesh Engram child units."""
+    """Keep repeated visual calls root-owned and wrap homogeneous Engram units."""
     module_by_fqn = dict(model.named_modules())
     engram_units = tuple(
         module_fqn
         for module_fqn in module_by_fqn
         if module_fqn.endswith(".engram.embed") or module_fqn.endswith(".engram.wkv")
     )
-    return _get_visual_fsdp_wrap_modules(model) + engram_units
+    # Each rank can pack a different number of images. Nested visual units would
+    # issue a different number of parameter collectives inside the image loop.
+    return engram_units
 
 
 def get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
-    """Keep the ViT hierarchy out of HF decoder-container discovery."""
+    """Keep both per-image branches out of automatic decoder discovery."""
     module_by_fqn = dict(model.named_modules())
-    return ("model.vision",) if module_by_fqn.get("model.vision") is not None else ()
+    return tuple(name for name in ("model.vision", "model.aligner") if module_by_fqn.get(name) is not None)
 
 
 def get_fsdp_execution_order(
         model: Any,
         module_fqns: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Return visual and per-decoder child units in V4.1 forward order."""
-    visual_fqns = _get_visual_fsdp_wrap_modules(model)
+    """Return per-decoder child units in V4.1 forward order."""
+    del model
     selected_fqns = set(module_fqns)
-    execution_order = [
-        module_fqn for module_fqn in visual_fqns if module_fqn in selected_fqns
-    ]
+    execution_order = []
     layer_fqns = tuple(
         module_fqn
         for module_fqn in module_fqns

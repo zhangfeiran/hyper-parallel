@@ -125,13 +125,14 @@ class DeepseekV41VisionAttention(nn.Module):
         )
         query = _apply_vision_rotary(query, cosine, sine)
         key = _apply_vision_rotary(key, cosine, sine)
+        # Fused SDPA requires a batch dimension; a 3D input falls back to dense attention math.
         attention_output = functional.scaled_dot_product_attention(  # pylint: disable=not-callable
-            query.transpose(0, 1),
-            key.transpose(0, 1),
-            value.transpose(0, 1),
+            query.transpose(0, 1).unsqueeze(0),
+            key.transpose(0, 1).unsqueeze(0),
+            value.transpose(0, 1).unsqueeze(0),
             is_causal=False,
         )
-        return self.wo(attention_output.transpose(0, 1).reshape(token_count, -1))
+        return self.wo(attention_output.squeeze(0).transpose(0, 1).reshape(token_count, -1))
 
 
 class DeepseekV41VisionMLP(nn.Module):
