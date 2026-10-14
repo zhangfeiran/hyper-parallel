@@ -15,8 +15,11 @@
 """Unit tests for the model-facing MegaMoe module."""
 
 import unittest
+from collections import OrderedDict
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
 
 import torch
@@ -33,6 +36,45 @@ class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
 
     # pylint: disable=protected-access
+
+    def test_dynamic_constructor_retains_capacity_and_accepts_real_shapes(self) -> None:
+        """Arbitrary including empty inputs do not change the reserved resource specification."""
+        experts = MegaMoeExperts(max_local_num_tokens=257, hidden_size=16, intermediate_size=8,
+                                 num_experts=4, top_k=2)
+        self.addCleanup(experts.close)
+        self.assertIsNone(experts.local_num_tokens)
+        self.assertEqual(experts._resource_group.specification["local_num_tokens"], 384)
+        with patch.object(experts, "_validate_tensors"):
+            for tokens in (0, 1, 127, 128, 129, 257):
+                with self.subTest(tokens=tokens):
+                    result = experts._validate_forward_inputs(
+                        torch.empty(1, tokens, 16), torch.empty(tokens, 2, dtype=torch.int32),
+                        torch.empty(tokens, 2), None, (experts.gate_up_weight, experts.down_weight))
+                    self.assertEqual(tuple(result.shape), (tokens, 16))
+        for kwargs in ({}, {"local_num_tokens": 128, "max_local_num_tokens": 256},
+                       {"max_local_num_tokens": 0}, {"max_local_num_tokens": True}, {"max_local_num_tokens": 2**31}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **kwargs)
+
+    def test_plan_cache_evicts_without_mutating_retained_plans_or_capacity(self) -> None:
+        """A deferred backward retains its old plan after cache eviction and a new shape."""
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources.spec = MegaMoeSpec(4096, 16, 8, 4, 2, None, 8192, 1, None, 0, 24,
+                                    max_local_num_tokens=4096)
+        resources._plans = OrderedDict()
+        with patch.object(mega_moe_module, "build_mega_moe_plan",
+                          side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
+            retained = resources.plan_for_tokens(128, "cpu")
+            self.assertIs(retained, resources.plan_for_tokens(128, "cpu"))
+            for tokens in (256, 384, 512, 4096):
+                resources.plan_for_tokens(tokens, "cpu")
+            self.assertEqual(len(resources._plans), 4)
+            self.assertNotIn((128, False), resources._plans)
+            self.assertEqual(retained.spec.plan_tokens, 128)
+            self.assertEqual(retained.spec.routed_slots, 8192)
+            self.assertEqual(retained.spec.receive_capacity, 8192)
+            self.assertEqual(resources.spec, replace(retained.spec, schedule_tokens=None))
+            self.assertEqual(build.call_count, 5)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -215,7 +257,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         torch.testing.assert_close(hidden_flat, hidden_states.reshape(128, 16))
         mock_prepare.assert_called_once_with(
             hidden_flat, topk_ids, topk_weights, resources.spec, tokens_per_expert,
-            workspace=resources.workspace, replica_route=None,
+            workspace=resources.workspace, replica_route=None, autograd_mask=13,
         )
         resources.ensure_capacity.assert_called_once_with(512)
         mock_execute.assert_called_once_with(
@@ -577,6 +619,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         resources.heap_manager = Mock(access=nullcontext)
         resources.workspace.close.side_effect = RuntimeError("workspace busy")
         resources._workspace_closed = False  # pylint: disable=protected-access
+        resources._plans = OrderedDict()
         resources._closed = False  # pylint: disable=protected-access
 
         with (
@@ -596,6 +639,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         resources.workspace = Mock()
         resources._workspace_closed = False  # pylint: disable=protected-access
         resources.heap_manager = Mock(access=nullcontext)
+        resources._plans = OrderedDict()
         resources._closed = False  # pylint: disable=protected-access
 
         with (

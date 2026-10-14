@@ -75,7 +75,7 @@ def _native_reference(module, inputs, indices, weights, *, expert_weights=None):
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestDeepseekV41MegaMoe(unittest.TestCase):
-    """Exercise target replacement, fixed-size padding and Trainer ownership."""
+    """Exercise target replacement, dynamic token execution and Trainer ownership."""
 
     def test_external_weights_preserve_gradients_and_state(self):
         """Use current tensors across calls and never register placeholder weights."""
@@ -197,8 +197,8 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
             torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-5)
         self.assertGreater(actual_grads[0][image_mask].abs().sum().item(), 0)
 
-    def test_fixed_padding_output_and_all_gradients(self):
-        """Padding is zero-weighted and keeps every real-token gradient."""
+    def test_real_token_output_and_all_gradients(self):
+        """Real token rows reach the executor unchanged and preserve every gradient."""
         for tokens in (0, 7, 128):
             with self.subTest(tokens=tokens):
                 experts = DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128)
@@ -211,7 +211,9 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                                              expert_weights=(experts.gate_up_proj, experts.down_proj))
                 with patch.object(MegaMoeExperts, 'forward', autospec=True, side_effect=_native_reference) as run:
                     actual = experts(hidden, ids, weights)
-                self.assertEqual(run.call_args.args[1].shape[0], 128)
+                self.assertIs(run.call_args.args[1], hidden)
+                self.assertIs(run.call_args.args[2], ids)
+                self.assertIs(run.call_args.args[3], weights)
                 torch.testing.assert_close(actual, expected)
                 params = (hidden, weights, experts.gate_up_proj, experts.down_proj)
                 actual_grads = torch.autograd.grad(actual.sum(), params)

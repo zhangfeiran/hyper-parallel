@@ -297,10 +297,16 @@ class TestMegaMoeFunction(unittest.TestCase):
         """A mutated saved parameter must abort before any resident replica can be borrowed."""
         self._check_deferred_backward(permuted=False, mutate_before_backward=True)
 
+    def test_dynamic_rows_survive_reverse_backward_with_reserved_workspace(self) -> None:
+        """Each graph restores its own row count after later calls reuse a larger buffer."""
+        for pull in (False, True):
+            with self.subTest(pull=pull):
+                self._check_deferred_backward(permuted=True, pull=pull, vary_tokens=True)
+
     def _check_deferred_backward(
         self, *, permuted: bool, input_grad: bool = True, reuse: bool = False, pull: bool = False,
         empty_replica_route: bool = False,
-        mutate_before_backward: bool = False,
+        mutate_before_backward: bool = False, vary_tokens: bool = False,
     ) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(replica_slots_per_rank=int(empty_replica_route), hidden_size=4,
@@ -320,9 +326,9 @@ class TestMegaMoeFunction(unittest.TestCase):
             replica_runtime_images={},
             in_use=False,
             expert_capacity=128,
-            source_buffer=torch.empty(4, 4),
+            source_buffer=torch.empty(8 if vary_tokens else 4, 4),
             expert_buffer=torch.empty(128, 4),
-            routed_buffer=torch.empty(4, 4),
+            routed_buffer=torch.empty(8 if vary_tokens else 4, 4),
             forward_event_counters=torch.empty(16),
             backward_event_counters=torch.empty(16),
             gmm_workspace=torch.empty(1),
@@ -361,8 +367,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         def permutation_gradient(grad: Any, mapping: Any, token_rows: int, top_k: int) -> Any:
             """Require direct consumption of shared rows and return owned token rows."""
             self.assertEqual(grad.data_ptr(), workspace.routed_buffer.data_ptr())
-            self.assertEqual((token_rows, top_k), (2, 2))
-            self.assertEqual(mapping.tolist(), [0, 2, 1, 3])
+            expected_rows = (1, 3, 2, 4)[int(grad[0, 0]) - 1] if vary_tokens else 2
+            self.assertEqual((token_rows, top_k), (expected_rows, 2))
+            self.assertEqual(mapping.tolist(), list(range(token_rows * 2)) if vary_tokens else [0, 2, 1, 3])
             self.assertTrue(torch.isfinite(grad).all())
             return grad.reshape(token_rows, top_k, 4).sum(dim=1)
 
@@ -394,7 +401,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             self.assertTrue(torch.equal(args[5], torch.full_like(args[5], tag + 20)))
             for tensor, width in ((args[8], 2), (args[10], 4), (args[12], 4)):
                 self.assertEqual(tuple(tensor.shape), (capacity, width))
-            self.assertEqual(tuple(args[13].shape), (4, 4))
+            self.assertEqual(tuple(args[13].shape), (8 if vary_tokens else 4, 4))
             self.assertEqual(args[12].data_ptr() == args[0].data_ptr(), reuse)
             self.assertNotEqual(saved_dispatch.data_ptr(), args[0].data_ptr())
             scratch_references[:] = [weakref.ref(args[index]) for index in (8, 10, 12)]
@@ -408,15 +415,17 @@ class TestMegaMoeFunction(unittest.TestCase):
             """Borrow the caller's lease when routing directly into pull source."""
             if not permuted:
                 return function_module.execute_mega_moe(source, weight1, weight2, route, plan, workspace)
-            ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+            ids = torch.tensor([[0, 1]] * source.shape[0], dtype=torch.int32)
             prepared = SimpleNamespace(
                 routed_tokens=source.detach().repeat_interleave(2, dim=0), metadata=route,
-                unpermute_mapping=torch.tensor([0, 2, 1, 3], dtype=torch.int32),
+                unpermute_mapping=(torch.arange(source.shape[0] * 2, dtype=torch.int32) if vary_tokens
+                                  else torch.tensor([0, 2, 1, 3], dtype=torch.int32)),
             )
             if pull:
                 workspace.claim()
-                workspace.source_buffer.copy_(prepared.routed_tokens)
-                prepared.routed_tokens = workspace.source_buffer
+                destination = workspace.source_buffer[:prepared.routed_tokens.shape[0]]
+                destination.copy_(prepared.routed_tokens)
+                prepared.routed_tokens = destination
             output = function_module.execute_mega_moe_with_permutation(
                 source, ids, weight1, weight2, prepared, plan, workspace, workspace_claimed=pull,
             )
@@ -448,7 +457,8 @@ class TestMegaMoeFunction(unittest.TestCase):
                          side_effect=permutation_gradient) as mock_permutation,
         ):
             for tag, capacity in enumerate(capacities, start=1):
-                source = torch.full((2 if permuted else 4, 4), float(tag), requires_grad=input_grad)
+                tokens = (1, 3, 2, 4)[tag - 1] if vary_tokens else 2
+                source = torch.full((tokens if permuted else 4, 4), float(tag), requires_grad=input_grad)
                 replica = SimpleNamespace(plan=SimpleNamespace(transfers=())) if empty_replica_route else None
                 route = SimpleNamespace(replica_route=replica, expert_capacity=capacity,
                                         group_list=torch.tensor([0, capacity]))
@@ -463,7 +473,7 @@ class TestMegaMoeFunction(unittest.TestCase):
                 self.assertEqual(saved[0].data_ptr(), (dispatch_pointers if pull else down_pointers)[-1])
                 self.assertNotEqual(saved[0].data_ptr(), workspace.expert_buffer.data_ptr())
                 self.assertEqual(saved[0].untyped_storage().nbytes(), capacity * 4 * source.element_size())
-                self.assertEqual(tuple(output.shape), (4, 4))
+                self.assertEqual(tuple(output.shape), (tokens * 2 if permuted else 4, 4))
                 outputs.append(output)
                 sources.append(source)
             if mutate_before_backward:
@@ -475,7 +485,7 @@ class TestMegaMoeFunction(unittest.TestCase):
                 self.assertEqual(workspace.claim.call_count, claims)
                 return
             for tag in range(len(outputs), 0, -1):
-                self.assertTrue(torch.equal(outputs[tag - 1], torch.full((4, 4), float(tag + 40))))
+                self.assertTrue(torch.equal(outputs[tag - 1], torch.full_like(outputs[tag - 1], float(tag + 40))))
                 outputs[tag - 1].sum().backward()
                 source = sources[tag - 1]
                 expected = torch.full_like(source, float(tag * (2 if permuted else 1)))

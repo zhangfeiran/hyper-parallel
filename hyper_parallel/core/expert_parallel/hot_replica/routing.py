@@ -136,7 +136,7 @@ def prepare_replica_route(
 
     Route validation is collective: invalid IDs and repeated experts are reported
     by all ranks before any sparse weight transfers. All ranks must supply the
-    same shape and configuration, as required by the EP module contract.
+    same Top-K width and configuration; source token counts may differ.
 
     Args:
         topk_ids: Integer expert IDs, with distinct experts in each token's row.
@@ -162,11 +162,13 @@ def prepare_replica_route(
     if size != config.ep_size:
         raise ValueError("replica configuration must match the EP group size")
     tokens, top_k = topk_ids.shape
-    upper = config.maximum_receive_rows(tokens, top_k, alignment=1)
+    config.maximum_receive_rows(max(1, tokens), top_k, alignment=1)
     ids = topk_ids.to(torch.int64)
     payload = _replica_count_payload(ids, config.num_experts)
     matrix = _gather_replica_counts(payload, size, group)
     if planner_backend == "device":
+        maximum_tokens = int(matrix[:, :-1].sum(dim=1).max()) // top_k
+        upper = config.maximum_receive_rows(max(1, maximum_tokens), top_k, alignment=1)
         device_plan = build_device_expert_replica_plan(
             matrix[:, :-1], config, capacity_limit=upper,
             target_load=min(upper, target_load) if target_load is not None else None,
@@ -186,6 +188,9 @@ def prepare_replica_route(
     host = matrix.cpu().tolist()
     if any(row[-1] for row in host):
         raise ValueError("hot replication requires in-range, distinct expert IDs per token")
+    # Every planner must use the same bound when source ranks have unequal or zero rows.
+    maximum_tokens = max(sum(row[:-1]) for row in host) // top_k
+    upper = config.maximum_receive_rows(max(1, maximum_tokens), top_k, alignment=1)
     plan = build_expert_replica_plan(
         [row[:-1] for row in host], config.replica_slots_per_rank,
         target_load=min(upper, target_load) if target_load is not None else None,

@@ -57,7 +57,7 @@ class DeepseekV41MegaMoeExperts(nn.Module, ModelRuntimeModule):
             module: HF DeepSeek routed experts with a supported SwiGLU limit.
             module_fqn: Checkpoint scope assigned by the replacement executor.
             context: Active parallel axes; binding occurs after structure replacement.
-            local_num_tokens: Fixed, 128-aligned expert execution size; shorter inputs are padded.
+            local_num_tokens: Upper bound on actual expert input rows; no synthetic tokens are added.
             dispatch_mode: MegaMoe dispatch transport, either push or pull.
             initial_capacity_factor: Push initial receive capacity; None uses the executor default.
             capacity_growth_factor: Push capacity growth multiplier; omit for pull.
@@ -121,7 +121,7 @@ class DeepseekV41MegaMoeExperts(nn.Module, ModelRuntimeModule):
         from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
 
         self._executor = MegaMoeExperts(
-            local_num_tokens=self.local_num_tokens, hidden_size=self.hidden_size,
+            max_local_num_tokens=self.local_num_tokens, hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size, num_experts=self.global_experts,
             top_k=top_k, ep_group=ep_group, ep_size=ep_size,
             dispatch_mode=self.dispatch_mode, initial_capacity_factor=self.initial_capacity_factor,
@@ -147,24 +147,7 @@ class DeepseekV41MegaMoeExperts(nn.Module, ModelRuntimeModule):
             raise RuntimeError("Configure MegaMoe EP execution before forward")
         weights = tuple(parameter.to_local() if isinstance(parameter, DTensor) else parameter
                         for parameter in (self.gate_up_proj, self.down_proj))
-        original_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, self.hidden_size)
-        num_tokens = hidden_flat.shape[0]
-        top_k = self._executor.top_k
-        if top_k_index.shape != (num_tokens, top_k) or top_k_weights.shape != (num_tokens, top_k):
-            raise ValueError("MegaMoe routing tensors must match the unpadded token count and top_k")
-        padding = self._executor.local_num_tokens - num_tokens
-        if padding < 0:
-            raise ValueError("Packed token count exceeds configured MegaMoe capacity; increase the packing bound")
-        if padding:
-            # Balanced synthetic routes avoid overloading expert zero; zero weights remove their gradients.
-            padding_ids = torch.arange(padding * top_k, device=top_k_index.device, dtype=top_k_index.dtype)
-            padding_ids = padding_ids.remainder(self.global_experts).reshape(padding, top_k)
-            hidden_flat = torch.cat((hidden_flat, hidden_flat.new_zeros((padding, self.hidden_size))))
-            top_k_index = torch.cat((top_k_index, padding_ids))
-            top_k_weights = torch.cat((top_k_weights, top_k_weights.new_zeros((padding, top_k))))
-        output = self._executor(hidden_flat, top_k_index, top_k_weights, expert_weights=weights)
-        return output[:num_tokens].reshape(original_shape)
+        return self._executor(hidden_states, top_k_index, top_k_weights, expert_weights=weights)
 
     @staticmethod
     def prepare_runtime_group(experts: list[DeepseekV41MegaMoeExperts]) -> None:

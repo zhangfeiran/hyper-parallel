@@ -122,9 +122,10 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
     return parse_training_args([str(path)])
 
 
-def _step(trainer, iterator, step, work):
+def _step(trainer, iterator, step, work, token_rows):
     dist.barrier()
     torch.npu.synchronize()
+    token_rows.clear()
     start = time.perf_counter()
     metrics = trainer.train_step(iterator)
     torch.npu.synchronize()
@@ -135,6 +136,7 @@ def _step(trainer, iterator, step, work):
     dist.all_reduce(times, op=dist.ReduceOp.MAX)
     row = {"step": step + 1, "local_seconds": elapsed, "max_rank_seconds": times.item(),
            "allocated_bytes": torch.npu.memory_allocated(), "reserved_bytes": torch.npu.memory_reserved(),
+           "moe_input_rows": dict(token_rows),
            "trainer_env": dict(trainer.base.step_env_metrics),
            "trainer_metrics": dict(trainer.base.step_train_metrics), **metrics}
     with (work / "steps.jsonl").open("a", encoding="utf-8") as stream:
@@ -202,6 +204,15 @@ def main() -> None:
     dist.barrier()
     trainer.on_train_begin()
     torch.npu.reset_peak_memory_stats()
+    token_rows = {}
+    hooks = []
+    def record_rows(name):
+        def hook(_module, inputs):
+            token_rows[name] = inputs[0].numel() // inputs[0].shape[-1]
+        return hook
+    for name, module in trainer.base.model.named_modules():
+        if name.endswith(".mlp") and hasattr(module, "gate"):
+            hooks.append(module.register_forward_pre_hook(record_rows(name)))
     rows = []
     for epoch in range(trainer.base.train_epochs):
         loader = trainer.base.train_dataloader
@@ -211,7 +222,7 @@ def main() -> None:
         iterator = iter(loader)
         count = min(trainer.base.train_steps, args.steps - len(rows))
         for _ in range(count):
-            rows.append(_step(trainer, iterator, len(rows), work))
+            rows.append(_step(trainer, iterator, len(rows), work, token_rows))
         trainer.on_epoch_end()
         trainer.base.state.epoch = epoch + 1
         if len(rows) == args.steps:
@@ -224,6 +235,8 @@ def main() -> None:
               "weights_initialization": "canonical_random_not_pretrained", "workspace_shared": bool(experts),
               "shmem_state": shmem.debug_state() if experts else None,
               "owner_use_grouped_gemm": args.backend == "owner_ep"}
+    for hook in hooks:
+        hook.remove()
     trainer.on_train_end()
     (work / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     dist.barrier()

@@ -10,6 +10,7 @@ SHMEM 由 Multicore 在内部管理，不提供独立用户接口。
 - [MegaKernel Profiling 使用指南](../../../docs/guide/mega_kernel_profiling.md)
 - [MegaKernel Profiling 设计与实现](docs/mega_kernel_profiling_design_and_usage.md)
 - [私有 SHMEM 生命周期](docs/shmem.md)
+- [MegaMoe 动态 token 设计与验证](docs/mega_moe_dynamic_tokens_design.md)
 - [完整 MegaMoE 样例](examples/mega_moe/README.md)
 
 ## 核心概念
@@ -76,10 +77,12 @@ cross-node interface selection and group-local shutdown requirements.
 
 ### 输入与权重
 
-- EP may be WORLD or a subgroup; per-rank token count `T` is fixed and a multiple of 128, and `E` is divisible by EP.
-  执行计划采用静态 tiling，构造后的 `T/H/I/E/K/EP` 固定；其他 shape、芯片及后端需单独验证。
+- EP may be WORLD or a subgroup; `E` must be divisible by EP.
+  Supply exactly one of `local_num_tokens=T` (fixed, positive, 128-aligned) or
+  `max_local_num_tokens=T_cap` (variable actual rows from zero through `T_cap`).
+  `H/I/E/K/EP` remain fixed after construction.
 - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
-  ID 使用全局专家编号。
+  ID 使用全局专家编号，同一个 token 的 K 个 ID 必须互不重复。
 - 可选的 `tokens_per_expert` 是同 device 上 `[E]` 的精确本 rank histogram。
   省略时内部统计；传入时由调用方保证与当前 ID 一致。contiguous INT32 可直接使用，
   INT64 或非连续输入会转换。
@@ -99,6 +102,20 @@ output = experts(
     tokens_per_expert=tokens_per_expert,
 )
 ```
+
+### Dynamic token counts
+
+`max_local_num_tokens=4096` reserves source communication capacity while executing
+only the actual input rows. EP ranks may have unequal lengths or no source rows;
+all ranks must participate in the same forward and backward calls. Input, routing
+weights and output remain unpadded. Schedules cover the group maximum rounded up
+to 128, with a four-entry cache; outstanding autograd graphs retain their own plans.
+
+Both push and pull support dynamic rows and expert replicas. Push retains its
+existing receive-capacity growth policy; a change of source length alone does not
+resize SHMEM. Replica bounds use the maximum source length from the gathered
+logical counts, including empty ranks. Dynamic calls validate gradient participation
+and the configured source bound before kernel execution. Graph capture is unsupported.
 
 ### 通信模式与容量
 

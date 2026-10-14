@@ -22,12 +22,32 @@ import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica import routing
 from tests.common.mark_utils import arg_mark
 
 
 class TestReplicaRouting(unittest.TestCase):
     """Compare both remap paths with explicit per-expert occurrence quotas."""
+
+    def test_ragged_sources_use_one_receive_bound_including_empty_ranks(self) -> None:
+        """Unequal source rows must produce the same feasible plan on every rank."""
+        config = ExpertReplicaConfig(4, 2, 2)
+        for lengths in ((0, 4), (1, 7), (0, 0)):
+            matrix = torch.tensor([[length, length, 0, 0, 0] for length in lengths], dtype=torch.int64)
+            plans = []
+            for rank, length in enumerate(lengths):
+                ids = torch.tensor([[0, 1]] * length, dtype=torch.int64).reshape(length, 2)
+                with (patch.object(routing.dist, "is_initialized", return_value=True),
+                      patch.object(routing.dist, "get_rank", return_value=rank),
+                      patch.object(routing.dist, "get_world_size", return_value=2),
+                      patch.object(routing, "_gather_replica_counts", return_value=matrix)):
+                    route = routing.prepare_replica_route(ids, config)
+                self.assertEqual(route.physical_ids.shape, ids.shape)
+                self.assertEqual(int(route.counts_by_source[rank].sum()), length * 2)
+                plans.append(route.plan)
+            self.assertEqual(plans[0], plans[1])
+            self.assertLessEqual(max(plans[0].destination_loads), max(1, max(lengths)) * 2)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
