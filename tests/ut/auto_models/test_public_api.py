@@ -260,20 +260,22 @@ class TestOptimizerContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_wrapper_signatures(self):
-        """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged."""
+        """Dense builders accept optional external exclusions without changing old arguments."""
         from hyper_parallel.components import optim
 
         self.assertEqual(
             str(inspect.signature(optim.AdamW.__init__)),
             "(self, adamw_config: dict, model: torch.nn.modules.module.Module, "
-            "no_decay_params: Optional[List[str]] = None) -> None",
+            "no_decay_params: Optional[List[str]] = None, "
+            "excluded_param_ids: Optional[Sequence[int]] = None) -> None",
         )
         self.assertEqual(
             str(inspect.signature(optim.Muon.__init__)),
             "(self, muon_config: dict, adamw_config: dict, "
             "model: torch.nn.modules.module.Module, "
             "extra_adamw_name_keywords: Optional[List[str]] = None, "
-            "no_decay_params: Optional[List[str]] = None) -> None",
+            "no_decay_params: Optional[List[str]] = None, "
+            "excluded_param_ids: Optional[Sequence[int]] = None) -> None",
         )
         self.assertEqual(
             str(inspect.signature(optim.MixedPrecisionOptimizer.__init__)),

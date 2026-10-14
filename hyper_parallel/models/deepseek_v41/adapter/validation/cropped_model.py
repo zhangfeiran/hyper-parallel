@@ -371,6 +371,11 @@ def build_deepseek_v41_validation_config(
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
         dspark_confidence_coeff: float = 0.1,
+        root_owned_vision: bool = False,
+        engram_storage_backend: str = "device",
+        engram_max_pending_entries: int = 1000000,
+        engram_max_sparse_rows_per_step: int = 1000000,
+        engram_sparse_adam_config: dict[str, Any] | None = None,
 ) -> DeepseekV4Config:
     """Translate the released config into a configurable validation crop.
 
@@ -401,6 +406,11 @@ def build_deepseek_v41_validation_config(
             to the last three, matching the released layout.
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
+        root_owned_vision: Keep per-image visual parameters in the FSDP root for variable image counts.
+        engram_storage_backend: Device table or CPU owner-local sparse table.
+        engram_max_pending_entries: Limit on accumulated Host row requests per step.
+        engram_max_sparse_rows_per_step: Limit on synchronized Host rows per owner.
+        engram_sparse_adam_config: CPU SparseAdam hyperparameters for Host tables.
 
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
@@ -443,6 +453,15 @@ def build_deepseek_v41_validation_config(
         dspark_loss_coeff,
         dspark_confidence_coeff,
     )
+    if not isinstance(root_owned_vision, bool):
+        raise ValueError("root_owned_vision must be a boolean")
+    config.v41_root_owned_vision = root_owned_vision
+    if engram_storage_backend not in ("device", "host"):
+        raise ValueError("engram_storage_backend must be 'device' or 'host'")
+    config.engram_storage_backend = engram_storage_backend
+    config.engram_max_pending_entries = engram_max_pending_entries
+    config.engram_max_sparse_rows_per_step = engram_max_sparse_rows_per_step
+    config.engram_sparse_adam_config = engram_sparse_adam_config or {"lr": 1.0e-3}
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     # Record the source identity the way AutoConfig.from_pretrained does; the
     # codegen from_config path resolves the modeling source from it.
@@ -465,6 +484,11 @@ def build_cropped_deepseek_v41(
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
         dspark_confidence_coeff: float = 0.1,
+        root_owned_vision: bool = False,
+        engram_storage_backend: str = "device",
+        engram_max_pending_entries: int = 1000000,
+        engram_max_sparse_rows_per_step: int = 1000000,
+        engram_sparse_adam_config: dict[str, Any] | None = None,
         torch_dtype: str = "bfloat16",
         validate_placement: bool = False,
         distributed_setup: DistributedSetup | None = None,
@@ -497,6 +521,11 @@ def build_cropped_deepseek_v41(
             to the last three, matching the released layout.
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
+        root_owned_vision: Keep per-image visual parameters in the FSDP root for variable image counts.
+        engram_storage_backend: Device table or CPU owner-local sparse table.
+        engram_max_pending_entries: Limit on accumulated Host row requests per step.
+        engram_max_sparse_rows_per_step: Limit on synchronized Host rows per owner.
+        engram_sparse_adam_config: CPU SparseAdam hyperparameters for Host tables.
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -528,6 +557,11 @@ def build_cropped_deepseek_v41(
         dspark_target_layer_ids=dspark_target_layer_ids,
         dspark_loss_coeff=dspark_loss_coeff,
         dspark_confidence_coeff=dspark_confidence_coeff,
+        root_owned_vision=root_owned_vision,
+        engram_storage_backend=engram_storage_backend,
+        engram_max_pending_entries=engram_max_pending_entries,
+        engram_max_sparse_rows_per_step=engram_max_sparse_rows_per_step,
+        engram_sparse_adam_config=engram_sparse_adam_config,
     )
     return HyperAutoModelForCausalLM.from_config(
         config,

@@ -181,6 +181,56 @@ class TestUtil(unittest.TestCase):
         self.assertEqual([len(m) for m in masks], [1, 1])
         self.assertEqual(sum(sum(m) for m in masks), 1)
 
+    def test_plan_ownership_masks_keeps_nonempty_uneven_shard(self):
+        """An empty shard at the same offset must not replace real tensor data."""
+        index = MetadataIndex(fqn="indexer.weights_proj.weight", offset=(2, 0))
+        properties = TensorProperties(dtype="float32")
+        nonempty = WriteItem(
+            index=index,
+            type=WriteItemType.TENSOR,
+            tensor_data={
+                "chunk": ChunkStorageMetadata(offsets=(2, 0), sizes=(1, 640)),
+                "properties": properties,
+                "size": (4, 640),
+            },
+        )
+        empty = WriteItem(
+            index=index,
+            type=WriteItemType.TENSOR,
+            tensor_data={
+                "chunk": ChunkStorageMetadata(offsets=(2, 0), sizes=(0, 640)),
+                "properties": properties,
+                "size": (4, 640),
+            },
+        )
+        for items, expected in (((empty, nonempty), [0, 1]),
+                                ((nonempty, empty), [1, 0])):
+            with self.subTest(first_chunk_size=items[0].tensor_data["chunk"].sizes):
+                plans = [SavePlan(items=[item]) for item in items]
+                actual = [mask[0] for mask in plan_ownership_masks(plans)]
+                self.assertEqual(actual, expected)
+
+    def test_plan_ownership_masks_rejects_different_nonempty_metadata(self):
+        """Overlapping real chunks must fail even when their byte counts match."""
+        index = MetadataIndex(fqn="weight", offset=(0, 0))
+        properties = TensorProperties(dtype="float32")
+        for other_shape in ((2, 320), (2, 640)):
+            with self.subTest(other_shape=other_shape):
+                plans = [
+                    SavePlan(items=[WriteItem(
+                        index=index,
+                        type=WriteItemType.TENSOR,
+                        tensor_data={
+                            "chunk": ChunkStorageMetadata(offsets=(0, 0), sizes=shape),
+                            "properties": properties,
+                            "size": (4, 640),
+                        },
+                    )])
+                    for shape in ((1, 640), other_shape)
+                ]
+                with self.assertRaisesRegex(ValueError, "different nonempty metadata"):
+                    plan_ownership_masks(plans)
+
     def test_create_chunk_list_for_plain_tensor(self):
         """
         Feature: create_chunk_list_for_tensor full-tensor default chunk.

@@ -63,6 +63,7 @@ from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE_NEW_LINE,
     IMAGE_START,
 )
+from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
@@ -98,6 +99,13 @@ class DeepseekV41Engram(nn.Module):
         """Create the scaled table and the V4.1 gated residual projection."""
         super().__init__()
         self.layer_id = layer_id
+        backend = getattr(config, "engram_storage_backend", "device")
+        if backend not in ("device", "host"):
+            raise ValueError("engram_storage_backend must be 'device' or 'host'")
+        if getattr(config, "engram_host_lookup_impl", None) is not None:
+            raise ValueError("Engram Host lookup implementation selection is unsupported")
+        self.engram_max_pending_entries = int(getattr(config, "engram_max_pending_entries", 1000000))
+        self.engram_max_sparse_rows_per_step = int(getattr(config, "engram_max_sparse_rows_per_step", 1000000))
         self.hidden_size = config.hidden_size
         self.hc_mult = config.hc_mult
         self.eps = config.rms_norm_eps
@@ -654,6 +662,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize backbone state after FSDP has established local shards."""
+        if isinstance(module, HostEngramTable):
+            return
         if isinstance(module, nn.Embedding):
             _initialize_embedding_shard_safe(module, self.config.initializer_range)
             return
@@ -1121,6 +1131,8 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize V4.1-only state in addition to the inherited V4 modules."""
+        if isinstance(module, HostEngramTable):
+            return
         if isinstance(module, nn.Embedding):
             _initialize_embedding_shard_safe(module, self.config.initializer_range)
             return

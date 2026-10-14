@@ -72,5 +72,33 @@ class TestBaseTrainerCleanup(unittest.TestCase):
                 data_iterator.stop.assert_called_once_with()
 
 
+class TestHcclDeterminismSetup(unittest.TestCase):
+    """Check that HCCL receives its reproducibility flag before group creation."""
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="allcards",
+        essential_mark="essential",
+    )
+    def test_hccl_flag_is_set_before_distributed_initialization(self) -> None:
+        """The communicator must read the flag when it is initialized."""
+        trainer = MagicMock()
+        trainer.config.training.backend = "hccl"
+        trainer.config.training.enable_full_determinism = True
+
+        def check_initialization(*, backend: str) -> None:
+            """Check the deterministic flag at the distributed setup boundary."""
+            self.assertEqual(backend, "hccl")
+            self.assertEqual(base_module.os.environ["HCCL_DETERMINISTIC"], "true")
+            raise RuntimeError("stop after preflight")
+
+        with patch.dict(base_module.os.environ, {"HCCL_DETERMINISTIC": "false"}):
+            with patch.object(base_module, "setup_logging"):
+                with patch.object(base_module, "initialize_distributed", side_effect=check_initialization):
+                    with self.assertRaisesRegex(RuntimeError, "stop after preflight"):
+                        base_module.BaseTrainer._setup(trainer)
+
+
 if __name__ == "__main__":
     unittest.main()

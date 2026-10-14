@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Checkpoint management for finalized HyperParallel models."""
+# pylint: disable=forbidden-backend-import
 
 import json
 import logging
@@ -71,7 +72,11 @@ class DCPBackend(Protocol):
         checkpoint_id: str | Path,
         **kwargs: Any,
     ) -> Any:
-        """Load a DCP checkpoint into the supplied sharded state dict."""
+        """Load a DCP checkpoint into the supplied sharded state dict.
+
+        Args:
+            state_dict: State dictionary to read or write.
+        """
 
     def save(
         self,
@@ -80,7 +85,11 @@ class DCPBackend(Protocol):
         checkpoint_id: str | Path,
         **kwargs: Any,
     ) -> Any:
-        """Save the supplied sharded state dict as DCP."""
+        """Save the supplied sharded state dict as DCP.
+
+        Args:
+            state_dict: State dictionary to read or write.
+        """
 
 
 @dataclass(frozen=True)
@@ -94,7 +103,11 @@ class _CheckpointIndex:
         return tuple(sorted(self.files_by_key, key=dot_natural_key))
 
     def load_tensor(self, key: str) -> torch.Tensor:
-        """Materialize one checkpoint tensor on CPU."""
+        """Materialize one checkpoint tensor on CPU.
+
+        Args:
+            key: Checkpoint tensor key.
+        """
         file_path = self.files_by_key.get(key)
         if file_path is None:
             raise ValueError(f"Checkpoint key is not indexed: {key}")
@@ -125,7 +138,11 @@ class _SourceModelView:
         }
 
     def get_parameter(self, name: str) -> _TensorShape:
-        """Return source parameter metadata used by shape-aware converters."""
+        """Return source parameter metadata used by shape-aware converters.
+
+        Args:
+            name: Parameter name.
+        """
         try:
             return self._targets[name]
         except KeyError as exc:
@@ -166,7 +183,9 @@ def _index_sharded_checkpoint(directory: Path, index_path: Path) -> _CheckpointI
     return _CheckpointIndex(files_by_key)
 
 
-def _resolve_checkpoint_index(pretrained_path: str) -> _CheckpointIndex:
+def _resolve_checkpoint_index(
+        pretrained_path: str, *, additional_patterns: tuple[str, ...] = (),
+) -> _CheckpointIndex:
     """Resolve a local or Hub checkpoint into a tensor-to-file index."""
 
     path = Path(pretrained_path).expanduser()
@@ -181,7 +200,7 @@ def _resolve_checkpoint_index(pretrained_path: str) -> _CheckpointIndex:
         checkpoint_directory = Path(
             snapshot_download(
                 repo_id=pretrained_path,
-                allow_patterns=list(_SNAPSHOT_PATTERNS),
+                allow_patterns=list((*_SNAPSHOT_PATTERNS, *additional_patterns)),
             )
         )
 
@@ -492,8 +511,14 @@ class CheckpointManager:
         *,
         strict: bool = True,
         weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
+        external_target_fqns: frozenset[str] = frozenset(),
+        claimed_source_keys: frozenset[str] = frozenset(),
     ) -> LoadReport:
-        """Load complete Hugging Face weights into the finalized model."""
+        """Load complete Hugging Face weights into the finalized model.
+
+        Args:
+            pretrained_path: Source checkpoint path.
+        """
         if not pretrained_path:
             raise ValueError("pretrained_path must be provided when load_base_model=True")
         if weights_mapping is None:
@@ -505,6 +530,17 @@ class CheckpointManager:
 
         checkpoint_index = _resolve_checkpoint_index(pretrained_path)
         targets = _build_load_targets(self.model)
+        if not external_target_fqns <= targets.keys():
+            raise ValueError("External target is absent from the model")
+        # An external reader may consume a logical key from its own validated
+        # row manifest rather than a tensor in the ordinary safetensors index.
+        if external_target_fqns:
+            targets = {key: value for key, value in targets.items() if key not in external_target_fqns}
+        if claimed_source_keys:
+            checkpoint_index = _CheckpointIndex({
+                key: value for key, value in checkpoint_index.files_by_key.items()
+                if key not in claimed_source_keys
+            })
         replacement_mapping = getattr(
             self.model,
             "_hp_replacement_weight_conversions",
@@ -665,6 +701,9 @@ class CheckpointManager:
 
         Returns:
             True on the writing rank and False on all other ranks.
+
+        Args:
+            save_directory: Destination directory for saved weights.
         """
         save_method = getattr(self.model, "save_pretrained", None)
         if not callable(save_method):
@@ -707,7 +746,11 @@ class CheckpointManager:
         strict: bool = True,
         **kwargs: Any,
     ) -> Any:
-        """Delegate DCP loading, then apply the restored sharded model state."""
+        """Delegate DCP loading, then apply the restored sharded model state.
+
+        Args:
+            checkpoint_id: Distributed checkpoint path.
+        """
         backend = self._require_dcp_backend()
         model_state = self.model.state_dict()
         state_dict = {"model": model_state}
@@ -720,7 +763,11 @@ class CheckpointManager:
         return result
 
     def save_dcp(self, checkpoint_id: str | Path, **kwargs: Any) -> Any:
-        """Delegate sharded model-state saving to the configured DCP backend."""
+        """Delegate sharded model-state saving to the configured DCP backend.
+
+        Args:
+            checkpoint_id: Distributed checkpoint path.
+        """
         backend = self._require_dcp_backend()
         return backend.save(
             {"model": self.model.state_dict()},

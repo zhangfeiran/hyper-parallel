@@ -30,6 +30,7 @@ from hyper_parallel.distributed.expert_parallel.experts import (
     require_attrs,
 )
 from hyper_parallel.distributed.recipe_spec import local_compute
+from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts, _swiglu_limit,
 )
@@ -272,7 +273,7 @@ def deepseek_v41_engram_compute_fn(
             segment_starts: Optional packed sequence boundaries.
             token_mask: CP-local mask selecting Engram updates.
         """
-        if ep_size > 1:
+        if ep_size > 1 and not isinstance(module.embed, HostEngramTable):
             return module.parallel_forward(
                 hidden_states, input_ids, segment_starts, token_mask,
                 ep_group=ep_group, ep_rank=ep_rank, ep_size=ep_size,
