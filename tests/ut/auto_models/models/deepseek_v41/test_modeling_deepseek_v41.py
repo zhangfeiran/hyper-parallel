@@ -24,6 +24,8 @@ from unittest.mock import Mock, mock_open, patch
 import torch
 from torch.nn import functional
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
+
 try:
     from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
     from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MLP
@@ -36,6 +38,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_pa
 from hyper_parallel.models.deepseek_v41.adapter.validation.native_module_parity import HyperParallelMoE
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Model,
+    _initialize_embedding_shard_safe,
     bind_shared_expert_forward,
 )
 
@@ -80,6 +83,51 @@ def _native_shared_oracle(module: torch.nn.Module, states: torch.Tensor) -> torc
     return functional.linear(  # pylint: disable=not-callable
         intermediate, module.down_proj.weight, module.down_proj.bias,
     )
+
+
+class TestV41EmbeddingInitialization(unittest.TestCase):
+    """Clear padding only on the owning local rows, including uneven shards."""
+
+    def test_sharded_padding_uses_global_row_ownership(self) -> None:
+        """Replicas and column shards clear the row; other row shards retain data."""
+        cases = [
+            ((3,), (0, -1), (10, 4), (0,), 6, [(4, None), (4, 2), (2, None)]),
+            ((2, 2), (1, 0), (8, 4), (), 6, [(4, None), (4, None), (4, 2), (4, 2)]),
+            ((2,), (-1, -1), (8, 4), (), 6, [(8, 6), (8, 6)]),
+        ]
+        for mesh_shape, tensor_map, shape, uneven, padding, shards in cases:
+            for index, (rows, padding_row) in enumerate(shards):
+                with self.subTest(mesh=mesh_shape, map=tensor_map, rank=index):
+                    columns = 2 if len(mesh_shape) == 2 else 4
+                    local = torch.ones(rows, columns)
+                    ranks = [2 * rank + 1 for rank in range(len(shards))]
+                    weight = Mock(spec=DTensor)
+                    weight.shape = shape
+                    weight.layout = SimpleNamespace(
+                        mesh_shape=mesh_shape, tensor_map=tensor_map,
+                        uneven_shard_mesh_dims=uneven, rank_list=ranks,
+                        mesh=SimpleNamespace(rank=ranks[index]),
+                    )
+                    weight.to_local.return_value = local
+                    module = SimpleNamespace(weight=weight, padding_idx=padding)
+                    with patch("torch.nn.init.normal_") as initialize:
+                        _initialize_embedding_shard_safe(module, 0.02)
+                    initialize.assert_called_once_with(weight, mean=0.0, std=0.02)
+                    expected = torch.ones_like(local)
+                    if padding_row is not None:
+                        expected[padding_row].zero_()
+                    torch.testing.assert_close(local, expected, rtol=0, atol=0)
+
+    def test_plain_embedding_retains_padding_and_random_initialization(self) -> None:
+        """An ordinary embedding keeps the standard initialization behavior."""
+        for padding in (None, 2):
+            with self.subTest(padding=padding), torch.no_grad():
+                module = torch.nn.Embedding(8, 4, padding_idx=padding)
+                _initialize_embedding_shard_safe(module, 0.02)
+                self.assertTrue(torch.isfinite(module.weight).all())
+                self.assertGreater(module.weight[0].abs().sum().item(), 0)
+                if padding is not None:
+                    torch.testing.assert_close(module.weight[padding], torch.zeros(4), rtol=0, atol=0)
 
 
 class TestV41SharedExpert(unittest.TestCase):

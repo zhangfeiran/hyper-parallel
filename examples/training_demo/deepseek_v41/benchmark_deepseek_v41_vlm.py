@@ -27,7 +27,7 @@ import torch.distributed as dist
 import yaml
 
 from examples.training_demo.deepseek_v41.deepseek_v41_random_init import initialize_random_shards
-from hyper_parallel.core.multicore import _loader
+from hyper_parallel.core.multicore import _loader, shmem
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.vlm_trainer import VLMTrainer
@@ -46,6 +46,13 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
     recipe["fsdp_config"].update(dp_shard_size=world, edp_shard_size=edp_shard_size)
     recipe["dataset"]["data_path"] = args.data
     recipe["dataset"]["model_assets"]["config_path"] = args.model_dir
+    if args.validation_crop:
+        recipe["model"].update(
+            text_parameter_divisor=1, vision_parameter_divisor=1,
+            num_hidden_layers=args.num_hidden_layers or 4,
+            vision_num_hidden_layers=args.vision_num_hidden_layers or 1,
+            exercise_post_training_indexer=False,
+        )
     if args.full_model:
         source = json.loads((Path(args.model_dir) / "config.json").read_text())
         text, vision = source["text_config"], source["vision_config"]
@@ -145,9 +152,12 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--capacity-factor", type=float)
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--replica-slots-per-rank", type=int, default=6)
-    parser.add_argument("--full-model", action="store_true", help="Use released dimensions, with optional depth crops")
-    parser.add_argument("--num-hidden-layers", type=int, help="Language depth override; requires --full-model")
-    parser.add_argument("--vision-num-hidden-layers", type=int, help="Vision depth override; requires --full-model")
+    scale = parser.add_mutually_exclusive_group()
+    scale.add_argument("--full-model", action="store_true", help="Use released dimensions, with optional depth crops")
+    scale.add_argument("--validation-crop", action="store_true",
+                       help="Use full widths and 4+1 layers with supplied validation Engram assets and expert count")
+    parser.add_argument("--num-hidden-layers", type=int, help="Language depth override for full-model or validation-crop")
+    parser.add_argument("--vision-num-hidden-layers", type=int, help="Vision depth override for full-model or validation-crop")
     parser.add_argument("--edp-shard-size", type=int, help="Expert FSDP shard degree; remaining EDP ranks replicate")
     parser.add_argument("--ep-size", type=int, help="EP degree; dense FSDP spans the full world")
     parser.add_argument("--steps", type=int, default=100)
@@ -164,8 +174,8 @@ def _arguments() -> argparse.Namespace:
     if world < 1 or ep_size < 2 or world % ep_size or args.steps < 1 or args.experts < 6 or args.experts % ep_size:
         parser.error("requires positive steps, EP >= 2 dividing WORLD_SIZE, and experts >= 6 divisible by EP")
     for depth in (args.num_hidden_layers, args.vision_num_hidden_layers):
-        if depth is not None and (not args.full_model or depth <= 0):
-            parser.error("depth overrides require --full-model and positive values")
+        if depth is not None and (not (args.full_model or args.validation_crop) or depth <= 0):
+            parser.error("depth overrides require --full-model or --validation-crop and positive values")
     if args.edp_shard_size is not None:
         if args.edp_shard_size <= 0 or (world // ep_size) % args.edp_shard_size:
             parser.error("edp-shard-size must be positive and divide WORLD_SIZE/EP")
@@ -212,6 +222,7 @@ def main() -> None:
               "steps_detail": rows, "peak_allocated_bytes": torch.npu.max_memory_allocated(),
               "peak_reserved_bytes": torch.npu.max_memory_reserved(), "finite": True,
               "weights_initialization": "canonical_random_not_pretrained", "workspace_shared": bool(experts),
+              "shmem_state": shmem.debug_state() if experts else None,
               "owner_use_grouped_gemm": args.backend == "owner_ep"}
     trainer.on_train_end()
     (work / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")

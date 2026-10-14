@@ -46,6 +46,8 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 # pylint: disable=unused-import
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext as SharedAttentionCPContext,
@@ -82,9 +84,16 @@ def _resolve_v41_model_mode(config: Any) -> str:
 
 
 def _initialize_embedding_shard_safe(module: nn.Embedding, std: float) -> None:
-    """Initialize an embedding and clear its global padding row through DTensor."""
+    """Initialize an embedding and clear padding on its owning local shard."""
     nn.init.normal_(module.weight, mean=0.0, std=std)
     if module.padding_idx is None:
+        return
+    if isinstance(module.weight, DTensor):
+        layout = module.weight.layout
+        rank_index = layout.rank_list.index(layout.mesh.rank)
+        start, stop = infer_slice_area_by_layout(layout, rank_index, module.weight.shape)[0]
+        if start <= module.padding_idx < stop:
+            module.weight.to_local()[module.padding_idx - start].zero_()
         return
     module.weight[module.padding_idx].zero_()
 
