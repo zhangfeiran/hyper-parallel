@@ -13,12 +13,19 @@
 # limitations under the License.
 # ============================================================================
 """Compare native/GMM, MegaMoE push and pull on the production VLM training loop."""
+# pylint: disable=forbidden-backend-import
+
+from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+from functools import wraps
 import json
 import math
 import os
 from pathlib import Path
+import statistics
+import sys
 import time
 from typing import Any
 
@@ -27,6 +34,10 @@ import torch.distributed as dist
 import yaml
 
 from examples.training_demo.deepseek_v41.deepseek_v41_random_init import initialize_random_shards
+from examples.training_demo.deepseek_v41.deepseek_v41_moe_timing import MoeTiming
+import hyper_parallel.core.expert_parallel.hot_replica.native as native_replica_module
+import hyper_parallel.core.expert_parallel.hot_replica.routing as replica_routing_module
+from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
 from hyper_parallel.core.multicore import _loader, shmem
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.trainer.config.parser import parse_training_args
@@ -34,12 +45,19 @@ from hyper_parallel.trainer.vlm_trainer import VLMTrainer
 
 
 def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
-    recipe = yaml.safe_load(Path(__file__).with_name("train_deepseek_v41_vlm_online.yaml").read_text())
+    recipe = yaml.safe_load(Path(__file__).with_name("train_deepseek_v41_vlm_online.yaml").read_text(encoding="utf-8"))
     recipe["model"].update(config_path=args.model_dir, engram_assets_path=args.engram_assets,
                           num_routed_experts=args.experts)
     recipe["model_init_dtype"] = "float32"
+    packing_mode = getattr(args, "packing_mode", "packed")
+    recipe["dataloader"].update(token_budget=1 if packing_mode == "dynamic" else 4096,
+                                min_buffered_samples=1 if packing_mode == "dynamic" else 16)
     recipe["training"].update(train_iters=args.steps, global_batch_size=world)
     recipe["activation_checkpoint"]["mode"] = args.activation_checkpoint
+    if args.activation_checkpoint == "full":
+        recipe["activation_checkpoint"]["selection"] = {
+            "source": "model_adapter_safe_regions", "layer_count": 0,
+        }
     ep_size = world if args.ep_size is None else args.ep_size
     recipe["accelerator"]["ep_size"] = ep_size
     edp_shard_size = args.edp_shard_size or world // ep_size
@@ -54,9 +72,9 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
             exercise_post_training_indexer=False,
         )
     if args.full_model:
-        source = json.loads((Path(args.model_dir) / "config.json").read_text())
+        source = json.loads((Path(args.model_dir) / "config.json").read_text(encoding="utf-8"))
         text, vision = source["text_config"], source["vision_config"]
-        assets = json.loads(Path(args.engram_assets).read_text())
+        assets = json.loads(Path(args.engram_assets).read_text(encoding="utf-8"))
         expected = {
             "num_hidden_layers": text["num_hidden_layers"],
             "bucket_base": text["engram_vocab_size"],
@@ -95,6 +113,23 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
         for override in recipe["plan_overrides"]:
             if isinstance(override["match"], str):
                 override["match"] = override["match"].replace("model.vision.blocks.0.", "model.vision.blocks.*.")
+    if args.activation_checkpoint == "full":
+        depth = recipe["model"].get("num_hidden_layers")
+        if depth is None:
+            source = json.loads((Path(args.model_dir) / "config.json").read_text(encoding="utf-8"))
+            depth = source["text_config"]["num_hidden_layers"]
+        recipe["activation_checkpoint"]["selection"]["layer_count"] = depth
+    recipe["model"]["engram_storage_backend"] = args.engram_storage_backend
+    if args.engram_storage_backend == "host":
+        adamw = recipe["optimizer"]["adamw_config"]
+        recipe["model"]["engram_sparse_adam_config"] = {
+            "lr": adamw["adamw_lr"], "betas": adamw["adamw_betas"], "eps": adamw["adamw_eps"],
+        }
+        for override in recipe["plan_overrides"]:
+            if override.get("module_type", "").endswith(".DeepseekV41Engram"):
+                override["replace_module"]["_target_"] = (
+                    "hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule"
+                )
     replica_options = {"replica_slots_per_rank": args.replica_slots_per_rank,
                        "replica_minimum_load_reduction": 0.0}
     compute = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel."
@@ -122,21 +157,134 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
     return parse_training_args([str(path)])
 
 
-def _step(trainer, iterator, step, work, token_rows):
+class _RouteDiagnostics:
+    """Retain host planner facts and serialize them after the timed step."""
+
+    def __init__(self, model: torch.nn.Module, enabled: bool) -> None:
+        """Attach source-row hooks and optional observations of existing plans."""
+        self.token_rows: dict[str, int] = {}
+        self.plans: dict[str, ExpertExecutionPlan] = {}
+        self.calls: dict[str, int] = {}
+        self.top_k = model.config.num_experts_per_tok
+        self.hooks = []
+        self.originals = []
+        self.layer_ids: dict[int, str] = {}
+        for name, module in model.named_modules():
+            if name.endswith(".mlp") and hasattr(module, "gate"):
+                self.hooks.append(module.register_forward_pre_hook(self._record_rows(name)))
+                self.layer_ids[id(module)] = name
+                executor = getattr(module.experts, "_executor", None)
+                if executor is not None:
+                    self.layer_ids[id(executor)] = name
+        if enabled:
+            for module in (native_replica_module, replica_routing_module):
+                original = module.build_expert_replica_plan
+                self.originals.append((module, original))
+                module.build_expert_replica_plan = self._observe_planner(original)
+
+    def _record_rows(self, name: str) -> Any:
+        def hook(_module: torch.nn.Module, inputs: tuple) -> None:
+            """Record the source token rows observed at the MoE boundary."""
+            self.token_rows[name] = inputs[0].numel() // inputs[0].shape[-1]
+        return hook
+
+    def _observe_planner(self, original: Any) -> Any:
+        @wraps(original)
+        def observe(*args: Any, **kwargs: Any) -> ExpertExecutionPlan:
+            """Retain the existing planner result for the current layer."""
+            plan = original(*args, **kwargs)
+            name = self._planner_layer()
+            if name is None:
+                raise RuntimeError("Cannot attribute the replica planner to a model layer")
+            self.plans[name] = plan
+            self.calls[name] = self.calls.get(name, 0) + 1
+            return plan
+        return observe
+
+    def _planner_layer(self) -> str | None:
+        # Checkpoint recomputation can bypass the outer module pre-hook.
+        frame = sys._getframe(1)
+        try:
+            for _ in range(64):
+                if frame is None:
+                    break
+                for key in ("module", "self"):
+                    name = self.layer_ids.get(id(frame.f_locals.get(key)))
+                    if name is not None:
+                        return name
+                frame = frame.f_back
+        finally:
+            del frame
+        return None
+
+    def clear(self) -> None:
+        """Release observations before the next measured training step."""
+        self.token_rows.clear()
+        self.plans.clear()
+        self.calls.clear()
+
+    def snapshot(self) -> dict[str, Any]:
+        """Serialize conserved route counts after the training step completes."""
+        records = {}
+        for name, plan in self.plans.items():
+            config = plan.config
+            logical = [sum(row[expert] for row in plan.logical_counts) for expert in range(config.num_experts)]
+            source_rows = [sum(row) for row in plan.logical_counts]
+            tokens = self.token_rows[name]
+            local_source = next((row for row in source_rows if row == tokens * self.top_k), None)
+            if local_source is None or any(rows % self.top_k for rows in source_rows):
+                raise RuntimeError(f"Replica route does not conserve source rows: {name}")
+            home = config.home_experts
+            slots = [sum(expert >= 0 for expert in row[home:]) for row in plan.slot_to_logical]
+            guest_rows = [sum(row[home:]) for row in plan.destination_counts]
+            home_loads = [sum(logical[rank * home:(rank + 1) * home]) for rank in range(config.ep_size)]
+            records[name] = {
+                "planner_calls_including_recompute": self.calls[name],
+                "source_tokens_by_ep_rank": [rows // self.top_k for rows in source_rows],
+                "logical_expert_rows": logical,
+                "home_destination_rows": home_loads,
+                "balanced_destination_rows": list(plan.destination_loads),
+                "active_guest_slots_by_ep_rank": slots,
+                "guest_compute_rows_by_ep_rank": guest_rows,
+                "weight_transfers": len(plan.transfers),
+                "replica_slot_budget_per_rank": config.replica_slots_per_rank,
+            }
+        return records
+
+    def close(self) -> None:
+        """Restore hooks and planner functions after observation ends."""
+        for hook in self.hooks:
+            hook.remove()
+        for module, original in self.originals:
+            module.build_expert_replica_plan = original
+
+
+def _step(trainer: Any, iterator: Any, step: int, work: Path,
+          diagnostics: _RouteDiagnostics, warmup_steps: int, moe_timing: MoeTiming | None = None) -> dict[str, Any]:
     dist.barrier()
     torch.npu.synchronize()
-    token_rows.clear()
+    diagnostics.clear()
+    if moe_timing is not None:
+        moe_timing.clear()
+    started_at = datetime.now(timezone.utc).isoformat()
     start = time.perf_counter()
     metrics = trainer.train_step(iterator)
     torch.npu.synchronize()
     elapsed = time.perf_counter() - start
+    finished_at = datetime.now(timezone.utc).isoformat()
     if not all(math.isfinite(value) for value in metrics.values()):
         raise RuntimeError(f"Nonfinite metrics at step {step}: {metrics}")
     times = torch.tensor([elapsed], device="npu", dtype=torch.float32)
     dist.all_reduce(times, op=dist.ReduceOp.MAX)
     row = {"step": step + 1, "local_seconds": elapsed, "max_rank_seconds": times.item(),
            "allocated_bytes": torch.npu.memory_allocated(), "reserved_bytes": torch.npu.memory_reserved(),
-           "moe_input_rows": dict(token_rows),
+           "phase": "warmup" if step < warmup_steps else "measured",
+           "started_at": started_at, "finished_at": finished_at,
+           "moe_input_rows": dict(diagnostics.token_rows),
+           "replica_routes": diagnostics.snapshot(),
+           "moe_timing": moe_timing.snapshot() if moe_timing is not None else None,
+           "peak_allocated_bytes": torch.npu.max_memory_allocated(),
+           "peak_reserved_bytes": torch.npu.max_memory_reserved(),
            "trainer_env": dict(trainer.base.step_env_metrics),
            "trainer_metrics": dict(trainer.base.step_train_metrics), **metrics}
     with (work / "steps.jsonl").open("a", encoding="utf-8") as stream:
@@ -158,19 +306,32 @@ def _arguments() -> argparse.Namespace:
     scale.add_argument("--full-model", action="store_true", help="Use released dimensions, with optional depth crops")
     scale.add_argument("--validation-crop", action="store_true",
                        help="Use full widths and 4+1 layers with supplied validation Engram assets and expert count")
-    parser.add_argument("--num-hidden-layers", type=int, help="Language depth override for full-model or validation-crop")
-    parser.add_argument("--vision-num-hidden-layers", type=int, help="Vision depth override for full-model or validation-crop")
+    parser.add_argument("--num-hidden-layers", type=int,
+                        help="Language depth override for full-model or validation-crop")
+    parser.add_argument("--vision-num-hidden-layers", type=int,
+                        help="Vision depth override for full-model or validation-crop")
     parser.add_argument("--edp-shard-size", type=int, help="Expert FSDP shard degree; remaining EDP ranks replicate")
     parser.add_argument("--ep-size", type=int, help="EP degree; dense FSDP spans the full world")
     parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--warmup-steps", type=int, default=0, help="Exclude initial steps from measured statistics")
+    parser.add_argument("--packing-mode", choices=("dynamic", "packed"), default="packed",
+                        help="Dynamic emits one complete source sample; packed selects up to 4096 tokens")
+    parser.add_argument("--moe-timing", action="store_true", help="Record MoE current-stream event spans")
+    parser.add_argument("--route-diagnostics", action="store_true", help="Record existing CPU planner facts")
     parser.add_argument("--activation-checkpoint", choices=("off", "full"), default="off")
-    parser.add_argument("--random-init-seed", type=int, default=42, help="Generate identical canonical shards in memory")
+    parser.add_argument("--engram-storage-backend", choices=("device", "host"), default="device")
+    parser.add_argument("--random-init-seed", type=int, default=42,
+                        help="Generate identical canonical shards in memory")
     parser.add_argument("--native-lib", type=Path)
     parser.add_argument("--output", required=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.replica_slots_per_rank < 0:
         parser.error("replica-slots-per-rank must be nonnegative")
+    if not 0 <= args.warmup_steps < args.steps:
+        parser.error("warmup-steps must be nonnegative and smaller than steps")
+    if args.route_diagnostics and not args.replica_slots_per_rank:
+        parser.error("route-diagnostics requires expert replicas")
     world = int(os.environ.get("WORLD_SIZE", "16"))
     ep_size = world if args.ep_size is None else args.ep_size
     if world < 1 or ep_size < 2 or world % ep_size or args.steps < 1 or args.experts < 6 or args.experts % ep_size:
@@ -196,7 +357,7 @@ def main() -> None:
     if args.dry_run:
         return
     if args.native_lib:
-        _loader._component_root = lambda: args.native_lib.resolve()
+        _loader._component_root = args.native_lib.resolve
     trainer = VLMTrainer(config)
     experts = [module for module in trainer.base.model.modules() if isinstance(module, DeepseekV41MegaMoeExperts)]
     initialization = initialize_random_shards(trainer, seed=args.random_init_seed, backend=args.backend)
@@ -204,39 +365,43 @@ def main() -> None:
     dist.barrier()
     trainer.on_train_begin()
     torch.npu.reset_peak_memory_stats()
-    token_rows = {}
-    hooks = []
-    def record_rows(name):
-        def hook(_module, inputs):
-            token_rows[name] = inputs[0].numel() // inputs[0].shape[-1]
-        return hook
-    for name, module in trainer.base.model.named_modules():
-        if name.endswith(".mlp") and hasattr(module, "gate"):
-            hooks.append(module.register_forward_pre_hook(record_rows(name)))
+    diagnostics = _RouteDiagnostics(trainer.base.model, args.route_diagnostics)
+    moe_timing = MoeTiming(trainer.base.model) if args.moe_timing else None
     rows = []
-    for epoch in range(trainer.base.train_epochs):
-        loader = trainer.base.train_dataloader
-        if hasattr(loader, "set_epoch"):
-            loader.set_epoch(epoch)
-        trainer.on_epoch_begin()
-        iterator = iter(loader)
-        count = min(trainer.base.train_steps, args.steps - len(rows))
-        for _ in range(count):
-            rows.append(_step(trainer, iterator, len(rows), work, token_rows))
-        trainer.on_epoch_end()
-        trainer.base.state.epoch = epoch + 1
-        if len(rows) == args.steps:
-            break
+    try:
+        for epoch in range(trainer.base.train_epochs):
+            loader = trainer.base.train_dataloader
+            if hasattr(loader, "set_epoch"):
+                loader.set_epoch(epoch)
+            trainer.on_epoch_begin()
+            iterator = iter(loader)
+            count = min(trainer.base.train_steps, args.steps - len(rows))
+            for _ in range(count):
+                if len(rows) == args.warmup_steps:
+                    torch.npu.reset_peak_memory_stats()
+                rows.append(_step(trainer, iterator, len(rows), work, diagnostics, args.warmup_steps, moe_timing))
+            trainer.on_epoch_end()
+            trainer.base.state.epoch = epoch + 1
+            if len(rows) == args.steps:
+                break
+    finally:
+        diagnostics.close()
+        if moe_timing is not None:
+            moe_timing.close()
     if len(rows) != args.steps:
         raise RuntimeError(f"Incomplete training: {len(rows)} of {args.steps} steps")
+    measured = rows[args.warmup_steps:]
     result = {**vars(args), "native_lib": str(args.native_lib), "rank": rank, "world_size": world,
-              "steps_detail": rows, "peak_allocated_bytes": torch.npu.max_memory_allocated(),
-              "peak_reserved_bytes": torch.npu.max_memory_reserved(), "finite": True,
+              "steps_detail": rows, "peak_allocated_bytes": max(row["peak_allocated_bytes"] for row in rows),
+              "peak_reserved_bytes": max(row["peak_reserved_bytes"] for row in rows), "finite": True,
+              "measurement": {"first_step": args.warmup_steps + 1, "steps": len(measured),
+                              "mean_max_rank_seconds": statistics.mean(row["max_rank_seconds"] for row in measured),
+                              "median_max_rank_seconds": statistics.median(row["max_rank_seconds"] for row in measured),
+                              "peak_allocated_bytes": torch.npu.max_memory_allocated(),
+                              "peak_reserved_bytes": torch.npu.max_memory_reserved()},
               "weights_initialization": "canonical_random_not_pretrained", "workspace_shared": bool(experts),
               "shmem_state": shmem.debug_state() if experts else None,
               "owner_use_grouped_gemm": args.backend == "owner_ep"}
-    for hook in hooks:
-        hook.remove()
     trainer.on_train_end()
     (work / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     dist.barrier()

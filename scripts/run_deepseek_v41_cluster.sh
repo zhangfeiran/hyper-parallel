@@ -13,12 +13,21 @@ Run the same command on every node in one PanGu job.
 NNODES: MA_NUM_HOSTS, otherwise the count of VC_WORKER_HOSTS (required).
 NODE_RANK: RANK_AFTER_ACC, otherwise VC_TASK_INDEX (required for multiple nodes).
 MASTER_ADDR: first VC_WORKER_HOSTS entry; MASTER_PORT_BASE defaults to 61300.
-NUM_CARDS=16 EP_SIZE=64 TRAIN_ITERS=3; dense FSDP=WORLD_SIZE, EDP=WORLD_SIZE/EP.
+NUM_CARDS=16 EP_SIZE=64 TRAIN_ITERS=40 WARMUP_STEPS=10; dense FSDP=WORLD_SIZE.
+Case order: dynamic native/push/pull, then packed native/push/pull.
+Steps 1-10 warm up; steps 11-40 are measured in each independent case. MegaMoe executes actual token rows.
+ROUTE_DIAGNOSTICS=1 records host planner loads and guest utilization after timing.
+MOE_TIMING=1 records forward/replay/backward current-stream spans per MoE layer.
+CASE_SYNC_TIMEOUT=600 bounds the cleanup barrier after workers have exited.
+HBM_INTERVAL=1 samples physical HBM and process ownership on every node.
 ACTIVATION_CHECKPOINT=full. REPLICA_SLOTS_PER_RANK defaults to 384/EP_SIZE (6 for EP64).
+Full checkpointing recomputes decoder layers and all attention roles.
+ENGRAM_STORAGE_BACKEND=host keeps EP owner tables and SparseAdam state on CPU.
+Set ENGRAM_STORAGE_BACKEND=device for the device-table comparison.
 NUM_HIDDEN_LAYERS=4 VISION_NUM_HIDDEN_LAYERS=1; optional full depths are 40 and 32.
 EDP_SHARD_SIZE defaults to WORLD_SIZE/EP; it is 2 for EP64 on 128 dies.
 RUN_ID defaults to MA_JOB_ID (required); use a fresh ID for each run.
-DRY_RUN=1 prints all three commands without installing packages or using devices.
+DRY_RUN=1 prints all six commands without installing packages or using devices.
 PYTHON_BIN may select a Python 3.11 base interpreter; runtime wheels are installed
 into a node-local venv. CANN_ENV_FILE and MHC_ENV_FILE may select an existing CANN
 9.1.0 / Omni Ops installation; otherwise use the shared PanGu CANN installer.
@@ -41,17 +50,29 @@ NODE_RANK=${NODE_RANK:-${RANK_AFTER_ACC:-${VC_TASK_INDEX:-}}}
 MASTER_ADDR=${MASTER_ADDR:-${worker_hosts%%,*}}
 NUM_CARDS=${NUM_CARDS:-16}
 EP_SIZE=${EP_SIZE:-64}
-TRAIN_ITERS=${TRAIN_ITERS:-3}
+TRAIN_ITERS=${TRAIN_ITERS:-40}
+WARMUP_STEPS=${WARMUP_STEPS:-10}
+ROUTE_DIAGNOSTICS=${ROUTE_DIAGNOSTICS:-1}
+MOE_TIMING=${MOE_TIMING:-1}
+CASE_SYNC_TIMEOUT=${CASE_SYNC_TIMEOUT:-600}
+HBM_INTERVAL=${HBM_INTERVAL:-1}
 ACTIVATION_CHECKPOINT=${ACTIVATION_CHECKPOINT:-full}
+ENGRAM_STORAGE_BACKEND=${ENGRAM_STORAGE_BACKEND:-host}
 NUM_HIDDEN_LAYERS=${NUM_HIDDEN_LAYERS:-4}
 VISION_NUM_HIDDEN_LAYERS=${VISION_NUM_HIDDEN_LAYERS:-1}
 [[ ${ACTIVATION_CHECKPOINT} == off || ${ACTIVATION_CHECKPOINT} == full ]] || die "Invalid ACTIVATION_CHECKPOINT"
+[[ ${ENGRAM_STORAGE_BACKEND} == device || ${ENGRAM_STORAGE_BACKEND} == host ]] || die "Invalid ENGRAM_STORAGE_BACKEND"
 MASTER_PORT_BASE=${MASTER_PORT_BASE:-61300}
 RUN_ID=${RUN_ID:-${MA_JOB_ID:-}}
 [[ ${RUN_ID} =~ ^[A-Za-z0-9._-]+$ ]] || die "Set RUN_ID to a fresh shared job identifier"
 for key in NNODES NUM_CARDS EP_SIZE TRAIN_ITERS MASTER_PORT_BASE NUM_HIDDEN_LAYERS VISION_NUM_HIDDEN_LAYERS; do
     [[ ${!key} =~ ^[1-9][0-9]*$ ]] || die "${key} must be a positive integer"
 done
+[[ ${WARMUP_STEPS} =~ ^[0-9]+$ && ${WARMUP_STEPS} -lt ${TRAIN_ITERS} ]] || die "Invalid WARMUP_STEPS"
+[[ ${ROUTE_DIAGNOSTICS} == 0 || ${ROUTE_DIAGNOSTICS} == 1 ]] || die "Invalid ROUTE_DIAGNOSTICS"
+[[ ${MOE_TIMING} == 0 || ${MOE_TIMING} == 1 ]] || die "Invalid MOE_TIMING"
+[[ ${CASE_SYNC_TIMEOUT} =~ ^[1-9][0-9]*$ ]] || die "Invalid CASE_SYNC_TIMEOUT"
+[[ ${HBM_INTERVAL} =~ ^[1-9][0-9]*$ ]] || die "HBM_INTERVAL must be a positive integer"
 if [[ ${NNODES} == 1 ]]; then
     NODE_RANK=${NODE_RANK:-0}
     MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
@@ -62,12 +83,13 @@ WORLD_SIZE=$((NNODES * NUM_CARDS))
 (( EP_SIZE >= 2 && WORLD_SIZE % EP_SIZE == 0 && 384 % EP_SIZE == 0 )) || die "EP must divide WORLD_SIZE and 384"
 REPLICA_SLOTS_PER_RANK=${REPLICA_SLOTS_PER_RANK:-$((384 / EP_SIZE))}
 [[ ${REPLICA_SLOTS_PER_RANK} =~ ^[0-9]+$ ]] || die "Invalid REPLICA_SLOTS_PER_RANK"
+(( ROUTE_DIAGNOSTICS == 0 || REPLICA_SLOTS_PER_RANK > 0 )) || die "Route diagnostics require replicas"
 EDP_SHARD_SIZE=${EDP_SHARD_SIZE:-$((WORLD_SIZE / EP_SIZE))}
 [[ ${EDP_SHARD_SIZE} =~ ^[1-9][0-9]*$ ]] || die "Invalid EDP_SHARD_SIZE"
 (( WORLD_SIZE / EP_SIZE % EDP_SHARD_SIZE == 0 )) || die "EDP_SHARD_SIZE must divide WORLD_SIZE/EP"
 (( NUM_HIDDEN_LAYERS >= 4 && NUM_HIDDEN_LAYERS <= 40 )) || die "Language depth must be in [4, 40]"
 (( VISION_NUM_HIDDEN_LAYERS <= 32 )) || die "Vision depth must be in [1, 32]"
-(( MASTER_PORT_BASE + 209 < 65536 )) || die "MASTER_PORT_BASE is too large"
+(( MASTER_PORT_BASE + 223 < 65536 )) || die "MASTER_PORT_BASE is too large"
 RUN_ROOT=${RUN_ROOT:-${SHARED_ROOT}/dsv41-runs/${RUN_ID}}
 NODE_LOCAL_ROOT=${NODE_LOCAL_ROOT:-${MODELARTS_JOB_DIR:-/tmp}/dsv41-${RUN_ID}}
 case ${NODE_LOCAL_ROOT} in /work/*|/home/ma-user/work/*) die "NODE_LOCAL_ROOT must not use shared work storage";; esac
@@ -89,7 +111,7 @@ for path in "${MODEL_DIR}/config.json" "${DATA}" "${ENGRAM}" "${NATIVE_LIB}/set_
     [[ -s ${path} ]] || die "Missing bundle input: ${path}"
 done
 data_records=$(wc -l < "${DATA}")
-(( data_records >= WORLD_SIZE )) || die "Dataset needs at least WORLD_SIZE=${WORLD_SIZE} records; got ${data_records}"
+(( data_records >= WORLD_SIZE * TRAIN_ITERS )) || die "Dataset is too short for the requested training horizon"
 
 if [[ ${DRY_RUN} != 1 ]]; then
     mkdir -p "${NODE_OUTPUT}" "${NODE_LOCAL_ROOT}"
@@ -176,9 +198,21 @@ if [[ ${DRY_RUN} != 1 ]]; then
     [[ -n ${SHMEM_HOST} ]] || die "Cannot resolve SHMEM_HOST to IPv4"
 fi
 export MASTER_ADDR NODE_RANK
-for index in 0 1 2; do
+publish_summary() {
+    local summary_status=0
+    "${PYTHON_BIN}" -m examples.training_demo.deepseek_v41.summarize_deepseek_v41_cluster \
+        --run-root "${RUN_ROOT}" --nodes "${NNODES}" --cards-per-node "${NUM_CARDS}" \
+        --steps "${TRAIN_ITERS}" --warmup-steps "${WARMUP_STEPS}" --matrix \
+        > "${RUN_ROOT}/summary.log" 2>&1 || summary_status=$?
+    printf '%s\n' "${summary_status}" > "${NODE_OUTPUT}/summary_exit_status.txt"
+    return "${summary_status}"
+}
+
+for index in 0 1 2 3 4 5; do
     labels=(native push pull)
-    label=${labels[index]}
+    label=${labels[index % 3]}
+    packing=dynamic
+    (( index < 3 )) || packing=packed
     backend=owner_ep
     mode=push
     if [[ ${label} == push || ${label} == pull ]]; then backend=megamoe; mode=${label}; fi
@@ -189,25 +223,48 @@ for index in 0 1 2; do
         --rdzv-conf=timeout=7200
         -m examples.training_demo.deepseek_v41.benchmark_deepseek_v41_vlm
         --full-model --experts 384 --ep-size "${EP_SIZE}" --steps "${TRAIN_ITERS}"
+        --warmup-steps "${WARMUP_STEPS}" --packing-mode "${packing}"
         --num-hidden-layers "${NUM_HIDDEN_LAYERS}" --vision-num-hidden-layers "${VISION_NUM_HIDDEN_LAYERS}"
         --replica-slots-per-rank "${REPLICA_SLOTS_PER_RANK}"
         --edp-shard-size "${EDP_SHARD_SIZE}"
         --activation-checkpoint "${ACTIVATION_CHECKPOINT}"
+        --engram-storage-backend "${ENGRAM_STORAGE_BACKEND}"
         --model-dir "${MODEL_DIR}" --engram-assets "${ENGRAM}" --data "${DATA}"
-        --random-init-seed "${RANDOM_INIT_SEED}" --native-lib "${NATIVE_LIB}" --output "${RUN_ROOT}/${label}"
+        --random-init-seed "${RANDOM_INIT_SEED}" --native-lib "${NATIVE_LIB}" --output "${RUN_ROOT}/${packing}/${label}"
         --backend "${backend}" --dispatch-mode "${mode}")
-    echo "Case=${label} world=${WORLD_SIZE} EP=${EP_SIZE} FSDP=${WORLD_SIZE} EDP_SHARD=${EDP_SHARD_SIZE}"
-    echo "Depth=${NUM_HIDDEN_LAYERS}+${VISION_NUM_HIDDEN_LAYERS} E384 TP1 CP1 MBS1 S4096 B=${REPLICA_SLOTS_PER_RANK} planner=cpu replicas=p2p"
+    [[ ${ROUTE_DIAGNOSTICS} == 0 ]] || command+=(--route-diagnostics)
+    [[ ${MOE_TIMING} == 0 ]] || command+=(--moe-timing)
+    echo "Case=${packing}/${label} world=${WORLD_SIZE} EP=${EP_SIZE} FSDP=${WORLD_SIZE} EDP_SHARD=${EDP_SHARD_SIZE}"
+    echo "Depth=${NUM_HIDDEN_LAYERS}+${VISION_NUM_HIDDEN_LAYERS} E384 TP1 CP1 MBS1 maxS4096 B=${REPLICA_SLOTS_PER_RANK} planner=cpu replicas=p2p"
+    echo "Engram=${ENGRAM_STORAGE_BACKEND} activation_checkpoint=${ACTIVATION_CHECKPOINT} decoder_attention_tier=all"
+    echo "Warmup=${WARMUP_STEPS} measured=$((TRAIN_ITERS - WARMUP_STEPS)) actual_tokens=true diagnostics=${ROUTE_DIAGNOSTICS}"
     printf '%q ' "${command[@]}"; printf '\n'
     [[ ${DRY_RUN} == 1 ]] && continue
-    case_dir=${NODE_OUTPUT}/${label}
+    case_dir=${RUN_ROOT}/${packing}/nodes/node_${NODE_RANK}/${label}
     mkdir -p "${case_dir}"
     printf '%q ' "${command[@]}" > "${case_dir}/command.txt"
     printf '\n' >> "${case_dir}/command.txt"
-    npu-smi info > "${case_dir}/npu_before.txt"
-    status=0
-    "${command[@]}" > "${case_dir}/run.log" 2>&1 || status=$?
-    printf '%s\n' "${status}" > "${case_dir}/exit_status.txt"
-    npu-smi info > "${case_dir}/npu_after.txt"
-    (( status == 0 )) || exit "${status}"
+    controller_status=0
+    "${PYTHON_BIN}" -m examples.training_demo.deepseek_v41.coordinate_deepseek_v41_cluster \
+        --run-root "${RUN_ROOT}" --packing-mode "${packing}" --label "${label}" \
+        --nodes "${NNODES}" --node-rank "${NODE_RANK}" --cards-per-node "${NUM_CARDS}" \
+        --interval "${HBM_INTERVAL}" --sync-timeout "${CASE_SYNC_TIMEOUT}" -- "${command[@]}" \
+        > "${case_dir}/controller.log" 2>&1 || controller_status=$?
+    if [[ ${NODE_RANK} == 0 ]]; then
+        publish_summary || echo "ERROR: Summary publication failed; see ${RUN_ROOT}/summary.log" >&2
+    fi
+    (( controller_status == 0 )) || die "Case cleanup barrier failed: ${packing}/${label}; see ${case_dir}/controller.log"
 done
+
+if [[ ${DRY_RUN} != 1 && ${NODE_RANK} == 0 ]]; then
+    publish_summary
+    "${PYTHON_BIN}" - "${RUN_ROOT}/summary.json" <<'PY_FINAL'
+import json
+import sys
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text())
+if not report['complete']:
+    raise SystemExit('Some cases failed; completed comparisons remain in summary.json')
+PY_FINAL
+fi

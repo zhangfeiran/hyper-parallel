@@ -12,9 +12,10 @@ spans WORLD_SIZE/EP_SIZE. The 128-die configuration therefore uses eight nodes,
 dense FSDP128 and expert FSDP2. MTP/DSpark heads are outside this adapter.
 
 The new runner uses the current branch's Omni data path. It retains the frozen
-image conversations and the released image ceiling of 1024. Native sees each
-packed sample's actual token count (at most 4096); MegaMoe pads to its fixed
-4096-token execution capacity. This is not a timing continuation of the older
+image conversations and the released image ceiling of 1024. Native and MegaMoe
+execute each packed sample's actual token count (at most 4096). MegaMoe reserves
+communication capacity for 4096 tokens without adding synthetic routes.
+This is not a timing continuation of the older
 September data/runtime bundle.
 
 ## Replica budget
@@ -78,22 +79,44 @@ released nested `config.json` and must be recorded in bundle provenance.
 Run on every node of an eight-node / 128-die job:
 
 ```bash
-RUN_ID=dsv41-depth4-ep64-128-b6-004 \
+RUN_ID=dsv41-depth4-ep64-128-b6-dynamic-005 \
 NUM_CARDS=16 EP_SIZE=64 EDP_SHARD_SIZE=2 \
 REPLICA_SLOTS_PER_RANK=6 \
 NUM_HIDDEN_LAYERS=4 VISION_NUM_HIDDEN_LAYERS=1 \
-ACTIVATION_CHECKPOINT=full TRAIN_ITERS=3 \
-bash /work/z00961864/hyper-dsv4.1-depth4-replica-20261014/source/scripts/run_deepseek_v41_cluster.sh
+ACTIVATION_CHECKPOINT=full TRAIN_ITERS=40 WARMUP_STEPS=10 \
+ROUTE_DIAGNOSTICS=1 HBM_INTERVAL=1 \
+bash /work/z00961864/hyper-dsv4.1-depth4-dynamic-20261014/source/scripts/run_deepseek_v41_cluster.sh
 ```
 
 Use a fresh RUN_ID for each attempt. `DRY_RUN=1` validates topology and prints
 all three commands without device work. `REPLICA_SLOTS_PER_RANK=0` selects the
-ordinary no-copy paths for a separately labeled comparison; the prior extreme
+ordinary no-copy paths for a separately labeled comparison (also set
+`ROUTE_DIAGNOSTICS=0`); the prior extreme
 hotspot OOM remains possible with that setting.
 
 Weights are generated directly into local parameter shards with canonical
 name/global-index SplitMix64 initialization and seed 42. No weight checkpoints
 are written. Checkpoint saving and restoration are disabled for this smoke.
+
+The default protocol has ten warmup steps followed by thirty measured steps.
+Both phases update the optimizer with the same forty-step LR horizon in every
+case. Per-rank records contain actual MoE input rows, phase and UTC timing
+boundaries. With `ROUTE_DIAGNOSTICS=1`, the harness retains existing immutable
+CPU planner results and summarizes them after timing: logical expert rows,
+home and balanced destination loads, active guest slots, guest compute rows
+and weight-transfer count. Planner calls during checkpoint recomputation are
+attributed to their actual model layer; no extra device count copy is added.
+
+Every node samples physical HBM and classifies device PIDs against its own
+launcher. The sampler records gaps, failed queries and foreign/unresolved PIDs.
+Its exit status is separate from the training exit status. After all case
+cleanup sentinels exist, node zero writes `RUN_ROOT/summary.json`, comparing
+all-rank initialization and actual token rows, reducing full-step timings by
+rank maximum and reporting whole-run versus measured-window physical peaks.
+HBM or timing comparisons with incomplete monitoring or foreign PIDs are
+marked ineligible. SHMEM heap, Torch allocator and physical HBM remain separate.
+The sampler covers initialization as well; allocator peaks start after model
+initialization and include separate warmup and measured-window statistics.
 
 CPU tests, meta construction, recipe resolution and native compilation do not
 establish distributed numerical correctness, full-step performance or HBM fit.
