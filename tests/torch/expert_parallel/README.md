@@ -119,6 +119,48 @@ Native 保留原有默认阈值零。
 传输证据记录实际执行专家数、活动副本预算和权重梯度 dtype；
 全局 guest plan 为空时可执行普通图，同时保留配置的传输能力供后续热点使用。
 
+## MoonEP A3 适配
+
+`MoonEPExperts` 使用 native NPU grouped matmul/SwiGLU，保留本 rank 原始
+`w1/w2/w3` 参数及 AdamW 更新。通信采用 [MoonEP 的 dev_server_dedup 分支](https://gitcode.com/Ascend/MoonEP/tree/dev_server_dedup)
+中的 MTE dispatch/combine、权重预取和 FP32 副本梯度归并内核。
+`MoonEPRuntime` 的通信区、三份权重副本池和三份梯度归并池由各层共享；
+反向保存独立激活副本，避免下一次通信覆盖保存的张量。
+
+上游构建仅支持 A5。A3 适配将 SIMT 规划改为逐次在线 CPU 规划，
+采用 rank 去重，不执行 A5 UDMA 或 server 去重。CPU 规划、所有同步、
+原始权重发布拷贝以及激活边界拷贝均包含在计时中。
+构建脚本固定上游提交，并让误调用 A5-only 入口显式报错。
+保留上游 MTE 算法，给 dispatch/combine/barrier 入口显式设置 A3 FFTS 同步基址，
+避免 `SyncAll` 在冷启动时依赖此前 native kernel 留下的同步状态。
+Python Buffer 接口增加紧凑 `[E/EP,M,N]` home carrier，内核仍按原有对称基址访问。
+A3 不支持上游 VMM handle 导出，适配使用先初始化的 MTE SHMEM heap 分配，
+计入整个预留 heap（含未使用容量），并在 finalize 前释放所有 pool tensor。
+Combine 对共享存储增加输入发布和读完确认边界，避免 A3 上异步复用造成数值波动；
+这些设备同步及 HCCL barrier 也计入耗时。
+权重梯度使用与 native 相同的 BF16 packed grouped GEMM，再转入 FP32 home/guest 归并池；
+不以逐专家 FP32 matmul 替代 native 的权重梯度计算。
+
+MoonEP 默认槽位数为 `B=E/EP`，EP16/E96 对应 B=6；不能将其标为 B=1。
+运行时必须独立于 MegaMoE 的 SHMEM 生命周期，以新进程启动。
+
+```bash
+git clone --branch dev_server_dedup https://gitcode.com/Ascend/MoonEP.git /path/to/MoonEP
+git -C /path/to/MoonEP checkout b4632790350631d1e526e85d617ee13086dcac7f
+git -C /path/to/MoonEP submodule update --init --recursive
+source /path/to/cann/set_env.sh
+(cd /path/to/MoonEP/npu_patch/3rdparty/shmem && bash scripts/build.sh -soc_type Ascend910B)
+python scripts/build_moonep_a3.py --source /path/to/MoonEP
+export ASCEND_MOONEP_VMM_PAGE_SIZE=2m
+torchrun --standalone --nproc-per-node=16 --module tests.torch.expert_parallel._benchmark_dirichlet_replica \
+    --backend moonep --budget 6 --accept --pairs 10000:42,1:7,0.01:42,0.01:274,0.01:1942 \
+    --result-dir /path/to/moonep_accept
+```
+
+正式计时使用相同命令去掉 `--accept`，保留模型尺寸、点及顺序，
+启动前同样经过 16 卡空闲门和共享锁。新旧扫描点数不同时，权重更新和
+allocator 高水位历史不同；叠加旧图用于观察趋势，严格通信对照应重跑相同五点的 native B=6。
+
 `--diagnose` 在计时结束后，单独采集一个 checkpoint MoE 层的 Torch/NPU 和内部 MegaKernel trace。
 记录原始前向、重计算、反向、实际放置、provider 标志及包含等待的 host 时间区间。
 这些启用 profiler 的 trace 用于诊断重叠和 ready 等待，

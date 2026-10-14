@@ -33,6 +33,7 @@ from torch.utils.checkpoint import checkpoint
 from hyper_parallel import DTensor, Shard, init_device_mesh
 from hyper_parallel.components.modules.moe import GroupedExperts
 from hyper_parallel.core.expert_parallel import ExpertParallel
+from hyper_parallel.core.expert_parallel.moonep import MoonEPExperts, MoonEPRuntime
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore._loader import get_multicore_paths
 from hyper_parallel.core.multicore.profiler import mega_kernel_profile
@@ -62,10 +63,12 @@ def _native_forward(module, values, ids, scores, counts):
 def _forward(module, values, ids, scores, counts):
     if isinstance(module, MegaMoeExperts):
         return module(values, ids, scores)
+    if isinstance(module, MoonEPExperts):
+        return module(values, ids, scores, counts)
     return _native_forward(module, values, ids, scores, counts)
 
 
-def _make_layer(args, mesh, index, backend=None, budget=None):
+def _make_layer(args, mesh, index, backend=None, budget=None, moonep_runtime=None):
     backend = backend or args.backend
     budget = args.budget if budget is None else budget
     rank, size = dist.get_rank(), dist.get_world_size()
@@ -87,6 +90,8 @@ def _make_layer(args, mesh, index, backend=None, budget=None):
             local = value.to(device)
             global_shape = (args.experts, *value.shape[1:])
             setattr(module, name, torch.nn.Parameter(DTensor.from_local(local, mesh, [Shard(0)], shape=global_shape)))
+    elif backend == "moonep":
+        module = MoonEPExperts({name: value.to(device) for name, value in weights.items()}, moonep_runtime)
     else:
         module = MegaMoeExperts(local_num_tokens=args.tokens, hidden_size=args.hidden,
                                 intermediate_size=args.intermediate, num_experts=args.experts, top_k=args.top_k,
@@ -108,6 +113,16 @@ def _parameters(module):
 
 
 def _transport_evidence(module, values, expected):
+    if isinstance(module, MoonEPExperts):
+        return {"actual_transport": "moonep_mte", "planner": "cpu_online",
+                "dedup": "rank", "replica_slots_per_rank": module.runtime.home,
+                "weight_gradient_dtype": "float32", "shared_runtime": True,
+                "weight_partial_compute": "native_bf16_packed_grouped_gemm",
+                "activation_boundary_copy": True, "weight_home_publish_copy": True,
+                "combine_completion": "host_publish_and_read_fences",
+                "allocation": "legacy_mte_heap",
+                "ffts_sync_base": "explicit_kernel_entry",
+                "a5_simt": False, "udma": False, "server_dedup": False}
     if not isinstance(module, MegaMoeExperts):
         return {"actual_transport": "p2p"}
     resources = module._get_execution_resources(values)  # pylint: disable=protected-access
@@ -156,6 +171,9 @@ def _memory(layers, values, backend):
         resources = layers[0]._get_execution_resources(values)  # pylint: disable=protected-access
         heap = resources.heap_manager.heap_bytes
         capacity, epoch = resources.workspace.capacity_floor, resources.heap_manager.epoch
+    elif backend == "moonep":
+        heap = layers[0].runtime.heap_bytes
+        capacity, epoch = layers[0].runtime.capacity, 1
     return {"allocated": torch.npu.memory_allocated(), "reserved": torch.npu.memory_reserved(),
             "peak_allocated": torch.npu.max_memory_allocated(), "peak_reserved": torch.npu.max_memory_reserved(),
             "shmem_heap": heap, "total_peak_bytes": torch.npu.max_memory_allocated() + heap,
@@ -235,7 +253,14 @@ def _point(args, layers, inputs, gradient, optimizer, alpha, seed, directory):
                          for value in state.values() if isinstance(value, torch.Tensor)]
     _finite([value for layer in layers for value in _parameters(layer)] + optimizer_tensors)
     evidence = None
-    if args.budget:
+    if args.backend == "moonep":
+        route_state = layers[0].runtime.last_route
+        placement = route_state.placement
+        evidence = {"destination_loads": placement.compact_counts.sum(1).tolist(),
+                    "slots": placement.experts_to_copy.tolist(),
+                    "transfers": int((placement.experts_to_copy >= 0).sum()),
+                    "destination_counts": placement.compact_counts.tolist()}
+    elif args.budget:
         output = _forward(layers[0], inputs[0].detach().requires_grad_(), *route[:2], route[2])
         plan = saved_route(output).plan
         evidence = {"destination_loads": plan.destination_loads, "slots": plan.slot_to_logical,
@@ -313,7 +338,7 @@ def _diagnose(args, layer, inputs, gradient, optimizer, alpha, seed, directory):
 
 
 def _logical_gradients(module):
-    if isinstance(module, GroupedExperts):
+    if isinstance(module, (GroupedExperts, MoonEPExperts)):
         return {name: _local(getattr(module, name).grad) for name in ("w1", "w2", "w3")}
     gate, up = module.gate_up_weight.grad.chunk(2, dim=-1)
     return {"w1": gate.transpose(1, 2), "w2": module.down_weight.grad.transpose(1, 2), "w3": up.transpose(1, 2)}
@@ -361,9 +386,14 @@ def run(args: argparse.Namespace) -> None:
     if args.pairs:
         points = [(float(alpha), int(seed)) for alpha, seed in (value.split(":") for value in args.pairs.split(","))]
     layers, identities = [], []
+    moonep_runtime = None
     try:
+        if args.backend == "moonep":
+            moonep_runtime = MoonEPRuntime(args.tokens, args.hidden, args.intermediate, args.experts,
+                                           args.top_k, dist.group.WORLD)
+            moonep_runtime.initialize()
         for index in range(1 if args.accept else args.layers):
-            layer, identity = _make_layer(args, mesh, index)
+            layer, identity = _make_layer(args, mesh, index, moonep_runtime=moonep_runtime)
             layers.append(layer)
             identities.append(identity)
         if args.backend == "megamoe":
@@ -387,6 +417,15 @@ def run(args: argparse.Namespace) -> None:
             vendor, adapter = get_multicore_paths()
             identity.update(adapter=file_identity(adapter), kernels=[file_identity(path) for path in
                                                                      sorted(vendor.rglob("*.o"))])
+        if args.backend == "moonep":
+            import npu_patch  # pylint: disable=import-outside-toplevel
+            dependency_root = Path(npu_patch.__file__).resolve().parent
+            identity["moonep"] = {"root": str(dependency_root),
+                                  "files": [file_identity(path) for path in
+                                            sorted(dependency_root.rglob("*.so"))] +
+                                           [file_identity(path) for path in sorted(dependency_root.glob("*.py"))],
+                                  "adaptation": json.loads((dependency_root.parent /
+                                                            "a3-adaptation.json").read_text(encoding="utf-8"))}
         (directory / "identity.json").write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
         if args.accept:
             results = _accept(args, mesh, layers[0], values, gradient, points)
@@ -407,12 +446,14 @@ def run(args: argparse.Namespace) -> None:
         for layer in layers:
             if isinstance(layer, MegaMoeExperts):
                 layer.close()
+        if moonep_runtime is not None:
+            moonep_runtime.close()
 
 
 def main() -> None:
     """Configure one fresh-process variant; initialize devices only in workers."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("native", "megamoe"), required=True)
+    parser.add_argument("--backend", choices=("native", "megamoe", "moonep"), required=True)
     parser.add_argument("--budget", type=int, required=True)
     parser.add_argument("--layers", type=int, default=16)
     parser.add_argument("--tokens", type=int, default=4096)
@@ -434,6 +475,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.backend == "native" and args.replica_transport != "p2p":
         parser.error("native supports only p2p replica transport")
+    if args.backend == "moonep" and args.budget != args.experts // int(os.environ["WORLD_SIZE"]):
+        parser.error("MoonEP A3 requires E/EP replica slots per rank")
     if args.budget < 0 or args.replica_min_rows < 0:
         parser.error("budget and replica-min-rows must be nonnegative")
     if args.replica_target_load is not None and (args.backend != "megamoe" or args.replica_target_load <= 0):

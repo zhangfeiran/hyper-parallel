@@ -18,6 +18,8 @@ __all__ = [
     "ExpertParallel",
     "TensorParallel",
     "ExpertTensorParallel",
+    "MoonEPExperts",
+    "MoonEPRuntime",
 ]
 
 from hyper_parallel.core.expert_parallel.expert_parallel import (
@@ -26,3 +28,4 @@ from hyper_parallel.core.expert_parallel.expert_parallel import (
     TensorParallel,
     ExpertTensorParallel,
 )
+from hyper_parallel.core.expert_parallel.moonep import MoonEPExperts, MoonEPRuntime

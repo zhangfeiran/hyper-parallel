@@ -117,6 +117,8 @@ def _complete(directory, command=None):
         files.update({Path(item["path"]): item["sha256"] for item in identity["measurement_scripts"].values()})
         if "adapter" in identity:
             files.update({Path(item["path"]): item["sha256"] for item in [identity["adapter"], *identity["kernels"]]})
+        if "moonep" in identity:
+            files.update({Path(item["path"]): item["sha256"] for item in identity["moonep"]["files"]})
         if any(not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest
                for path, digest in files.items()):
             return False
