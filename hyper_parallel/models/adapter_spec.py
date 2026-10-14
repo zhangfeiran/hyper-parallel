@@ -37,14 +37,38 @@ from typing import Any, Callable, Optional
 class RecomputePolicy:
     """Model-owned activation-checkpoint regions used by normal training.
 
-    Cross-layer state producers must be excluded from whole-module replay.
-    The adapter therefore declares checkpoint-safe submodules independently
-    from optional model-integration validation metadata. Layer coverage is
-    selected independently through the Trainer's activation-checkpoint config.
+    One declaration covers both region shapes a model may need:
+
+    * ``region_patterns`` names the modules that become checkpoint regions. The
+      outermost match inside every selected layer is used, so a pattern set of
+      leaf submodules keeps one region per submodule while a layer pattern wraps
+      the whole layer and saves a single copy of the layer input.
+    * ``exclude_patterns`` names descendants that must stay outside the
+      recompute region, for a submodule whose forward may not run a second time
+      at all. A cross-layer state producer or consumer does not need an
+      exclusion: a model may instead guard its state writes with
+      ``is_recomputing()`` and pin the discrete results a recompute has to
+      reuse, as DeepSeek-V4.1 does for its indexer selection.
+
+    A module may not be a region root and an excluded descendant at the same
+    time, and an excluded module may not contain a region root. Layer coverage
+    is selected independently through the Trainer's activation-checkpoint
+    config.
+
+    ``on_applied`` lets a model enable runtime behaviour that depends on the
+    region shape finally installed, for example pinning the discrete selection
+    of every layer that will be recomputed.
+
+    ``exclude_predicate`` complements the patterns with an attribute rule that a
+    path cannot express, such as "keep the attention of every role that does not
+    recompute out of the region". It receives ``(module_fqn, module)`` and is
+    evaluated together with ``exclude_patterns``.
     """
 
-    safe_module_patterns: tuple[str, ...]
-    no_replay_module_patterns: tuple[str, ...] = ()
+    region_patterns: tuple[str, ...]
+    exclude_patterns: tuple[str, ...] = ()
+    exclude_predicate: Optional[Callable[[str, Any], bool]] = None
+    on_applied: Optional[Callable[[Any], None]] = None
 
 
 @dataclass(frozen=True)

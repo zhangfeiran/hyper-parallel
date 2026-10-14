@@ -417,22 +417,25 @@ case = ModuleParityCase(
 
 ### 3.4 安全重计算区域
 
-共享 KV、Indexer 状态或其他跨层状态的 producer 不应被整层 replay。模型 adapter 应声明可重计算子模块：
+共享跨层状态的 producer/consumer 可以参与重算，但重算路径上有两类动作必须先处理掉：**只需执行一次的副作用**（写跨层状态）和**离散且不可复现的选择**（Top-K / 候选池）。模型 adapter 用一份声明同时描述"哪些模块成为区域"和"哪些后代必须留在重算之外"，并用 `on_applied` 安装依赖最终区域形状的运行期行为（例如给会被重算的层 pin 选区）：
 
 ```python
 from hyper_parallel.models.adapter_spec import RecomputePolicy
 
 
 def build_recompute_policy():
+    """Use one region per layer and derive attention coverage from its roles."""
+    recomputed = ("full", "reindex", "reuse")
     return RecomputePolicy(
-        safe_module_patterns=(
-            "model.layers.*.input_layernorm",
-            "model.layers.*.post_attention_layernorm",
-            "model.layers.*.mlp",
-        ),
-        no_replay_module_patterns=("model.layers.*.self_attn",),
+        region_patterns=("model.layers.*",),
+        exclude_predicate=...,  # Keep attention roles outside recomputed resident.
+        on_applied=...,  # Pin discrete selections for recomputed index sources.
     )
 ```
+
+DeepSeek-V4.1 把它写成 `models/deepseek_v41/adapter/policies/activation_checkpointing.py` 里的一档开关：`ATTENTION_RECOMPUTE_TIER` 取 `reuse` / `reuse_reindex` / `all`（默认）/ `none`，不在重算范围里的角色由同一张角色表派生为 `exclude_predicate`，会重算的 index source 由同一个元组派给 `configure_shared_state` 去 pin 选区。默认 `all`：Full、Reindex 和 Reuse attention 都随 decoder 层重算；其他档位将未选中的角色留在区域外保留激活。`configure_shared_state` 把 indexer 的离散选择 pin 成 exclude 区域，重算复用正向选出的集合，也避免"跳过一段可微代码"破坏 checkpoint 的张量数不变量。跨层状态本身不需要调度——它作为重算区域的输入被 checkpoint 持有，发布出去的条目随它活到反向结束，而 `publish_*` 只在正向执行（`is_recomputing()` 判定），重算不会写第二次。pin 只覆盖离散选择：选区之外的 compressor、indexer 投影按档位随层重算或留在区域外。
+
+`region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除（`HP-STATE-002`）。`on_applied` 是区域装好后的模型自有钩子，用于开启依赖最终区域形状的运行时行为（例如 DeepSeek-V4.1 用它给会被重算的层安装选区 pin）。
 
 Trainer recipe 通过通用配置选择该策略：
 
@@ -761,7 +764,7 @@ DeepSeek adapter 的验证声明包括：
 - `compressed_kv`、`index_key`、`topk_indices`、`candidate_blocks` 跨层 publish/consume 检查；
 - packed runtime 字段、视觉输入字段及 vision/aligner 梯度检查；
 - 独立进程中的原生 Engram/MoE/CSA2 前向与反向比较；
-- attention 不 replay，只对 norm/MLP/MoE 安全区域做分层重计算。
+- 整层作为一个区域重算（含 CSA2 attention）：状态写入只在正向执行（`is_recomputing()` 判定），离散选择 pin 成 exclude 区域；跨层条目由 autograd 图持有到反向结束。
 
 DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相替代的：
 
@@ -787,7 +790,7 @@ DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相
 | `HP-CKPT-001/002` | checkpoint key 未覆盖或转换不可逆 | 增加 mapping/transform/reverse transform 或显式合法排除 |
 | `HP-DATA-001/002` | forward 字段所有权冲突、字段缺失、label shift/模态梯度不符 | 修正 Omni dataset transform、get-batch 或 runtime input adapter 声明 |
 | `HP-PREC-001` | required probe 未匹配最终参数 | 使用替换后的最终 FQN 更新 adapter 声明 |
-| `HP-STATE-001/002/003` | 跨层状态缺 producer/consumer、producer replay 或 trace 超限 | 缩小重计算边界，修正共享状态来源和 forward 生命周期 |
+| `HP-STATE-001/002/003` | 跨层状态缺 producer/consumer、producer 重复发布或 trace 超限 | 让状态写入只在正向执行（`is_recomputing()`）、把离散选择 pin 成 exclude 区域，或缩小重算边界 |
 | Online dataloader 拒绝跨 DP world-size cursor，或跳过 cursor 后 input hash 仍不同 | DCP 能重分片模型/优化器，不代表 loader 能重建全局样本位置；从同一配置起点也不保证 DP-invariant packing | warm-start 可用 `restore_dataloader_state=false` 请求 replay，但必须检查 global input hash；正式跨拓扑精度改用固定 Offline replay，真正续训改用支持全局 cursor 重建的 loader，否则标为 `BLOCKED` |
 | `BLOCKED` | 证据、设备、资产或独立 oracle 不可用 | 补齐前置条件；不要放宽阈值或静默缩小实验 |
 
