@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Declare parameter sharding and FSDP wrapping policies."""
+# pylint: disable=unsupported-binary-operation
 
 from __future__ import annotations
 
@@ -45,11 +46,16 @@ def build_parameter_sharding_rules() -> list[tuple[list[str] | str, Any]]:
 
 def get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
     """Keep repeated visual calls root-owned and wrap homogeneous Engram units."""
+    from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import (  # pylint: disable=C0415
+        HostEngramTable,
+    )
     module_by_fqn = dict(model.named_modules())
     engram_units = tuple(
         module_fqn
         for module_fqn in module_by_fqn
-        if module_fqn.endswith(".engram.embed") or module_fqn.endswith(".engram.wkv")
+        if module_fqn.endswith(".engram.wkv")
+        or (module_fqn.endswith(".engram.embed")
+            and not isinstance(module_by_fqn[module_fqn], HostEngramTable))
     )
     # Each rank can pack a different number of images. Nested visual units would
     # issue a different number of parameter collectives inside the image loop.

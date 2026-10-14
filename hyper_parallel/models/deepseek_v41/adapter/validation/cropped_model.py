@@ -262,6 +262,10 @@ def build_deepseek_v41_validation_config(
         vision_num_hidden_layers: int | None = None,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        engram_storage_backend: str = "device",
+        engram_max_pending_entries: int = 1000000,
+        engram_max_sparse_rows_per_step: int = 1000000,
+        engram_sparse_adam_config: dict[str, Any] | None = None,
 ) -> DeepseekV4Config:
     """Translate the released config into a depth-preserving parameter crop.
 
@@ -286,6 +290,10 @@ def build_deepseek_v41_validation_config(
             exercises candidate selection before the released Reindex layers.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient. The released
             report does not disclose its production value.
+        engram_storage_backend: Device table or CPU owner-local sparse table.
+        engram_max_pending_entries: Limit on accumulated Host row requests per step.
+        engram_max_sparse_rows_per_step: Limit on synchronized Host rows per owner.
+        engram_sparse_adam_config: CPU SparseAdam hyperparameters for Host tables.
 
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
@@ -334,6 +342,12 @@ def build_deepseek_v41_validation_config(
                 or not 1 <= vision_num_hidden_layers <= config.v41_vision_num_hidden_layers):
             raise ValueError("vision_num_hidden_layers must be between one and the released depth")
         config.v41_vision_num_hidden_layers = vision_num_hidden_layers
+    if engram_storage_backend not in ("device", "host"):
+        raise ValueError("engram_storage_backend must be 'device' or 'host'")
+    config.engram_storage_backend = engram_storage_backend
+    config.engram_max_pending_entries = engram_max_pending_entries
+    config.engram_max_sparse_rows_per_step = engram_max_sparse_rows_per_step
+    config.engram_sparse_adam_config = engram_sparse_adam_config or {"lr": 1.0e-3}
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     return config
 
@@ -349,6 +363,10 @@ def build_cropped_deepseek_v41(
         vision_num_hidden_layers: int | None = None,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        engram_storage_backend: str = "device",
+        engram_max_pending_entries: int = 1000000,
+        engram_max_sparse_rows_per_step: int = 1000000,
+        engram_sparse_adam_config: dict[str, Any] | None = None,
         torch_dtype: str = "bfloat16",
         validate_placement: bool = False,
         distributed_setup: DistributedSetup | None = None,
@@ -373,6 +391,10 @@ def build_cropped_deepseek_v41(
         exercise_post_training_indexer: Exercise the released Full/Reindex
             hierarchy at its native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
+        engram_storage_backend: Device table or CPU owner-local sparse table.
+        engram_max_pending_entries: Limit on accumulated Host row requests per step.
+        engram_max_sparse_rows_per_step: Limit on synchronized Host rows per owner.
+        engram_sparse_adam_config: CPU SparseAdam hyperparameters for Host tables.
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -397,6 +419,10 @@ def build_cropped_deepseek_v41(
         vision_num_hidden_layers=vision_num_hidden_layers,
         exercise_post_training_indexer=exercise_post_training_indexer,
         indexer_loss_coeff=indexer_loss_coeff,
+        engram_storage_backend=engram_storage_backend,
+        engram_max_pending_entries=engram_max_pending_entries,
+        engram_max_sparse_rows_per_step=engram_max_sparse_rows_per_step,
+        engram_sparse_adam_config=engram_sparse_adam_config,
     )
     return HyperAutoModelForCausalLM.from_config(
         config,
