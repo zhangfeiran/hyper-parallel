@@ -231,9 +231,9 @@ dataloader:
     runtime_input_adapter:
       _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
   sampler_type: single
-  # Emit one complete multimodal sample per rank without waiting to fill 4k.
-  token_budget: 128
-  min_buffered_samples: 1
+  # Pack real multimodal samples toward the configured 4k sequence budget.
+  token_budget: 4096
+  min_buffered_samples: 16
   drop_last: true
   num_workers: 0
   pin_memory: false
