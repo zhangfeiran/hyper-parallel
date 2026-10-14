@@ -236,6 +236,20 @@ def _check_unknown_owner(mega: MegaMoeExperts, shape: baseline.MoeShape) -> None
     assert before.untyped_storage().nbytes() > 0
 
 
+def _check_companions(pending: list, lazy: MegaMoeExperts, lazy_reference: torch.nn.Module,
+                      shape: baseline.MoeShape) -> None:
+    """Finish a pull graph and bind a previously unused push owner after growth."""
+    snapshots = []
+    for member, output, source, weights, upstream in pending:
+        output.backward(upstream)
+        snapshots.append([output, source.grad, weights.grad, *baseline.expert_weight_gradients(member)])
+    for reference, actual in zip(*snapshots):
+        baseline.assert_close("mixed owner across rebuild", actual, reference)
+    expected = _deferred_pair(lazy_reference, shape, ("balanced", "tail"))
+    actual = _deferred_pair(lazy, shape, ("balanced", "tail"))
+    for reference, actual_tensor in zip(expected, actual):
+        baseline.assert_close("lazy owner after rebuild", actual_tensor, reference)
+
 
 def test_mega_moe_heap_growth() -> None:
     """Feature: Online push heap growth.

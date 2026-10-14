@@ -24,6 +24,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
+
 
 _COMMUNICATION_SPLIT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
@@ -50,11 +52,23 @@ class MegaMoeSpec:
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
     swiglu_limit: float | None = None
+    replica_slots_per_rank: int = 0
+    logical_num_experts: int = 0
+    replica_transport: str = "p2p"
 
     @property
     def local_experts(self) -> int:
-        """Return experts owned by this expert-parallel rank."""
+        """Return execution slots on this rank, including enabled guest slots."""
         return self.num_experts // self.ep_size
+
+    @property
+    def maximum_receive_capacity(self) -> int:
+        """Return the bound for dynamic growth without requiring preallocation."""
+        if not self.replica_slots_per_rank:
+            return _align_capacity(self.ep_size * self.routed_slots)
+        return ExpertReplicaConfig(
+            self.logical_num_experts, self.ep_size, self.replica_slots_per_rank,
+        ).maximum_receive_rows(self.local_num_tokens, self.top_k)
 
     @property
     def routed_slots(self) -> int:
@@ -85,10 +99,27 @@ def _resolve_receive_capacity(
 def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tuple[int, int]:
     """Return geometric and minimum capacities without exceeding the lossless bound."""
     upper = _align_capacity(spec.ep_size * spec.routed_slots)
+    if spec.replica_slots_per_rank:
+        upper = ExpertReplicaConfig(
+            spec.logical_num_experts, spec.ep_size, spec.replica_slots_per_rank,
+        ).maximum_receive_rows(spec.local_num_tokens, spec.top_k)
     if required > upper:
         raise ValueError("MegaMoe route exceeds the lossless token bound")
     requested = max(required, math.ceil(min(upper, current * spec.capacity_growth_factor)))
     return min(upper, _align_capacity(requested)), _align_capacity(required)
+
+def initial_receive_capacity(specification: Mapping[str, Any]) -> int:
+    """Resolve the initial allocation and apply the optional replica bound."""
+    capacity = _resolve_receive_capacity(
+        specification["initial_capacity_factor"],
+        specification["local_num_tokens"] * specification["top_k"], specification["ep_size"],
+    )
+    budget = specification.get("replica_slots_per_rank", 0)
+    if budget:
+        config = ExpertReplicaConfig(specification["logical_num_experts"], specification["ep_size"], budget)
+        capacity = min(capacity, config.maximum_receive_rows(
+            specification["local_num_tokens"], specification["top_k"]))
+    return capacity
 
 
 def _resolve_capacity_factors(
@@ -178,16 +209,15 @@ def bind_mega_moe_spec(
     top_k = specification["top_k"]
     initial_capacity_factor = specification["initial_capacity_factor"]
     swiglu_limit = specification.get("swiglu_limit")
-    receive_capacity = _resolve_receive_capacity(
-        initial_capacity_factor,
-        local_num_tokens * top_k,
-        ep_size,
-    )
+    receive_capacity = initial_receive_capacity(specification)
     return MegaMoeSpec(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],
         intermediate_size=specification["intermediate_size"],
         num_experts=specification["num_experts"],
+        logical_num_experts=specification.get("logical_num_experts", specification["num_experts"]),
+        replica_slots_per_rank=specification.get("replica_slots_per_rank", 0),
+        replica_transport=specification.get("replica_transport", "p2p"),
         top_k=top_k,
         initial_capacity_factor=initial_capacity_factor,
         receive_capacity=receive_capacity,

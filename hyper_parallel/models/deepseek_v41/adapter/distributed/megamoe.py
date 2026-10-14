@@ -26,6 +26,8 @@ from transformers.activations import ACT2FN
 
 from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import _integer
+from hyper_parallel.core.expert_parallel.hot_replica.admission import reduction_basis_points
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.models.runtime_resources import ModelRuntimeModule
 
@@ -47,7 +49,8 @@ class DeepseekV41MegaMoeExperts(nn.Module, ModelRuntimeModule):
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None, local_num_tokens: int = 4096,
                  dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
-                 capacity_growth_factor: float | None = None, initializer_range: float = 0.02) -> None:
+                 capacity_growth_factor: float | None = None, initializer_range: float = 0.02,
+                 replica_slots_per_rank: int = 0, replica_minimum_load_reduction: float = 0.0) -> None:
         """Convert a full HF holder before EP partitioning and FSDP construction.
 
         Args:
@@ -59,6 +62,8 @@ class DeepseekV41MegaMoeExperts(nn.Module, ModelRuntimeModule):
             initial_capacity_factor: Push initial receive capacity; None uses the executor default.
             capacity_growth_factor: Push capacity growth multiplier; omit for pull.
             initializer_range: Standard deviation used for meta-model random initialization.
+            replica_slots_per_rank: Maximum additional expert slots per EP rank.
+            replica_minimum_load_reduction: Optional-copy admission threshold; zero prioritizes balance.
         """
         super().__init__()
         del module_fqn
@@ -67,6 +72,10 @@ class DeepseekV41MegaMoeExperts(nn.Module, ModelRuntimeModule):
         if isinstance(local_num_tokens, bool) or not isinstance(local_num_tokens, int) or (
                 local_num_tokens <= 0 or local_num_tokens % 128):
             raise ValueError("local_num_tokens must be a positive multiple of 128")
+        _integer(replica_slots_per_rank, "replica_slots_per_rank", 0)
+        reduction_basis_points(replica_minimum_load_reduction)
+        self.replica_slots_per_rank = replica_slots_per_rank
+        self.replica_minimum_load_reduction = replica_minimum_load_reduction
         self.local_num_tokens = local_num_tokens
         self.dispatch_mode = dispatch_mode
         self.initial_capacity_factor = initial_capacity_factor
@@ -102,7 +111,7 @@ class DeepseekV41MegaMoeExperts(nn.Module, ModelRuntimeModule):
         """Bind the EP mesh and routing width after model replacement.
 
         Args:
-            ep_group: Whole-world EP group in global rank order.
+            ep_group: Ordered EP process group, including a subgroup of the training world.
             ep_size: Number of EP ranks.
             top_k: Number of selected experts per token.
         """
@@ -117,7 +126,9 @@ class DeepseekV41MegaMoeExperts(nn.Module, ModelRuntimeModule):
             top_k=top_k, ep_group=ep_group, ep_size=ep_size,
             dispatch_mode=self.dispatch_mode, initial_capacity_factor=self.initial_capacity_factor,
             capacity_growth_factor=self.capacity_growth_factor, swiglu_limit=self.swiglu_limit,
-            create_parameters=False,
+            create_parameters=False, replica_slots_per_rank=self.replica_slots_per_rank,
+            replica_minimum_load_reduction=self.replica_minimum_load_reduction,
+            replica_min_rows=0, replica_planner="cpu", replica_transport="p2p",
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,

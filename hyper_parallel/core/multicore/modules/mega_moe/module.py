@@ -20,12 +20,23 @@ __all__ = ["MegaMoeExperts"]
 
 import math
 import struct
+from dataclasses import replace
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
+from hyper_parallel.core.expert_parallel.hot_replica.admission import (
+    reduction_basis_points, resolve_replica_admission,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
+from hyper_parallel.core.expert_parallel.hot_replica.device import validate_planner_backend
+from hyper_parallel.core.expert_parallel.hot_replica.routing import prepare_replica_route
+from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import SIGNAL_TRANSPORT_MODES
+
 from hyper_parallel.core.multicore import shmem
+from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capacity
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
@@ -33,7 +44,7 @@ from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
     _COMMUNICATION_SPLIT, _grow_receive_capacity, _resolve_capacity_factors,
-    _resolve_receive_capacity, bind_mega_moe_spec,
+    initial_receive_capacity, bind_mega_moe_spec,
 )
 from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
 
@@ -87,9 +98,7 @@ def _create_mega_moe_parameters(
 def _heap_layout(specification: dict[str, Any], element_size: int, capacity: int | None = None) -> tuple[Any, ...]:
     """Describe byte demand and deterministic configuration with an opaque capacity payload."""
     if capacity is None:
-        capacity = _resolve_receive_capacity(specification["initial_capacity_factor"],
-                                             specification["local_num_tokens"] * specification["top_k"],
-                                             specification["ep_size"])
+        capacity = initial_receive_capacity(specification)
     signature = tuple(sorted((key, value) for key, value in specification.items() if key != "ep_group"))
     return _spec_workspace_bytes(specification, element_size, receive_capacity=capacity), signature, capacity
 
@@ -116,6 +125,15 @@ class _MegaMoeExecutionResources:
         shmem.acquire(self.spec.ep_group, heap_size_bytes=self.heap_manager.heap_bytes)
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
+            self.home_plan = None
+            if self.spec.replica_slots_per_rank:
+                home_spec = replace(self.spec, num_experts=self.spec.logical_num_experts, replica_slots_per_rank=0)
+                # Ready generations follow the ordinary event region. Reusing
+                # a workspace requires the same offset for both graph variants.
+                if (mega_moe_event_capacity(home_spec.num_experts, home_spec.ep_size)
+                        == mega_moe_event_capacity(self.spec.num_experts, self.spec.ep_size)):
+                    self.home_plan = build_mega_moe_plan(home_spec, tensor.device)
+            self.last_execution_plan = self.plan
             self.workspace = MegaMoeWorkspace(shared=shared)
             self.workspace.capacity_floor = self.heap_manager.bind(self, specification)
             self.workspace.heap_manager = self.heap_manager
@@ -132,6 +150,8 @@ class _MegaMoeExecutionResources:
         Args:
             maximum_received_slots: Maximum destination load from the root count exchange.
         """
+        if maximum_received_slots > self.spec.maximum_receive_capacity:
+            raise ValueError("MegaMoe route exceeds the lossless token bound")
         if maximum_received_slots <= self.workspace.capacity_floor:
             return
         with self.heap_manager.access():
@@ -176,6 +196,8 @@ class _MegaMoeExecutionResources:
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split,
+            self.spec.logical_num_experts, self.spec.replica_slots_per_rank, self.spec.replica_transport,
+            self.spec.swiglu_limit,
         )
 
     def can_close(self) -> bool:
@@ -232,6 +254,13 @@ class MegaMoeExperts(MulticoreModule):
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
+        replica_slots_per_rank: int = 0,
+        replica_transport: str = "p2p",
+        replica_min_rows: int = 1024,
+        replica_cost_model: ExpertReplicaCostModel | None = None,
+        replica_planner: str = "cpu",
+        replica_target_load: int | None = None,
+        replica_minimum_load_reduction: float | None = None,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -254,6 +283,32 @@ class MegaMoeExperts(MulticoreModule):
                 Must be a positive multiple of 128 that divides local_num_tokens.
             combine_split: Combine tile rows in forward and backward, with the same
                 constraints and default as dispatch_split. Sharing requires equal splits.
+            replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
+            replica_transport: "p2p", barrier-based "shmem", direct "shmem_signal",
+                or mapped-peer "shmem_signal_sdma" copies. "shmem_signal_sdma_parallel"
+                prefetches weights concurrently on one stream per target peer.
+                "shmem_signal_sdma_bidir" also reads gradients on separate projection
+                streams, caching at most one full FP32 expert gradient per provider.
+                "shmem_signal_sdma_overlap" lets home compute precede guest-weight readiness.
+                "shmem_signal_sdma_projection" waits per projection, prefetching W13
+                first in forward and W2 first in backward.
+                "shmem_signal_kernel_gradient" uses idle kernel AIV workers for W2 return
+                with one-sided MTE reads and ordered FP32 accumulation.
+            replica_planner: Shared CPU or fused device replica quota policy.
+            replica_target_load: Preferred received rows per rank, independent of buffer capacity.
+                All EP ranks must agree. None uses current capacity for push and average load for pull.
+                Explicit positive values apply to either dispatch mode and retain lossless routing.
+            replica_minimum_load_reduction: Required fractional receive-peak reduction for
+                optional replicas. None requires a 40 percent reduction for each route;
+                zero preserves the earlier placement policy. Capacity-required replicas
+                remain enabled, and all ranks must agree.
+            replica_cost_model: Optional matching offline cost calibration shared by all EP ranks.
+            replica_min_rows: Soft minimum rows per copied expert, default 1024. Smaller
+                copies are retained when capacity requires them. Removing a copy can grow
+                the push receive buffer up to its theoretical bound. Calibrate the threshold
+                for the intended shape and use the same value on all EP ranks.
+            dispatch_mode: Dispatch transport, either "push" (default) or "pull".
+                Construct separate modules to switch modes; sharing requires equal modes.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             ep_group: Torch expert-parallel process group, possibly a subgroup of
@@ -276,11 +331,37 @@ class MegaMoeExperts(MulticoreModule):
         _validate_swiglu_limit(swiglu_limit)
         if swiglu_limit is not None:
             swiglu_limit = float(swiglu_limit)
+        if replica_transport not in ("p2p", "shmem", *SIGNAL_TRANSPORT_MODES):
+            raise ValueError("Unsupported replica_transport; expected p2p, shmem, shmem_signal, "
+                             "shmem_signal_sdma, shmem_signal_sdma_parallel, shmem_signal_sdma_bidir "
+                             "shmem_signal_sdma_overlap, shmem_signal_sdma_projection "
+                             "or shmem_signal_kernel_gradient")
+        replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
+        _integer(replica_min_rows, "replica_min_rows", 0)
+        if replica_target_load is not None:
+            _integer(replica_target_load, "replica_target_load", 1)
+        validate_planner_backend(replica_planner, replica_min_rows, replica_cost_model)
+        self.replica_planner = replica_planner
+        self.replica_min_rows = replica_min_rows
+        self.replica_target_load = replica_target_load
+        if replica_minimum_load_reduction is not None:
+            reduction_basis_points(replica_minimum_load_reduction)
+        self.replica_minimum_load_reduction = replica_minimum_load_reduction
+        self.replica_transport = replica_transport
+        if replica_cost_model is not None:
+            if not isinstance(replica_cost_model, ExpertReplicaCostModel):
+                raise ValueError("replica_cost_model must be an ExpertReplicaCostModel")
+            replica_cost_model.validate_execution(dispatch_mode, hidden_size, intermediate_size, ep_size,
+                                                   replica_transport)
+        self.replica_cost_model = replica_cost_model
         specification = {
             "local_num_tokens": local_num_tokens,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
-            "num_experts": num_experts,
+            "num_experts": replica_config.physical_experts,
+            "logical_num_experts": num_experts,
+            "replica_slots_per_rank": replica_slots_per_rank,
+            "replica_transport": replica_transport,
             "top_k": top_k,
             "swiglu_limit": swiglu_limit,
             "initial_capacity_factor": initial_capacity_factor,
@@ -298,6 +379,8 @@ class MegaMoeExperts(MulticoreModule):
             resource_compatibility_key=compatibility_key,
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
+        self.replica_config = replica_config
+        self.replica_slots_per_rank = replica_slots_per_rank
         self.local_num_tokens = local_num_tokens
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -486,23 +569,49 @@ class MegaMoeExperts(MulticoreModule):
             # Pull writes its permutation into SHMEM, so its lease must cover
             # route preparation as well as execution and output restoration.
             with torch.no_grad():
+                replica_route = None
+                execution_plan = resources.plan
+                execution_spec = resources.spec
+                if self.replica_slots_per_rank:
+                    target_load = self.replica_target_load
+                    if target_load is None and not pull:
+                        target_load = resources.workspace.capacity_floor
+                    admission, saved_rows = resolve_replica_admission(self.replica_minimum_load_reduction)
+                    replica_route = prepare_replica_route(
+                        topk_ids, self.replica_config, self._ep_group,
+                        target_load=target_load,
+                        minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
+                        planner_backend=self.replica_planner,
+                        minimum_load_reduction=admission, minimum_saved_rows=saved_rows,
+                        compact_home=resources.home_plan is not None,
+                    )
+                    if replica_route.home_only:
+                        execution_plan = resources.home_plan
+                        execution_spec = execution_plan.spec
+                        # Allocate using the reserved physical topology, even
+                        # when the first invocation executes only home experts.
+                        resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
+                    topk_ids = replica_route.physical_ids
+                    tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
                 route = prepare_topk_route(
                     hidden_flat,
                     topk_ids,
                     topk_weights,
-                    resources.spec,
+                    execution_spec,
                     tokens_per_expert,
                     workspace=resources.workspace,
+                    replica_route=replica_route,
                 )
             if not pull:
                 resources.ensure_capacity(route.maximum_received_slots)
+            resources.last_execution_plan = execution_plan
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,
                 weights[0],
                 weights[1],
                 route,
-                resources.plan,
+                execution_plan,
                 resources.workspace,
                 topk_weights=topk_weights if pull else None,
                 workspace_claimed=pull,

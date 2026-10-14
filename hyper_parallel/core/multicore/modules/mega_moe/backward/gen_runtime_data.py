@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
 
 def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
                           num_cube_cores: int = 24) -> RuntimeConfigC:
-    """Build backward RuntimeConfig for a single rank.
+    """Build RuntimeConfig for a single rank.
 
     Args:
         graph: Propagated backward compute graph.

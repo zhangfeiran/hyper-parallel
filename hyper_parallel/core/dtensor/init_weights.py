@@ -27,9 +27,10 @@ def init_empty_weights(include_buffers=False):
     """Context manager that initializes model parameters (and optionally
     buffers) on the meta device.
 
-    Models created under this context have no real data, which avoids allocating
-    any NPU/GPU/CPU memory.  This is useful when the model is too large to fit in RAM
-    and the weights will be loaded from a checkpoint afterwards.
+    Registered parameters have no real data. Tensor factories can still reserve
+    temporary CPU storage before registration, but deterministic empty-storage
+    filling is disabled inside this context. This is useful when the model is
+    too large to fit in RAM and weights will be initialized after sharding.
 
     Args:
         include_buffers (bool): If ``True``, buffers are also placed on the meta
@@ -40,11 +41,14 @@ def init_empty_weights(include_buffers=False):
         from hyper_parallel import init_empty_weights
 
         with init_empty_weights():
-            model = MyLargeModel()  # no memory allocated
+            model = MyLargeModel()  # parameters are registered on meta
 
     Note:
         A model initialised under this context has **no weights**.  You cannot
         call ``model.to(some_device)`` directly; load a checkpoint first.
+        CPU buffers and explicit tensor initialization can still allocate real
+        memory. Deterministic algorithms and the caller's fill policy are
+        preserved outside this context.
     """
     with _init_on_device(torch.device("meta"), include_buffers=include_buffers):
         yield

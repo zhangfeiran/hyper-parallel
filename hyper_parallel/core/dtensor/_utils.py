@@ -26,12 +26,13 @@ callers elsewhere should import from :mod:`hyper_parallel.core.utils`.
 """
 # pylint: disable=C9006,C9007
 from contextlib import contextmanager
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Union
 
 import torch
 from torch import nn
 from torch._C._distributed_c10d import ProcessGroup
 from torch.distributed.distributed_c10d import _get_default_group
+from torch.utils import deterministic
 
 import torch.distributed as dist
 
@@ -447,16 +448,26 @@ def construct_strided_slice(x, begin, end, stride):
 # ---------------------------------------------------------------------------
 
 @contextmanager
-def init_on_device(device, include_buffers=False):  # pylint: disable=W0621
+def init_on_device(
+        device: Union[str, torch.device],  # pylint: disable=redefined-outer-name
+        include_buffers: bool = False,
+) -> Iterator[None]:
     """Monkey-patch ``nn.Module`` so that every parameter (and optionally every
     buffer) is placed on *device* at registration time.
 
     Args:
         device (torch.device): Target device.
         include_buffers (bool): Also redirect buffers to *device*.
+
+    Note:
+        Meta construction temporarily disables deterministic filling of empty
+        storage before parameter registration. Deterministic algorithms remain
+        enabled, and the caller's fill policy is restored on exit.
     """
     orig_register_parameter = nn.Module.register_parameter
     orig_register_buffer = nn.Module.register_buffer
+    is_meta_device = torch.device(device).type == "meta"
+    original_fill = deterministic.fill_uninitialized_memory
 
     # pylint: disable=W0212
     def _register_parameter(module, name, param):
@@ -477,6 +488,10 @@ def init_on_device(device, include_buffers=False):  # pylint: disable=W0621
             module._buffers[name] = module._buffers[name].to(device)
 
     try:
+        if is_meta_device:
+            # Factories run before registration: filling full-size CPU weights
+            # here can exhaust RAM before they are discarded for meta tensors.
+            deterministic.fill_uninitialized_memory = False
         nn.Module.register_parameter = _register_parameter
         if include_buffers:
             nn.Module.register_buffer = _register_buffer
@@ -485,6 +500,8 @@ def init_on_device(device, include_buffers=False):  # pylint: disable=W0621
         nn.Module.register_parameter = orig_register_parameter
         if include_buffers:
             nn.Module.register_buffer = orig_register_buffer
+        if is_meta_device:
+            deterministic.fill_uninitialized_memory = original_fill
 
 
 __all__ = [

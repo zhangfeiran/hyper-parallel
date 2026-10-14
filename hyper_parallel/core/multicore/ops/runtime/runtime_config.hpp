@@ -396,6 +396,7 @@ __aicore__ inline bool isRuntimeTailValid(__gm__ uint8_t *tiling, uint64_t runti
   return required < RUNTIME_ADDRESS_SPACE_BYTES && runtime_bytes >= required;
 }
 
+
 __aicore__ inline bool isRuntimeCapacityValid(__gm__ uint8_t *tiling, uint64_t event_bytes, uint64_t capacity,
                                               uint64_t events) {
   return capacity % RUNTIME_CAPACITY_ALIGNMENT == 0 && events >= MIN_EVENT_CAPACITY &&
@@ -436,10 +437,11 @@ __aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t ru
   uint64_t capacity = getRuntimeTaskCapacity(tiling);
   uint64_t events = getRuntimeEventCapacity(tiling);
   if (!isRuntimeCapacityValid(tiling, event_bytes, capacity, events) ||
-      !isReadyHandshakeStorageValid(tiling, event_bytes, events, ep_size)) {
+      !isReadyHandshakeStorageValid(tiling, event_bytes, events, ep_size) ||
+      !isRuntimeTailValid(tiling, runtime_bytes, local_experts)) {
     return false;
   }
-  return isRuntimeTailValid(tiling, runtime_bytes, local_experts) && areTaskIndexCountsValid(tiling, capacity);
+  return areTaskIndexCountsValid(tiling, capacity);
 }
 
 template <AscendC::HardEvent event>

@@ -28,6 +28,14 @@ from hyper_parallel.distributed.expert_parallel.experts import (
     ep_routed_forward,
     require_attrs,
 )
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.expert_parallel.hot_replica.admission import reduction_basis_points
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
+from hyper_parallel.core.expert_parallel.hot_replica.native import (
+    combine_native_replicas, dispatch_native_replicas, native_replica_experts,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, stable_expert_order
+from hyper_parallel.distributed._builder.forward_rewriter import _install_bound_forward
 from hyper_parallel.distributed.recipe_spec import local_compute
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts, _swiglu_limit,
@@ -114,6 +122,38 @@ def _routed_and_shared_forward(
     return routed + module.shared_experts(hidden_states)
 
 
+def _replica_expert_forward(experts: Any, values: torch.Tensor, counts: torch.Tensor,
+                            route: ReplicaRoute) -> torch.Tensor:
+    """Read current FSDP-unsharded weights inside the experts module boundary."""
+    weights = tuple(parameter.to_local() if isinstance(parameter, DTensor) else parameter
+                    for parameter in (experts.gate_up_proj, experts.down_proj))
+    return native_replica_experts(
+        values, weights[0].transpose(1, 2).contiguous(), weights[1].transpose(1, 2).contiguous(),
+        counts, route, swiglu_limit=float(experts.limit),
+    )
+
+
+def _replica_routed_forward(module: Any, hidden_states: torch.Tensor, image_mask: torch.Tensor | None,
+                            ep_group: Any, config: ExpertReplicaConfig, reduction: float) -> torch.Tensor:
+    """Balance logical routes before any large receive activation is allocated."""
+    indices, weights = _router(module, hidden_states, image_mask)
+    states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    order = stable_expert_order(indices.reshape(-1), config.num_experts)
+    counts = torch.zeros(config.num_experts, dtype=torch.int64, device=states.device)
+    counts.scatter_add_(0, indices.reshape(-1).long(), torch.ones_like(indices.reshape(-1), dtype=torch.int64))
+    values = states[torch.div(order, indices.shape[-1], rounding_mode="floor")]
+    (values, received), state = dispatch_native_replicas(
+        (values, counts), config, ep_group, minimum_replica_rows=0, planner_backend="cpu",
+        minimum_load_reduction=reduction,
+    )
+    output = module.experts(values, received, state.route)
+    output = combine_native_replicas(output, state)
+    unsorted = torch.empty_like(output)
+    unsorted[order] = output
+    routed = (unsorted.reshape(*indices.shape, states.shape[-1]) * weights.unsqueeze(-1)).sum(dim=1)
+    return routed.to(states.dtype).reshape(hidden_states.shape) + module.shared_experts(hidden_states)
+
+
 @local_compute
 def deepseek_v41_ep_compute_fn(
         *,
@@ -123,14 +163,34 @@ def deepseek_v41_ep_compute_fn(
         cp_mesh: Any,
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
+        replica_slots_per_rank: int = 0,
+        replica_minimum_load_reduction: float = 0.0,
 ) -> Callable:
     """Build the complete V4.1 routed-plus-shared expert forward."""
-    del mesh, tp_mesh, cp_mesh
+    del mesh
     require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 EP")
     if ep_mesh is None:
         raise ValueError("DeepSeek-V4.1 EP forward requires an active ep_mesh")
     if module.is_hash:
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
+    _integer(replica_slots_per_rank, "replica_slots_per_rank", 0)
+    reduction_basis_points(replica_minimum_load_reduction)
+    if replica_slots_per_rank:
+        config = ExpertReplicaConfig(module.experts.num_experts, ep_mesh["ep"].size(), replica_slots_per_rank)
+        if any(axis is not None and axis.size() > 1 for axis in (tp_mesh, cp_mesh)):
+            raise ValueError("DSV4.1 expert replicas require TP=CP=1")
+        _install_bound_forward(module.experts, _replica_expert_forward)
+        ep_group = ep_mesh.get_group("ep")
+
+        def replica_compute_fn(module: Any, hidden_states: torch.Tensor,
+                               input_ids: torch.Tensor | None = None,
+                               image_mask: torch.Tensor | None = None) -> torch.Tensor:
+            """Preserve learned routing and shared experts with bounded guest slots."""
+            del input_ids
+            return _replica_routed_forward(module, hidden_states, image_mask, ep_group, config,
+                                           replica_minimum_load_reduction)
+
+        return replica_compute_fn
     apply_gate = (
         module.experts._apply_gate  # pylint: disable=protected-access
         if module.experts.limit > 0 else _deepseek_v41_unclamped_gate
@@ -194,9 +254,8 @@ def deepseek_v41_megamoe_compute_fn(
         raise ValueError("Routed and shared experts must have the same swiglu_limit")
     ep_group = None if ep_mesh is None else ep_mesh.get_group("ep")
     ep_size = 1 if ep_mesh is None else ep_mesh["ep"].size()
-    if dist.is_initialized() and (ep_size != dist.get_world_size() or (
-            ep_group is not None and dist.get_process_group_ranks(ep_group) != list(range(ep_size)))):
-        raise ValueError("MegaMoe requires whole-world EP in global rank order")
+    if dist.is_initialized() and dist.get_world_size(ep_group) != ep_size:
+        raise ValueError("MegaMoe EP mesh and process group sizes must match")
     module.experts.configure(ep_group, ep_size, module.gate.top_k)
 
     def compute_fn(

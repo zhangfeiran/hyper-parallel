@@ -50,6 +50,14 @@ from hyper_parallel.core.expert_parallel.static_splits import (
     static_plan_key,
     store_static_plan,
 )
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
+from hyper_parallel.core.expert_parallel.hot_replica.admission import reduction_basis_points, resolve_replica_admission
+from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
+from hyper_parallel.core.expert_parallel.hot_replica.device import validate_planner_backend
+from hyper_parallel.core.expert_parallel.hot_replica.native import (
+    dispatch_native_replicas, combine_native_replicas,
+)
+
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
     distribute_module,
@@ -81,11 +89,12 @@ class AsyncHandle:
     :meth:`wait` method that is safe to call multiple times.
     """
 
-    def __init__(self, async_tensor) -> None:
+    def __init__(self, async_tensor: object) -> None:
+        """Retain the asynchronous collective result until its first wait."""
         self._tensor = async_tensor
         self._waited = False
 
-    def wait(self):
+    def wait(self) -> object:
         """Wait for the async collective to complete.
 
         Idempotent — the first call blocks until the collective finishes;
@@ -435,6 +444,7 @@ class _DeredundencyCombineHandle(AsyncHandle):
         mesh_info: _DeredundencyMeshInfo,
         ctx: DeredundencyDispatchContext,
     ) -> None:
+        """Retain the reverse-dispatch metadata needed after collective completion."""
         super().__init__(async_tensor)
         self._mesh_info = mesh_info
         self._ctx = ctx
@@ -702,7 +712,7 @@ class AllToAllTokenDispatcher:
         return combined
 
     @staticmethod
-    def combine_start(routed_output, device_mesh, ctx):
+    def combine_start(routed_output: object, device_mesh: DeviceMesh, ctx: DispatchContext) -> AsyncHandle:
         """Launch async combine all-to-all without waiting for completion.
 
         Splits the combine into two phases so that the caller can overlap
@@ -741,7 +751,7 @@ class AllToAllTokenDispatcher:
         return AsyncHandle(combined_async)
 
     @staticmethod
-    def combine_wait(handle):
+    def combine_wait(handle: AsyncHandle) -> object:
         """Wait for the async combine all-to-all to complete.
 
         Args:
@@ -1110,10 +1120,23 @@ class ExpertParallel(BaseExpertParallel):
         >>> sharded_experts = ep_style.apply(experts_module, ep_device_mesh)
     """
 
-    def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False) -> None:
+    def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False,
+                 *, replica_slots_per_rank: int = 0,
+                 replica_min_rows: int = 0, replica_cost_model: Optional[ExpertReplicaCostModel] = None,
+                 replica_planner: str = "cpu", replica_minimum_load_reduction: Optional[float] = None) -> None:
         """Initialize ExpertParallel.
 
         Args:
+            replica_slots_per_rank: Extra execution slots per EP rank; zero disables hot replication.
+            replica_planner: Shared CPU or fused device replica quota policy.
+            replica_cost_model: Optional native/p2p offline calibration shared by all EP ranks.
+            replica_min_rows: Soft minimum rows per copied expert. Zero retains token balancing.
+                Smaller copies remain when required by the receive bound. Calibrate this
+                threshold for the intended shape; all EP ranks must use the same value.
+            replica_minimum_load_reduction: Required fractional receive-peak reduction for
+                optional replicas. None requires a 40 percent reduction for each route.
+                One uses ordinary dispatch; native receives have no fixed replica capacity.
+                Zero preserves the earlier placement policy.
             token_dispatcher: Token dispatch strategy. Supported values are
                 ``"all_to_all"`` and ``"deredundency"``.
             async_combine: If ``True``, use asynchronous combine all-to-all
@@ -1122,6 +1145,22 @@ class ExpertParallel(BaseExpertParallel):
         if isinstance(token_dispatcher, bool):
             async_combine = token_dispatcher
             token_dispatcher = "all_to_all"
+        ExpertReplicaConfig(1, 1, replica_slots_per_rank)
+        _integer(replica_min_rows, "replica_min_rows", 0)
+        validate_planner_backend(replica_planner, replica_min_rows, replica_cost_model)
+        self.replica_planner = replica_planner
+        self.replica_min_rows = replica_min_rows
+        if replica_minimum_load_reduction is not None:
+            reduction_basis_points(replica_minimum_load_reduction)
+        self.replica_minimum_load_reduction = replica_minimum_load_reduction
+        self._replicas_enabled = bool(replica_slots_per_rank and replica_minimum_load_reduction != 1.0)
+        if replica_cost_model is not None and (not isinstance(replica_cost_model, ExpertReplicaCostModel)
+                                              or replica_cost_model.backend != "native"):
+            raise ValueError("Native replicas require a native ExpertReplicaCostModel")
+        self.replica_cost_model = replica_cost_model
+        if replica_slots_per_rank and (token_dispatcher != "all_to_all" or async_combine):
+            raise ValueError("hot replicas require synchronous all_to_all token dispatch")
+        self.replica_slots_per_rank = replica_slots_per_rank
         self._dispatch_ctx: Optional[DispatchContext] = None
         self.async_combine = async_combine
         self._token_dispatcher_name = token_dispatcher
@@ -1148,6 +1187,20 @@ class ExpertParallel(BaseExpertParallel):
         # Delegate to the configured dispatcher (all_to_all or deredundency).
         # Hard-coding AllToAllTokenDispatcher here would mismatch _token_combine
         # (which uses self._token_dispatcher) and break deredundency.
+        # Dispatch state belongs to the module, matching the existing EP hook contract.
+        # pylint: disable=W0212
+        if self._replicas_enabled:
+            config = ExpertReplicaConfig(inputs[1].numel(), device_mesh.size(), self.replica_slots_per_rank)
+            if self.replica_cost_model is not None:
+                self.replica_cost_model.validate_execution(
+                    "native", module.w1.shape[-1], module.w1.shape[-2], device_mesh.size(), "p2p")
+            routed, state = dispatch_native_replicas(
+                inputs, config, device_mesh.get_group(),
+                minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
+                planner_backend=self.replica_planner,
+                minimum_load_reduction=resolve_replica_admission(self.replica_minimum_load_reduction)[0])
+            module._hot_replica_dispatch = state
+            return routed
         dispatch_result = self._token_dispatcher.dispatch(module, inputs, device_mesh)
         ctx = dispatch_result[-1]
         # Store context in module attribute for _token_combine to read.
@@ -1187,6 +1240,8 @@ class ExpertParallel(BaseExpertParallel):
         """
         # Read dispatch context from module attribute set by _token_dispatch.
         # pylint: disable=W0212
+        if self._replicas_enabled:
+            return combine_native_replicas(routed_output, module._hot_replica_dispatch)
         ctx = getattr(module, "_ep_dispatch_ctx", None)
         if ctx is None:
             raise RuntimeError(

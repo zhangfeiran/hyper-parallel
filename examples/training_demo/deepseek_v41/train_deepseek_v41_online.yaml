@@ -63,11 +63,13 @@ plan_overrides:
   # Optional MegaMoe: uncomment this replacement AND change the MoE
   # local_compute_fn below to deepseek_v41_megamoe_compute_fn (remove when: ep
   # and use_grouped_gemm, which belongs to the native compute target).
-  # Requires TP=CP=PP=1 and whole-world EP; local_num_tokens is fixed capacity.
+  # Requires TP=CP=PP=1; supports ordered EP subgroups; local_num_tokens is fixed capacity.
   # - match: "*.mlp.experts"
   #   module_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts
   #   replace_module:
   #     _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
+  #     replica_slots_per_rank: 6  # EP64/E384 cluster default; B=0 disables copies.
+  #     replica_minimum_load_reduction: 0.0
   #     local_num_tokens: 4096
   #     dispatch_mode: push  # Use pull for SHMEM get-based dispatch.
   #     initial_capacity_factor: null  # Push default: 1.25; omit for pull.

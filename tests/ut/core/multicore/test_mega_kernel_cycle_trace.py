@@ -100,6 +100,19 @@ def _parse(buffer: bytes, *, detailed_task_names: bool = False, aiv_capacity: in
 class TestMegaKernelCycleTrace(unittest.TestCase):
     """Validate schema, timing, naming, fallback, and corruption checks."""
 
+    def test_parse_aiv_tail_above_former_limit(self) -> None:
+        """Decode the 257th vector record instead of silently dropping the tail."""
+        buffer = bytearray(_profile_buffer_bytes_for_capacities(16, 272))
+        offset = _slot_offset(2, 0)
+        CORE_HEADER.pack_into(buffer, offset, 100, 257, 0, 2, 0, 272, 0)
+        for index in range(257):
+            PROFILE_RECORD.pack_into(buffer, offset + CORE_HEADER.size + index * PROFILE_RECORD.size,
+                                     110 + index * 2, 111 + index * 2, 0x10002, index, index, INVALID_OWNER_ID)
+        trace = _parse(buffer, aiv_capacity=272)
+        events = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+        self.assertEqual((len(events), events[-1]["args"]["task_id"]), (257, 256))
+        self.assertEqual(trace["megaKernelCycleTrace"]["droppedRecordCount"], 0)
+
     def test_parse_converts_cycles_and_preserves_raw_identifiers(self):
         """Convert 50 MHz cycles to microseconds and keep raw record fields."""
         trace = _parse(_profile_buffer())

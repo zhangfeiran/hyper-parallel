@@ -155,7 +155,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the minimal optimizer benchmark interface.
 
     Args:
-        argv: Optional command-line arguments; ``None`` reads the process arguments.
+        argv: Optional command-line arguments, defaulting to the process arguments.
+
+    Returns:
+        Validated optimizer and communication options.
     """
     parser = argparse.ArgumentParser(
         description="Run an eight-NPU Qwen MoE optimizer-step benchmark.",

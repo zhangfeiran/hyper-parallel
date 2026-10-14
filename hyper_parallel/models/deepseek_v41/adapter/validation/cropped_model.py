@@ -258,6 +258,8 @@ def build_deepseek_v41_validation_config(
         enable_vision: bool = False,
         vision_parameter_divisor: int = 4,
         num_routed_experts: int = 16,
+        num_hidden_layers: int | None = None,
+        vision_num_hidden_layers: int | None = None,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
 ) -> DeepseekV4Config:
@@ -271,13 +273,15 @@ def build_deepseek_v41_validation_config(
             width. Per-head dimensions and the grouped-output partition count
             stay unchanged so attention semantics and supported TP degrees are
             preserved. Decoder depth and layer roles are always inherited from
-            the released config.
+            the released config unless num_hidden_layers is supplied.
         enable_vision: Enable the native multimodal branch. Its released depth
             is retained when enabled.
         vision_parameter_divisor: Uniform divisor for vision hidden, MLP, and
             attention-head dimensions.
         num_routed_experts: Routed-expert count for the parameter crop. Routing
             top-k and every released MoE layer are retained.
+        num_hidden_layers: Optional prefix depth for full-width cluster bring-up, at least four.
+        vision_num_hidden_layers: Optional vision prefix depth for cluster bring-up.
         exercise_post_training_indexer: Bound the candidate pool so a 4K smoke
             exercises candidate selection before the released Reindex layers.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient. The released
@@ -308,6 +312,28 @@ def build_deepseek_v41_validation_config(
         indexer_loss_coeff,
     )
     _apply_v41_vision_fields(config, source, enable_vision, vision_parameter_divisor)
+    if num_hidden_layers is not None:
+        if (isinstance(num_hidden_layers, bool) or not isinstance(num_hidden_layers, int)
+                or not 4 <= num_hidden_layers <= released_hidden_layers):
+            raise ValueError("num_hidden_layers must be between four and the released depth")
+        if exercise_post_training_indexer:
+            raise ValueError("Depth crops require exercise_post_training_indexer=False")
+        config.num_hidden_layers = num_hidden_layers
+        config.layer_types = config.layer_types[:num_hidden_layers]
+        config.mlp_layer_types = config.mlp_layer_types[:num_hidden_layers]
+        config.v41_compress_ratios = config.v41_compress_ratios[:num_hidden_layers]
+        for name in ("v41_kv_source_layer_ids", "v41_index_source_layer_ids"):
+            setattr(config, name, [layer for layer in getattr(config, name) if layer < num_hidden_layers])
+        if config.v41_candidate_source_layer_id >= num_hidden_layers:
+            config.v41_candidate_source_layer_id = -1
+        retained = [index for index, layer in enumerate(config.v41_engram_layer_ids) if layer < num_hidden_layers]
+        config.v41_engram_layer_ids = [config.v41_engram_layer_ids[index] for index in retained]
+        config.v41_engram_num_embeddings = [config.v41_engram_num_embeddings[index] for index in retained]
+    if vision_num_hidden_layers is not None:
+        if (isinstance(vision_num_hidden_layers, bool) or not isinstance(vision_num_hidden_layers, int)
+                or not 1 <= vision_num_hidden_layers <= config.v41_vision_num_hidden_layers):
+            raise ValueError("vision_num_hidden_layers must be between one and the released depth")
+        config.v41_vision_num_hidden_layers = vision_num_hidden_layers
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     return config
 
@@ -319,6 +345,8 @@ def build_cropped_deepseek_v41(
         enable_vision: bool = False,
         vision_parameter_divisor: int = 4,
         num_routed_experts: int = 16,
+        num_hidden_layers: int | None = None,
+        vision_num_hidden_layers: int | None = None,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
         torch_dtype: str = "bfloat16",
@@ -340,6 +368,8 @@ def build_cropped_deepseek_v41(
         enable_vision: Enable the full-depth, parameter-scaled visual tower.
         vision_parameter_divisor: Uniform visual-dimension divisor.
         num_routed_experts: Routed-expert count for the parameter crop.
+        num_hidden_layers: Optional language prefix depth, otherwise retain the released depth.
+        vision_num_hidden_layers: Optional vision prefix depth, otherwise retain the released depth.
         exercise_post_training_indexer: Exercise the released Full/Reindex
             hierarchy at its native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
@@ -363,6 +393,8 @@ def build_cropped_deepseek_v41(
         enable_vision=enable_vision,
         vision_parameter_divisor=vision_parameter_divisor,
         num_routed_experts=num_routed_experts,
+        num_hidden_layers=num_hidden_layers,
+        vision_num_hidden_layers=vision_num_hidden_layers,
         exercise_post_training_indexer=exercise_post_training_indexer,
         indexer_loss_coeff=indexer_loss_coeff,
     )

@@ -119,4 +119,4 @@ class CycleTraceRecorder {
 
 }  // namespace MulticoreRuntime
 
-#endif  // MULTICORE_SCHEDULER_CYCLE_TRACE_RECORDER_H
+#endif  // HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_CYCLE_TRACE_RECORDER_H_

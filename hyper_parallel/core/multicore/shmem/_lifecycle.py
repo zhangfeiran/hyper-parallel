@@ -239,8 +239,6 @@ def _runtime_access(function):
 def _reconfiguration():
     """Serialize managed teardown with allocation and lifecycle API calls."""
     with _lock:
-        if _shutdown_failed:
-            raise RuntimeError("SHMEM Runtime is unsafe after a shutdown or reconfiguration failure")
         yield
 
 
