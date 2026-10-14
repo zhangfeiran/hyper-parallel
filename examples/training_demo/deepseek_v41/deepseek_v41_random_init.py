@@ -13,8 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Generate topology-independent canonical random shards without weight files."""
+# pylint: disable=forbidden-backend-import
 
-import hashlib
 import math
 from typing import Any
 
@@ -22,22 +22,11 @@ import numpy as np
 import torch
 
 from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
+from hyper_parallel.core.utils.random_init import canonical_normal
+from hyper_parallel.models.external_state import get_model_external_state
 
 
 _CHUNK_ELEMENTS = 1 << 20
-
-
-def canonical_normal(indices: np.ndarray, name: str, seed: int, std: float) -> np.ndarray:
-    """Map canonical global element indices to reproducible normal FP32 values."""
-    key = int.from_bytes(hashlib.sha256(f"{seed}:{name}".encode()).digest()[:8], "little")
-    with np.errstate(over="ignore"):
-        bits = indices.astype(np.uint64) + np.uint64(key)
-        bits = (bits ^ (bits >> 30)) * np.uint64(0xBF58476D1CE4E5B9)
-        bits = (bits ^ (bits >> 27)) * np.uint64(0x94D049BB133111EB)
-        bits ^= bits >> 31
-    first = ((bits >> 32).astype(np.float64) + 0.5) / 2**32
-    second = ((bits & np.uint64(0xFFFFFFFF)).astype(np.float64) + 0.5) / 2**32
-    return (np.sqrt(-2 * np.log(first)) * np.cos(2 * np.pi * second) * std).astype(np.float32)
 
 
 def canonical_indices(start: int, count: int, shape: tuple[int, ...],
@@ -67,6 +56,8 @@ def initialize_random_shards(trainer: Any, *, seed: int, backend: str, std: floa
     and biases, mHC bases and attention sinks keep zeros. Persistent model buffers
     retain the builder's deterministic values. Only bounded CPU chunks are used.
     """
+    external = get_model_external_state(trainer.base.model)
+    host_tables = {id(table.weight): table for table in external.tables.values()} if external else {}
     count = 0
     signature = np.uint64(0)
     with torch.no_grad():
@@ -76,7 +67,13 @@ def initialize_random_shards(trainer: Any, *, seed: int, backend: str, std: floa
                 raise ValueError(f"Random initialization requires contiguous storage: {name}")
             shape = tuple(parameter.shape)
             layout = getattr(parameter, "layout", None)
-            if hasattr(layout, "rank_list"):
+            if id(parameter) in host_tables:
+                table = host_tables[id(parameter)]
+                if table.global_row_start is None or table.rows_per_owner is None:
+                    raise RuntimeError(f"Host table is not bound before random initialization: {name}")
+                shape = (table.physical_rows, table.width)
+                area = ((table.global_row_start, table.global_row_start + table.rows_per_owner), (0, table.width))
+            elif hasattr(layout, "rank_list"):
                 area = infer_slice_area_by_layout(layout, layout.rank_list.index(layout.mesh.rank), shape)
             else:
                 area = tuple((0, size) for size in shape)
