@@ -37,6 +37,19 @@ class TestMegaMoeFunction(unittest.TestCase):
 
     # pylint: disable=protected-access
 
+    def test_empty_native_source_preserves_symmetric_storage(self) -> None:
+        """Empty pull ranks must retain the symmetric base used to address remote ranks."""
+        storage = torch.arange(32).reshape(8, 4)
+        empty_source = storage[:0]
+        native_source = function_module._native_source(empty_source)
+        self.assertEqual(native_source.data_ptr(), storage.data_ptr())
+        torch.testing.assert_close(native_source, storage[:1])
+        self.assertEqual(tuple(empty_source.shape), (0, 4))
+        ordinary_empty = torch.empty(0, 4)
+        placeholder = function_module._native_source(ordinary_empty)
+        self.assertEqual(tuple(placeholder.shape), (1, 4))
+        self.assertNotEqual(placeholder.data_ptr(), 0)
+
     def test_backward_unpacks_saved_tensors_once(self) -> None:
         """Checkpoint unpack hooks must only be consumed once per backward call."""
         tensors = tuple(torch.ones(1) for _ in range(13))
