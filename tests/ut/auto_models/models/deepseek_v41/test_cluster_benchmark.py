@@ -98,6 +98,10 @@ class TestClusterRecipe(unittest.TestCase):
                                 self.assertEqual(moe["replica_slots_per_rank"], 0)
                             if modality == "text":
                                 self.assertIsNone(recipe["model"]["vision_num_hidden_layers"])
+                                self.assertFalse(any(entry["match"] == "dspark"
+                                                     or entry["match"].startswith("dspark.")
+                                                     for entry in recipe["plan_overrides"]
+                                                     if isinstance(entry["match"], str)))
                             else:
                                 expected = 1 if packing == "dynamic" else 4096
                                 self.assertEqual(recipe["dataloader"]["token_budget"], expected)

@@ -50,6 +50,11 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
     modality = getattr(args, "modality", "vlm")
     filename = "train_deepseek_v41_vlm_online.yaml" if modality == "vlm" else "train_deepseek_v41_online.yaml"
     recipe = yaml.safe_load(Path(__file__).with_name(filename).read_text(encoding="utf-8"))
+    # Exact FQNs are validated even when the optional drafter is absent.
+    if recipe["model"].get("dspark_depth", 0) == 0:
+        recipe["plan_overrides"] = [entry for entry in recipe["plan_overrides"]
+                                    if not isinstance(entry["match"], str)
+                                    or (entry["match"] != "dspark" and not entry["match"].startswith("dspark."))]
     recipe["model"].update(config_path=args.model_dir, engram_assets_path=args.engram_assets,
                           num_routed_experts=args.experts, root_owned_vision=modality == "vlm")
     recipe["model_init_dtype"] = "float32"
