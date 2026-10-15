@@ -42,10 +42,12 @@ class TestRouteDiagnostics(unittest.TestCase):
     def test_records_actual_rows_and_removes_hooks(self) -> None:
         """Changing local token lengths must be reflected without altering outputs."""
         model = torch.nn.Module()
+        model.config = SimpleNamespace(num_experts_per_tok=2)
         model.layer = torch.nn.Module()
         model.layer.mlp = torch.nn.Sequential(torch.nn.Identity())
         model.layer.mlp.gate = torch.nn.Identity()
-        diagnostics = _RouteDiagnostics(model)
+        model.layer.mlp.experts = torch.nn.Identity()
+        diagnostics = _RouteDiagnostics(model, False)
         for rows in (0, 7, 13):
             inputs = torch.ones(rows, 4)
             self.assertIs(model.layer.mlp(inputs), inputs)
@@ -93,7 +95,7 @@ class TestClusterRecipe(unittest.TestCase):
                                 moe = next(item for item in replacements
                                            if item["_target_"].endswith("DeepseekV41MegaMoeExperts"))
                                 self.assertEqual(moe["local_num_tokens"], 4096)
-                                self.assertNotIn("replica_slots_per_rank", moe)
+                                self.assertEqual(moe["replica_slots_per_rank"], 0)
                             if modality == "text":
                                 self.assertIsNone(recipe["model"]["vision_num_hidden_layers"])
                             else:

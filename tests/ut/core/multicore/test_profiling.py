@@ -22,8 +22,12 @@ from typing import Any
 import unittest
 from unittest.mock import patch
 
-from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
-from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
+    build_backward_graph,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
+    build_forward_graph,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.profiling import (
     MEGA_MOE_PROFILE_OWNER_LABEL,
     _configure_mega_moe_profile_metadata,
@@ -42,13 +46,15 @@ from hyper_parallel.core.multicore.modules.mega_gate.profiling import (
     MEGA_GATE_ROUTE_STAGE_NAMES,
 )
 from hyper_parallel.core.multicore.profiler.profiling import (
+    DEFAULT_STAGE_NAMES,
     GRAPH_STAGE_DESC_BASE,
     MAX_PROFILE_BUFFER_BYTES,
-    _ProfileSpec,
     _apply_mega_kernel_profile_graph,
     _calculate_profile_layout,
+    _duration_trace_event,
     _get_mega_kernel_profile_metadata,
     _prepare_mega_kernel_runtime_config,
+    _ProfileSpec,
     _resolve_cycle_frequency_mhz,
     _set_mega_kernel_profile_metadata,
 )
@@ -74,10 +80,16 @@ def _runtime_config(task_capacity: int = 16) -> RuntimeConfigC:
     return allocate_runtime_config(task_capacity)
 
 
-def _three_record_task() -> TaskDescC:
+def _four_record_task() -> TaskDescC:
     task = TaskDescC()
     task.task_type = TaskType.TASK_GROUPED_MATMUL
     task.dependent_event = 0
+    return task
+
+
+def _three_record_task() -> TaskDescC:
+    task = _four_record_task()
+    task.task_type = TaskType.TASK_SWI_GLU
     return task
 
 
@@ -108,6 +120,38 @@ def _add_profile_op(
 
 class TestMegaKernelProfilingMetadata(unittest.TestCase):
     """Validate graph-driven stage and owner resolution."""
+
+    def test_replica_return_records_do_not_inherit_graph_task_zero(self) -> None:
+        """Synthetic return work identifies its peer without borrowing a Cube task's stage."""
+        record = {"desc_id": 0x10008, "task_id": 0, "core_type": 2, "block_id": 2,
+                  "stage_task_index": 3, "owner_id": 0, "start_cycle": 1000,
+                  "end_cycle": 1100, "entry_cycle": 900}
+        event = _duration_trace_event(record, rank=0, device_id=0, anchor_cycle=900,
+                                      cycle_frequency_mhz=50, detailed_task_names=True,
+                                      owner_label="Expert", stage_names=DEFAULT_STAGE_NAMES,
+                                      task_stage_names={0: "W2Grad"})
+        self.assertEqual(event["args"]["task_stage"], "ReplicaW2Return")
+        self.assertEqual(event["args"]["peer_rank"], 3)
+        self.assertEqual(event["args"]["core_type"], "AIV")
+        self.assertIn("ReplicaW2Return", event["name"])
+        self.assertEqual(event["dur"], 2)
+
+    def test_replica_ready_wait_keeps_epoch_projection_and_consumer(self) -> None:
+        """Wait records must not mistake a guest slot for a logical expert or epoch for task index."""
+        for desc, projection in ((0x1000A, "W13"), (0x1000B, "W2")):
+            record = {"desc_id": desc, "task_id": 7, "core_type": 1, "block_id": 2,
+                      "stage_task_index": 2147483646, "owner_id": 3, "start_cycle": 1000,
+                      "end_cycle": 1100, "entry_cycle": 900}
+            event = _duration_trace_event(record, rank=0, device_id=0, anchor_cycle=900,
+                                          cycle_frequency_mhz=50, detailed_task_names=True,
+                                          owner_label="Expert", stage_names=DEFAULT_STAGE_NAMES,
+                                          task_stage_names={7: "GMM1"})
+            self.assertEqual(event["args"]["replica_slot"], 3)
+            self.assertEqual(event["args"]["epoch"], 2147483646)
+            self.assertEqual(event["args"]["projection"], projection)
+            self.assertEqual(event["args"]["consumer_stage"], "GMM1")
+            self.assertNotIn("owner_id", event["args"])
+            self.assertEqual(event["dur"], 2)
 
     def test_graph_serializes_stage_names_and_owner_ids(self):
         """Use graph task ranges and prefer an explicit diagnostic name."""
@@ -242,8 +286,8 @@ class TestMegaKernelProfilingMetadata(unittest.TestCase):
         _add_profile_op(graph, "second", task_num=1, diagnostic_name="Duplicate")
         runtime_config = _runtime_config()
         runtime_config.task_num = 2
-        runtime_config.all_tasks[0] = _three_record_task()
-        runtime_config.all_tasks[1] = _three_record_task()
+        runtime_config.all_tasks[0] = _four_record_task()
+        runtime_config.all_tasks[1] = _four_record_task()
 
         _apply_mega_kernel_profile_graph(
             runtime_config,
@@ -316,18 +360,34 @@ class TestMegaKernelProfilingMetadata(unittest.TestCase):
 class TestMegaKernelProfileLayout(unittest.TestCase):
     """Validate exact bounded AIC/AIV buffer sizing."""
 
+    def test_reserved_gradient_workers_cover_high_fanout(self) -> None:
+        """Both W2/W13 emit one record per replica outside the vector task queue."""
+        runtime_config = _runtime_config(128)
+        runtime_config.num_workers = 48
+        for peers in (7, 31, 63):
+            with self.subTest(peers=peers):
+                runtime = _prepare_mega_kernel_runtime_config(
+                    runtime_config, tensor_factory=lambda data: data, profile_tensor_factory=lambda data: data,
+                    rank=0, device="cpu", device_id=0, replica_gradient_records=2 * peers,
+                )
+                self.assertGreaterEqual(runtime_config.aiv_profile_record_capacity, 2 * peers)
+                self.assertIsNotNone(runtime.normal_tensor)
+        for invalid in (-1, True, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "nonnegative integer"):
+                _calculate_profile_layout(runtime_config, replica_gradient_records=invalid)
+
     def test_layout_rounds_busiest_workers_to_sixteen_records(self):
         """Mirror Device round-robin assignment for AIC and AIV independently."""
         runtime_config = _runtime_config(128)
         runtime_config.num_workers = 48
-        runtime_config.all_tasks[0] = _three_record_task()
+        runtime_config.all_tasks[0] = _four_record_task()
         runtime_config.task_index_num[0] = 121
         runtime_config.task_index_num[1] = 24
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 18)
-        self.assertEqual(layout.aiv_required_records, 3)
+        self.assertEqual(layout.aic_required_records, 24)
+        self.assertEqual(layout.aiv_required_records, 4)
         self.assertEqual(layout.aic_record_capacity, 32)
         self.assertEqual(layout.aiv_record_capacity, 16)
         self.assertEqual(layout.buffer_size, 53760)

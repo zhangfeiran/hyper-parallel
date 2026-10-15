@@ -25,6 +25,12 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
+    GRADIENT_BAND_TRANSPORT,
+    KERNEL_GRADIENT_TRANSPORT_MODES,
+    SignalReplicaTransport,
+    signal_storage_bytes,
+)
 from hyper_parallel.core.multicore import _automatic, shmem
 from hyper_parallel.core.multicore.scheduler.config import (
     MIN_EVENT_CAPACITY,
@@ -32,7 +38,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
     mega_moe_event_capacity,
 )
 
-from .spec import MegaMoeSpec, _resolve_receive_capacity
+from .spec import MegaMoeSpec, initial_receive_capacity
 
 # The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
 # tensor arguments. Keep non-empty ABI placeholders; native tiling reserves
@@ -41,7 +47,7 @@ _GMM_WORKSPACE_BYTES = 512
 _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
 _SYMMETRIC_FIELDS = ("source_buffer", "expert_buffer", "routed_buffer",
-                     "forward_event_counters", "backward_event_counters")
+                     "forward_event_counters", "backward_event_counters", "replica_inbox")
 
 
 def _spec_workspace_bytes(
@@ -50,11 +56,7 @@ def _spec_workspace_bytes(
     """Return planned symmetric bytes for one execution-resource group."""
     local_tokens = specification["local_num_tokens"]
     routed_slots = local_tokens * specification["top_k"]
-    capacity = _resolve_receive_capacity(
-        specification["initial_capacity_factor"],
-        routed_slots,
-        specification["ep_size"],
-    )
+    capacity = initial_receive_capacity(specification)
     if receive_capacity is not None:
         capacity = receive_capacity
     if specification.get("dispatch_mode", "push") == "pull":
@@ -63,7 +65,22 @@ def _spec_workspace_bytes(
         (capacity + routed_slots) * specification["hidden_size"] * element_size
     )
     event_bytes = event_workspace_bytes(specification["ep_size"], specification["num_experts"])
-    return tensor_bytes + 2 * event_bytes + 4 * (_WORKSPACE_ALIGNMENT - 1)
+    replica_bytes = _replica_inbox_bytes(specification)
+    return tensor_bytes + 2 * event_bytes + 4 * (_WORKSPACE_ALIGNMENT - 1) + replica_bytes
+
+
+def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
+    """Reserve bounded replica storage, including symmetric alignment padding."""
+    budget = specification.get("replica_slots_per_rank", 0)
+    mode = specification.get("replica_transport", "p2p")
+    if not budget or mode == "p2p":
+        return 0
+    hidden, intermediate = specification["hidden_size"], specification["intermediate_size"]
+    if mode not in KERNEL_GRADIENT_TRANSPORT_MODES:
+        raise ValueError("Unsupported replica_transport; expected p2p or a kernel-gradient transport")
+    size = signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)), budget,
+                                specification["ep_size"], 2, gradient_bands=mode == GRADIENT_BAND_TRANSPORT)
+    return size + _WORKSPACE_ALIGNMENT - 1
 
 
 @dataclass
@@ -81,9 +98,12 @@ class MegaMoeWorkspace:
     routed_buffer: Any | None = None
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
+    replica_inbox: Any | None = None
+    replica_provider: Any | None = None
     gmm_workspace: Any | None = None
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
+    replica_runtime_images: dict[int, tuple[Any, bytes, Any]] = field(default_factory=dict, repr=False)
     in_use: bool = False
     closing: bool = False
     used: bool = False
@@ -181,6 +201,8 @@ class MegaMoeWorkspace:
                 dtype=torch.uint8,
                 alignment=_WORKSPACE_ALIGNMENT,
             )
+            if spec.replica_slots_per_rank and spec.replica_transport != "p2p":
+                self._allocate_replica_storage(spec)
             self.gmm_workspace = torch.empty(
                 (_GMM_WORKSPACE_BYTES,),
                 dtype=torch.uint8,
@@ -196,6 +218,16 @@ class MegaMoeWorkspace:
             self._free_symmetric_tensors()
             self._free_local_tensors()
             raise
+
+    def _allocate_replica_storage(self, spec: MegaMoeSpec) -> None:
+        """Recreate provider state with the new symmetric heap generation."""
+        shapes = ((spec.hidden_size, 2 * spec.intermediate_size), (spec.intermediate_size, spec.hidden_size))
+        size = signal_storage_bytes(shapes, spec.replica_slots_per_rank, spec.ep_size, 2,
+                                    gradient_bands=spec.replica_transport == GRADIENT_BAND_TRANSPORT)
+        self.replica_inbox = shmem.empty((size,), dtype=torch.uint8, alignment=_WORKSPACE_ALIGNMENT)
+        self.replica_provider = SignalReplicaTransport(shmem, self.replica_inbox,
+                                                      spec.replica_slots_per_rank, spec.ep_size,
+                                                      gradient_bands=spec.replica_transport == GRADIENT_BAND_TRANSPORT)
 
     def prepare_event_counters(self, *, forward: bool) -> Any:
         """Reset per-call counters while preserving the ready generation."""
@@ -251,18 +283,11 @@ class MegaMoeWorkspace:
     def _free_symmetric_tensors(self) -> None:
         """Free each unique SHMEM allocation and invalidate its tensor view."""
         if self.closing:
-            remaining = tuple(tensor is not None for tensor in (
-                self.source_buffer, self.expert_buffer, self.routed_buffer,
-                self.forward_event_counters, self.backward_event_counters))
+            remaining = tuple(getattr(self, name) is not None for name in _SYMMETRIC_FIELDS)
             if any(peer != remaining for peer in _automatic.exchange(remaining)):
                 raise RuntimeError("partial symmetric teardown differs across ranks; restart the process")
-        for field_name in (
-            "source_buffer",
-            "expert_buffer",
-            "routed_buffer",
-            "forward_event_counters",
-            "backward_event_counters",
-        ):
+        self.replica_provider = None
+        for field_name in _SYMMETRIC_FIELDS:
             tensor = getattr(self, field_name)
             if tensor is None:
                 continue
@@ -275,6 +300,9 @@ class MegaMoeWorkspace:
 
     def _free_local_tensors(self) -> None:
         """Release local-only workspaces after all queued kernels complete."""
+        for _, _, image in self.replica_runtime_images.values():
+            image.untyped_storage().resize_(0)
+        self.replica_runtime_images.clear()
         for field_name in ("gmm_workspace", "swiglu_grad_workspace"):
             tensor = getattr(self, field_name)
             if tensor is None:
@@ -294,16 +322,9 @@ class MegaMoeWorkspace:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
             if not for_rebuild and not self.can_close():
                 raise RuntimeError("cannot close MegaMoe workspace while backward graphs still need its buffers.")
-            empty = all(tensor is None for tensor in (
-                self.source_buffer,
-                self.expert_buffer,
-                self.routed_buffer,
-                self.forward_event_counters,
-                self.backward_event_counters,
-                self.gmm_workspace,
-                self.swiglu_grad_workspace,
-                self.completion_event,
-            ))
+            empty = all(getattr(self, name) is None for name in (
+                *_SYMMETRIC_FIELDS, "gmm_workspace", "swiglu_grad_workspace", "completion_event",
+            )) and not self.replica_runtime_images
             self.closing = True
         # An empty rank must still participate when peers retain buffers after a failure.
         if all(_automatic.exchange(empty)):

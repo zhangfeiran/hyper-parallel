@@ -198,7 +198,17 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           value = value - grouped_list_tensor.GetValue(data_index - 1);
           start = grouped_list_tensor.GetValue(data_index - 1);
         }
+        uint32_t band_output_rows = 0, band_rows = 0;
+        int32_t band_epoch = 0;
+        GM_ADDR band_flags = this->GetGradientBandProduction(
+            task_desc.outputs[0].input_position, data_index, &band_output_rows, &band_rows, &band_epoch);
         if (value == 0) {
+          if (band_flags != nullptr) {
+            MulticoreRuntime::GradientBandProducer producer;
+            producer.Set(band_flags, band_epoch, band_rows);
+            producer.Begin(band_output_rows, this->worker_id_, this->core_num);
+            producer.PublishEmpty();
+          }
           return;
         }
         for (uint32_t i = 0; i < expert_num_single_rank; i++) {
@@ -209,6 +219,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           } else {
             grouped_list_tensor_real.SetValue(i, 0);
           }
+        }
+        if (this->home_experts_ > 0) {
+          grouped_list_tensor_real.SetValue(0, value);
         }
         cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
 
@@ -226,6 +239,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
           cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
         }
+        if (this->home_experts_ > 0) {
+          tilingdata_data->gmmBaseParams.groupNum = 1;
+          cacheWriteThrough(tiling_data_addr, sizeof(tilingdata_data->gmmBaseParams));
+        }
         PipeBarrier<PIPE_ALL>();
 
         int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
@@ -238,12 +255,29 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                                     ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
                                     : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
 
+        GM_ADDR weight_base = input_list[task_desc.inputs[1].input_position];
+        GM_ADDR output_base = input_list[task_desc.outputs[0].input_position];
+        if (this->home_experts_ > 0) {
+          if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[0].dim[1]) *
+                                         task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
+            const uint32_t position = task_desc.outputs[0].input_position;
+            output_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 18 ? 2 : 3);
+            output_0_offset = 0;
+          } else {
+            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
+                                         task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+            const uint32_t position = task_desc.inputs[1].input_position;
+            weight_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 11 ? 0 : 1);
+          }
+        }
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + input_1_offset, nullptr, nullptr, nullptr,
+                       weight_base + input_1_offset, nullptr, nullptr, nullptr,
                        nullptr, nullptr, grouped_list_real, nullptr,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
+                       output_base + output_0_offset, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
-                       getTransposeData(task_desc.inputs[1].transpose_flag));
+                       getTransposeData(task_desc.inputs[1].transpose_flag),
+                       task_desc.outputs[0].data_type == sizeof(float), band_flags, band_epoch, band_rows);
       }
       return;
     }

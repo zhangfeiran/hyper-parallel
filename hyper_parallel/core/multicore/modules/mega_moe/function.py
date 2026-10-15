@@ -16,18 +16,33 @@
 
 from __future__ import annotations
 
+import struct
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 import torch_npu
 
+from hyper_parallel.core.expert_parallel.hot_replica._metadata import (
+    _async_device_bytes,
+    _copy_device_bytes,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.transport import (
+    prefetch_weights,
+    return_gradients,
+)
 from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan, record_plan_stream
+from .kernel_gradients import (
+    prepare_kernel_gradient_return,
+)
 from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
+
+_RUNTIME_IMAGE_CACHE_LIMIT = 12
 
 
 @dataclass(frozen=True)
@@ -78,6 +93,7 @@ class _ForwardExecution:
     profile_call: Any
     gmm_workspace: Any
     intermediates: _ForwardIntermediates
+    runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +106,7 @@ class _BackwardExecution:
     gmm_workspace: Any
     swiglu_workspace: Any
     intermediates: _BackwardIntermediates
+    runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -155,7 +172,8 @@ def _allocate_backward_intermediates(
     reusable_dispatch: Any | None = None,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    grad_weight2 = torch.zeros_like(weight2)
+    gradient_dtype = torch.float32 if spec.replica_slots_per_rank else weight2.dtype
+    grad_weight2 = torch.zeros_like(weight2, dtype=gradient_dtype)
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -172,7 +190,7 @@ def _allocate_backward_intermediates(
         device=grad_output.device,
     )
     # Empty experts must retain exact zero gradients on the baseline kernel.
-    grad_weight1 = torch.zeros_like(weight1)
+    grad_weight1 = torch.zeros_like(weight1, dtype=gradient_dtype)
     return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
 
 
@@ -203,6 +221,7 @@ def _prepare_forward_execution(
             source=source,
             combine=combine,
             profile_call=profile_call,
+            runtime_cache=workspace.replica_runtime_images if profile_call.runtime is None else None,
             gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
             intermediates=_allocate_forward_intermediates(
                 plan.spec,
@@ -222,6 +241,9 @@ def _prepare_backward_execution(
     plan: MegaMoePlan,
     saved: _SavedBackwardState,
     grad_output: Any,
+    *,
+    has_replica_transfers: bool = True,
+    overlap_w13: bool = True,
 ) -> _BackwardExecution:
     """Resolve workspace, profiler, and intermediate tensors for backward."""
     if plan.spec.dispatch_mode == "pull":
@@ -232,8 +254,15 @@ def _prepare_backward_execution(
     profile_call = None
     try:
         events = workspace.prepare_event_counters(forward=False)
+        runtime = plan.bwd_runtime
+        reuse_dispatch = plan.reuse_backward_dispatch
+        if not has_replica_transfers or not overlap_w13:
+            fallback = getattr(plan, "bwd_runtime_no_replica", None)
+            if fallback is not None:
+                runtime = fallback
+                reuse_dispatch = getattr(plan, "bwd_runtime_no_replica_reuse_dispatch", False)
         profile_call = prepare_mega_kernel_call(
-            plan.bwd_runtime,
+            runtime,
             direction="backward",
             fallback_event_counters=events,
         )
@@ -241,6 +270,7 @@ def _prepare_backward_execution(
             dispatch=dispatch,
             grad_x=grad_x,
             profile_call=profile_call,
+            runtime_cache=workspace.replica_runtime_images if profile_call.runtime is None else None,
             gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
             swiglu_workspace=_workspace_tensor(
                 workspace.swiglu_grad_workspace,
@@ -252,7 +282,7 @@ def _prepare_backward_execution(
                 grad_output,
                 saved.weight1,
                 saved.weight2,
-                dispatch[:saved.dispatch.shape[0]] if plan.reuse_backward_dispatch else None,
+                dispatch[:saved.dispatch.shape[0]] if reuse_dispatch else None,
             ),
         )
     except Exception:
@@ -320,6 +350,60 @@ def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
         workspace.release_graph(ctx)
 
 
+def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool = False,
+                   gradient_return: torch.Tensor | None = None, home_only: bool = False,
+                   cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None) -> torch.Tensor:
+    """Append split addresses after profiler preparation, retaining the base ABI."""
+    if gradient_return is not None and (not backward or getattr(pool, "projection_ready", None) is None):
+        raise ValueError("Kernel gradient metadata requires a projection-ready backward lease")
+    if pool is None and not home_only:
+        return base
+    # An enabled replica graph still needs per-home-expert GMM addressing.
+    # Empty global plans cannot read guest matrices, so their pointers stay null.
+    if pool is None:
+        projection_ready = None
+        values = (home, 0, 0, 0, 0)
+    else:
+        pointers = (0, 0) if not backward else tuple(value.data_ptr() for value in pool.gradients)
+        values = (home, *(value.data_ptr() for value in pool.weights), *pointers)
+        projection_ready = getattr(pool, "projection_ready", None)
+    if projection_ready is not None:
+        bases, epoch = projection_ready
+        if len(bases) != 2:
+            raise ValueError("Multicore requires two projection ready addresses")
+        data = (struct.pack("<II9Q", 0x53505754, 5, *values, *bases, epoch, gradient_return.data_ptr())
+                if gradient_return is not None else
+                struct.pack("<II8Q", 0x53505754, 4, *values, *bases, epoch))
+    else:
+        data = struct.pack("<II5Q", 0x53505754, 2, *values)
+    return _runtime_image(base, data, cache, static=projection_ready is None)
+
+
+def _runtime_image(base: torch.Tensor, data: bytes,
+                   cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None, *, static: bool) -> torch.Tensor:
+    """Reuse images and update dynamic suffixes inside the serial workspace lease."""
+    # The serial workspace lease orders both writable scratch and dynamic suffix updates.
+    previous = None if cache is None else cache.get(id(base))
+    if previous is not None and previous[0] is base and (previous[1] == data or
+                                                       (not static and len(previous[1]) == len(data))):
+        result = previous[2]
+        if previous[1] != data:
+            _copy_device_bytes(data, result[base.numel():])
+            cache[id(base)] = (base, data, result)
+        result.record_stream(torch.npu.current_stream(base.device))
+        return result
+    metadata = _async_device_bytes(data, base.device)
+    result = torch.cat((base, metadata))
+    result.record_stream(torch.npu.current_stream(base.device))
+    if cache is not None:
+        cache[id(base)] = (base, data, result)
+        # Dynamic schedules may replace their graph images across token lengths.
+        # Stream recording protects evicted images still referenced by kernels.
+        while len(cache) > _RUNTIME_IMAGE_CACHE_LIMIT:
+            del cache[next(iter(cache))]
+    return result
+
+
 def _launch_forward_kernel(
     plan: MegaMoePlan,
     metadata: RouteMetadata,
@@ -327,6 +411,7 @@ def _launch_forward_kernel(
     weight1: Any,
     weight2: Any,
     execution: _ForwardExecution,
+    pool: Any = None,
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -352,7 +437,8 @@ def _launch_forward_kernel(
         plan.up_proj_tiling,
         plan.swiglu_tiling,
         plan.down_proj_tiling,
-        execution.profile_call.runtime_config,
+        _split_runtime(execution.profile_call.runtime_config, pool, weight1.shape[0],
+                       home_only=pool is None and bool(spec.replica_slots_per_rank), cache=execution.runtime_cache),
         execution.profile_call.event_counters,
         execution.profile_call.profile_buffer,
         spec.rank_id,
@@ -368,6 +454,8 @@ def _launch_backward_kernel(
     saved: _SavedBackwardState,
     grad_output: Any,
     execution: _BackwardExecution,
+    pool: Any = None,
+    gradient_return: torch.Tensor | None = None,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -401,7 +489,9 @@ def _launch_backward_kernel(
         plan.swiglu_grad_tiling,
         execution.gmm_workspace,
         execution.swiglu_workspace,
-        execution.profile_call.runtime_config,
+        _split_runtime(execution.profile_call.runtime_config, pool, saved.weight1.shape[0], backward=True,
+                       gradient_return=gradient_return, home_only=pool is None and bool(spec.replica_slots_per_rank),
+                       cache=execution.runtime_cache),
         execution.profile_call.event_counters,
         execution.profile_call.profile_buffer,
         spec.rank_id,
@@ -464,6 +554,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         if topk_weights is not None and (spec.dispatch_mode != "pull" or permutation is None):
             raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
         metadata = route
+        ctx.replica_route = route.replica_route
+        home_weights = (weight1, weight2)
         permutation_inputs = ()
         if permutation is not None:
             routed_tokens, _, unpermute_mapping = permutation
@@ -479,8 +571,14 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         else:
             workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
             workspace.claim()
+        has_replica_transfers = ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers)
         execution = None
+        leases = ExitStack()
         try:
+            provider = workspace.replica_provider
+            pool = None if not has_replica_transfers else leases.enter_context(
+                prefetch_weights(home_weights, ctx.replica_route, provider=provider, overlap=True))
+            ctx.replica_weight_generation = None if pool is None else getattr(pool, "weight_generation", None)
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
             capacity = metadata.expert_capacity
             execution = _prepare_forward_execution(
@@ -496,6 +594,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 weight1,
                 weight2,
                 execution,
+                pool,
             )
             execution.profile_call.complete()
             output = execution.combine[:ctx.source_rows].clone()
@@ -518,8 +617,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 saved_dispatch,
                 execution.intermediates.up_proj,
                 execution.intermediates.activation,
-                weight1,
-                weight2,
+                home_weights[0],
+                home_weights[1],
                 metadata,
                 permutation_inputs,
             )
@@ -527,6 +626,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         finally:
             if execution is not None:
                 execution.profile_call.cancel()
+            leases.close()
             if not workspace_claimed:
                 workspace.release()
 
@@ -551,28 +651,53 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         permutation_inputs = saved_tensors[12:]
         del saved_tensors
         workspace.claim()
+        has_replica_transfers = ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers)
         execution = None
+        leases = ExitStack()
         try:
+            provider = workspace.replica_provider
+            pool = None if not has_replica_transfers else leases.enter_context(
+                prefetch_weights((saved.weight1, saved.weight2), ctx.replica_route,
+                                 backward=True, provider=provider, overlap=True,
+                                 reuse_generation=ctx.replica_weight_generation))
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
             permutation_inputs = permutation_inputs[:1]
+            kernel_return = has_replica_transfers and getattr(provider, "kernel_gradients", False)
+            kernel_w13 = kernel_return and bool(plan.replica_w13_events)
             execution = _prepare_backward_execution(
                 workspace,
                 plan,
                 saved,
                 grad_output,
+                has_replica_transfers=has_replica_transfers,
+                overlap_w13=kernel_w13,
             )
-            _launch_backward_kernel(
-                plan,
-                saved,
-                source,
-                execution,
-            )
+            early_return = prepare_kernel_gradient_return(
+                plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,
+                None if pool is None else pool.gradients[1],
+                gradient_w13=execution.intermediates.grad_weight1 if kernel_w13 else None,
+                guest_w13=None if pool is None else pool.gradients[0]) if kernel_return else None
+            _launch_backward_kernel(plan, saved, source, execution, pool,
+                                    None if early_return is None else early_return.metadata)
+            if provider is not None and hasattr(provider, "last_kernel_gradient_matrices"):
+                provider.last_kernel_gradient_matrices = () if early_return is None else early_return.matrices
             execution.profile_call.complete()
+            grad_weight1 = execution.intermediates.grad_weight1
+            grad_weight2 = execution.intermediates.grad_weight2
+            if has_replica_transfers:
+                if early_return is not None and 0 in early_return.matrices:
+                    pass  # The fused kernel owns both returns through their final ACKs.
+                elif early_return is not None:
+                    grad_weight1, = return_gradients(
+                        (grad_weight1,), ctx.replica_route, pool.gradients[:1], provider, consume=True)
+                else:
+                    grad_weight1, grad_weight2 = return_gradients(
+                        (grad_weight1, grad_weight2), ctx.replica_route, pool.gradients, provider, consume=True)
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
             execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
-                execution.intermediates.grad_weight1,
-                execution.intermediates.grad_weight2,
+                grad_weight1,
+                grad_weight2,
                 None, None, None,
             ))
             grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
@@ -591,6 +716,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         finally:
             if execution is not None:
                 execution.profile_call.cancel()
+            leases.close()
             workspace.release()
 
 

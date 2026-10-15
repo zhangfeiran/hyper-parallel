@@ -22,7 +22,8 @@ MODALITY=vlm or text selects the production Trainer and dataset.
 MOE_TIMING=1 records forward/replay/backward current-stream spans per MoE layer.
 CASE_SYNC_TIMEOUT=600 bounds the cleanup barrier after workers have exited.
 HBM_INTERVAL=1 samples physical HBM and process ownership on every node.
-ACTIVATION_CHECKPOINT=full. ATTENTION_RECOMPUTE_TIER=all; expert replicas are disabled.
+ACTIVATION_CHECKPOINT=full. ATTENTION_RECOMPUTE_TIER=all; expert replicas default to B0.
+REPLICA_SLOTS_PER_RANK=1 enables one guest slot per EP rank.
 Full checkpointing recomputes decoder layers and all attention roles.
 PROFILE=1 selects packed native/push only and profiles one local rank per node.
 PROFILE_START_STEP=3 PROFILE_END_STEP=5 (exclusive); profiler timings are diagnostic.
@@ -78,7 +79,8 @@ done
 [[ ${WARMUP_STEPS} =~ ^[0-9]+$ && ${WARMUP_STEPS} -lt ${TRAIN_ITERS} ]] || die "Invalid WARMUP_STEPS"
 [[ ${MODALITY} == vlm || ${MODALITY} == text ]] || die "Invalid MODALITY"
 [[ ${EMPTY_CACHE_STEPS} =~ ^[0-9]+$ ]] || die "Invalid EMPTY_CACHE_STEPS"
-[[ ${REPLICA_SLOTS_PER_RANK:-0} == 0 ]] || die "Expert replicas are not supported on this branch"
+REPLICA_SLOTS_PER_RANK=${REPLICA_SLOTS_PER_RANK:-0}
+[[ ${REPLICA_SLOTS_PER_RANK} =~ ^[0-9]+$ ]] || die "Invalid REPLICA_SLOTS_PER_RANK"
 [[ ${MOE_TIMING} == 0 || ${MOE_TIMING} == 1 ]] || die "Invalid MOE_TIMING"
 [[ ${CASE_SYNC_TIMEOUT} =~ ^[1-9][0-9]*$ ]] || die "Invalid CASE_SYNC_TIMEOUT"
 [[ ${HBM_INTERVAL} =~ ^[1-9][0-9]*$ ]] || die "HBM_INTERVAL must be a positive integer"
@@ -250,6 +252,7 @@ for index in "${indices[@]}"; do
         --num-hidden-layers "${NUM_HIDDEN_LAYERS}" --vision-num-hidden-layers "${VISION_NUM_HIDDEN_LAYERS}"
         --modality "${MODALITY}" --attention-recompute-tier "${ATTENTION_RECOMPUTE_TIER}"
         --empty-cache-steps "${EMPTY_CACHE_STEPS}"
+        --replica-slots-per-rank "${REPLICA_SLOTS_PER_RANK}" --route-diagnostics
         --edp-shard-size "${EDP_SHARD_SIZE}"
         --activation-checkpoint "${ACTIVATION_CHECKPOINT}"
         --engram-storage-backend "${ENGRAM_STORAGE_BACKEND}"
@@ -258,7 +261,7 @@ for index in "${indices[@]}"; do
         --backend "${backend}" --dispatch-mode "${mode}")
     [[ ${MOE_TIMING} == 0 ]] || command+=(--moe-timing)
     echo "Case=${packing}/${label} world=${WORLD_SIZE} EP=${EP_SIZE} FSDP=${WORLD_SIZE} EDP_SHARD=${EDP_SHARD_SIZE}"
-    echo "Depth=${NUM_HIDDEN_LAYERS}+${VISION_NUM_HIDDEN_LAYERS} E384 TP1 CP1 MBS1 maxS4096 B=0 modality=${MODALITY}"
+    echo "Depth=${NUM_HIDDEN_LAYERS}+${VISION_NUM_HIDDEN_LAYERS} E384 TP1 CP1 MBS1 maxS4096 B=${REPLICA_SLOTS_PER_RANK} modality=${MODALITY}"
     echo "Engram=${ENGRAM_STORAGE_BACKEND} activation_checkpoint=${ACTIVATION_CHECKPOINT} decoder_attention_tier=${ATTENTION_RECOMPUTE_TIER}"
     echo "Warmup=${WARMUP_STEPS} measured=$((TRAIN_ITERS - WARMUP_STEPS)) actual_tokens=true"
     printf '%q ' "${command[@]}"; printf '\n'

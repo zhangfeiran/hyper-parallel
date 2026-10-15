@@ -23,6 +23,8 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
+from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
+
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .spec import MegaMoeSpec, _align_capacity
@@ -45,6 +47,7 @@ class RouteMetadata:
     expert_capacity: int
     local_num_tokens: int | None = None
     plan_tokens: int | None = None
+    replica_route: ReplicaRoute | None = None
 
 
 @dataclass(frozen=True)
@@ -146,16 +149,15 @@ def _finish_count_gather(
 def _expert_capacity(
     counts_by_source: torch.Tensor,
     spec: MegaMoeSpec,
+    loads: tuple[int, ...] | None = None,
 ) -> tuple[int, int]:
-    """Validate the global bound and size rank-local computation tensors."""
-    destination_loads = counts_by_source.reshape(
-        spec.ep_size,
-        spec.ep_size,
-        spec.local_experts,
-    ).sum(dim=(0, 2), dtype=torch.int32)
-    # One host transfer serves both the coordinated overflow check and local
-    # allocation; the existing gathered counts require no extra collective.
-    loads = destination_loads.tolist()
+    """Size rank-local tensors, reusing exact host loads from a replica plan."""
+    if loads is None:
+        destination_loads = counts_by_source.reshape(
+            spec.ep_size, spec.ep_size, spec.local_experts,
+        ).sum(dim=(0, 2), dtype=torch.int32)
+        # Ordinary routes need one readback for local allocation and global growth.
+        loads = destination_loads.tolist()
     # Keep a non-null ABI argument on ranks whose experts receive no tokens.
     # Source outputs and symmetric communication buffers retain their own sizes.
     return max(1, loads[spec.rank_id]), max(loads)
@@ -245,6 +247,7 @@ def prepare_topk_route(
     workspace: MegaMoeWorkspace | None = None,
     *,
     autograd_mask: int = 0,
+    replica_route: ReplicaRoute | None = None,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -257,6 +260,7 @@ def prepare_topk_route(
         workspace: Optional workspace ordered before the count exchange. Pull
             requires an initialized, caller-held lease covering route execution.
         autograd_mask: Group-consistent gradient participation flags in dynamic mode.
+        replica_route: Optional shared placement plan and completed dispatch counts.
 
     Returns:
         Permuted tokens and exact native route metadata.
@@ -264,7 +268,7 @@ def prepare_topk_route(
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     if spec.max_local_num_tokens is not None:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
-                                      workspace, autograd_mask)
+                                      workspace, autograd_mask, replica_route)
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
     permutation_output = None
     if workspace is not None:
@@ -274,26 +278,30 @@ def prepare_topk_route(
             permutation_output = workspace.source_buffer
         else:
             workspace.wait_for_reuse()
-    counts_by_source, count_work = _start_count_gather(counts, spec)
+    if replica_route is None:
+        counts_by_source, count_work = _start_count_gather(counts, spec)
+    else:
+        counts_by_source, count_work = replica_route.counts_by_source, None
     if permutation_output is None:
         routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     else:
         routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
     received_counts = _finish_count_gather(counts_by_source, count_work, spec)
-    expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec)
+    loads = None if replica_route is None else replica_route.plan.destination_loads
+    expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec, loads)
     return PreparedTopKRoute(
         routed_tokens=routed_tokens,
         unpermute_mapping=unpermute_mapping,
         tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum_received_slots,
-        metadata=_compute_route_metadata(
+        metadata=replace(_compute_route_metadata(
             counts,
             counts_by_source,
             received_counts,
             spec,
             expert_capacity,
-        ),
+        ), replica_route=replica_route),
     )
 
 
@@ -325,6 +333,7 @@ def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int
 def _prepare_dynamic_route(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
+    replica_route: ReplicaRoute | None = None,
 ) -> PreparedTopKRoute:
     """Exchange variable-length metadata without adding a token-count collective."""
     tokens = hidden_states.shape[0]
@@ -361,7 +370,7 @@ def _prepare_dynamic_route(
         routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum,
-        metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens),
+        metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens, replica_route=replica_route),
     )
 
 

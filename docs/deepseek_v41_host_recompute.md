@@ -1,7 +1,7 @@
 # DeepSeek-V4.1 Host Engram and cluster experiments
 
 This extension sits on top of the core DSV4.1 MegaMoe adapter and bounded dynamic
-token support. Expert hot replicas are excluded. Native, push and pull all use
+token support and the merged expert-hot-replica implementation. Native, push and pull all use
 the same model, initialization, optimizer policy and data order.
 
 ## Host Engram
@@ -67,7 +67,7 @@ fresh shared `RUN_ID`. Defaults for an eight-node, 16-die-per-node allocation ar
 | Decoder / vision depth | 4 / 1 |
 | Width / expert intermediate / experts | released values / released values / 384 |
 | Engram | original retained-layer tables, CPU owners |
-| Expert replicas | disabled |
+| Expert replicas | B0 by default; `REPLICA_SLOTS_PER_RANK=1` enables B1 |
 | Steps / warmup | 40 / 10 |
 | Maximum sequence / actual token bound | 4096 / 4096 |
 | Cache clearing | every step; `EMPTY_CACHE_STEPS=0` disables it |
@@ -140,3 +140,19 @@ unresolved PIDs, unhealthy devices or insufficient HBM samples invalidate the
 relevant comparison. Finite loss/gradnorm and reported differences do not
 constitute tensor-level numerical acceptance. Reduced CPU and four-rank HCCL
 fixtures do not establish full-model fit or 128-die performance.
+
+## Optional expert replicas
+
+The DSV4.1 native and MegaMoe adapters accept `replica_slots_per_rank` and
+`replica_minimum_load_reduction`. B0 keeps ordinary expert ownership; B1 permits
+one guest expert slot per EP rank. Current DSV4.1 recipes use the CPU planner,
+P2P weight/gradient transport and FP32 clamped SwiGLU semantics. The explicit
+admission threshold defaults to zero, preserving the earlier balance-oriented
+policy; this differs from the generic component's conservative default.
+
+`--route-diagnostics` records host placement plans after each step, including
+source tokens, home and balanced destination loads, guest slots and transfers.
+A B1 budget does not imply every layer or step activates a guest. Full-layer
+recomputation may call the planner again, and diagnostics retain its call count.
+Dynamic token schedules retain bounded plan and runtime-image caches; evicted
+native images remain protected by stream recording.

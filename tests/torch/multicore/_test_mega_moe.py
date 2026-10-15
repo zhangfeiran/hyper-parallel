@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+
 # The launcher activates the Ascend runtime and multicore payload before importing this
 # worker. Framework imports stay out of the ``test_mega_moe.py`` launcher.
 import torch

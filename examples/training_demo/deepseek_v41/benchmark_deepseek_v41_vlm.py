@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from functools import wraps
 import json
 import math
 import os
 from pathlib import Path
 import statistics
+import sys
 import time
 from typing import Any
 
@@ -33,6 +35,9 @@ import yaml
 
 from examples.training_demo.deepseek_v41.deepseek_v41_random_init import initialize_random_shards
 from examples.training_demo.deepseek_v41.deepseek_v41_moe_timing import MoeTiming
+import hyper_parallel.core.expert_parallel.hot_replica.native as native_replica_module
+import hyper_parallel.core.expert_parallel.hot_replica.routing as replica_routing_module
+from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
 from hyper_parallel.core.multicore import _loader, shmem
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.trainer.config.parser import parse_training_args
@@ -137,10 +142,12 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
     compute = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel."
     moe_override = next(entry for entry in recipe["plan_overrides"]
                         if entry.get("local_compute_fn", {}).get("_target_", "").endswith("deepseek_v41_ep_compute_fn"))
+    replica_options = {"replica_slots_per_rank": getattr(args, "replica_slots_per_rank", 0),
+                       "replica_minimum_load_reduction": getattr(args, "replica_minimum_load_reduction", 0.0)}
     if args.backend == "megamoe":
         replacement = {
             "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts",
-            "local_num_tokens": 4096, "dispatch_mode": args.dispatch_mode,
+            "local_num_tokens": 4096, "dispatch_mode": args.dispatch_mode, **replica_options,
         }
         if args.dispatch_mode == "push" and args.capacity_factor is not None:
             replacement["initial_capacity_factor"] = args.capacity_factor
@@ -151,6 +158,8 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
         })
         moe_override.pop("when", None)
         moe_override["local_compute_fn"] = {"_target_": compute + "deepseek_v41_megamoe_compute_fn"}
+    else:
+        moe_override["local_compute_fn"].update(replica_options)
     recipe["checkpoint"].update(save_ckpt=False, restore_from=None, checkpoint_dir=str(work / "unused-checkpoint"))
     path = work / "recipe.yaml"
     path.write_text(yaml.safe_dump(recipe), encoding="utf-8")
@@ -158,29 +167,105 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
 
 
 class _RouteDiagnostics:
-    """Record actual source token rows without retaining activations."""
+    """Retain host planner facts and serialize them after the timed step."""
 
-    def __init__(self, model: torch.nn.Module) -> None:
-        """Attach observations to each routed-plus-shared MoE boundary."""
+    def __init__(self, model: torch.nn.Module, enabled: bool) -> None:
+        """Attach source-row hooks and optional observations of existing plans."""
         self.token_rows: dict[str, int] = {}
-        self.hooks = [module.register_forward_pre_hook(self._record_rows(name))
-                      for name, module in model.named_modules()
-                      if name.endswith(".mlp") and hasattr(module, "gate")]
+        self.plans: dict[str, ExpertExecutionPlan] = {}
+        self.calls: dict[str, int] = {}
+        self.top_k = model.config.num_experts_per_tok
+        self.hooks = []
+        self.originals = []
+        self.layer_ids: dict[int, str] = {}
+        for name, module in model.named_modules():
+            if name.endswith(".mlp") and hasattr(module, "gate"):
+                self.hooks.append(module.register_forward_pre_hook(self._record_rows(name)))
+                self.layer_ids[id(module)] = name
+                executor = getattr(module.experts, "_executor", None)
+                if executor is not None:
+                    self.layer_ids[id(executor)] = name
+        if enabled:
+            for module in (native_replica_module, replica_routing_module):
+                original = module.build_expert_replica_plan
+                self.originals.append((module, original))
+                module.build_expert_replica_plan = self._observe_planner(original)
 
     def _record_rows(self, name: str) -> Any:
         def hook(_module: torch.nn.Module, inputs: tuple) -> None:
-            """Record rows without changing the source tensor."""
+            """Record the source token rows observed at the MoE boundary."""
             self.token_rows[name] = inputs[0].numel() // inputs[0].shape[-1]
         return hook
 
+    def _observe_planner(self, original: Any) -> Any:
+        @wraps(original)
+        def observe(*args: Any, **kwargs: Any) -> ExpertExecutionPlan:
+            """Retain the existing planner result for the current layer."""
+            plan = original(*args, **kwargs)
+            name = self._planner_layer()
+            if name is None:
+                raise RuntimeError("Cannot attribute the replica planner to a model layer")
+            self.plans[name] = plan
+            self.calls[name] = self.calls.get(name, 0) + 1
+            return plan
+        return observe
+
+    def _planner_layer(self) -> str | None:
+        # Checkpoint recomputation can bypass the outer module pre-hook.
+        frame = sys._getframe(1)
+        try:
+            for _ in range(64):
+                if frame is None:
+                    break
+                for key in ("module", "self"):
+                    name = self.layer_ids.get(id(frame.f_locals.get(key)))
+                    if name is not None:
+                        return name
+                frame = frame.f_back
+        finally:
+            del frame
+        return None
+
     def clear(self) -> None:
-        """Clear observations before the next training step."""
+        """Release observations before the next measured training step."""
         self.token_rows.clear()
+        self.plans.clear()
+        self.calls.clear()
+
+    def snapshot(self) -> dict[str, Any]:
+        """Serialize conserved route counts after the training step completes."""
+        records = {}
+        for name, plan in self.plans.items():
+            config = plan.config
+            logical = [sum(row[expert] for row in plan.logical_counts) for expert in range(config.num_experts)]
+            source_rows = [sum(row) for row in plan.logical_counts]
+            tokens = self.token_rows[name]
+            local_source = next((row for row in source_rows if row == tokens * self.top_k), None)
+            if local_source is None or any(rows % self.top_k for rows in source_rows):
+                raise RuntimeError(f"Replica route does not conserve source rows: {name}")
+            home = config.home_experts
+            slots = [sum(expert >= 0 for expert in row[home:]) for row in plan.slot_to_logical]
+            guest_rows = [sum(row[home:]) for row in plan.destination_counts]
+            home_loads = [sum(logical[rank * home:(rank + 1) * home]) for rank in range(config.ep_size)]
+            records[name] = {
+                "planner_calls_including_recompute": self.calls[name],
+                "source_tokens_by_ep_rank": [rows // self.top_k for rows in source_rows],
+                "logical_expert_rows": logical,
+                "home_destination_rows": home_loads,
+                "balanced_destination_rows": list(plan.destination_loads),
+                "active_guest_slots_by_ep_rank": slots,
+                "guest_compute_rows_by_ep_rank": guest_rows,
+                "weight_transfers": len(plan.transfers),
+                "replica_slot_budget_per_rank": config.replica_slots_per_rank,
+            }
+        return records
 
     def close(self) -> None:
-        """Remove all observations after training."""
+        """Restore hooks and planner functions after observation ends."""
         for hook in self.hooks:
             hook.remove()
+        for module, original in self.originals:
+            module.build_expert_replica_plan = original
 
 
 def _step(trainer: Any, iterator: Any, step: int, work: Path,
@@ -205,7 +290,7 @@ def _step(trainer: Any, iterator: Any, step: int, work: Path,
            "phase": "warmup" if step < warmup_steps else "measured",
            "started_at": started_at, "finished_at": finished_at,
            "moe_input_rows": dict(diagnostics.token_rows),
-           "replica_routes": {},
+           "replica_routes": diagnostics.snapshot(),
            "moe_timing": moe_timing.snapshot() if moe_timing is not None else None,
            "peak_allocated_bytes": torch.npu.max_memory_allocated(),
            "peak_reserved_bytes": torch.npu.max_memory_reserved(),
@@ -225,6 +310,9 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
     parser.add_argument("--capacity-factor", type=float)
     parser.add_argument("--experts", type=int, default=384)
+    parser.add_argument("--replica-slots-per-rank", type=int, default=0)
+    parser.add_argument("--replica-minimum-load-reduction", type=float, default=0.0)
+    parser.add_argument("--route-diagnostics", action="store_true")
     parser.add_argument("--modality", choices=("text", "vlm"), default="vlm")
     parser.add_argument("--empty-cache-steps", type=int, default=1)
     parser.add_argument("--attention-recompute-tier", choices=("none", "reuse", "reuse_reindex", "all"),
@@ -252,6 +340,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.replica_slots_per_rank < 0 or not 0 <= args.replica_minimum_load_reduction <= 1:
+        parser.error("Require a nonnegative replica budget and admission threshold in [0, 1]")
     if args.empty_cache_steps < 0:
         parser.error("empty-cache-steps must be nonnegative")
     if not 0 <= args.warmup_steps < args.steps:
@@ -290,7 +380,7 @@ def main() -> None:
     dist.barrier()
     trainer.on_train_begin()
     torch.npu.reset_peak_memory_stats()
-    diagnostics = _RouteDiagnostics(trainer.base.model)
+    diagnostics = _RouteDiagnostics(trainer.base.model, args.route_diagnostics)
     moe_timing = MoeTiming(trainer.base.model) if args.moe_timing else None
     rows = []
     try:

@@ -27,6 +27,7 @@ import torch
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_parallel.core.multicore.modules.mega_moe.workspace import MegaMoeWorkspace
 from tests.common.mark_utils import arg_mark
 
 
@@ -268,6 +269,125 @@ class TestMegaMoeExperts(unittest.TestCase):
             expert_output, route.unpermute_mapping, topk_weights
         )
 
+    def test_replica_target_load_rejects_invalid_values_before_allocation(self) -> None:
+        """Reject invalid independent load targets before creating parameters."""
+        with patch.object(mega_moe_module, "_create_mega_moe_parameters") as create:
+            for target in (0, -1, True, 1.5, "256"):
+                with self.subTest(target=target), self.assertRaisesRegex(ValueError, "replica_target_load"):
+                    MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                                   num_experts=4, top_k=2, ep_size=2, replica_target_load=target)
+            create.assert_not_called()
+
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_replica_target_load_is_independent_of_capacity_in_push_and_pull(self) -> None:
+        """
+        description: Preserve default routing targets and pass explicit targets without resizing buffers.
+        expectation: Explicit targets and invocation graph switches preserve workspace ownership.
+        feature: Expert hot replica resource selection.
+        """
+        hidden = torch.ones(128, 16, dtype=torch.bfloat16)
+        ids = torch.zeros(128, 2, dtype=torch.int32)
+        probabilities = torch.full((128, 2), 0.5)
+        for mode, target, expected in (("push", None, 384), ("push", 256, 256),
+                                       ("pull", None, None), ("pull", 256, 256)):
+            with self.subTest(mode=mode, target=target):
+                experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                                         num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
+                                         replica_slots_per_rank=1, replica_target_load=target).bfloat16()
+                resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0, replica_slots_per_rank=1),
+                                            plan=SimpleNamespace(spec=object()),
+                                            home_plan=None,
+                                            workspace=Mock(capacity_floor=384), ensure_capacity=Mock())
+                replica = SimpleNamespace(physical_ids=ids, counts_by_source=torch.zeros(2, 6), home_only=False)
+                route = SimpleNamespace(routed_tokens=object(), metadata=object(), unpermute_mapping=object(),
+                                        maximum_received_slots=256)
+                try:
+                    with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+                          patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
+                          patch.object(experts, "_get_execution_resources", return_value=resources),
+                          patch.object(mega_moe_module, "prepare_replica_route", return_value=replica) as prepare,
+                          patch.object(mega_moe_module, "prepare_topk_route", return_value=route),
+                          patch.object(mega_moe_module, "execute_mega_moe_with_permutation", return_value=hidden),
+                          patch.object(mega_moe_module, "restore_topk_output", return_value=hidden)):
+                        torch.testing.assert_close(experts(hidden, ids, probabilities), hidden)
+                    self.assertEqual(prepare.call_args.kwargs["target_load"], expected)
+                    self.assertEqual(prepare.call_args.kwargs["minimum_replica_rows"], 1024)
+                    self.assertEqual(resources.workspace.capacity_floor, 384)
+                    if mode == "push":
+                        resources.ensure_capacity.assert_called_once_with(256)
+                finally:
+                    experts.close()
+
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_home_only_execution_can_switch_back_to_replica_graph(self) -> None:
+        """
+        description: Alternate globally empty and active guest plans while retaining physical storage.
+        expectation: Explicit targets and invocation graph switches preserve workspace ownership.
+        feature: Expert hot replica resource selection.
+        """
+        hidden = torch.ones(128, 16, dtype=torch.bfloat16)
+        ids, probabilities = torch.zeros(128, 2, dtype=torch.int32), torch.full((128, 2), 0.5)
+        for mode, budget in (("push", 1), ("push", 2), ("pull", 1), ("pull", 2)):
+            with self.subTest(mode=mode, budget=budget):
+                experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                                         num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
+                                         replica_slots_per_rank=budget).bfloat16()
+                spec = SimpleNamespace(rank_id=0, replica_slots_per_rank=budget)
+                resources = SimpleNamespace(spec=spec, plan=SimpleNamespace(spec=spec),
+                                            home_plan=SimpleNamespace(spec=SimpleNamespace(rank_id=0)),
+                                            workspace=Mock(capacity_floor=384, in_use=True), ensure_capacity=Mock())
+                route = SimpleNamespace(unpermute_mapping=object(), maximum_received_slots=256)
+                try:
+                    with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+                          patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
+                          patch.object(experts, "_get_execution_resources", return_value=resources),
+                          patch.object(mega_moe_module, "prepare_replica_route") as prepare,
+                          patch.object(mega_moe_module, "prepare_topk_route", return_value=route) as topk,
+                          patch.object(mega_moe_module, "execute_mega_moe_with_permutation",
+                                       return_value=hidden) as execute,
+                          patch.object(mega_moe_module, "restore_topk_output", return_value=hidden)):
+                        for home_only in (True, False, True, False):
+                            prepare.return_value = SimpleNamespace(physical_ids=ids, home_only=home_only,
+                                                                   counts_by_source=torch.zeros(2, 4))
+                            torch.testing.assert_close(experts(hidden, ids, probabilities), hidden)
+                            selected = resources.home_plan if home_only else resources.plan
+                            self.assertIs(topk.call_args.args[3], selected.spec)
+                            self.assertIs(execute.call_args.args[5], selected)
+                            self.assertIs(resources.last_execution_plan, selected)
+                            self.assertTrue(prepare.call_args.kwargs["compact_home"])
+                    self.assertTrue(all(call.args[0] is spec for call in resources.workspace.ensure.call_args_list))
+                    self.assertEqual(resources.workspace.ensure.call_count, 2 if mode == "push" else 6)
+                finally:
+                    experts.close()
+
+    def test_home_plan_requires_matching_persistent_ready_offsets(self) -> None:
+        """Reject workspace sharing when guest slots change the ready-generation offset."""
+        for logical, expected_plans in ((96, 2), (800, 1)):
+            spec = MegaMoeSpec(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                               num_experts=logical + 16 * 4, logical_num_experts=logical,
+                               replica_slots_per_rank=4, top_k=2, initial_capacity_factor=1.5,
+                               receive_capacity=384, ep_size=16, ep_group=object(), rank_id=0, num_cube_cores=24)
+            with (self.subTest(logical=logical),
+                  patch.object(mega_moe_module, "bind_mega_moe_spec", return_value=spec),
+                  patch.object(mega_moe_module.shmem, "get_heap_manager",
+                               return_value=Mock(heap_bytes=1024, growth_records=[])),
+                  patch.object(mega_moe_module.shmem, "acquire"),
+                  patch.object(mega_moe_module, "build_mega_moe_plan") as build,
+                  patch.object(mega_moe_module, "MegaMoeWorkspace")):
+                resources = mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
+                    {}, SimpleNamespace(device="npu:0", dtype=torch.bfloat16, element_size=lambda: 2),
+                    shared=False, active_specifications=())
+                self.assertEqual(build.call_count, expected_plans)
+                if expected_plans == 2:
+                    home_spec = build.call_args.args[0]
+                    self.assertEqual(home_spec.num_experts, logical)
+                    self.assertEqual(home_spec.replica_slots_per_rank, 0)
+                    self.assertEqual(home_spec.receive_capacity, spec.receive_capacity)
+                else:
+                    self.assertIsNone(resources.home_plan)
+
     def test_forward_rejects_invalid_weights_before_resource_creation(self) -> None:
         """Reject invalid expert weights before initializing native resources."""
         experts = MegaMoeExperts(
@@ -375,7 +495,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         """
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
-                                     dispatch_mode="push", max_local_num_tokens=None)
+                                     dispatch_mode="push", max_local_num_tokens=None, replica_slots_per_rank=0)
         workspace = Mock()
 
         with (
@@ -417,7 +537,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         """
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
-                                     dispatch_mode="push", max_local_num_tokens=None)
+                                     dispatch_mode="push", max_local_num_tokens=None, replica_slots_per_rank=0)
 
         with (
             patch.object(
@@ -495,6 +615,41 @@ class TestMegaMoeExperts(unittest.TestCase):
             resources.close()
         resources.workspace.close.assert_called_once_with()
         release.assert_called_once_with()
+
+
+    def test_replica_capacity_bound_survives_managed_heap_migration(self) -> None:
+        """Reject impossible routes before reuse and clamp geometric growth to the replica bound."""
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources.specification = {"local_num_tokens": 4096, "top_k": 8, "hidden_size": 5120,
+                                   "num_experts": 48, "ep_size": 8, "initial_capacity_factor": 1.0}
+        resources.element_size = 2
+        resources.workspace = MegaMoeWorkspace(shared=True)
+        resources.heap_manager = Mock(access=nullcontext, heap_limit=None, entries=[], growth_records=[])
+        for upper, current, received, expected in ((32768, 65536, 32769, None), (40960, 32768, 40000, 40960)):
+            with self.subTest(upper=upper):
+                resources.spec = SimpleNamespace(maximum_receive_capacity=upper, capacity_growth_factor=10.0)
+                resources.workspace.capacity_floor = current
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, "lossless token bound"):
+                        resources.ensure_capacity(received)
+                    resources.heap_manager.replace.assert_not_called()
+                else:
+                    resources.ensure_capacity(received)
+                    layout = mega_moe_module._heap_layout(resources.specification, 2, expected)
+                    resources.heap_manager.replace.assert_called_once_with(resources, layout)
+
+
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_removed_replica_transports_fail_before_allocation(self, create_parameters: Mock) -> None:
+        """Reject obsolete protocols even when the replica budget is disabled."""
+        for mode in ("shmem", "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel",
+                     "shmem_signal_sdma_bidir", "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection",
+                     "shmem_signal_kernel_gradient_adaptive"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "Unsupported replica_transport"):
+                MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                               num_experts=4, top_k=2, ep_size=2, replica_transport=mode)
+        create_parameters.assert_not_called()
+
 
 
 if __name__ == "__main__":

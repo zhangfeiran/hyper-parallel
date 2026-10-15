@@ -18,10 +18,10 @@ from __future__ import annotations
 
 __all__ = []
 
+import struct
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-import struct
 from threading import Lock
 from typing import Any
 
@@ -37,7 +37,6 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode
 from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
-
 
 CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
 VECTOR_SLOT_COUNT = NUM_WORKERS_VECTOR
@@ -64,6 +63,10 @@ DEFAULT_STAGE_NAMES = {
     0x10000: "WaitDependency",
     0x10006: "TerminateTask",
     0x10007: "TriggerEvent",
+    0x10008: "ReplicaW2Return",
+    0x10009: "ReplicaW13Return",
+    0x1000A: "ReplicaW13WeightReadyWait",
+    0x1000B: "ReplicaW2WeightReadyWait",
 }
 TASK_TYPE_NAMES = {
     0: "Terminate",
@@ -215,8 +218,8 @@ def _round_up_record_capacity(required_records: int) -> int:
 
 
 def _records_for_task(task_desc: TaskDescC) -> int:
-    """Mirror the wait, compute, and trigger records emitted by ExecuteTaskProfiled()."""
-    record_count = 1
+    """Bound dependency, compute, trigger and optional guest-weight wait records."""
+    record_count = 1 + int(task_desc.task_type == TaskType.TASK_GROUPED_MATMUL)
     if task_desc.dependent_event != EVENT_INVALID_ID:
         record_count += 1
     if task_desc.task_type != TaskType.TASK_SHMEM_PUT_MEM_SIGNAL:
@@ -278,7 +281,9 @@ def _calculate_aiv_pipeline_profile_layout(
     )
 
 
-def _calculate_event_driven_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
+def _calculate_event_driven_profile_layout(
+        runtime_config: RuntimeConfigC, replica_gradient_records: int = 0,
+) -> _ProfileLayout:
     """Size AIC/AIV slots for event-driven task queues using the busiest worker."""
     num_workers = int(runtime_config.num_workers)
     if num_workers < 0 or num_workers % 2 != 0 or num_workers > VECTOR_SLOT_COUNT:
@@ -298,6 +303,8 @@ def _calculate_event_driven_profile_layout(runtime_config: RuntimeConfigC) -> _P
         int(runtime_config.task_index_num[1]),
         active_worker_count,
     )
+    # Reserved gradient workers bypass the task queue and record both projections.
+    aiv_required_records = max(aiv_required_records, replica_gradient_records)
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,
@@ -306,20 +313,27 @@ def _calculate_event_driven_profile_layout(runtime_config: RuntimeConfigC) -> _P
     )
 
 
-def _calculate_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
+def _calculate_profile_layout(
+        runtime_config: RuntimeConfigC, *, replica_gradient_records: int = 0,
+) -> _ProfileLayout:
     """Select the profile layout algorithm for the configured task execution mode."""
     _validate_runtime_config(runtime_config)
+    if (isinstance(replica_gradient_records, bool) or not isinstance(replica_gradient_records, int)
+            or replica_gradient_records < 0):
+        raise ValueError("replica_gradient_records must be a nonnegative integer")
     metadata = _get_mega_kernel_profile_metadata(runtime_config)
     if metadata.execution_mode is _TaskExecutionMode.AIV_PIPELINE:
         return _calculate_aiv_pipeline_profile_layout(runtime_config)
     if metadata.execution_mode is _TaskExecutionMode.EVENT_DRIVEN:
-        return _calculate_event_driven_profile_layout(runtime_config)
+        return _calculate_event_driven_profile_layout(runtime_config, replica_gradient_records)
     raise ValueError(f"unsupported task execution mode: {metadata.execution_mode!r}")
 
 
-def _configure_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
+def _configure_profile_layout(
+        runtime_config: RuntimeConfigC, *, replica_gradient_records: int = 0,
+) -> _ProfileLayout:
     """Calculate and serialize the bounded AIC/AIV record capacities."""
-    layout = _calculate_profile_layout(runtime_config)
+    layout = _calculate_profile_layout(runtime_config, replica_gradient_records=replica_gradient_records)
     runtime_config.aic_profile_record_capacity = layout.aic_record_capacity
     runtime_config.aiv_profile_record_capacity = layout.aiv_record_capacity
     return layout
@@ -533,6 +547,7 @@ class _PreparedMegaKernelRuntime:
         rank: int,
         device: Any,
         device_id: int,
+        replica_gradient_records: int = 0,
     ) -> None:
         """Prepare immutable metadata and the default disabled Device tensor."""
         _validate_runtime_config(runtime_config)
@@ -545,7 +560,7 @@ class _PreparedMegaKernelRuntime:
         self._device = device
         self._device_id = device_id
         self._metadata = _get_mega_kernel_profile_metadata(runtime_config)
-        self._layout = _configure_profile_layout(runtime_config)
+        self._layout = _configure_profile_layout(runtime_config, replica_gradient_records=replica_gradient_records)
         runtime_config.cycle_profiling_enabled = 0
         self._normal_tensor = tensor_factory(serialize_runtime_config(runtime_config))
         self._profile_tensor = None
@@ -625,6 +640,7 @@ def _prepare_mega_kernel_runtime_config(
     rank: int,
     device: Any,
     device_id: int,
+    replica_gradient_records: int = 0,
 ) -> _PreparedMegaKernelRuntime:
     """Prepare fast/profiled RuntimeConfig variants without exposing ABI details."""
     return _PreparedMegaKernelRuntime(
@@ -634,6 +650,7 @@ def _prepare_mega_kernel_runtime_config(
         rank=rank,
         device=device,
         device_id=device_id,
+        replica_gradient_records=replica_gradient_records,
     )
 
 
@@ -731,6 +748,8 @@ def _event_name(
         stage_name = f"{task_stage_name}_{stage_name}"
     if not detailed_task_names:
         return stage_name
+    if desc_id in (0x1000A, 0x1000B):
+        return f"ReplicaSlot{owner_id}_{stage_name}_epoch{stage_task_index}"
     task_name = f"{stage_name}_task{stage_task_index + 1}"
     if owner_id == INVALID_OWNER_ID:
         return task_name
@@ -951,11 +970,21 @@ def _duration_trace_event(
         "end_cycle": record["end_cycle"],
         "core_entry_cycle": record["entry_cycle"],
     }
-    if task_id in task_stage_names:
+    if desc_id in (0x1000A, 0x1000B):
+        args["task_stage"] = "ReplicaWeightReadyWait"
+        args["consumer_stage"] = task_stage_names.get(task_id)
+        args["projection"] = "W13" if desc_id == 0x1000A else "W2"
+        args["replica_slot"] = record["owner_id"]
+        args["epoch"] = record["stage_task_index"]
+        args.pop("task_number")
+    elif desc_id in (0x10008, 0x10009):
+        args["task_stage"] = "ReplicaW2Return" if desc_id == 0x10008 else "ReplicaW13Return"
+        args["peer_rank"] = record["stage_task_index"]
+    elif task_id in task_stage_names:
         args["task_stage"] = task_stage_names[task_id]
     if desc_id >= TASK_TYPE_DESC_BASE:
         args["task_type"] = desc_id - TASK_TYPE_DESC_BASE
-    if record["owner_id"] != INVALID_OWNER_ID:
+    if record["owner_id"] != INVALID_OWNER_ID and desc_id not in (0x1000A, 0x1000B):
         args["owner_id"] = record["owner_id"]
     return {
         "name": _event_name(
