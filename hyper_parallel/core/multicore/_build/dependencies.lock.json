@@ -87,7 +87,8 @@
         "tree": "f941884a2f35988711169e77772c9faea4e942f2",
         "git_archive_tar_sha256": "72cbff27e7e1602c547e17ebccdba013c109e80c331ddd46b896b32628118aa1",
         "git_archive_tar_sha256_compat": [
-          "f8a1baea0d188fdcff8426e7b7d11bf9d43f3ea3fb26fa4dd270eb88d1566229"
+          "f8a1baea0d188fdcff8426e7b7d11bf9d43f3ea3fb26fa4dd270eb88d1566229",
+          "1c026f7f4891f2cd24eb00bd8b26da7ff18cd868d9b8f2be612a01ea5c5d5ba7"
         ],
         "resolution": "exact upstream commit providing MhcPost and MhcPreSinkhorn sources; adapters are applied only to an isolated source copy",
         "patches": [
