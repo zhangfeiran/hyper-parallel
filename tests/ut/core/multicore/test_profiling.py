@@ -227,7 +227,7 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
             with self.subTest(peers=peers):
                 runtime = _prepare_mega_kernel_runtime_config(
                     runtime_config, tensor_factory=lambda data: data, profile_tensor_factory=lambda data: data,
-                    rank=0, device_id=0, replica_gradient_records=2 * peers,
+                    rank=0, device=object(), device_id=0, replica_gradient_records=2 * peers,
                 )
                 self.assertGreaterEqual(runtime_config.aiv_profile_record_capacity, 2 * peers)
                 self.assertIsNotNone(runtime.normal_tensor)
@@ -256,13 +256,13 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         """Allocate the complete trace when a long schedule exceeds 256 records."""
         runtime_config = _runtime_config(2048)
         runtime_config.num_workers = 48
-        runtime_config.all_tasks[0] = _three_record_task()
+        runtime_config.all_tasks[0] = _four_record_task()
         runtime_config.task_index_num[0] = 2041
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 258)
-        self.assertEqual(layout.aic_record_capacity, 272)
+        self.assertEqual(layout.aic_required_records, 344)
+        self.assertEqual(layout.aic_record_capacity, 352)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

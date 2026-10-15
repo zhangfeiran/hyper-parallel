@@ -28,6 +28,7 @@ from hyper_parallel.core.expert_parallel.hot_replica import (
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
     SignalReplicaTransport,
     signal_storage_bytes,
+    gradient_band_layout,
 )
 from tests.common.mark_utils import arg_mark
 
@@ -35,6 +36,49 @@ from tests.common.mark_utils import arg_mark
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestSignalReplicaTransport(unittest.TestCase):
     """Keep host boundary checks alongside real-stream NPU protocol acceptance."""
+
+    def test_band_storage_is_bounded_and_preserves_existing_transport_options(self):
+        """Reserve all guest signal tables before execution without changing legacy modes."""
+        shapes = ((5120, 3584), (1792, 5120))
+        self.assertEqual(gradient_band_layout(shapes[0]), (292, 18))
+        self.assertEqual(gradient_band_layout(shapes[1]), (204, 9))
+        original = signal_storage_bytes(shapes, 2, 16, 2)
+        extended = signal_storage_bytes(shapes, 2, 16, 2, gradient_bands=True)
+        self.assertEqual(extended - original, 2 * (18 + 9) * 32 * 64)
+        for shape in ((0, 3), (1, True), (2, 3, 4), (65, 1048576)):
+            self.assertIsNone(gradient_band_layout(shape))
+
+
+    def test_band_tables_are_inbox_views_and_reset_at_reserved_rollover(self):
+        """Compact views survive calls and reset with all protocol words before epoch reuse."""
+        shapes = ((16, 32), (32, 16))
+        size = signal_storage_bytes(shapes, 2, 4, 2, gradient_bands=True)
+        storage = torch.empty(size, dtype=torch.uint8)
+        runtime = MagicMock()
+        provider = SignalReplicaTransport(runtime, storage, 2, 4, gradient_bands=True)
+        provider._bind(tuple(torch.ones(2, *shape, dtype=torch.bfloat16) for shape in shapes))
+        with provider._lock:
+            pointers = []
+            for matrix in (0, 1):
+                flags, rows, bands = provider.kernel_gradient_band_signals(matrix, 24)
+                self.assertEqual((rows, bands), (shapes[matrix][0], 1))
+                self.assertEqual(tuple(flags.shape), (2, 1, 24, 16))
+                self.assertEqual(flags.untyped_storage().data_ptr(), storage.data_ptr())
+                self.assertIs(provider.kernel_gradient_band_signals(matrix, 24)[0], flags)
+                flags.fill_(17)
+                pointers.append(flags.data_ptr())
+            self.assertNotEqual(pointers[0], pointers[1])
+            self.assertIsNone(provider.kernel_gradient_band_signals(0, 33))
+            provider.epoch = 2**31 - 2
+            self.assertEqual(provider._advance(reserve=2), 1)
+            self.assertEqual(runtime.host_barrier.call_count, 3)
+            for matrix in (0, 1):
+                self.assertEqual(int(provider.kernel_gradient_band_signals(matrix, 24)[0].count_nonzero()), 0)
+            self.assertEqual(provider.kernel_gradient_signals()[0], 2)
+            self.assertEqual(provider.kernel_gradient_signals()[0], 3)
+        with self.assertRaisesRegex(ValueError, "active backward lease"):
+            provider.kernel_gradient_band_signals(0, 24)
+
 
     def test_saved_generation_reuse_and_backward_epoch_reservation(self):
         """Reuse a live forward generation and roll over before publishing backward weights."""

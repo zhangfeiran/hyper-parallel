@@ -42,6 +42,17 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     # pylint: disable=protected-access
 
+    def test_replica_slots_do_not_expand_logical_topk_range(self) -> None:
+        """Feature: Logical routing validation.
+        Description: Request more selections than logical experts with and without guest slots.
+        Expectation: Both configurations fail before resource registration or parameter allocation.
+        """
+        for budget in (0, 1):
+            with self.subTest(budget=budget), self.assertRaisesRegex(ValueError, "top_k"):
+                MegaMoeExperts(hidden_size=16, intermediate_size=8,
+                               num_experts=4, top_k=5, ep_size=2, replica_slots_per_rank=budget,
+                               create_parameters=False)
+
     @staticmethod
     def _cache_resources(capacity: int, *, automatic: bool = False, mode: str = "push") -> Any:
         """Create a lazy resource with an explicit committed source reservation."""

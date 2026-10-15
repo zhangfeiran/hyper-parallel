@@ -76,5 +76,23 @@ __aicore__ inline void WaitReplicaCompletion(GM_ADDR address, int32_t epoch) {
   } while (*value < epoch);
 }
 
+// A band can remain in production for many tiles. Limit global cache refreshes
+// while polling so its readers do not continually invalidate the producer line.
+__aicore__ inline void WaitBandProducer(GM_ADDR address, int32_t epoch) {
+  AscendC::GlobalTensor<int32_t> flag;
+  flag.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(address), 1);
+  __gm__ volatile int32_t *value = reinterpret_cast<__gm__ volatile int32_t *>(address);
+  uint64_t refreshed = 0;
+  constexpr uint64_t refresh_cycles = 50;
+  do {
+    const uint64_t now = AscendC::GetSystemCycle();
+    if (now - refreshed >= refresh_cycles) {
+      AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                        AscendC::DcciDst::CACHELINE_OUT>(flag);
+      refreshed = now;
+    }
+  } while (*value < epoch);
+}
+
 }  // namespace MulticoreRuntime
 #endif  // HYPER_PARALLEL_MULTICORE_REPLICA_GRADIENT_H

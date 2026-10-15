@@ -24,7 +24,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import KERNEL_GRADIENT_TRANSPORT
+from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
+    KERNEL_GRADIENT_TRANSPORT_MODES,
+)
 
 from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics, prepare_mega_kernel_diagnostics
 from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import (
@@ -188,8 +190,9 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
         spec.rank_id,
         spec.num_cube_cores,
     )
-    if overlap_w13 and spec.replica_slots_per_rank and spec.replica_transport == KERNEL_GRADIENT_TRANSPORT:
-        prepare_w13_overlap_schedule(backward_data, spec.local_experts, spec.num_cube_cores)
+    if overlap_w13 and spec.replica_slots_per_rank and spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES:
+        prepare_w13_overlap_schedule(backward_data, spec.local_experts, spec.num_cube_cores,
+                                    replica_slots=spec.replica_slots_per_rank)
     return forward_graph, forward_data, backward_graph, backward_data
 
 
@@ -211,7 +214,7 @@ def _prepare_diagnostics(
         **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
     }
     gradient_records = (2 * (spec.ep_size - 1) * spec.replica_slots_per_rank
-                        if spec.replica_transport == KERNEL_GRADIENT_TRANSPORT else 0)
+                        if spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES else 0)
     return (
         prepare_mega_kernel_diagnostics(forward_graph, forward_config, parameter_count=16, **options),
         prepare_mega_kernel_diagnostics(backward_graph, backward_config, parameter_count=20, extra_aiv_records=gradient_records, **options),
@@ -231,7 +234,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec, overlap_w13=False)
     original_reuse = can_reuse_backward_dispatch(backward_config, spec.local_experts, spec.num_cube_cores)
     fallback = None
-    if spec.replica_slots_per_rank and spec.replica_transport == KERNEL_GRADIENT_TRANSPORT:
+    if spec.replica_slots_per_rank and spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES:
         overlap_config = deepcopy(backward_config)
         if (prepare_w13_overlap_schedule(overlap_config, spec.local_experts, spec.num_cube_cores)
                 and replica_w2_ready_events(overlap_config, spec.local_experts, spec.num_cube_cores)
