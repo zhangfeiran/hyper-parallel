@@ -42,7 +42,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.routing import (
     prepare_replica_route,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    KERNEL_GRADIENT_TRANSPORT,
+    KERNEL_GRADIENT_TRANSPORT_MODES,
 )
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capacity
@@ -288,6 +288,8 @@ class MegaMoeExperts(MulticoreModule):
             replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
             replica_transport: "p2p" or "shmem_signal_kernel_gradient". The latter uses
                 projection-ready SDMA weights and fused FP32 gradient return.
+                "shmem_signal_kernel_gradient_bands" publishes completed output row bands
+                directly from Cube workers and consumes them in independent AIV groups.
             replica_planner: Shared CPU or fused device replica quota policy.
             replica_target_load: Preferred received rows per rank, independent of buffer capacity.
                 All EP ranks must agree. None uses current capacity for push and average load for pull.
@@ -318,8 +320,8 @@ class MegaMoeExperts(MulticoreModule):
                 PP/DP groups bootstrap independently; one process can have only
                 one ordered EP membership active in SHMEM at a time.
         """
-        if replica_transport not in ("p2p", KERNEL_GRADIENT_TRANSPORT):
-            raise ValueError("Unsupported replica_transport; expected p2p or shmem_signal_kernel_gradient")
+        if replica_transport not in ("p2p", *KERNEL_GRADIENT_TRANSPORT_MODES):
+            raise ValueError("Unsupported replica_transport; expected p2p or a kernel-gradient transport")
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         _integer(replica_min_rows, "replica_min_rows", 0)
         if replica_target_load is not None:
@@ -400,7 +402,7 @@ class MegaMoeExperts(MulticoreModule):
             local_num_tokens=specification["local_num_tokens"],
             hidden_size=specification["hidden_size"],
             intermediate_size=specification["intermediate_size"],
-            num_experts=specification["num_experts"],
+            num_experts=specification.get("logical_num_experts", specification["num_experts"]),
             top_k=specification["top_k"],
             swiglu_limit=specification["swiglu_limit"],
             ep_size=specification["ep_size"],

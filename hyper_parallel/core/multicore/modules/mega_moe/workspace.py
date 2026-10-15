@@ -26,7 +26,8 @@ from typing import Any
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    KERNEL_GRADIENT_TRANSPORT,
+    GRADIENT_BAND_TRANSPORT,
+    KERNEL_GRADIENT_TRANSPORT_MODES,
     SignalReplicaTransport,
     signal_storage_bytes,
 )
@@ -75,10 +76,10 @@ def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
     if not budget or mode == "p2p":
         return 0
     hidden, intermediate = specification["hidden_size"], specification["intermediate_size"]
-    if mode != KERNEL_GRADIENT_TRANSPORT:
-        raise ValueError("Unsupported replica_transport; expected p2p or shmem_signal_kernel_gradient")
+    if mode not in KERNEL_GRADIENT_TRANSPORT_MODES:
+        raise ValueError("Unsupported replica_transport; expected p2p or a kernel-gradient transport")
     size = signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)), budget,
-                                specification["ep_size"], 2)
+                                specification["ep_size"], 2, gradient_bands=mode == GRADIENT_BAND_TRANSPORT)
     return size + _WORKSPACE_ALIGNMENT - 1
 
 
@@ -221,10 +222,12 @@ class MegaMoeWorkspace:
     def _allocate_replica_storage(self, spec: MegaMoeSpec) -> None:
         """Recreate provider state with the new symmetric heap generation."""
         shapes = ((spec.hidden_size, 2 * spec.intermediate_size), (spec.intermediate_size, spec.hidden_size))
-        size = signal_storage_bytes(shapes, spec.replica_slots_per_rank, spec.ep_size, 2)
+        size = signal_storage_bytes(shapes, spec.replica_slots_per_rank, spec.ep_size, 2,
+                                    gradient_bands=spec.replica_transport == GRADIENT_BAND_TRANSPORT)
         self.replica_inbox = shmem.empty((size,), dtype=torch.uint8, alignment=_WORKSPACE_ALIGNMENT)
         self.replica_provider = SignalReplicaTransport(shmem, self.replica_inbox,
-                                                      spec.replica_slots_per_rank, spec.ep_size)
+                                                      spec.replica_slots_per_rank, spec.ep_size,
+                                                      gradient_bands=spec.replica_transport == GRADIENT_BAND_TRANSPORT)
 
     def prepare_event_counters(self, *, forward: bool) -> Any:
         """Reset per-call counters while preserving the ready generation."""

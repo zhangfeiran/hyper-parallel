@@ -55,7 +55,6 @@ from hyper_parallel.core.multicore.profiler.profiling import (
     _duration_trace_event,
     _get_mega_kernel_profile_metadata,
     _prepare_mega_kernel_runtime_config,
-    _ProfileSpec,
     _resolve_cycle_frequency_mhz,
     _set_mega_kernel_profile_metadata,
 )
@@ -363,7 +362,7 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
             with self.subTest(peers=peers):
                 runtime = _prepare_mega_kernel_runtime_config(
                     runtime_config, tensor_factory=lambda data: data, profile_tensor_factory=lambda data: data,
-                    rank=0, device_id=0, replica_gradient_records=2 * peers,
+                    rank=0, device=object(), device_id=0, replica_gradient_records=2 * peers,
                 )
                 self.assertGreaterEqual(runtime_config.aiv_profile_record_capacity, 2 * peers)
                 self.assertIsNotNone(runtime.normal_tensor)
@@ -392,13 +391,13 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         """Allocate the complete trace when a long schedule exceeds 256 records."""
         runtime_config = _runtime_config(2048)
         runtime_config.num_workers = 48
-        runtime_config.all_tasks[0] = _three_record_task()
+        runtime_config.all_tasks[0] = _four_record_task()
         runtime_config.task_index_num[0] = 2041
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 258)
-        self.assertEqual(layout.aic_record_capacity, 272)
+        self.assertEqual(layout.aic_required_records, 344)
+        self.assertEqual(layout.aic_record_capacity, 352)
 
     def test_mega_gate_pipeline_runtime_configs(self):
         """Validate forward, ordinary-grad and K=1 descriptor streams."""

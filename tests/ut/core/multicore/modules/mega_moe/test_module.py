@@ -33,6 +33,17 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     # pylint: disable=protected-access
 
+    def test_replica_slots_do_not_expand_logical_topk_range(self) -> None:
+        """Feature: Logical routing validation.
+        Description: Request more selections than logical experts with and without guest slots.
+        Expectation: Both configurations fail before resource registration or parameter allocation.
+        """
+        for budget in (0, 1):
+            with self.subTest(budget=budget), self.assertRaisesRegex(ValueError, "top_k"):
+                MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                               num_experts=4, top_k=5, ep_size=2, replica_slots_per_rank=budget,
+                               create_parameters=False)
+
     def test_replica_capacity_bound_survives_managed_heap_migration(self) -> None:
         """Reject impossible routes before reuse and clamp geometric growth to the replica bound."""
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)

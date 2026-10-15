@@ -161,6 +161,30 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             self.assertIsNone(workspace.replica_provider.pool)
             self.assertEqual(workspace.replica_provider.gradient_scratch_bytes, 0)
 
+    def test_gradient_band_signals_are_included_in_the_fixed_inbox_budget(self) -> None:
+        """Band mode adds bounded signal bytes to the existing allocation and rebuild lifetime."""
+        specification = {"local_num_tokens": 128, "top_k": 2, "hidden_size": 5120,
+                         "intermediate_size": 1792, "num_experts": 28, "ep_size": 4,
+                         "logical_num_experts": 24, "replica_slots_per_rank": 2, "initial_capacity_factor": 1.0,
+                         "replica_transport": "shmem_signal_kernel_gradient"}
+        before = workspace_module._spec_workspace_bytes(specification, 2)
+        specification["replica_transport"] = "shmem_signal_kernel_gradient_bands"
+        after = workspace_module._spec_workspace_bytes(specification, 2)
+        self.assertEqual(after - before, 2 * (18 + 9) * 32 * 64)
+        spec = SimpleNamespace(hidden_size=8, intermediate_size=4, ep_size=4,
+                               replica_slots_per_rank=2, replica_transport=specification["replica_transport"])
+        workspace = MegaMoeWorkspace(shared=True)
+        with patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
+                shape, dtype=kw["dtype"])) as allocate, patch.object(workspace_module.shmem, "free") as free:
+            workspace._allocate_replica_storage(spec)
+            self.assertTrue(workspace.replica_provider.gradient_bands)
+            allocate.assert_called_once()
+            inbox = workspace.replica_inbox
+            workspace._free_symmetric_tensors()
+            free.assert_called_once_with(inbox)
+            self.assertIsNone(workspace.replica_provider)
+            self.assertIsNone(workspace.replica_inbox)
+
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Retain expanded event storage when allocating through the SHMEM API."""
         spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
@@ -175,7 +199,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
         self.assertEqual(allocate.call_count, 4)
-        self.assertEqual(workspace.event_counter_bytes, 1104 * 4)
+        self.assertEqual(workspace.event_counter_bytes, 1120 * 4)
         for tensor in (workspace.forward_event_counters, workspace.backward_event_counters):
             self.assertEqual(tensor.numel(), event_workspace_bytes(spec.ep_size, spec.num_experts))
         for allocation in allocate.call_args_list:
@@ -214,7 +238,7 @@ class TestReadyEventWorkspace(unittest.TestCase):
     @patch.object(workspace_module.shmem, "host_barrier")
     def test_initializes_once_and_preserves_ready_tail_per_direction(self, mock_barrier, mock_free) -> None:
         """Clear stale task counters without clearing a later peer signal."""
-        workspace = MegaMoeWorkspace(shared=True, event_counter_bytes=1104 * 4)
+        workspace = MegaMoeWorkspace(shared=True, event_counter_bytes=1120 * 4)
         events = [torch.full((event_workspace_bytes(64, 1024),), 123, dtype=torch.uint8) for _ in range(2)]
         workspace.forward_event_counters, workspace.backward_event_counters = events
         for forward, tensor in zip((True, False), events):
