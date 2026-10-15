@@ -44,7 +44,7 @@
           },
           {
             "path": "hyper_parallel/core/multicore/ops/swi_glu_clamp.patch",
-            "sha256": "436abdaa6ff3b30009aea3d4653adf5548ce6a46591ba513346f10ab620463ce",
+            "sha256": "a28d5a60b140ee948542199d3750ccd6d9910fbf81658aa270cb778252b8a18f",
             "allow_zero_context": true,
             "purpose": "add task-configured DeepSeek clipped SwiGLU forward and backward semantics"
           },
