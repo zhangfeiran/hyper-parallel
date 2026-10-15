@@ -24,7 +24,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts, DeepseekV4SparseMoeBlock
 
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
 from hyper_parallel.models.replacement import (
@@ -33,6 +33,7 @@ from hyper_parallel.models.replacement import (
 from hyper_parallel.trainer.config.parser import parse_training_args
 
 from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.distributed._builder.forward_rewriter import validate_local_compute_signature
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts,
 )
@@ -86,7 +87,8 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         mesh.get_group.return_value = group
         mesh.__getitem__.return_value.size.return_value = 2
         module = SimpleNamespace(is_hash=False, experts=experts, gate=SimpleNamespace(top_k=2),
-                                 shared_experts=SimpleNamespace(limit=10.0))
+                                 shared_experts=SimpleNamespace(limit=10.0),
+                                 forward=lambda hidden_states, input_ids=None: hidden_states)
         with (patch.object(ep_adapter.dist, 'is_initialized', return_value=True),
               patch.object(ep_adapter.dist, 'get_world_size', return_value=2) as world_size,
               patch('hyper_parallel.core.multicore.modules.mega_moe.module.shmem.root_members', return_value=(1, 3))):
@@ -214,6 +216,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                                  forward=lambda hidden_states, input_ids=None, image_mask=None: hidden_states)
         compute = deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None,
                                              ep_mesh=None)
+        validate_local_compute_signature(compute, module.forward, owner='VLM MegaMoe')
         hidden = (torch.randn(1, 18, 8) * 5).requires_grad_()
         image_mask = torch.zeros(1, 18, dtype=torch.bool)
         image_mask[:, 3:8] = True
@@ -233,6 +236,43 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         for left, right in zip(actual_grads, expected_grads):
             torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-5)
         self.assertGreater(actual_grads[0][image_mask].abs().sum().item(), 0)
+
+    def test_text_forward_signature_and_gradients(self) -> None:
+        """Apply the real text MoE contract and preserve routed/shared gradients."""
+        torch.manual_seed(82)
+        config = DeepseekV4Config.from_dict({
+            'hidden_size': 8, 'moe_intermediate_size': 4, 'num_hidden_layers': 1,
+            'num_local_experts': 4, 'num_experts_per_tok': 2, 'mlp_layer_types': ['moe'],
+            'swiglu_limit': 10.0, 'scoring_func': 'sigmoid', 'routed_scaling_factor': 1.0,
+        })
+        config.v41_vision_enabled = False
+        module = DeepseekV4SparseMoeBlock(config, 0)
+        module.gate = DeepseekV41TopKRouter(config)
+        for parameter in module.parameters():
+            nn.init.normal_(parameter, std=0.1)
+        module.experts = DeepseekV41MegaMoeExperts(module=module.experts, local_num_tokens=128)
+        self.addCleanup(module.experts.close_runtime)
+        compute = deepseek_v41_megamoe_compute_fn(
+            module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None,
+        )
+        validate_local_compute_signature(compute, module.forward, owner='text MegaMoe')
+        hidden = torch.randn(1, 7, 8, requires_grad=True)
+        input_ids = torch.arange(7).unsqueeze(0)
+        _, weights, ids = module.gate(hidden)
+        expected = _native_reference(
+            module.experts._executor, hidden, ids, weights,
+            expert_weights=(module.experts.gate_up_proj, module.experts.down_proj),
+        ) + module.shared_experts(hidden)
+        with patch.object(MegaMoeExperts, 'forward', _native_reference):
+            actual = compute(module, hidden, input_ids=input_ids)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+        targets = (hidden, module.gate.weight, module.experts.gate_up_proj, module.experts.down_proj,
+                   *module.shared_experts.parameters())
+        derivative = torch.randn_like(actual)
+        actual_grads = torch.autograd.grad(actual, targets, derivative)
+        expected_grads = torch.autograd.grad(expected, targets, derivative)
+        for left, right in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-5)
 
     def test_real_token_output_and_all_gradients(self) -> None:
         """Real token rows reach the executor unchanged and preserve every gradient."""

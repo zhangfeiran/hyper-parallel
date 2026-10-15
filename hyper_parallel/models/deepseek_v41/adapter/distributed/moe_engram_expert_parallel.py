@@ -288,7 +288,24 @@ def deepseek_v41_megamoe_compute_fn(
         indices, weights = _router(module, hidden_states, image_mask)
         return module.experts(hidden_states, indices, weights) + module.shared_experts(hidden_states)
 
-    return compute_fn
+    if "image_mask" in inspect.signature(module.forward).parameters:
+        return compute_fn
+
+    def text_compute_fn(
+            module: Any,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Match the text-only source forward without visual routing arguments.
+
+        Args:
+            module: Routed and shared expert module.
+            hidden_states: Current decoder hidden rows.
+            input_ids: Unused token IDs from the local compute contract.
+        """
+        return compute_fn(module, hidden_states, input_ids)
+
+    return text_compute_fn
 
 
 @local_compute
