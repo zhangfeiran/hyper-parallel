@@ -54,9 +54,9 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
     """
     if ep_size <= 0 or num_experts <= 0 or num_experts % ep_size:
         raise ValueError("num_experts must be positive and divisible by ep_size")
-    # Ready and worker completion follow termination with separate atomic lanes.
+    # Optional per-expert producer fences follow the ready/completion atomic lanes.
     final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
-    required = final_event + ATOMIC_ADD_VALUE_LEN
+    required = final_event + 2 * ATOMIC_ADD_VALUE_LEN + num_experts // ep_size
     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
 
 
@@ -388,6 +388,9 @@ def _validate_runtime_queues(cfg: RuntimeConfigC) -> None:
                 task.trigger_event + ATOMIC_ADD_VALUE_LEN > event_capacity
             ):
                 raise ValueError(f"task {task_id} references an event outside allocated capacity {event_capacity}")
+            if (task.task_type == TaskType.TASK_GROUPED_MATMUL and task.extra_value_1
+                    and task.extra_value_1 + ATOMIC_ADD_VALUE_LEN > event_capacity):
+                raise ValueError(f"task {task_id} producer event exceeds allocated capacity {event_capacity}")
 
 
 def validate_runtime_config(

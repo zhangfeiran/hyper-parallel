@@ -78,6 +78,8 @@ class ExpertReplicaCostModel:
         if isinstance(self.calibration_version, bool) or self.calibration_version != 2:
             raise ValueError("Regenerate replica calibration with calibration_version=2")
         expected_schedule = ("native_grouped_v1" if self.backend == "native" else
+                             "fixed_queue_gradient_bands_v1" if
+                             self.transport == "shmem_signal_kernel_gradient_bands" else
                              "fixed_queue_w13_first_v1" if self.transport == "shmem_signal_kernel_gradient" else
                              "fixed_queue_v1")
         if self.schedule is not None and self.schedule != expected_schedule:

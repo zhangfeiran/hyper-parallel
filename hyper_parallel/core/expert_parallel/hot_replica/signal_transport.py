@@ -31,17 +31,40 @@ from .routing import ReplicaRoute
 from .transport import _gradient_accumulators
 
 KERNEL_GRADIENT_TRANSPORT = "shmem_signal_kernel_gradient"
+GRADIENT_BAND_TRANSPORT = "shmem_signal_kernel_gradient_bands"
+KERNEL_GRADIENT_TRANSPORT_MODES = (KERNEL_GRADIENT_TRANSPORT, GRADIENT_BAND_TRANSPORT)
 _SIGNAL_BYTES = 64
 _SIGNAL_CHANNELS = 5
 _MAX_EPOCH = 2**31 - 1
+_GRADIENT_BAND_BYTES = 4 * 1024 * 1024
+_MAX_GRADIENT_BANDS = 64
+_MAX_GRADIENT_BAND_CORES = 32
 
 
 def _aligned(size: int) -> int:
     return (size + _SIGNAL_BYTES - 1) // _SIGNAL_BYTES * _SIGNAL_BYTES
 
 
+def gradient_band_layout(shape: tuple[int, ...]) -> tuple[int, int] | None:
+    """Derive bounded, whole-row publication bands from an FP32 matrix shape.
+
+    Args:
+        shape: Expert matrix dimensions, excluding the expert slot dimension.
+
+    Returns:
+        Rows per band and band count, or None for an unsupported shape.
+    """
+    if len(shape) != 2 or any(not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0 for dim in shape):
+        return None
+    rows, columns = shape
+    band_rows = max(1, min(rows, _GRADIENT_BAND_BYTES // (columns * 4)))
+    bands = (rows + band_rows - 1) // band_rows
+    return (band_rows, bands) if bands <= _MAX_GRADIENT_BANDS else None
+
+
+
 def signal_storage_bytes(shapes: tuple[tuple[int, ...], ...], slots: int,
-                         ep_size: int, element_size: int) -> int:
+                         ep_size: int, element_size: int, *, gradient_bands: bool = False) -> int:
     """Size symmetric B slots, FP32 gradients and per-projection ready words."""
     _integer(slots, "slots")
     _integer(ep_size, "ep_size")
@@ -54,7 +77,10 @@ def signal_storage_bytes(shapes: tuple[tuple[int, ...], ...], slots: int,
         for dim in shape:
             _integer(dim, "expert matrix dimension")
     matrices = sum(_aligned(slots * math.prod(shape) * size) for size in (element_size, 4) for shape in shapes)
-    return matrices + (_SIGNAL_CHANNELS * ep_size + len(shapes)) * slots * _SIGNAL_BYTES
+    layouts = [gradient_band_layout(shape) for shape in shapes] if gradient_bands else []
+    band_bytes = sum(slots * layout[1] * _MAX_GRADIENT_BAND_CORES * _SIGNAL_BYTES
+                     for layout in layouts if layout is not None)
+    return matrices + (_SIGNAL_CHANNELS * ep_size + len(shapes)) * slots * _SIGNAL_BYTES + band_bytes
 
 
 class SignalReplicaTransport:
@@ -65,7 +91,8 @@ class SignalReplicaTransport:
     SDMA internally. All ranks submit the same invocation and epoch sequence.
     """
 
-    def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int) -> None:
+    def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int,
+                 *, gradient_bands: bool = False) -> None:
         """Bind externally owned, aligned symmetric uint8 storage.
 
         Args:
@@ -73,6 +100,7 @@ class SignalReplicaTransport:
             storage: Symmetric storage retained through all remote consumers.
             slots: Guest expert budget per rank.
             ep_size: Number of ranks in the runtime's peer namespace.
+            gradient_bands: Enable Cube-produced row bands; include their bytes in storage sizing.
         """
         if (storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous()
                 or storage.data_ptr() % _SIGNAL_BYTES):
@@ -81,6 +109,9 @@ class SignalReplicaTransport:
         _integer(ep_size, "ep_size")
         self.runtime, self.storage, self.slots, self.ep_size = runtime, storage, slots, ep_size
         self.pool = self.signals = self.projection_signals = None
+        self.gradient_bands = gradient_bands
+        self._gradient_band_storage = {}
+        self._gradient_band_tables = {}
         self.epoch = 0
         self._layout = None
         self._lock = threading.Lock()
@@ -92,6 +123,36 @@ class SignalReplicaTransport:
     def kernel_gradients(self) -> bool:
         """Allow fused projection publication, accumulation and acknowledgement."""
         return True
+
+    def kernel_gradient_band_signals(self, matrix: int, cores: int) -> tuple[torch.Tensor, int, int] | None:
+        """Borrow a compact per-Cube band table from the existing symmetric inbox.
+
+        Args:
+            matrix: Projection index in the bound weight/gradient tuple.
+            cores: Active Cube producer count, identical on every EP rank.
+
+        Returns:
+            Table, rows per band and band count, or None to retain full-expert return.
+
+        Raises:
+            ValueError: The provider has no active backward lease or the indices are invalid.
+        """
+        if not self.gradient_bands or not self._lock.locked() or self.pool is None:
+            raise ValueError("Gradient bands require an active backward lease")
+        _integer(matrix, "matrix", 0)
+        _integer(cores, "cores")
+        if matrix >= len(self._layout):
+            raise ValueError("Gradient band matrix index is outside the bound layout")
+        if cores > _MAX_GRADIENT_BAND_CORES or matrix not in self._gradient_band_storage:
+            return None
+        band_rows, bands = gradient_band_layout(self._layout[matrix][0])
+        key = (matrix, cores)
+        if key not in self._gradient_band_tables:
+            length = self.slots * bands * cores * _SIGNAL_BYTES
+            self._gradient_band_tables[key] = self._gradient_band_storage[matrix][:length].view(torch.int32).reshape(
+                self.slots, bands, cores, _SIGNAL_BYTES // 4)
+        return self._gradient_band_tables[key], band_rows, bands
+
 
     @property
     def gradient_scratch_bytes(self) -> int:
@@ -115,7 +176,8 @@ class SignalReplicaTransport:
         if any(weight.device != self.storage.device or weight.dtype != weights[0].dtype for weight in weights):
             raise ValueError("Signal weights must share the symmetric storage device and one dtype")
         shapes = tuple(tuple(weight.shape[1:]) for weight in weights)
-        required = signal_storage_bytes(shapes, self.slots, self.ep_size, weights[0].element_size())
+        required = signal_storage_bytes(shapes, self.slots, self.ep_size, weights[0].element_size(),
+                                        gradient_bands=self.gradient_bands)
         if required > self.storage.numel():
             raise ValueError("Symmetric signal replica storage is too small")
         views, offset = [], 0
@@ -127,10 +189,22 @@ class SignalReplicaTransport:
         signal_end = offset + _SIGNAL_CHANNELS * self.ep_size * self.slots * _SIGNAL_BYTES
         self.signals = self.storage[offset:signal_end].view(torch.int32).reshape(
             _SIGNAL_CHANNELS, self.ep_size, self.slots, _SIGNAL_BYTES // 4)
-        self.projection_signals = self.storage[signal_end:required].view(torch.int32).reshape(
+        ready_end = signal_end + len(weights) * self.slots * _SIGNAL_BYTES
+        self.projection_signals = self.storage[signal_end:ready_end].view(torch.int32).reshape(
             len(weights), self.slots, _SIGNAL_BYTES // 4)
         self.signals.zero_()
         self.projection_signals.zero_()
+        signal_end = ready_end
+        if self.gradient_bands:
+            for matrix, shape in enumerate(shapes):
+                band_layout = gradient_band_layout(shape)
+                if band_layout is None:
+                    continue
+                length = self.slots * band_layout[1] * _MAX_GRADIENT_BAND_CORES * _SIGNAL_BYTES
+                self._gradient_band_storage[matrix] = self.storage[signal_end:signal_end + length]
+                self._gradient_band_storage[matrix].zero_()
+                signal_end += length
+
         self.runtime.host_barrier()
         self.pool = ReplicaPool(tuple(views[:len(weights)]), self.slots, borrow=True)
         self.pool.gradients = tuple(views[len(weights):])
@@ -141,6 +215,8 @@ class SignalReplicaTransport:
             self.runtime.host_barrier()
             self.signals.zero_()
             self.projection_signals.zero_()
+            for table in self._gradient_band_storage.values():
+                table.zero_()
             self.runtime.host_barrier()
             self.epoch = 0
             self._resident_generation = self._resident_ready = None

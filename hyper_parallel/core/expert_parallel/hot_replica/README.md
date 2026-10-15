@@ -154,3 +154,21 @@ checkpoint 使用 reentrant 完整重算，取证记录有梯度的 forward 所�
 每个 rank 输出配置、source/payload identity、实际计划、local/rank-max 样本和峰值内存。
 对照应保持 route、seed、shape、checkpoint 和资源所有权一致，使用新进程 A/B/B/A；
 诊断或单算子耗时不能替代完整步骤收益，CPU 回归和 build/load 也不能代替 NPU 数值验收。
+
+## 按行带重叠梯度返回
+
+`shmem_signal_kernel_gradient_bands` 使用 Cube 直接发布行带就绪信号，
+使 W2/W13 梯度可以在整专家计算结束之前返回。启用此模式前需要重新构建 multicore 原生载荷。
+行带按 FP32 矩阵形状和 4 MiB 目标大小划分，不根据路由 skew、seed 或副本预算选择策略。
+每个 Cube 只在该行带全部 K 维累加与最终 GM 写回完成后发布信号；
+没有分配到输出 tile 的 Cube 和零行专家也必须发布完成信号。
+
+返回侧按实际 worker 数和行带数划分最多四个独立 AIV 组。
+一组等待某个 peer 时，其他组可以推进自己的行带。
+每个元素仍按原目标 rank 顺序累加 FP32 梯度，不改变路由、副本配额和数值精度。
+两个投影均完成所有读取后，在最终 ACK 汇合处释放 guest 租约。
+
+对称的 guest 信号表直接放入已有 replica inbox，纳入构造阶段的 SHMEM 堆预算，
+随 inbox 一起释放，在 epoch 回绕时同步清零；普通 owner 信号表保持调用内独占并记录 stream 生命周期。
+无法证明两个投影的生产调度、行带数超过 64 或 Cube 数超过预留的 32 时，保留完整专家返回。
+B=0 和没有实际副本搬运的路由沿用原有执行路径。

@@ -122,7 +122,7 @@ struct TaskDesc {
   uint32_t task_split_num;
   uint32_t task_split_value;
   uint32_t extra_value_0;
-  uint32_t extra_value_1;
+  uint32_t extra_value_1;  // GMM: optional producer completion event; zero disables it.
   uint32_t extra_value_2;
   uint32_t profile_desc_id;
   uint32_t profile_owner_id;
