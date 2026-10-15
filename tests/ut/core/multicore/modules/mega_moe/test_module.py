@@ -282,42 +282,49 @@ class TestMegaMoeExperts(unittest.TestCase):
               essential_mark="essential")
     def test_replica_target_load_is_independent_of_capacity_in_push_and_pull(self) -> None:
         """
-        description: Preserve default routing targets and pass explicit targets without resizing buffers.
+        description: Preserve routing targets when shared buffers grow between forward and replay.
         expectation: Explicit targets and invocation graph switches preserve workspace ownership.
         feature: Expert hot replica resource selection.
         """
         hidden = torch.ones(128, 16, dtype=torch.bfloat16)
         ids = torch.zeros(128, 2, dtype=torch.int32)
         probabilities = torch.full((128, 2), 0.5)
-        for mode, target, expected in (("push", None, 384), ("push", 256, 256),
-                                       ("pull", None, None), ("pull", 256, 256)):
-            with self.subTest(mode=mode, target=target):
-                experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
-                                         num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
-                                         replica_slots_per_rank=1, replica_target_load=target).bfloat16()
-                resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0, replica_slots_per_rank=1),
-                                            plan=SimpleNamespace(spec=object()),
-                                            home_plan=None,
-                                            workspace=Mock(capacity_floor=384), ensure_capacity=Mock())
-                replica = SimpleNamespace(physical_ids=ids, counts_by_source=torch.zeros(2, 6), home_only=False)
-                route = SimpleNamespace(routed_tokens=object(), metadata=object(), unpermute_mapping=object(),
-                                        maximum_received_slots=256)
-                try:
-                    with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
-                          patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
-                          patch.object(experts, "_get_execution_resources", return_value=resources),
-                          patch.object(mega_moe_module, "prepare_replica_route", return_value=replica) as prepare,
-                          patch.object(mega_moe_module, "prepare_topk_route", return_value=route),
-                          patch.object(mega_moe_module, "execute_mega_moe_with_permutation", return_value=hidden),
-                          patch.object(mega_moe_module, "restore_topk_output", return_value=hidden)):
-                        torch.testing.assert_close(experts(hidden, ids, probabilities), hidden)
-                    self.assertEqual(prepare.call_args.kwargs["target_load"], expected)
-                    self.assertEqual(prepare.call_args.kwargs["minimum_replica_rows"], 1024)
-                    self.assertEqual(resources.workspace.capacity_floor, 384)
-                    if mode == "push":
-                        resources.ensure_capacity.assert_called_once_with(256)
-                finally:
-                    experts.close()
+        for dynamic in (False, True):
+            for mode, target, expected in (("push", None, 384), ("push", 256, 256),
+                                           ("pull", None, None), ("pull", 256, 256)):
+                with self.subTest(mode=mode, target=target, dynamic=dynamic):
+                    tokens = {"max_local_num_tokens" if dynamic else "local_num_tokens": 128}
+                    experts = MegaMoeExperts(**tokens, hidden_size=16, intermediate_size=8,
+                                             num_experts=8, top_k=2, ep_size=4, dispatch_mode=mode,
+                                             replica_slots_per_rank=1, replica_target_load=target).bfloat16()
+                    plan = SimpleNamespace(spec=object())
+                    resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0, replica_slots_per_rank=1),
+                                                plan=None if dynamic else plan, home_plan=None,
+                                                plan_for_tokens=Mock(return_value=plan),
+                                                workspace=Mock(capacity_floor=384), ensure_capacity=Mock())
+                    replica = SimpleNamespace(physical_ids=ids, counts_by_source=torch.zeros(4, 12), home_only=False)
+                    route = SimpleNamespace(routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
+                                            unpermute_mapping=object(), maximum_received_slots=256)
+                    try:
+                        with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+                              patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
+                              patch.object(experts, "_get_execution_resources", return_value=resources),
+                              patch.object(mega_moe_module, "prepare_replica_route", return_value=replica) as prepare,
+                              patch.object(mega_moe_module, "prepare_topk_route", return_value=route),
+                              patch.object(mega_moe_module, "execute_mega_moe_with_permutation", return_value=hidden),
+                              patch.object(mega_moe_module, "restore_topk_output", return_value=hidden)):
+                            # A shared layer may grow the heap between forward and checkpoint replay.
+                            for capacity in (384, 512):
+                                resources.workspace.capacity_floor = capacity
+                                torch.testing.assert_close(experts(hidden, ids, probabilities), hidden)
+                                self.assertEqual(prepare.call_args.kwargs["target_load"], expected)
+                                self.assertEqual(prepare.call_args.kwargs["minimum_replica_rows"], 1024)
+                                self.assertEqual(resources.workspace.capacity_floor, capacity)
+                        if mode == "push":
+                            self.assertEqual(resources.ensure_capacity.call_count, 2)
+                            resources.ensure_capacity.assert_called_with(256)
+                    finally:
+                        experts.close()
 
     @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")

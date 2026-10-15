@@ -51,7 +51,8 @@ Multicore 的构建、载荷激活和 SHMEM 生命周期见
 
 规划器汇总各 source 的整数计数，生成确定性的放置和配额。稳定重映射保留每个 TopK 位置、
 源顺序和总行数，既不丢 token，也不执行 multi-wave。`replica_target_load` 是期望接收负载，
-独立于缓冲区容量；push 未设置时使用当前容量，pull 未设置时使用平均负载。
+独立于缓冲区容量；push 未设置时使用配置的初始容量，pull 未设置时使用平均负载。
+The default push target remains fixed when the shared heap grows, so checkpoint replay preserves replica placement.
 
 `ExpertReplicaConfig.maximum_receive_rows(S, K)` 给出有界接收容量。B=0 的未对齐上界为
 P*S*min(K,H)，B>=H 时为 S*K；其余预算按 home/guest 混合界和整数截断余量计算。

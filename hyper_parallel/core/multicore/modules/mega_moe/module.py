@@ -322,7 +322,7 @@ class MegaMoeExperts(MulticoreModule):
                 directly from Cube workers and consumes them in independent AIV groups.
             replica_planner: Shared CPU or fused device replica quota policy.
             replica_target_load: Preferred received rows per rank, independent of buffer capacity.
-                All EP ranks must agree. None uses current capacity for push and average load for pull.
+                All EP ranks must agree. None uses initial configured capacity for push and average load for pull.
                 Explicit positive values apply to either dispatch mode and retain lossless routing.
             replica_minimum_load_reduction: Required fractional receive-peak reduction for
                 optional replicas. None requires a 40 percent reduction for each route;
@@ -655,7 +655,8 @@ class MegaMoeExperts(MulticoreModule):
                 if self.replica_slots_per_rank:
                     target_load = self.replica_target_load
                     if target_load is None and not pull:
-                        target_load = resources.workspace.capacity_floor
+                        # Heap growth must not change placement during checkpoint replay.
+                        target_load = initial_receive_capacity(self._resource_group.specification)
                     admission, saved_rows = resolve_replica_admission(self.replica_minimum_load_reduction)
                     replica_route = prepare_replica_route(
                         topk_ids, self.replica_config, self._ep_group,
