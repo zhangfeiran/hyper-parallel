@@ -388,9 +388,10 @@ def test_swiglu_clamp_ub_scratch() -> None:
     observed_calls = 0
     comparisons = []
 
-    def check_backward(plan: Any, saved: Any, grad_output: Any, execution: Any) -> None:
+    def check_backward(plan: Any, saved: Any, grad_output: Any, execution: Any,
+                       pool: Any = None, gradient_return: torch.Tensor | None = None) -> None:
         nonlocal observed_calls
-        original_launch(plan, saved, grad_output, execution)
+        original_launch(plan, saved, grad_output, execution, pool, gradient_return)
         torch.npu.synchronize(baseline.DEVICE)
         rows = int(saved.group_list[-1].item())
         gate, up = saved.up_proj[:rows].detach().cpu().double().chunk(2, dim=-1)
