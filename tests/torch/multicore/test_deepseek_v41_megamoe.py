@@ -39,3 +39,12 @@ def test_deepseek_v41_megamoe(monkeypatch: pytest.MonkeyPatch, dispatch_mode: st
     worker = str(Path(__file__).with_name("_test_deepseek_v41_dynamic_tokens.py"))
     with without_inherited_rank_environment():
         parallel_run([TorchCase(worker, "test_deepseek_v41_dynamic_tokens", num_proc=8)], global_num_proc=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="essential")
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_deepseek_v41_megamoe_with_replicas(monkeypatch: pytest.MonkeyPatch, dispatch_mode: str) -> None:
+    """Compare empty and unequal B1 sources with independent clipped-expert gradients."""
+    monkeypatch.setenv("HP_DSV41_DYNAMIC_REPLICA_SLOTS", "1")
+    test_deepseek_v41_megamoe(monkeypatch, dispatch_mode)

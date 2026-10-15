@@ -122,6 +122,7 @@ def _replica_count_payload(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
 def prepare_replica_route(
     topk_ids: torch.Tensor, config: ExpertReplicaConfig, group: object = None,
     *, target_load: int | None = None, minimum_replica_rows: int = 0,
+    max_local_num_tokens: int | None = None,
     cost_model: ExpertReplicaCostModel | None = None, planner_backend: str = "cpu",
     compact_home: bool = False,
     minimum_load_reduction: float = 0.0,
@@ -131,7 +132,7 @@ def prepare_replica_route(
 
     Route validation is collective: invalid IDs and repeated experts are reported
     by all ranks before any sparse weight transfers. All ranks must supply the
-    same shape and configuration, as required by the EP module contract.
+    same configuration and either equal source shapes or a common source-row bound.
 
     Args:
         topk_ids: Integer expert IDs, with distinct experts in each token's row.
@@ -139,6 +140,7 @@ def prepare_replica_route(
         group: EP process group; None selects the default group.
         target_load: Optional preferred destination load, capped by the receive bound.
         minimum_replica_rows: Minimum useful row count for a guest copy.
+        max_local_num_tokens: Shared source-row bound for unequal or empty dynamic inputs.
         cost_model: Optional calibrated model for CPU quota refinement.
         planner_backend: CPU or device placement implementation.
         compact_home: Keep logical IDs and counts when the global plan has no guests.
@@ -157,7 +159,8 @@ def prepare_replica_route(
     if size != config.ep_size:
         raise ValueError("replica configuration must match the EP group size")
     tokens, top_k = topk_ids.shape
-    upper = config.maximum_receive_rows(tokens, top_k, alignment=1)
+    reserved_tokens = tokens if max_local_num_tokens is None else max_local_num_tokens
+    upper = config.maximum_receive_rows(reserved_tokens, top_k, alignment=1)
     ids = topk_ids.to(torch.int64)
     payload = _replica_count_payload(ids, config.num_experts)
     matrix = _gather_replica_counts(payload, size, group)

@@ -661,6 +661,7 @@ class MegaMoeExperts(MulticoreModule):
                     replica_route = prepare_replica_route(
                         topk_ids, self.replica_config, self._ep_group,
                         target_load=target_load,
+                        max_local_num_tokens=self.max_local_num_tokens,
                         minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
                         planner_backend=self.replica_planner,
                         minimum_load_reduction=admission, minimum_saved_rows=saved_rows,

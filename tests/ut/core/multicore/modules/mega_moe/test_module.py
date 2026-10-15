@@ -318,6 +318,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                                 resources.workspace.capacity_floor = capacity
                                 torch.testing.assert_close(experts(hidden, ids, probabilities), hidden)
                                 self.assertEqual(prepare.call_args.kwargs["target_load"], expected)
+                                self.assertEqual(prepare.call_args.kwargs["max_local_num_tokens"],
+                                                 128 if dynamic else None)
                                 self.assertEqual(prepare.call_args.kwargs["minimum_replica_rows"], 1024)
                                 self.assertEqual(resources.workspace.capacity_floor, capacity)
                         if mode == "push":

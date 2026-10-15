@@ -21,6 +21,7 @@ from unittest.mock import patch
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import (
+    ExpertReplicaConfig,
     build_expert_replica_plan,
     routing,
 )
@@ -28,6 +29,27 @@ from hyper_parallel.core.expert_parallel.hot_replica import (
 
 class TestReplicaRouting(unittest.TestCase):
     """Compare both remap paths with explicit per-expert occurrence quotas."""
+
+    def test_shared_source_bound_preserves_empty_and_unequal_rank_plans(self) -> None:
+        """All dynamic source ranks must plan against the same reserved row bound."""
+        config = ExpertReplicaConfig(4, 2, 1)
+        for lengths in ((0, 2), (1, 128), (0, 0)):
+            counts = torch.tensor([[rows, rows, 0, 0, 0] for rows in lengths], dtype=torch.int64)
+            plans = []
+            for rank, rows in enumerate(lengths):
+                with self.subTest(lengths=lengths, rank=rank):
+                    ids = torch.tensor([[0, 1]], dtype=torch.int32).repeat(rows, 1)
+                    with (patch.object(routing.dist, "is_initialized", return_value=True),
+                          patch.object(routing.dist, "get_world_size", return_value=2),
+                          patch.object(routing.dist, "get_rank", return_value=rank),
+                          patch.object(routing, "_gather_replica_counts", return_value=counts)):
+                        route = routing.prepare_replica_route(ids, config, max_local_num_tokens=128)
+                    self.assertEqual(tuple(route.physical_ids.shape), (rows, 2))
+                    self.assertEqual(route.counts_by_source.sum(dim=1).tolist(), [2 * value for value in lengths])
+                    self.assertEqual(sum(route.plan.destination_loads), 2 * sum(lengths))
+                    plans.append(route.plan)
+            self.assertEqual(len(plans), len(lengths))
+            self.assertEqual(plans[0], plans[1])
 
     def test_count_payload_retains_global_validation_flags(self) -> None:
         """Build payloads for legal, duplicate, out-of-range and empty routes."""

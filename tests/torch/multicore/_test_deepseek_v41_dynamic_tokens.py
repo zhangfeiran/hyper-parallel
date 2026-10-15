@@ -85,7 +85,9 @@ def test_deepseek_v41_dynamic_tokens() -> None:
     source.gate_up_proj = nn.Parameter(weights[0].transpose(1, 2).contiguous())
     source.down_proj = nn.Parameter(weights[1].transpose(1, 2).contiguous())
     dispatch_mode = os.getenv("HP_DYNAMIC_DISPATCH", "push")
-    dynamic = DeepseekV41MegaMoeExperts(module=source, dispatch_mode=dispatch_mode)
+    replicas = int(os.getenv("HP_DSV41_DYNAMIC_REPLICA_SLOTS", "0"))
+    dynamic = DeepseekV41MegaMoeExperts(module=source, dispatch_mode=dispatch_mode,
+                                      replica_slots_per_rank=replicas)
     experts = slice(rank * 6, (rank + 1) * 6)
     dynamic.gate_up_proj = nn.Parameter(dynamic.gate_up_proj[experts].detach().npu())
     dynamic.down_proj = nn.Parameter(dynamic.down_proj[experts].detach().npu())
@@ -121,7 +123,7 @@ def test_deepseek_v41_dynamic_tokens() -> None:
                         "fixed_comparison_max_abs": errors, "fp32_diagnostic": fp32})
     dynamic.close_runtime()
     fixed.close()
-    result = {"rank": rank, "limit": 10, "ep": world, "experts": 48,
+    result = {"rank": rank, "limit": 10, "ep": world, "experts": 48, "replica_slots_per_rank": replicas,
               "passed": True, "cases": reports, "rtol": 2e-2, "atol": 2e-3}
     if os.getenv("HP_DSV41_DYNAMIC_RESULT_DIR"):
         output = Path(os.environ["HP_DSV41_DYNAMIC_RESULT_DIR"])
