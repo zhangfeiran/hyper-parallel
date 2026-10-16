@@ -89,13 +89,28 @@ class TestClusterRecipe(unittest.TestCase):
                                             if "replace_module" in entry]
                             self.assertTrue(any(item["_target_"].endswith("HostEngramModule")
                                                 for item in replacements))
+                            moe_replacements = [item for item in replacements
+                                                if item["_target_"].endswith("DeepseekV41MegaMoeExperts")]
+                            compute = next(entry["local_compute_fn"] for entry in recipe["plan_overrides"]
+                                           if entry["match"] == "model.layers.*.mlp")
                             if backend == "megamoe":
-                                moe = next(item for item in replacements
-                                           if item["_target_"].endswith("DeepseekV41MegaMoeExperts"))
+                                self.assertEqual(len(moe_replacements), 1)
+                                moe = moe_replacements[0]
                                 self.assertEqual(moe["local_num_tokens"], 4096)
+                                self.assertEqual(moe["dispatch_mode"], mode)
                                 self.assertNotIn("replica_slots_per_rank", moe)
+                                self.assertTrue(compute["_target_"].endswith("deepseek_v41_megamoe_compute_fn"))
+                                self.assertNotIn("use_grouped_gemm", compute)
+                            else:
+                                self.assertEqual(moe_replacements, [])
+                                self.assertTrue(compute["_target_"].endswith("deepseek_v41_ep_compute_fn"))
+                                self.assertTrue(compute["use_grouped_gemm"])
                             if modality == "text":
                                 self.assertIsNone(recipe["model"]["vision_num_hidden_layers"])
+                                self.assertFalse(any(entry["match"] == "dspark"
+                                                     or entry["match"].startswith("dspark.")
+                                                     for entry in recipe["plan_overrides"]
+                                                     if isinstance(entry["match"], str)))
                             else:
                                 expected = 1 if packing == "dynamic" else 4096
                                 self.assertEqual(recipe["dataloader"]["token_budget"], expected)

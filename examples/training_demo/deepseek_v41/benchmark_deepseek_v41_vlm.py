@@ -45,6 +45,13 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
     modality = getattr(args, "modality", "vlm")
     filename = "train_deepseek_v41_vlm_online.yaml" if modality == "vlm" else "train_deepseek_v41_online.yaml"
     recipe = yaml.safe_load(Path(__file__).with_name(filename).read_text(encoding="utf-8"))
+    # Exact FQNs are validated even when the optional drafter is absent.
+    if recipe["model"].get("dspark_depth", 0) == 0:
+        recipe["plan_overrides"] = [
+            entry for entry in recipe["plan_overrides"]
+            if not isinstance(entry["match"], str)
+            or (entry["match"] != "dspark" and not entry["match"].startswith("dspark."))
+        ]
     recipe["model"].update(config_path=args.model_dir, engram_assets_path=args.engram_assets,
                           num_routed_experts=args.experts, root_owned_vision=modality == "vlm")
     recipe["model_init_dtype"] = "float32"
@@ -135,8 +142,16 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
                     "hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule"
                 )
     compute = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel."
+    # The shared recipes enable MegaMoe; each benchmark selects its own backend.
+    recipe["plan_overrides"] = [
+        entry for entry in recipe["plan_overrides"]
+        if not entry.get("replace_module", {}).get("_target_", "").endswith(".DeepseekV41MegaMoeExperts")
+    ]
     moe_override = next(entry for entry in recipe["plan_overrides"]
-                        if entry.get("local_compute_fn", {}).get("_target_", "").endswith("deepseek_v41_ep_compute_fn"))
+                        if entry["match"] == "model.layers.*.mlp" and "local_compute_fn" in entry)
+    moe_override["local_compute_fn"] = {
+        "_target_": compute + "deepseek_v41_ep_compute_fn", "use_grouped_gemm": True,
+    }
     if args.backend == "megamoe":
         replacement = {
             "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts",
