@@ -1,7 +1,7 @@
 # DeepSeek-V4.1 Host Engram and cluster experiments
 
-This extension sits on top of the core DSV4.1 MegaMoe adapter and bounded dynamic
-token support. Expert hot replicas are excluded. Native, push and pull all use
+This extension uses upstream Host Engram with the core DSV4.1 MegaMoe adapter and
+bounded dynamic token support. Expert hot replicas are excluded. Native, push and pull all use
 the same model, initialization, optimizer policy and data order.
 
 ## Host Engram
@@ -26,16 +26,17 @@ independent of the EP/FSDP placement and expert matrix transposition. Generation
 uses bounded CPU chunks and creates no weight snapshots. Optimizer FP32 masters
 are refreshed after benchmark initialization.
 
-The generic external-state lifecycle delegates model-specific validation and
-loading to the adapter. Host sidecars store owner weights and optional sparse
+The upstream external-state lifecycle validates build and checkpoint policies
+and uses the adapter to load Host rows. Host sidecars store weights and optional sparse
 optimizer moments; DCP stores dense state. Restore validates topology, key sets,
 file checksums and optimizer scope before consuming state. The cluster benchmark
 disables checkpoint saving; `prepare_engram_host_rows.py` is an optional
 pretrained-row conversion tool and is not used by random initialization.
 
-Host training requires meta construction, FP32 model initialization and optimizer
+The cluster benchmark uses meta construction, FP32 model initialization and optimizer
 masters, BF16 FSDP parameters, FP32 gradient reduction and disabled automatic
-forward-input casting. Placement validation, compilation and asynchronous Host
+forward-input casting. The upstream BF16 initialization and reduction policy remains
+supported; both policies bind Host lookup to BF16 execution. Placement validation, compilation and asynchronous Host
 checkpointing are unsupported and fail explicitly.
 
 ## Decoder and attention recomputation

@@ -387,6 +387,7 @@ def build_deepseek_v41_validation_config(
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
         dspark_confidence_coeff: float = 0.1,
+        root_owned_vision: bool = False,
         engram_storage_backend: str = "device",
         engram_max_pending_entries: int = 1000000,
         engram_max_sparse_rows_per_step: int = 1000000,
@@ -418,6 +419,7 @@ def build_deepseek_v41_validation_config(
             to the last three, matching the released layout.
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
+        root_owned_vision: Keep variable-image visual parameters in the root FSDP unit.
 
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
@@ -460,6 +462,9 @@ def build_deepseek_v41_validation_config(
         dspark_loss_coeff,
         dspark_confidence_coeff,
     )
+    if not isinstance(root_owned_vision, bool):
+        raise ValueError("root_owned_vision must be a boolean")
+    config.v41_root_owned_vision = root_owned_vision
     _apply_engram_host_fields(
         config,
         engram_storage_backend,
@@ -489,6 +494,7 @@ def build_cropped_deepseek_v41(
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
         dspark_confidence_coeff: float = 0.1,
+        root_owned_vision: bool = False,
         engram_storage_backend: str = "device",
         engram_max_pending_entries: int = 1000000,
         engram_max_sparse_rows_per_step: int = 1000000,
@@ -520,6 +526,7 @@ def build_cropped_deepseek_v41(
             to the last three.
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
+        root_owned_vision: Keep variable-image visual parameters in the root FSDP unit.
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -548,6 +555,7 @@ def build_cropped_deepseek_v41(
         dspark_target_layer_ids=dspark_target_layer_ids,
         dspark_loss_coeff=dspark_loss_coeff,
         dspark_confidence_coeff=dspark_confidence_coeff,
+        root_owned_vision=root_owned_vision,
         engram_storage_backend=engram_storage_backend,
         engram_max_pending_entries=engram_max_pending_entries,
         engram_max_sparse_rows_per_step=engram_max_sparse_rows_per_step,

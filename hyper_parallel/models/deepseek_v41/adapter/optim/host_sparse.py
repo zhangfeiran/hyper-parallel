@@ -89,6 +89,10 @@ class HostSparseOptimizerCoordinator:
         """Return only dense optimizer state for regular DCP."""
         return self.dense.state_dict()
 
+    def reload_model_params(self) -> None:
+        """Refresh dense masters after initialization; Host weights remain FP32."""
+        self.dense.reload_model_params()
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Load only dense optimizer state; the sparse sidecar restores the rest.
 
