@@ -16,6 +16,7 @@
 # pylint: disable=wrong-import-position
 
 import copy
+import sys
 import unittest
 from itertools import product
 from types import SimpleNamespace
@@ -138,8 +139,12 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         inputs = torch.randn(counts.sum(), experts.hidden_dim, dtype=dtype, requires_grad=True)
         expected_inputs = inputs.detach().clone().requires_grad_()
         grouped = Mock(side_effect=self._cpu_grouped_matmul)
-        # Patch the lazy export without importing the optional NPU backend on CPU.
-        with patch.dict(hp_functional.__dict__, {"grouped_matmul": grouped}):
+        # A direct submodule import can replace the lazy package export with a module.
+        backend = SimpleNamespace(grouped_matmul=grouped)
+        with (
+            patch.dict(sys.modules, {"hyper_parallel.components.functional.grouped_matmul": backend}),
+            patch.dict(hp_functional.__dict__, {"grouped_matmul": backend}),
+        ):
             output = _deepseek_v41_grouped_expert_forward(experts, inputs, counts)
         self.assertEqual(grouped.call_count, 2)
         self.assertEqual(output.dtype, dtype)
@@ -212,7 +217,11 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         inputs = torch.randn(len(indices), config.hidden_size, dtype=dtype, requires_grad=True)
         reference_inputs = inputs.detach().clone().requires_grad_()
         matmul = Mock(side_effect=self._cpu_grouped_matmul)
-        with patch.dict(hp_functional.__dict__, {"grouped_matmul": matmul}):
+        backend = SimpleNamespace(grouped_matmul=matmul)
+        with (
+            patch.dict(sys.modules, {"hyper_parallel.components.functional.grouped_matmul": backend}),
+            patch.dict(hp_functional.__dict__, {"grouped_matmul": backend}),
+        ):
             actual = experts(inputs, indices)
         self.assertEqual(matmul.call_count, 2 if grouped else 0)
         expected = torch.zeros_like(reference_inputs)
@@ -244,7 +253,11 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
             experts.gate_up_proj.copy_(torch.tensor([[[2.421875], [-4.40625]]]))
             experts.down_proj.fill_(1.0)
         grouped = Mock(side_effect=self._cpu_grouped_matmul)
-        with patch.dict(hp_functional.__dict__, {"grouped_matmul": grouped}):
+        backend = SimpleNamespace(grouped_matmul=grouped)
+        with (
+            patch.dict(sys.modules, {"hyper_parallel.components.functional.grouped_matmul": backend}),
+            patch.dict(hp_functional.__dict__, {"grouped_matmul": backend}),
+        ):
             actual = _deepseek_v41_grouped_expert_forward(
                 experts, torch.ones(1, 1, dtype=torch.bfloat16), torch.tensor([1]),
             )
