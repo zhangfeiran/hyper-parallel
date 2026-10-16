@@ -248,7 +248,8 @@ dataset:
 
 dataloader:
   _target_: hyper_parallel.data.batching.TokenBatchLoader
-  min_buffered_samples: 1
+  token_budget: 4096
+  min_buffered_samples: 16
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:
