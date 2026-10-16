@@ -16,6 +16,7 @@
 # pylint: disable=C9006,C9007
 
 from contextlib import contextmanager
+from typing import Iterator
 
 import torch
 
@@ -23,13 +24,15 @@ from hyper_parallel.core.dtensor._utils import init_on_device as _init_on_device
 
 
 @contextmanager
-def init_empty_weights(include_buffers=False):
+def init_empty_weights(include_buffers: bool = False) -> Iterator[None]:
     """Context manager that initializes model parameters (and optionally
     buffers) on the meta device.
 
-    Models created under this context have no real data, which avoids allocating
-    any NPU/GPU/CPU memory.  This is useful when the model is too large to fit in RAM
-    and the weights will be loaded from a checkpoint afterwards.
+    Registered parameters have no real storage. Factories can reserve temporary
+    CPU storage before registration; deterministic empty-storage filling is
+    disabled during meta construction to avoid touching that storage. The
+    caller's fill policy is restored on exit, while deterministic algorithms
+    remain enabled.
 
     Args:
         include_buffers (bool): If ``True``, buffers are also placed on the meta
@@ -40,7 +43,7 @@ def init_empty_weights(include_buffers=False):
         from hyper_parallel import init_empty_weights
 
         with init_empty_weights():
-            model = MyLargeModel()  # no memory allocated
+            model = MyLargeModel()  # registered parameters have no real storage
 
     Note:
         A model initialised under this context has **no weights**.  You cannot
