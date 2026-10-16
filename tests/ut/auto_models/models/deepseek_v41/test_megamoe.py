@@ -44,8 +44,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_pa
 from hyper_parallel.models.deepseek_v41.adapter.distributed import moe_engram_expert_parallel as ep_adapter
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
 from hyper_parallel.models.runtime_resources import ModelRuntimeResources
-from hyper_parallel.trainer.config import PlanOverride, entries_to_module_replacements
-from hyper_parallel.trainer.config.resolver import resolve_component
+from hyper_parallel.trainer.config import entries_to_module_replacements
 from hyper_parallel.trainer.base import BaseTrainer
 from tests.common.mark_utils import arg_mark
 
@@ -98,17 +97,27 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         self.assertEqual(experts._executor.max_local_num_tokens, 128)
 
     def test_enabled_recipes_preserve_base_replacements_and_precision(self) -> None:
-        """Resolve executable text/VLM recipes with paired replacement and EP compute targets."""
+        """Resolve existing text/VLM recipes with paired expert and compute targets."""
         directory = Path(__file__).resolve().parents[5] / 'examples/training_demo/deepseek_v41'
         for suffix in ('online', 'vlm_online'):
             with self.subTest(modality=suffix):
-                native = parse_training_args([str(directory / f'train_deepseek_v41_{suffix}.yaml')])
-                mega = parse_training_args([str(directory / f'train_deepseek_v41_megamoe_{suffix}.yaml')])
+                mega = parse_training_args([str(directory / f'train_deepseek_v41_{suffix}.yaml')])
                 replacements = entries_to_module_replacements(mega.plan_overrides)
-                self.assertEqual(len(replacements), len(entries_to_module_replacements(native.plan_overrides)) + 1)
+                matches = {match for rule in replacements for match in rule.match}
+                expected = {'model.layers.*.mlp.experts', 'model.layers.*.attn_hc', 'model.layers.*.ffn_hc',
+                            'model.layers.*.mlp.gate', 'model.layers.*.engram', 'model.layers.*.self_attn'}
+                if suffix == 'vlm_online':
+                    expected.add('model.vision.blocks.*.attn')
+                self.assertEqual(matches, expected)
+                experts = [entry for entry in mega.plan_overrides if entry.replace_module is not None
+                           and entry.replace_module.callable is DeepseekV41MegaMoeExperts]
+                self.assertEqual(len(experts), 1)
+                self.assertEqual(experts[0].replace_module.local_num_tokens, 4096)
+                self.assertEqual(experts[0].replace_module.dispatch_mode, 'push')
                 compute = [entry for entry in mega.plan_overrides if entry.local_compute_fn is not None
                            and entry.local_compute_fn.callable is deepseek_v41_megamoe_compute_fn]
                 self.assertEqual(len(compute), 1)
+                self.assertEqual(compute[0].match, 'model.layers.*.mlp')
                 self.assertIsNone(compute[0].when)
                 self.assertEqual(mega.model_init_dtype, 'float32')
                 self.assertEqual(mega.fsdp_config.mix_precision.param_dtype, 'bfloat16')
@@ -305,37 +314,26 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
             with self.subTest(recipe=filename):
                 config = parse_training_args([str(root / 'examples/training_demo/deepseek_v41' / filename)])
                 self.assertNotIn('megamoe', config.to_dict())
-                native = next(entry for entry in config.plan_overrides
-                              if entry.local_compute_fn is not None
-                              and entry.local_compute_fn._target_ is deepseek_v41_ep_compute_fn)
-                self.assertEqual(native.when, 'ep')
-                node = {
-                    'match': '*.mlp.experts',
-                    'module_type': 'transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts',
-                    'replace_module': {
-                        '_target_': ('hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.'
-                                    'DeepseekV41MegaMoeExperts'),
-                        'local_num_tokens': 128,
-                        'dispatch_mode': 'push',
-                    },
-                }
-                entry = resolve_component(node, annotation=PlanOverride, path='plan_overrides[0]')
+                entry = next(entry for entry in config.plan_overrides
+                             if entry.replace_module is not None
+                             and entry.replace_module.callable is DeepseekV41MegaMoeExperts)
                 rules = entries_to_module_replacements([entry])
                 model = nn.Module()
                 model.config = DeepseekV4Config.from_dict({
                     'hidden_size': 32, 'moe_intermediate_size': 16,
                     'num_local_experts': 4, 'num_experts_per_tok': 2, 'swiglu_limit': 10.,
                 })
-                model.layer = nn.Module()
-                model.layer.mlp = nn.Module()
-                model.layer.mlp.experts = DeepseekV4Experts(model.config)
+                model.model = nn.Module()
+                model.model.layers = nn.ModuleList([nn.Module()])
+                model.model.layers[0].mlp = nn.Module()
+                model.model.layers[0].mlp.experts = DeepseekV4Experts(model.config)
                 for parameter in model.parameters():
                     nn.init.normal_(parameter, std=0.02)
                 original = {key: value.clone() for key, value in model.state_dict().items()}
                 conversions = []
                 apply_module_replacements(model, compile_module_replacements(model, rules),
                                           weights_mapping=conversions)
-                self.assertIsInstance(model.layer.mlp.experts, DeepseekV41MegaMoeExperts)
+                self.assertIsInstance(model.model.layers[0].mlp.experts, DeepseekV41MegaMoeExperts)
                 model._weight_conversions = conversions
                 restored = revert_weight_conversion(model, dict(model.state_dict()))
                 for name, value in original.items():

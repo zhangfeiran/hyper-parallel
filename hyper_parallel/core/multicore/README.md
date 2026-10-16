@@ -10,7 +10,6 @@ SHMEM 由 Multicore 在内部管理，不提供独立用户接口。
 - [MegaKernel Profiling 使用指南](../../../docs/guide/mega_kernel_profiling.md)
 - [MegaKernel Profiling 设计与实现](docs/mega_kernel_profiling_design_and_usage.md)
 - [私有 SHMEM 生命周期](docs/shmem.md)
-- [MegaMoe 动态 token 设计与验证](docs/mega_moe_dynamic_tokens_design.md)
 - [完整 MegaMoE 样例](examples/mega_moe/README.md)
 
 ## 核心概念
@@ -111,7 +110,12 @@ cross-node interface selection and group-local shutdown requirements.
 - EP may be WORLD or a subgroup; `local_num_tokens=T` is fixed and a multiple of 128, or `max_local_num_tokens=T_cap` enables unequal/empty sources;
   `E` must be divisible by EP.
   With dynamic tokens, storage is reserved by the aligned bound and schedules follow actual source lengths.
-  See [bounded dynamic tokens](docs/mega_moe_dynamic_tokens_design.md) for lifetime and gradient-participation contracts.
+  The two token-size arguments are mutually exclusive. Dynamic execution is eager-only and never adds synthetic rows.
+  All EP ranks must enter each forward/backward in the same order, including empty sources, and agree on the
+  input/expert/router gradient-participation policy. Actual lengths and this policy travel with the route counts.
+  The schedule covers the group maximum actual length rounded up to 128, with a minimum of 128 for an all-empty group.
+  A resource group caches at most four schedules; autograd retains each invocation's schedule through backward.
+  For pull, an empty source retains its symmetric base address. Changing actual lengths alone does not rebuild SHMEM.
 - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
   ID 使用全局专家编号，同一个 token 的 K 个 ID 必须互不重复。
 - 可选的 `tokens_per_expert` 是同 device 上 `[E]` 的精确本 rank histogram。
