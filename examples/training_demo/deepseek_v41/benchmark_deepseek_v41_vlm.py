@@ -33,6 +33,7 @@ import yaml
 
 from examples.training_demo.deepseek_v41.deepseek_v41_random_init import initialize_random_shards
 from examples.training_demo.deepseek_v41.deepseek_v41_moe_timing import MoeTiming
+from examples.training_demo.deepseek_v41.deepseek_v41_mega_ab import ModuleTiming, select_kernels
 from hyper_parallel.core.multicore import _loader, shmem
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.trainer.config.parser import parse_training_args
@@ -56,9 +57,8 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
                           num_routed_experts=args.experts, root_owned_vision=modality == "vlm")
     recipe["model_init_dtype"] = "float32"
     packing_mode = getattr(args, "packing_mode", "packed")
-    if modality == "vlm":
-        recipe["dataloader"].update(token_budget=1 if packing_mode == "dynamic" else 4096,
-                                    min_buffered_samples=1 if packing_mode == "dynamic" else 16)
+    recipe["dataloader"].update(token_budget=1 if packing_mode == "dynamic" else 4096,
+                                min_buffered_samples=1 if packing_mode == "dynamic" else 16)
     recipe["training"].update(train_iters=args.steps, global_batch_size=world,
                                empty_cache_steps=args.empty_cache_steps, seed=args.random_init_seed)
     recipe["activation_checkpoint"]["mode"] = args.activation_checkpoint
@@ -167,6 +167,11 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
         moe_override.pop("when", None)
         moe_override["local_compute_fn"] = {"_target_": compute + "deepseek_v41_megamoe_compute_fn"}
     recipe["checkpoint"].update(save_ckpt=False, restore_from=None, checkpoint_dir=str(work / "unused-checkpoint"))
+    mega_kernels = getattr(args, "mega_kernels", None)
+    if mega_kernels is not None:
+        if (args.backend == "megamoe") != (mega_kernels != "off"):
+            raise ValueError("Mega A/B requires owner_ep for off and megamoe for moe/on")
+        select_kernels(recipe, mega_kernels == "on")
     path = work / "recipe.yaml"
     path.write_text(yaml.safe_dump(recipe), encoding="utf-8")
     return parse_training_args([str(path)])
@@ -259,6 +264,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--packing-mode", choices=("dynamic", "packed"), default="packed",
                         help="Dynamic emits one complete source sample; packed selects up to 4096 tokens")
     parser.add_argument("--moe-timing", action="store_true", help="Record MoE current-stream event spans")
+    parser.add_argument("--mega-kernels", choices=("off", "moe", "on"),
+                        help="Compare all three Mega replacements with matched module timing boundaries")
     parser.add_argument("--activation-checkpoint", choices=("off", "full"), default="off")
     parser.add_argument("--engram-storage-backend", choices=("device", "host"), default="device")
     parser.add_argument("--random-init-seed", type=int, default=42,
@@ -306,7 +313,8 @@ def main() -> None:
     trainer.on_train_begin()
     torch.npu.reset_peak_memory_stats()
     diagnostics = _RouteDiagnostics(trainer.base.model)
-    moe_timing = MoeTiming(trainer.base.model) if args.moe_timing else None
+    timing_class = ModuleTiming if args.mega_kernels is not None else MoeTiming
+    moe_timing = timing_class(trainer.base.model) if args.moe_timing else None
     rows = []
     try:
         for epoch in range(trainer.base.train_epochs):

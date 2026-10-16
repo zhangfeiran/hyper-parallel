@@ -7,6 +7,9 @@ BUNDLE_ROOT=${BUNDLE_ROOT:-$(dirname -- "${HYPER_ROOT}")}
 SHARED_ROOT=${SHARED_ROOT:-$(dirname -- "${BUNDLE_ROOT}")}
 DRY_RUN=${DRY_RUN:-0}
 PROFILE=${PROFILE:-0}
+MEGA_AB=${MEGA_AB:-0}
+[[ ${MEGA_AB} == 0 || ${MEGA_AB} == 1 ]] || { echo "ERROR: Invalid MEGA_AB" >&2; exit 1; }
+[[ ${MEGA_AB} == 0 || ${PROFILE} == 0 ]] || { echo "ERROR: MEGA_AB requires PROFILE=0" >&2; exit 1; }
 [[ ${PROFILE} == 0 || ${PROFILE} == 1 ]] || { echo "ERROR: Invalid PROFILE" >&2; exit 1; }
 if [[ ${1:-} == --help ]]; then
     cat <<'HELP'
@@ -208,12 +211,18 @@ if [[ ${DRY_RUN} != 1 ]]; then
     [[ -n ${SHMEM_HOST} ]] || die "Cannot resolve SHMEM_HOST to IPv4"
 fi
 export MASTER_ADDR NODE_RANK
+export PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER:-1}
+export TORCH_SHOW_CPP_STACKTRACES=${TORCH_SHOW_CPP_STACKTRACES:-1}
 publish_summary() {
     local summary_status=0
     local summary_module=examples.training_demo.deepseek_v41.summarize_deepseek_v41_cluster
     local summary_options=(--matrix)
     if [[ ${PROFILE} == 1 ]]; then
         summary_module=examples.training_demo.deepseek_v41.summarize_deepseek_v41_profile
+        summary_options=()
+    fi
+    if [[ ${MEGA_AB} == 1 ]]; then
+        summary_module=examples.training_demo.deepseek_v41.summarize_deepseek_v41_mega_ab
         summary_options=()
     fi
     "${PYTHON_BIN}" -m "${summary_module}" \
@@ -226,6 +235,7 @@ publish_summary() {
 
 indices=(0 1 2 3 4 5)
 benchmark_module=examples.training_demo.deepseek_v41.benchmark_deepseek_v41_vlm
+if [[ ${MEGA_AB} == 1 ]]; then indices=(3 4 5); fi
 if [[ ${PROFILE} == 1 ]]; then
     indices=(3 4)
     benchmark_module=examples.training_demo.deepseek_v41.benchmark_deepseek_v41_profile
@@ -233,12 +243,14 @@ if [[ ${PROFILE} == 1 ]]; then
 fi
 for index in "${indices[@]}"; do
     labels=(native push pull)
+    if [[ ${MEGA_AB} == 1 ]]; then labels=(native moe_only push); fi
     label=${labels[index % 3]}
     packing=dynamic
     (( index < 3 )) || packing=packed
     backend=owner_ep
     mode=push
     if [[ ${label} == push || ${label} == pull ]]; then backend=megamoe; mode=${label}; fi
+    if [[ ${label} == moe_only ]]; then backend=megamoe; mode=push; fi
     export HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT="tcp://${SHMEM_HOST}:$((MASTER_PORT_BASE + 100 + index))"
     export HCCL_IF_BASE_PORT=$((MASTER_PORT_BASE + 200 + index * 4))
     command=("${PYTHON_BIN}" -m torch.distributed.run --nnodes="${NNODES}" --node-rank="${NODE_RANK}"
@@ -257,6 +269,12 @@ for index in "${indices[@]}"; do
         --random-init-seed "${RANDOM_INIT_SEED}" --native-lib "${NATIVE_LIB}" --output "${RUN_ROOT}/${packing}/${label}"
         --backend "${backend}" --dispatch-mode "${mode}")
     [[ ${MOE_TIMING} == 0 ]] || command+=(--moe-timing)
+    if [[ ${MEGA_AB} == 1 ]]; then
+        mega_kernels=off
+        [[ ${label} == native ]] || mega_kernels=on
+        [[ ${label} != moe_only ]] || mega_kernels=moe
+        command+=(--mega-kernels "${mega_kernels}")
+    fi
     echo "Case=${packing}/${label} world=${WORLD_SIZE} EP=${EP_SIZE} FSDP=${WORLD_SIZE} EDP_SHARD=${EDP_SHARD_SIZE}"
     echo "Depth=${NUM_HIDDEN_LAYERS}+${VISION_NUM_HIDDEN_LAYERS} E384 TP1 CP1 MBS1 maxS4096 B=0 modality=${MODALITY}"
     echo "Engram=${ENGRAM_STORAGE_BACKEND} activation_checkpoint=${ACTIVATION_CHECKPOINT} decoder_attention_tier=${ATTENTION_RECOMPUTE_TIER}"

@@ -85,6 +85,10 @@ class TestClusterRecipe(unittest.TestCase):
                             self.assertFalse(recipe["fsdp_config"]["mix_precision"]["cast_forward_inputs"])
                             self.assertTrue(recipe["optimizer"]["fp32_main_params"])
                             self.assertEqual(recipe["activation_checkpoint"]["selection"]["layer_count"], 4)
+                            expected_budget = 1 if packing == "dynamic" else 4096
+                            expected_buffer = 1 if packing == "dynamic" else 16
+                            self.assertEqual(recipe["dataloader"]["token_budget"], expected_budget)
+                            self.assertEqual(recipe["dataloader"]["min_buffered_samples"], expected_buffer)
                             replacements = [entry["replace_module"] for entry in recipe["plan_overrides"]
                                             if "replace_module" in entry]
                             self.assertTrue(any(item["_target_"].endswith("HostEngramModule")

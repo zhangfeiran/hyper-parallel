@@ -153,7 +153,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-root', type=Path, required=True)
     parser.add_argument('--packing-mode', choices=('dynamic', 'packed'), required=True)
-    parser.add_argument('--label', choices=('native', 'push', 'pull'), required=True)
+    parser.add_argument('--label', choices=('native', 'moe_only', 'push', 'pull'), required=True)
     parser.add_argument('--node-rank', type=int, required=True)
     parser.add_argument('--nodes', type=int, required=True)
     parser.add_argument('--cards-per-node', type=int, required=True)

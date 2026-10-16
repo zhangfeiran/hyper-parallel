@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Run the 18-layer text benchmark with native and push profiling.
+set -euo pipefail
+
+export RUN_ID=${RUN_ID:-dsv41-text18-host-b0-profile-${MA_JOB_ID:-manual-001}}
+export MASTER_PORT_BASE=${MASTER_PORT_BASE:-63500}
+export CANN_INSTALL_ROOT=${CANN_INSTALL_ROOT:-/tmp/pangu-cann-${RUN_ID}}
+export NUM_CARDS=${NUM_CARDS:-16} EP_SIZE=${EP_SIZE:-64} EDP_SHARD_SIZE=${EDP_SHARD_SIZE:-2}
+export NUM_HIDDEN_LAYERS=${NUM_HIDDEN_LAYERS:-18}
+export REPLICA_SLOTS_PER_RANK=0 MODALITY=text
+export ENGRAM_STORAGE_BACKEND=host ACTIVATION_CHECKPOINT=full ATTENTION_RECOMPUTE_TIER=all
+export TRAIN_ITERS=${TRAIN_ITERS:-40} WARMUP_STEPS=${WARMUP_STEPS:-10}
+export SCHEDULE_TRAIN_ITERS=${SCHEDULE_TRAIN_ITERS:-${TRAIN_ITERS}}
+export PROFILE_START_STEP=${PROFILE_START_STEP:-3} PROFILE_END_STEP=${PROFILE_END_STEP:-5}
+export MOE_TIMING=1 EMPTY_CACHE_STEPS=1 HBM_INTERVAL=${HBM_INTERVAL:-1}
+exec bash "$(dirname -- "${BASH_SOURCE[0]}")/run_dsv41_push_profile_cluster.sh" "$@"
