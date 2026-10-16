@@ -43,9 +43,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_pa
 )
 from hyper_parallel.models.deepseek_v41.adapter.distributed import moe_engram_expert_parallel as ep_adapter
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
-from hyper_parallel.models.runtime_resources import ModelRuntimeResources
 from hyper_parallel.trainer.config import entries_to_module_replacements
-from hyper_parallel.trainer.base import BaseTrainer
 from tests.common.mark_utils import arg_mark
 
 def _source(limit=10.0):
@@ -338,9 +336,8 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 restored = revert_weight_conversion(model, dict(model.state_dict()))
                 for name, value in original.items():
                     torch.testing.assert_close(restored[name], value, rtol=0, atol=0)
-                resources = ModelRuntimeResources(model)
                 with self.assertRaisesRegex(RuntimeError, 'Configure every expert'):
-                    resources.prepare()
+                    DeepseekV41MegaMoeExperts.prepare_runtime_group([model.model.layers[0].mlp.experts])
 
     def test_dispatch_transports_and_capacity_options(self) -> None:
         """Preserve push growth settings and reject push-only factors for pull."""
@@ -384,21 +381,15 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, 'module replacement'):
             deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None)
 
-    def test_resources_shared_without_trainer_cleanup_on_error(self) -> None:
-        """Training failures preserve shared executors for automatic runtime cleanup."""
+    def test_configured_experts_share_runtime_resources(self) -> None:
+        """Configured experts share workspace and retain explicit cleanup."""
         model = nn.ModuleList([DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128) for _ in range(2)])
         for experts in model:
+            self.addCleanup(experts.close_runtime)
             experts.configure(None, 1, 2)
-        resources = ModelRuntimeResources(model)
-        self.addCleanup(resources.close)
-        resources.prepare()
+        DeepseekV41MegaMoeExperts.prepare_runtime_group(list(model))
         self.assertIs(model[0]._executor._resource_group, model[1]._executor._resource_group)
-        trainer = BaseTrainer.__new__(BaseTrainer)
-        trainer.config = SimpleNamespace()
-        trainer.model_runtime_resources = resources
-        trainer.on_train_begin = Mock(side_effect=RuntimeError('training failure'))
-        with self.assertRaisesRegex(RuntimeError, 'training failure'):
-            trainer.train()
         self.assertTrue(all(experts._executor is not None for experts in model))
-        resources.close()
+        for experts in model:
+            experts.close_runtime()
         self.assertTrue(all(experts._executor is None for experts in model))

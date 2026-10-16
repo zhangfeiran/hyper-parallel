@@ -27,7 +27,6 @@ from transformers.activations import ACT2FN
 from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.models.runtime_resources import ModelRuntimeModule
 
 if TYPE_CHECKING:
     from hyper_parallel.core.multicore import MegaMoeExperts
@@ -41,7 +40,7 @@ def _swiglu_limit(value: float) -> float:
 
 
 @module_replacement
-class DeepseekV41MegaMoeExperts(nn.Module, ModelRuntimeModule):
+class DeepseekV41MegaMoeExperts(nn.Module):
     """Own native-layout parameters while retaining the HF checkpoint names."""
 
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
