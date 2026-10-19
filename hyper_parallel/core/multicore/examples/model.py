@@ -13,14 +13,14 @@
 # limitations under the License.
 # ============================================================================
 
-"""Compact random-weight Qwen MoE model for optimizer-step benchmarking."""
+"""Random-weight MoE Transformer integration example with simplified GQA and four-stream mHC."""
 
 from __future__ import annotations
 
 __all__ = [
-    "QwenMoeBlock",
-    "QwenMoeConfig",
-    "QwenMoeModel",
+    "MoeTransformerBlock",
+    "MoeTransformerConfig",
+    "MoeTransformerModel",
 ]
 
 from dataclasses import dataclass
@@ -32,17 +32,18 @@ import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb
-from hyper_parallel.components.modules import RMSNorm, SwiGLUMLP
+from hyper_parallel.components.modules import RMSNorm
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import _resolve_capacity_factors
-from hyper_parallel.models.qwen3_moe.adapter.attention import (
-    run_qwen3_moe_flash_attention,
+from hyper_parallel.core.multicore.examples.mhc import (
+    MhcBoundary, MhcState, finish_mhc_state, initial_mhc_state,
 )
+from hyper_parallel.core.multicore.examples.moe import MoeTransformerBlock
 
 
 @dataclass(frozen=True)
-class QwenMoeConfig:
-    """Fixed-shape synthetic Qwen model configuration.
+class MoeTransformerConfig:
+    """Synthetic MoE Transformer model configuration with four-stream mHC.
 
     The example intentionally models one TP1/EP8 optimizer-step workload.
     Route stress, fusion matrices, and isolated expert performance belong to
@@ -122,10 +123,10 @@ class QwenMoeConfig:
             )
 
 
-class QwenAttention(nn.Module):
-    """Thin Qwen GQA using the library's fused Ascend attention kernel."""
+class MoeTransformerAttention(nn.Module):
+    """Simplified grouped-query attention for the integration example."""
 
-    def __init__(self, config: QwenMoeConfig) -> None:
+    def __init__(self, config: MoeTransformerConfig) -> None:
         """Initialize QKV, output, and rotary projections."""
         super().__init__()
         self.num_heads = config.num_attention_heads
@@ -194,134 +195,70 @@ class QwenAttention(nn.Module):
         cos = self.rotary_cos[position_ids].to(hidden_states.dtype)
         sin = self.rotary_sin[position_ids].to(hidden_states.dtype)
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
-        output, _ = run_qwen3_moe_flash_attention(
-            self,
-            query,
-            key,
-            value,
-            attention_mask=None,
-            dropout=0.0,
-            scaling=self.scaling,
-        )
+        if hidden_states.device.type == "npu":
+            # Import the optional Ascend backend only when executing on NPU.
+            from hyper_parallel.components.functional.npu_fusion_attention import (  # pylint: disable=C0415
+                npu_fusion_attention_forward,
+            )
+            output, _ = npu_fusion_attention_forward(
+                self, query, key, value, attention_mask=None, dropout=0.0, scaling=self.scaling,
+            )
+        else:
+            repeats = self.num_heads // self.num_key_value_heads
+            output = F.scaled_dot_product_attention(  # pylint: disable=not-callable
+                query, key.repeat_interleave(repeats, dim=1), value.repeat_interleave(repeats, dim=1),
+                is_causal=True, scale=self.scaling,
+            ).transpose(1, 2).contiguous()
         return self.o_proj(output.reshape(batch_size, sequence_length, -1))
 
 
-def _topk_route(
-    hidden_states: torch.Tensor,
-    gate: nn.Linear,
-    top_k: int,
-    routed_scaling_factor: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return normalized learned TopK scores and expert IDs."""
-    logits = F.linear(  # pylint: disable=not-callable
-        hidden_states.float(),
-        gate.weight.float(),
-    )
-    top_logits, topk_ids = torch.topk(logits, top_k, dim=-1)
-    topk_weights = F.softmax(top_logits, dim=-1, dtype=torch.float32)
-    return topk_weights * routed_scaling_factor, topk_ids
-
-
-class QwenMoeBlock(nn.Module):
-    """One Qwen router, managed routed-expert, and shared-expert block."""
+class MoeTransformerDecoderLayer(nn.Module):
+    """One mHC attention and MoE decoder layer."""
 
     def __init__(
         self,
-        config: QwenMoeConfig,
+        config: MoeTransformerConfig,
         ep_group: Any | None,
-    ) -> None:
-        """Initialize the router, routed experts, and shared expert."""
-        super().__init__()
-        self.config = config
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        self.experts = MegaMoeExperts(
-            local_num_tokens=config.local_num_tokens,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            num_experts=config.num_experts,
-            top_k=config.top_k,
-            initial_capacity_factor=config.initial_capacity_factor,
-            ep_size=config.ep_size,
-            ep_group=ep_group,
-            dispatch_mode=config.dispatch_mode,
-            capacity_growth_factor=config.capacity_growth_factor,
-        )
-        shared_source = nn.Module()
-        shared_source.gate_proj = nn.Linear(config.hidden_size, config.shared_expert_intermediate_size, bias=False)
-        shared_source.up_proj = nn.Linear(config.hidden_size, config.shared_expert_intermediate_size, bias=False)
-        shared_source.down_proj = nn.Linear(config.shared_expert_intermediate_size, config.hidden_size, bias=False)
-        self.shared_expert = SwiGLUMLP(module=shared_source)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run learned routed experts and the always-active shared expert."""
-        hidden_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, hidden_shape[-1])
-        topk_weights, topk_ids = _topk_route(
-            hidden_flat,
-            self.gate,
-            self.config.top_k,
-            self.config.routed_scaling_factor,
-        )
-        tokens_per_expert = torch.bincount(
-            topk_ids.reshape(-1).to(torch.int64),
-            minlength=self.config.num_experts,
-        ).to(torch.int32)
-        routed_output = self.experts(
-            hidden_flat,
-            topk_ids,
-            topk_weights,
-            tokens_per_expert=tokens_per_expert,
-        )
-        shared_output = self.shared_expert(hidden_flat)
-        return (routed_output + shared_output).view(hidden_shape)
-
-
-class QwenDecoderLayer(nn.Module):
-    """One residual attention and MoE decoder layer."""
-
-    def __init__(
-        self,
-        config: QwenMoeConfig,
-        ep_group: Any | None,
+        mega_kernels: tuple[str, ...],
     ) -> None:
         """Initialize one attention and MoE decoder layer."""
         super().__init__()
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
-            config.rms_norm_eps,
+        self.attention_mhc = MhcBoundary(
+            config.hidden_size, config.rms_norm_eps, use_mega_mhc="mhc" in mega_kernels,
         )
-        self.self_attn = QwenAttention(config)
-        self.mlp = QwenMoeBlock(config, ep_group)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run residual attention followed by residual MoE."""
-        hidden_states = hidden_states + self.self_attn(
-            self.input_layernorm(hidden_states),
-            position_ids,
+        self.ffn_mhc = MhcBoundary(
+            config.hidden_size, config.rms_norm_eps, use_mega_mhc="mhc" in mega_kernels,
         )
-        return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        self.self_attn = MoeTransformerAttention(config)
+        self.mlp = MoeTransformerBlock(config, ep_group, mega_kernels)
+
+    def forward(self, state: MhcState, position_ids: torch.Tensor) -> MhcState:
+        """Carry shifted residual mappings across attention, MoE, and decoder layers."""
+        residual, pre, post, mix, block_input = self.attention_mhc(*state)
+        attention_output = self.self_attn(block_input, position_ids)
+        residual, pre, post, mix, block_input = self.ffn_mhc(attention_output, residual, pre, post, mix)
+        return self.mlp(block_input), residual, pre, post, mix
 
 
-class QwenMoeModel(nn.Module):
-    """Random-weight text-only Qwen MoE language model."""
+class MoeTransformerModel(nn.Module):
+    """Random-weight text-only MoE Transformer demo with four-stream mHC."""
 
     def __init__(
         self,
-        config: QwenMoeConfig,
+        config: MoeTransformerConfig,
         *,
         ep_group: Any | None = None,
+        mega_kernels: tuple[str, ...] = ("moe", "gate", "mhc"),
     ) -> None:
         """Initialize all decoder layers and their shared execution group."""
         super().__init__()
+        unknown = set(mega_kernels) - {"moe", "gate", "mhc"}
+        if unknown:
+            raise ValueError(f"Unsupported Mega kernels: {sorted(unknown)}.")
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            QwenDecoderLayer(config, ep_group)
+            MoeTransformerDecoderLayer(config, ep_group, mega_kernels)
             for _ in range(config.num_layers)
         )
         MegaMoeExperts.share_execution_resources(
@@ -342,8 +279,10 @@ class QwenMoeModel(nn.Module):
             dtype=torch.int64,
             device=hidden_states.device,
         )
+        state = initial_mhc_state(hidden_states)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, position_ids)
+            state = layer(state, position_ids)
+        hidden_states = finish_mhc_state(state)
         logits = self.lm_head(self.norm(hidden_states))
         loss = None
         if labels is not None:

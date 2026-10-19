@@ -1,16 +1,38 @@
-# MoE 多核并行使用指南
+# 三个 MegaKernel 的多核并行接入指南
 
 Multicore 是独立的 Torch-only 组件，提供芯片内多核 MPMD 并行能力，结合核级内存语义单边通信，增强 MoE 通算掩盖和 MAC 利用率。
 
-用户从独立组件 `hyper_parallel.core.multicore` 显式导入 `MegaGate` 或 `MegaMoeExperts`。
+用户从独立组件 `hyper_parallel.core.multicore` 显式导入 `MegaGate`、`MegaMoeExperts` 或 `HyperMegaMhc`。
 SHMEM 由 Multicore 在内部管理，不提供独立用户接口。
 
 - [构建与交付](docs/build.md)
 - [架构设计与扩展](docs/architecture.md)
-- [MegaKernel Profiling 使用指南](../../../docs/guide/mega_kernel_profiling.md)
-- [MegaKernel Profiling 设计与实现](docs/mega_kernel_profiling_design_and_usage.md)
+- [MegaKernel Profiling 使用指南与设计](docs/mega_kernel_profiling.md)
 - [私有 SHMEM 生命周期](docs/shmem.md)
-- [完整 MegaMoE 样例](examples/mega_moe/README.md)
+- [MoE Transformer 三个 MegaKernel 接入示例](examples/README.md)
+
+## 从已有网络开始接入
+
+三个 kernel 可以独立使用，也可组合到同一个 decoder；模型的评分规则、参数和残差语义需要保持一致。
+
+| 接口 | 替换范围 | 调用方保留的逻辑 |
+| --- | --- | --- |
+| `MegaMoeExperts` | dispatch、GMM1、SwiGLU、GMM2、combine | Router TopK、共享专家、外层并行和优化器 |
+| `MegaGate` | gate projection 及路由；NPU sqrtsoftplus 使用 native Route/RouteGrad | 原评分函数、correction bias 更新、辅助 loss |
+| `HyperMegaMhc` | 四流 shifted mHC、映射预测和输入 RMSNorm | 首层初始化、跨 block 状态传递及末层合并 |
+
+推荐先保持现有 Router，只替换路由专家执行，检查输出、输入/路由/专家梯度和参数更新；
+再按相同数学定义接入 MegaGate 和已有的 mHC。普通残差网络增加 mHC 会改变架构，需要两条对照路径同时修改。
+模块统一从以下公共入口导入：
+
+```python
+from hyper_parallel.core.multicore import MegaGate, MegaMoeExperts, HyperMegaMhc
+```
+
+可直接运行的[MoE Transformer示例](examples/README.md)给出三者组合、独立开关、
+push/pull 启动命令、原始 MoE 到 MegaMoe 的前后代码、旧权重布局转换以及外部参数管理接口。
+`model.py` 负责整网组装，`moe.py`、`gate.py`、`mhc.py` 分别在同一个文件中展示普通实现与 Mega 替换。
+它采用随机权重和简化 GQA；真实 DSV4.1 的 TP/SP/CP 接入继续见下文。
 
 ## 核心概念
 
@@ -62,7 +84,7 @@ gate = MegaGate(
     scoring_func="sqrtsoftplus",
     routed_scaling_factor=1.0,
     vision_enabled=True,
-).to(device="npu", dtype=torch.bfloat16)
+).to(device="npu")
 
 logits, routing_weights, expert_indices = gate(hidden_states, image_mask=image_mask)
 ```
@@ -72,6 +94,30 @@ bias初始化为零。`hidden_states`形状为
 `[batch, sequence, H]`。`logits`保持Projection输出dtype，`routing_weights`为FP32，专家索引为INT64。
 传入`image_mask`时，mask形状须为`[batch, sequence]`；启用视觉bias时还须是同一NPU上的连续BOOL Tensor。
 外层BF16 autocast开启时Projection产生BF16 logits；MegaGate将其转换为FP32后调用native Route。
+
+### HyperMegaMhc
+
+`HyperMegaMhc` 的训练接口固定四流、二十轮 Sinkhorn，输入激活为 BF16，映射为 FP32。
+H 须为 128 的倍数且不超过 5760；反向 token 数须不小于 `max(40, AIV 核数)`。
+它返回五个 Tensor，使用上一边界的 pre 生成当前 block 输入，并预测下一边界的映射：
+
+```python
+from hyper_parallel.core.multicore import HyperMegaMhc
+
+mhc = HyperMegaMhc(hidden_size=5120).to(device="npu")
+residual, next_pre, next_post, next_mix, block_input = mhc(
+    previous_output, residual, previous_pre, previous_post, previous_mix,
+)
+```
+
+`previous_output` 为 `[..., H]`，residual 为 `[..., 4, H]`，pre/post 为 `[..., 4]`，mix 为 `[..., 4, 4]`。
+参数 `phi: [24, 4H]`、`alpha: [3]`、`bias: [24]` 保持 FP32，`norm_weight: [H]` 保持 BF16；
+迁移设备时使用 `.to(device=...)`，不要把整个模块转换成 BF16。
+构造后应复用/转换原模型参数，并在构造优化器前完成替换。
+
+mHC 不能作为普通残差加法的等价替换。接入需要保留五元状态、首层 bootstrap 和末层 pending output 合并，
+完整 decoder 代码、Omni 性能 common 与 Torch 精度参考见
+[示例的 mHC 接入说明](examples/README.md#4-用-hypermegamhc-替换已有四流-mhc)。
 
 ### MegaMoeExperts
 
@@ -99,11 +145,9 @@ experts = MegaMoeExperts(
 output = experts(hidden_states, topk_ids, topk_weights)
 ```
 
-`ep_group` may also be a PP/DP-local EP subgroup: pass its size as `ep_size`.
-MegaMoE uses group-local expert ownership and does not take a TP-size argument.
-Subgroups exchange independent CANN bootstrap IDs internally and do not use a
-shared WORLD rendezvous port. See the [SHMEM lifecycle](docs/shmem.md) for
-cross-node interface selection and group-local shutdown requirements.
+`ep_group` 也可使用 PP/DP 内的 EP 子组，同时将组大小传入 `ep_size`。
+MegaMoe 按组内 rank 分配专家，不接收 TP 大小参数。各子组在内部交换独立的 CANN bootstrap ID，
+不共用 WORLD rendezvous 端口。跨节点网卡选择和组内关闭要求见 [SHMEM 生命周期](docs/shmem.md)。
 
 ### DSV4.1 的 TP/SP 与 CP 集成
 
@@ -275,8 +319,8 @@ SHMEM Python层以进程级引用计数统一管理Runtime生命周期。整个M
 重新开启生命周期时，所有 rank 完成关闭后使用新的 `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT`，
 `HYPER_PARALLEL_SHMEM_HEAP_SIZE` 等堆配置在下一生命周期首次获取引用时重新生效。
 
-完整 Qwen 接入及启动方式见 [MegaMoe 示例](examples/mega_moe/README.md)。MegaKernel 内部阶段采集方式见
-[MegaKernel Profiling 使用指南](../../../docs/guide/mega_kernel_profiling.md)。
+完整 MoE Transformer 接入及启动方式见 [MoE Transformer 示例](examples/README.md)。MegaKernel 内部阶段采集方式见
+[MegaKernel Profiling 使用指南](docs/mega_kernel_profiling.md)。
 
 ---
 
