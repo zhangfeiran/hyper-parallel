@@ -198,15 +198,23 @@ pytest -q tests/torch/multicore/test_deepseek_v41_megamoe.py -k megamoe_parallel
 ### 输入与权重
 
 - EP 可以使用 WORLD 或子组，`E` 必须能被 EP 整除。
-  `local_num_tokens=T` 指定固定 token 数，要求 `T` 是 128 的倍数；
-  `max_local_num_tokens=T_cap` 则允许各 rank 的实际 token 数不同，也允许空输入。
-  动态模式按对齐后的上限预留存储，按实际输入长度生成调度计划。
-  这两个 token 数参数互斥；动态执行仅支持 eager 模式，不会添加填充 token。
+  省略 `local_num_tokens` 和 `max_local_num_tokens` 时，push/pull 都采用自动容量模式，
+  无需预估 token 上限。首次绑定仅预留 128 个 token 对应的小容量，执行时根据现有路由计数交换中的
+  组内最大实际输入长度确定源端容量；push 还根据最大实际接收行数确定接收端容量。
+  容量不足时统一重建 SHMEM，并同时更新所需缓冲区；已有容量足够时直接复用，不自动缩容。
+  超出原生 INT32 路由限制或显式 SHMEM heap 预算时仍会报错。
+  `local_num_tokens=T` 保留固定长度模式，要求 `T` 是 128 的倍数且满足通信 split 对齐；
+  `max_local_num_tokens=T_cap` 保留显式上限模式，按对齐后的上限预留存储并检查实际长度。
+  这两个参数互斥。自动容量和显式上限模式都允许各 rank 的实际 token 数不同，也允许空输入，
+  按实际输入长度生成调度计划，仅支持 eager 模式，不会添加填充 token。
   包括空输入 rank 在内，所有 EP rank 必须按相同顺序进入每次正反向，并采用一致的
   输入、专家权重和路由权重梯度参与策略。实际长度和梯度参与策略随路由计数一起交换。
   调度范围取组内最大实际长度并向上对齐到 128；全组输入为空时，最小调度范围仍为 128。
   每个资源组最多缓存四份调度计划；autograd 会保留每次调用所用的计划，直到对应反向完成。
-  pull模式下，空输入仍保留其对称内存基址；仅改变实际输入长度不会触发Runtime restart。
+  pull 模式下，空输入仍保留其对称内存基址。自动模式先完成计数交换和必要的扩容，
+  再将 permutation 结果直接写入当前源缓冲区；显式上限模式保留计数交换与 permutation 的重叠。
+  扩容会产生同步和 Runtime restart 开销；容量内改变长度不会触发 restart。
+  每次调用的实际长度、路由与调度计划独立保留，后续扩容不改变待执行 backward 的逻辑长度。
 - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
   ID 使用全局专家编号，同一个 token 的 K 个 ID 必须互不重复。
 - 可选的 `tokens_per_expert` 是同 device 上 `[E]` 的精确本 rank histogram。

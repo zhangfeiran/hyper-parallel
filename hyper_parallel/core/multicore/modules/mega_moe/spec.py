@@ -24,7 +24,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-
 _COMMUNICATION_SPLIT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
 
@@ -52,6 +51,12 @@ class MegaMoeSpec:
     swiglu_limit: float | None = None
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
+    auto_tokens: bool = False
+
+    @property
+    def dynamic_tokens(self) -> bool:
+        """Report variable-length execution with automatic or bounded storage."""
+        return self.auto_tokens or self.max_local_num_tokens is not None
 
     @property
     def plan_tokens(self) -> int:
@@ -208,4 +213,5 @@ def bind_mega_moe_spec(
         dispatch_split=specification.get("dispatch_split", _COMMUNICATION_SPLIT),
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
+        auto_tokens=specification.get("auto_tokens", False),
     )

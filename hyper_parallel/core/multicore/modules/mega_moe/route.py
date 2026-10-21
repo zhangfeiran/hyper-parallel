@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -245,6 +246,7 @@ def prepare_topk_route(
     workspace: MegaMoeWorkspace | None = None,
     *,
     autograd_mask: int = 0,
+    prepare_workspace: Callable[[int, int], None] | None = None,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -255,16 +257,17 @@ def prepare_topk_route(
         spec: Bound shape and expert-parallel specification.
         tokens_per_expert: Optional trusted Router histogram.
         workspace: Optional workspace ordered before the count exchange. Pull
-            requires an initialized, caller-held lease covering route execution.
+            requires a lease acquired by the caller or the automatic-capacity callback.
         autograd_mask: Group-consistent gradient participation flags in dynamic mode.
+        prepare_workspace: Automatic-capacity callback, run after count agreement and before pull permutation.
 
     Returns:
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
-    if spec.max_local_num_tokens is not None:
+    if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
-                                      workspace, autograd_mask)
+                                      workspace, autograd_mask, prepare_workspace)
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
     permutation_output = None
     if workspace is not None:
@@ -297,6 +300,19 @@ def prepare_topk_route(
     )
 
 
+def _validate_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> None:
+    """Validate every rank before any automatic allocation or SHMEM write."""
+    if spec.auto_tokens and any(row[0] or row[1] < 0 for row in rows):
+        raise RuntimeError("MegaMoe dynamic route exceeds native INT32 size limits")
+    if not spec.auto_tokens and any(row[0] or not 0 <= row[1] <= spec.max_local_num_tokens for row in rows):
+        raise RuntimeError(f"MegaMoe token capacity overflow: limit={spec.max_local_num_tokens}, "
+                           f"actual={[row[1] for row in rows]}")
+    if any(row[2] != rows[0][2] for row in rows):
+        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
+    if any(row[3] != row[1] * spec.top_k or row[4] < 0 or row[5] > row[1] for row in rows):
+        raise RuntimeError("MegaMoe counts must describe the actual distinct Top-K routes")
+
+
 def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int]:
     """Use one Host summary for shape, participation, receive limits, and schedule."""
     counts = payload[:, 3:]
@@ -304,31 +320,40 @@ def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int
     summary = torch.cat((payload[:, :3], counts.sum(1, keepdim=True),
                          counts.amin(1, keepdim=True), counts.amax(1, keepdim=True), loads[:, None]), dim=1)
     rows = summary.tolist()
-    if any(row[0] or not 0 <= row[1] <= spec.max_local_num_tokens for row in rows):
-        raise RuntimeError(f"MegaMoe token capacity overflow: limit={spec.max_local_num_tokens}, "
-                           f"actual={[row[1] for row in rows]}")
-    if any(row[2] != rows[0][2] for row in rows):
-        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
-    if any(row[3] != row[1] * spec.top_k or row[4] < 0 or row[5] > row[1] for row in rows):
-        raise RuntimeError("MegaMoe counts must describe the actual distinct Top-K routes")
+    _validate_dynamic_rows(rows, spec)
     maximum = max(row[6] for row in rows)
-    maximum_capacity = _align_capacity(spec.ep_size * spec.routed_slots)
+    maximum_tokens = max(row[1] for row in rows) if spec.auto_tokens else spec.local_num_tokens
+    maximum_capacity = _align_capacity(spec.ep_size * maximum_tokens * spec.top_k)
     if maximum > maximum_capacity:
         raise RuntimeError(f"MegaMoe receive capacity overflow: configured_capacity={maximum_capacity}, "
                            f"actual_maximum={maximum}")
     plan_tokens = max(128, _align_capacity(max(row[1] for row in rows)))
-    if plan_tokens * spec.hidden_size > 2**31 - 1 or maximum > 2**31 - 1:
+    if plan_tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 or maximum > 2**31 - 1:
         raise RuntimeError("MegaMoe dynamic route exceeds native INT32 size limits")
     return max(1, rows[spec.rank_id][6]), plan_tokens, maximum
+
+
+def _permute_dynamic_pull(
+    hidden_states: torch.Tensor, topk_ids: torch.Tensor, spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Take the source view only after automatic growth and lease acquisition."""
+    if workspace is None or not workspace.in_use or workspace.source_buffer is None:
+        raise RuntimeError("Pull permutation requires an initialized, claimed workspace.")
+    tokens = hidden_states.shape[0]
+    output = workspace.source_buffer[:tokens * spec.top_k]
+    return (_permute_topk_input_out(hidden_states, topk_ids, output) if tokens
+            else (output, topk_ids.reshape(-1)))
 
 
 def _prepare_dynamic_route(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
+    prepare_workspace: Callable[[int, int], None] | None = None,
 ) -> PreparedTopKRoute:
     """Exchange variable-length metadata without adding a token-count collective."""
     tokens = hidden_states.shape[0]
-    invalid = tokens > spec.max_local_num_tokens
+    invalid = (tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 if spec.auto_tokens
+               else tokens > spec.max_local_num_tokens)
     counts = (torch.zeros(spec.num_experts, dtype=torch.int32, device=hidden_states.device) if invalid
               else _resolve_counts(flat_ids, supplied_counts, spec))
     header = torch.tensor([int(invalid), tokens, autograd_mask], dtype=torch.int64, device=hidden_states.device)
@@ -340,19 +365,27 @@ def _prepare_dynamic_route(
     else:
         gathered = torch.empty((spec.ep_size, payload.numel()), dtype=torch.int64, device=payload.device)
         work = dist.all_gather_into_tensor(gathered.reshape(-1), payload, group=spec.ep_group, async_op=True)
+    # Push permutation owns ordinary storage and can overlap count agreement and heap growth.
+    permuted = (_permute_topk_input(hidden_states, topk_ids)
+                if spec.auto_tokens and spec.dispatch_mode == "push" and not invalid else None)
+    summary = None
+    if spec.auto_tokens:
+        if work is not None:
+            work.wait()
+            work = None
+        summary = _dynamic_summary(gathered, spec)
+        if prepare_workspace is None:
+            raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
+        prepare_workspace(summary[1], summary[2])
     if invalid:
         permuted = None
     elif spec.dispatch_mode == "pull":
-        if workspace is None or not workspace.in_use or workspace.source_buffer is None:
-            raise RuntimeError("Pull permutation requires an initialized, claimed workspace.")
-        output = workspace.source_buffer[:tokens * spec.top_k]
-        permuted = (_permute_topk_input_out(hidden_states, topk_ids, output) if tokens
-                    else (output, topk_ids.reshape(-1)))
-    else:
+        permuted = _permute_dynamic_pull(hidden_states, topk_ids, spec, workspace)
+    elif permuted is None:
         permuted = _permute_topk_input(hidden_states, topk_ids)
     if work is not None:
         work.wait()
-    capacity, plan_tokens, maximum = _dynamic_summary(gathered, spec)
+    capacity, plan_tokens, maximum = _dynamic_summary(gathered, spec) if summary is None else summary
     counts_by_source = gathered[:, 3:].contiguous()
     start = spec.rank_id * spec.local_experts
     received_counts = counts_by_source[:, start:start + spec.local_experts].contiguous()

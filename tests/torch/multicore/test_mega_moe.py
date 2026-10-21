@@ -50,6 +50,15 @@ def test_mega_moe_dynamic_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     _run_acceptance_worker(monkeypatch, tmp_path, "test_dynamic_tokens", 8, "_test_mega_moe_dynamic_tokens.py")
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="unessential")
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_auto_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str) -> None:
+    """Validate token-free configuration, source growth and pending backward on EP8."""
+    monkeypatch.setenv("HP_DYNAMIC_DISPATCH", dispatch_mode)
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_auto_tokens", 8, "_test_mega_moe_auto_tokens.py")
+
+
 def _prepare_torch_multicore_test_environment() -> None:
     """Activate multicore and require a payload built for the Torch framework."""
     prepare_multicore_test_environment()

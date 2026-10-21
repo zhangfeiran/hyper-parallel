@@ -48,10 +48,29 @@ class TestMegaMoeExperts(unittest.TestCase):
                         torch.empty(1, tokens, 16), torch.empty(tokens, 2, dtype=torch.int32),
                         torch.empty(tokens, 2), None, (experts.gate_up_weight, experts.down_weight))
                     self.assertEqual(tuple(result.shape), (tokens, 16))
-        for kwargs in ({}, {"local_num_tokens": 128, "max_local_num_tokens": 256},
+        for kwargs in ({"local_num_tokens": 128, "max_local_num_tokens": 256},
                        {"max_local_num_tokens": 0}, {"max_local_num_tokens": True}, {"max_local_num_tokens": 2**31}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **kwargs)
+
+    def test_omitted_token_arguments_enable_automatic_push_and_pull(self) -> None:
+        """Unbounded input lengths use a small lazy reservation in either transport."""
+        for mode in ("push", "pull"):
+            with self.subTest(mode=mode):
+                experts = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+                                         dispatch_mode=mode)
+                self.addCleanup(experts.close)
+                self.assertIsNone(experts.local_num_tokens)
+                self.assertIsNone(experts.max_local_num_tokens)
+                self.assertTrue(experts._resource_group.specification["auto_tokens"])
+                self.assertEqual(experts._resource_group.specification["local_num_tokens"], 128)
+                self.assertIsNone(experts._resource_group.resources)
+                with patch.object(experts, "_validate_tensors"):
+                    for tokens in (0, 1, 129, 4097):
+                        result = experts._validate_forward_inputs(
+                            torch.empty(tokens, 16), torch.zeros(tokens, 2, dtype=torch.int32),
+                            torch.ones(tokens, 2), None, (experts.gate_up_weight, experts.down_weight))
+                        self.assertEqual(tuple(result.shape), (tokens, 16))
 
     def test_plan_cache_evicts_without_mutating_retained_plans_or_capacity(self) -> None:
         """A deferred backward retains its old plan after cache eviction and a new shape."""
@@ -83,9 +102,9 @@ class TestMegaMoeExperts(unittest.TestCase):
             self.assertIs(kwargs["group"], resources.spec.ep_group)
             output[:] = [value, ("different",)]
 
-        with patch.object(mega_moe_module.dist, "all_gather_object", side_effect=gather):
-            with self.assertRaisesRegex(ValueError, "configurations differ"):
-                resources._validate_distributed_configuration(({"local_num_tokens": 128},))
+        with (patch.object(mega_moe_module.dist, "all_gather_object", side_effect=gather),
+              self.assertRaisesRegex(ValueError, "configurations differ")):
+            resources._validate_distributed_configuration(({"local_num_tokens": 128},))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -215,7 +234,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         topk_weights = torch.full((128, 2), 0.5)
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
-        resources = SimpleNamespace(spec=object(), plan=object(), workspace=object(), ensure_capacity=Mock())
+        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=False, dynamic_tokens=False),
+                                    plan=object(), workspace=object(), ensure_capacity=Mock())
         route = SimpleNamespace(
             routed_tokens=object(), metadata=object(), unpermute_mapping=object(), maximum_received_slots=512
         )
@@ -375,7 +395,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         """
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
-                                     dispatch_mode="push", max_local_num_tokens=None)
+                                     dispatch_mode="push", max_local_num_tokens=None,
+                                     dynamic_tokens=False, auto_tokens=False)
         workspace = Mock()
         manager = Mock(heap_bytes=1024, epoch=0, workspaces=[], growth_records=[])
         manager.reserve.return_value = ({},)
@@ -421,7 +442,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         """
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
-                                     dispatch_mode="push", max_local_num_tokens=None)
+                                     dispatch_mode="push", max_local_num_tokens=None,
+                                     dynamic_tokens=False, auto_tokens=False)
 
         manager = Mock(heap_bytes=1024, epoch=0, workspaces=[])
         manager.reserve.return_value = ({},)
@@ -455,7 +477,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         root_group = object()
         specification = {"name": "new resource"}
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
-                                     dispatch_mode="push", max_local_num_tokens=None)
+                                     dispatch_mode="push", max_local_num_tokens=None,
+                                     dynamic_tokens=False, auto_tokens=False)
         growth_record = {"epoch": 1, "heap_bytes": 4096}
         manager = Mock(heap_bytes=2048, epoch=0, workspaces=[object()], growth_records=[])
         manager.attach_runtime.return_value = False

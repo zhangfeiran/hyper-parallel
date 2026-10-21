@@ -35,6 +35,87 @@ from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 class TestMegaMoeRoute(unittest.TestCase):
     """Validate trusted Router counts and bounded capacity without hardware."""
 
+    def test_automatic_route_grows_before_writing_pull_source(self) -> None:
+        """One count exchange establishes capacity before a pull view can reference SHMEM."""
+        for mode in ("push", "pull"):
+            with self.subTest(mode=mode):
+                self._automatic_route_grows_before_writing_source(mode)
+
+    def _automatic_route_grows_before_writing_source(self, mode: str) -> None:
+        """Check one transport with callbacks bound outside the test loop."""
+        spec = replace(self._spec(ep_size=2), auto_tokens=True, dispatch_mode=mode)
+        hidden = torch.randn(257, 4)
+        ids = torch.tensor([[0, 1]] * 257, dtype=torch.int32)
+        weights = torch.ones(257, 2)
+        payload = torch.tensor([[0, 257, 15, 257, 257, 0, 0], [0, 0, 15, 0, 0, 0, 0]])
+        workspace = Mock(in_use=False, source_buffer=None)
+        order = []
+
+        def gather(output: Any, _value: Any, **_kwargs: Any) -> Mock:
+            """Record completion before permitting the capacity callback."""
+            output.copy_(payload.flatten())
+            return Mock(wait=lambda: order.append("wait"))
+
+        def grow(tokens: int, received: int) -> None:
+            """Install the larger source allocation only after count agreement."""
+            self.assertEqual(order, ["wait"] if mode == "pull" else ["permute", "wait"])
+            self.assertEqual((tokens, received), (384, 514))
+            workspace.source_buffer = torch.empty(tokens * 2, 4)
+            workspace.in_use = True
+            order.append("grow")
+
+        def permute(*args: Any) -> tuple:
+            """Observe the new allocation rather than an invalidated old view."""
+            self.assertEqual(order, ["wait", "grow"] if mode == "pull" else [])
+            order.append("permute")
+            output = args[2] if mode == "pull" else hidden.repeat_interleave(2, dim=0)
+            return output, torch.arange(514, dtype=torch.int32)
+
+        with (
+            patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
+            patch.object(route_module, "_permute_topk_input", side_effect=permute),
+            patch.object(route_module, "_permute_topk_input_out", side_effect=permute),
+        ):
+            route = prepare_topk_route(hidden, ids, weights, spec, None, workspace,
+                                       autograd_mask=15, prepare_workspace=grow)
+        self.assertEqual(exchange.call_count, 1)
+        self.assertEqual(order, ["wait", "grow", "permute"] if mode == "pull" else ["permute", "wait", "grow"])
+        self.assertEqual(tuple(route.routed_tokens.shape), (514, 4))
+        self.assertEqual(route.metadata.expert_capacity, 514)
+
+    def test_automatic_summary_keeps_native_and_gradient_limits(self) -> None:
+        """Removing a user bound still rejects invalid ABI sizes and mixed autograd participation."""
+        spec = replace(self._spec(ep_size=2), auto_tokens=True)
+        valid = torch.tensor([[0, 0, 15, 0, 0, 0, 0], [0, 257, 15, 257, 257, 0, 0]])
+        self.assertEqual(route_module._dynamic_summary(valid, spec), (514, 384, 514))
+        for column, value, message in ((0, 1, "INT32"), (1, 2**31, "INT32"),
+                                       (2, 0, "autograd participation"), (3, -1, "counts")):
+            invalid = valid.clone()
+            invalid[1, column] = value
+            if column == 1:
+                invalid[1, 3:5] = value
+            with self.subTest(column=column), self.assertRaisesRegex(RuntimeError, message):
+                route_module._dynamic_summary(invalid, spec)
+
+    def test_invalid_automatic_pull_route_never_allocates_or_writes_source(self) -> None:
+        """All ranks reject inconsistent participation before the allocation callback can run."""
+        spec = replace(self._spec(ep_size=2), auto_tokens=True, dispatch_mode="pull")
+        hidden, ids, weights = torch.ones(1, 4), torch.tensor([[0, 1]], dtype=torch.int32), torch.ones(1, 2)
+        payload = torch.tensor([[0, 1, 15, 1, 1, 0, 0], [0, 1, 0, 1, 1, 0, 0]])
+
+        def gather(output: Any, _value: Any, **_kwargs: Any) -> Mock:
+            """Inject a peer that chose incompatible autograd participation."""
+            output.copy_(payload.flatten())
+            return Mock()
+
+        callback = Mock()
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather),
+              patch.object(route_module, "_permute_topk_input_out") as permute,
+              self.assertRaisesRegex(RuntimeError, "autograd participation")):
+            prepare_topk_route(hidden, ids, weights, spec, None, prepare_workspace=callback)
+        callback.assert_not_called()
+        permute.assert_not_called()
+
     def test_route_counts_match_native_abi_after_int64_dynamic_gather(self) -> None:
         """Both transports must lower dynamic INT64 counts to the kernel's INT32 ABI."""
         for mode in ('push', 'pull'):

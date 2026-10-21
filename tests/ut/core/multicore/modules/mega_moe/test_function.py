@@ -150,7 +150,8 @@ class TestMegaMoeFunction(unittest.TestCase):
                                 vary_tokens: bool = False, replay: bool = False) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
-                               ep_size=2, num_experts=4, local_num_tokens=2, top_k=2, dispatch_mode="push")
+                               ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
+                               dispatch_mode="push", auto_tokens=False)
         plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
