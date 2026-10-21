@@ -17,7 +17,7 @@
 import unittest
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -218,6 +218,7 @@ class TestFrontendMigration(unittest.TestCase):
         self.assertEqual(gate.backend_for(npu_input).name, "native")
         self.assertIsNone(MegaMhc.execution_requirements()["minimum_training_tokens"])
         fake_device = SimpleNamespace(type="npu", index=0)
+        fake_npu = SimpleNamespace(get_device_limit=Mock(return_value={"cube_core_num": 24, "vector_core_num": 48}))
         with (patch("hyper_parallel.core.multicore.modules.mega_mhc.module.torch.device", return_value=fake_device),
-              patch.object(torch.npu, "get_device_limit", return_value={"cube_core_num": 24, "vector_core_num": 48})):
+              patch.object(torch, "npu", fake_npu, create=True)):
             self.assertEqual(MegaMhc.execution_requirements("npu:0")["minimum_training_tokens"], 48)
