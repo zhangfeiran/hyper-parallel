@@ -20,7 +20,7 @@ from __future__ import annotations
 import torch  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.core.multicore import MegaGate
+from hyper_parallel.core.multicore import GateOutput, MegaGate
 
 
 class Gate(MegaGate):
@@ -45,13 +45,21 @@ class Gate(MegaGate):
         self.bias.requires_grad_(False)
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return logits, normalized routing weights, and global expert identifiers."""
+        """Return logits, normalized routing weights, and global expert identifiers.
+
+        Args:
+            hidden_states: Input activations preserving the batch, sequence and hidden dimensions.
+        """
         if self.use_mega_gate:
             return self.mega_forward(hidden_states)
         return self.native_forward(hidden_states)
 
     def native_forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run projection, score transformation, biased TopK, gather, and normalization."""
+        """Run projection, score transformation, biased TopK, gather, and normalization.
+
+        Args:
+            hidden_states: Input activations preserving the batch, sequence and hidden dimensions.
+        """
         hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_flat.float(), self.weight.float())  # pylint: disable=not-callable
         scores = F.softplus(logits).sqrt()  # pylint: disable=not-callable
@@ -59,8 +67,12 @@ class Gate(MegaGate):
         topk_weights = scores.gather(-1, topk_ids)
         if self.top_k > 1:
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1.0e-20)
-        return logits, topk_weights * self.routed_scaling_factor, topk_ids
+        return GateOutput(logits, topk_weights * self.routed_scaling_factor, topk_ids)
 
     def mega_forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Replace the ordinary routing sequence with the managed MegaGate call."""
+        """Replace the ordinary routing sequence with the managed MegaGate call.
+
+        Args:
+            hidden_states: Input activations preserving the batch, sequence and hidden dimensions.
+        """
         return super().forward(hidden_states)

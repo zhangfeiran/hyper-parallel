@@ -18,58 +18,17 @@
 from __future__ import annotations
 
 import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.functional.mhc_post import mhc_post
-from hyper_parallel.components.functional.sinkhorn import sinkhorn, sinkhorn_knopps
-from hyper_parallel.core.multicore import HyperMegaMhc
-
-
-# State order: previous block output, residual streams, pre, post, residual mix.
-MhcState = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+from hyper_parallel.core.multicore import MegaMhc, MegaMhcOutput, MhcState
 
 
 def initial_mhc_state(hidden_states: torch.Tensor) -> MhcState:
-    """Expand embeddings and bootstrap the first boundary with identity mappings."""
-    leading_shape = hidden_states.shape[:-1]
-    residual = hidden_states.unsqueeze(-2).expand(*leading_shape, 4, hidden_states.shape[-1]).contiguous()
-    pre = torch.zeros((*leading_shape, 4), device=hidden_states.device, dtype=torch.float32)
-    pre[..., 0] = 1.0
-    post = torch.zeros_like(pre)
-    mix = torch.eye(4, device=hidden_states.device, dtype=torch.float32).expand(*leading_shape, 4, 4).contiguous()
-    return torch.zeros_like(hidden_states), residual, pre, post, mix
+    """Use the public bootstrap protocol for both implementations.
 
-
-def require_omni_mhc() -> None:
-    """Require the complete Omni training baseline instead of silently using Torch."""
-    # Omni is optional for CPU semantic checks, but required by the NPU common path.
-    try:
-        import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import,import-outside-toplevel
-    except ImportError as exc:
-        raise ImportError("NPU mHC common requires omni_training_custom_ops and its matching vendor OPP") from exc
-    required = (
-        "npu_ai_infra_manifold_constrained_hyper_connection_post",
-        "npu_ai_infra_mhc_post_grad",
-        "npu_sinkhorn",
-        "npu_sinkhorn_grad",
-    )
-    missing = [name for name in required if not hasattr(torch.ops.custom, name)]
-    if missing:
-        raise RuntimeError(f"NPU mHC common is missing Omni training operators: {', '.join(missing)}")
-
-
-def _advance_residual(state: MhcState) -> torch.Tensor:
-    """Apply the shared Omni post, including the final pending block output."""
-    output, residual, _, post, mix = state
-    if residual.device.type != "npu":
-        return _reference_residual(state)
-    require_omni_mhc()
-    hidden = residual.shape[-1]
-    result = mhc_post(
-        output.reshape(1, -1, hidden), residual.reshape(1, -1, 4 * hidden),
-        post.reshape(1, -1, 4), mix.reshape(1, -1, 4, 4), 4,
-    )
-    return result.reshape_as(residual)
+    Args:
+        hidden_states: Input activations preserving the batch, sequence and hidden dimensions.
+    """
+    return MhcState.initialize(hidden_states)
 
 
 def _reference_residual(state: MhcState) -> torch.Tensor:
@@ -107,32 +66,38 @@ def _mapping_logits(residual: torch.Tensor, phi: torch.Tensor, norm_eps: float) 
 
 
 def finish_mhc_state(state: MhcState) -> torch.Tensor:
-    """Flush the final block output and collapse streams using the pending pre mapping."""
-    residual = _advance_residual(state)
-    return (residual.float() * state[2].float().unsqueeze(-1)).sum(dim=-2).to(residual.dtype)
+    """Use the public terminal merge, including the last pending block output.
+
+    Args:
+        state: Explicit pending output, residual streams and mixing coefficients.
+    """
+    return MhcState(*state).finish()
 
 
-class MhcBoundary(HyperMegaMhc):
-    """Compare ordinary Omni/Torch mHC with Mega using identical parameters."""
+def _sinkhorn(logits: torch.Tensor, iterations: int, epsilon: float) -> torch.Tensor:
+    """Show the ordinary Torch normalization used by the comparison path."""
+    matrix = logits.softmax(-1) + epsilon
+    matrix = matrix / (matrix.sum(-2, keepdim=True) + epsilon)
+    for _ in range(iterations - 1):
+        matrix = matrix / (matrix.sum(-1, keepdim=True) + epsilon)
+        matrix = matrix / (matrix.sum(-2, keepdim=True) + epsilon)
+    return matrix
+
+
+class MhcBoundary(MegaMhc):
+    """Compare ordinary Torch mHC with Mega using identical parameters."""
 
     def __init__(self, hidden_size: int, norm_eps: float, *, use_mega_mhc: bool) -> None:
         """Initialize FP32 predictors and the BF16 input RMSNorm weight."""
         super().__init__(hidden_size, norm_eps=norm_eps)
         self.use_mega_mhc = use_mega_mhc
 
-    def forward(
-        self,
-        previous_output: torch.Tensor,
-        residual: torch.Tensor,
-        previous_pre_mix: torch.Tensor,
-        previous_post_mix: torch.Tensor,
-        previous_residual_mix: torch.Tensor,
-    ) -> MhcState:
-        """Return updated residual, next mappings, and the current normalized block input."""
-        state = (previous_output, residual, previous_pre_mix, previous_post_mix, previous_residual_mix)
+    def forward(self, *state: torch.Tensor | MhcState) -> MegaMhcOutput:
+        """Accept explicit named state or the compatible five-tensor boundary call."""
+        values = tuple(state[0]) if len(state) == 1 and isinstance(state[0], MhcState) else state
         if self.use_mega_mhc:
-            return self.mega_forward(*state)
-        return self.native_forward(*state)
+            return MegaMhcOutput(*self.mega_forward(*values))
+        return MegaMhcOutput(*self.native_forward(*values))
 
     def mega_forward(
         self,
@@ -142,20 +107,27 @@ class MhcBoundary(HyperMegaMhc):
         previous_post_mix: torch.Tensor,
         previous_residual_mix: torch.Tensor,
     ) -> MhcState:
-        """Replace the boundary calculations with one managed Mega mHC call."""
+        """Replace the boundary calculations with one managed Mega mHC call.
+
+        Args:
+            previous_output: Output of the previous block, shaped [..., H].
+            residual: Four residual streams, shaped [..., 4, H].
+            previous_pre_mix: Previous pre-mix coefficients, shaped [..., 4].
+            previous_post_mix: Previous post-mix coefficients, shaped [..., 4].
+            previous_residual_mix: Previous residual mixing matrices, shaped [..., 4, 4].
+        """
         return super().forward(
             previous_output, residual, previous_pre_mix, previous_post_mix, previous_residual_mix,
         )
 
-    def _mappings(self, logits: torch.Tensor, *, use_omni: bool) -> tuple[torch.Tensor, ...]:
+    def _mappings(self, logits: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Share coefficient transforms while keeping the Sinkhorn backend explicit."""
         pre_logits, post_logits, mix_logits = logits.split((4, 4, 16), dim=-1)
         pre_bias, post_bias, mix_bias = self.bias.float().split((4, 4, 16))
         pre = torch.sigmoid(pre_logits * self.alpha[0] + pre_bias) + self.hc_eps
         post = 2.0 * torch.sigmoid(post_logits * self.alpha[1] + post_bias)
         mix = (mix_logits * self.alpha[2] + mix_bias).reshape(*logits.shape[:-1], 4, 4)
-        normalize = sinkhorn if use_omni else sinkhorn_knopps
-        return pre, post, normalize(mix, self.num_iters, self.hc_eps)
+        return pre, post, _sinkhorn(mix, self.num_iters, self.hc_eps)
 
     def native_forward(
         self,
@@ -165,19 +137,18 @@ class MhcBoundary(HyperMegaMhc):
         previous_post_mix: torch.Tensor,
         previous_residual_mix: torch.Tensor,
     ) -> MhcState:
-        """Run ordinary Post, projection, Sinkhorn, mixing, and RMSNorm operations."""
-        state = (previous_output, residual, previous_pre_mix, previous_post_mix, previous_residual_mix)
-        if residual.device.type != "npu":
-            return self.reference_forward(*state)
-        new_residual = _advance_residual(state)
-        flattened = new_residual.flatten(-2).float()
-        normalized = flattened * torch.rsqrt(flattened.square().mean(dim=-1, keepdim=True) + self.norm_eps)
-        logits = F.linear(normalized, self.phi.float())  # pylint: disable=not-callable
-        pre, post, mix = self._mappings(logits, use_omni=True)
-        mixed = (new_residual.float() * state[2].float().unsqueeze(-1)).sum(dim=-2).to(new_residual.dtype)
-        normalized = mixed.float() * torch.rsqrt(mixed.float().square().mean(dim=-1, keepdim=True) + self.norm_eps)
-        block_input = normalized.to(mixed.dtype) * self.norm_weight
-        return new_residual, pre, post, mix, block_input
+        """Run ordinary ordinary operations without an additional custom-operator package.
+
+        Args:
+            previous_output: Output of the previous block, shaped [..., H].
+            residual: Four residual streams, shaped [..., 4, H].
+            previous_pre_mix: Previous pre-mix coefficients, shaped [..., 4].
+            previous_post_mix: Previous post-mix coefficients, shaped [..., 4].
+            previous_residual_mix: Previous residual mixing matrices, shaped [..., 4, 4].
+        """
+        return self.reference_forward(previous_output, residual, previous_pre_mix,
+                                      previous_post_mix, previous_residual_mix)
+
 
     def reference_forward(
         self,
@@ -187,11 +158,19 @@ class MhcBoundary(HyperMegaMhc):
         previous_post_mix: torch.Tensor,
         previous_residual_mix: torch.Tensor,
     ) -> MhcState:
-        """Evaluate the Torch precision reference without selecting the timing baseline."""
+        """Evaluate the ordinary precision reference without selecting the timing baseline.
+
+        Args:
+            previous_output: Output of the previous block, shaped [..., H].
+            residual: Four residual streams, shaped [..., 4, H].
+            previous_pre_mix: Previous pre-mix coefficients, shaped [..., 4].
+            previous_post_mix: Previous post-mix coefficients, shaped [..., 4].
+            previous_residual_mix: Previous residual mixing matrices, shaped [..., 4, 4].
+        """
         state = (previous_output, residual, previous_pre_mix, previous_post_mix, previous_residual_mix)
         new_residual = _reference_residual(state)
         logits = _mapping_logits(new_residual, self.phi, self.norm_eps)
-        pre, post, mix = self._mappings(logits, use_omni=False)
+        pre, post, mix = self._mappings(logits)
         if residual.device.type == "npu":
             # CANN reduces streams left to right and stores BF16 before ordinary RMSNorm.
             weighted = new_residual.float() * previous_pre_mix.float().unsqueeze(-1)

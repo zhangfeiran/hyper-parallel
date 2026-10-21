@@ -20,8 +20,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
 import torch_npu
+from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.modules import SwiGLUMLP
 from hyper_parallel.components.modules.moe import GroupedExperts
@@ -120,13 +120,11 @@ class MoeTransformerBlock(nn.Module):
             routed_scaling_factor=config.routed_scaling_factor, use_mega_gate="gate" in mega_kernels,
         )
         self.experts = MegaMoeExperts(
-            max_local_num_tokens=config.local_num_tokens,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             num_experts=config.num_experts,
             top_k=config.top_k,
             initial_capacity_factor=config.initial_capacity_factor,
-            ep_size=config.ep_size,
             ep_group=ep_group,
             dispatch_mode=config.dispatch_mode,
             capacity_growth_factor=config.capacity_growth_factor,
@@ -138,26 +136,23 @@ class MoeTransformerBlock(nn.Module):
         self.shared_expert = SwiGLUMLP(module=shared_source)
 
     def use_native_experts(self, ep_mesh: Any, device: torch.device) -> None:
-        """Replace MegaMoe with equal-weight ordinary EP experts before building the optimizer."""
+        """Replace MegaMoe with equal-weight ordinary EP experts before building the optimizer.
+
+        Args:
+            ep_mesh: Device mesh defining the original expert ownership.
+            device: Execution device used for the parameters and workspace.
+        """
         source = self.experts
         native = NativeExperts(self.config, source, ep_mesh, device)
         source.close()
         self.experts = native
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run learned routed experts and the always-active shared expert."""
-        hidden_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, hidden_shape[-1])
-        _, topk_weights, topk_ids = self.gate(hidden_states)
-        tokens_per_expert = torch.bincount(
-            topk_ids.reshape(-1).to(torch.int64),
-            minlength=self.config.num_experts,
-        ).to(torch.int32)
-        routed_output = self.experts(
-            hidden_flat,
-            topk_ids,
-            topk_weights,
-            tokens_per_expert=tokens_per_expert,
-        )
-        shared_output = self.shared_expert(hidden_flat)
-        return (routed_output + shared_output).view(hidden_shape)
+        """Run learned routed experts and the always-active shared expert.
+
+        Args:
+            hidden_states: Input activations preserving the batch, sequence and hidden dimensions.
+        """
+        route = self.gate(hidden_states)
+        routed_output = self.experts(hidden_states, topk_ids=route.ids, topk_weights=route.weights)
+        return routed_output + self.shared_expert(hidden_states)

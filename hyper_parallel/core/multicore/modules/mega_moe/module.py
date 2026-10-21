@@ -112,6 +112,22 @@ def _create_mega_moe_parameters(
     return gate_up_weight, down_weight
 
 
+def _resolve_ep_size(ep_size: int | None, ep_group: Any | None) -> int:
+    """Infer size from an explicit group without silently choosing WORLD."""
+    if ep_size is not None and (not isinstance(ep_size, int) or isinstance(ep_size, bool) or ep_size <= 0):
+        raise ValueError("ep_size must be a positive integer or None")
+    if ep_group is not None:
+        if not dist.is_initialized():
+            raise ValueError("Initialize torch.distributed before passing ep_group")
+        group_size = dist.get_world_size(ep_group)
+        if ep_size is not None and ep_size != group_size:
+            raise ValueError(f"ep_size={ep_size} does not match ep_group size={group_size}")
+        return group_size
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        raise ValueError("Pass ep_group explicitly for distributed MegaMoeExperts")
+    return 1 if ep_size is None else ep_size
+
+
 class _MegaMoeExecutionResources:
     """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
@@ -210,7 +226,12 @@ class _MegaMoeExecutionResources:
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
 
     def plan_for_tokens(self, tokens: int, device: Any) -> Any:
-        """Cache bounded schedules without changing symmetric workspace capacity."""
+        """Cache bounded schedules without changing symmetric workspace capacity.
+
+        Args:
+            tokens: Current local source-token count.
+            device: Execution device used for the parameters and workspace.
+        """
         if tokens not in self._plans:
             self._plans[tokens] = build_mega_moe_plan(replace(self.spec, schedule_tokens=tokens), device)
         self._plans.move_to_end(tokens)
@@ -239,6 +260,48 @@ class MegaMoeExperts(MulticoreModule):
     independent parameters and optimizer state.
     """
 
+    @classmethod
+    def from_module(
+        cls, module: torch.nn.Module, *, top_k: int, ep_group: Any | None = None, **execution_options: Any,
+    ) -> MegaMoeExperts:
+        """Convert materialized local GroupedExperts SwiGLU weights before optimizer construction.
+
+        Args:
+            module: Module exposing w1/w3 [local_E, I, H], w2 [local_E, H, I].
+                DTensor local EP shards are accepted; FSDP weights must be materialized first.
+            top_k: Experts selected by the existing router for each token.
+            ep_group: Explicit EP group owning these local experts, or None for a standalone rank.
+            **execution_options: Advanced MegaMoe options, including optional num_experts override.
+
+        Returns:
+            Experts with copied, converted Parameters. Optimizer state is not migrated.
+        """
+        values = []
+        for name in ("w1", "w3", "w2"):
+            value = getattr(module, name, None)
+            if hasattr(value, "to_local"):
+                value = value.to_local()
+            if not isinstance(value, torch.Tensor) or value.ndim != 3:
+                raise ValueError(f"source {name} must be a materialized local rank-three expert tensor")
+            values.append(value)
+        gate, up, down = values[0], values[1], values[2]
+        if (up.shape != gate.shape or down.shape != (gate.shape[0], gate.shape[2], gate.shape[1])
+                or any(value.device != gate.device or value.dtype != gate.dtype for value in values)
+                or gate.requires_grad != up.requires_grad):
+            raise ValueError("source SwiGLU expert shapes, dtypes, devices and gate/up gradient policies must match")
+        ep_size = _resolve_ep_size(execution_options.get("ep_size"), ep_group)
+        experts = execution_options.pop("num_experts", getattr(module, "num_experts", gate.shape[0] * ep_size))
+        if experts != gate.shape[0] * ep_size:
+            raise ValueError("source local expert count does not match num_experts and ep_group")
+        result = cls(hidden_size=gate.shape[2], intermediate_size=gate.shape[1], num_experts=experts,
+                     top_k=top_k, ep_group=ep_group, create_parameters=False, **execution_options)
+        result.gate_up_weight = torch.nn.Parameter(
+            torch.cat((gate.detach().transpose(1, 2), up.detach().transpose(1, 2)), dim=-1).contiguous(),
+            requires_grad=gate.requires_grad)
+        result.down_weight = torch.nn.Parameter(down.detach().transpose(1, 2).contiguous(),
+                                                requires_grad=down.requires_grad)
+        return result
+
     def _resource_signature(self, tensor: Any) -> Any:
         """Compare static configuration without process-local group identities."""
         configuration = tuple(sorted((name, value) for name, value in self._resource_group.specification.items()
@@ -260,7 +323,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         swiglu_limit: float | None = None,
-        ep_size: int = 1,
+        ep_size: int | None = None,
         ep_group: Any | None = None,
         create_parameters: bool = True,
         dispatch_mode: str = "push",
@@ -294,7 +357,7 @@ class MegaMoeExperts(MulticoreModule):
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
                 preserves the legacy unclamped path.
-            ep_size: Expert-parallel degree, equal to the size of ep_group.
+            ep_size: Optional compatibility check; normally inferred from explicit ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             ep_group: Torch expert-parallel process group, possibly a subgroup of
                 WORLD. Expert ownership follows group-local rank order. Disjoint
@@ -310,7 +373,7 @@ class MegaMoeExperts(MulticoreModule):
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
-            "ep_size": ep_size,
+            "ep_size": _resolve_ep_size(ep_size, ep_group),
             "ep_group": ep_group,
             "dispatch_mode": dispatch_mode,
             "capacity_growth_factor": capacity_growth_factor,
@@ -340,8 +403,8 @@ class MegaMoeExperts(MulticoreModule):
         self.dispatch_split = dispatch_split
         self.combine_split = combine_split
         self.swiglu_limit = specification["swiglu_limit"]
-        self.ep_size = ep_size
-        self.local_experts = num_experts // ep_size
+        self.ep_size = specification["ep_size"]
+        self.local_experts = num_experts // self.ep_size
         self._ep_group = ep_group
         if create_parameters:
             self.gate_up_weight, self.down_weight = _create_mega_moe_parameters(
@@ -552,7 +615,12 @@ class MegaMoeExperts(MulticoreModule):
         automatic = resources.spec.auto_tokens
         claimed = False
         def prepare_workspace(tokens: int, received: int) -> None:
-            """Grow before publishing pull source rows into symmetric memory."""
+            """Grow before publishing pull source rows into symmetric memory.
+
+            Args:
+                tokens: Current local source-token count.
+                received: Current routed receive-row count.
+            """
             nonlocal claimed
             resources.prepare_auto_workspace(tokens, received, hidden_flat)
             claimed = pull

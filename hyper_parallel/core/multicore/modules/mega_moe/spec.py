@@ -161,6 +161,8 @@ def bind_mega_moe_spec(
     ep_group = specification["ep_group"]
     ep_size = specification["ep_size"]
     if dist.is_initialized():
+        if ep_group is None and dist.get_world_size() > 1:
+            raise ValueError("Pass ep_group explicitly for distributed MegaMoeExperts")
         group_size = dist.get_world_size(ep_group)
         rank_id = dist.get_rank(ep_group)
     else:

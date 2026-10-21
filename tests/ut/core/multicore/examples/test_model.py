@@ -15,44 +15,63 @@
 
 """Hardware-independent checks for the three-kernel example and benchmark wiring."""
 
-from dataclasses import replace
+from __future__ import annotations
+
+import importlib
+import io
 import sys
-from types import SimpleNamespace
 import unittest
+from contextlib import redirect_stderr
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
 from hyper_parallel import DeviceMesh, DTensor, Shard, SkipDTensorDispatch
+from hyper_parallel.components.optim import Float16OptimizerWithFloat16Params
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore.examples import benchmark
 from hyper_parallel.core.multicore.examples import mhc as mhc_module
 from hyper_parallel.core.multicore.examples import moe as moe_module
-from hyper_parallel.core.multicore.examples.mhc import MhcBoundary, finish_mhc_state, initial_mhc_state
-from hyper_parallel.core.multicore.examples.model import MoeTransformerConfig, MoeTransformerModel
-from hyper_parallel.components.optim import Float16OptimizerWithFloat16Params
+from hyper_parallel.core.multicore.examples.mhc import (
+    MhcBoundary,
+    finish_mhc_state,
+    initial_mhc_state,
+)
+from hyper_parallel.core.multicore.examples.model import (
+    MoeTransformerConfig,
+    MoeTransformerModel,
+)
 from hyper_parallel.core.optimizer.adamw import AdamW
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
+from tests.common.mark_utils import arg_mark
 from tests.common.multicore.mega_mhc_golden import torch_mega_mhc
+
+rms_norm_module = importlib.import_module("hyper_parallel.components.functional.rms_norm")
 
 
 def _experts_reference(
     module: MegaMoeExperts,
     hidden: torch.Tensor,
-    ids: torch.Tensor,
-    weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
     *,
-    tokens_per_expert: torch.Tensor,
+    tokens_per_expert: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Evaluate all local experts explicitly; EP is one in these CPU checks."""
-    expected_counts = torch.bincount(ids.flatten(), minlength=module.num_experts).to(torch.int32)
-    torch.testing.assert_close(tokens_per_expert, expected_counts, rtol=0, atol=0)
+    ids, weights = topk_ids, topk_weights
+    shape = hidden.shape
+    hidden = hidden.reshape(-1, shape[-1])
+    if tokens_per_expert is not None:
+        expected_counts = torch.bincount(ids.flatten(), minlength=module.num_experts).to(torch.int32)
+        torch.testing.assert_close(tokens_per_expert, expected_counts, rtol=0, atol=0)
     gate_up = torch.einsum("th,ehj->tej", hidden, module.gate_up_weight)
     gate, up = gate_up.chunk(2, dim=-1)
-    output = torch.einsum("tei,eih->teh", F.silu(gate) * up, module.down_weight)
+    output = torch.einsum("tei,eid->ted", F.silu(gate) * up, module.down_weight)
     scores = torch.zeros(hidden.shape[0], module.num_experts).scatter_add(1, ids, weights)
-    return (output.float() * scores.unsqueeze(-1)).sum(dim=1).to(hidden.dtype)
+    return (output.float() * scores.unsqueeze(-1)).sum(dim=1).to(hidden.dtype).reshape(shape)
 
 
 def _rms_reference(hidden: torch.Tensor, weight: torch.Tensor, *, epsilon: float) -> tuple:
@@ -101,8 +120,15 @@ class TestMoeTransformerExample(unittest.TestCase):
         finally:
             torch.set_default_dtype(original_dtype)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_router_scores_and_gradients(self) -> None:
-        """Match sqrt-softplus TopK, unbiased selected scores, and projection gradients."""
+        """Match sqrt-softplus TopK, unbiased selected scores, and projection gradients.
+
+        Feature: MegaKernel model integration.
+        Description: Router scores and gradients.
+        Expectation: Match sqrt-softplus TopK, unbiased selected scores, and projection gradients.
+        """
         model = self._model(())
         self.addCleanup(model.close)
         gate = model.layers[0].mlp.gate
@@ -119,8 +145,15 @@ class TestMoeTransformerExample(unittest.TestCase):
         for got, want in zip(actual_grads, expected_grads):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_two_layer_training_and_native_boundary_wiring(self) -> None:
-        """Keep cross-layer mHC state and gradients equal across execution choices."""
+        """Keep cross-layer mHC state and gradients equal across execution choices.
+
+        Feature: MegaKernel model integration.
+        Description: Two layer training and native boundary wiring.
+        Expectation: Keep cross-layer mHC state and gradients equal across execution choices.
+        """
         reference = self._model(())
         optimized = self._model(("moe", "gate", "mhc"))
         self.addCleanup(reference.close)
@@ -128,7 +161,7 @@ class TestMoeTransformerExample(unittest.TestCase):
         inputs = torch.arange(128).reshape(1, -1) % 32
         with (
             patch.object(MegaMoeExperts, "forward", _experts_reference),
-            patch("hyper_parallel.components.functional.rms_norm.torch_npu.npu_rms_norm", _rms_reference),
+            patch.object(rms_norm_module.torch_npu, "npu_rms_norm", _rms_reference),
             patch("hyper_parallel.components.functional.rotary_embedding.torch_npu.npu_rotary_mul", _rotary_reference),
             patch("hyper_parallel.core.multicore.modules.mega_mhc.module.hyper_mega_mhc",
                   side_effect=_native_mhc_reference) as native_mhc,
@@ -150,8 +183,15 @@ class TestMoeTransformerExample(unittest.TestCase):
             if got.requires_grad:
                 torch.testing.assert_close(got.grad, want.grad, rtol=0, atol=0)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_selective_backend_construction(self) -> None:
-        """Use common EP unless moe is explicitly selected in the optimized backend."""
+        """Use common EP unless moe is explicitly selected in the optimized backend.
+
+        Feature: MegaKernel model integration.
+        Description: Selective backend construction.
+        Expectation: Use common EP unless moe is explicitly selected in the optimized backend.
+        """
         for backend, kernels in (("common", ("moe", "gate", "mhc")), ("mega", ("gate",)), ("mega", ("moe",))):
             with (
                 self.subTest(backend=backend, kernels=kernels),
@@ -174,8 +214,15 @@ class TestMoeTransformerExample(unittest.TestCase):
                     if isinstance(layer.mlp.experts, MegaMoeExperts):
                         layer.mlp.experts.close()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_mixed_dtype_gradient_synchronization(self) -> None:
-        """Keep FP32 mHC predictors and BF16 dense weights in separate collectives."""
+        """Keep FP32 mHC predictors and BF16 dense weights in separate collectives.
+
+        Feature: MegaKernel model integration.
+        Description: Mixed dtype gradient synchronization.
+        Expectation: Keep FP32 mHC predictors and BF16 dense weights in separate collectives.
+        """
         gradients = [torch.ones(3, dtype=torch.bfloat16), torch.ones(2), torch.full((5,), 2.0)]
         expected = [gradient.clone() for gradient in gradients]
 
@@ -196,8 +243,15 @@ class TestMoeTransformerExample(unittest.TestCase):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_ep_main_gradient_layout_and_optimizer_update(self, mock_rank: object) -> None:
-        """Bridge actual local autograd gradients to a DTensor main-parameter update."""
+        """Bridge actual local autograd gradients to a DTensor main-parameter update.
+
+        Feature: MegaKernel model integration.
+        Description: Ep main gradient layout and optimizer update.
+        Expectation: Bridge actual local autograd gradients to a DTensor main-parameter update.
+        """
         del mock_rank
         mesh = DeviceMesh("cpu", [0, 1], mesh_dim_names=("ep",), _init_backend=False)
         parameter = torch.nn.Parameter(DTensor.from_local(
@@ -219,22 +273,48 @@ class TestMoeTransformerExample(unittest.TestCase):
         self.assertIsInstance(adamw.state[parameter.main_param]["exp_avg"], DTensor)
         self.assertEqual(tuple(adamw.state[parameter.main_param]["exp_avg"].shape), (4,))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_arguments_and_topology_validation(self) -> None:
-        """Validate selected kernels and reject incompatible fixed workload shapes."""
-        args = benchmark.parse_args(["--dispatch-mode", "pull", "--mega-kernels", "gate", "mhc"])
-        self.assertEqual(args.mega_kernels, ["gate", "mhc"])
+        """Validate selected kernels and reject incompatible fixed workload shapes.
+
+        Feature: MegaKernel model integration.
+        Description: Arguments and topology validation.
+        Expectation: Validate selected kernels and reject incompatible fixed workload shapes.
+        """
+        args = benchmark.parse_args(["--dispatch-mode", "pull", "--mega-kernels", "gate,mhc"])
+        self.assertEqual(args.mega_kernels, ("gate", "mhc"))
         self.assertIsNone(args.initial_capacity_factor)
         self.assertIsNone(args.capacity_growth_factor)
         self.assertEqual(benchmark.parse_args([]).mega_kernels, ("moe", "gate", "mhc"))
         self.assertEqual(benchmark.parse_args([]).accuracy_mode, "components")
         self.assertEqual(benchmark.parse_args(["--accuracy-mode", "full_step"]).accuracy_mode, "full_step")
-        with self.assertRaisesRegex(ValueError, "divisible by 128"):
-            replace(self._config(), local_num_tokens=129)
+        self.assertEqual(replace(self._config(), local_num_tokens=129).local_num_tokens, 129)
         with self.assertRaisesRegex(ValueError, "Unsupported Mega kernels"):
             MoeTransformerModel(self._config(), mega_kernels=("invalid",))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_kernel_selection_rejects_invalid_comma_separated_values(self) -> None:
+        """CLI component selection is explicit, nonempty and free of duplicate names.
+
+        Feature: MegaKernel model integration.
+        Description: Kernel selection rejects invalid comma separated values.
+        Expectation: CLI component selection is explicit, nonempty and free of duplicate names.
+        """
+        for value in ("", "moe,", "unknown", "gate,gate"):
+            with (self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit)):
+                benchmark.parse_args(["--mega-kernels", value])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_component_comparison_checks_all_outputs_and_gradients(self) -> None:
-        """Use one shared input set to check five outputs and all nine gradient groups."""
+        """Use one shared input set to check five outputs and all nine gradient groups.
+
+        Feature: MegaKernel model integration.
+        Description: Component comparison checks all outputs and gradients.
+        Expectation: Use one shared input set to check five outputs and all nine gradient groups.
+        """
         models = {"common": self._model(()), "mega": self._model(("moe", "gate", "mhc"))}
         for model in models.values():
             self.addCleanup(model.close)
@@ -260,8 +340,15 @@ class TestMoeTransformerExample(unittest.TestCase):
             self.assertEqual(result[f"{backend}_forward"]["tensor_count"], 5)
             self.assertEqual(result[f"{backend}_gradients"]["tensor_count"], 9)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_component_scope_restores_native_for_complete_training(self) -> None:
-        """Keep strict controlled checks separate from fully enabled training steps."""
+        """Keep strict controlled checks separate from fully enabled training steps.
+
+        Feature: MegaKernel model integration.
+        Description: Component scope restores native for complete training.
+        Expectation: Keep strict controlled checks separate from fully enabled training steps.
+        """
         models = {"common": self._model(()), "mega": self._model(("moe", "gate", "mhc"))}
         for model in models.values():
             self.addCleanup(model.close)
@@ -304,8 +391,15 @@ class TestMoeTransformerExample(unittest.TestCase):
 class TestMhcBoundary(unittest.TestCase):
     """Compare all outputs and gradients with the independent semantic oracle."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_reference_forward_and_backward(self) -> None:
-        """Preserve shifted input mappings and FP32 predictor gradients."""
+        """Preserve shifted input mappings and FP32 predictor gradients.
+
+        Feature: MegaKernel model integration.
+        Description: Reference forward and backward.
+        Expectation: Preserve shifted input mappings and FP32 predictor gradients.
+        """
         torch.manual_seed(20)
         boundary = MhcBoundary(128, 1e-6, use_mega_mhc=False)
         state = (
@@ -332,44 +426,56 @@ class TestMhcBoundary(unittest.TestCase):
         self.assertEqual(boundary.phi.dtype, torch.float32)
         self.assertEqual(boundary.norm_weight.dtype, torch.bfloat16)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_projection_restores_hf32_after_failure(self) -> None:
-        """Never leave the process-wide NPU setting changed when projection raises."""
+        """Never leave the process-wide NPU setting changed when projection raises.
+
+        Feature: MegaKernel model integration.
+        Description: Projection restores hf32 after failure.
+        Expectation: Never leave the process-wide NPU setting changed when projection raises.
+        """
         residual = SimpleNamespace(
             float=lambda: torch.ones(1, 2, 4, 128), device=SimpleNamespace(type="npu"),
         )
         for previous in (False, True):
             with self.subTest(previous=previous):
                 matmul_config = SimpleNamespace(allow_hf32=previous)
-                with patch.object(torch, "npu", SimpleNamespace(matmul=matmul_config), create=True), \
-                     patch.object(torch, "matmul", side_effect=RuntimeError("projection failed")):
-                    with self.assertRaisesRegex(RuntimeError, "projection failed"):
-                        # Exercise the NPU setting boundary without an accelerator.
-                        # pylint: disable-next=protected-access
-                        mhc_module._mapping_logits(residual, torch.ones(24, 512), 1e-6)
+                with (patch.object(torch, "npu", SimpleNamespace(matmul=matmul_config), create=True),
+                      patch.object(torch, "matmul", side_effect=RuntimeError("projection failed")),
+                      self.assertRaisesRegex(RuntimeError, "projection failed")):
+                    # Exercise the NPU setting boundary without an accelerator.
+                    # pylint: disable-next=protected-access
+                    mhc_module._mapping_logits(residual, torch.ones(24, 512), 1e-6)
                 self.assertEqual(matmul_config.allow_hf32, previous)
 
-    def test_common_requires_omni_registration(self) -> None:
-        """Reject a missing optional package instead of timing the Torch fallback."""
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_common_runs_without_omni_registration(self) -> None:
+        """The ordinary comparison is a Torch formula without an extra vendor dependency.
+
+        Feature: MegaKernel model integration.
+        Description: Common runs without omni registration.
+        Expectation: The ordinary comparison is a Torch formula without an extra vendor dependency.
+        """
+        boundary = MhcBoundary(128, 1e-6, use_mega_mhc=False)
+        hidden = torch.randn(1, 64, 128, dtype=torch.bfloat16, requires_grad=True)
         with patch.dict(sys.modules, {"omni_training_custom_ops": None}):
-            with self.assertRaisesRegex(ImportError, "NPU mHC common requires"):
-                mhc_module.require_omni_mhc()
+            state = initial_mhc_state(hidden)
+            result = boundary(state)
+            result.hidden_states.float().square().sum().backward()
+        self.assertIsNotNone(hidden.grad)
+        self.assertTrue(torch.isfinite(hidden.grad).all())
 
-    def test_common_requires_backward_operators(self) -> None:
-        """Reject forward-only installations before allocating a training workload."""
-        required = (
-            "npu_ai_infra_manifold_constrained_hyper_connection_post",
-            "npu_ai_infra_mhc_post_grad", "npu_sinkhorn", "npu_sinkhorn_grad",
-        )
-        for missing in required:
-            with self.subTest(missing=missing):
-                operators = SimpleNamespace(**{name: object() for name in required if name != missing})
-                with patch.dict(sys.modules, {"omni_training_custom_ops": SimpleNamespace()}), \
-                     patch.object(torch.ops, "custom", operators):
-                    with self.assertRaisesRegex(RuntimeError, missing):
-                        mhc_module.require_omni_mhc()
-
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_bootstrap_and_final_flush(self) -> None:
-        """Do not drop the final block's output or pending residual mappings."""
+        """Do not drop the final block's output or pending residual mappings.
+
+        Feature: MegaKernel model integration.
+        Description: Bootstrap and final flush.
+        Expectation: Do not drop the final block's output or pending residual mappings.
+        """
         hidden = torch.randn(2, 128, 128, dtype=torch.bfloat16)
         state = initial_mhc_state(hidden)
         torch.testing.assert_close(finish_mhc_state(state), hidden, rtol=0, atol=0)

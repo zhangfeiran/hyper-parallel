@@ -58,9 +58,6 @@ source_env() {
 
 cd "$ROOT"
 source_env "$CANN_ENV_FILE"
-if [[ -n "${OMNI_ENV_FILE:-}" ]]; then
-    source_env "$OMNI_ENV_FILE"
-fi
 source_env "$NATIVE_ENV_FILE"
 
 export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"

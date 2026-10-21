@@ -34,11 +34,16 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb
 from hyper_parallel.components.modules import RMSNorm
 from hyper_parallel.core.multicore import MegaMoeExperts
-from hyper_parallel.core.multicore.modules.mega_moe.spec import _resolve_capacity_factors
 from hyper_parallel.core.multicore.examples.mhc import (
-    MhcBoundary, MhcState, finish_mhc_state, initial_mhc_state,
+    MhcBoundary,
+    MhcState,
+    finish_mhc_state,
+    initial_mhc_state,
 )
 from hyper_parallel.core.multicore.examples.moe import MoeTransformerBlock
+from hyper_parallel.core.multicore.modules.mega_moe.spec import (
+    _resolve_capacity_factors,
+)
 
 
 @dataclass(frozen=True)
@@ -112,10 +117,6 @@ class MoeTransformerConfig:
             raise ValueError(
                 f"top_k ({self.top_k}) cannot exceed num_experts ({self.num_experts})."
             )
-        if self.local_num_tokens % 128:
-            raise ValueError(
-                f"local_num_tokens ({self.local_num_tokens}) must be divisible by 128."
-            )
         if self.max_seq_len > self.local_num_tokens:
             raise ValueError(
                 f"max_seq_len ({self.max_seq_len}) cannot exceed local_num_tokens "
@@ -160,7 +161,12 @@ class MoeTransformerAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Run fused causal grouped-query attention."""
+        """Run fused causal grouped-query attention.
+
+        Args:
+            hidden_states: Input activations preserving the batch, sequence and hidden dimensions.
+            position_ids: Position indices used by the rotary embedding.
+        """
         batch_size, sequence_length, _ = hidden_states.shape
         query = (
             self.q_proj(hidden_states)
@@ -233,11 +239,16 @@ class MoeTransformerDecoderLayer(nn.Module):
         self.mlp = MoeTransformerBlock(config, ep_group, mega_kernels)
 
     def forward(self, state: MhcState, position_ids: torch.Tensor) -> MhcState:
-        """Carry shifted residual mappings across attention, MoE, and decoder layers."""
-        residual, pre, post, mix, block_input = self.attention_mhc(*state)
-        attention_output = self.self_attn(block_input, position_ids)
-        residual, pre, post, mix, block_input = self.ffn_mhc(attention_output, residual, pre, post, mix)
-        return self.mlp(block_input), residual, pre, post, mix
+        """Carry shifted residual mappings across attention, MoE, and decoder layers.
+
+        Args:
+            state: Explicit pending output, residual streams and mixing coefficients.
+            position_ids: Position indices used by the rotary embedding.
+        """
+        attention = self.attention_mhc(state)
+        state = attention.next_state(self.self_attn(attention.hidden_states, position_ids))
+        feed_forward = self.ffn_mhc(state)
+        return feed_forward.next_state(self.mlp(feed_forward.hidden_states))
 
 
 class MoeTransformerModel(nn.Module):
@@ -272,7 +283,12 @@ class MoeTransformerModel(nn.Module):
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
-        """Return token logits and optional next-token loss."""
+        """Return token logits and optional next-token loss.
+
+        Args:
+            input_ids: Rank-local token IDs shaped [batch, sequence].
+            labels: Optional next-token targets with the same leading dimensions.
+        """
         hidden_states = self.embed_tokens(input_ids)
         position_ids = torch.arange(
             hidden_states.shape[1],

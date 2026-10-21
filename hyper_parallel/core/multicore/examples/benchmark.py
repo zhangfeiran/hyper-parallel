@@ -38,10 +38,14 @@ from hyper_parallel.components.optim import (
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.multicore import MegaMoeExperts, shmem
-from hyper_parallel.core.multicore.examples.mhc import require_omni_mhc
-from hyper_parallel.core.multicore.examples.model import MoeTransformerConfig, MoeTransformerModel
+from hyper_parallel.core.multicore.examples.model import (
+    MoeTransformerConfig,
+    MoeTransformerModel,
+)
 from hyper_parallel.core.multicore.examples.moe import NativeExperts, _local_tensor
-from hyper_parallel.core.multicore.modules.mega_moe.spec import _resolve_capacity_factors
+from hyper_parallel.core.multicore.modules.mega_moe.spec import (
+    _resolve_capacity_factors,
+)
 from hyper_parallel.core.optimizer import get_hyper_optimizer
 
 _WORLD_SIZE = 8
@@ -87,6 +91,14 @@ class _BenchmarkContext:
     models: dict[str, MoeTransformerModel] = field(default_factory=dict)
 
 
+def _parse_mega_kernels(value: str) -> tuple[str, ...]:
+    """Parse explicit comma-separated component names without changing model structure."""
+    names = tuple(part.strip() for part in value.split(","))
+    if not names or any(name not in ("moe", "gate", "mhc") for name in names) or len(set(names)) != len(names):
+        raise argparse.ArgumentTypeError("use a comma-separated subset of moe,gate,mhc without duplicates")
+    return names
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the minimal optimizer benchmark interface.
 
@@ -106,7 +118,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--capacity-growth-factor", type=float, default=None,
                         help="push only: growth multiplier (default: 1.25; 1.0 fits actual demand)")
     parser.add_argument(
-        "--mega-kernels", nargs="+", choices=("moe", "gate", "mhc"), default=("moe", "gate", "mhc"),
+        "--mega-kernels", type=_parse_mega_kernels, default=("moe", "gate", "mhc"),
         help="optimized backend kernels; common always uses the same architecture with Torch references",
     )
     parser.add_argument(
@@ -609,7 +621,9 @@ def _write_result(
             "architecture": "moe_transformer",
             "mega_kernels": list(args.mega_kernels),
             "accuracy_mode": args.accuracy_mode,
-            "common_mhc_backend": "omni_post_sinkhorn",
+            "common_mhc_backend": "torch",
+            "gate_route_backend": {"common": "torch",
+                                   "mega": "native" if "gate" in args.mega_kernels else "torch"},
             "mhc_precision_reference": "torch",
             "topology": {"world_size": _WORLD_SIZE, "tp": 1, "ep": config.ep_size},
             "shape": {
@@ -800,7 +814,6 @@ def _validate_accuracy(
 def _prepare_benchmark(argv: list[str] | None) -> _BenchmarkContext:
     """Parse arguments and initialize the distributed benchmark runtime."""
     args = parse_args(argv)
-    require_omni_mhc()
     rank, world_size, device, initialized_here = _init_runtime()
     config = replace(
         MoeTransformerConfig(),
