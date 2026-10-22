@@ -69,22 +69,44 @@ class TestMegaMoeExperts(unittest.TestCase):
         Expectation: The cache stays bounded while a retained plan and its physical capacity remain unchanged.
         """
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
-        resources.spec = MegaMoeSpec(8192, 16, 8, 4, 2, None, 16384, 1, None, 0, 24,
-                                    max_local_num_tokens=8192)
+        resources.spec = MegaMoeSpec(32768, 16, 8, 4, 2, None, 65536, 1, None, 0, 24,
+                                    max_local_num_tokens=32768)
         resources._plans = OrderedDict()
         with patch.object(mega_moe_module, "build_mega_moe_plan",
                           side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
             retained = resources.plan_for_tokens(128, "cpu")
             self.assertIs(retained, resources.plan_for_tokens(128, "cpu"))
-            for tokens in (1152, 2176, 3200, 4224):
+            for tokens in range(1152, 16513, 1024):
                 resources.plan_for_tokens(tokens, "cpu")
-            self.assertEqual(len(resources._plans), 4)
+            self.assertEqual(len(resources._plans), 16)
             self.assertNotIn(1024, resources._plans)
             self.assertEqual(retained.spec.plan_tokens, 1024)
-            self.assertEqual(retained.spec.routed_slots, 16384)
-            self.assertEqual(retained.spec.receive_capacity, 16384)
+            self.assertEqual(retained.spec.routed_slots, 65536)
+            self.assertEqual(retained.spec.receive_capacity, 65536)
             self.assertEqual(resources.spec, replace(retained.spec, schedule_tokens=None))
-            self.assertEqual(build.call_count, 5)
+            self.assertEqual(build.call_count, 17)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_dispersed_dynamic_lengths_retain_every_eight_k_bucket(self) -> None:
+        """Feature: dispersed dynamic lengths retain every eight k bucket.
+
+        Description: Repeated lengths span all eight 1024-token buckets in mixed order.
+        Expectation: Each bucket builds once and subsequent cycles retain the same plan objects.
+        """
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources.spec = MegaMoeSpec(8192, 16, 8, 4, 2, None, 16384, 1, None, 0, 24,
+                                    max_local_num_tokens=8192)
+        resources._plans = OrderedDict()
+        with patch.object(mega_moe_module, "build_mega_moe_plan",
+                          side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
+            retained = {tokens: resources.plan_for_tokens(tokens, "cpu")
+                        for tokens in range(1024, 8193, 1024)}
+            for tokens in (8192, 1024, 5120, 2048, 7168, 3072, 6144, 4096) * 3:
+                self.assertIs(resources.plan_for_tokens(tokens, "cpu"), retained[tokens])
+            self.assertEqual(build.call_count, 8)
+            self.assertEqual(len(resources._plans), 8)
+            self.assertEqual(resources.spec, replace(retained[8192].spec, schedule_tokens=None))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

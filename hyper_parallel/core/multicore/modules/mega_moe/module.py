@@ -239,7 +239,7 @@ class _MegaMoeExecutionResources:
             self._plans[tokens] = build_mega_moe_plan(replace(self.spec, schedule_tokens=tokens), device)
         self._plans.move_to_end(tokens)
         plan = self._plans[tokens]
-        while len(self._plans) > 4:
+        while len(self._plans) > 16:
             # Autograd contexts keep in-flight plans alive independently of this cache.
             self._plans.popitem(last=False)
         return plan
