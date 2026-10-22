@@ -82,6 +82,46 @@ def _pending_growth(layer: MegaMoeExperts, weights: tuple, rank: int, world: int
     return result
 
 
+def _pending_bucket_growth(layer: MegaMoeExperts, weights: tuple, rank: int, world: int,
+                           device: torch.device) -> dict:
+    """Replace a partial bucket while backward still retains its previous plan."""
+    lengths = [257] * world
+    inputs = _inputs(lengths, layer.num_experts, layer.top_k)
+    pending = _forward(layer, inputs, rank, device)
+    resources = layer._resource_group.resources  # pylint: disable=protected-access
+    retained = resources._plans[512]  # pylint: disable=protected-access
+    coverage = retained.spec.plan_tokens
+    result = _verify(layer, [385] * world, weights, rank, device)
+    expanded = resources._plans[512]  # pylint: disable=protected-access
+    if expanded is retained or retained.spec.plan_tokens != coverage or expanded.spec.plan_tokens < 512:
+        raise AssertionError(f"partial bucket was not replaced immutably: old={coverage}, "
+                             f"new={expanded.spec.plan_tokens}")
+    layer.zero_grad(set_to_none=True)
+    _check_gradients(layer, pending, _rounded_oracle(weights, inputs), lengths, rank)
+    return result
+
+
+def _bucket_reuse(layer: MegaMoeExperts, weights: tuple, rank: int, world: int,
+                  device: torch.device) -> dict:
+    """Cycle through more than four buckets without rebuilding stable plans or storage."""
+    lengths = (0, 1, 129, 257, 513, 1025, 2049, 4097)
+    for tokens in lengths:
+        _verify(layer, [tokens] * world, weights, rank, device)
+    resources = layer._resource_group.resources  # pylint: disable=protected-access
+    plans = dict(resources._plans)  # pylint: disable=protected-access
+    epoch = _state(layer)["epoch"]
+    if len(plans) < 7:
+        raise AssertionError(f"wide token cycle did not retain seven buckets: cached={list(plans)}")
+    errors = []
+    for tokens in lengths:
+        errors.append(_verify(layer, [tokens] * world, weights, rank, device)["max_abs_error"])
+        if _state(layer)["epoch"] != epoch:
+            raise AssertionError(f"warm token cycle restarted the heap: expected_epoch={epoch}")
+        if any(resources._plans.get(bucket) is not plan for bucket, plan in plans.items()):  # pylint: disable=protected-access
+            raise AssertionError(f"warm token cycle replaced cached plans: buckets={list(plans)}")
+    return {"buckets": sorted(plans), "epoch": epoch, "max_abs_errors": errors}
+
+
 def _other_workspace_growth(layer: MegaMoeExperts, weights: tuple, rank: int, world: int,
                             device: torch.device) -> None:
     """Rebuild a root containing both transports without invalidating pending graphs."""
@@ -113,6 +153,7 @@ def test_auto_tokens() -> None:
     if _state(layer)["routed_rows"] != 128 * layer.top_k:
         raise AssertionError("empty first input reserved more than the bootstrap capacity")
     results.append(_pending_growth(layer, weights, rank, world, device))
+    results.append(_pending_bucket_growth(layer, weights, rank, world, device))
     _other_workspace_growth(layer, weights, rank, world, device)
     for lengths, hot in (([129 + index for index in range(world)], False),
                          ([769] + [0] * (world - 1), True),
@@ -137,11 +178,13 @@ def test_auto_tokens() -> None:
         layer.down_weight.copy_(weights[1][rank * 6:(rank + 1) * 6])
     peer.close()
     _deferred(layer, weights, rank, device)
+    bucket_reuse = _bucket_reuse(layer, weights, rank, world, device)
     final_state = _state(layer)
     layer.close()
     result = {"status": "passed", "dispatch_mode": mode, "results": results,
               "source_growth_pending_backward": "passed", "mixed_transport_restart": "passed",
-              "checkpoint_shared_stream_sgd": "passed", "deferred_plan_eviction": "passed",
+              "same_bucket_growth_pending_backward": "passed", "geometric_plan_reuse": bucket_reuse,
+              "checkpoint_shared_stream_sgd": "passed", "deferred_plan_reuse": "passed",
               "final_capacity": final_state, "torch": torch.__version__, "torch_npu": torch_npu.__version__}
     print(json.dumps({"rank": rank, **result}), flush=True)
     write_evidence(result)

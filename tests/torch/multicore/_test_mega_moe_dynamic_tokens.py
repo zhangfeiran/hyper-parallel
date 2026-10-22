@@ -15,6 +15,8 @@
 
 """Unequal and empty-token MegaMoe validation against an independent CPU FP32 oracle."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -157,7 +159,7 @@ def _cases(world: int) -> list[tuple[list[int], bool]]:
 
 
 def _deferred(mega: MegaMoeExperts, weights: tuple, rank: int, device: torch.device) -> None:
-    """Five pending forwards retain evicted plans through both backward orders."""
+    """Five pending forwards retain immutable plans through both backward orders."""
     world = dist.get_world_size()
     lengths = [[size + rank_index for rank_index in range(world)] for size in (1, 129, 257, 385, 513)]
     batches = [_inputs(item, mega.num_experts, mega.top_k) for item in lengths]
@@ -261,6 +263,27 @@ def _fixed_comparison(fixed: MegaMoeExperts, weights: tuple, inputs: tuple, actu
     return report
 
 
+def _check_lifecycle_result(
+    layers: list[MegaMoeExperts], outputs: list[tuple[torch.Tensor, torch.Tensor]],
+    leaves: list[torch.Tensor], references: list[torch.Tensor] | None,
+) -> list[torch.Tensor]:
+    """Compare checkpoint gradients and the SGD update against the first execution."""
+    tensors = [value for value, _ in outputs] + [leaf.grad for leaf in leaves]
+    parameters = [parameter for layer in layers for parameter in layer.parameters()]
+    tensors.extend(parameter.grad for parameter in parameters)
+    observed = [value.detach().cpu().clone() for value in tensors]
+    if references is None:
+        return observed
+    for index, (actual, expected) in enumerate(zip(observed, references)):
+        _assert_close(f"checkpoint tensor {index}", actual, expected)
+    expected_updates = [parameter.detach().cpu().add(gradient, alpha=-1e-3)
+                        for parameter, gradient in zip(parameters, references[-len(parameters):])]
+    torch.optim.SGD(parameters, lr=1e-3).step()
+    for actual, expected in zip(parameters, expected_updates):
+        _assert_close("SGD update", actual, expected)
+    return references
+
+
 def _lifecycle(layers: list[MegaMoeExperts], rank: int, device: torch.device) -> None:
     """Compare shared-layer checkpoint and cross-stream gradients and an SGD update."""
     world = dist.get_world_size()
@@ -292,20 +315,7 @@ def _lifecycle(layers: list[MegaMoeExperts], rank: int, device: torch.device) ->
         for value, dy in reversed(outputs):
             (value * dy).sum().backward()
         torch.npu.synchronize()
-        tensors = [value for value, _ in outputs] + [leaf.grad for leaf in leaves]
-        parameters = [parameter for layer in layers for parameter in layer.parameters()]
-        tensors.extend(parameter.grad for parameter in parameters)
-        observed = [value.detach().cpu().clone() for value in tensors]
-        if references is None:
-            references = observed
-        else:
-            for index, (actual, expected) in enumerate(zip(observed, references)):
-                _assert_close(f"checkpoint tensor {index}", actual, expected)
-            expected_updates = [parameter.detach().cpu().add(gradient, alpha=-1e-3)
-                                for parameter, gradient in zip(parameters, references[-len(parameters):])]
-            torch.optim.SGD(parameters, lr=1e-3).step()
-            for actual, expected in zip(parameters, expected_updates):
-                _assert_close("SGD update", actual, expected)
+        references = _check_lifecycle_result(layers, outputs, leaves, references)
 
 
 def _configuration_failures(world: int, rank: int, device: torch.device) -> None:

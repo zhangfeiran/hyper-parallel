@@ -20,7 +20,6 @@ __all__ = ["MegaMoeExperts"]
 
 import math
 import struct
-from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -141,7 +140,8 @@ class _MegaMoeExecutionResources:
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
-        self._plans = OrderedDict()
+        self._token_capacity = self.spec.local_num_tokens
+        self._plans = {}
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
         reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
@@ -202,6 +202,7 @@ class _MegaMoeExecutionResources:
         """
         physical_spec = self.heap_manager.ensure_token_capacity(self.workspace, tokens, received)
         self.workspace.ensure(physical_spec, tensor.dtype, tensor.device)
+        self._token_capacity = physical_spec.local_num_tokens
         if self.spec.dispatch_mode == "pull":
             self.workspace.claim()
 
@@ -226,19 +227,26 @@ class _MegaMoeExecutionResources:
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
 
     def plan_for_tokens(self, tokens: int, device: Any) -> Any:
-        """Cache bounded schedules without changing symmetric workspace capacity.
+        """Reuse one covering plan per geometric bucket within committed capacity.
 
         Args:
-            tokens: Current local source-token count.
+            tokens: EP group maximum input rows, already aligned to 128.
             device: Execution device used for the parameters and workspace.
+
+        Returns:
+            Immutable plan covering the requested rows without enlarging storage.
         """
-        if tokens not in self._plans:
-            self._plans[tokens] = build_mega_moe_plan(replace(self.spec, schedule_tokens=tokens), device)
-        self._plans.move_to_end(tokens)
-        plan = self._plans[tokens]
-        while len(self._plans) > 4:
-            # Autograd contexts keep in-flight plans alive independently of this cache.
-            self._plans.popitem(last=False)
+        if tokens > self._token_capacity:
+            raise RuntimeError(f"MegaMoe schedule exceeds committed token capacity: "
+                               f"requested={tokens}, capacity={self._token_capacity}")
+        bucket = 1 << (max(128, tokens) - 1).bit_length()
+        plan = self._plans.get(bucket)
+        if plan is None or plan.spec.plan_tokens < tokens:
+            schedule_tokens = min(bucket, self._token_capacity)
+            plan = build_mega_moe_plan(replace(self.spec, schedule_tokens=schedule_tokens), device)
+            # INT32 route bounds allow at most 25 buckets starting at 128 rows.
+            # A growing partial bucket replaces its plan; backward keeps the old object.
+            self._plans[bucket] = plan
         return plan
 
     def close(self) -> None:
