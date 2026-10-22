@@ -37,6 +37,32 @@ class _Group:
 class TestReplicaPool(unittest.TestCase):
     """Exercise the pool independently of accelerator and collective setup."""
 
+    def test_backward_clears_only_the_active_guest_prefix(self) -> None:
+        """Keep inactive storage untouched and clear newly activated slots on later leases."""
+        pool = ReplicaPool((torch.ones(6, 2, 3),), 6)
+        pool.gradients = (torch.full((6, 2, 3), 17.0),)
+        with pool.lease(backward=True, active_slots=2):
+            torch.testing.assert_close(pool.gradients[0][:2], torch.zeros(2, 2, 3))
+            torch.testing.assert_close(pool.gradients[0][2:], torch.full((4, 2, 3), 17.0))
+            pool.gradients[0][:2].fill_(9)
+        with pool.lease(backward=True, active_slots=0):
+            self.assertEqual(pool.gradients[0][0, 0, 0], 9)
+        with pool.lease(backward=True, active_slots=4):
+            torch.testing.assert_close(pool.gradients[0][:4], torch.zeros(4, 2, 3))
+            torch.testing.assert_close(pool.gradients[0][4:], torch.full((2, 2, 3), 17.0))
+        with pool.lease(backward=True):
+            torch.testing.assert_close(pool.gradients[0], torch.zeros(6, 2, 3))
+
+    def test_invalid_active_prefix_releases_the_lease(self) -> None:
+        """Reject malformed active widths without permanently taking the pool lock."""
+        pool = ReplicaPool((torch.ones(1, 2, 2),), 2)
+        for count in (-1, 3, True, 1.5):
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError, 'Active guest slots'):
+                with pool.lease(backward=True, active_slots=count):
+                    self.fail('Invalid active width was accepted')
+        with pool.lease():
+            self.assertIsNone(pool.gradients)
+
     def test_projection_prefetch_waits_once_per_matrix(self):
         """Join each projection once, including a final whole-slot wait."""
         pool = ReplicaPool((torch.ones(1, 2, 2), torch.ones(1, 2, 1)), 1)
