@@ -51,7 +51,9 @@ class ExpertExecutionPlan:
     def destination_counts(self) -> tuple[tuple[int, ...], ...]:
         """Return per-slot work for every destination without device readback."""
         width = self.config.slots_per_rank
-        totals = tuple(sum(row[slot] for row in self.dispatch_counts) for slot in range(self.config.physical_experts))
+        if any(len(row) != self.config.physical_experts for row in self.dispatch_counts):
+            raise ValueError("dispatch row does not match physical expert count")
+        totals = tuple(map(sum, zip(*self.dispatch_counts)))
         return tuple(totals[rank * width:(rank + 1) * width] for rank in range(self.config.ep_size))
 
     @cached_property
@@ -96,9 +98,10 @@ class ExpertExecutionPlan:
                 raise ValueError("dispatch row does not match physical expert count")
             reconstructed = [0] * config.num_experts
             for expert, count in zip(self.physical_to_logical, row):
-                if not isinstance(count, int) or isinstance(count, bool) or count < 0 or (expert == -1 and count):
+                if ((type(count) is not int and (not isinstance(count, int) or isinstance(count, bool)))
+                        or count < 0 or (expert == -1 and count)):
                     raise ValueError("invalid physical dispatch count")
-                if expert >= 0:
+                if count:
                     reconstructed[expert] += count
             if tuple(reconstructed) != self.logical_counts[source]:
                 raise ValueError("physical dispatch must conserve every source/logical-expert count")
