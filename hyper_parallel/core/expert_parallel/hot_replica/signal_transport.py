@@ -246,7 +246,11 @@ class SignalReplicaTransport:
             raise RuntimeError("Concurrent signal replica leases are unsupported")
         try:
             self._bind(weights)
-            with self.pool.lease(backward=backward):
+            # Transfers are immutable host metadata; inactive guests have no kernel readers or gradient return.
+            home = route.plan.config.home_experts
+            active_slots = max((item.target_slot - home + 1 for item in route.plan.transfers
+                                if item.target_rank == route.rank), default=0) if backward else None
+            with self.pool.lease(backward=backward, active_slots=active_slots):
                 if (backward and overlap and reuse_generation is not None
                         and reuse_generation is self._resident_generation and self._resident_ready is not None
                         and self.epoch < _MAX_EPOCH - 2):

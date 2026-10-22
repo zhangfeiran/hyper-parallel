@@ -24,6 +24,7 @@ from typing import Any
 import torch
 import torch_npu
 
+from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 from hyper_parallel.core.expert_parallel.hot_replica._metadata import (
     _async_device_bytes,
     _copy_device_bytes,
@@ -41,6 +42,51 @@ from .kernel_gradients import (
 from .plan import MegaMoePlan
 from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
+
+
+@dataclass
+class _ReplicaWeightGeneration:
+    """Share the latest weight generation with the original checkpoint context."""
+
+    value: object | None
+
+
+class _RecomputedReplicaWeights:
+    """Match weight generations in checkpoint invocation order without retaining tensors."""
+
+    def __init__(self) -> None:
+        """Initialize an ordered registry for one checkpoint invocation."""
+        self.entries: list[tuple[Any, _ReplicaWeightGeneration]] = []
+        self.cursor = 0
+
+    def clear(self) -> None:
+        """Release registry references while backward retains its generation holder."""
+        self.entries.clear()
+        self.cursor = 0
+
+    def remember(self, generation: object | None, route: Any, *, recomputing: bool) -> _ReplicaWeightGeneration:
+        """Refresh only the matching invocation and globally identical placement."""
+        placement = (route.plan.config, route.plan.transfers)
+        if not recomputing:
+            holder = _ReplicaWeightGeneration(generation)
+            self.entries.append((placement, holder))
+            return holder
+        if self.cursor >= len(self.entries):
+            # A later retained-graph replay has no original registry to refresh.
+            return _ReplicaWeightGeneration(generation)
+        expected, holder = self.entries[self.cursor]
+        self.cursor += 1
+        holder.value = generation if placement == expected else None
+        return holder
+
+
+def _remember_replica_generation(generation: object | None, route: Any, workspace: Any) -> object | None:
+    """Connect replayed weights to backward while preserving transport residency checks."""
+    state = get_recompute_state()
+    if state is None or route is None:
+        return generation
+    cache = state.get_resource((_RecomputedReplicaWeights, id(workspace)), _RecomputedReplicaWeights)
+    return cache.remember(generation, route, recomputing=state.is_recomputing)
 
 
 @dataclass(frozen=True)
@@ -552,7 +598,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             provider = workspace.replica_provider
             pool = None if not has_replica_transfers else leases.enter_context(
                 prefetch_weights(home_weights, ctx.replica_route, provider=provider, overlap=True))
-            ctx.replica_weight_generation = None if pool is None else getattr(pool, "weight_generation", None)
+            generation = None if pool is None else getattr(pool, "weight_generation", None)
+            ctx.replica_weight_generation = _remember_replica_generation(generation, ctx.replica_route, workspace)
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
             capacity = metadata.expert_capacity
             execution = _prepare_forward_execution(
@@ -621,6 +668,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         saved_tensors = ctx.saved_tensors
         ctx.maybe_clear_saved_tensors()
         saved = _saved_backward_state(saved_tensors)
+        generation = ctx.replica_weight_generation
+        if isinstance(generation, _ReplicaWeightGeneration):
+            generation = generation.value
         permutation_inputs = saved_tensors[12:]
         del saved_tensors
         workspace.claim()
@@ -632,7 +682,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             pool = None if not has_replica_transfers else leases.enter_context(
                 prefetch_weights((saved.weight1, saved.weight2), ctx.replica_route,
                                  backward=True, provider=provider, overlap=True,
-                                 reuse_generation=ctx.replica_weight_generation))
+                                 reuse_generation=generation))
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
             permutation_inputs = permutation_inputs[:1]
             kernel_return = has_replica_transfers and getattr(provider, "kernel_gradients", False)

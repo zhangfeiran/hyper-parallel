@@ -20,7 +20,9 @@ from unittest.mock import patch
 
 import torch
 
+from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts, get_recompute_state
 from hyper_parallel.core.expert_parallel.hot_replica import (
+    ExpertReplicaConfig,
     build_expert_replica_plan,
     routing,
 )
@@ -28,6 +30,70 @@ from hyper_parallel.core.expert_parallel.hot_replica import (
 
 class TestReplicaRouting(unittest.TestCase):
     """Compare both remap paths with explicit per-expert occurrence quotas."""
+
+    def test_checkpoint_reuses_only_matching_cpu_plans_and_clears_after_replay(self) -> None:
+        """A changed resident capacity cannot change the original invocation's replay placement."""
+        config, group = ExpertReplicaConfig(4, 2, 1), object()
+        counts = [[10, 4, 0, 0]] * 2
+        forward, replay = create_recompute_contexts()
+        with patch.object(routing, "build_expert_replica_plan", wraps=build_expert_replica_plan) as build:
+            with forward:
+                first, hit = routing._plan_replica_route(counts, config, group, 0,
+                                                        capacity_limit=28)
+                self.assertFalse(hit)
+                cache = get_recompute_state().get_resource(routing._RecomputedReplicaPlans, lambda: None)
+            with replay:
+                second, hit = routing._plan_replica_route(counts, config, group, 0,
+                                                         capacity_limit=28)
+                self.assertTrue(hit)
+                self.assertIs(first, second)
+            self.assertEqual(build.call_count, 1)
+            self.assertFalse(cache.entries)
+            third, hit = routing._plan_replica_route(counts, config, group, 0,
+                                                    capacity_limit=28)
+            self.assertFalse(hit)
+            self.assertIsNot(first, third)
+            self.assertEqual(build.call_count, 2)
+
+
+    def test_replay_rebuilds_changed_inputs_configuration_and_retained_graphs(self) -> None:
+        """Counts, invocation order and process-group identity guard every cache lookup."""
+        config, group = ExpertReplicaConfig(4, 2, 1), object()
+        counts = [[10, 4, 0, 0]] * 2
+        for change in ("counts", "group", "target"):
+            with self.subTest(change=change):
+                forward, replay = create_recompute_contexts()
+                with forward:
+                    first, _ = routing._plan_replica_route(counts, config, group, 0, target_load=14)
+                changed = [[9, 5, 0, 0]] * 2 if change == "counts" else counts
+                with replay:
+                    plan, hit = routing._plan_replica_route(changed, config, object() if change == "group" else group,
+                                                            0, target_load=15 if change == "target" else 14)
+                    self.assertFalse(hit)
+                    self.assertEqual(plan.logical_counts, tuple(map(tuple, changed)))
+                    self.assertIsNot(plan, first)
+                with replay:
+                    _, hit = routing._plan_replica_route(counts, config, group, 0, target_load=14)
+                    self.assertFalse(hit)
+
+
+    def test_replay_cache_is_ordered_and_released_on_exceptions(self) -> None:
+        """Multiple calls in a region replay in order and partial failures release all CPU plans."""
+        config, group = ExpertReplicaConfig(4, 2, 1), object()
+        forward, replay = create_recompute_contexts()
+        counts = ([[10, 4, 0, 0]] * 2, [[0, 0, 10, 4]] * 2)
+        with forward:
+            plans = [routing._plan_replica_route(value, config, group, 0)[0] for value in counts]
+            cache = get_recompute_state().get_resource(routing._RecomputedReplicaPlans, lambda: None)
+        with self.assertRaisesRegex(RuntimeError, "consumer failed"), replay:
+            for value, plan in zip(counts, plans):
+                actual, hit = routing._plan_replica_route(value, config, group, 0)
+                self.assertTrue(hit)
+                self.assertIs(actual, plan)
+            raise RuntimeError("consumer failed")
+        self.assertFalse(cache.entries)
+        self.assertIsNone(get_recompute_state())
+
 
     def test_count_payload_retains_global_validation_flags(self) -> None:
         """Build payloads for legal, duplicate, out-of-range and empty routes."""

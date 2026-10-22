@@ -43,8 +43,11 @@ class ReplicaPool:
             raise ValueError("Replica matrix index is out of range")
 
     @contextmanager
-    def lease(self, *, backward: bool = False) -> Iterator[ReplicaPool]:
-        """Order this stream after the previous consumer, rejecting host overlap."""
+    def lease(self, *, backward: bool = False, active_slots: int | None = None) -> Iterator[ReplicaPool]:
+        """Order consumers and clear the active guest prefix, or every slot when unspecified."""
+        if active_slots is not None and (type(active_slots) is not int
+                                         or not 0 <= active_slots <= self.weights[0].shape[0]):
+            raise ValueError("Active guest slots must be an integer within the allocated pool")
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Concurrent expert replica pool leases are unsupported")
         backend, stream = None, None
@@ -57,8 +60,10 @@ class ReplicaPool:
             if backward:
                 if self.gradients is None:
                     self.gradients = tuple(torch.empty_like(weight, dtype=torch.float32) for weight in self.weights)
-                for gradient in self.gradients:
-                    gradient.zero_()
+                if active_slots != 0:
+                    for gradient in self.gradients:
+                        target = gradient if active_slots is None else gradient[:active_slots]
+                        target.zero_()
             yield self
         finally:
             try:

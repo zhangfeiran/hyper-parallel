@@ -18,9 +18,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import struct
+from typing import Any
 
 import torch
 import torch.distributed as dist
+
+from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 
 from .capacity import ExpertReplicaConfig
 from .cost import ExpertReplicaCostModel
@@ -43,6 +46,51 @@ class ReplicaRoute:
     transport: object | None = None
     device_plan: DeviceExpertExecutionPlan | None = None
     home_only: bool = False
+    plan_reused: bool = False
+
+
+class _RecomputedReplicaPlans:
+    """Retain only immutable CPU plans for one checkpoint invocation."""
+
+    def __init__(self) -> None:
+        """Initialize ordered call records without retaining any device tensors."""
+        self.entries: list[tuple[Any, ExpertExecutionPlan]] = []
+        self.cursor = 0
+
+    def clear(self) -> None:
+        """Release all plans after complete or interrupted recomputation."""
+        self.entries.clear()
+        self.cursor = 0
+
+    def lookup(self, signature: Any, counts: tuple[tuple[int, ...], ...]) -> ExpertExecutionPlan | None:
+        """Advance in invocation order and reject changed counts or static policy."""
+        if self.cursor >= len(self.entries):
+            return None
+        expected, plan = self.entries[self.cursor]
+        self.cursor += 1
+        return plan if signature == expected and counts == plan.logical_counts else None
+
+
+def _plan_replica_route(counts: Any, config: ExpertReplicaConfig, group: object, rank: int,
+                        **options: Any) -> tuple[ExpertExecutionPlan, bool]:
+    """Replay the original decision after the usual count exchange validates current inputs."""
+    state = get_recompute_state()
+    if state is None:
+        return build_expert_replica_plan(counts, config.replica_slots_per_rank, **options), False
+    frozen = tuple(tuple(row) for row in counts)
+    # Heap migration may increase the reservation between phases. Replaying the
+    # original decision preserves checkpoint metadata while growth remains legal.
+    policy = tuple((key, type(value), value) for key, value in sorted(options.items()) if key != "receive_capacity")
+    signature = (config, id(group), rank, policy)
+    cache = state.get_resource(_RecomputedReplicaPlans, _RecomputedReplicaPlans)
+    if state.is_recomputing:
+        plan = cache.lookup(signature, frozen)
+        if plan is not None:
+            return plan, True
+    plan = build_expert_replica_plan(frozen, config.replica_slots_per_rank, **options)
+    if not state.is_recomputing:
+        cache.entries.append((signature, plan))
+    return plan, False
 
 
 def stable_expert_order(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -181,8 +229,8 @@ def prepare_replica_route(
     host = matrix.cpu().tolist()
     if any(row[-1] for row in host):
         raise ValueError("hot replication requires in-range, distinct expert IDs per token")
-    plan = build_expert_replica_plan(
-        [row[:-1] for row in host], config.replica_slots_per_rank,
+    plan, reused = _plan_replica_route(
+        [row[:-1] for row in host], config, group, rank,
         target_load=min(upper, target_load) if target_load is not None else None,
         minimum_replica_rows=minimum_replica_rows, capacity_limit=upper, cost_model=cost_model,
         minimum_load_reduction=minimum_load_reduction,
@@ -192,7 +240,7 @@ def prepare_replica_route(
         raise RuntimeError("replica planner exceeded the theoretical receive bound")
     if compact_home and not plan.transfers:
         return ReplicaRoute(plan, topk_ids, matrix[:, :-1].to(torch.int32).contiguous(),
-                            rank, group, home_only=True)
+                            rank, group, home_only=True, plan_reused=reused)
     slots, lengths, device_counts = _upload_route_metadata(plan, rank, ids.device)
     remapped = _remap_replica_ids(ids, plan, slots, lengths)
-    return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_counts, rank, group)
+    return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_counts, rank, group, plan_reused=reused)
