@@ -19,15 +19,23 @@ from typing import TYPE_CHECKING, Any
 from hyper_parallel.core.multicore import profiler
 
 if TYPE_CHECKING:
+    from hyper_parallel.core.multicore.modules.routed_ffn import routed_ffn
     from hyper_parallel.core.multicore.modules.mega_gate.module import MegaGate
     from hyper_parallel.core.multicore.modules.mega_mhc.module import HyperMegaMhc
     from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 
-__all__ = ["HyperMegaMhc", "MegaGate", "MegaMoeExperts", "profiler"]
+__all__ = ["HyperMegaMhc", "MegaGate", "MegaMoeExperts", "profiler", "routed_ffn"]
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     """Load optional multicore modules only when their public API is requested."""
+    if name == "routed_ffn":
+        from hyper_parallel.core.multicore.modules.routed_ffn import (  # pylint: disable=import-outside-toplevel
+            routed_ffn as local_ffn,
+        )
+
+        globals()[name] = local_ffn
+        return local_ffn
     if name == "HyperMegaMhc":
         from hyper_parallel.core.multicore.modules.mega_mhc.module import (  # pylint: disable=import-outside-toplevel
             HyperMegaMhc as hyper_mega_mhc,

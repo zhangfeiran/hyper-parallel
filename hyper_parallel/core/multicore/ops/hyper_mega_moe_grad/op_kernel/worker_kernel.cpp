@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -70,12 +70,49 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       case TaskType::TASK_SWI_GLU_GRAD:
         ExecuteSwiGluGrad(task_desc);
         break;
+      case TaskType::TASK_ZERO_EMPTY_EXPERTS:
+        ExecuteZeroEmptyExperts(task_desc);
+        break;
       default:
         break;
     }
   }
 
  private:
+  __aicore__ inline void ExecuteZeroEmptyExperts(const TaskDesc &task) {
+    constexpr uint32_t tile = 8192;
+    TPipe pipe;
+    TBuf<TPosition::VECCALC> buffer;
+    pipe.InitBuffer(buffer, tile * sizeof(DTYPE_DISPATCH_TARGET));
+    LocalTensor<DTYPE_DISPATCH_TARGET> zeros = buffer.Get<DTYPE_DISPATCH_TARGET>();
+    Duplicate(zeros, static_cast<DTYPE_DISPATCH_TARGET>(0), tile);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    GlobalTensor<int64_t> groups;
+    groups.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(input_list[19]));
+    for (uint32_t expert = 0; expert < task.inputs[0].dim[0]; ++expert) {
+      const int64_t end = groups.GetValue(expert);
+      if (end == 0) {
+        for (uint32_t output = 0; output < task.num_outputs; ++output) {
+          const TensorDesc &desc = task.outputs[output];
+          const uint64_t elements = static_cast<uint64_t>(desc.dim[1]) * desc.dim[2];
+          const uint64_t chunk = ((elements + task.task_split_num * 128 - 1) / (task.task_split_num * 128)) * 128;
+          const uint64_t start = task.task_index * chunk;
+          const uint64_t stop = start + chunk < elements ? start + chunk : elements;
+          GlobalTensor<DTYPE_DISPATCH_TARGET> target;
+          target.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_DISPATCH_TARGET *>(input_list[desc.input_position]) +
+                                 expert * elements);
+          for (uint64_t offset = start; offset < stop; offset += tile) {
+            const uint32_t count = stop - offset < tile ? stop - offset : tile;
+            DataCopy(target[offset], zeros, count);
+          }
+        }
+      }
+    }
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+  }
+
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
     union {
       uint32_t bits;
@@ -119,12 +156,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         int64_t expert_num_single_rank = expert_num / ep;
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
-        uint32_t grouped_list_shape = dynamic_data.dynamic_group_size;
+        uint32_t grouped_list_shape = task_desc.extra_value_1 == 0 ? dynamic_data.dynamic_group_size : 1;
         uint32_t per_task_num = task_desc.task_split_num / grouped_list_shape;
         uint32_t data_index = task_desc.task_index / per_task_num;
         uint32_t task_index = task_desc.task_index % per_task_num;
         int64_t start = 0;
-        int64_t end = grouped_list_tensor.GetValue(data_index);
+        int64_t end = task_desc.extra_value_1 != 0 ?
+            getExtraValueFromTiling(input_list[TILING_IDX], 4) : grouped_list_tensor.GetValue(data_index);
         if (data_index != 0) {
           start = grouped_list_tensor.GetValue(data_index - 1);
         }
@@ -176,6 +214,49 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     }
   }
 
+  __aicore__ inline void PrepareGroupedList(GM_ADDR grouped_list_real, uint32_t experts,
+                                           uint32_t expert, int64_t value, bool whole_group) {
+    GlobalTensor<int64_t> grouped_list_tensor_real;
+    grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), experts);
+    for (uint32_t i = 0; !whole_group && i < experts; i++) {
+      grouped_list_tensor_real.SetValue(i, i < expert ? 0 : value);
+    }
+    if (this->home_experts_ > 0) {
+      grouped_list_tensor_real.SetValue(0, value);
+    }
+    if (!whole_group) {
+      cacheWriteThrough(grouped_list_real, experts * sizeof(int64_t));
+    }
+  }
+
+  __aicore__ inline void UpdateGmmTile(const TaskDesc &task_desc, GM_ADDR tiling_data_addr, int64_t value) {
+    __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
+    if (task_desc.extra_value_0 != 0) {
+      tilingdata_data->gmmBaseParams.groupListType = 1;
+      cacheWriteThrough(tiling_data_addr, sizeof(tilingdata_data->gmmBaseParams));
+    }
+    if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+      tilingdata_data->mmTilingData.Ka = value;
+      tilingdata_data->mmTilingData.Kb = value;
+      tilingdata_data->mmTilingData.singleCoreK = value;
+      cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
+    } else {
+      tilingdata_data->gmmBaseParams.m = value;
+      tilingdata_data->mmTilingData.M = value;
+      tilingdata_data->mmTilingData.singleCoreM = value;
+      cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+      cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+    }
+    if (this->home_experts_ > 0) {
+      tilingdata_data->gmmBaseParams.groupNum = 1;
+      cacheWriteThrough(tiling_data_addr, sizeof(tilingdata_data->gmmBaseParams));
+    }
+  }
+
+  __aicore__ inline static int64_t TensorOffset(const TensorDesc &desc, int64_t start) {
+    return (desc.dynamic_shape == 1 ? start * desc.dim[1] : desc.base_ptr_offset) * desc.data_type;
+  }
+
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
       DynamicData dynamic_data;
@@ -189,13 +270,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         int64_t expert_num_single_rank = expert_num / ep;
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
-        GM_ADDR grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
-        GlobalTensor<int64_t> grouped_list_tensor_real;
-        grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
+        const bool whole_group = task_desc.extra_value_0 != 0;
+        GM_ADDR grouped_list_real = whole_group ? grouped_list :
+            this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
         uint32_t data_index = task_desc.task_index / this->core_num;
-        int64_t value = grouped_list_tensor.GetValue(data_index);
+        int64_t value = whole_group ? getExtraValueFromTiling(input_list[TILING_IDX], 4) :
+            grouped_list_tensor.GetValue(data_index);
         int64_t start = 0;
-        if (data_index != 0) {
+        if (data_index != 0 && !whole_group) {
           value = value - grouped_list_tensor.GetValue(data_index - 1);
           start = grouped_list_tensor.GetValue(data_index - 1);
         }
@@ -212,49 +294,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           }
           return;
         }
-        for (uint32_t i = 0; i < expert_num_single_rank; i++) {
-          if (i > data_index) {
-            grouped_list_tensor_real.SetValue(i, value);
-          } else if (i == data_index) {
-            grouped_list_tensor_real.SetValue(i, value);
-          } else {
-            grouped_list_tensor_real.SetValue(i, 0);
-          }
-        }
-        if (this->home_experts_ > 0) {
-          grouped_list_tensor_real.SetValue(0, value);
-        }
-        cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
+        PrepareGroupedList(grouped_list_real, expert_num_single_rank, data_index, value, whole_group);
 
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
-        __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
-        if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
-          tilingdata_data->mmTilingData.Ka = value;
-          tilingdata_data->mmTilingData.Kb = value;
-          tilingdata_data->mmTilingData.singleCoreK = value;
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
-        } else {
-          tilingdata_data->gmmBaseParams.m = value;
-          tilingdata_data->mmTilingData.M = value;
-          tilingdata_data->mmTilingData.singleCoreM = value;
-          cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
-        }
-        if (this->home_experts_ > 0) {
-          tilingdata_data->gmmBaseParams.groupNum = 1;
-          cacheWriteThrough(tiling_data_addr, sizeof(tilingdata_data->gmmBaseParams));
-        }
+        UpdateGmmTile(task_desc, tiling_data_addr, value);
         PipeBarrier<PIPE_ALL>();
 
-        int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
-                                   ? start * task_desc.inputs[0].dim[1] * task_desc.inputs[0].data_type
-                                   : task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type;
-        int64_t input_1_offset = task_desc.inputs[1].dynamic_shape == 1
-                                   ? start * task_desc.inputs[1].dim[1] * task_desc.inputs[1].data_type
-                                   : task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type;
-        int64_t output_0_offset = task_desc.outputs[0].dynamic_shape == 1
-                                    ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
-                                    : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
+        int64_t input_0_offset = TensorOffset(task_desc.inputs[0], start);
+        int64_t input_1_offset = TensorOffset(task_desc.inputs[1], start);
+        int64_t output_0_offset = TensorOffset(task_desc.outputs[0], start);
 
         GM_ADDR weight_base = input_list[task_desc.inputs[1].input_position];
         GM_ADDR output_base = input_list[task_desc.outputs[0].input_position];

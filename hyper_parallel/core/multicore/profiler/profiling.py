@@ -91,6 +91,7 @@ TASK_TYPE_NAMES = {
     118: "MhcPostGrad",
     119: "MhcGradPrevAAndMapping",
     141: "ShmemGetMem",
+    142: "ZeroEmptyExperts",
 }
 CORE_TYPE_NAMES = {
     1: "AIC",
