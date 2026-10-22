@@ -51,6 +51,8 @@ class MegaMoeSpec:
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
     swiglu_limit: float | None = None
+    max_local_num_tokens: int | None = None
+    schedule_tokens: int | None = None
     replica_slots_per_rank: int = 0
     logical_num_experts: int = 0
     replica_transport: str = "p2p"
@@ -63,6 +65,11 @@ class MegaMoeSpec:
     def dynamic_tokens(self) -> bool:
         """Report variable-length execution with automatic or bounded storage."""
         return self.auto_tokens or self.max_local_num_tokens is not None
+
+    @property
+    def plan_tokens(self) -> int:
+        """Return schedule coverage independently of reserved source storage."""
+        return self.local_num_tokens if self.schedule_tokens is None else self.schedule_tokens
 
     @property
     def plan_tokens(self) -> int:

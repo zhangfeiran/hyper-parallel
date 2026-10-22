@@ -35,9 +35,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.transport import (
 )
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
-from .kernel_gradients import (
-    prepare_kernel_gradient_return,
-)
+from .kernel_gradients import prepare_kernel_gradient_return
 from .plan import MegaMoePlan, record_plan_stream
 from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
@@ -594,6 +592,18 @@ def _launch_backward_kernel(
             spec.hidden_size,
             getattr(spec, "plan_tokens", spec.local_num_tokens),
         )
+
+
+def _native_source(tensor: torch.Tensor) -> torch.Tensor:
+    """Keep a non-null ABI pointer and preserve empty symmetric source storage."""
+    if tensor.shape[0] == 0:
+        row_elements = tensor.shape[1]
+        required_bytes = (tensor.storage_offset() + row_elements) * tensor.element_size()
+        if tensor.untyped_storage().nbytes() >= required_bytes:
+            # Pull derives remote addresses from this local symmetric base even on empty ranks.
+            return tensor.as_strided((1, row_elements), (row_elements, 1))
+        return tensor.new_empty((1, tensor.shape[1]))
+    return tensor.contiguous()
 
 
 def _native_source(tensor: torch.Tensor) -> torch.Tensor:

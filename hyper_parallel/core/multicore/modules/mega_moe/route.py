@@ -373,7 +373,8 @@ def prepare_topk_route(
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
-                                      workspace, autograd_mask, prepare_workspace)
+                                      workspace, autograd_mask, replica_route=replica_route,
+                                      prepare_workspace=prepare_workspace)
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
     permutation_output = None
     if workspace is not None:
@@ -523,6 +524,7 @@ def _start_dynamic_gather(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[tor
 def _prepare_dynamic_route(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
+    replica_route: ReplicaRoute | None = None,
     prepare_workspace: Callable[[int, int], None] | None = None,
 ) -> PreparedTopKRoute:
     """Exchange variable-length metadata without adding a token-count collective."""
@@ -530,7 +532,9 @@ def _prepare_dynamic_route(
     counts, payload, invalid = _dynamic_route_payload(hidden_states, flat_ids, spec, supplied_counts, autograd_mask)
     if workspace is not None and spec.dispatch_mode != "pull":
         workspace.wait_for_reuse()
-    gathered, work = _start_dynamic_gather(payload, spec)
+    source_summary = None if replica_route is None else replica_route.dynamic_summary
+    gathered, work = (_start_dynamic_gather(payload, spec) if source_summary is None
+                      else (replica_route.counts_by_source, None))
     # Push permutation owns ordinary storage and can overlap count agreement and heap growth.
     permuted = (_permute_topk_input(hidden_states, topk_ids)
                 if spec.auto_tokens and spec.dispatch_mode == "push" and not invalid else None)
@@ -539,7 +543,10 @@ def _prepare_dynamic_route(
         if work is not None:
             work.wait()
             work = None
-        summary, host_rows = _read_dynamic_route(gathered, spec)
+        if source_summary is None:
+            summary, host_rows = _read_dynamic_route(gathered, spec)
+        else:
+            summary = _summarize_dynamic_rows(source_summary, spec)
         if prepare_workspace is None:
             raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
         prepare_workspace(summary[1], summary[2])
@@ -552,10 +559,13 @@ def _prepare_dynamic_route(
     if work is not None:
         work.wait()
     if summary is None:
-        summary, host_rows = _read_dynamic_route(gathered, spec)
+        if source_summary is None:
+            summary, host_rows = _read_dynamic_route(gathered, spec)
+        else:
+            summary = _summarize_dynamic_rows(source_summary, spec)
     capacity, plan_tokens, maximum = summary
     if host_rows is None:
-        counts_by_source = gathered[:, 3:].contiguous()
+        counts_by_source = gathered[:, 3:].contiguous() if source_summary is None else gathered
         start = spec.rank_id * spec.local_experts
         received_counts = counts_by_source[:, start:start + spec.local_experts].contiguous()
         metadata = _compute_route_metadata(counts, counts_by_source, received_counts, spec, capacity)
@@ -566,7 +576,7 @@ def _prepare_dynamic_route(
         routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum,
-        metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens),
+        metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens, replica_route=replica_route),
     )
 
 

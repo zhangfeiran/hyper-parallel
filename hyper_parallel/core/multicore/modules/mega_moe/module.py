@@ -170,12 +170,15 @@ class _MegaMoeExecutionResources:
                 """Build and bind local resources before converging construction results."""
                 self.plan = (build_mega_moe_plan(self.spec, tensor.device)
                              if not self.spec.dynamic_tokens else None)
+                self.home_spec = None
                 self.home_plan = None
-                if self.spec.replica_slots_per_rank and not self.spec.dynamic_tokens:
+                if self.spec.replica_slots_per_rank:
                     home_spec = replace(self.spec, num_experts=self.spec.logical_num_experts, replica_slots_per_rank=0)
                     if (mega_moe_event_capacity(home_spec.num_experts, home_spec.ep_size)
                             == mega_moe_event_capacity(self.spec.num_experts, self.spec.ep_size)):
-                        self.home_plan = build_mega_moe_plan(home_spec, tensor.device)
+                        self.home_spec = home_spec
+                        if self.plan is not None:
+                            self.home_plan = build_mega_moe_plan(home_spec, tensor.device)
                 self.last_execution_plan = self.plan
                 self.workspace = MegaMoeWorkspace(shared=shared)
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
@@ -245,7 +248,7 @@ class _MegaMoeExecutionResources:
         if any(value != manifests[0] for value in manifests):
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
 
-    def plan_for_tokens(self, tokens: int, device: Any) -> Any:
+    def plan_for_tokens(self, tokens: int, device: Any, *, home_only: bool = False) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
 
         Args:
@@ -255,17 +258,21 @@ class _MegaMoeExecutionResources:
         Returns:
             Immutable plan covering the requested rows without enlarging storage.
         """
+        spec = self.home_spec if home_only else self.spec
+        if spec is None:
+            raise ValueError("MegaMoe home-only execution requires compatible persistent event offsets")
         if tokens > self._token_capacity:
             raise RuntimeError(f"MegaMoe schedule exceeds committed token capacity: "
                                f"requested={tokens}, capacity={self._token_capacity}")
         bucket = 1 << (max(128, tokens) - 1).bit_length()
-        plan = self._plans.get(bucket)
+        key = (bucket, True) if home_only else bucket
+        plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
             schedule_tokens = min(bucket, self._token_capacity)
-            plan = build_mega_moe_plan(replace(self.spec, schedule_tokens=schedule_tokens), device)
+            plan = build_mega_moe_plan(replace(spec, schedule_tokens=schedule_tokens), device)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.
-            self._plans[bucket] = plan
+            self._plans[key] = plan
         return plan
 
     def close(self) -> None:
@@ -422,6 +429,7 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
+        reserved_tokens = _resolve_token_capacity(local_num_tokens, max_local_num_tokens, hidden_size, top_k)
         if replica_transport not in ("p2p", *KERNEL_GRADIENT_TRANSPORT_MODES):
             raise ValueError("Unsupported replica_transport; expected p2p or a kernel-gradient transport")
         ep_size = _resolve_ep_size(ep_size, ep_group)
@@ -730,7 +738,7 @@ class MegaMoeExperts(MulticoreModule):
                 if self.replica_slots_per_rank:
                     target_load = self.replica_target_load
                     if target_load is None and not pull:
-                        target_load = resources.workspace.capacity_floor
+                        target_load = initial_receive_capacity(self._resource_group.specification)
                     admission, saved_rows = resolve_replica_admission(self.replica_minimum_load_reduction)
                     replica_route = prepare_replica_route(
                         topk_ids, self.replica_config, self._ep_group,
@@ -738,11 +746,17 @@ class MegaMoeExperts(MulticoreModule):
                         minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
                         planner_backend=self.replica_planner,
                         minimum_load_reduction=admission, minimum_saved_rows=saved_rows,
-                        compact_home=resources.home_plan is not None,
+                        compact_home=resources.home_spec is not None,
+                        max_local_num_tokens=self.max_local_num_tokens,
+                        dynamic_header=((int(hidden_flat.shape[0] > self.max_local_num_tokens), hidden_flat.shape[0],
+                                         route_options["autograd_mask"])
+                                        if self.max_local_num_tokens is not None else None),
+                        receive_capacity=(initial_receive_capacity(self._resource_group.specification)
+                                          if not pull else None),
                     )
                     if replica_route.home_only:
                         execution_plan = resources.home_plan
-                        execution_spec = execution_plan.spec
+                        execution_spec = resources.home_spec
                         # Allocate using the reserved physical topology, even
                         # when the first invocation executes only home experts.
                         resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
@@ -760,7 +774,9 @@ class MegaMoeExperts(MulticoreModule):
                 )
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
-            execution_plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            execution_plan = resources.plan_for_tokens(
+                route.metadata.plan_tokens, hidden_flat.device,
+                home_only=replica_route is not None and replica_route.home_only)
             resources.last_execution_plan = execution_plan
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
