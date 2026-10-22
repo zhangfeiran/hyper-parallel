@@ -14,6 +14,7 @@
 # ============================================================================
 """Bounded planner conservation and logical-route contract tests."""
 
+from dataclasses import replace
 import random
 import unittest
 from types import SimpleNamespace
@@ -35,6 +36,32 @@ from tests.common.mark_utils import arg_mark
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestHotReplica(unittest.TestCase):
     """Check capacity against independent distinct-TopK route generation."""
+
+    def test_fast_integer_validation_keeps_rejecting_zero_booleans(self) -> None:
+        """Zero-valued malformed counts must not bypass validation or conservation checks."""
+        plan = build_expert_replica_plan([[8, 0], [0, 0]], 1)
+        for value in (False, True, 0.0, -1, '0', None):
+            with self.subTest(value=value):
+                counts = [[8, value], [0, 0]]
+                with self.assertRaises(ValueError):
+                    build_expert_replica_plan(counts, 1)
+                dispatch = [list(row) for row in plan.dispatch_counts]
+                dispatch[0][-1] = value
+                with self.assertRaises(ValueError):
+                    replace(plan, dispatch_counts=dispatch).validate()
+
+    def test_transposed_totals_preserve_integer_subclasses_and_dimensions(self) -> None:
+        """Keep accepted integer counts and reject rectangular truncation explicitly."""
+        class Count(int):
+            """Exercise the existing integer subclass contract."""
+
+        plan = build_expert_replica_plan([[Count(8), Count(0)], [Count(0), Count(0)]], 1)
+        plan.validate()
+        expected = tuple(tuple(sum(row[rank * 2 + slot] for row in plan.dispatch_counts)
+                               for slot in range(2)) for rank in range(2))
+        self.assertEqual(plan.destination_counts, expected)
+        with self.assertRaisesRegex(ValueError, 'dispatch row'):
+            replace(plan, dispatch_counts=[row[:-1] for row in plan.dispatch_counts]).destination_counts
 
     def test_owned_p2p_return_preserves_guest_storage_and_fp32_order(self):
         """Consume only home rows while preserving guest slices and cancellation order."""

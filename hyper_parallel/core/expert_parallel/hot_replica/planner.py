@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from itertools import chain
 
 from .admission import reduction_basis_points
 from .capacity import ExpertReplicaConfig, _integer
@@ -33,7 +34,8 @@ def _counts_matrix(counts: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ..
         if len(row) != len(rows[0]):
             raise ValueError("counts_by_source must be rectangular")
         for count in row:
-            _integer(count, "expert count", 0)
+            if type(count) is not int or count < 0:
+                _integer(count, "expert count", 0)
     return rows
 
 
@@ -238,9 +240,10 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
         # provide exact quotas; expanding and redistributing them is redundant.
         slots = tuple(tuple(range(rank * home, (rank + 1) * home)) + (-1,) * config.replica_slots_per_rank
                       for rank in range(config.ep_size))
-        dispatch = tuple(tuple(value for rank in range(config.ep_size)
-                               for value in (*row[rank * home:(rank + 1) * home],
-                                             *((0,) * config.replica_slots_per_rank))) for row in counts)
+        padding = (0,) * config.replica_slots_per_rank
+        starts = range(0, config.num_experts, home)
+        dispatch = tuple(tuple(chain.from_iterable(row[start:start + home] + padding for start in starts))
+                         for row in counts)
         plan = ExpertExecutionPlan(config, counts, slots, dispatch)
         if capacity_limit is not None and max(plan.destination_loads) > capacity_limit:
             raise ValueError("replica plan exceeds capacity_limit; use a feasible receive bound")
@@ -257,6 +260,13 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
                 by_expert[expert].append([rank * width + slot, row[expert]])
     dispatch = [[0] * config.physical_experts for _ in counts]
     for expert, quotas in enumerate(by_expert):
+        if len(quotas) == 1:
+            physical = quotas[0][0]
+            for output_row, input_row in zip(dispatch, counts):
+                output_row[physical] = input_row[expert]
+            continue
+        if not quotas:
+            continue
         pending_by_source = [row[expert] for row in counts]
         # Local source rows and destination quotas are independent per rank;
         # saturating their intersections minimizes remote rows for this placement.
@@ -286,7 +296,7 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
 
 def _home_layout(counts, config):
     """Create original owner quotas and rank loads from exact integer counts."""
-    totals = [sum(row[expert] for row in counts) for expert in range(config.num_experts)]
+    totals = list(map(sum, zip(*counts)))
     home = config.home_experts
     copies = [{expert: totals[expert] for expert in range(rank * home, (rank + 1) * home)}
               for rank in range(config.ep_size)]
@@ -317,7 +327,8 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
             It is a target, not a drop threshold: residual load remains lossless.
         minimum_replica_rows: Prefer removing copies below this threshold. Zero retains
             token-balancing placement. Mandatory copies remain when capacity requires them;
-            retained copies may take additional home rows without raising the receive peak.
+            without a cost model retained copies may take additional home rows. A cost
+            model accepts deletions only without worsening its score or the receive peak.
         capacity_limit: Optional receive bound already derived from the invocation shape.
             Without shape metadata, use a bound safe for every compatible distinct-TopK
             shape, falling back to observed home loads for unequal source sizes.
@@ -328,8 +339,9 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
             copies. Capacity-required copies are retained; zero preserves the original policy.
         minimum_saved_rows: Required absolute receive-peak reduction for optional copies.
             It covers fixed communication overhead independently of the fractional threshold.
-        receive_capacity: Globally agreed receive reservation. Optional refinement cannot
-            exceed this reservation or the original placement peak.
+        receive_capacity: Current globally agreed receive reservation, when known.
+            Cost refinement cannot grow beyond it or the uncalibrated plan's peak.
+            Necessary growth and the independent lossless capacity bound remain enabled.
 
     Returns:
         Immutable physical placement and exact per-source dispatch quotas.
@@ -360,14 +372,16 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
     if max(sum(row.values()) for row in copies) > max(loads):
         copies = [dict(row) for row in baseline]
     _improve_copies(copies, config, target)
-    _prune_small_copies(copies, counts, loads, config, minimum_replica_rows, capacity_limit)
-    if minimum_replica_rows:
-        _rebalance_existing_copies(copies, config)
+    if cost_model is None:
+        _prune_small_copies(copies, counts, loads, config, minimum_replica_rows, capacity_limit)
+        if minimum_replica_rows:
+            _rebalance_existing_copies(copies, config)
     if cost_model is not None:
         if receive_capacity is not None:
             peak = max(sum(row.values()) for row in copies)
             limit = min(limit, max(receive_capacity, peak))
-        refine_replica_quotas(copies, counts, config, limit, cost_model)
+        refine_replica_quotas(copies, counts, config, limit, cost_model,
+                              minimum_replica_rows=minimum_replica_rows)
     candidate_peak = max(sum(row.values()) for row in copies)
     if not _optional_peak_is_useful(candidate_peak, loads, limit, admission, minimum_saved_rows):
         copies = baseline
