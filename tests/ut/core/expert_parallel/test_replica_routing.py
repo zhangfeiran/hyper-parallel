@@ -21,6 +21,7 @@ from unittest.mock import patch
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import (
+    ExpertReplicaConfig,
     build_expert_replica_plan,
     routing,
 )
@@ -28,6 +29,26 @@ from hyper_parallel.core.expert_parallel.hot_replica import (
 
 class TestReplicaRouting(unittest.TestCase):
     """Compare both remap paths with explicit per-expert occurrence quotas."""
+
+    def test_ragged_and_empty_sources_use_one_shared_receive_bound(self) -> None:
+        """An empty source must not derive a zero receive bound for its nonempty peers."""
+        config = ExpertReplicaConfig(4, 2, 1)
+        matrix = torch.tensor([[0, 0, 0, 0, 0], [3, 3, 0, 0, 0]], dtype=torch.int64)
+        limits = []
+        for rank, tokens in enumerate((0, 3)):
+            ids = torch.tensor([[0, 1]] * tokens, dtype=torch.int64).reshape(tokens, 2)
+            with (
+                patch.object(routing.dist, "is_initialized", return_value=True),
+                patch.object(routing.dist, "get_rank", return_value=rank),
+                patch.object(routing.dist, "get_world_size", return_value=2),
+                patch.object(routing, "_gather_replica_counts", return_value=matrix),
+                patch.object(routing, "build_expert_replica_plan", wraps=build_expert_replica_plan) as build,
+            ):
+                route = routing.prepare_replica_route(ids, config, max_local_num_tokens=128)
+            route.plan.validate()
+            self.assertEqual(tuple(route.physical_ids.shape), (tokens, 2))
+            limits.append(build.call_args.kwargs["capacity_limit"])
+        self.assertEqual(limits, [config.maximum_receive_rows(128, 2, alignment=1)] * 2)
 
     def test_count_payload_retains_global_validation_flags(self) -> None:
         """Build payloads for legal, duplicate, out-of-range and empty routes."""
