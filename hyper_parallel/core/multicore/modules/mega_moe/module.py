@@ -225,7 +225,16 @@ class _MegaMoeExecutionResources:
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
 
     def plan_for_tokens(self, tokens: int, device: Any) -> Any:
-        """Cache bounded schedules without changing symmetric workspace capacity."""
+        """Cache covering schedules without changing symmetric workspace capacity.
+
+        Args:
+            tokens: Global maximum input rows, already aligned to 128.
+            device: Device on which to materialize the plan.
+
+        Returns:
+            A cached plan covering the requested rows within the reserved capacity.
+        """
+        tokens = min(self.spec.local_num_tokens, (tokens + 1023) // 1024 * 1024)
         if tokens not in self._plans:
             self._plans[tokens] = build_mega_moe_plan(replace(self.spec, schedule_tokens=tokens), device)
         self._plans.move_to_end(tokens)
