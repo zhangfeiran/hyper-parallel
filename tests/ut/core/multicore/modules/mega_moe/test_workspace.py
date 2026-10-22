@@ -38,6 +38,14 @@ from tests.common.mark_utils import arg_mark
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
 
+    def test_pending_backward_prevents_close_without_changing_buffers(self) -> None:
+        """An outstanding graph must release its claim before symmetric memory teardown."""
+        workspace = workspace_module.MegaMoeWorkspace(shared=False)
+        context = Mock()
+        workspace.track_graph(context)
+        self.assertFalse(workspace.can_close())
+        workspace.release_graph(context)
+        self.assertTrue(workspace.can_close())
     def test_partial_replica_teardown_rejects_mismatched_ranks_before_free(self) -> None:
         """An inbox surviving only on one rank cannot enter a collective free."""
         workspace = MegaMoeWorkspace(shared=True)

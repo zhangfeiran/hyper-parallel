@@ -19,13 +19,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from torch.utils.checkpoint import DefaultDeviceType
 
-from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts, get_recompute_state
+from hyper_parallel.core.activation_memory import checkpoint
 from hyper_parallel.core.expert_parallel.hot_replica import (
     ExpertReplicaConfig,
     build_expert_replica_plan,
     routing,
 )
+from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts, get_recompute_state
 
 
 class TestReplicaRouting(unittest.TestCase):
@@ -39,22 +41,21 @@ class TestReplicaRouting(unittest.TestCase):
         with patch.object(routing, "build_expert_replica_plan", wraps=build_expert_replica_plan) as build:
             with forward:
                 first, hit = routing._plan_replica_route(counts, config, group, 0,
-                                                        capacity_limit=28)
+                                                        capacity_limit=28, receive_capacity=14)
                 self.assertFalse(hit)
                 cache = get_recompute_state().get_resource(routing._RecomputedReplicaPlans, lambda: None)
             with replay:
                 second, hit = routing._plan_replica_route(counts, config, group, 0,
-                                                         capacity_limit=28)
+                                                         capacity_limit=28, receive_capacity=28)
                 self.assertTrue(hit)
                 self.assertIs(first, second)
             self.assertEqual(build.call_count, 1)
             self.assertFalse(cache.entries)
             third, hit = routing._plan_replica_route(counts, config, group, 0,
-                                                    capacity_limit=28)
+                                                    capacity_limit=28, receive_capacity=28)
             self.assertFalse(hit)
             self.assertIsNot(first, third)
             self.assertEqual(build.call_count, 2)
-
 
     def test_replay_rebuilds_changed_inputs_configuration_and_retained_graphs(self) -> None:
         """Counts, invocation order and process-group identity guard every cache lookup."""
@@ -76,7 +77,6 @@ class TestReplicaRouting(unittest.TestCase):
                     _, hit = routing._plan_replica_route(counts, config, group, 0, target_load=14)
                     self.assertFalse(hit)
 
-
     def test_replay_cache_is_ordered_and_released_on_exceptions(self) -> None:
         """Multiple calls in a region replay in order and partial failures release all CPU plans."""
         config, group = ExpertReplicaConfig(4, 2, 1), object()
@@ -94,6 +94,44 @@ class TestReplicaRouting(unittest.TestCase):
         self.assertFalse(cache.entries)
         self.assertIsNone(get_recompute_state())
 
+    def test_multistep_checkpoint_preserves_collectives_remapping_and_gradients(self) -> None:
+        """Replay dynamic and empty routes while rebuilding only CPU plans once per invocation."""
+        previous = DefaultDeviceType.get_device_type()
+        DefaultDeviceType.set_device_type("cpu")
+        self.addCleanup(DefaultDeviceType.set_device_type, previous)
+        config = ExpertReplicaConfig(4, 2, 1)
+        group, observations = object(), []
+        for tokens, peer_tokens in ((4, 4), (0, 4), (3, 0), (0, 0), (7, 2), (2, 7)):
+            with self.subTest(tokens=tokens, peer_tokens=peer_tokens):
+                ids = torch.zeros((tokens, 1), dtype=torch.int64)
+                matrix = torch.tensor([[tokens, 0, 0, 0, 0], [peer_tokens, 0, 0, 0, 0]])
+                capacity = [1]
+                value = torch.arange(tokens, dtype=torch.float32).requires_grad_()
+
+                def operation(source: torch.Tensor) -> torch.Tensor:
+                    """Exercise full route construction followed by saved-tensor recomputation."""
+                    with torch.no_grad():
+                        route = routing.prepare_replica_route(ids, config, group, receive_capacity=capacity[0])
+                        observations.append((route.plan_reused, route.plan, route.counts_by_source))
+                    return source.sin().square()
+
+                with (patch.object(routing, "dist") as distributed,
+                      patch.object(routing, "_gather_replica_counts", side_effect=lambda *_: matrix.clone()) as gather,
+                      patch.object(routing, "build_expert_replica_plan", wraps=build_expert_replica_plan) as build):
+                    distributed.is_initialized.return_value = True
+                    distributed.get_rank.return_value = 0
+                    distributed.get_world_size.return_value = 2
+                    result = checkpoint(operation, value, use_reentrant=False)
+                    capacity[0] = 100
+                    result.sum().backward()
+                self.assertEqual(gather.call_count, 2)
+                self.assertEqual(build.call_count, 1)
+                before, after = observations[-2], observations[-1]
+                self.assertFalse(before[0])
+                self.assertTrue(after[0])
+                self.assertIs(before[1], after[1])
+                self.assertNotEqual(before[2].data_ptr(), after[2].data_ptr())
+                torch.testing.assert_close(value.grad, 2*value.detach().sin()*value.detach().cos())
 
     def test_count_payload_retains_global_validation_flags(self) -> None:
         """Build payloads for legal, duplicate, out-of-range and empty routes."""

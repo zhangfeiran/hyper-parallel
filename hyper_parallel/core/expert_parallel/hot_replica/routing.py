@@ -25,7 +25,7 @@ import torch.distributed as dist
 
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 
-from .capacity import ExpertReplicaConfig
+from .capacity import ExpertReplicaConfig, _integer
 from .cost import ExpertReplicaCostModel
 from .count_kernel import try_count_payload
 from .device import DeviceExpertExecutionPlan, ReplicaPlanSummary, build_device_expert_replica_plan
@@ -36,7 +36,11 @@ from .planner import build_expert_replica_plan
 
 @dataclass(frozen=True)
 class ReplicaRoute:
-    """Invocation-owned logical plan and device execution metadata."""
+    """Invocation-owned logical plan and device execution metadata.
+
+    The optional dynamic summary stores invalid/token/autograd headers, logical
+    count sum/min/max, and destination load for every EP rank on the host.
+    """
 
     plan: ExpertExecutionPlan | ReplicaPlanSummary
     physical_ids: torch.Tensor
@@ -46,6 +50,7 @@ class ReplicaRoute:
     transport: object | None = None
     device_plan: DeviceExpertExecutionPlan | None = None
     home_only: bool = False
+    dynamic_summary: tuple[tuple[int, ...], ...] | None = None
     plan_reused: bool = False
 
 
@@ -156,6 +161,11 @@ def _replica_count_payload(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
     fused = try_count_payload(ids, num_experts)
     if fused is not None:
         return fused
+    return _torch_replica_count_payload(ids, num_experts)
+
+
+def _torch_replica_count_payload(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Validate and count exactly when the optional native counter is unavailable."""
     ordered = (ids.float() if num_experts <= 2**24 else ids).sort(dim=1).values
     invalid = ((ids < 0) | (ids >= num_experts)).any()
     invalid = invalid | (ordered[:, 1:] == ordered[:, :-1]).any()
@@ -174,12 +184,15 @@ def prepare_replica_route(
     compact_home: bool = False,
     minimum_load_reduction: float = 0.0,
     minimum_saved_rows: int = 0,
+    dynamic_header: tuple[int, int, int] | None = None,
+    max_local_num_tokens: int | None = None,
+    receive_capacity: int | None = None,
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
     Route validation is collective: invalid IDs and repeated experts are reported
     by all ranks before any sparse weight transfers. All ranks must supply the
-    same shape and configuration, as required by the EP module contract.
+    same Top-K width and configuration; source token counts may differ.
 
     Args:
         topk_ids: Integer expert IDs, with distinct experts in each token's row.
@@ -193,11 +206,18 @@ def prepare_replica_route(
             The caller must execute that invocation with a home-only kernel topology.
         minimum_load_reduction: Required receive-peak reduction for optional copies.
         minimum_saved_rows: Required absolute receive-peak reduction for optional copies.
+        dynamic_header: Optional invalid/token-count/autograd header fused into the count gather.
+        max_local_num_tokens: Optional source-row reservation, validated again by the dynamic route summary.
+        receive_capacity: Globally agreed resident receive rows for capacity-aware CPU cost refinement.
 
     Returns:
         Invocation-owned placement, physical IDs and dispatch counts.
     """
     validate_planner_backend(planner_backend, minimum_replica_rows, cost_model)
+    if receive_capacity is not None:
+        _integer(receive_capacity, "receive_capacity", 0)
+    if max_local_num_tokens is not None:
+        _integer(max_local_num_tokens, "max_local_num_tokens", 1)
     if topk_ids.ndim != 2 or topk_ids.dtype not in (torch.int32, torch.int64):
         raise ValueError("topk_ids must be a two-dimensional integer tensor")
     rank = dist.get_rank(group) if dist.is_initialized() else 0
@@ -205,42 +225,65 @@ def prepare_replica_route(
     if size != config.ep_size:
         raise ValueError("replica configuration must match the EP group size")
     tokens, top_k = topk_ids.shape
-    upper = config.maximum_receive_rows(tokens, top_k, alignment=1)
+    config.maximum_receive_rows(max(1, tokens), top_k, alignment=1)
     ids = topk_ids.to(torch.int64)
     payload = _replica_count_payload(ids, config.num_experts)
+    if dynamic_header is not None:
+        payload = torch.cat((payload, payload.new_tensor(dynamic_header)))
     matrix = _gather_replica_counts(payload, size, group)
+    logical_counts = matrix[:, :config.num_experts]
     if planner_backend == "device":
+        source_summary = None
+        if dynamic_header is not None:
+            summary = torch.cat((matrix[:, config.num_experts + 1:], logical_counts.sum(1, keepdim=True),
+                                 logical_counts.amin(1, keepdim=True), logical_counts.amax(1, keepdim=True)), dim=1)
+            source_summary = summary.cpu().tolist()
+        maximum_tokens = (max(row[1] for row in source_summary) if source_summary is not None
+                          else int(logical_counts.sum(dim=1).max()) // top_k)
+        upper = config.maximum_receive_rows(max(1, maximum_tokens), top_k, alignment=1)
         device_plan = build_device_expert_replica_plan(
-            matrix[:, :-1], config, capacity_limit=upper,
+            logical_counts, config, capacity_limit=upper,
             target_load=min(upper, target_load) if target_load is not None else None,
             minimum_replica_rows=minimum_replica_rows, minimum_load_reduction=minimum_load_reduction,
             minimum_saved_rows=minimum_saved_rows)
-        device_plan.control[:1].bitwise_or_(matrix[:, -1].any().to(torch.int64))
+        device_plan.control[:1].bitwise_or_(matrix[:, config.num_experts].any().to(torch.int64))
         plan = device_plan.host_summary()
+        dynamic_summary = (None if source_summary is None else
+                           tuple(tuple(row) + (load,) for row, load in zip(source_summary, plan.destination_loads)))
         if compact_home and not plan.transfers:
-            return ReplicaRoute(plan, topk_ids, matrix[:, :-1].to(torch.int32).contiguous(),
-                                rank, group, device_plan=device_plan, home_only=True)
+            return ReplicaRoute(plan, topk_ids, logical_counts.to(torch.int32).contiguous(),
+                                rank, group, device_plan=device_plan, home_only=True, dynamic_summary=dynamic_summary)
         slots, lengths = device_plan.source_runs(rank)
         remapped = _remap_replica_ids(ids, plan, slots, lengths)
         return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_plan.dispatch_counts.to(torch.int32),
-                            rank, group, device_plan=device_plan)
+                            rank, group, device_plan=device_plan, dynamic_summary=dynamic_summary)
     # The deterministic host planner shares the route-count synchronization with
     # split sizing; no per-expert device-to-host reads occur below.
     host = matrix.cpu().tolist()
-    if any(row[-1] for row in host):
+    if any(row[config.num_experts] for row in host):
         raise ValueError("hot replication requires in-range, distinct expert IDs per token")
+    logical_host = [row[:config.num_experts] for row in host]
+    # Every planner must use the same bound when source ranks have unequal or zero rows.
+    maximum_tokens = max(sum(row) for row in logical_host) // top_k
+    upper = config.maximum_receive_rows(max(1, maximum_tokens), top_k, alignment=1)
     plan, reused = _plan_replica_route(
-        [row[:-1] for row in host], config, group, rank,
+        logical_host, config, group, rank,
         target_load=min(upper, target_load) if target_load is not None else None,
         minimum_replica_rows=minimum_replica_rows, capacity_limit=upper, cost_model=cost_model,
         minimum_load_reduction=minimum_load_reduction,
         minimum_saved_rows=minimum_saved_rows,
+        receive_capacity=receive_capacity,
     )
     if max(plan.destination_loads) > upper:
         raise RuntimeError("replica planner exceeded the theoretical receive bound")
+    # Distinct logical Top-K counts bound every physical split, including home-only plans.
+    dynamic_summary = (None if dynamic_header is None else tuple(
+        tuple(row[config.num_experts + 1:]) + (sum(counts), min(counts), max(counts), load)
+        for row, counts, load in zip(host, logical_host, plan.destination_loads)))
     if compact_home and not plan.transfers:
-        return ReplicaRoute(plan, topk_ids, matrix[:, :-1].to(torch.int32).contiguous(),
-                            rank, group, home_only=True, plan_reused=reused)
+        return ReplicaRoute(plan, topk_ids, logical_counts.to(torch.int32).contiguous(),
+                            rank, group, home_only=True, dynamic_summary=dynamic_summary, plan_reused=reused)
     slots, lengths, device_counts = _upload_route_metadata(plan, rank, ids.device)
     remapped = _remap_replica_ids(ids, plan, slots, lengths)
-    return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_counts, rank, group, plan_reused=reused)
+    return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_counts, rank, group,
+                        dynamic_summary=dynamic_summary, plan_reused=reused)

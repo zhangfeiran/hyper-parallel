@@ -51,9 +51,16 @@ class MegaMoeSpec:
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
     swiglu_limit: float | None = None
+    max_local_num_tokens: int | None = None
+    schedule_tokens: int | None = None
     replica_slots_per_rank: int = 0
     logical_num_experts: int = 0
     replica_transport: str = "p2p"
+
+    @property
+    def plan_tokens(self) -> int:
+        """Return schedule coverage independently of reserved source storage."""
+        return self.local_num_tokens if self.schedule_tokens is None else self.schedule_tokens
 
     @property
     def local_experts(self) -> int:
@@ -226,4 +233,5 @@ def bind_mega_moe_spec(
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
         dispatch_split=specification.get("dispatch_split", _COMMUNICATION_SPLIT),
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
+        max_local_num_tokens=specification.get("max_local_num_tokens"),
     )

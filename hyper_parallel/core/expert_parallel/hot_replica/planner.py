@@ -306,7 +306,8 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
                               *, target_load: int | None = None, minimum_replica_rows: int = 0,
                               capacity_limit: int | None = None,
                               cost_model: ExpertReplicaCostModel | None = None,
-                              minimum_load_reduction: float = 0.0, minimum_saved_rows: int = 0) -> ExpertExecutionPlan:
+                              minimum_load_reduction: float = 0.0, minimum_saved_rows: int = 0,
+                              receive_capacity: int | None = None) -> ExpertExecutionPlan:
     """Build a bounded single-execution plan, then reduce residual imbalance.
 
     Args:
@@ -327,6 +328,8 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
             copies. Capacity-required copies are retained; zero preserves the original policy.
         minimum_saved_rows: Required absolute receive-peak reduction for optional copies.
             It covers fixed communication overhead independently of the fractional threshold.
+        receive_capacity: Globally agreed receive reservation. Optional refinement cannot
+            exceed this reservation or the original placement peak.
 
     Returns:
         Immutable physical placement and exact per-source dispatch quotas.
@@ -336,6 +339,8 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
     admission = reduction_basis_points(minimum_load_reduction)
     if capacity_limit is not None:
         _integer(capacity_limit, "capacity_limit", 0)
+    if receive_capacity is not None:
+        _integer(receive_capacity, "receive_capacity", 0)
     if cost_model is not None and not isinstance(cost_model, ExpertReplicaCostModel):
         raise ValueError("cost_model must be an ExpertReplicaCostModel")
     counts = _counts_matrix(counts_by_source)
@@ -359,6 +364,9 @@ def build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica
     if minimum_replica_rows:
         _rebalance_existing_copies(copies, config)
     if cost_model is not None:
+        if receive_capacity is not None:
+            peak = max(sum(row.values()) for row in copies)
+            limit = min(limit, max(receive_capacity, peak))
         refine_replica_quotas(copies, counts, config, limit, cost_model)
     candidate_peak = max(sum(row.values()) for row in copies)
     if not _optional_peak_is_useful(candidate_peak, loads, limit, admission, minimum_saved_rows):

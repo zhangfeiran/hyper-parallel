@@ -16,20 +16,21 @@
 
 import struct
 import unittest
+from functools import partial
 import weakref
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
 import torch
-
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from hyper_parallel.core.activation_memory import checkpoint as hyper_checkpoint
 from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
-    SignalReplicaTransport, signal_storage_bytes,
+    SignalReplicaTransport,
+    signal_storage_bytes,
 )
 from hyper_parallel.core.multicore.modules.mega_moe import function as function_module
 from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
@@ -42,133 +43,46 @@ class TestMegaMoeFunction(unittest.TestCase):
 
     # pylint: disable=protected-access
 
-    def test_checkpoint_backward_reuses_replayed_replica_weights(self) -> None:
-        """Replay refreshes the original context without a third weight transfer."""
-        self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
-        DefaultDeviceType.set_device_type("cpu")
-        for engine in ("off", "torch", "hyper"):
-            for pull in (False, True):
-                for calls in (1, 2):
-                    with self.subTest(engine=engine, pull=pull, calls=calls):
-                        self._check_replica_recompute(engine=engine, pull=pull, calls=calls)
+    def test_ragged_pull_uses_reserved_source_prefix(self) -> None:
+        """Forward and backward retain SHMEM addresses while exposing only actual rows."""
+        buffer = torch.full((256, 4), float("nan"))
+        workspace = SimpleNamespace(source_buffer=buffer)
+        spec = SimpleNamespace(dispatch_mode="pull", hidden_size=4)
+        rows = torch.arange(12).reshape(3, 4).float()
+        dispatch, source = function_module._dispatch_and_source(spec, workspace, rows, 7)
+        self.assertEqual(tuple(dispatch.shape), (7, 4))
+        self.assertEqual(source.data_ptr(), buffer.data_ptr())
+        torch.testing.assert_close(source, rows)
+        self.assertTrue(torch.isnan(buffer[3:]).all())
+        context = SimpleNamespace(plan=SimpleNamespace(spec=spec), workspace=workspace,
+                                  source_rows=3, has_unpermute=False)
+        staged, probabilities = function_module._stage_backward_source(context, rows + 1, ())
+        torch.testing.assert_close(staged, rows + 1)
+        self.assertIsNone(probabilities)
+        context.source_rows = 0
+        context.has_unpermute = True
+        context.needs_input_grad = (False,) * 7 + (True,)
+        context.topk_dtype = torch.float32
+        with patch.object(function_module.multicore_ops, "mega_moe_unpermute_grad_out") as unpermute:
+            empty, gradient = function_module._stage_backward_source(
+                context, rows[:0], (torch.empty(0, dtype=torch.int32), rows[:0], torch.empty(0, 2)))
+        unpermute.assert_not_called()
+        self.assertEqual(tuple(empty.shape), (0, 4))
+        self.assertEqual(tuple(gradient.shape), (0, 2))
+        self.assertEqual(function_module._native_source(empty).data_ptr(), buffer.data_ptr())
 
-
-    def test_replayed_generation_requires_matching_placement_and_invocation(self) -> None:
-        """Different placements, workspaces and checkpoint invocations cannot share a generation."""
-        route = SimpleNamespace(plan=build_expert_replica_plan([[8, 0], [0, 0]], 1))
-        changed = SimpleNamespace(plan=build_expert_replica_plan([[0, 0], [0, 8]], 1))
-        workspace, other_workspace = object(), object()
-        first, second, third = object(), object(), object()
-        forward_context, replay_context = create_recompute_contexts()
-        with forward_context:
-            remembered = function_module._remember_replica_generation(first, route, workspace)
-            skipped = function_module._remember_replica_generation(second, route, workspace)
-            following = function_module._remember_replica_generation(second, route, workspace)
-            other = function_module._remember_replica_generation(second, route, other_workspace)
-        with replay_context:
-            function_module._remember_replica_generation(third, changed, workspace)
-            function_module._remember_replica_generation(None, route, workspace)
-            function_module._remember_replica_generation(third, route, workspace)
-            function_module._remember_replica_generation(third, route, other_workspace)
-        self.assertIsNone(remembered.value)
-        self.assertIsNone(skipped.value)
-        self.assertIs(following.value, third)
-        self.assertIs(other.value, third)
-        # Clearing replay resources must not clear the holder still owned by backward.
-        with replay_context:
-            function_module._remember_replica_generation(first, route, other_workspace)
-        self.assertIs(other.value, third)
-        with create_recompute_contexts()[0]:
-            isolated = function_module._remember_replica_generation(first, route, other_workspace)
-        self.assertIsNot(isolated, other)
-        self.assertIs(isolated.value, first)
-        self.assertIsNone(function_module._remember_replica_generation(None, None, workspace))
-        self.assertIs(function_module._remember_replica_generation(first, route, workspace), first)
-
-
-    def _check_replica_recompute(self, *, engine: str, pull: bool, calls: int) -> None:
-        """Exercise the real autograd bridge and signal protocol with CPU kernels."""
-        weights = (torch.ones(1, 2, 2, requires_grad=True), torch.ones(1, 1, 2, requires_grad=True))
-        shapes = tuple(tuple(weight.shape[1:]) for weight in weights)
-        storage = torch.empty(signal_storage_bytes(shapes, 1, 2, 4), dtype=torch.uint8)
-        provider = SignalReplicaTransport(MagicMock(), storage, 1, 2)
-        replica = SimpleNamespace(plan=build_expert_replica_plan([[8, 0], [0, 0]], 1), rank=0)
-        self.assertTrue(replica.plan.transfers)
-        workspace = Mock(replica_provider=provider, in_use=False, replica_runtime_images={},
-                         source_buffer=torch.empty(2, 2), expert_buffer=torch.empty(2, 2),
-                         routed_buffer=torch.empty(2, 2), gmm_workspace=torch.empty(1),
-                         swiglu_grad_workspace=torch.empty(1))
-
-        def claim() -> None:
-            """Reject overlapping execution on the shared workspace."""
-            self.assertFalse(workspace.in_use)
-            workspace.in_use = True
-
-        def release() -> None:
-            """End the current workspace lease."""
-            self.assertTrue(workspace.in_use)
-            workspace.in_use = False
-
-        workspace.claim.side_effect = claim
-        workspace.release.side_effect = release
-        spec = SimpleNamespace(replica_slots_per_rank=1, hidden_size=2, intermediate_size=1,
-                               top_k=1, dispatch_mode="pull" if pull else "push")
-        runtime = SimpleNamespace(normal_tensor=None)
-        plan = SimpleNamespace(spec=spec, fwd_runtime=runtime, bwd_runtime=runtime, reuse_backward_dispatch=False)
-        route = SimpleNamespace(replica_route=replica, expert_capacity=2, group_list=torch.tensor([2]))
-        for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
-                     "combine_src_off", "combine_target_off", "combine_size"):
-            setattr(route, name, torch.zeros(2, dtype=torch.int64))
-
-        def forward_kernel(_plan: Any, _route: Any, source: Any, weight1: Any, weight2: Any,
-                           execution: Any, _pool: Any) -> None:
-            """Emulate a differentiable scalar projection into the real saved buffers."""
-            execution.dispatch.copy_(source)
-            execution.combine.copy_(source * (weight1.sum() + weight2.sum()))
-            execution.intermediates.up_proj.zero_()
-            execution.intermediates.activation.zero_()
-
-        def backward_kernel(_plan: Any, saved: Any, gradient: Any, execution: Any,
-                            _pool: Any, _gradient_return: Any = None) -> None:
-            """Differentiate the CPU projection using the checkpoint-restored inputs."""
-            execution.grad_x.copy_(gradient * (saved.weight1.sum() + saved.weight2.sum()))
-            value = (gradient * saved.dispatch).sum()
-            execution.intermediates.grad_weight1.fill_(value)
-            execution.intermediates.grad_weight2.fill_(value)
-
-        source = torch.arange(4, dtype=torch.float32).reshape(2, 2).requires_grad_()
-
-        def operation(value: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor) -> torch.Tensor:
-            """Run serial MoE calls through one checkpoint region and shared workspace."""
-            for _ in range(calls):
-                value = function_module.execute_mega_moe(value, weight1, weight2, route, plan, workspace)
-            return value
-
-        with (
-            patch.object(torch, "cpu", MagicMock()),
-            patch.object(torch.npu, "current_stream"),
-            patch.object(torch.Tensor, "record_stream", autospec=True),
-            patch.object(type(provider), "kernel_gradients", new_callable=PropertyMock, return_value=False),
-            patch.object(provider, "_overlapped_prefetch", wraps=provider._overlapped_prefetch) as transfers,
-            patch.object(function_module, "_launch_forward_kernel", side_effect=forward_kernel),
-            patch.object(function_module, "_launch_backward_kernel", side_effect=backward_kernel),
-            patch.object(function_module, "return_gradients", side_effect=lambda gradients, *_args, **_kw: gradients),
-        ):
-            if engine == "torch":
-                output = checkpoint(operation, source, *weights, use_reentrant=False,
-                                    context_fn=create_recompute_contexts)
-            elif engine == "hyper":
-                output = hyper_checkpoint(operation, source, *weights, use_reentrant=False)
-            else:
-                output = operation(source, *weights)
-            output.sum().backward()
-        torch.testing.assert_close(output, source.detach() * 6 ** calls)
-        torch.testing.assert_close(source.grad, torch.full_like(source, 6 ** calls))
-        for weight in weights:
-            torch.testing.assert_close(weight.grad, torch.full_like(weight, calls * 6 ** calls))
-        self.assertEqual(transfers.call_count, (2 if engine == "off" else 3) * calls - 1)
-        self.assertFalse(workspace.in_use)
-
+    def test_empty_native_source_preserves_symmetric_storage(self) -> None:
+        """Empty pull ranks must retain the symmetric base used to address remote ranks."""
+        storage = torch.arange(32).reshape(8, 4)
+        empty_source = storage[:0]
+        native_source = function_module._native_source(empty_source)
+        self.assertEqual(native_source.data_ptr(), storage.data_ptr())
+        torch.testing.assert_close(native_source, storage[:1])
+        self.assertEqual(tuple(empty_source.shape), (0, 4))
+        ordinary_empty = torch.empty(0, 4)
+        placeholder = function_module._native_source(ordinary_empty)
+        self.assertEqual(tuple(placeholder.shape), (1, 4))
+        self.assertNotEqual(placeholder.data_ptr(), 0)
 
     def test_backward_unpacks_saved_tensors_once(self) -> None:
         """Checkpoint unpack hooks must only be consumed once per backward call."""
@@ -382,6 +296,17 @@ class TestMegaMoeFunction(unittest.TestCase):
         """
         self._check_deferred_backward(permuted=True, input_grad=False)
 
+    def test_dynamic_tokens_restore_each_deferred_forward_length(self) -> None:
+        """Use per-call token counts despite later forwards reusing a larger source buffer."""
+        self._check_deferred_backward(permuted=True, vary_tokens=True)
+
+    def test_non_reentrant_checkpoint_unpacks_saved_tensors_once(self) -> None:
+        """Checkpoint recomputation must not fail when backward reads its permutation state."""
+        # CPU-only inputs must not select an installed accelerator for autocast replay.
+        self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
+        DefaultDeviceType.set_device_type("cpu")
+        self._check_deferred_backward(permuted=False, replay=True)
+
     def test_empty_replica_plan_skips_leases_through_reversed_backward(self) -> None:
         """B stays enabled while an immutable global plan has no transfers."""
         for pull in (False, True):
@@ -392,10 +317,135 @@ class TestMegaMoeFunction(unittest.TestCase):
         """A mutated saved parameter must abort before any resident replica can be borrowed."""
         self._check_deferred_backward(permuted=False, mutate_before_backward=True)
 
+    def test_checkpoint_backward_reuses_replayed_replica_weights(self) -> None:
+        """Replay refreshes the original context without a third weight transfer."""
+        self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
+        DefaultDeviceType.set_device_type("cpu")
+        for engine in ("off", "torch", "hyper"):
+            for pull in (False, True):
+                for calls in (1, 2):
+                    with self.subTest(engine=engine, pull=pull, calls=calls):
+                        self._check_replica_recompute(engine=engine, pull=pull, calls=calls)
+
+    def test_replayed_generation_requires_matching_placement_and_invocation(self) -> None:
+        """Different placements, workspaces and checkpoint invocations cannot share a generation."""
+        route = SimpleNamespace(plan=build_expert_replica_plan([[8, 0], [0, 0]], 1))
+        changed = SimpleNamespace(plan=build_expert_replica_plan([[0, 0], [0, 8]], 1))
+        workspace, other_workspace = object(), object()
+        first, second, third = object(), object(), object()
+        forward_context, replay_context = create_recompute_contexts()
+        with forward_context:
+            remembered = function_module._remember_replica_generation(first, route, workspace)
+            skipped = function_module._remember_replica_generation(second, route, workspace)
+            following = function_module._remember_replica_generation(second, route, workspace)
+            other = function_module._remember_replica_generation(second, route, other_workspace)
+        with replay_context:
+            function_module._remember_replica_generation(third, changed, workspace)
+            function_module._remember_replica_generation(None, route, workspace)
+            function_module._remember_replica_generation(third, route, workspace)
+            function_module._remember_replica_generation(third, route, other_workspace)
+        self.assertIsNone(remembered.value)
+        self.assertIsNone(skipped.value)
+        self.assertIs(following.value, third)
+        self.assertIs(other.value, third)
+        # Clearing replay resources must not clear the holder still owned by backward.
+        with replay_context:
+            function_module._remember_replica_generation(first, route, other_workspace)
+        self.assertIs(other.value, third)
+        with create_recompute_contexts()[0]:
+            isolated = function_module._remember_replica_generation(first, route, other_workspace)
+        self.assertIsNot(isolated, other)
+        self.assertIs(isolated.value, first)
+        self.assertIsNone(function_module._remember_replica_generation(None, None, workspace))
+        self.assertIs(function_module._remember_replica_generation(first, route, workspace), first)
+
+    def _check_replica_recompute(self, *, engine: str, pull: bool, calls: int) -> None:
+        """Exercise the real autograd bridge and signal protocol with CPU kernels."""
+        weights = (torch.ones(1, 2, 2, requires_grad=True), torch.ones(1, 1, 2, requires_grad=True))
+        shapes = tuple(tuple(weight.shape[1:]) for weight in weights)
+        storage = torch.empty(signal_storage_bytes(shapes, 1, 2, 4), dtype=torch.uint8)
+        provider = SignalReplicaTransport(MagicMock(), storage, 1, 2)
+        replica = SimpleNamespace(plan=build_expert_replica_plan([[8, 0], [0, 0]], 1), rank=0)
+        self.assertTrue(replica.plan.transfers)
+        workspace = Mock(replica_provider=provider, in_use=False, replica_runtime_images={},
+                         source_buffer=torch.empty(2, 2), expert_buffer=torch.empty(2, 2),
+                         routed_buffer=torch.empty(2, 2), gmm_workspace=torch.empty(1),
+                         swiglu_grad_workspace=torch.empty(1))
+
+        def claim() -> None:
+            """Reject overlapping execution on the shared workspace."""
+            self.assertFalse(workspace.in_use)
+            workspace.in_use = True
+
+        def release() -> None:
+            """End the current workspace lease."""
+            self.assertTrue(workspace.in_use)
+            workspace.in_use = False
+
+        workspace.claim.side_effect = claim
+        workspace.release.side_effect = release
+        spec = SimpleNamespace(replica_slots_per_rank=1, hidden_size=2, intermediate_size=1,
+                               top_k=1, dispatch_mode="pull" if pull else "push")
+        runtime = SimpleNamespace(normal_tensor=None)
+        plan = SimpleNamespace(spec=spec, fwd_runtime=runtime, bwd_runtime=runtime, reuse_backward_dispatch=False)
+        route = SimpleNamespace(replica_route=replica, expert_capacity=2, group_list=torch.tensor([2]))
+        for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
+                     "combine_src_off", "combine_target_off", "combine_size"):
+            setattr(route, name, torch.zeros(2, dtype=torch.int64))
+
+        def forward_kernel(_plan: Any, _route: Any, source: Any, weight1: Any, weight2: Any,
+                           execution: Any, _pool: Any) -> None:
+            """Emulate a differentiable scalar projection into the real saved buffers."""
+            execution.dispatch.copy_(source)
+            execution.combine.copy_(source * (weight1.sum() + weight2.sum()))
+            execution.intermediates.up_proj.zero_()
+            execution.intermediates.activation.zero_()
+
+        def backward_kernel(_plan: Any, saved: Any, gradient: Any, execution: Any,
+                            _pool: Any, _gradient_return: Any = None) -> None:
+            """Differentiate the CPU projection using the checkpoint-restored inputs."""
+            execution.grad_x.copy_(gradient * (saved.weight1.sum() + saved.weight2.sum()))
+            value = (gradient * saved.dispatch).sum()
+            execution.intermediates.grad_weight1.fill_(value)
+            execution.intermediates.grad_weight2.fill_(value)
+
+        source = torch.arange(4, dtype=torch.float32).reshape(2, 2).requires_grad_()
+
+        def operation(value: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor) -> torch.Tensor:
+            """Run serial MoE calls through one checkpoint region and shared workspace."""
+            for _ in range(calls):
+                value = function_module.execute_mega_moe(value, weight1, weight2, route, plan, workspace)
+            return value
+
+        with (
+            patch.object(torch, "cpu", MagicMock()),
+            patch.object(torch.npu, "current_stream"),
+            patch.object(torch.Tensor, "record_stream", autospec=True),
+            patch.object(type(provider), "kernel_gradients", new_callable=PropertyMock, return_value=False),
+            patch.object(provider, "_overlapped_prefetch", wraps=provider._overlapped_prefetch) as transfers,
+            patch.object(function_module, "_launch_forward_kernel", side_effect=forward_kernel),
+            patch.object(function_module, "_launch_backward_kernel", side_effect=backward_kernel),
+            patch.object(function_module, "return_gradients", side_effect=lambda gradients, *_args, **_kw: gradients),
+        ):
+            if engine == "torch":
+                output = checkpoint(operation, source, *weights, use_reentrant=False,
+                                    context_fn=create_recompute_contexts)
+            elif engine == "hyper":
+                output = hyper_checkpoint(operation, source, *weights, use_reentrant=False)
+            else:
+                output = operation(source, *weights)
+            output.sum().backward()
+        torch.testing.assert_close(output, source.detach() * 6 ** calls)
+        torch.testing.assert_close(source.grad, torch.full_like(source, 6 ** calls))
+        for weight in weights:
+            torch.testing.assert_close(weight.grad, torch.full_like(weight, calls * 6 ** calls))
+        self.assertEqual(transfers.call_count, (2 if engine == "off" else 3) * calls - 1)
+        self.assertFalse(workspace.in_use)
+
     def _check_deferred_backward(
         self, *, permuted: bool, input_grad: bool = True, reuse: bool = False, pull: bool = False,
-        empty_replica_route: bool = False,
-        mutate_before_backward: bool = False,
+        empty_replica_route: bool = False, mutate_before_backward: bool = False,
+        vary_tokens: bool = False, replay: bool = False,
     ) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(replica_slots_per_rank=int(empty_replica_route), hidden_size=4,
@@ -417,7 +467,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             expert_capacity=128,
             source_buffer=torch.empty(4, 4),
             expert_buffer=torch.empty(128, 4),
-            routed_buffer=torch.empty(4, 4),
+            routed_buffer=torch.empty(8 if vary_tokens else 4, 4),
             forward_event_counters=torch.empty(16),
             backward_event_counters=torch.empty(16),
             gmm_workspace=torch.empty(1),
@@ -456,8 +506,10 @@ class TestMegaMoeFunction(unittest.TestCase):
         def permutation_gradient(grad: Any, mapping: Any, token_rows: int, top_k: int) -> Any:
             """Require direct consumption of shared rows and return owned token rows."""
             self.assertEqual(grad.data_ptr(), workspace.routed_buffer.data_ptr())
-            self.assertEqual((token_rows, top_k), (2, 2))
-            self.assertEqual(mapping.tolist(), [0, 2, 1, 3])
+            expected_rows = (1, 3, 2, 4)[int(grad[0, 0]) - 1] if vary_tokens else 2
+            self.assertEqual((token_rows, top_k), (expected_rows, 2))
+            self.assertEqual(grad.shape[0], token_rows * top_k)
+            self.assertEqual(mapping.tolist(), list(range(token_rows * 2)) if vary_tokens else [0, 2, 1, 3])
             self.assertTrue(torch.isfinite(grad).all())
             return grad.reshape(token_rows, top_k, 4).sum(dim=1)
 
@@ -489,7 +541,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             self.assertTrue(torch.equal(args[5], torch.full_like(args[5], tag + 20)))
             for tensor, width in ((args[8], 2), (args[10], 4), (args[12], 4)):
                 self.assertEqual(tuple(tensor.shape), (capacity, width))
-            self.assertEqual(tuple(args[13].shape), (4, 4))
+            self.assertEqual(tuple(args[13].shape), (8 if vary_tokens else 4, 4))
             self.assertEqual(args[12].data_ptr() == args[0].data_ptr(), reuse)
             self.assertNotEqual(saved_dispatch.data_ptr(), args[0].data_ptr())
             scratch_references[:] = [weakref.ref(args[index]) for index in (8, 10, 12)]
@@ -503,10 +555,12 @@ class TestMegaMoeFunction(unittest.TestCase):
             """Borrow the caller's lease when routing directly into pull source."""
             if not permuted:
                 return function_module.execute_mega_moe(source, weight1, weight2, route, plan, workspace)
-            ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+            tokens = source.shape[0]
+            ids = torch.tensor([[0, 1]] * tokens, dtype=torch.int32)
             prepared = SimpleNamespace(
                 routed_tokens=source.detach().repeat_interleave(2, dim=0), metadata=route,
-                unpermute_mapping=torch.tensor([0, 2, 1, 3], dtype=torch.int32),
+                unpermute_mapping=(torch.arange(tokens * 2, dtype=torch.int32) if vary_tokens
+                                   else torch.tensor([0, 2, 1, 3], dtype=torch.int32)),
             )
             if pull:
                 workspace.claim()
@@ -543,14 +597,24 @@ class TestMegaMoeFunction(unittest.TestCase):
                          side_effect=permutation_gradient) as mock_permutation,
         ):
             for tag, capacity in enumerate(capacities, start=1):
-                source = torch.full((2 if permuted else 4, 4), float(tag), requires_grad=input_grad)
+                tokens = (1, 3, 2, 4)[tag - 1] if vary_tokens else 2
+                source = torch.full((tokens if permuted else 4, 4), float(tag), requires_grad=input_grad)
                 replica = SimpleNamespace(plan=SimpleNamespace(transfers=())) if empty_replica_route else None
                 route = SimpleNamespace(replica_route=replica, expert_capacity=capacity,
                                         group_list=torch.tensor([0, capacity]))
                 for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
                              "combine_src_off", "combine_target_off", "combine_size"):
                     setattr(route, name, torch.zeros(4, dtype=torch.int64))
-                output = _forward(source, route)
+                if replay:
+                    operation = partial(function_module.execute_mega_moe, route=route, plan=plan, workspace=workspace)
+                    output = checkpoint(operation, source, weight1, weight2, use_reentrant=False)
+                else:
+                    output = _forward(source, route)
+                outputs.append(output)
+                sources.append(source)
+                self.assertEqual(tuple(output.shape), (tokens * 2 if permuted else 4, 4))
+                if replay:
+                    continue
                 saved = output.grad_fn.saved_tensors
                 self.assertEqual(len(saved), 13 if permuted and input_grad else 12)
                 self.assertTrue(all(t.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
@@ -558,9 +622,6 @@ class TestMegaMoeFunction(unittest.TestCase):
                 self.assertEqual(saved[0].data_ptr(), (dispatch_pointers if pull else down_pointers)[-1])
                 self.assertNotEqual(saved[0].data_ptr(), workspace.expert_buffer.data_ptr())
                 self.assertEqual(saved[0].untyped_storage().nbytes(), capacity * 4 * source.element_size())
-                self.assertEqual(tuple(output.shape), (4, 4))
-                outputs.append(output)
-                sources.append(source)
             if mutate_before_backward:
                 claims = workspace.claim.call_count
                 with torch.no_grad():
@@ -570,15 +631,15 @@ class TestMegaMoeFunction(unittest.TestCase):
                 self.assertEqual(workspace.claim.call_count, claims)
                 return
             for tag in range(len(outputs), 0, -1):
-                self.assertTrue(torch.equal(outputs[tag - 1], torch.full((4, 4), float(tag + 40))))
+                self.assertTrue(torch.equal(outputs[tag - 1], torch.full_like(outputs[tag - 1], float(tag + 40))))
                 outputs[tag - 1].sum().backward()
                 self._assert_input_gradient(sources[tag - 1], tag, permuted=permuted, input_grad=input_grad)
         self.assertTrue(torch.equal(weight1.grad, torch.full_like(weight1, 10.0)))
         self.assertTrue(torch.equal(weight2.grad, torch.full_like(weight2, 10.0)))
         self.assertEqual(mock_permutation.call_count, len(outputs) if permuted and input_grad else 0)
         self.assertEqual(backward_capacities, list(reversed(capacities)))
-        self.assertEqual(workspace.claim.call_count, 8)
-        self.assertEqual(workspace.release.call_count, 8)
+        self.assertEqual(workspace.claim.call_count, 12 if replay else 8)
+        self.assertEqual(workspace.release.call_count, 12 if replay else 8)
 
     def _assert_input_gradient(
         self, source: torch.Tensor, tag: int, *, permuted: bool, input_grad: bool,
