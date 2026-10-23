@@ -18,12 +18,15 @@ from __future__ import annotations
 
 __all__ = ["MegaGate"]
 
-from functools import lru_cache
 import math
+from collections.abc import Callable
+from functools import lru_cache
+from typing import Any
 
 import torch
 from torch.nn import functional
 
+from hyper_parallel.core.multicore.modules._precision import preserve_fp32_parameters
 from hyper_parallel.core.multicore.modules.mega_gate.function import mega_gate
 from hyper_parallel.core.multicore.modules.mega_gate.plan import MegaGatePlan, build_mega_gate_plan
 
@@ -135,6 +138,50 @@ class MegaGate(torch.nn.Module):
             self.initializer_range,
         )
 
+    @classmethod
+    def from_module(cls, module: torch.nn.Module, **configuration: Any) -> MegaGate:
+        """Bind an existing router's projection and correction-bias Parameters.
+
+        Args:
+            module: Router with weight [E, H], optional correction bias [E] and bias_vl [E].
+                Its bias is a TopK correction, not a linear-projection bias.
+            **configuration: top_k, scoring_func and routed_scaling_factor, when not present on module.
+                vision_enabled defaults to whether the source provides bias_vl; it cannot disable an existing bias_vl.
+
+        Returns:
+            Router sharing the original Parameters. Construct the optimizer after module replacement.
+        """
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, torch.nn.Parameter) or weight.ndim != 2:
+            raise ValueError("source router requires a weight Parameter shaped [num_experts, hidden_size]")
+        options = {}
+        for name in ("top_k", "scoring_func", "routed_scaling_factor"):
+            value = configuration.pop(name, getattr(module, name, None))
+            if value is None:
+                raise ValueError(f"Provide {name} or expose it on the source router")
+            options[name] = value
+        bias_vl = getattr(module, "bias_vl", None)
+        vision_enabled = configuration.pop("vision_enabled", bias_vl is not None)
+        if bias_vl is not None and not vision_enabled:
+            raise ValueError("source bias_vl requires vision_enabled=True")
+        result = cls(hidden_size=weight.shape[1], num_experts=weight.shape[0],
+                     top_k=options["top_k"], scoring_func=options["scoring_func"],
+                     routed_scaling_factor=options["routed_scaling_factor"],
+                     vision_enabled=vision_enabled, **configuration).to(device=weight.device)
+        result.weight = weight
+        for name in ("bias", "bias_vl"):
+            value = getattr(module, name, None)
+            if value is not None:
+                if (not isinstance(value, torch.nn.Parameter) or value.shape != (weight.shape[0],)
+                        or value.dtype != torch.float32 or value.device != weight.device):
+                    raise ValueError(f"source {name} must be an FP32 Parameter [num_experts] on the weight device")
+                setattr(result, name, value)
+        return result
+
+    def _apply(self, fn: Callable, recurse: bool = True) -> MegaGate:
+        """Keep correction biases FP32 under enclosing model dtype conversion."""
+        return super()._apply(preserve_fp32_parameters(self, fn, ("bias", "bias_vl")), recurse=recurse)
+
     def _plan(self, hidden_states: torch.Tensor) -> MegaGatePlan:
         """Return the process-level plan for an NPU tensor."""
         return _plan_for_device(hidden_states.device)
@@ -188,14 +235,13 @@ class MegaGate(torch.nn.Module):
 
         Args:
             hidden_states: Tensor shaped ``[batch, sequence, hidden_size]``.
-                The projection follows the active Torch autocast policy. The
+                The projection follows the active autocast policy. The
                 logits are converted to FP32 before the native NPU Route.
             image_mask: Optional BOOL tensor shaped ``[batch, sequence]``.
                 When visual bias is enabled, true entries select ``bias_vl``
                 and false entries select ``bias``. Native visual routing
                 requires a contiguous mask on the same NPU as
-                ``hidden_states``. The mask is ignored after shape validation
-                when no visual bias exists.
+                ``hidden_states``. Passing a mask without vision_enabled=True raises ValueError.
 
         Returns:
             A tuple containing logits ``[tokens, num_experts]`` in the
@@ -213,6 +259,8 @@ class MegaGate(torch.nn.Module):
             The native NPU Route supports first-order differentiation only.
             Differentiating through RouteGrad is unsupported.
         """
+        if image_mask is not None and self.bias_vl is None:
+            raise ValueError("image_mask requires vision_enabled=True when constructing MegaGate")
         if image_mask is not None and image_mask.shape != hidden_states.shape[:2]:
             raise ValueError("image_mask must have shape [batch, sequence]")
         if (

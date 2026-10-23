@@ -94,7 +94,8 @@ class DeepseekV41MegaGate(MegaGate):
             sequence_partition_groups: tuple[Any, ...] = (),
             sequence_ids: torch.Tensor | None = None,
             num_sequences: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return_tokens_per_expert: bool = False,
+    ) -> tuple[torch.Tensor | None, ...]:
         """Run MegaGate while retaining the DeepSeek V4.1 training contract.
 
         Args:
@@ -104,9 +105,11 @@ class DeepseekV41MegaGate(MegaGate):
             sequence_partition_groups: Token-partition process groups.
             sequence_ids: Optional logical sample IDs.
             num_sequences: Total logical sample count for packed inputs.
+            return_tokens_per_expert: Append reusable unmasked local counts, or None when unavailable.
 
         Returns:
             Router logits, training-aware weights, and selected experts.
+            When requested, append current dispatch counts or None when unavailable.
         """
         if image_mask is not None and (
                 image_mask.shape != hidden_states.shape[:-1] or image_mask.dtype != torch.bool):
@@ -126,7 +129,11 @@ class DeepseekV41MegaGate(MegaGate):
             sequence_partition_groups,
             sequence_ids,
             num_sequences,
+            return_tokens_per_expert=return_tokens_per_expert,
         )
+        if return_tokens_per_expert:
+            weights, counts = weights
+            return logits, weights, indices, counts
         return logits, weights, indices
 
     @torch.no_grad()

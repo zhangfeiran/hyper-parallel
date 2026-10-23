@@ -99,6 +99,22 @@ def _create_mega_moe_parameters(
     return gate_up_weight, down_weight
 
 
+def _resolve_ep_size(ep_size: int | None, ep_group: Any | None) -> int:
+    """Infer size from an explicit group without silently choosing WORLD."""
+    if ep_size is not None and (not isinstance(ep_size, int) or isinstance(ep_size, bool) or ep_size <= 0):
+        raise ValueError("ep_size must be a positive integer or None")
+    if ep_group is not None:
+        if not dist.is_initialized():
+            raise ValueError("Initialize torch.distributed before passing ep_group")
+        group_size = dist.get_world_size(ep_group)
+        if ep_size is not None and ep_size != group_size:
+            raise ValueError(f"ep_size={ep_size} does not match ep_group size={group_size}")
+        return group_size
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        raise ValueError("Pass ep_group explicitly for distributed MegaMoeExperts")
+    return 1 if ep_size is None else ep_size
+
+
 class _MegaMoeExecutionResources:
     """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
@@ -243,6 +259,55 @@ class MegaMoeExperts(MulticoreModule):
     independent parameters and optimizer state.
     """
 
+    @classmethod
+    def from_module(
+        cls, module: torch.nn.Module, *, top_k: int, ep_group: Any | None = None, **execution_options: Any,
+    ) -> MegaMoeExperts:
+        """Convert materialized local GroupedExperts SwiGLU weights before optimizer construction.
+
+        Args:
+            module: Module exposing w1/w3 [local_E, I, H], w2 [local_E, H, I].
+                DTensor local EP shards are accepted; FSDP weights must be materialized first.
+            top_k: Experts selected by the existing router for each token.
+            ep_group: Explicit EP group owning these local experts, or None for a standalone rank.
+            **execution_options: Advanced MegaMoe options, including num_experts and expert_weight_layout.
+
+        Returns:
+            Experts with copied, converted Parameters. Optimizer state is not migrated.
+        """
+        values = []
+        for name in ("w1", "w3", "w2"):
+            value = getattr(module, name, None)
+            if hasattr(value, "to_local"):
+                value = value.to_local()
+            if not isinstance(value, torch.Tensor) or value.ndim != 3:
+                raise ValueError(f"source {name} must be a materialized local rank-three expert tensor")
+            if value.is_meta:
+                raise ValueError(f"source {name} is meta; materialize and initialize/load weights before from_module")
+            values.append(value)
+        gate, up, down = values[0], values[1], values[2]
+        if (up.shape != gate.shape or down.shape != (gate.shape[0], gate.shape[2], gate.shape[1])
+                or any(value.device != gate.device or value.dtype != gate.dtype for value in values)
+                or gate.requires_grad != up.requires_grad):
+            raise ValueError("source SwiGLU expert shapes, dtypes, devices and gate/up gradient policies must match")
+        ep_size = _resolve_ep_size(execution_options.get("ep_size"), ep_group)
+        experts = execution_options.pop("num_experts", getattr(module, "num_experts", gate.shape[0] * ep_size))
+        if experts != gate.shape[0] * ep_size:
+            raise ValueError("source local expert count does not match num_experts and ep_group")
+        result = cls(hidden_size=gate.shape[2], intermediate_size=gate.shape[1], num_experts=experts,
+                     top_k=top_k, ep_group=ep_group, create_parameters=False, **execution_options)
+        gate_up = torch.cat((gate.detach(), up.detach()), dim=1)
+        down_data = down.detach()
+        if result.expert_weight_layout == "EIO":
+            gate_up = gate_up.transpose(1, 2)
+            down_data = down_data.transpose(1, 2)
+        result.gate_up_weight = torch.nn.Parameter(
+            gate_up.contiguous(), requires_grad=gate.requires_grad)
+        result.down_weight = torch.nn.Parameter(
+            down_data.clone(memory_format=torch.contiguous_format),
+            requires_grad=down.requires_grad)
+        return result
+
     def _resource_signature(self, tensor: Any) -> Any:
         """Compare static configuration without process-local group identities."""
         configuration = tuple(sorted((name, value) for name, value in self._resource_group.specification.items()
@@ -262,7 +327,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         swiglu_limit: float | None = None,
-        ep_size: int = 1,
+        ep_size: int | None = None,
         ep_group: Any | None = None,
         create_parameters: bool = True,
         expert_weight_layout: ExpertWeightLayout = "EIO",
@@ -294,16 +359,15 @@ class MegaMoeExperts(MulticoreModule):
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
                 preserves the legacy unclamped path.
-            ep_size: Expert-parallel degree, equal to the size of ep_group.
+            ep_size: Optional compatibility check; normally inferred from explicit ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
                 ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
                 ``[experts, out_features, in_features]`` and accepts Torch linear storage directly. ``EOI`` weights
                 must use dense contiguous storage for zero-copy execution.
-            ep_group: Torch expert-parallel process group, possibly a subgroup of
-                WORLD. Expert ownership follows group-local rank order. Disjoint
-                PP/DP groups bootstrap independently; one process can have only
-                one ordered EP membership active in SHMEM at a time.
+            ep_group: Explicit EP group; expert ownership follows group-local rank order.
+                Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
+                can be active in SHMEM per process.
         """
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT,
@@ -313,7 +377,7 @@ class MegaMoeExperts(MulticoreModule):
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
-            "ep_size": ep_size,
+            "ep_size": _resolve_ep_size(ep_size, ep_group),
             "ep_group": ep_group,
             "expert_weight_layout": expert_weight_layout,
             "dispatch_mode": dispatch_mode,

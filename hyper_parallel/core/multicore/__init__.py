@@ -22,36 +22,30 @@ from hyper_parallel.core.multicore.diagnostics import (
 
 if TYPE_CHECKING:
     from hyper_parallel.core.multicore.modules.mega_gate.module import MegaGate
-    from hyper_parallel.core.multicore.modules.mega_mhc.module import HyperMegaMhc
+    from hyper_parallel.core.multicore.modules.mega_mhc.module import MegaMhc
     from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 
 __all__ = [
-    "HyperMegaMhc", "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
+    "MegaGate", "MegaMhc", "MegaMoeExperts", "MegaKernelDiagnostics",
     "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
 ]
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     """Load optional multicore modules only when their public API is requested."""
-    if name == "HyperMegaMhc":
+    if name == "MegaMhc":
         from hyper_parallel.core.multicore.modules.mega_mhc.module import (  # pylint: disable=import-outside-toplevel
-            HyperMegaMhc as hyper_mega_mhc,
+            MegaMhc as value,
         )
-
-        globals()[name] = hyper_mega_mhc
-        return hyper_mega_mhc
-    if name == "MegaGate":
+    elif name == "MegaGate":
         from hyper_parallel.core.multicore.modules.mega_gate.module import (  # pylint: disable=import-outside-toplevel
-            MegaGate as mega_gate,
+            MegaGate as value,
         )
-
-        globals()[name] = mega_gate
-        return mega_gate
-    if name == "MegaMoeExperts":
+    elif name == "MegaMoeExperts":
         from hyper_parallel.core.multicore.modules.mega_moe.module import (  # pylint: disable=import-outside-toplevel
-            MegaMoeExperts as mega_moe_experts,
+            MegaMoeExperts as value,
         )
-
-        globals()[name] = mega_moe_experts
-        return mega_moe_experts
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value

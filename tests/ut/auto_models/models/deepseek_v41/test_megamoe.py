@@ -36,6 +36,7 @@ from hyper_parallel.trainer.config.trainer import TrainerConfig
 
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.distributed._builder.forward_rewriter import validate_local_compute_signature
+from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts,
 )
@@ -116,9 +117,12 @@ def _source(limit=10.0):
     source.down_proj = nn.Parameter(torch.randn(4, 8, 4))
     return source
 
-def _native_reference(module, inputs, indices, weights, *, expert_weights=None):
+def _native_reference(module, inputs, indices, weights, *, expert_weights=None, tokens_per_expert=None):
     """Differentiate the routed expert math independently of the native executor."""
     gate_up, down_weight = expert_weights or (module.gate_up_weight, module.down_weight)
+    if tokens_per_expert is not None:
+        expected_counts = torch.stack([(indices == expert).sum() for expert in range(gate_up.shape[0])])
+        torch.testing.assert_close(tokens_per_expert.long(), expected_counts, rtol=0, atol=0)
     original_shape = inputs.shape
     inputs = inputs.reshape(-1, inputs.shape[-1])
     result = torch.zeros_like(inputs)
@@ -161,7 +165,11 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
               patch.object(ep_adapter.dist, 'get_world_size', return_value=2) as world_size,
               patch('hyper_parallel.core.multicore.modules.mega_moe.module.shmem.root_members', return_value=(1, 3))):
             deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=mesh)
-        world_size.assert_called_once_with(group)
+        self.assertGreater(world_size.call_count, 0)
+        for invocation in world_size.call_args_list:
+            self.assertEqual(invocation.args, (group,))
+            self.assertFalse(invocation.kwargs)
+        self.assertEqual(experts._executor.ep_size, 2)
         self.assertIs(experts._executor._ep_group, group)
         self.assertTrue(experts._executor._resource_group.specification["auto_tokens"])
 
@@ -290,6 +298,49 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_router_reuses_current_load_without_another_histogram(self) -> None:
+        """Feature: Reuse current Router load counts.
+        Description: Request counts from both gates with empty, changing and masked inputs.
+        Expectation: Reuse exactly one load histogram, leave accumulation to backward and fall back when unavailable.
+        """
+        source = DeepseekV41TopKRouter(SimpleNamespace(
+            hidden_size=8, num_local_experts=4, num_experts_per_tok=2, scoring_func="sigmoid",
+            routed_scaling_factor=1.0, v41_vision_enabled=True,
+        ))
+        from_gate = DeepseekV41MegaGate(module=source, module_fqn="gate", context={})
+        scatter_add = torch.Tensor.scatter_add
+        calls = []
+
+        def histogram(tensor: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+            """Count existing histogram kernels while preserving their implementation."""
+            calls.append(tensor.shape)
+            return scatter_add(tensor, *args, **kwargs)
+
+        for gate in (source, from_gate):
+            for rows in (0, 7, 3):
+                hidden = torch.randn(1, rows, 8)
+                image_mask = torch.arange(rows).reshape(1, rows) % 2 == 0
+                calls.clear()
+                with patch.object(torch.Tensor, "scatter_add", histogram):
+                    _, weights, ids, counts = gate(hidden, image_mask=image_mask, return_tokens_per_expert=True)
+                self.assertEqual(len(calls), 1)
+                expected = torch.stack([(ids == expert).sum() for expert in range(4)])
+                torch.testing.assert_close(counts, expected, rtol=0, atol=0)
+                self.assertEqual(gate.tokens_per_expert.sum().item(), 0)
+                weights.sum().backward()
+                self.assertEqual(gate.tokens_per_expert.sum().item(), rows * 2)
+                gate.tokens_per_expert.zero_()
+            mask = torch.tensor([[True, False, True]])
+            result = gate(torch.randn(1, 3, 8), token_mask=mask, return_tokens_per_expert=True)
+            self.assertIsNone(result[3])
+            gate.eval()
+            self.assertIsNone(gate(torch.randn(1, 3, 8), return_tokens_per_expert=True)[3])
+            gate.train()
+            gate.enable_expert_bias = False
+            self.assertIsNone(gate(torch.randn(1, 3, 8), return_tokens_per_expert=True)[3])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_multimodal_router_and_shared_expert_gradients(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Use real image/text router biases and propagate image-token gradients through variable-length experts.
@@ -322,7 +373,9 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         expected = _native_reference(experts._executor, hidden.reshape(-1, 8), ids, weights,
                                      expert_weights=(experts.gate_up_proj, experts.down_proj)).reshape_as(hidden)
         expected = expected + shared(hidden)
-        with patch.object(MegaMoeExperts, "forward", _native_reference):
+        with (patch.object(MegaMoeExperts, "forward", _native_reference),
+              patch.object(torch, "bincount", side_effect=AssertionError("Router counts must be forwarded")),
+              patch.object(torch.Tensor, "scatter_add_", side_effect=AssertionError("No extra dispatch histogram"))):
             actual = compute(module, hidden, image_mask=image_mask)
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
         targets = (hidden, gate.weight, experts.gate_up_proj, experts.down_proj, shared.weight, shared.bias)

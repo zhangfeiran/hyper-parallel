@@ -114,17 +114,19 @@ def _router(
         router_sequence_ids: torch.Tensor | None = None,
         router_num_sequences: int | None = None,
         sequence_partition_groups: tuple[Any, ...] = (),
-) -> tuple[torch.Tensor, torch.Tensor]:
+        *, return_tokens_per_expert: bool = False,
+) -> tuple[torch.Tensor | None, ...]:
     """Return the V4.1 learned router's selected experts and weights."""
     output = module.gate(
         hidden_states, image_mask=image_mask, token_mask=router_token_mask,
         sequence_ids=router_sequence_ids, num_sequences=router_num_sequences,
         sequence_partition_groups=sequence_partition_groups,
+        **({"return_tokens_per_expert": True} if return_tokens_per_expert else {}),
     )
-    if not isinstance(output, (tuple, list)) or len(output) != 3:
+    if not isinstance(output, (tuple, list)) or len(output) != (4 if return_tokens_per_expert else 3):
         raise TypeError("DeepSeek-V4.1 gate must return logits, weights, and indices")
-    _, weights, indices = output
-    return indices, weights
+    _, weights, indices = output[:3]
+    return (indices, weights, output[3]) if return_tokens_per_expert else (indices, weights)
 
 
 def _routed_and_shared_forward(
@@ -155,36 +157,44 @@ def _routed_and_shared_forward(
     return routed + module.shared_experts(hidden_states)
 
 
-def _resolve_router(router_fn: Callable, ep_size: int, fix_router: bool = False) -> Callable:
+def _resolve_router(router_fn: Callable, ep_size: int, fix_router: bool = False,
+                    *, return_tokens_per_expert: bool = False) -> Callable:
     """Keep learned gate work and optionally balance destinations for benchmarks.
 
     Only dispatch indices change; weights keep their original autograd graph.
     Fixed assignments ignore gate scores and must only be used for performance tests.
     Both native EP and MegaMoe supply the size of their expert-parallel mesh.
+    MegaMoe reuses current unmasked Router counts when available. Fixed routing
+    invalidates learned counts and keeps the executor's existing fallback.
     """
-    if not fix_router:
+    if not fix_router and not return_tokens_per_expert:
         return router_fn
 
-    def balanced_router(module: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Spread slots across destination ranks before cycling their experts.
+    def resolved_router(module: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+        """Resolve dispatch indices and optional counts while preserving learned weights.
 
         Args:
             module: MoE block exposing the learned gate.
             hidden_states: Local token activations passed to the learned router.
 
         Returns:
-            Balanced expert indices and unchanged learned routing weights.
+            Dispatch indices, learned weights, and optional current local expert counts.
         """
-        indices, weights = router_fn(module, hidden_states)
+        result = router_fn(module, hidden_states)
+        indices, weights = result[:2]
         expert_count = module.gate.num_experts
-        if expert_count <= 0 or ep_size <= 0 or expert_count % ep_size != 0:
-            raise ValueError("The positive global expert count must be divisible by the positive EP size")
-        local_count = expert_count // ep_size
-        slots = torch.arange(indices.numel(), device=indices.device, dtype=torch.long)
-        balanced = (slots % ep_size) * local_count + (slots // ep_size) % local_count
-        return balanced.view_as(indices).to(indices.dtype), weights
+        if fix_router:
+            if expert_count <= 0 or ep_size <= 0 or expert_count % ep_size != 0:
+                raise ValueError("The positive global expert count must be divisible by the positive EP size")
+            local_count = expert_count // ep_size
+            slots = torch.arange(indices.numel(), device=indices.device, dtype=torch.long)
+            balanced = (slots % ep_size) * local_count + (slots // ep_size) % local_count
+            indices = balanced.view_as(indices).to(indices.dtype)
+        if return_tokens_per_expert:
+            return indices, weights, None if fix_router else result[2]
+        return indices, weights
 
-    return balanced_router
+    return resolved_router
 
 
 @local_compute
@@ -394,17 +404,27 @@ def deepseek_v41_megamoe_compute_fn(
             # Slicing multiple batch rows leaves gaps, which native MegaGate rejects.
             local_image_mask = local_image_mask.contiguous()
 
-        def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            """Keep training metadata attached to the learned gate before balancing."""
-            return _router(
+        def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+            """Keep training metadata and reusable counts attached to the learned gate.
+
+            Args:
+                target: MoE block owning the learned router.
+                states: Local token activations before expert dispatch.
+            """
+            result = _router(
                 target, states, local_image_mask,
                 router_token_mask=_local_router_metadata(router_token_mask, states, tp_mesh),
                 router_sequence_ids=_local_router_metadata(router_sequence_ids, states, tp_mesh),
                 router_num_sequences=router_num_sequences, sequence_partition_groups=sequence_groups,
+                return_tokens_per_expert=not fix_router,
             )
+            return (*result, None) if fix_router else result
 
-        indices, weights = _resolve_router(router_fn, fix_router=fix_router, ep_size=ep_size)(module, hidden_states)
-        return module.experts(hidden_states, indices, weights) + module.shared_experts(hidden_states)
+        indices, weights, counts = _resolve_router(
+            router_fn, fix_router=fix_router, ep_size=ep_size, return_tokens_per_expert=True,
+        )(module, hidden_states)
+        routed = module.experts(hidden_states, indices, weights, tokens_per_expert=counts)
+        return routed + module.shared_experts(hidden_states)
 
     if "image_mask" in inspect.signature(module.forward).parameters:
         return compute_fn

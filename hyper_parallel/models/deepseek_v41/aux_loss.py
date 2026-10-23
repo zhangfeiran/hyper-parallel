@@ -117,7 +117,8 @@ def accumulate_router_load(
         image_mask: torch.Tensor | None,
         token_mask: torch.Tensor | None,
         accumulator: torch.Tensor,
-) -> torch.Tensor:
+        *, return_counts: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Attach text/image load accumulation to the router's backward path.
 
     Args:
@@ -126,6 +127,7 @@ def accumulate_router_load(
         image_mask: Boolean token mask; true means image, otherwise text.
         token_mask: Boolean token mask; true tokens contribute.
         accumulator: Integer [2, E] step counter, text then image.
+        return_counts: Also return reusable local dispatch counts, or None when token_mask filters the load.
     """
     num_tokens, top_k = selected_experts.shape
     modalities = selected_experts.new_zeros(num_tokens) if image_mask is None else image_mask.reshape(-1).long()
@@ -136,7 +138,11 @@ def accumulate_router_load(
     ).view_as(accumulator)
     if torch.is_grad_enabled() and not weights.requires_grad:
         weights = weights.detach().requires_grad_()
-    return _AccumulateRouterLoad.apply(weights, counts, accumulator)
+    weights = _AccumulateRouterLoad.apply(weights, counts, accumulator)
+    if return_counts:
+        dispatch_counts = None if token_mask is not None else (counts[0] if image_mask is None else counts.sum(dim=0))
+        return weights, dispatch_counts
+    return weights
 
 
 @torch.no_grad()

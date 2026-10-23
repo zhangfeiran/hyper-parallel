@@ -205,7 +205,8 @@ def _apply_router_training_state(
         sequence_partition_groups: tuple[Any, ...],
         sequence_ids: torch.Tensor | None,
         num_sequences: int | None,
-) -> torch.Tensor:
+        *, return_tokens_per_expert: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Attach sequence auxiliary gradients and deferred modality counts."""
     if token_mask is not None:
         if token_mask.shape != hidden_states.shape[:-1] or token_mask.dtype != torch.bool:
@@ -234,8 +235,12 @@ def _apply_router_training_state(
         module.last_aux_loss = aux_loss.detach()
         weights = aux_loss_auto_scale(weights, aux_loss * module.aux_loss_coeff)
     if module.training and module.enable_expert_bias:
-        weights = accumulate_router_load(weights, indices, image_mask, token_mask, module.tokens_per_expert)
-    return weights
+        return accumulate_router_load(
+            weights, indices, image_mask, token_mask, module.tokens_per_expert,
+            return_counts=return_tokens_per_expert,
+        )
+    return (weights, None) if return_tokens_per_expert else weights
+
 
 
 class DeepseekV41TopKRouter(nn.Module):
@@ -277,7 +282,8 @@ class DeepseekV41TopKRouter(nn.Module):
             sequence_partition_groups: tuple[Any, ...] = (),
             sequence_ids: torch.Tensor | None = None,
             num_sequences: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return_tokens_per_expert: bool = False,
+    ) -> tuple[torch.Tensor | None, ...]:
         """Return raw logits, routing weights, and selected experts.
 
         ``bias`` and ``bias_vl`` select experts only; the gathered routing
@@ -292,11 +298,13 @@ class DeepseekV41TopKRouter(nn.Module):
                 one microbatch's token stream, supplied by the parallel adapter.
             sequence_ids: Optional logical sample IDs matching the token dimensions.
             num_sequences: Total logical samples, including samples absent on this rank.
+            return_tokens_per_expert: Append reusable unmasked local counts, or None when unavailable.
 
         Returns:
             Flattened logits, scaled top-k weights, and expert indices. During
             training with a positive coefficient, weights carry the auxiliary
             gradient and ``last_aux_loss`` stores its unweighted detached value.
+            When requested, a fourth result provides current dispatch counts or None.
         """
         flattened = hidden_states.reshape(-1, self.hidden_size)
         logits = functional.linear(  # pylint: disable=not-callable
@@ -329,7 +337,11 @@ class DeepseekV41TopKRouter(nn.Module):
             sequence_partition_groups,
             sequence_ids,
             num_sequences,
+            return_tokens_per_expert=return_tokens_per_expert,
         )
+        if return_tokens_per_expert:
+            weights, counts = weights
+            return logits, weights, indices, counts
         return logits, weights, indices
 
     @torch.no_grad()

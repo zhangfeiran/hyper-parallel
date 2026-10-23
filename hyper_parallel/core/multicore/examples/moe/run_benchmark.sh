@@ -23,11 +23,10 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 if [[ "$PYTHON_BIN" != */* ]]; then
     PYTHON_BIN=$(command -v "$PYTHON_BIN") || die "Python is not executable: $PYTHON_BIN"
 fi
-TORCHRUN_BIN="${TORCHRUN_BIN:-$(dirname "$PYTHON_BIN")/torchrun}"
 CANN_ENV_FILE="${CANN_ENV_FILE:-/usr/local/Ascend/cann/set_env.sh}"  # codespell:ignore cann
 NATIVE_ENV_FILE="${NATIVE_ENV_FILE:-$ROOT/build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash}"
 SHMEM_LIB_DIR="${SHMEM_LIB_DIR:-$ROOT/build/native/payload/hyper_parallel/core/multicore/shmem/lib/shmem}"
-VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-}"
 NNODES_VALUE="${NNODES:-1}"
 NPROC_PER_NODE_VALUE="${NPROC_PER_NODE:-8}"
 NODE_RANK_VALUE="${NODE_RANK:-0}"
@@ -46,8 +45,7 @@ source_env() {
 }
 
 [[ -x "$PYTHON_BIN" ]] || die "Python is not executable: $PYTHON_BIN"
-[[ -x "$TORCHRUN_BIN" ]] || die "torchrun is not executable: $TORCHRUN_BIN"
-[[ -f "$SCRIPT_DIR/qwen_moe_benchmark.py" ]] || \
+[[ -f "$SCRIPT_DIR/benchmark.py" ]] || \
     die "benchmark runner is missing under $ROOT"
 [[ -d "$SHMEM_LIB_DIR" ]] || die "SHMEM library directory is missing: $SHMEM_LIB_DIR"
 [[ "$NNODES_VALUE" =~ ^[0-9]+$ ]] || die "NNODES must be an integer"
@@ -55,8 +53,25 @@ source_env() {
 [[ "$NODE_RANK_VALUE" =~ ^[0-9]+$ ]] || die "NODE_RANK must be an integer"
 [[ "$MASTER_PORT_VALUE" =~ ^[0-9]+$ ]] || die "MASTER_PORT must be an integer"
 [[ "$SHMEM_PORT_VALUE" =~ ^[0-9]+$ ]] || die "SHMEM_PORT must be an integer"
-((NNODES_VALUE * NPROC_PER_NODE_VALUE == 8)) || \
-    die "NNODES * NPROC_PER_NODE must equal the benchmark EP size 8"
+((NNODES_VALUE > 0 && NPROC_PER_NODE_VALUE > 0)) || \
+    die "NNODES and NPROC_PER_NODE must be positive"
+((NODE_RANK_VALUE < NNODES_VALUE)) || die "NODE_RANK must be smaller than NNODES"
+
+if [[ -z "$VISIBLE_DEVICES" ]]; then
+    for ((device_index = 0; device_index < NPROC_PER_NODE_VALUE; device_index++)); do
+        VISIBLE_DEVICES+="${VISIBLE_DEVICES:+,}$device_index"
+    done
+fi
+[[ "$VISIBLE_DEVICES" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || \
+    die "ASCEND_RT_VISIBLE_DEVICES must be a comma-separated list of nonnegative device IDs"
+IFS=',' read -r -a VISIBLE_DEVICE_IDS <<< "$VISIBLE_DEVICES"
+((${#VISIBLE_DEVICE_IDS[@]} >= NPROC_PER_NODE_VALUE)) || \
+    die "ASCEND_RT_VISIBLE_DEVICES has fewer devices than NPROC_PER_NODE=$NPROC_PER_NODE_VALUE"
+declare -A SEEN_DEVICE_IDS=()
+for device_id in "${VISIBLE_DEVICE_IDS[@]}"; do
+    [[ -z "${SEEN_DEVICE_IDS[$device_id]:-}" ]] || die "duplicate visible device ID: $device_id"
+    SEEN_DEVICE_IDS[$device_id]=1
+done
 
 cd "$ROOT"
 source_env "$CANN_ENV_FILE"
@@ -77,11 +92,11 @@ case "$IMPORTED_PACKAGE" in
 esac
 
 exec timeout --kill-after=60s "$TIMEOUT_SECONDS" \
-    "$TORCHRUN_BIN" \
+    "$PYTHON_BIN" -m torch.distributed.run \
     --nnodes="$NNODES_VALUE" \
     --nproc_per_node="$NPROC_PER_NODE_VALUE" \
     --node_rank="$NODE_RANK_VALUE" \
     --master_addr="$MASTER_ADDR_VALUE" \
     --master_port="$MASTER_PORT_VALUE" \
-    hyper_parallel/core/multicore/examples/mega_moe/qwen_moe_benchmark.py \
+    hyper_parallel/core/multicore/examples/moe/benchmark.py \
     "$@"

@@ -5,8 +5,8 @@ Launcher 保持无框架导入，设备断言放在 `_test_*.py` worker 中。
 所有 multicore launcher 通过 `_case_launcher.py` 启动 worker：在继承的
 `ASCEND_RT_VISIBLE_DEVICES` 范围内选择物理卡，并对重叠设备加进程锁。
 未设置掩码时使用从 0 开始的卡号；不同卡集合仍可并行。锁只在 multicore 测试间生效，
-等待不计入 worker 超时；默认 420 秒，合并后的动态 token worker 为 840 秒，
-等于原两套 worker 的总预算。SHMEM launcher 保留原有不设内部超时的行为。
+等待不计入 worker 超时；默认 420 秒，合并后的动态 token 和 MegaGate forward/backward
+worker 均为 840 秒，等于各自原两套 worker 的总预算。SHMEM launcher 保留原有不设内部超时的行为。
 启动日志分别记录设备等待时间和实际卡号，便于区分排队与执行耗时。
 约束见 [测试规则](../../../.agent/rules/testing.md) 和 [环境要求](../../../AGENTS.md)。
 

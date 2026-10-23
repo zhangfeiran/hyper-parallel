@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Model-facing Torch module for shifted BF16 HyperMegaMhc."""
+"""Model-facing MegaMhc module for shifted BF16 mHC."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
 
+from .._precision import preserve_fp32_parameters
 from ..mega_mhc_common import (
     MHC_MAPPINGS,
     MHC_SINKHORN_ITERS,
@@ -31,7 +33,7 @@ from .function import hyper_mega_mhc
 from .graph import DEFAULT_TOKEN_TILE
 
 
-class HyperMegaMhc(torch.nn.Module):
+class MegaMhc(torch.nn.Module):
     """Own the current layer's mapping predictor and input RMSNorm weight.
 
     Note:
@@ -53,7 +55,7 @@ class HyperMegaMhc(torch.nn.Module):
         super().__init__()
         validate_mega_mhc_hidden_size(hidden_size, need_backward=True)
         if num_iters != MHC_SINKHORN_ITERS:
-            raise ValueError(f"initial HyperMegaMhc requires num_iters={MHC_SINKHORN_ITERS}, got {num_iters}.")
+            raise ValueError(f"MegaMhc requires num_iters={MHC_SINKHORN_ITERS}, got {num_iters}.")
         if not isinstance(token_tile, int) or isinstance(token_tile, bool) or token_tile <= 0:
             raise ValueError(f"token_tile must be a positive integer, got {token_tile!r}.")
         self.hidden_size = hidden_size
@@ -75,6 +77,39 @@ class HyperMegaMhc(torch.nn.Module):
             mean=0.0,
             std=(MHC_STREAMS * hidden_size) ** -0.5,
         )
+
+    def _apply(self, fn: Callable, recurse: bool = True) -> MegaMhc:
+        """Keep mapping predictors FP32 when the enclosing model changes dtype or device."""
+        return super()._apply(preserve_fp32_parameters(self, fn, ("phi", "alpha", "bias")), recurse=recurse)
+
+    @classmethod
+    def from_module(cls, module: torch.nn.Module) -> MegaMhc:
+        """Bind an existing four-stream, shifted mHC module without replacing its Parameters.
+
+        Args:
+            module: Source with hidden_size, hc_eps, norm_eps, num_iters and Parameters
+                phi [24, 4H], alpha [3], bias [24], norm_weight [H]. Predictor Parameters must be FP32.
+
+        Returns:
+            Boundary sharing all original Parameters and mathematical configuration.
+        """
+        configuration = {}
+        for name in ("hidden_size", "hc_eps", "norm_eps", "num_iters"):
+            if not hasattr(module, name):
+                raise ValueError(f"source mHC module must expose {name}")
+            configuration[name] = getattr(module, name)
+        phi = getattr(module, "phi", None)
+        if not isinstance(phi, torch.nn.Parameter):
+            raise TypeError("source phi must be an FP32 Parameter [24, 4H]")
+        result = cls(**configuration, device=phi.device)
+        for name in ("phi", "alpha", "bias", "norm_weight"):
+            parameter = getattr(module, name, None)
+            expected = getattr(result, name)
+            if (not isinstance(parameter, torch.nn.Parameter) or parameter.shape != expected.shape
+                    or parameter.dtype != expected.dtype or parameter.device != expected.device):
+                raise ValueError(f"source {name} must match shape={tuple(expected.shape)}, dtype={expected.dtype}")
+            setattr(result, name, parameter)
+        return result
 
     def forward(
         self,

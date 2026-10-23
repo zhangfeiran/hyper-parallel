@@ -27,13 +27,13 @@ from tests.torch.multicore._test_env import (
 _WORKER = str(Path(__file__).resolve().parent / "_test_mega_gate.py")
 
 
-def _run_worker(case: str) -> None:
+def _run_worker(case: str, *, timeout: float = 420) -> None:
     """Run one MegaGate module worker on one NPU."""
     prepare_multicore_test_environment()
     if not multicore_adapter_is_available("hyper_parallel_mega_gate_torch"):
         raise RuntimeError("MegaGate ST requires a wheel or PYTHONPATH payload built with --multicore on")
     with without_inherited_rank_environment():
-        run_multicore_case(_WORKER, case, num_proc=1)
+        run_multicore_case(_WORKER, case, num_proc=1, timeout=timeout)
 
 
 @arg_mark(
@@ -53,20 +53,12 @@ def test_mega_gate_basic_parity() -> None:
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_mega_gate_forward_parity() -> None:
-    """Cover text, vision, empty, dynamic, and padded forward cases."""
-    _run_worker("test_mega_gate_forward_parity")
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level1",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_mega_gate_backward_parity() -> None:
-    """Cover text, vision, dynamic, and retained backward cases."""
-    _run_worker("test_mega_gate_backward_parity")
+def test_mega_gate_forward_backward_parity() -> None:
+    """Feature: MegaGate forward and backward.
+    Description: Run text, vision, empty, padding and gradient regressions in one worker.
+    Expectation: Match the independent references and retain invalid-input and second-derivative rejection.
+    """
+    _run_worker("test_mega_gate_forward_backward_parity", timeout=840)
 
 
 @arg_mark(

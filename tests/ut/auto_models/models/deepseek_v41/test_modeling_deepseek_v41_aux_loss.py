@@ -462,6 +462,8 @@ class TestV41NativeAuxLoss(unittest.TestCase):
 class TestV41MegaMoeAuxLoss(unittest.TestCase):
     """Run real router training state around a CPU replacement for native experts."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_megamoe_preserves_router_loss_gradients_and_loads(self) -> None:
         """Keep packed IDs, masks and independent aux switches through MegaMoe.
 
@@ -483,6 +485,7 @@ class TestV41MegaMoeAuxLoss(unittest.TestCase):
 
                         def execute(
                                 states: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor,
+                                *, tokens_per_expert: torch.Tensor | None = None,
                         ) -> torch.Tensor:
                             """Emulate only the native expert gradient carrier on CPU."""
                             del indices
@@ -547,9 +550,15 @@ class TestV41MegaMoeAuxLoss(unittest.TestCase):
         ep = Mock()
         ep.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
         router = Mock(num_experts=4, top_k=2,
-                      return_value=(torch.empty(4, 4), torch.ones(4, 2), torch.zeros(4, 2).long()))
+                      return_value=(torch.empty(4, 4), torch.ones(4, 2), torch.zeros(4, 2).long(), None))
+        def route(*args: object, **kwargs: object) -> tuple:
+            """Match the gate's optional count-returning contract."""
+            del args
+            return router.return_value if kwargs.get("return_tokens_per_expert") else router.return_value[:3]
+
+        router.side_effect = route
         experts = Mock(spec=DeepseekV41MegaMoeExperts, swiglu_limit=1.5, sequence_parallel=True)
-        experts.side_effect = lambda states, unused_indices, unused_weights: torch.zeros_like(states)
+        experts.side_effect = lambda states, unused_indices, unused_weights, **kwargs: torch.zeros_like(states)
         module = SimpleNamespace(
             gate=router, experts=experts, is_hash=False, forward=_v41_sparse_moe_forward,
             shared_experts=Mock(limit=1.5, side_effect=torch.zeros_like),

@@ -16,6 +16,7 @@
 """Verify component exports and absence of framework dispatch."""
 
 import ast
+import importlib
 import os
 import re
 import subprocess
@@ -109,13 +110,20 @@ class TestMulticoreBoundary(unittest.TestCase):
         Description: Inspect the component and HyperParallel root package symbols.
         Expectation: Business modules and profiler are exported only by Multicore.
         """
-        self.assertEqual(multicore.__all__, [
-            "HyperMegaMhc", "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
+        self.assertCountEqual(multicore.__all__, [
+            "MegaMhc", "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
             "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
         ])
         self.assertTrue(callable(multicore.prepare_mega_kernel_diagnostics))
+        for name in ("MhcState", "MegaMhcOutput", "GateOutput", "GateBackend"):
+            self.assertFalse(hasattr(multicore, name))
         for name in (
             "HyperMegaMhc",
+            "MegaMhc",
+            "MhcState",
+            "MegaMhcOutput",
+            "GateOutput",
+            "GateBackend",
             "MegaGate",
             "MegaMoeExperts",
             "MulticoreModule",
@@ -125,6 +133,21 @@ class TestMulticoreBoundary(unittest.TestCase):
             self.assertNotIn(name, hyper_parallel.__all__)
             self.assertFalse(hasattr(hyper_parallel, name))
         self.assertNotIn("hyper_parallel_shmem_torch", sys.modules)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_mhc_exposes_only_canonical_module_name(self) -> None:
+        """Feature: Single public mHC module name.
+        Description: Inspect component, mHC package and defining module exports.
+        Expectation: All paths expose the same MegaMhc class and none expose its removed alias.
+        """
+        package = importlib.import_module("hyper_parallel.core.multicore.modules.mega_mhc")
+        implementation = importlib.import_module("hyper_parallel.core.multicore.modules.mega_mhc.module")
+        for namespace in (multicore, package, implementation):
+            with self.subTest(namespace=namespace.__name__):
+                self.assertIs(namespace.MegaMhc, multicore.MegaMhc)
+                self.assertNotIn("HyperMegaMhc", getattr(namespace, "__all__", ()))
+                self.assertFalse(hasattr(namespace, "HyperMegaMhc"))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

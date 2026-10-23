@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU unit tests for HyperMegaMhc semantics and static validation."""
+"""CPU unit tests for MegaMhc semantics and static validation."""
 
 import unittest
 
 import torch
 
-from hyper_parallel.core.multicore.modules.mega_mhc.module import HyperMegaMhc
+from hyper_parallel.core.multicore.modules.mega_mhc.module import MegaMhc
 from tests.common.mark_utils import arg_mark
 from tests.common.multicore.mega_mhc_golden import torch_mega_mhc
 
 
-class TestHyperMegaMhc(unittest.TestCase):
+class TestMegaMhc(unittest.TestCase):
     """Validate shifted mapping semantics independently of NPU kernels."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -118,19 +118,19 @@ class TestHyperMegaMhc(unittest.TestCase):
     def test_module_rejects_unsupported_static_shapes(self) -> None:
         """Reject shapes outside the native static contract.
 
-        Feature: HyperMegaMhc input validation.
+        Feature: MegaMhc input validation.
         Description: Construct modules with unsupported hidden alignment and iterations.
         Expectation: Both invalid configurations raise descriptive errors.
         """
         with self.assertRaisesRegex(ValueError, "divisible by 128"):
-            HyperMegaMhc(127)
+            MegaMhc(127)
         with self.assertRaisesRegex(ValueError, "num_iters=20"):
-            HyperMegaMhc(128, num_iters=2)
+            MegaMhc(128, num_iters=2)
         with self.assertRaisesRegex(ValueError, "hidden_size <= 5760"):
-            HyperMegaMhc(7168)
+            MegaMhc(7168)
         for token_tile in (0, -1, 1.5, True):
             with self.subTest(token_tile=token_tile), self.assertRaisesRegex(ValueError, "token_tile"):
-                HyperMegaMhc(128, token_tile=token_tile)
+                MegaMhc(128, token_tile=token_tile)
 
 
 if __name__ == "__main__":

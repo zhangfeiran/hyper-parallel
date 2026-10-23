@@ -15,6 +15,6 @@
 """Single-Pass mHC multicore module and fused forward entry point."""
 
 from .function import hyper_mega_mhc
-from .module import HyperMegaMhc
+from .module import MegaMhc
 
-__all__ = ["HyperMegaMhc", "hyper_mega_mhc"]
+__all__ = ["MegaMhc", "hyper_mega_mhc"]

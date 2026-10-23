@@ -137,7 +137,7 @@ local_compute_fn:
                 module.forward = MethodType(_v41_sparse_moe_forward, module)
                 module.experts = Mock(
                     spec=DeepseekV41MegaMoeExperts, global_experts=8, swiglu_limit=1.5,
-                    side_effect=lambda states, indices, weights: states,
+                    side_effect=lambda states, indices, weights, **kwargs: states,
                 )
                 module.shared_experts = Mock(limit=1.5, side_effect=torch.zeros_like)
                 ep_mesh = MagicMock()
@@ -229,10 +229,13 @@ local_compute_fn:
     @staticmethod
     def _execute_mega_experts(
             inputs: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor,
-            *, expert_weights: tuple[torch.Tensor, torch.Tensor],
+            *, expert_weights: tuple[torch.Tensor, torch.Tensor], tokens_per_expert: torch.Tensor,
     ) -> torch.Tensor:
         """Execute the native packed parameter layout using CPU differentiable math."""
         gate_up, down = expert_weights
+        if tokens_per_expert is not None:
+            expected_counts = torch.stack([(indices == expert).sum() for expert in range(gate_up.shape[0])])
+            torch.testing.assert_close(tokens_per_expert.long(), expected_counts, rtol=0, atol=0)
         states = inputs.reshape(-1, inputs.shape[-1])
         output = torch.zeros_like(states)
         for slot in range(indices.shape[1]):
@@ -403,8 +406,13 @@ local_compute_fn:
         local_mask = image_mask
         captured = {}
 
-        def execute(inputs: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        def execute(inputs: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor,
+                    tokens_per_expert: torch.Tensor | None = None) -> torch.Tensor:
             """Keep expert identities and differentiable weights observable on CPU."""
+            self.assertEqual(tokens_per_expert is None, not megamoe or fixed)
+            if tokens_per_expert is not None:
+                expected_counts = torch.stack([(indices == expert).sum() for expert in range(module.gate.num_experts)])
+                torch.testing.assert_close(tokens_per_expert.long(), expected_counts, rtol=0, atol=0)
             captured.update(indices=indices, weights=weights)
             factors = (weights * (indices + 1)).sum(-1).reshape(1, 10, 1)
             return inputs * factors
@@ -491,13 +499,21 @@ local_compute_fn:
                 indices, actual_weights = ep_adapter._resolve_router(real_router, ep_size=peers, fix_router=True)(
                     module, states,
                 )
+                real_router.assert_called_once_with(module, states)
+                real_router.return_value = (*real_router.return_value, None)
+                for fixed in (False, True):
+                    routed_ids, routed_weights, histogram = ep_adapter._resolve_router(
+                        real_router, ep_size=peers, fix_router=fixed, return_tokens_per_expert=True,
+                    )(module, states)
+                    self.assertIsNone(histogram)
+                    self.assertEqual(routed_ids.shape, indices.shape)
+                    self.assertIs(routed_weights, weights)
                 cycle = [rank * local_count + offset for offset in range(local_count) for rank in range(peers)]
                 expected = torch.tensor(
                     [cycle[slot % experts] for slot in range(tokens * top_k)], dtype=torch.int32,
                 ).view(tokens, top_k)
                 torch.testing.assert_close(indices, expected)
                 self.assertIs(actual_weights, weights)
-                real_router.assert_called_once_with(module, states)
                 counts = torch.bincount(indices.flatten().long() // local_count, minlength=peers)
                 self.assertLessEqual((counts.max() - counts.min()).item(), 1)
 

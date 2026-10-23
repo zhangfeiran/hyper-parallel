@@ -121,13 +121,14 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
-                top_k_weights: torch.Tensor) -> torch.Tensor:
+                top_k_weights: torch.Tensor, tokens_per_expert: torch.Tensor | None = None) -> torch.Tensor:
         """Execute with the current parameters supplied by FSDP unshard hooks.
 
         Args:
             hidden_states: Token states before any EP dispatch.
             top_k_index: Global expert IDs selected by the unchanged router.
             top_k_weights: Differentiable router weights, including source scaling.
+            tokens_per_expert: Current local Router counts over global experts, including all dispatched rows.
 
         Returns:
             Routed output with the same shape as hidden_states.
@@ -136,7 +137,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             raise RuntimeError("Configure MegaMoe EP execution before forward")
         weights = tuple(parameter.to_local() if isinstance(parameter, DTensor) else parameter
                         for parameter in (self.gate_up_proj, self.down_proj))
-        return self._executor(hidden_states, top_k_index, top_k_weights, expert_weights=weights)
+        return self._executor(hidden_states, top_k_index, top_k_weights,
+                              expert_weights=weights, tokens_per_expert=tokens_per_expert)
 
     @staticmethod
     def prepare_runtime_group(experts: list[DeepseekV41MegaMoeExperts]) -> None:
