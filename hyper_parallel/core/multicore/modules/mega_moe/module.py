@@ -20,6 +20,7 @@ __all__ = ["MegaMoeExperts"]
 
 import math
 import struct
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -28,6 +29,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.multicore import _automatic, shmem
+from hyper_parallel.core.multicore.diagnostics.common.session import _get_execution_observer
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
@@ -241,12 +243,22 @@ class _MegaMoeExecutionResources:
                                f"requested={tokens}, capacity={self._token_capacity}")
         bucket = 1 << (max(128, tokens) - 1).bit_length()
         plan = self._plans.get(bucket)
-        if plan is None or plan.spec.plan_tokens < tokens:
+        build = plan is None or plan.spec.plan_tokens < tokens
+        observer = _get_execution_observer()
+        started = time.perf_counter() if observer is not None and build else None
+        if build:
             schedule_tokens = min(bucket, self._token_capacity)
             plan = build_mega_moe_plan(replace(self.spec, schedule_tokens=schedule_tokens), device)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.
             self._plans[bucket] = plan
+        if observer is not None:
+            observer.record_event("plan", {
+                "requested_tokens": tokens, "bucket": bucket, "schedule_tokens": plan.spec.plan_tokens,
+                "cache_hit": not build, "cached_plans": len(self._plans),
+                "execution_resource": id(self),
+                "build_cpu_ms": (time.perf_counter() - started) * 1000 if started is not None else 0.0,
+            })
         return plan
 
     def close(self) -> None:
@@ -267,6 +279,26 @@ class MegaMoeExperts(MulticoreModule):
     their first forward to share one automatically growing workspace while keeping
     independent parameters and optimizer state.
     """
+
+    def execution_state(self) -> dict[str, Any]:
+        """Report current capacity and shared plan keys without allocating resources."""
+        state = super().execution_state()
+        resources = self._resource_group.resources
+        state.update({
+            "parameter_mode": "external" if self.gate_up_weight is None else "owned",
+            "execution_resource": id(resources) if resources is not None else None,
+            "token_mode": "fixed" if self.local_num_tokens is not None else (
+                "bounded" if self.max_local_num_tokens is not None else "automatic"),
+            "token_capacity": getattr(resources, "_token_capacity", None),
+            "plan_buckets": sorted(getattr(resources, "_plans", {})),
+            "shmem_heap_bytes": getattr(getattr(resources, "heap_manager", None), "heap_bytes", None),
+            "receive_capacity": getattr(getattr(resources, "workspace", None), "capacity_floor", None),
+        })
+        if self._ep_group is not None and dist.is_initialized() and not self._resource_closed:
+            state["ep_ranks"] = dist.get_process_group_ranks(self._ep_group)
+        else:
+            state["ep_ranks"] = None
+        return state
 
     @classmethod
     def from_module(
@@ -291,6 +323,8 @@ class MegaMoeExperts(MulticoreModule):
                 value = value.to_local()
             if not isinstance(value, torch.Tensor) or value.ndim != 3:
                 raise ValueError(f"source {name} must be a materialized local rank-three expert tensor")
+            if value.is_meta:
+                raise ValueError(f"source {name} is meta; materialize and initialize/load weights before from_module")
             values.append(value)
         gate, up, down = values[0], values[1], values[2]
         if (up.shape != gate.shape or down.shape != (gate.shape[0], gate.shape[2], gate.shape[1])
@@ -655,6 +689,7 @@ class MegaMoeExperts(MulticoreModule):
                 resources.ensure_capacity(route.maximum_received_slots)
             plan = resources.plan if not resources.spec.dynamic_tokens else resources.plan_for_tokens(
                 route.metadata.plan_tokens, hidden_flat.device)
+            self._record_execution_route(route, plan, hidden_flat.shape[0])
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,
@@ -677,6 +712,17 @@ class MegaMoeExperts(MulticoreModule):
             topk_weights,
         )
         return output.reshape(hidden_states.shape)
+
+    def _record_execution_route(self, route: Any, plan: Any, tokens: int) -> None:
+        """Describe an existing route only when the execution observer is selected."""
+        observer = _get_execution_observer()
+        if observer is not None:
+            observer.record_event("moe", {
+                "resource_group": self._resource_group.identifier,
+                "local_tokens": tokens, "schedule_tokens": plan.spec.plan_tokens,
+                "maximum_received_rows": route.maximum_received_slots,
+                "local_receive_capacity": route.metadata.expert_capacity,
+            })
 
     def _create_execution_resources(
         self,

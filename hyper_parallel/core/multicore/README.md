@@ -36,7 +36,9 @@ mHC 是独立的跨层连接结构，和 MoE 并无绑定关系。只有原网�
 1. 从下方单组件命令判断环境与形状是否适用。
 2. 按[已有模块与权重迁移](examples/README.md#已有模块与权重迁移)替换原模块。
 3. 在[组合训练示例](examples/README.md#组合训练验证)中验证状态传递、梯度及优化器更新。
-4. 有测量需求时再阅读本文的容量/通信调优，以及[内部架构](docs/architecture.md)、
+4. 用[训练接入与运行检查](docs/mega_moe_integration.md)核对参数归属、初始化和实际执行状态，
+   在原训练循环中按需开启 `diagnostics.execution_monitor`，无需业务源码注入。
+5. 有测量需求时再阅读本文的容量/通信调优，以及[内部架构](docs/architecture.md)、
    [构建与交付](docs/build.md)、[Profiling](docs/mega_kernel_profiling.md)和[私有 SHMEM 生命周期](docs/shmem.md)。
 
 ## 单组件最小示例

@@ -32,6 +32,15 @@ python -m hyper_parallel.core.multicore.examples.minimal_moe
 python -m hyper_parallel.core.multicore.examples.minimal_mhc
 ```
 
+需要检查实际容量、计划命中和路由负载时，MoE 入口直接添加一个选项：
+
+```bash
+python -m hyper_parallel.core.multicore.examples.minimal_moe --diagnostic-output ./moe_execution
+```
+
+该命令保留一次前向/反向精度检查，并写出独立进程的 Host 执行报告。已有训练模型的接入点、
+FSDP/优化器边界及完整采样校验见[训练接入与运行检查](../docs/mega_moe_integration.md)。
+
 | 入口 | 最小输入及迁移 | 检查内容 |
 | --- | --- | --- |
 | [minimal_gate.py](minimal_gate.py) | `[1, 128, 512]`，从已有投影/修正偏置构造 Gate | logits、TopK ID/权重、输入与投影梯度；报告实际后端 |
