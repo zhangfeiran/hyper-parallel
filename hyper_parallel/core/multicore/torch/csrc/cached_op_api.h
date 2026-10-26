@@ -16,6 +16,13 @@
 #define HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
 
 #include "op_plugin/include/npu_cpp_extension.h"
+#include <torch/version.h>
+
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 12)
+#define HP_MULTICORE_PTA_LEVEL_CACHE_API 1
+#else
+#define HP_MULTICORE_PTA_LEVEL_CACHE_API 0
+#endif
 
 namespace hyper_parallel::multicore {
 
@@ -30,24 +37,36 @@ struct CachedOpApi {
   }
 
   void init_context() const {
+#if HP_MULTICORE_PTA_LEVEL_CACHE_API
+    InitExecCommonCtx();
+#else
     if (init_memory != nullptr) {
       init_memory(nullptr, false);
     }
+#endif
   }
 
   void release_context() const {
+#if HP_MULTICORE_PTA_LEVEL_CACHE_API
+    ReleaseExecCommonCtx();
+#else
     if (release_memory != nullptr) {
       release_memory(nullptr, false);
     }
+#endif
   }
 
   void uninit_context() const {
+#if HP_MULTICORE_PTA_LEVEL_CACHE_API
+    UnInitExecCommonCtx();
+#else
     if (uninit_memory != nullptr) {
       uninit_memory(nullptr, false);
     }
     if (uninit_cache != nullptr) {
       uninit_cache();
     }
+#endif
   }
 
   const char *name;
@@ -68,13 +87,26 @@ void execute_cached_op(const CachedOpApi &api, Args &...args) {
   if (task_queue_enable == 2) {
     auto copied_params = CopyTypesV2(args...);
     auto cache_params = GetCacheParams();
+#if HP_MULTICORE_PTA_LEVEL_CACHE_API
+    const auto level = c10_npu::GetDeterministicLevel();
+    auto acl_call = [api, copied_params, stream, cache_params, level]() -> int {
+#else
     auto acl_call = [api, copied_params, stream, cache_params]() -> int {
+#endif
       InitExecSubTheadCtx(stream);
       int status = 0;
+#if HP_MULTICORE_PTA_LEVEL_CACHE_API
+      at_npu::native::ApplyDeterministicLevel(
+          static_cast<int64_t>(level), at::globalContext().deterministicAlgorithms(), true);
+      if (hit_cache_v2_ext(stream, api.name, api.execute, copied_params, &status, cache_params, level)) {
+#else
       if (hit_cache_v2_ext(stream, api.name, api.execute, copied_params, &status, cache_params)) {
+#endif
         return status;
       }
+#if !HP_MULTICORE_PTA_LEVEL_CACHE_API
       SetExecConfigV2(cache_params);
+#endif
       api.init_context();
       uint64_t workspace_size = 0;
       aclOpExecutor *executor = nullptr;
@@ -91,11 +123,21 @@ void execute_cached_op(const CachedOpApi &api, Args &...args) {
     RunAclCall(api.name, acl_call);
     return;
   }
+#if HP_MULTICORE_PTA_LEVEL_CACHE_API
+  api.init_context();
+  const auto level = c10_npu::GetDeterministicLevel();
+  at_npu::native::ApplyDeterministicLevel(
+      static_cast<int64_t>(level), at::globalContext().deterministicAlgorithms(), true);
+  if (hit_cache_ext(stream, api.name, api.execute, level, args...)) {
+#else
   if (hit_cache_ext(stream, api.name, api.execute, args...)) {
+#endif
     return;
   }
+#if !HP_MULTICORE_PTA_LEVEL_CACHE_API
   SetExecConfig();
   api.init_context();
+#endif
   uint64_t workspace_size = 0;
   aclOpExecutor *executor = nullptr;
   auto *workspace_size_addr = &workspace_size;
@@ -117,5 +159,7 @@ void execute_cached_op(const CachedOpApi &api, Args &...args) {
 }
 
 }  // namespace hyper_parallel::multicore
+
+#undef HP_MULTICORE_PTA_LEVEL_CACHE_API
 
 #endif  // HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
