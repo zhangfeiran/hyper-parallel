@@ -19,8 +19,9 @@ __aicore__ inline void RunBlaze(const Problem& problem, GM_ADDR a, GM_ADDR b, GM
       static_cast<uint64_t>(tiling.baseM), static_cast<uint64_t>(tiling.baseN), k_l1,
       static_cast<uint32_t>(tiling.baseM), static_cast<uint32_t>(tiling.baseN),
       static_cast<uint32_t>(tiling.baseK), 2, static_cast<uint16_t>(tiling.dbL0C), nullptr, 0};
+  const auto tail = SplitTail(problem.m, problem.n, tiling.baseM, tiling.baseN, cubes);
   typename Block::BlockSchedulerGmmNoQuant::Params schedule_params{
-      tiling.baseM, tiling.baseN, 1, 1, 1, 1, -1, 1, static_cast<int64_t>(problem.m),
+      tiling.baseM, tiling.baseN, tail.m, tail.n, 1, 1, -1, 1, static_cast<int64_t>(problem.m),
       true, true, true, Mmad::TRANS_B, false, sizeof(bfloat16_t)};
   Block::BlockSchedulerGmmNoQuant schedule(schedule_params);
   typename Mmad::TupleShape shape{static_cast<int64_t>(problem.m), static_cast<int64_t>(problem.n),
@@ -66,6 +67,7 @@ __aicore__ inline void ExecuteBlazeTask(const Task& task, GM_ADDR* inputs, uint3
   const uint64_t start = expert == 0 ? 0 : groups.GetValue(expert - 1);
   const uint64_t rows = groups.GetValue(expert) - start;
   if (rows == 0) return;
+  AscendC::AscendCUtils::SetOverflow(1);
   GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, tiling, inputs[task.tiling_data_position]);
   const bool trans_a = task.inputs[0].transpose_flag == 1;
   const bool trans_b = task.inputs[1].transpose_flag == 1;

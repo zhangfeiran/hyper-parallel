@@ -22,7 +22,8 @@ __aicore__ inline void RunCgmct(const Problem& problem, GM_ADDR a, GM_ADDR b, GM
   tiling.singleCoreM = problem.m;
   tiling.singleCoreN = problem.n;
   tiling.singleCoreK = problem.k;
-  typename Kernel::GMMTiling group{1, 0, 0, 1, 1, 1, 0, 1, 1, 0};
+  const auto tail = SplitTail(problem.m, problem.n, tiling.baseM, tiling.baseN, cubes);
+  typename Kernel::GMMTiling group{1, 0, 0, 1, 1, 1, 0, tail.m, tail.n, 0};
   group.matmulTiling = &tiling;
   typename Kernel::Params params{{1, 1, 1, 1}, {a, b, c, nullptr, nullptr}, {}, group};
   AscendC::TPipe pipe;
@@ -50,6 +51,7 @@ __aicore__ inline void ExecuteCgmctTask(const Task& task, GM_ADDR* inputs, uint3
   const uint64_t start = expert == 0 ? 0 : groups.GetValue(expert - 1);
   const uint64_t rows = groups.GetValue(expert) - start;
   if (rows == 0) return;
+  AscendC::AscendCUtils::SetOverflow(1);
   GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, tiling, inputs[task.tiling_data_position]);
   const bool trans_a = task.inputs[0].transpose_flag == 1;
   const bool trans_b = task.inputs[1].transpose_flag == 1;

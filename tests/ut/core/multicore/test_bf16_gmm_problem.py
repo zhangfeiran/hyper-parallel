@@ -59,6 +59,22 @@ int main() {
       start += rows;
     }
   }
+  const auto up = MulticoreBf16::SplitTail(2048, 3584, 256, 256, 32);
+  assert(up.m == 2 && up.n == 1);
+  const auto full = MulticoreBf16::SplitTail(2048, 5120, 256, 256, 32);
+  assert(full.m == 1 && full.n == 1);
+  const auto small = MulticoreBf16::SplitTail(1, 1, 256, 256, 32);
+  assert(small.m == 1 && small.n == 1);
+  for (uint64_t rows = 1; rows < 8192; rows += 127) {
+    const uint64_t tiles = ((rows + 255) / 256) * 14;
+    const auto split = MulticoreBf16::SplitTail(rows, 3584, 256, 256, 32);
+    const uint64_t tail = tiles <= 32 ? 0 : tiles % 32;
+    if (tail == 0) assert(split.m == 1 && split.n == 1);
+    else {
+      assert(split.m * split.n * tail <= 32);
+      assert((split.m + 1) * split.n * tail > 32);
+    }
+  }
   return 0;
 }
 '''
