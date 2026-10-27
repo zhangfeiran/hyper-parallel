@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #endif
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
+#include "runtime/bf16_clamp.h"
 
 using namespace AscendC;
 
@@ -100,6 +101,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       float value;
     } encoded = {};
     encoded.bits = task_desc.extra_value_0;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+      return Bf16ClampLimit(encoded.value);
+    }
+#endif
     return encoded.value;
   }
 
