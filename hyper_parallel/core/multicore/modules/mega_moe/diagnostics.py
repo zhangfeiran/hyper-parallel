@@ -17,7 +17,7 @@
 __all__ = []
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 from hyper_parallel.core.multicore.scheduler.config import (
     TaskDescC,
@@ -49,7 +49,7 @@ def _resolve_expert_owner(
     operator: OperatorNode,
     task_desc: TaskDescC,
     raw_context: Any,
-) -> int:
+) -> Optional[int]:
     """Resolve the global expert ID from a graph operator and its concrete task."""
     context = _require_diagnostic_context(raw_context)
     topology = context.topology
@@ -79,6 +79,10 @@ def _resolve_expert_owner(
             return rank_owner_base + expert_index % topology.single_rank_expert_num
         raise ValueError(f"MegaMoe AllToAll operator has no expert owner rule: {operator.name!r}")
 
+    if operator.op_type in (OpType.WEIGHTED_UNPERMUTE, OpType.REMOTE_WRITE_ACQUIRE,
+                            OpType.UNPERMUTE_REDUCE_GRAD, OpType.TOPK_WEIGHT_GRAD):
+        # Token reductions mix experts; they have no individual expert owner.
+        return None
     raise ValueError(f"MegaMoe operator type has no expert owner rule: {operator.op_type}")
 
 

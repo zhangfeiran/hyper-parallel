@@ -21,7 +21,7 @@ the main fill loop.
 """
 from hyper_parallel.core.multicore.scheduler.config import (
     TensorDescC, TaskDescC, RuntimeConfigC,
-    TaskType, DynamicType,
+    TaskType, DynamicType, TaskSplitValue,
     MAX_TENSOR_DIMS,
 )
 
@@ -38,7 +38,18 @@ def make_tensor_desc(
     dynamic_dim:     int = 0,
     shape:           list = None,
 ) -> TensorDescC:
-    """Build a TensorDescC with the given fields."""
+    """Build a TensorDescC with the given fields.
+
+    Args:
+        tensor_type: Native tensor storage kind.
+        data_type: Element size in bytes.
+        input_position: Native input-list port.
+        shape: Logical tensor dimensions.
+        transpose_flag: Whether the matrix input is transposed.
+        dynamic_shape: Whether dynamic expert counts replace the first dimension.
+        dynamic_dim: Dimension governed by dynamic counts.
+        base_ptr_offset: Element offset within the supplied tensor.
+    """
     t = TensorDescC()
     t.tensor_type     = tensor_type
     t.data_type       = data_type
@@ -55,43 +66,81 @@ def make_tensor_desc(
 
 # ── tsv counter helpers ───────────────────────────────────────────────────────
 
-def advance_tsv_vector(tsv, task_num: int, event_group_size: int) -> None:
-    """Advance counters after a vector op with event grouping."""
+def advance_tsv_vector(
+    tsv: TaskSplitValue,
+    task_num: int,
+    event_group_size: int,
+) -> None:
+    """Advance counters after a vector op with event grouping.
+
+    Args:
+        tsv: Mutable schedule offsets.
+        task_num: Number of appended vector tasks.
+        event_group_size: Number of newly allocated event groups.
+    """
     tsv.pre_task_num        += task_num
     tsv.pre_vector_task_num += task_num
     tsv.pre_pre_event_num    = tsv.pre_event_num
     tsv.pre_event_num       += event_group_size
 
 
-def advance_tsv_cube(tsv, task_num: int, event_group_size: int) -> None:
-    """Advance counters after a cube op with event grouping."""
+def advance_tsv_cube(
+    tsv: TaskSplitValue,
+    task_num: int,
+    event_group_size: int,
+) -> None:
+    """Advance counters after a cube op with event grouping.
+
+    Args:
+        tsv: Mutable schedule offsets.
+        task_num: Number of appended Cube tasks.
+        event_group_size: Number of newly allocated event groups.
+    """
     tsv.pre_task_num      += task_num
     tsv.pre_cube_task_num += task_num
     tsv.pre_pre_event_num  = tsv.pre_event_num
     tsv.pre_event_num     += event_group_size
 
 
-def advance_tsv_cube_only(tsv, task_num: int) -> None:
-    """Advance only task/cube counters (no event update). Used by bwd GMM1."""
+def advance_tsv_cube_only(tsv: TaskSplitValue, task_num: int) -> None:
+    """Advance only task/cube counters (no event update). Used by bwd GMM1.
+
+    Args:
+        tsv: Mutable schedule offsets.
+        task_num: Number of appended Cube tasks.
+    """
     tsv.pre_task_num      += task_num
     tsv.pre_cube_task_num += task_num
 
 
-def advance_tsv_vector_only(tsv, task_num: int) -> None:
-    """Advance only task/vector counters (no event update). Used by bwd combine."""
+def advance_tsv_vector_only(tsv: TaskSplitValue, task_num: int) -> None:
+    """Advance only task/vector counters (no event update). Used by bwd combine.
+
+    Args:
+        tsv: Mutable schedule offsets.
+        task_num: Number of appended vector tasks.
+    """
     tsv.pre_task_num        += task_num
     tsv.pre_vector_task_num += task_num
 
 
 # ── Post-fill utilities ───────────────────────────────────────────────────────
 
-def add_terminate(cfg: RuntimeConfigC, tsv, trigger_count: int) -> None:
-    """
-    Append a terminate task to cfg.
+def add_terminate(
+    cfg: RuntimeConfigC,
+    tsv: TaskSplitValue,
+    trigger_count: int,
+) -> None:
+    """Append a terminate task to cfg.
 
     trigger_count:
       forward:  combine_op.task_num // tsv.ep * tsv.ep
       backward: w2_grad_op.task_num + w1_grad_op.task_num + combine_op.task_num // tsv.ep * tsv.ep
+
+    Args:
+        cfg: Runtime receiving the termination task.
+        tsv: Current topology and event offsets.
+        trigger_count: Number of completed tasks required for termination.
     """
     cfg.all_event_num_triggers[tsv.all_event_num] = trigger_count
     task = TaskDescC()
@@ -105,11 +154,44 @@ def add_terminate(cfg: RuntimeConfigC, tsv, trigger_count: int) -> None:
     cfg.task_index_num[1] += 1
 
 
-def add_dynamic_data(cfg: RuntimeConfigC, tsv, dynamic_input_position: int) -> None:
+def add_terminate_on_event(
+    cfg: RuntimeConfigC,
+    tsv: TaskSplitValue,
+    dependent_event: int,
+    trigger_count: int,
+) -> None:
+    """Append a terminate task that waits on an explicit final event.
+
+    Args:
+        cfg: Runtime receiving the termination task.
+        tsv: Current topology and queue offsets.
+        dependent_event: Event consumed by termination.
+        trigger_count: Required number of producers at the terminal event.
     """
-    Write the dynamic data record into cfg.
+    cfg.all_event_num_triggers[dependent_event] = trigger_count
+    task = TaskDescC()
+    task.task_type = TaskType.TASK_TERMINATE
+    task.dependent_event = dependent_event
+    task.trigger_event = dependent_event + 1
+    cfg.all_event_num_triggers[task.trigger_event] = 1
+    cfg.all_tasks[tsv.pre_task_num] = task
+    cfg.vector_task_indices[tsv.pre_vector_task_num] = tsv.pre_task_num
+    cfg.task_index_num[1] += 1
+
+
+def add_dynamic_data(
+    cfg: RuntimeConfigC,
+    tsv: TaskSplitValue,
+    dynamic_input_position: int,
+) -> None:
+    """Write the dynamic data record into cfg.
 
     dynamic_input_position: forward = 6, backward = 19.
+
+    Args:
+        cfg: Runtime receiving dynamic expert metadata.
+        tsv: Expert topology used to interpret dynamic groups.
+        dynamic_input_position: Native input-list position of the cumulative expert counts.
     """
     cfg.dynamic_data.dynamic_type           = DynamicType.DYNAMIC_DSV3_MOE
     cfg.dynamic_data.dynamic_input_position = dynamic_input_position

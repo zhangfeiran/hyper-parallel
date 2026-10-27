@@ -63,12 +63,13 @@ class RouteMetadata:
 class PreparedTopKRoute:
     """Permuted payload and exact metadata for one Router decision."""
 
-    routed_tokens: torch.Tensor
+    routed_tokens: torch.Tensor | None
     unpermute_mapping: torch.Tensor
     tokens_per_expert: torch.Tensor
     received_counts: torch.Tensor
     metadata: RouteMetadata
     maximum_received_slots: int = 0
+    permute_src_index: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -249,6 +250,22 @@ def _permute_topk_input_out(
     return output, mapping
 
 
+def _build_route_indices(
+    route_slots: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build expert-major route slots and the inverse token route map."""
+
+
+    permuted_slots, inverse_order = torch_npu.npu_moe_token_permute(
+        route_slots,
+        topk_ids.reshape(-1, 1),
+    )
+    permute_src_index = permuted_slots.reshape(-1).to(torch.int32).contiguous()
+    inverse_order = inverse_order.reshape(-1).to(torch.int32).contiguous()
+    return permute_src_index, inverse_order.reshape_as(topk_ids).contiguous()
+
+
 def _compute_route_metadata(
     counts: torch.Tensor,
     counts_by_source: torch.Tensor,
@@ -401,6 +418,7 @@ def prepare_topk_route(
     *,
     autograd_mask: int = 0,
     prepare_workspace: Callable[[int, int], None] | None = None,
+    route_slots: torch.Tensor | None = None,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -432,7 +450,13 @@ def prepare_topk_route(
         else:
             workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
-    if permutation_output is None:
+    permute_src_index = None
+    if spec.forward_permute_fused:
+        if route_slots is None:
+            raise RuntimeError("Fused route preparation requires the plan's scalar route slots")
+        permute_src_index, unpermute_mapping = _build_route_indices(route_slots, topk_ids)
+        routed_tokens = None
+    elif permutation_output is None:
         routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     else:
         routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
@@ -444,6 +468,7 @@ def prepare_topk_route(
         tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum_received_slots,
+        permute_src_index=permute_src_index,
         metadata=_compute_route_metadata(
             counts,
             counts_by_source,
@@ -753,6 +778,6 @@ def restore_topk_output(
         return expert_output[:0] + topk_weights.sum().to(expert_output.dtype)
     return load_torch_npu().npu_moe_token_unpermute(
         expert_output,
-        unpermute_mapping,
+        unpermute_mapping.reshape(-1),
         probs=topk_weights.float().contiguous(),
     )

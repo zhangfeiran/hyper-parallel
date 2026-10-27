@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -54,6 +55,8 @@ class MegaMoeSpec:
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    forward_fusion_mode: str = "legacy"
+    backward_fusion_mode: str = "legacy"
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -74,6 +77,50 @@ class MegaMoeSpec:
     def routed_slots(self) -> int:
         """Return routed rows produced by local Top-K expansion."""
         return self.local_num_tokens * self.top_k
+
+
+    @property
+    def forward_permute_fused(self) -> bool:
+        """Return whether the forward permute endpoint runs in the MegaKernel."""
+        return self.forward_fusion_mode in {"permute", "both"}
+
+    @property
+    def forward_unpermute_fused(self) -> bool:
+        """Return whether the forward unpermute endpoint runs in the MegaKernel."""
+        return self.forward_fusion_mode in {"unpermute", "both"}
+
+    @property
+    def backward_permute_fused(self) -> bool:
+        """Return whether the backward permute endpoint runs in the MegaKernel."""
+        return self.backward_fusion_mode in {"permute", "both"}
+
+    @property
+    def backward_unpermute_fused(self) -> bool:
+        """Return whether the backward unpermute endpoint runs in the MegaKernel."""
+        return self.backward_fusion_mode in {"unpermute", "both"}
+
+
+def _resolve_fusion_modes(specification: Mapping[str, Any]) -> tuple[str, str]:
+    """Resolve route endpoints before resource agreement and symmetric allocation."""
+    supported = (specification.get("dispatch_mode", "push") == "push"
+                 and specification.get("max_local_num_tokens") is None
+                 and not specification.get("auto_tokens", False)
+                 and specification["top_k"] <= 16
+                 and specification["local_num_tokens"] * specification["top_k"] <= 1 << 24)
+    shared = os.getenv("HYPER_PARALLEL_MEGA_MOE_FUSION_MODE")
+    defaults = ("permute", "legacy") if supported else ("legacy", "legacy")
+    modes = []
+    for direction, default in zip(("forward", "backward"), defaults):
+        name = f"{direction}_fusion_mode"
+        value = specification.get(name)
+        if value is None:
+            value = os.getenv(f"HYPER_PARALLEL_MEGA_MOE_{direction.upper()}_FUSION_MODE", shared or default)
+        if value not in {"legacy", "permute", "unpermute", "both"}:
+            raise ValueError(f"{name} must be legacy, permute, unpermute or both, got {value!r}")
+        if value != "legacy" and not supported:
+            raise ValueError("Route fusion requires static push dispatch, top_k <= 16 and T * K <= 2**24")
+        modes.append(value)
+    return modes[0], modes[1]
 
 
 def _align_capacity(capacity: int) -> int:
@@ -199,6 +246,7 @@ def bind_mega_moe_spec(
         local_num_tokens * top_k,
         ep_size,
     )
+    forward_fusion_mode, backward_fusion_mode = _resolve_fusion_modes(specification)
     return MegaMoeSpec(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],
@@ -219,4 +267,5 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        forward_fusion_mode=forward_fusion_mode, backward_fusion_mode=backward_fusion_mode,
     )

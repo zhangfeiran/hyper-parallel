@@ -18,8 +18,10 @@
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
+
+from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
 from hyper_parallel.core.multicore.torch import ops
@@ -37,17 +39,43 @@ class TestTorchOps(unittest.TestCase):
         patcher = patch.object(ops, "load_torch_npu")
         self.backend = patcher.start()
         self.addCleanup(patcher.stop)
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_route_diagnostics_bind_logical_ports_once(self):
+        """Feature: MegaMoe route diagnostics.
+        Description: Profile forward and backward through their logical port tuples.
+        Expectation: Diagnostic binding preserves counts before native operand packing.
+        """
+        for forward, count in ((True, 27), (False, 33)):
+            with self.subTest(forward=forward):
+                parameters = tuple(ops.torch.ones(2, dtype=ops.torch.bfloat16) for _ in range(count))
+                call = SimpleNamespace(runtime_config=parameters[0], event_counters=parameters[1],
+                                       diagnostic_buffer=parameters[2])
+                context = MagicMock()
+                context.__enter__.return_value = call
+                diagnostics = SimpleNamespace(is_active=True, launch=Mock(return_value=context))
+                name = "mega_moe" if forward else "mega_moe_grad"
+                with (patch.object(ops, "_load_native"),
+                      patch.object(ops.torch.ops.hyper_parallel, name, create=True) as native):
+                    ops.launch_route_fused(parameters, (0, 2, 8, 512, 128), diagnostics, forward=forward)
+                self.assertIs(diagnostics.launch.call_args.args[0], parameters)
+                self.assertEqual(len(native.call_args.args), (27 if forward else 31) + 6)
+                self.assertIs(native.call_args.args[-6], call.diagnostic_buffer)
 
     def tearDown(self) -> None:
         """Never retain a mocked native-registration cache between tests."""
         ops._load_native.cache_clear()
 
     @staticmethod
-    def _backward_op(alias: str = "a") -> SimpleNamespace:
+    def _backward_op(alias: str = "a", route_outputs: bool = True) -> SimpleNamespace:
         """Build a real schema for the mutable receive and expert input-gradient slots."""
         middle = ", ".join(f"Tensor input_{index}" for index in range(1, 12))
+        tail = ", ".join(f"Tensor input_{index}" for index in range(13, 25))
+        combine = "Tensor(j!) combine" if route_outputs else "Tensor combine"
+        weights = "Tensor(k!) weights" if route_outputs else "Tensor weights"
         schema = ops.torch._C.parse_schema(
-            f"mega_moe_grad(Tensor(a!) dispatch, {middle}, Tensor({alias}!) gate_dx) -> ()"
+            f"mega_moe_grad(Tensor(a!) dispatch, {middle}, Tensor({alias}!) gate_dx, {tail}, "
+            f"{combine}, Tensor runtime, Tensor events, Tensor indices, {weights}) -> ()"
         )
         return SimpleNamespace(default=SimpleNamespace(_schema=schema))
 
@@ -78,7 +106,7 @@ class TestTorchOps(unittest.TestCase):
             patch.object(ops, "preload_vendor_library") as preload,
             patch.object(ops.torch.ops, "load_library") as load,
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version",
-                         return_value=1, create=True) as version,
+                         return_value=4, create=True) as version,
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_grad", self._backward_op(), create=True) as backward,
         ):
             ops._load_native()
@@ -86,9 +114,11 @@ class TestTorchOps(unittest.TestCase):
             self.backend.assert_called_once_with()
             preload.assert_called_once_with(Path("vendor"))
             load.assert_called_once_with("good.so")
-            for protocol, alias, message in ((0, "a", "transport ABI"), (1, "e", "storage reuse")):
+            for protocol, alias, mutable, message in (
+                    (3, "a", True, "transport ABI"), (4, "e", True, "storage reuse"),
+                    (4, "a", False, "route output mutation")):
                 ops._load_native.cache_clear()
                 version.return_value = protocol
-                backward.default._schema = self._backward_op(alias).default._schema
+                backward.default._schema = self._backward_op(alias, mutable).default._schema
                 with self.assertRaisesRegex(NativeComponentUnavailableError, message):
                     ops._load_native()

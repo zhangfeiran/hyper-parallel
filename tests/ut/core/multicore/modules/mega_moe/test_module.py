@@ -372,6 +372,8 @@ class TestMegaMoeExperts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_constructor_rejects_invalid_static_values_before_allocation(
         self,
         mock_create_parameters: Mock,
@@ -415,6 +417,8 @@ class TestMegaMoeExperts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_constructor_validates_and_records_swiglu_limit(
         self,
         mock_create_parameters: Mock,
@@ -487,9 +491,10 @@ class TestMegaMoeExperts(unittest.TestCase):
         topk_weights = torch.full((128, 2), 0.5)
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
-        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=False, dynamic_tokens=False),
-                                    plan=object(), workspace=object(), ensure_capacity=Mock(),
-                                    plan_for_tokens=Mock())
+        spec = SimpleNamespace(auto_tokens=False, dynamic_tokens=False, forward_permute_fused=False,
+                               forward_fusion_mode="legacy", backward_fusion_mode="legacy")
+        resources = SimpleNamespace(spec=spec, plan=SimpleNamespace(spec=spec), workspace=object(),
+                                    ensure_capacity=Mock(), plan_for_tokens=Mock())
         route = SimpleNamespace(
             routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
             unpermute_mapping=object(), maximum_received_slots=512
@@ -591,6 +596,8 @@ class TestMegaMoeExperts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     @patch.object(MegaMoeExperts, "_register_runtime_release", return_value=None)
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_shared_layers_create_once_and_close_after_last_owner(
         self,
         mock_register_runtime_release: Mock,

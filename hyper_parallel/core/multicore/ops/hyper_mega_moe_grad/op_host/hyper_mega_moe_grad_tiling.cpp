@@ -74,9 +74,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   const int64_t hiddenSize = *hiddenSizeAttr;
   const int64_t seqSize = *seqSizeAttr;
   if (rankId < 0 || ep <= 0 || expertNum <= 0 || expertNum % ep != 0 || hiddenSize <= 0 || seqSize <= 0) {
-    OP_LOGE(context->GetNodeName(),
-            "Invalid topology: rankId=%ld, ep=%ld, expertNum=%ld, hiddenSize=%ld, seqSize=%ld.", rankId, ep,
-            expertNum, hiddenSize, seqSize);
+    OP_LOGE(context->GetNodeName(), "Invalid topology: rankId=%ld, ep=%ld, expertNum=%ld, hiddenSize=%ld, seqSize=%ld.",
+            rankId, ep, expertNum, hiddenSize, seqSize);
     return ge::GRAPH_FAILED;
   }
   tiling.set_rankId(rankId);
@@ -86,8 +85,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   tiling.set_seqSize(seqSize);
   tiling.set_coreNum(static_cast<int64_t>(coreNum));
 
-  auto runtimeShape = context->GetInputShape(27);
-  auto eventShape = context->GetInputShape(28);
+  auto runtimeShape = context->GetInputShape(26);
+  auto eventShape = context->GetInputShape(27);
   OP_CHECK_NULL_WITH_CONTEXT(context, runtimeShape);
   OP_CHECK_NULL_WITH_CONTEXT(context, eventShape);
   int64_t runtimeBytes = runtimeShape->GetStorageShape().GetShapeSize();
@@ -121,8 +120,6 @@ static ge::graphStatus TilingPrepareTilingFunc(gert::TilingParseContext *context
 
 struct HyperMegaMoeGradCompileInfo {};
 
-IMPL_OP_OPTILING(HyperMegaMoeGrad)
-  .Tiling(TilingFunc)
-  .TilingParse<HyperMegaMoeGradCompileInfo>(TilingPrepareTilingFunc);
+IMPL_OP_OPTILING(HyperMegaMoeGrad).Tiling(TilingFunc).TilingParse<HyperMegaMoeGradCompileInfo>(TilingPrepareTilingFunc);
 
 }  // namespace optiling

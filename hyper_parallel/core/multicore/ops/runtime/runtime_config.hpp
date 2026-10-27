@@ -103,6 +103,9 @@ enum class TaskType : uint32_t {
   TASK_GATE_GRAD_ADD_SELECTED = 139,
   TASK_GATE_GRAD_ZEROS = 140,
   TASK_SHMEM_GET_MEM = 141,
+  TASK_UNPERMUTE_REDUCE_GRAD = 142,
+  TASK_TOPK_WEIGHT_GRAD = 143,
+  TASK_WEIGHTED_UNPERMUTE = 144,
 };
 
 enum class EventType : uint32_t {
@@ -444,8 +447,8 @@ __aicore__ inline bool isRuntimeTailValid(__gm__ uint8_t *tiling, uint64_t runti
   uint64_t capacity = getRuntimeTaskCapacity(tiling);
   uint64_t events = getRuntimeEventCapacity(tiling);
   uint64_t prefix = sizeof(RuntimeHeader) + events * (INT32_T_SIZE + sizeof(EventDesc)) +
-                    capacity * (sizeof(TaskDesc) + TASK_AICORE_INDEX_TYPE_COUNT * INT32_T_SIZE) +
-                    4 * INT32_T_SIZE + sizeof(DynamicData);
+                    capacity * (sizeof(TaskDesc) + TASK_AICORE_INDEX_TYPE_COUNT * INT32_T_SIZE) + 4 * INT32_T_SIZE +
+                    sizeof(DynamicData);
   if (prefix >= RUNTIME_ADDRESS_SPACE_BYTES || runtime_bytes < prefix) {
     return false;
   }
@@ -470,8 +473,7 @@ __aicore__ inline bool isReadyHandshakeStorageValid(__gm__ uint8_t *tiling, uint
   return (meta.ready_event == 0 ||
           (ep_size > 1 && static_cast<uint64_t>(meta.ready_event) + ATOMIC_ADD_VALUE_LEN <= events &&
            event_bytes >= events * INT32_T_SIZE + 2 * (static_cast<uint64_t>(ep_size) + 1) * DATA_CACHE_LINE_SIZE)) &&
-         (meta.completion_event == 0 ||
-          static_cast<uint64_t>(meta.completion_event) + ATOMIC_ADD_VALUE_LEN <= events);
+         (meta.completion_event == 0 || static_cast<uint64_t>(meta.completion_event) + ATOMIC_ADD_VALUE_LEN <= events);
 }
 
 __aicore__ inline bool areTaskIndexCountsValid(__gm__ uint8_t *tiling, uint64_t capacity) {
@@ -485,8 +487,8 @@ __aicore__ inline bool areTaskIndexCountsValid(__gm__ uint8_t *tiling, uint64_t 
 }
 
 // Check byte and index bounds before reading variable-sized arrays.
-__aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t runtime_bytes,
-                                             uint64_t event_bytes, uint32_t ep_size = 1, uint64_t local_experts = 0) {
+__aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t runtime_bytes, uint64_t event_bytes,
+                                             uint32_t ep_size = 1, uint64_t local_experts = 0) {
   if (runtime_bytes < sizeof(RuntimeHeader) || runtime_bytes >= RUNTIME_ADDRESS_SPACE_BYTES) {
     return false;
   }

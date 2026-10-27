@@ -4,6 +4,8 @@ Multicore 是 HyperParallel 的 Torch 组件，提供芯片内多核 MPMD 执行
 它通过 AIC/AIV 分工和核级单边通信，把通信、矩阵乘与向量计算按 tile 编排，减少 kernel 启动并重叠通信与计算。
 当前业务接口包括 MoE 专家、Router 和四流 shifted mHC；三个组件可分别使用。
 
+[MegaMoe 路由融合与 HBM 存储约束](docs/mega_moe_route_fusion.md)
+
 ## 功能与适用范围
 
 | 接口 | 执行内容 | 设备与精度 |

@@ -46,6 +46,18 @@ constexpr int64_t VECTOR_EVENT_REFRESH_INTERVAL_UNITS = 150;  // 7,500 system cy
 constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
 constexpr int64_t READY_SIGNAL_RADIX = 2;
 
+// C220 has 192 KiB of UB. Route tasks own this scratch only until their MTE
+// events drain; subsequent SwiGLU and SHMEM tasks can reuse the same storage.
+constexpr uint64_t ROUTE_UB_BYTES = 192 * 1024;
+
+__aicore__ inline int64_t RouteChunkElements(uint64_t scratch_begin, int64_t fallback, uint64_t element_bytes) {
+  constexpr uint64_t REDUCE_RESULT_BYTES = 32;
+  if (scratch_begin + fallback * element_bytes + REDUCE_RESULT_BYTES > ROUTE_UB_BYTES) {
+    AscendC::Trap();
+  }
+  return scratch_begin + 8192 * element_bytes + REDUCE_RESULT_BYTES <= ROUTE_UB_BYTES ? 8192 : fallback;
+}
+
 enum class VectorWorkerPolicy : uint32_t {
   LEGACY_ODD = 0,
   ALL = 1,
@@ -80,8 +92,8 @@ class KernelWorkerBase {
       ep_size = static_cast<uint32_t>(getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1));
       local_experts = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 2) / ep_size;
     } else {
-      auto bounds = reinterpret_cast<__gm__ RuntimeStorageBounds *>(
-        input_list[Derived::TILING_IDX] + Derived::RUNTIME_BOUNDS_OFFSET);
+      auto bounds = reinterpret_cast<__gm__ RuntimeStorageBounds *>(input_list[Derived::TILING_IDX] +
+                                                                    Derived::RUNTIME_BOUNDS_OFFSET);
       runtime_bytes = bounds->runtime_config_bytes;
       event_bytes = bounds->event_counter_bytes;
     }
@@ -382,7 +394,8 @@ class KernelWorkerBase {
       AscendC::Trap();
     }
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
-      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
+      WaitForDependency(task_desc.dependent_event,
+                        task_desc.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ? 0 : task_desc.extra_value_2);
     }
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
@@ -401,7 +414,8 @@ class KernelWorkerBase {
       AscendC::Trap();
     }
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
-      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
+      WaitForDependency(task_desc.dependent_event,
+                        task_desc.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ? 0 : task_desc.extra_value_2);
     }
     CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_BEFORE);
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
@@ -429,7 +443,8 @@ class KernelWorkerBase {
     uint32_t owner_id = getTaskProfileOwnerId(this->runtimeConfigPtr, task_id);
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
       uint64_t wait_start_cycle = cycle_trace_recorder.Now();
-      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
+      WaitForDependency(task_desc.dependent_event,
+                        task_desc.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ? 0 : task_desc.extra_value_2);
       uint64_t wait_end_cycle = cycle_trace_recorder.Now();
       cycle_trace_recorder.Record(Derived::PROFILE_DESC_WAIT_DEPENDENCY, task_id, task_desc.task_index, owner_id,
                                   wait_start_cycle, wait_end_cycle);

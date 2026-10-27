@@ -24,7 +24,7 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.core.multicore import MegaMoeExperts, shmem
-from hyper_parallel.core.multicore.modules.mega_moe import function as function_module
+from hyper_parallel.core.multicore.modules.mega_moe import function as function_module, fusion as fusion_module
 from hyper_parallel.core.multicore.scheduler.config import (
     READY_CACHE_LINE_BYTES,
 )
@@ -90,6 +90,11 @@ def _snapshot_and_update(layers: list, outputs: list, leaves: list, step: int) -
     """Validate every result/gradient before retaining snapshots and applying the same SGD step."""
     tensors = outputs + [tensor.grad for tensor in leaves]
     tensors += [parameter.grad for layer in layers for parameter in layer.parameters()]
+    return _snapshot_and_update(layers, tensors, step)
+
+
+def _snapshot_and_update(layers: list, tensors: list, step: int) -> list:
+    """Check outputs and gradients before recording snapshots and applying SGD."""
     for index, tensor in enumerate(tensors):
         assert tensor is not None, f"rank={baseline.RANK}: missing tensor {index}, expected a result or gradient."
         baseline.assert_finite(f"ready step={step} tensor={index}", tensor)
@@ -161,6 +166,56 @@ def _assert_step_parity(reference: list, actual: list, independent: list, shared
             baseline.assert_close("lifecycle updated parameter", observed, expected)
 
 
+def _assert_resource_identity(independent: list, shared: list) -> None:
+    """Require one shared allocation group and three independent allocation groups."""
+    # Sharing identity and numerical parity are separate contracts.
+    resources = shared[0]._resource_group.resources  # pylint: disable=protected-access
+    shared_resources = [layer._resource_group.resources for layer in shared]  # pylint: disable=protected-access
+    assert all(resource is resources for resource in shared_resources), (
+        f"rank={baseline.RANK}: shared layers did not share the same resources"
+    )
+    # Each independent layer must retain a distinct physical allocation group.
+    independent_ids = {
+        id(layer._resource_group.resources) for layer in independent  # pylint: disable=protected-access
+    }
+    assert len(independent_ids) == 3, f"rank={baseline.RANK}: independent resource count={len(independent_ids)}"
+
+
+def _check_launch_recovery(independent, shared, shape, streams, replay, steps, workspace) -> None:
+    """Inject a failure at both launch boundaries and compare the next training step."""
+    source, _ = baseline.make_data(shape)
+    ids, weights, counts = baseline.make_balanced_route(shape)
+    with (
+        patch.object(function_module.multicore_ops, "mega_moe",
+                     side_effect=RuntimeError("injected launch error")),
+        patch.object(fusion_module.multicore_ops, "launch_route_fused",
+                     side_effect=RuntimeError("injected launch error")),
+    ):
+        try:
+            shared[0](source, ids, weights, tokens_per_expert=counts)
+        except RuntimeError as error:
+            assert str(error) == "injected launch error", f"unexpected launch failure: {error}"
+        else:
+            raise AssertionError("Injected launch error was not propagated.")
+    assert not workspace.in_use, f"rank={baseline.RANK}: failed launch left lease in_use={workspace.in_use}."
+    reference = _stack_step(independent, shape, streams, False, steps)
+    actual = _stack_step(shared, shape, streams, replay, steps)
+    for index, (expected, observed) in enumerate(zip(reference, actual)):
+        torch.testing.assert_close(
+            observed, expected, rtol=2e-2, atol=1e-5,
+            msg=f"rank={baseline.RANK}: recovery tensor={index}",
+        )
+
+
+def _append_ready_generation(generations: list, current: tuple) -> None:
+    """Require forward and backward ready generations to advance together."""
+    if generations:
+        assert all(new > old for new, old in zip(current, generations[-1])), (
+            f"rank={baseline.RANK}: ready generations={current}, expected greater than {generations[-1]}."
+        )
+    generations.append(current)
+
+
 def _run_lifecycle_case(alternate_streams: bool, replay: bool) -> dict:
     """Compare shared checkpoint execution against independent ordinary layers."""
     start_shmem_lifetime()
@@ -193,20 +248,14 @@ def _run_lifecycle_case(alternate_streams: bool, replay: bool) -> dict:
                 samples.append(sample)
             workspace = shared[0]._resource_group.resources.workspace  # pylint: disable=protected-access
             current = _ready_generations(workspace, shape.ep_size)
-            if generations:
-                assert all(new > old for new, old in zip(current, generations[-1])), (
-                    f"rank={baseline.RANK}: ready generations={current}, expected greater than {generations[-1]}."
-                )
-            generations.append(current)
+            _append_ready_generation(generations, current)
 
-        _check_resources_and_failed_launch(independent, shared, shape, samples)
-        reference = _stack_step(independent, shape, streams, False, steps)
-        actual = _stack_step(shared, shape, streams, replay, steps)
-        for index, (expected, observed) in enumerate(zip(reference, actual)):
-            torch.testing.assert_close(
-                observed, expected, rtol=2e-2, atol=1e-5,
-                msg=f"rank={baseline.RANK}: recovery tensor={index}",
-            )
+        if samples:
+            assert_stable_memory(samples)
+            allocations = [sample["shmem_allocations"] for sample in samples]
+            assert len(set(allocations)) == 1, f"rank={baseline.RANK}: unstable SHMEM allocations={allocations}"
+        _assert_resource_identity(independent, shared)
+        _check_launch_recovery(independent, shared, shape, streams, replay, steps, workspace)
         return {
             "shape": asdict(shape), "checkpoint_replay": replay, "layers": 3, "microbatches": 2,
             "steps": steps, "alternating_streams": len(streams), "rank_staggered": True,

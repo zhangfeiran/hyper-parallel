@@ -118,6 +118,9 @@ class TaskType(IntEnum):
     TASK_GATE_GRAD_ADD_SELECTED           = 139
     TASK_GATE_GRAD_ZEROS                  = 140
     TASK_SHMEM_GET_MEM              = 141
+    TASK_UNPERMUTE_REDUCE_GRAD = 142
+    TASK_TOPK_WEIGHT_GRAD = 143
+    TASK_WEIGHTED_UNPERMUTE = 144
 
 
 class EventType(IntEnum):
@@ -285,6 +288,7 @@ class TaskSplitValue:
     all_expert_num: int = 32
     top_k:          int = 8
     dispatch_mode: str = "push"
+    extra_event_num: int = 0
 
     def __post_init__(self) -> None:
         """Reject topology values that would invalidate runtime arithmetic."""
@@ -339,7 +343,7 @@ class TaskSplitValue:
     def all_event_num(self) -> int:
         """Total number of events needed for the schedule."""
         e = self.single_rank_expert_num
-        return 1 + self.all_expert_num + e + e + e
+        return 1 + self.all_expert_num + e + e + e + self.extra_event_num
 
     # ── Runtime counters (reset by init_task_split_value per rank) ────────────
     rank_id:              int = 0

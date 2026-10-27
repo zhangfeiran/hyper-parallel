@@ -103,8 +103,16 @@ def _resolve_swiglu(context: L1TensorViewContext) -> L1TensorView:
     )
 
 
+def _validate_fused_dispatch_view(context: L1TensorViewContext) -> None:
+    """Refuse a contiguous view of a gather whose rows belong to different source tokens."""
+    if (context.io == "input" and context.index == 1
+            and int(context.task_desc.extra_value_0) != 0xFFFFFFFF):
+        raise ValueError("Fused dispatch gathers noncontiguous token rows; select its local GMM consumer input")
+
+
 def _resolve_alltoall(context: L1TensorViewContext) -> L1TensorView:
     """Resolve local communication operands while rejecting remote-address reads."""
+    _validate_fused_dispatch_view(context)
     is_pull = int(context.task_desc.task_type) == TaskType.TASK_SHMEM_GET_MEM
     if is_pull and context.io == "input" and context.index == 1:
         raise ValueError("MegaMoe pull sources belong to a remote rank; select the local dispatch output instead")

@@ -18,6 +18,8 @@ Compute graph abstractions: OpType, TensorSpec, SplitSpec, OperatorNode, Compute
 ComputeGraph.propagate_splits() traverses the DAG in topological order and
 automatically computes task_num / split_dim for every node from their SplitSpec.
 """
+from __future__ import annotations
+
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -41,6 +43,10 @@ class OpType(Enum):
     MHC_INPUT_MIX = "mhc_input_mix"
     MHC_PIPELINE = "mhc_pipeline"
     RMS_NORM = "rms_norm"
+    UNPERMUTE_REDUCE_GRAD = "unpermute_reduce_grad"
+    TOPK_WEIGHT_GRAD = "topk_weight_grad"
+    WEIGHTED_UNPERMUTE = "weighted_unpermute"
+    REMOTE_WRITE_ACQUIRE = "remote_write_acquire"
 
 
 @dataclass
@@ -142,6 +148,14 @@ class ComputeGraph:
             name: Registered operator name.
         """
         return self._nodes[name]
+
+    def has_op(self, name: str) -> bool:
+        """Return whether an operator node exists.
+
+        Args:
+            name: Registered graph node name to query.
+        """
+        return name in self._nodes
 
     def topological_sort(self) -> List[OperatorNode]:
         """Kahn's algorithm; insertion order used for tie-breaking."""

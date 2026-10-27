@@ -44,7 +44,9 @@ class DeepseekV41MegaMoeExperts(nn.Module):
     """Own native-layout parameters while retaining the HF checkpoint names."""
 
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
-                 context: Mapping[str, Any] | None = None,
+                 context: Mapping[str, Any] | None = None, local_num_tokens: int | None = None,
+                 dynamic_tokens: bool = True, forward_fusion_mode: str | None = None,
+                 backward_fusion_mode: str | None = None,
                  dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
                  capacity_growth_factor: float | None = None, initializer_range: float = 0.02) -> None:
         """Convert a full HF holder before EP partitioning and FSDP construction.
@@ -53,6 +55,10 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             module: HF DeepSeek routed experts with a supported SwiGLU limit.
             module_fqn: Checkpoint scope assigned by the replacement executor.
             context: Active parallel axes and sequence_parallel; TP requires SP and EP>1, and PP must be 1.
+            local_num_tokens: Upper bound on actual expert input rows, or exact rows in static mode.
+            dynamic_tokens: Accept varying token rows; disable only for a fixed local input shape.
+            forward_fusion_mode: Optional forward endpoint selection passed to the executor.
+            backward_fusion_mode: Optional backward endpoint selection passed to the executor.
             dispatch_mode: MegaMoe dispatch transport, either push or pull.
             initial_capacity_factor: Push initial receive capacity; None uses the executor default.
             capacity_growth_factor: Push capacity growth multiplier; omit for pull.
@@ -68,6 +74,17 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         self.sequence_parallel = bool(context.get("sequence_parallel", False))
         if context.get("tp", False) and not self.sequence_parallel:
             raise ValueError("DSV4.1 MegaMoe with TP>1 requires sequence_parallel=true")
+        if local_num_tokens is not None and (isinstance(local_num_tokens, bool) or not isinstance(local_num_tokens, int) or (
+                local_num_tokens <= 0 or local_num_tokens % 128)):
+            raise ValueError("local_num_tokens must be a positive multiple of 128")
+        if not isinstance(dynamic_tokens, bool):
+            raise ValueError("dynamic_tokens must be boolean")
+        if not dynamic_tokens and local_num_tokens is None:
+            raise ValueError("Static MegaMoe requires explicit local_num_tokens")
+        self.local_num_tokens = local_num_tokens
+        self.dynamic_tokens = dynamic_tokens
+        self.forward_fusion_mode = forward_fusion_mode
+        self.backward_fusion_mode = backward_fusion_mode
         self.dispatch_mode = dispatch_mode
         self.initial_capacity_factor = initial_capacity_factor
         self.capacity_growth_factor = capacity_growth_factor
@@ -111,13 +128,17 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         # Multicore is optional for the default native-EP replacement provider.
         from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
 
+        token_options = {} if self.local_num_tokens is None else {
+            "max_local_num_tokens" if self.dynamic_tokens else "local_num_tokens": self.local_num_tokens,
+        }
         self._executor = MegaMoeExperts(
-            hidden_size=self.hidden_size,
+            **token_options, hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size, num_experts=self.global_experts,
             top_k=top_k, ep_group=ep_group, ep_size=ep_size,
             dispatch_mode=self.dispatch_mode, initial_capacity_factor=self.initial_capacity_factor,
             capacity_growth_factor=self.capacity_growth_factor, swiglu_limit=self.swiglu_limit,
-            create_parameters=False,
+            create_parameters=False, forward_fusion_mode=self.forward_fusion_mode,
+            backward_fusion_mode=self.backward_fusion_mode,
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,

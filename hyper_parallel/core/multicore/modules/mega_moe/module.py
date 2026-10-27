@@ -31,13 +31,12 @@ from hyper_parallel.core.multicore import _collective, shmem
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
+from .fusion import execute_mega_moe as execute_route_fused
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
-    _COMMUNICATION_SPLIT,
-    _resolve_capacity_factors,
-    bind_mega_moe_spec,
+    _COMMUNICATION_SPLIT, _align_capacity, _resolve_capacity_factors, _resolve_fusion_modes, bind_mega_moe_spec,
 )
 from .workspace import MegaMoeWorkspace
 
@@ -72,6 +71,28 @@ def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
             "swiglu_limit must be None or a finite positive float32-representable number, "
             f"got {swiglu_limit!r}."
         )
+
+
+def _resolve_token_capacity(
+    local_num_tokens: int | None,
+    max_local_num_tokens: int | None,
+    hidden_size: int,
+    top_k: int,
+) -> int:
+    """Validate the token mode and reserve aligned rows within the native route ABI."""
+    if local_num_tokens is None and max_local_num_tokens is None:
+        return _COMMUNICATION_SPLIT
+    if local_num_tokens is not None and max_local_num_tokens is not None:
+        raise ValueError("Provide only one of local_num_tokens and max_local_num_tokens")
+    if max_local_num_tokens is None:
+        return local_num_tokens
+    if (not isinstance(max_local_num_tokens, int) or isinstance(max_local_num_tokens, bool)
+            or max_local_num_tokens <= 0):
+        raise ValueError("max_local_num_tokens must be a positive integer")
+    reserved_tokens = _align_capacity(max_local_num_tokens)
+    if reserved_tokens * max(hidden_size, top_k) > 2**31 - 1:
+        raise ValueError("max_local_num_tokens exceeds native INT32 route limits")
+    return reserved_tokens
 
 
 def _create_mega_moe_parameters(
@@ -181,6 +202,7 @@ class _MegaMoeExecutionResources:
             self.spec.expert_weight_layout,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
+            self.spec.forward_fusion_mode, self.spec.backward_fusion_mode,
         )
 
     def prepare_auto_workspace(self, tokens: int, received: int, tensor: torch.Tensor) -> None:
@@ -207,7 +229,8 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens")
+                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens",
+                  "forward_fusion_mode", "backward_fusion_mode")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
@@ -327,6 +350,10 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         swiglu_limit: float | None = None,
+        local_num_tokens: int | None = None,
+        max_local_num_tokens: int | None = None,
+        forward_fusion_mode: str | None = None,
+        backward_fusion_mode: str | None = None,
         ep_size: int | None = None,
         ep_group: Any | None = None,
         create_parameters: bool = True,
@@ -359,6 +386,10 @@ class MegaMoeExperts(MulticoreModule):
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
                 preserves the legacy unclamped path.
+            local_num_tokens: Optional exact static input rows; omit for automatic token capacity.
+            max_local_num_tokens: Optional upper bound for variable input rows; mutually exclusive with static rows.
+            forward_fusion_mode: Forward endpoint selection: legacy, permute, unpermute or both.
+            backward_fusion_mode: Independent backward endpoint selection; defaults to legacy.
             ep_size: Optional compatibility check; normally inferred from explicit ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
@@ -369,8 +400,9 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
+        reserved_tokens = _resolve_token_capacity(local_num_tokens, max_local_num_tokens, hidden_size, top_k)
         specification = {
-            "local_num_tokens": _COMMUNICATION_SPLIT,
+            "local_num_tokens": reserved_tokens,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
@@ -382,10 +414,14 @@ class MegaMoeExperts(MulticoreModule):
             "expert_weight_layout": expert_weight_layout,
             "dispatch_mode": dispatch_mode,
             "capacity_growth_factor": capacity_growth_factor,
+            "forward_fusion_mode": forward_fusion_mode,
+            "backward_fusion_mode": backward_fusion_mode,
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
         }
-        specification["auto_tokens"] = True
+        specification["auto_tokens"] = local_num_tokens is None and max_local_num_tokens is None
+        if max_local_num_tokens is not None:
+            specification["max_local_num_tokens"] = max_local_num_tokens
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -394,6 +430,8 @@ class MegaMoeExperts(MulticoreModule):
             resource_compatibility_key=compatibility_key,
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
+        self.local_num_tokens = local_num_tokens
+        self.max_local_num_tokens = max_local_num_tokens
         self._initialize_module_state(specification, create_parameters=create_parameters)
 
     def _initialize_module_state(
@@ -450,10 +488,12 @@ class MegaMoeExperts(MulticoreModule):
             auto_tokens=specification.get("auto_tokens", False),
         )
         swiglu_limit = specification["swiglu_limit"]
+        forward_mode, backward_mode = _resolve_fusion_modes(specification)
         return {
             **specification,
             "initial_capacity_factor": initial_capacity_factor,
             "capacity_growth_factor": capacity_growth_factor,
+            "forward_fusion_mode": forward_mode, "backward_fusion_mode": backward_mode,
             "swiglu_limit": float(swiglu_limit) if swiglu_limit is not None else None,
         }
 
@@ -554,6 +594,8 @@ class MegaMoeExperts(MulticoreModule):
                 f"hidden size {self.hidden_size}, got {tuple(hidden_states.shape)}."
             )
         hidden_flat = hidden_states.reshape(-1, self.hidden_size)
+        if self.local_num_tokens is not None and hidden_flat.shape[0] != self.local_num_tokens:
+            raise ValueError(f"hidden_states must contain {self.local_num_tokens} local tokens")
         route_shape = (hidden_flat.shape[0], self.top_k)
         if tuple(topk_ids.shape) != route_shape:
             raise ValueError(
@@ -573,6 +615,12 @@ class MegaMoeExperts(MulticoreModule):
             )
         self._validate_tensors(hidden_flat, expert_weights)
         return hidden_flat
+
+    def _validate_graph_capture(self) -> None:
+        """Reject capture when allocation growth or dynamic scheduling can synchronize."""
+        if (self.dispatch_mode == "push" or self.max_local_num_tokens is not None) and (
+                torch.npu.is_current_stream_capturing()):
+            raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
 
     def forward(
         self,
@@ -622,6 +670,8 @@ class MegaMoeExperts(MulticoreModule):
             | (int(weights[0].requires_grad) << 2) | (int(weights[1].requires_grad) << 3)
             | (int(topk_weights.requires_grad) << 4)
         )}
+        if resources.spec.forward_permute_fused:
+            route_options["route_slots"] = resources.plan.route_slots
         pull = self.dispatch_mode == "pull"
         automatic = resources.spec.auto_tokens
         claimed = False
@@ -657,6 +707,11 @@ class MegaMoeExperts(MulticoreModule):
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
             plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            fused = (plan.spec.forward_fusion_mode != "legacy" or plan.spec.backward_fusion_mode != "legacy")
+            if fused:
+                output = execute_route_fused(hidden_flat, topk_ids, topk_weights, weights[0], weights[1],
+                                            route, plan, resources.workspace)
+                return output.reshape_as(hidden_states)
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,
