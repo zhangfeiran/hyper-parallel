@@ -42,7 +42,7 @@ _OPS_NN_PATHS = (
     "norm/rms_norm_grad/op_kernel",
     "index/linear_index/op_host/op_api",
 )
-_OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
+_OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel", "gmm/common/cgmct")
 _OPS_TRANSFORMER_MHC_PATHS = (
     "common/include",
     "mhc/mhc_post/op_kernel/arch22",
@@ -266,6 +266,8 @@ def _compose_hyper_parallel_ops(
             transformer_copy / "gmm" / "grouped_matmul" / "op_kernel",
             operator_root / "op_kernel" / "grouped_matmul",
         )
+        shutil.copytree(transformer_copy / "gmm/common/cgmct", operator_root / "op_kernel/cgmct")
+        shutil.copytree(_MULTICORE_OPS / "bf16_gmm", operator_root / "op_kernel/bf16_gmm")
     shutil.copytree(
         ops_nn_copy / "activation" / "swi_glu_grad" / "op_kernel",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad",
