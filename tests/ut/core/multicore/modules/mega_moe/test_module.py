@@ -36,8 +36,13 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     # pylint: disable=protected-access
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_dynamic_constructor_retains_capacity_and_accepts_real_shapes(self) -> None:
-        """Arbitrary including empty inputs do not change the reserved resource specification."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Construct a bounded dynamic executor and submit empty and irregular input shapes.
+        Expectation: Arbitrary including empty inputs do not change the reserved resource specification.
+        """
         experts = MegaMoeExperts(max_local_num_tokens=257, hidden_size=16, intermediate_size=8,
                                  num_experts=4, top_k=2)
         self.addCleanup(experts.close)
@@ -55,28 +60,38 @@ class TestMegaMoeExperts(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **kwargs)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_plan_cache_evicts_without_mutating_retained_plans_or_capacity(self) -> None:
-        """A deferred backward retains its old plan after cache eviction and a new shape."""
+        """Feature: Bounded dynamic plan cache.
+        Description: Retain a plan while traversing more than sixteen token buckets.
+        Expectation: Eviction preserves the retained plan and symmetric reservation.
+        """
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
-        resources.spec = MegaMoeSpec(4096, 16, 8, 4, 2, None, 8192, 1, None, 0, 24,
-                                    max_local_num_tokens=4096)
+        resources.spec = MegaMoeSpec(32768, 16, 8, 4, 2, None, 8192, 1, None, 0, 24,
+                                    max_local_num_tokens=32768)
         resources._plans = OrderedDict()
         with patch.object(mega_moe_module, "build_mega_moe_plan",
                           side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
             retained = resources.plan_for_tokens(128, "cpu")
             self.assertIs(retained, resources.plan_for_tokens(128, "cpu"))
-            for tokens in (256, 384, 512, 4096):
+            for tokens in range(2048, 17409, 1024):
                 resources.plan_for_tokens(tokens, "cpu")
-            self.assertEqual(len(resources._plans), 4)
-            self.assertNotIn((128, False), resources._plans)
-            self.assertEqual(retained.spec.plan_tokens, 128)
-            self.assertEqual(retained.spec.routed_slots, 8192)
+            self.assertEqual(len(resources._plans), 16)
+            self.assertNotIn((1024, False), resources._plans)
+            self.assertEqual(retained.spec.plan_tokens, 1024)
+            self.assertEqual(retained.spec.routed_slots, 65536)
             self.assertEqual(retained.spec.receive_capacity, 8192)
             self.assertEqual(resources.spec, replace(retained.spec, schedule_tokens=None))
-            self.assertEqual(build.call_count, 5)
+            self.assertEqual(build.call_count, 17)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_resource_manifest_rejects_rank_configuration_mismatch(self) -> None:
-        """Static and dynamic ranks enter the same check before symmetric allocation."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Report a mismatched static configuration from another expert rank.
+        Expectation: Static and dynamic ranks enter the same check before symmetric allocation.
+        """
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
         resources.spec = SimpleNamespace(ep_size=2, ep_group=object())
 
@@ -89,8 +104,13 @@ class TestMegaMoeExperts(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "configurations differ"):
                 resources._validate_distributed_configuration(({"local_num_tokens": 128},))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_dynamic_plan_cache_separates_home_and_replica_topologies(self) -> None:
-        """Retain each invocation's topology through shape changes and cache eviction."""
+        """Feature: Distinct home and replica schedules.
+        Description: Alternate both execution topologies across shared token buckets.
+        Expectation: Reuse each topology without mutating previously retained plans.
+        """
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
         resources.spec = MegaMoeSpec(4096, 16, 8, 6, 2, 2.5, 20480, 2, None, 0, 24,
                                     max_local_num_tokens=4096, replica_slots_per_rank=1, logical_num_experts=4)
@@ -110,15 +130,68 @@ class TestMegaMoeExperts(unittest.TestCase):
             self.assertEqual(build.call_count, 2)
             for tokens in (256, 384, 512, 4096):
                 resources.plan_for_tokens(tokens, "cpu", home_only=True)
-            self.assertEqual(len(resources._plans), 4)
-            self.assertEqual(home.spec.plan_tokens, 128)
+            self.assertEqual(len(resources._plans), 3)
+            self.assertEqual(home.spec.plan_tokens, 1024)
             self.assertEqual(physical.spec.replica_slots_per_rank, 1)
             resources.home_spec = None
             with self.assertRaisesRegex(ValueError, "home-only"):
                 resources.plan_for_tokens(128, "cpu", home_only=True)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_sixteen_k_dispersed_lengths_retain_both_topologies(self) -> None:
+        """Feature: Complete 16K dynamic coverage.
+        Description: Traverse every 128-row length twice with home and replica execution.
+        Expectation: Sixteen shared token buckets per topology remain cached without rebuilding.
+        """
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources.spec = MegaMoeSpec(16384, 16, 8, 80, 4, None, 65536, 16, None, 0, 24,
+                                    max_local_num_tokens=16384, replica_slots_per_rank=1, logical_num_experts=64)
+        resources.home_spec = replace(resources.spec, num_experts=64, replica_slots_per_rank=0)
+        resources._plans = OrderedDict()
+        retained = {}
+        with patch.object(mega_moe_module, "build_mega_moe_plan",
+                          side_effect=lambda spec, _device: SimpleNamespace(spec=spec)) as build:
+            for _ in range(2):
+                for tokens in range(128, 16385, 128):
+                    for home_only in (False, True):
+                        plan = resources.plan_for_tokens(tokens, "cpu", home_only=home_only)
+                        key = (plan.spec.plan_tokens, home_only)
+                        self.assertIs(plan, retained.setdefault(key, plan))
+                        self.assertGreaterEqual(plan.spec.plan_tokens, tokens)
+                        self.assertEqual(plan.spec.local_num_tokens, 16384)
+                        self.assertEqual(plan.spec.receive_capacity, 65536)
+            self.assertEqual(build.call_count, 32)
+            self.assertEqual(set(resources._plans), {(1024 * index, home) for index in range(1, 17)
+                                                    for home in (False, True)})
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_partial_final_bucket_never_exceeds_reserved_rows(self) -> None:
+        """Feature: Partial terminal token bucket.
+        Description: Request nearby lengths when the reservation is below one full bucket.
+        Expectation: One covering plan stays within the unchanged reservation.
+        """
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources.spec = MegaMoeSpec(384, 16, 8, 4, 2, None, 768, 1, None, 0, 24,
+                                    max_local_num_tokens=257)
+        resources._plans = OrderedDict()
+        with patch.object(mega_moe_module, "build_mega_moe_plan",
+                          side_effect=lambda spec, _device: SimpleNamespace(spec=spec)) as build:
+            for tokens in (128, 129, 256, 384):
+                plan = resources.plan_for_tokens(tokens, "cpu")
+                self.assertEqual(plan.spec.plan_tokens, 384)
+                self.assertEqual(plan.spec.local_num_tokens, 384)
+                self.assertEqual(plan.spec.receive_capacity, 768)
+            build.assert_called_once()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_dynamic_home_eligibility_preserves_persistent_event_offsets(self) -> None:
-        """Dynamic schedules may compact only when both topologies share ready offsets."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Bind logical and physical expert topologies with compatible and incompatible event layouts.
+        Expectation: Dynamic schedules may compact only when both topologies share ready offsets.
+        """
         for logical, compatible in ((96, True), (800, False)):
             spec = MegaMoeSpec(4096, 16, 8, logical+64, 2, 1.25, 10240, 16, None, 0, 24,
                                max_local_num_tokens=4096, replica_slots_per_rank=4, logical_num_experts=logical)
@@ -137,8 +210,13 @@ class TestMegaMoeExperts(unittest.TestCase):
                 self.assertIsNone(resources.home_plan)
                 build.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_dynamic_forward_switches_home_and_guest_schedules_without_resizing(self) -> None:
-        """Select the logical route spec and matching schedule independently for every call."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Alternate compact home routing and active guest routing on the same workspace.
+        Expectation: Select the logical route spec and matching schedule independently for every call.
+        """
         hidden = torch.ones(64, 16, dtype=torch.bfloat16)
         ids, probabilities = torch.zeros(64, 2, dtype=torch.int32), torch.full((64, 2), 0.5)
         for mode in ("push", "pull"):
@@ -176,6 +254,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 self.assertEqual(resources.workspace.capacity_floor, 384)
             finally:
                 experts.close()
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_replica_slots_do_not_expand_logical_topk_range(self) -> None:
         """Feature: Logical routing validation.
         Description: Request more selections than logical experts with and without guest slots.
@@ -187,8 +267,13 @@ class TestMegaMoeExperts(unittest.TestCase):
                                num_experts=4, top_k=5, ep_size=2, replica_slots_per_rank=budget,
                                create_parameters=False)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_replica_capacity_bound_survives_managed_heap_migration(self) -> None:
-        """Reject impossible routes before reuse and clamp geometric growth to the replica bound."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Grow a replica workspace and request routes around the lossless receive bound.
+        Expectation: Reject impossible routes before reuse and clamp geometric growth to the replica bound.
+        """
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
         resources.specification = {"local_num_tokens": 4096, "top_k": 8, "hidden_size": 5120,
                                    "num_experts": 48, "ep_size": 8, "initial_capacity_factor": 1.0}
@@ -226,8 +311,13 @@ class TestMegaMoeExperts(unittest.TestCase):
         self.assertIsNone(experts.swiglu_limit)
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_removed_replica_transports_fail_before_allocation(self, create_parameters: Mock) -> None:
-        """Reject obsolete protocols even when the replica budget is disabled."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Request protocols removed from the supported transport set.
+        Expectation: Reject obsolete protocols even when the replica budget is disabled.
+        """
         for mode in ("shmem", "shmem_signal", "shmem_signal_sdma", "shmem_signal_sdma_parallel",
                      "shmem_signal_sdma_bidir", "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection",
                      "shmem_signal_kernel_gradient_adaptive"):
@@ -237,11 +327,16 @@ class TestMegaMoeExperts(unittest.TestCase):
         create_parameters.assert_not_called()
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_constructor_rejects_invalid_static_values_before_allocation(
         self,
         mock_create_parameters: Mock,
     ) -> None:
-        """Reject invalid capacity and token split during construction."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Pass invalid capacity factors and token split values to the constructor.
+        Expectation: Reject invalid capacity and token split during construction.
+        """
         for overrides, message in (
             ({"local_num_tokens": 129}, "divisible"),
             ({"initial_capacity_factor": 0.999}, "initial_capacity_factor"),
@@ -272,6 +367,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         mock_create_parameters.assert_not_called()
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_constructor_validates_and_records_swiglu_limit(
         self,
         mock_create_parameters: Mock,
@@ -399,8 +496,13 @@ class TestMegaMoeExperts(unittest.TestCase):
             expert_output, route.unpermute_mapping, topk_weights
         )
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_replica_target_load_rejects_invalid_values_before_allocation(self) -> None:
-        """Reject invalid independent load targets before creating parameters."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Pass invalid explicit replica target loads to the constructor.
+        Expectation: Reject invalid independent load targets before creating parameters.
+        """
         with patch.object(mega_moe_module, "_create_mega_moe_parameters") as create:
             for target in (0, -1, True, 1.5, "256"):
                 with self.subTest(target=target), self.assertRaisesRegex(ValueError, "replica_target_load"):
@@ -494,8 +596,13 @@ class TestMegaMoeExperts(unittest.TestCase):
                 finally:
                     experts.close()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_home_plan_requires_matching_persistent_ready_offsets(self) -> None:
-        """Reject workspace sharing when guest slots change the ready-generation offset."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Share execution resources across topologies with different persistent ready offsets.
+        Expectation: Reject workspace sharing when guest slots change the ready-generation offset.
+        """
         for logical, expected_plans in ((96, 2), (800, 1)):
             spec = MegaMoeSpec(local_num_tokens=128, hidden_size=16, intermediate_size=8,
                                num_experts=logical + 16 * 4, logical_num_experts=logical,
@@ -520,8 +627,13 @@ class TestMegaMoeExperts(unittest.TestCase):
                 else:
                     self.assertIsNone(resources.home_plan)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_forward_rejects_invalid_weights_before_resource_creation(self) -> None:
-        """Reject invalid expert weights before initializing native resources."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Supply weights with invalid shape, dtype, stride, or device metadata.
+        Expectation: Reject invalid expert weights before initializing native resources.
+        """
         experts = MegaMoeExperts(
             local_num_tokens=128,
             hidden_size=16,
@@ -561,12 +673,17 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     @patch.object(MegaMoeExperts, "_retain_runtime", return_value=None)
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_shared_layers_create_once_and_close_after_last_owner(
         self,
         mock_retain_runtime: Mock,
         mock_create_parameters: Mock,
     ) -> None:
-        """Keep parameters independent while one serial resource group is shared."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Share one execution group across layers while retaining separate parameters.
+        Expectation: Keep parameters independent while one serial resource group is shared.
+        """
         mock_create_parameters.return_value = (object(), object())
         layers = [
             MegaMoeExperts(
@@ -698,8 +815,13 @@ class TestMegaMoeExperts(unittest.TestCase):
         mock_acquire.assert_called_once_with(root_group, heap_size_bytes=1024)
         mock_release.assert_called_once_with()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_workspace_close_failure_keeps_shmem_user(self) -> None:
-        """Do not leave SHMEM when a workspace cannot release its resources."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Make workspace teardown fail while the execution owner holds a SHMEM reference.
+        Expectation: Do not leave SHMEM when a workspace cannot release its resources.
+        """
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access
             mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
         )
@@ -719,8 +841,13 @@ class TestMegaMoeExperts(unittest.TestCase):
         mock_release.assert_not_called()
         self.assertFalse(resources._closed)  # pylint: disable=protected-access
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_shmem_release_failure_keeps_execution_resource_open(self) -> None:
-        """Keep the resource open when its SHMEM reference cannot be released."""
+        """Feature: MegaMoE resource lifecycle.
+        Description: Make SHMEM reference release fail during execution-resource teardown.
+        Expectation: Keep the resource open when its SHMEM reference cannot be released.
+        """
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access
             mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
         )

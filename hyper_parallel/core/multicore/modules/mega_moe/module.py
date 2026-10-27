@@ -255,16 +255,28 @@ class _MegaMoeExecutionResources:
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
 
     def plan_for_tokens(self, tokens: int, device: Any, *, home_only: bool = False) -> Any:
-        """Cache bounded schedules without changing symmetric workspace capacity."""
+        """Cache covering schedules without changing the symmetric reservation.
+
+        Args:
+            tokens: Global source-row bound for this invocation.
+            device: Device on which to materialize a missing plan.
+            home_only: Select the compact logical-expert execution topology.
+
+        Returns:
+            A covering plan retained independently by any active backward graph.
+        """
         spec = self.home_spec if home_only else self.spec
         if spec is None:
             raise ValueError("MegaMoe home-only execution requires compatible persistent event offsets")
+        tokens = min(spec.local_num_tokens, (tokens + 1023) // 1024 * 1024)
         key = tokens, home_only
         if key not in self._plans:
             self._plans[key] = build_mega_moe_plan(replace(spec, schedule_tokens=tokens), device)
         self._plans.move_to_end(key)
         plan = self._plans[key]
-        while len(self._plans) > 4:
+        # Each execution topology needs sixteen 1K buckets for a 16K reservation.
+        cache_limit = 32 if self.spec.replica_slots_per_rank else 16
+        while len(self._plans) > cache_limit:
             # Autograd contexts keep in-flight plans alive independently of this cache.
             self._plans.popitem(last=False)
         return plan
@@ -600,6 +612,36 @@ class MegaMoeExperts(MulticoreModule):
         self._validate_tensors(hidden_flat, expert_weights)
         return hidden_flat
 
+    def _prepare_replica_route(
+        self, topk_ids: torch.Tensor, hidden_flat: torch.Tensor,
+        resources: _MegaMoeExecutionResources, autograd_mask: int,
+    ) -> Any:
+        """Resolve stable placement inputs under the caller's no-grad scope."""
+        target_load = self.replica_target_load
+        if target_load is None and self.dispatch_mode != "pull":
+            target_load = initial_receive_capacity(self._resource_group.specification)
+        admission, saved_rows = resolve_replica_admission(self.replica_minimum_load_reduction)
+        return prepare_replica_route(
+            topk_ids, self.replica_config, self._ep_group,
+            target_load=target_load,
+            minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
+            planner_backend=self.replica_planner,
+            minimum_load_reduction=admission, minimum_saved_rows=saved_rows,
+            compact_home=resources.home_spec is not None,
+            max_local_num_tokens=self.max_local_num_tokens,
+            dynamic_header=((int(hidden_flat.shape[0] > self.max_local_num_tokens), hidden_flat.shape[0],
+                             autograd_mask)
+                            if self.max_local_num_tokens is not None else None),
+            receive_capacity=(initial_receive_capacity(self._resource_group.specification)
+                              if self.dispatch_mode != "pull" else None),
+        )
+
+    def _validate_graph_capture(self) -> None:
+        """Reject capture before entering dynamic or growing workspace execution."""
+        if (self.dispatch_mode == "push" or self.max_local_num_tokens is not None) and (
+                torch.npu.is_current_stream_capturing()):
+            raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -636,9 +678,7 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
             weights,
         )
-        if (self.dispatch_mode == "push" or self.max_local_num_tokens is not None) and (
-                torch.npu.is_current_stream_capturing()):
-            raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
+        self._validate_graph_capture()
         resources = self._get_execution_resources(hidden_flat)
         route_options = {}
         if self.max_local_num_tokens is not None:
@@ -659,24 +699,8 @@ class MegaMoeExperts(MulticoreModule):
                 execution_plan = resources.plan
                 execution_spec = resources.spec
                 if self.replica_slots_per_rank:
-                    target_load = self.replica_target_load
-                    if target_load is None and not pull:
-                        target_load = initial_receive_capacity(self._resource_group.specification)
-                    admission, saved_rows = resolve_replica_admission(self.replica_minimum_load_reduction)
-                    replica_route = prepare_replica_route(
-                        topk_ids, self.replica_config, self._ep_group,
-                        target_load=target_load,
-                        minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
-                        planner_backend=self.replica_planner,
-                        minimum_load_reduction=admission, minimum_saved_rows=saved_rows,
-                        compact_home=resources.home_spec is not None,
-                        max_local_num_tokens=self.max_local_num_tokens,
-                        dynamic_header=((int(hidden_flat.shape[0] > self.max_local_num_tokens), hidden_flat.shape[0],
-                                         route_options["autograd_mask"])
-                                        if self.max_local_num_tokens is not None else None),
-                        receive_capacity=(initial_receive_capacity(self._resource_group.specification)
-                                          if not pull else None),
-                    )
+                    replica_route = self._prepare_replica_route(
+                        topk_ids, hidden_flat, resources, route_options.get("autograd_mask", 0))
                     if replica_route.home_only:
                         execution_plan = resources.home_plan
                         execution_spec = resources.home_spec
