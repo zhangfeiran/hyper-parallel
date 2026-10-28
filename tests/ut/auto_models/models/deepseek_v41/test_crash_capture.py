@@ -50,6 +50,27 @@ class TestCrashCapture(unittest.TestCase):
         self.assertEqual(len({command[-1] for command in commands}), 3)
         self.assertIn('/native/', commands[0][-1] + '/')
 
+    def test_pull_case_appends_without_changing_existing_controls(self) -> None:
+        """Append a MoE-only pull run with the same workload and fused attention."""
+        env = {key: '/value' for key in ('HYPER_ROOT', 'SHMEM_HOST', 'MASTER_ADDR', 'MODEL_DIR',
+                                         'ENGRAM', 'DATA', 'NATIVE_LIB', 'RUN_ROOT', 'DSV41_NATIVE_CAPTURE_LIB')}
+        env.update(MASTER_PORT_BASE='64100', NNODES='8', NODE_RANK='7', NUM_CARDS='16')
+        with patch.dict('os.environ', env):
+            previous = [capture.capture_command(case, index) for index, case in enumerate(capture.case_matrix())]
+            cases = capture.case_matrix(include_pull=True)
+            commands = [capture.capture_command(case, index) for index, case in enumerate(cases)]
+        self.assertEqual(commands[:3], previous)
+        self.assertEqual([case.name for case in cases],
+                         ['01_native', '02_moe_push', '03_all_on', '04_moe_pull'])
+        pull = commands[-1]
+        for key, value in {'--steps': '105', '--warmup-steps': '20', '--num-hidden-layers': '8',
+                           '--experts': '384', '--ep-size': '64', '--edp-shard-size': '2',
+                           '--dispatch-mode': 'pull', '--mega-kernels': 'moe', '--backend': 'megamoe'}.items():
+            self.assertEqual(pull[pull.index(key) + 1], value)
+        self.assertIn('--use-fused-attention', pull)
+        self.assertNotIn('--capacity-factor', pull)
+        self.assertTrue(pull[-1].endswith('/04_moe_pull/packed/pull'))
+
     def test_capture_environment_is_child_scoped(self) -> None:
         """Preserve existing preload libraries without mutating the parent environment."""
         with TemporaryDirectory() as directory:

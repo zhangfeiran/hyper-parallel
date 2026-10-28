@@ -25,9 +25,10 @@ from examples.training_demo.deepseek_v41.coordinate_deepseek_v41_cluster import 
 from examples.training_demo.deepseek_v41.deepseek_v41_clean_abba import Case, command_for
 
 
-def case_matrix() -> tuple[Case, ...]:
+def case_matrix(include_pull: bool = False) -> tuple[Case, ...]:
     """Use a native baseline before MegaMoe-only and all three Mega kernels."""
-    return (Case('01_native', 'off'), Case('02_moe_push', 'moe'), Case('03_all_on', 'on'))
+    cases = (Case('01_native', 'off'), Case('02_moe_push', 'moe'), Case('03_all_on', 'on'))
+    return cases + (Case('04_moe_pull', 'moe', 'pull'),) if include_pull else cases
 
 
 def capture_command(case: Case, index: int) -> list[str]:
@@ -41,13 +42,15 @@ def capture_command(case: Case, index: int) -> list[str]:
                     f"DSV41_NATIVE_CAPTURE_LIB={os.environ['DSV41_NATIVE_CAPTURE_LIB']}",
                     f'ASCEND_PROCESS_LOG_PATH={node}/cann-logs', f'ASCEND_WORK_PATH={node}/ascend-work']
     command.insert(command.index('--output'), '--use-fused-attention')
+    if os.environ.get('DSV41_FUSED_RMSNORM', '0') == '1':
+        command.insert(command.index('--output'), '--use-fused-rmsnorm')
     return command
 
 
-def publish(root: Path, nodes: int) -> dict[str, Any]:
+def publish(root: Path, nodes: int, *, include_pull: bool = False) -> dict[str, Any]:
     """Report failures and capture coverage without treating diagnostic times as speedups."""
     cases = {}
-    for case in case_matrix():
+    for case in case_matrix(include_pull):
         base = root/'cases'/case.name/'packed'
         statuses = []
         for node in range(nodes):
@@ -86,8 +89,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
+    include_pull = os.environ.get('CLEAN_INCLUDE_PULL', '0') == '1'
     if args.dry_run:
-        for index, case in enumerate(case_matrix()):
+        for index, case in enumerate(case_matrix(include_pull)):
             print(json.dumps({'case': case.name, 'mode': case.mega_kernels,
                               'command': capture_command(case, index)}))
         return
@@ -100,7 +104,7 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
-    for index, case in enumerate(case_matrix()):
+    for index, case in enumerate(case_matrix(include_pull)):
         peers = [root/'cases'/case.name/'packed/nodes'/f'node_{node}'/case.backend for node in range(nodes)]
         folder = peers[node_rank]
         folder.mkdir(parents=True, exist_ok=True)
@@ -111,9 +115,9 @@ def main() -> None:
                             float(os.environ.get('CASE_SYNC_TIMEOUT', '600')))
         print(json.dumps({'event': 'finished', 'case': case.name, 'statuses': statuses}), flush=True)
         if node_rank == 0:
-            publish(root, nodes)
+            publish(root, nodes, include_pull=include_pull)
     if node_rank == 0:
-        report = publish(root, nodes)
+        report = publish(root, nodes, include_pull=include_pull)
         if not report['training_all_passed']:
             raise SystemExit('Capture completed with training failures; '
                              'inspect capture-summary.json and native-stacks.log')

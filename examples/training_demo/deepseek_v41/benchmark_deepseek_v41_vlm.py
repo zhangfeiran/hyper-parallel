@@ -183,6 +183,13 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
         replacement = override.get("replace_module", {})
         if replacement.get("_target_", "").endswith(".SharedCompressedDSAAttention"):
             replacement["use_fused_ops"] = getattr(args, "use_fused_attention", False)
+    if getattr(args, "use_fused_rmsnorm", False):
+        # Attention owns its descendants; replacement plans reject nested targets.
+        recipe["plan_overrides"].append({
+            "match": ["model.norm", "*.input_layernorm", "*.post_attention_layernorm"],
+            "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4RMSNorm",
+            "replace_module": {"_target_": "hyper_parallel.components.modules.rms_norm.RMSNorm"},
+        })
     path = work / "recipe.yaml"
     path.write_text(yaml.safe_dump(recipe), encoding="utf-8")
     return parse_training_args([str(path)])
@@ -347,6 +354,8 @@ def _arguments() -> argparse.Namespace:
                         help="Hash consumed batch tensors outside the timed optimizer step")
     parser.add_argument("--use-fused-attention", action="store_true",
                         help="Require fused attention, Lightning Indexer and KL operators without fallback")
+    parser.add_argument("--use-fused-rmsnorm", action="store_true",
+                        help="Replace decoder and final direct-scale RMSNorm with the existing NPU operator")
     parser.add_argument("--activation-checkpoint", choices=("off", "full"), default="off")
     parser.add_argument("--engram-storage-backend", choices=("device", "host"), default="device")
     parser.add_argument("--random-init-seed", type=int, default=42,
@@ -404,6 +413,19 @@ def main() -> None:
     trainer = (VLMTrainer if args.modality == "vlm" else TextTrainer)(config)
     module_counts = _mega_module_counts(trainer.base.model)
     attention_counts = _attention_module_counts(trainer.base.model)
+    fused_norm_count = None
+    if getattr(args, "use_fused_rmsnorm", False):
+        # The selected replacement requires the optional NPU normalization backend.
+        from hyper_parallel.components.modules.rms_norm import RMSNorm  # pylint: disable=import-outside-toplevel
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4RMSNorm
+        fused_norm_count = sum(isinstance(module, RMSNorm) for module in trainer.base.model.modules())
+        reference_norm_count = sum(
+            isinstance(module, DeepseekV4RMSNorm) and ".self_attn." not in name
+            for name, module in trainer.base.model.named_modules()
+        )
+        if not fused_norm_count or reference_norm_count:
+            raise RuntimeError(f"Rank {rank}: incomplete RMSNorm fusion: "
+                               f"fused={fused_norm_count}, reference={reference_norm_count}")
     if args.num_hidden_layers is not None:
         expected_attention = {"fused": args.num_hidden_layers if args.use_fused_attention else 0,
                               "reference": 0 if args.use_fused_attention else args.num_hidden_layers}
@@ -464,6 +486,7 @@ def main() -> None:
               "profiling_enabled": config.profiler.enable,
               "mega_module_counts": module_counts,
               "attention_module_counts": attention_counts,
+              "fused_rmsnorm_module_count": fused_norm_count,
               "shmem_state": shmem.debug_state() if experts else None,
               "owner_use_grouped_gemm": args.backend == "owner_ep"}
     trainer.on_train_end()

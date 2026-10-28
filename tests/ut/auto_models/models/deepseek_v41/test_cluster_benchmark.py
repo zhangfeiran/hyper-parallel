@@ -146,7 +146,7 @@ class TestClusterRecipe(unittest.TestCase):
                             num_hidden_layers=8, vision_num_hidden_layers=None, full_model=False,
                             engram_storage_backend="host", backend="owner_ep" if mode == "off" else "megamoe",
                             dispatch_mode="push", capacity_factor=None, mega_kernels=mode,
-                            use_fused_attention=fused,
+                            use_fused_attention=fused, use_fused_rmsnorm=fused,
                         )
                         _recipe(args, work, 4)
                         recipe = yaml.safe_load((work / "recipe.yaml").read_text())
@@ -155,6 +155,10 @@ class TestClusterRecipe(unittest.TestCase):
                                             ".SharedCompressedDSAAttention")]
                         self.assertEqual(len(replacements), 1)
                         self.assertIs(replacements[0].get("use_fused_ops"), fused)
+                        norms = [entry for entry in recipe["plan_overrides"]
+                                 if entry.get("replace_module", {}).get("_target_") ==
+                                 "hyper_parallel.components.modules.rms_norm.RMSNorm"]
+                        self.assertEqual(len(norms), int(fused))
 
     def test_host_recipes_preserve_dynamic_tokens_and_precision(self) -> None:
         """All backends share dense precision, full decoder replay and Host selection."""
