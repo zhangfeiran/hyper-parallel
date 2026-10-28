@@ -322,6 +322,7 @@ def build_deepseek_v41_external_state(model: nn.Module,
         table.bind_planned_shard(
             ep_rank=ep_rank, ep_size=ep_size,
             ep_group=ep_mesh.get_group() if ep_mesh is not None else None,
-            compute_dtype=context.model_init_dtype,
+            # Both supported initialization policies execute dense FSDP in BF16.
+            compute_dtype=torch.bfloat16,
         )
     return DeepseekV41HostState(model, tables, mesh)

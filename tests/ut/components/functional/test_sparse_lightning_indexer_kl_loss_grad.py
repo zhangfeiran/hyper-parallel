@@ -126,6 +126,47 @@ class TestSparseLightningIndexerKL(unittest.TestCase):
             self.assertIsNone(cached[1])
             loader.assert_not_called()
 
+    def test_attention_canonicalizes_singleton_batch_bank_strides(self) -> None:
+        """Cropped native KV banks require canonical singleton strides without extra copies."""
+        for batch in (1, 2):
+            for ratio in (0, 2):
+                with self.subTest(batch=batch, ratio=ratio):
+                    query = torch.ones(batch, 8, 32, 512, dtype=torch.bfloat16)
+                    raw = torch.ones(batch, 1, 192, 512, dtype=torch.bfloat16)
+                    main = torch.ones(batch, 64, 512, dtype=torch.bfloat16)
+                    indices = torch.zeros(batch, 32, 4, dtype=torch.int32)
+
+                    def forward(queries, **kwargs):
+                        native_raw = kwargs["ori_kv"]
+                        self.assertEqual(native_raw.shape, (batch, 96, 1, 512))
+                        self.assertEqual(native_raw.stride(), (96 * 512, 512, 512, 1))
+                        native_main = kwargs["cmp_kv"]
+                        if ratio:
+                            self.assertEqual(native_main.shape, (batch, 48, 1, 512))
+                            self.assertEqual(native_main.stride(), (48 * 512, 512, 512, 1))
+                            torch.testing.assert_close(native_main.squeeze(2), main[:, :48])
+                        else:
+                            self.assertIsNone(native_main)
+                        torch.testing.assert_close(native_raw.squeeze(2), raw[:, 0, :96])
+                        if batch == 1:
+                            self.assertEqual(
+                                native_raw.untyped_storage().data_ptr(), raw.untyped_storage().data_ptr(),
+                            )
+                            if ratio:
+                                self.assertEqual(
+                                    native_main.untyped_storage().data_ptr(), main.untyped_storage().data_ptr(),
+                                )
+                        return queries.clone(), torch.zeros(queries.shape[:-1])
+
+                    with patch.object(attention_ops, "_attention_metadata", return_value=(None, None)), \
+                            patch.object(attention_ops, "_load_attention_ops", return_value=(forward, None, None)):
+                        actual = attention_ops.sparse_flash_mla(
+                            query, raw, main if ratio else None, indices if ratio else None,
+                            torch.zeros(8), 512**-.5, ratio, 128, 64, ((0, 32, 0, 48, 0),),
+                        )
+                    torch.testing.assert_close(actual, query.transpose(1, 2))
+
+
     def test_attention_preserves_logical_topk_width(self):
         """SMLA must not interpret KL padding as additional selected keys."""
         widths = []

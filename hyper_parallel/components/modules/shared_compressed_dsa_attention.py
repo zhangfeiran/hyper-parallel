@@ -886,12 +886,13 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 )
                 # Preserve the einsum result if SAC cached its storage.
                 selected_key_grad = selected_key_grad.masked_fill(~valid.unsqueeze(-1), 0.0)
-                scatter_indices = safe_indices.unsqueeze(-1).expand_as(selected_key_grad)
-                grad_index_key.scatter_add_(
-                    1,
-                    scatter_indices.reshape(batch_size, -1, index_key.shape[-1]),
-                    selected_key_grad.reshape(batch_size, -1, index_key.shape[-1]),
-                )
+                # Accumulate whole key rows without the broadcast ScatterAdd workspace path.
+                for batch_index in range(batch_size):
+                    grad_index_key[batch_index].index_put_(
+                        (safe_indices[batch_index].reshape(-1),),
+                        selected_key_grad[batch_index].reshape(-1, index_key.shape[-1]),
+                        accumulate=True,
+                    )
 
         ctx.save_for_backward(grad_index_query, grad_index_key, grad_merge_weight)
         return total_loss

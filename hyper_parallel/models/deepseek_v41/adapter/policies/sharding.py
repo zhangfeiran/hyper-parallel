@@ -45,6 +45,9 @@ def build_parameter_sharding_rules() -> list[tuple[Union[list[str], str], Any]]:
 
 def _get_visual_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
     """Return V4.1 visual execution units with bounded unshard size."""
+    if getattr(getattr(model, "config", None), "v41_root_owned_vision", False):
+        # Per-image execution must not introduce rank-dependent collectives.
+        return ()
     module_by_fqn = dict(model.named_modules())
     vision_blocks = tuple(
         module_fqn
@@ -89,7 +92,10 @@ def get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
         model: Model being built or inspected.
     """
     module_by_fqn = dict(model.named_modules())
-    return ("model.vision",) if module_by_fqn.get("model.vision") is not None else ()
+    candidates = (("model.vision", "model.aligner")
+                  if getattr(getattr(model, "config", None), "v41_root_owned_vision", False)
+                  else ("model.vision",))
+    return tuple(name for name in candidates if module_by_fqn.get(name) is not None)
 
 
 def get_fsdp_execution_order(

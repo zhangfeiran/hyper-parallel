@@ -15,12 +15,12 @@
 """Resolve and materialize only the Host rows owned by this EP rank."""
 # pylint: disable=forbidden-backend-import
 
-import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from safetensors import safe_open
 from torch import nn
@@ -35,6 +35,7 @@ from hyper_parallel.components.checkpoint.load_groups import (
     build_load_targets,
     resolve_checkpoint_index,
 )
+from hyper_parallel.core.utils.random_init import canonical_normal
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
 from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
 from hyper_parallel.models.external_state import ExternalLoadContext
@@ -125,11 +126,14 @@ def _host_source_keys(model: nn.Module, checkpoint_index: Any,
 def _seed_owner_rows(fqn: str, table: HostEngramTable) -> torch.Tensor:
     """Initialize each owner row independently of EP replica placement."""
     rows = torch.empty((table.rows_per_owner, table.width), dtype=torch.float32)
-    generator = torch.Generator(device="cpu")
-    layer_seed = int.from_bytes(hashlib.sha256(fqn.encode()).digest()[:8], "little")
-    for local_row in range(table.rows_per_owner):
-        generator.manual_seed((1729 + layer_seed + table.global_row_start + local_row) % (2**63 - 1))
-        rows[local_row] = torch.randn(table.width, generator=generator)
+    flat = rows.view(-1)
+    global_start = table.global_row_start * table.width
+    chunk_elements = 1 << 20
+    for start in range(0, flat.numel(), chunk_elements):
+        count = min(chunk_elements, flat.numel() - start)
+        indices = np.arange(global_start + start, global_start + start + count, dtype=np.uint64)
+        values = canonical_normal(indices, f"{fqn}.weight", seed=1729, std=1.0)
+        flat[start:start + count].copy_(torch.from_numpy(values))
     return rows
 
 
