@@ -257,7 +257,7 @@ def _build_route_indices(
     """Build expert-major route slots and the inverse token route map."""
 
 
-    permuted_slots, inverse_order = torch_npu.npu_moe_token_permute(
+    permuted_slots, inverse_order = load_torch_npu().npu_moe_token_permute(
         route_slots,
         topk_ids.reshape(-1, 1),
     )

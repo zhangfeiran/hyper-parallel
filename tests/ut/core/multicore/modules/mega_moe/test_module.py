@@ -60,7 +60,7 @@ class TestMegaMoeExperts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_automatic_constructor_accepts_shapes_without_token_arguments(self) -> None:
         """Feature: Automatic token API.
-        Description: Construct both transports without predicting token counts and reject removed keywords.
+        Description: Construct both transports with automatic capacity and retain explicit static fusion shapes.
         Expectation: Start lazily at 128 rows and accept empty, aligned and arbitrary real input shapes.
         """
         for mode in ("push", "pull"):
@@ -68,8 +68,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 layer = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
                                        dispatch_mode=mode)
                 self.addCleanup(layer.close)
-                self.assertFalse(hasattr(layer, "local_num_tokens"))
-                self.assertFalse(hasattr(layer, "max_local_num_tokens"))
+                self.assertIsNone(layer.local_num_tokens)
+                self.assertIsNone(layer.max_local_num_tokens)
                 self.assertTrue(layer._resource_group.specification["auto_tokens"])
                 self.assertEqual(layer._resource_group.specification["local_num_tokens"], 128)
                 self.assertIsNone(layer._resource_group.resources)
@@ -81,8 +81,12 @@ class TestMegaMoeExperts(unittest.TestCase):
                             torch.zeros(rows, 2, dtype=torch.int32), torch.ones(rows, 2), None, parameters)
                         self.assertEqual(tuple(result.shape), (rows, 16))
         for keyword in ("local_num_tokens", "max_local_num_tokens"):
-            with self.subTest(keyword=keyword), self.assertRaisesRegex(TypeError, keyword):
-                MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **{keyword: 128})
+            with self.subTest(keyword=keyword):
+                layer = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+                                       **{keyword: 128})
+                self.addCleanup(layer.close)
+                self.assertFalse(layer._resource_group.specification["auto_tokens"])
+                self.assertEqual(getattr(layer, keyword), 128)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -241,8 +245,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 self.assertIs(kwargs["group"], resources.spec.ep_group)
                 if kind == "layout":
                     peer_specification = list(value[2][0])
-                    self.assertEqual(peer_specification[-3], "EOI")
-                    peer_specification[-3] = "EIO"
+                    layout_index = peer_specification.index("EOI")
+                    peer_specification[layout_index] = "EIO"
                     peer = (value[0], value[1], (tuple(peer_specification),))
                 else:
                     peer = ("dynamic_tokens_v1", *value[1:]) if kind == "wire" else ("different",)

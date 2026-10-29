@@ -393,8 +393,11 @@ def build_route_forward_graph(tsv: TaskSplitValue, **kwargs: Any) -> ComputeGrap
     hidden_size = kwargs.get("hidden_size", 7168)
     intermediate_size = kwargs.get("intermediate_size", 2048)
     dtype_size = kwargs.get("dtype_size", 2)
+    expert_weight_layout = kwargs.get("expert_weight_layout", "EIO")
+    if expert_weight_layout not in ("EIO", "EOI"):
+        raise ValueError(f"Invalid expert_weight_layout: {expert_weight_layout!r}")
     specs = _build_fwd_tensor_specs(
-        tsv, hidden_size, intermediate_size, dtype_size
+        tsv, hidden_size, intermediate_size, dtype_size, expert_weight_layout
     )
     dispatch, up_proj, swiglu, down_proj, combine = _build_fwd_ops(
         tsv,

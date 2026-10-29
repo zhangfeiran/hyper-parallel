@@ -158,9 +158,10 @@ class TestMegaMoeFusion(unittest.TestCase):
         """
         self.assertEqual(len(set(TaskType)), len(TaskType.__members__))
         modes = ("legacy", "permute", "unpermute", "both")
-        for transport, forward, backward in itertools.product(("push", "pull"), modes, modes):
-            with self.subTest(transport=transport, forward=forward, backward=backward):
-                spec = self._spec(dispatch_mode=transport, forward_fusion_mode=forward, backward_fusion_mode=backward)
+        for transport, layout, forward, backward in itertools.product(("push", "pull"), ("EIO", "EOI"), modes, modes):
+            with self.subTest(transport=transport, layout=layout, forward=forward, backward=backward):
+                spec = self._spec(dispatch_mode=transport, expert_weight_layout=layout,
+                                  forward_fusion_mode=forward, backward_fusion_mode=backward)
                 fg, fc, bg, bc = _build_runtime_artifacts(spec)
                 if spec.forward_permute_fused:
                     self.assertEqual(fg.get_op("dispatch").inputs[1].shape, [128, 512])
@@ -212,7 +213,8 @@ class TestMegaMoeFusion(unittest.TestCase):
             inverse = torch.argsort(order)
             return values[order], inverse.to(torch.int32)
 
-        with patch.object(route.torch_npu, "npu_moe_token_permute", side_effect=_scalar_permute) as permutation:
+        permutation = Mock(side_effect=_scalar_permute)
+        with patch.object(route, "load_torch_npu", return_value=SimpleNamespace(npu_moe_token_permute=permutation)):
             prepared = route.prepare_topk_route(hidden, ids, weights, spec, None, route_slots=slots)
         self.assertIsNone(prepared.routed_tokens)
         self.assertEqual(permutation.call_count, 1)
