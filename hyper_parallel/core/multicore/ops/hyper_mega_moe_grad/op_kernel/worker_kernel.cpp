@@ -70,6 +70,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
             MulticoreBf16::ExecuteCgmctTask(task_desc, input_list, this->core_num);
           } else if (task_desc.extra_value_1 == 2) {
             MulticoreBf16::ExecuteBlazeTask(task_desc, input_list, this->core_num);
+          } else if (task_desc.extra_value_1 == 3) {
+            MulticoreBf16::ExecuteBlazeTask<true>(task_desc, input_list, this->core_num);
           } else {
             ExecuteGroupedMatmul(task_desc);
           }
