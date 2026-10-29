@@ -106,7 +106,7 @@ class TestTorchOps(unittest.TestCase):
             patch.object(ops, "preload_vendor_library") as preload,
             patch.object(ops.torch.ops, "load_library") as load,
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version",
-                         return_value=4, create=True) as version,
+                         return_value=5, create=True) as version,
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_grad", self._backward_op(), create=True) as backward,
         ):
             ops._load_native()
@@ -115,8 +115,8 @@ class TestTorchOps(unittest.TestCase):
             preload.assert_called_once_with(Path("vendor"))
             load.assert_called_once_with("good.so")
             for protocol, alias, mutable, message in (
-                    (3, "a", True, "transport ABI"), (4, "e", True, "storage reuse"),
-                    (4, "a", False, "route output mutation")):
+                    (4, "a", True, "transport ABI"), (5, "e", True, "storage reuse"),
+                    (5, "a", False, "route output mutation")):
                 ops._load_native.cache_clear()
                 version.return_value = protocol
                 backward.default._schema = self._backward_op(alias, mutable).default._schema

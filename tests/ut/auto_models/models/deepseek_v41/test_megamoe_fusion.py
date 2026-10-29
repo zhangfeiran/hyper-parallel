@@ -69,5 +69,5 @@ class TestDeepseekV41Fusion(unittest.TestCase):
             DeepseekV41MegaMoeExperts(module=_source(), dynamic_tokens="false")
         experts = DeepseekV41MegaMoeExperts(module=_source(), forward_fusion_mode="both")
         self.addCleanup(experts.close_runtime)
-        with self.assertRaisesRegex(ValueError, "static push"):
+        with self.assertRaisesRegex(ValueError, "static tokens"):
             experts.configure(None, 1, 2)

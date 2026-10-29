@@ -44,6 +44,7 @@ class _ForwardBuffers:
     """Forward tensors prepared around the fused multicore launch."""
 
     dispatch: Any
+    source: Any
     combine: Any
     gmm_workspace: Any
     up_proj: Any
@@ -179,10 +180,12 @@ def _unpermute_grad(
     grad_output: Any,
     reduce_route_index: Any,
     topk_weights: Any,
+    expert_grad: Any | None = None,
 ) -> tuple[Any, Any]:
     """Differentiate the external weighted-unpermute endpoint with ACLNN."""
 
-    expert_grad = torch.empty_like(expert_output)
+    if expert_grad is None:
+        expert_grad = torch.empty_like(expert_output)
     grad_weights = torch.empty_like(topk_weights)
     multicore_ops.mega_moe_unpermute_grad_out(
         expert_output, grad_output, reduce_route_index.reshape(-1).to(torch.int32),
@@ -250,6 +253,16 @@ def _save_forward_state(
     workspace.track_graph(ctx)
 
 
+def _publish_pull_route(workspace: MegaMoeWorkspace, indices: Any, weights: Any | None = None) -> Any:
+    """Publish owned scalar routing metadata before the device-ready handshake."""
+    metadata = _workspace_tensor(workspace.route_metadata, "route_metadata")
+    metadata[:, 0].copy_(indices)
+    if weights is not None:
+        ordered = weights.reshape(-1).index_select(0, indices)
+        metadata[:, 1].copy_(ordered.view(torch.int32))
+    return metadata
+
+
 def _prepare_forward_buffers(
     torch_module: Any,
     plan: MegaMoePlan,
@@ -261,7 +274,10 @@ def _prepare_forward_buffers(
     """Allocate and select tensors consumed by the forward custom operator."""
     spec = plan.spec
     capacity = metadata.expert_capacity
-    dispatch = _workspace_tensor(
+    pull = spec.dispatch_mode == "pull"
+    dispatch = torch_module.empty(
+        (capacity, spec.hidden_size), dtype=hidden_states.dtype, device=hidden_states.device,
+    ) if pull else _workspace_tensor(
         workspace.expert_buffer,
         "expert_buffer",
     ).narrow(0, 0, capacity)
@@ -286,8 +302,13 @@ def _prepare_forward_buffers(
         if spec.forward_permute_fused
         else route.tokens_per_expert
     )
+    source_rows = spec.local_num_tokens if spec.forward_permute_fused else spec.routed_slots
+    source = _workspace_tensor(workspace.source_buffer, "source_buffer")[:source_rows] if pull else None
+    if pull and spec.forward_permute_fused:
+        permute_src_index = _publish_pull_route(workspace, permute_src_index)
     return _ForwardBuffers(
         dispatch=dispatch,
+        source=source,
         combine=combine,
         gmm_workspace=_workspace_tensor(
             workspace.gmm_workspace,
@@ -300,6 +321,19 @@ def _prepare_forward_buffers(
         permute_src_index=permute_src_index,
         events=workspace.prepare_event_counters(forward=True),
     )
+
+
+def _forward_expert_output(spec: Any, buffers: _ForwardBuffers, save_for_backward: bool) -> Any:
+    """Save expert outputs without retaining surplus down-projection rows."""
+    output = (buffers.down_proj.narrow(0, 0, spec.routed_slots)
+              if spec.forward_unpermute_fused else buffers.combine)
+    # Fused backward retains this snapshot while allocating GMM scratch.
+    # A narrow view would keep the larger receive allocation alive throughout.
+    compact = (spec.forward_unpermute_fused and spec.backward_permute_fused
+               and buffers.down_proj.shape[0] > spec.routed_slots)
+    if save_for_backward and (not spec.forward_unpermute_fused or compact):
+        return output.clone()
+    return output
 
 
 def _launch_forward(
@@ -316,6 +350,10 @@ def _launch_forward(
     """Launch the forward graph with route-mode-independent ABI arguments."""
     spec = plan.spec
     kernel_input = kernel_input.contiguous()
+    if spec.dispatch_mode == "pull":
+        if kernel_input.data_ptr() != buffers.source.data_ptr():
+            buffers.source.copy_(kernel_input)
+        kernel_input = buffers.source
     record_plan_stream(plan, plan.fwd_runtime_config)
     multicore_ops.launch_route_fused((
         buffers.dispatch,
@@ -386,12 +424,21 @@ def _prepare_backward_route(
             saved,
         )
         grad_topk_weights = None
+        if spec.dispatch_mode == "pull":
+            _publish_pull_route(workspace, permute_src_index, saved.topk_weights)
+            permute_src_index = _workspace_tensor(workspace.route_metadata, "route_metadata")
+            source = _workspace_tensor(workspace.source_buffer, "source_buffer")[:spec.local_num_tokens]
+            source.copy_(kernel_grad_output)
+            kernel_grad_output = source
     else:
+        source = (_workspace_tensor(workspace.source_buffer, "source_buffer")[:spec.routed_slots]
+                  if spec.dispatch_mode == "pull" else None)
         kernel_grad_output, grad_topk_weights = _unpermute_grad(
             saved.expert_output,
             grad_output,
             saved.reduce_route_index,
             saved.topk_weights,
+            expert_grad=source,
         )
         kernel_grad_output = kernel_grad_output.contiguous()
         # This stable ABI slot has no consumer in the non-permute graph.
@@ -399,7 +446,9 @@ def _prepare_backward_route(
         permute_src_index = saved.dispatch_size
 
     capacity = saved.dispatch.shape[0]
-    dispatch = _workspace_tensor(
+    dispatch = torch.empty(
+        (capacity, spec.hidden_size), dtype=grad_output.dtype, device=grad_output.device,
+    ) if spec.dispatch_mode == "pull" else _workspace_tensor(
         workspace.expert_buffer,
         "expert_buffer",
     ).narrow(0, 0, max(capacity, spec.routed_slots))
@@ -553,6 +602,7 @@ def _finish_backward(
         None,
         None,
         None,
+        None,
     )
 
 
@@ -579,6 +629,7 @@ def _get_mega_moe_function() -> Any:
             route: PreparedTopKRoute,
             plan: MegaMoePlan,
             workspace: MegaMoeWorkspace,
+            save_for_backward: bool,
         ) -> Any:
             """Launch the selected forward route endpoints and expert graph.
 
@@ -593,6 +644,7 @@ def _get_mega_moe_function() -> Any:
                 route: Scalar route indices and exact communication metadata.
                 plan: Matching forward/backward graphs and tiling tensors.
                 workspace: Shared buffers ordered across streams and layers.
+                save_for_backward: Whether the outer call can participate in autograd.
             """
             spec = plan.spec
             metadata = route.metadata
@@ -610,7 +662,9 @@ def _get_mega_moe_function() -> Any:
                 hidden_states.dtype,
                 hidden_states.device,
             )
-            workspace.claim()
+            pull = spec.dispatch_mode == "pull"
+            if not pull:
+                workspace.claim()
             try:
                 # Exact route offsets cover every row consumed by GMM and
                 # unpermute. Clearing the capacity tail only adds device work.
@@ -633,11 +687,7 @@ def _get_mega_moe_function() -> Any:
                     topk_weights,
                     buffers,
                 )
-                expert_output = (
-                    buffers.down_proj.narrow(0, 0, spec.routed_slots)
-                    if spec.forward_unpermute_fused
-                    else buffers.combine.clone()
-                )
+                expert_output = _forward_expert_output(spec, buffers, save_for_backward)
                 output = (
                     buffers.final_out
                     if spec.forward_unpermute_fused
@@ -647,7 +697,11 @@ def _get_mega_moe_function() -> Any:
                         topk_weights,
                     )
                 )
-                if spec.forward_unpermute_fused:
+                if not save_for_backward:
+                    return output
+                if pull:
+                    saved_dispatch = buffers.dispatch
+                elif spec.forward_unpermute_fused:
                     saved_dispatch = buffers.dispatch.clone()
                 else:
                     # Down projection is dead after Combine; retain the received
@@ -671,7 +725,8 @@ def _get_mega_moe_function() -> Any:
                 )
                 return output
             finally:
-                workspace.release()
+                if not pull:
+                    workspace.release()
 
         @staticmethod
         def backward(ctx: Any, grad_output: Any) -> tuple[Any, ...]:
@@ -749,4 +804,7 @@ def execute_mega_moe(
         route,
         plan,
         workspace,
+        torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (hidden_states, topk_weights, weight1, weight2)
+        ),
     )

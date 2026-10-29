@@ -390,6 +390,8 @@ class MegaMoeExperts(MulticoreModule):
             max_local_num_tokens: Optional upper bound for variable input rows; mutually exclusive with static rows.
             forward_fusion_mode: Forward endpoint selection: legacy, permute, unpermute or both.
             backward_fusion_mode: Independent backward endpoint selection; defaults to legacy.
+                Explicit fusion supports static push and pull; it rejects dynamic tokens,
+                top_k > 16 and T * K > 2**24. Pull defaults to legacy in both directions.
             ep_size: Optional compatibility check; normally inferred from explicit ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means

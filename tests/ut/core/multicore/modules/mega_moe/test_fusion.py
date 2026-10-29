@@ -23,6 +23,8 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import fusion, route
+from hyper_parallel.core.multicore.modules.mega_moe import workspace as workspace_module
+from hyper_parallel.core.multicore.modules.mega_moe.workspace import _pull_workspace_options, _workspace_allocation_specs
 from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts, _prepare_diagnostics
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec, _resolve_fusion_modes
@@ -66,13 +68,86 @@ class TestMegaMoeFusion(unittest.TestCase):
         specification = {"local_num_tokens": 128, "top_k": 2}
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(_resolve_fusion_modes(specification), ("permute", "legacy"))
-            for unsupported in ({"dispatch_mode": "pull"}, {"max_local_num_tokens": 128}, {"top_k": 17}):
+            self.assertEqual(_resolve_fusion_modes({**specification, "dispatch_mode": "pull"}), ("legacy", "legacy"))
+            self.assertEqual(_resolve_fusion_modes({**specification, "dispatch_mode": "pull",
+                                                   "forward_fusion_mode": "both"}), ("both", "legacy"))
+            for unsupported in ({"max_local_num_tokens": 128}, {"top_k": 17}):
                 configured = {**specification, **unsupported}
                 self.assertEqual(_resolve_fusion_modes(configured), ("legacy", "legacy"))
-                with self.assertRaisesRegex(ValueError, "static push"):
+                with self.assertRaisesRegex(ValueError, "static tokens"):
                     _resolve_fusion_modes({**configured, "forward_fusion_mode": "permute"})
             with patch.dict(os.environ, {"HYPER_PARALLEL_MEGA_MOE_FUSION_MODE": "legacy"}):
                 self.assertEqual(_resolve_fusion_modes(specification), ("legacy", "legacy"))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_pull_publication_keeps_saved_indices_owned(self):
+        """Feature: Indexed pull route publication.
+        Description: Publish sorted indices and FP32 weight bits, then reuse the publication buffer.
+        Expectation: Metadata matches the route and saved tensors remain independent.
+        """
+        indices = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
+        weights = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+        workspace = SimpleNamespace(route_metadata=torch.empty((4, 2), dtype=torch.int32))
+        published = fusion._publish_pull_route(workspace, indices, weights)
+        self.assertEqual(published[:, 0].tolist(), indices.tolist())
+        self.assertTrue(torch.equal(published[:, 1].contiguous().view(torch.float32),
+                                    weights.flatten()[indices]))
+        published.zero_()
+        self.assertEqual(indices.tolist(), [2, 0, 3, 1])
+        self.assertTrue(torch.equal(weights, torch.tensor([[0.1, 0.2], [0.3, 0.4]])))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_indexed_pull_metadata_survives_restart_and_is_freed(self) -> None:
+        """Feature: Indexed pull workspace lifecycle.
+        Description: Allocate, validate and replace every symmetric tensor, including routing metadata.
+        Expectation: The original-row source and metadata use the same restart and free protocol.
+        """
+        spec = SimpleNamespace(receive_capacity=256, routed_slots=256, hidden_size=16,
+                               ep_size=2, num_experts=4, dispatch_mode="pull", local_num_tokens=128,
+                               forward_fusion_mode="permute", backward_fusion_mode="both")
+        workspace = workspace_module.MegaMoeWorkspace(shared=True)
+        with (
+            patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
+                shape, dtype=kw["dtype"],
+            )) as allocate,
+            patch.object(workspace_module.torch.npu, "Event"),
+        ):
+            workspace.ensure(spec, torch.bfloat16, torch.device("cpu"))
+        self.assertEqual(allocate.call_count, 5)
+        self.assertEqual(workspace.source_buffer.shape, (128, 16))
+        self.assertEqual(workspace.route_metadata.shape, (256, 2))
+        replacements = workspace.describe_restart_allocations(spec, torch.bfloat16, 256)
+        self.assertEqual(len(replacements), 5)
+        self.assertTrue(workspace.validate_restart_allocations(spec, torch.bfloat16, 256, replacements))
+        tensors = tuple(torch.empty_like(replacement.current) for replacement in replacements)
+        workspace.validate_restarted_allocations(spec, torch.bfloat16, 256, tensors)
+        workspace.bind_restarted_allocations(spec, torch.bfloat16, torch.device("cpu"), 256, tensors)
+        self.assertIs(workspace.route_metadata, tensors[-1])
+        with patch.object(workspace_module.shmem, "free") as free:
+            workspace._free_symmetric_tensors()  # pylint: disable=protected-access
+        self.assertEqual(free.call_count, 5)
+        self.assertIsNone(workspace.route_metadata)
+        self.assertIsNone(workspace.source_buffer)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_pull_reserves_original_rows_only_when_both_dispatches_are_fused(self):
+        """Feature: Indexed pull workspace sizing.
+        Description: Check the source capacity for all forward and backward mode combinations.
+        Expectation: Both fused dispatches reserve T rows; either legacy dispatch reserves T*K.
+        """
+        for forward, backward in itertools.product(("legacy", "permute", "unpermute", "both"), repeat=2):
+            spec = self._spec(dispatch_mode="pull", forward_fusion_mode=forward, backward_fusion_mode=backward)
+            allocations = dict(_workspace_allocation_specs(
+                dispatch_mode="pull", routed_slots=spec.routed_slots, receive_capacity=spec.receive_capacity,
+                hidden_size=spec.hidden_size, ep_size=spec.ep_size, num_experts=spec.num_experts,
+                dtype=torch.bfloat16, **_pull_workspace_options(spec)))
+            rows = spec.local_num_tokens if spec.forward_permute_fused and spec.backward_permute_fused else spec.routed_slots
+            self.assertEqual(allocations["source_buffer"].shape, (rows, spec.hidden_size))
+            self.assertEqual(allocations["routed_buffer"].shape, (spec.routed_slots, spec.hidden_size))
+            self.assertEqual("route_metadata" in allocations, spec.forward_permute_fused or spec.backward_permute_fused)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -83,17 +158,19 @@ class TestMegaMoeFusion(unittest.TestCase):
         """
         self.assertEqual(len(set(TaskType)), len(TaskType.__members__))
         modes = ("legacy", "permute", "unpermute", "both")
-        for forward, backward in itertools.product(modes, repeat=2):
-            with self.subTest(forward=forward, backward=backward):
-                spec = self._spec(forward_fusion_mode=forward, backward_fusion_mode=backward)
+        for transport, forward, backward in itertools.product(("push", "pull"), modes, modes):
+            with self.subTest(transport=transport, forward=forward, backward=backward):
+                spec = self._spec(dispatch_mode=transport, forward_fusion_mode=forward, backward_fusion_mode=backward)
                 fg, fc, bg, bc = _build_runtime_artifacts(spec)
                 if spec.forward_permute_fused:
                     self.assertEqual(fg.get_op("dispatch").inputs[1].shape, [128, 512])
                 for graph, config, integrated in ((fg, fc, spec.forward_permute_fused),
                                                   (bg, bc, spec.backward_permute_fused)):
                     dispatch = graph.get_op("dispatch")
+                    task_type = {"pull": TaskType.TASK_SHMEM_GET_MEM,
+                                 "push": TaskType.TASK_SHMEM_PUT_MEM_SIGNAL}[transport]
                     descriptor = next(task for task in config.all_tasks[:config.task_num]
-                                      if task.task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL)
+                                      if task.task_type == task_type)
                     self.assertEqual(descriptor.inputs[1].dim[3], spec.top_k if integrated else 0)
                     for index in range(config.task_num):
                         task = config.all_tasks[index]
@@ -261,6 +338,38 @@ class TestMegaMoeFusion(unittest.TestCase):
                 self.assertEqual(buffers.gate_dx.data_ptr() == received.data_ptr(), approved)
                 self.assertEqual(torch.count_nonzero(buffers.grad_weight1).item(), 0)
                 self.assertEqual(torch.count_nonzero(buffers.grad_weight2).item(), 0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_expert_snapshot_does_not_pin_surplus_receive_storage(self):
+        """Feature: Expert-output snapshot lifetime.
+        Description: Retain a routed output when a receiver owns more rows than the sender routes.
+        Expectation: Fused backward saves exactly the routed rows; no-grad does not copy them.
+        """
+        cases = (
+            (True, True, True, 512, True),
+            (True, True, True, 256, False),
+            (True, True, False, 512, False),
+            (True, False, True, 512, False),
+            (False, True, True, 512, True),
+            (False, False, True, 256, True),
+            (False, True, False, 512, False),
+        )
+        for fused_forward, fused_backward, save, capacity, owned in cases:
+            with self.subTest(forward=fused_forward, backward=fused_backward, save=save, capacity=capacity):
+                spec = SimpleNamespace(forward_unpermute_fused=fused_forward,
+                                       backward_permute_fused=fused_backward, routed_slots=256)
+                buffers = SimpleNamespace(down_proj=torch.randn(capacity, 16), combine=torch.randn(256, 16))
+                output = fusion._forward_expert_output(spec, buffers, save)
+                source = buffers.down_proj[:256] if fused_forward else buffers.combine
+                torch.testing.assert_close(output, source)
+                if owned:
+                    self.assertNotEqual(output.data_ptr(), source.data_ptr())
+                    self.assertEqual(output.untyped_storage().nbytes(), output.numel() * output.element_size())
+                    source.zero_()
+                    self.assertGreater(output.abs().sum().item(), 0)
+                else:
+                    self.assertEqual(output.data_ptr(), source.data_ptr())
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

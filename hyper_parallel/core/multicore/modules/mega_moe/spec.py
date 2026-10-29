@@ -102,13 +102,13 @@ class MegaMoeSpec:
 
 def _resolve_fusion_modes(specification: Mapping[str, Any]) -> tuple[str, str]:
     """Resolve route endpoints before resource agreement and symmetric allocation."""
-    supported = (specification.get("dispatch_mode", "push") == "push"
-                 and specification.get("max_local_num_tokens") is None
+    supported = (specification.get("max_local_num_tokens") is None
                  and not specification.get("auto_tokens", False)
                  and specification["top_k"] <= 16
                  and specification["local_num_tokens"] * specification["top_k"] <= 1 << 24)
     shared = os.getenv("HYPER_PARALLEL_MEGA_MOE_FUSION_MODE")
-    defaults = ("permute", "legacy") if supported else ("legacy", "legacy")
+    defaults = (("permute", "legacy") if supported and specification.get("dispatch_mode", "push") == "push"
+                else ("legacy", "legacy"))
     modes = []
     for direction, default in zip(("forward", "backward"), defaults):
         name = f"{direction}_fusion_mode"
@@ -118,7 +118,7 @@ def _resolve_fusion_modes(specification: Mapping[str, Any]) -> tuple[str, str]:
         if value not in {"legacy", "permute", "unpermute", "both"}:
             raise ValueError(f"{name} must be legacy, permute, unpermute or both, got {value!r}")
         if value != "legacy" and not supported:
-            raise ValueError("Route fusion requires static push dispatch, top_k <= 16 and T * K <= 2**24")
+            raise ValueError("Route fusion requires static tokens, top_k <= 16 and T * K <= 2**24")
         modes.append(value)
     return modes[0], modes[1]
 

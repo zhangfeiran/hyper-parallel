@@ -308,6 +308,11 @@ class KernelWorkerBase {
       reinterpret_cast<__gm__ int32_t *>(input_list[task.inputs[3].input_position])[task.inputs[3].base_ptr_offset];
     int64_t start = (task.task_index % tiles) * static_cast<int64_t>(task.task_split_value) * hidden;
     if (start >= size) {
+#ifndef __DAV_C220_CUBE__
+      if (task.extra_value_0 != 0xFFFFFFFFU && task.extra_value_2 != 0) {
+        TriggerEvent(task.extra_value_2);
+      }
+#endif
       return;
     }
     int64_t tile_elements = static_cast<int64_t>(task.task_split_value) * hidden;
@@ -316,10 +321,127 @@ class KernelWorkerBase {
       reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[0].input_position])[task.inputs[0].base_ptr_offset];
     int64_t source_offset =
       reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[2].input_position])[task.inputs[2].base_ptr_offset];
+#ifndef __DAV_C220_CUBE__
+    if (task.extra_value_0 != 0xFFFFFFFFU) {
+      ExecuteIndexedPull<T>(task, source_pe, source_offset + start, destination_offset + start, elements, hidden);
+      if (task.extra_value_2 != 0) {
+        TriggerEvent(task.extra_value_2);
+      }
+      return;
+    }
+#endif
     PullToLocal<T>(input_list[task.outputs[0].input_position] + (destination_offset + start) * sizeof(T),
                    input_list[task.inputs[1].input_position] + (source_offset + start) * sizeof(T), elements,
                    source_pe);
   }
+
+#ifndef __DAV_C220_CUBE__
+  template <typename T>
+  __aicore__ inline LocalTensor<T> RouteLocalTensor(uint64_t address, uint32_t elements) {
+    LocalTensor<T> result;
+    TBuffAddr buffer{};
+    buffer.logicPos = static_cast<uint8_t>(TPosition::VECCALC);
+    buffer.bufferAddr = address;
+#if ASCENDC_CPU_DEBUG
+    buffer.dataLen = elements * sizeof(T);
+    buffer.absAddr = reinterpret_cast<uint8_t *>(address);
+#endif
+    result.SetAddr(buffer);
+    result.SetSize(elements);
+    return result;
+  }
+
+  template <typename T>
+  __aicore__ inline void PullIndexedRows(__gm__ T *source, __gm__ T *destination, __ubuf__ int32_t *metadata,
+                                         uint64_t scratch, int64_t rows, int64_t hidden, uint32_t top_k,
+                                         bool weighted) {
+    constexpr int64_t CHUNK = 8192;
+    uint64_t value_bytes = CHUNK * sizeof(T);
+    if (scratch + 2 * value_bytes + CHUNK * sizeof(float) > ROUTE_UB_BYTES) {
+      AscendC::Trap();
+    }
+    LocalTensor<T> ping = RouteLocalTensor<T>(scratch, CHUNK);
+    LocalTensor<T> pong = RouteLocalTensor<T>(scratch + value_bytes, CHUNK);
+    LocalTensor<float> temporary = RouteLocalTensor<float>(scratch + 2 * value_bytes, CHUNK);
+    auto *weights = reinterpret_cast<__ubuf__ float *>(metadata);
+    __ubuf__ T *buffers[2] = {reinterpret_cast<__ubuf__ T *>(scratch),
+                            reinterpret_cast<__ubuf__ T *>(scratch + value_bytes)};
+    for (int64_t col = 0; col < hidden; col += CHUNK) {
+      int64_t elements = hidden - col < CHUNK ? hidden - col : CHUNK;
+      uint64_t bytes = elements * sizeof(T);
+      AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+      AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+      AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+      int64_t first = metadata[0] / top_k;
+      aclshmemi_copy_gm2ub(buffers[0], source + first * hidden + col, bytes);
+      AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+      for (int64_t row = 0; row < rows; ++row) {
+        uint32_t parity = row & 1;
+        AscendC::TEventID event = parity ? EVENT_ID1 : EVENT_ID0;
+        LocalTensor<T> value = parity ? pong : ping;
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(event);
+        if (row + 1 < rows) {
+          AscendC::TEventID next = parity ? EVENT_ID0 : EVENT_ID1;
+          AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(next);
+          int64_t token = metadata[(row + 1) * 2] / top_k;
+          aclshmemi_copy_gm2ub(buffers[1 - parity], source + token * hidden + col, bytes);
+          AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(next);
+        }
+        if (weighted) {
+          float weight = weights[row * 2 + 1];
+          Cast(temporary, value, RoundMode::CAST_NONE, elements);
+          PipeBarrier<PIPE_V>();
+          Muls(temporary, temporary, weight, elements);
+          PipeBarrier<PIPE_V>();
+          Cast(value, temporary, RoundMode::CAST_RINT, elements);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(event);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(event);
+        aclshmemi_copy_ub2gm(destination + row * hidden + col, buffers[parity], bytes);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+      }
+      AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+      AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+    }
+  }
+
+  template <typename T>
+  __aicore__ inline void ExecuteIndexedPull(const TaskDesc &task, int source_pe, int64_t source_offset,
+                                            int64_t destination_offset, int64_t elements, int64_t hidden) {
+    namespace plane = hyper_parallel::multicore::shmem::data_plane;
+    constexpr int64_t META_ROWS = 128;
+    // Each task drains all transfers before another task reuses this worker's UB.
+    uint64_t scratch_ub;
+    uint64_t transport_bytes;
+    if (!hyper_parallel::multicore::shmem::cann::device::query_mte_resources(
+          source_pe, scratch_ub, transport_bytes) || transport_bytes == 0) {
+      AscendC::Trap();
+    }
+    auto *remote_data = reinterpret_cast<__gm__ T *>(plane::remote_ptr(
+      input_list[task.inputs[1].input_position], source_pe));
+    auto *remote_metadata = reinterpret_cast<__gm__ int32_t *>(plane::remote_ptr(
+      input_list[task.extra_value_0], source_pe));
+    if (remote_data == nullptr || remote_metadata == nullptr) {
+      AscendC::Trap();
+    }
+    auto *destination = reinterpret_cast<__gm__ T *>(input_list[task.outputs[0].input_position]) + destination_offset;
+    int64_t source_row = source_offset / hidden;
+    int64_t total_rows = elements / hidden;
+    for (int64_t begin = 0; begin < total_rows; begin += META_ROWS) {
+      int64_t rows = total_rows - begin < META_ROWS ? total_rows - begin : META_ROWS;
+      auto *metadata = reinterpret_cast<__ubuf__ int32_t *>(scratch_ub);
+      aclshmemi_copy_gm2ub(metadata, remote_metadata + (source_row + begin) * 2,
+                           rows * 2 * sizeof(int32_t));
+      // No TPipe is alive in the transport task. Own a fixed event rather
+      // than querying FetchEventID through the previous task's pipe pointer.
+      AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+      AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+      PullIndexedRows<T>(remote_data, destination + begin * hidden, metadata,
+                         scratch_ub + META_ROWS * 2 * sizeof(int32_t), rows, hidden,
+                         task.inputs[1].dim[3], task.extra_value_1 != 0xFFFFFFFFU);
+    }
+  }
+#endif
 
   __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
 #ifdef __DAV_C220_CUBE__
@@ -395,7 +517,8 @@ class KernelWorkerBase {
     }
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
       WaitForDependency(task_desc.dependent_event,
-                        task_desc.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ? 0 : task_desc.extra_value_2);
+                        (task_desc.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ||
+                         task_desc.task_type == TaskType::TASK_SHMEM_GET_MEM) ? 0 : task_desc.extra_value_2);
     }
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
@@ -415,7 +538,8 @@ class KernelWorkerBase {
     }
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
       WaitForDependency(task_desc.dependent_event,
-                        task_desc.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ? 0 : task_desc.extra_value_2);
+                        (task_desc.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ||
+                         task_desc.task_type == TaskType::TASK_SHMEM_GET_MEM) ? 0 : task_desc.extra_value_2);
     }
     CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_BEFORE);
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
@@ -444,7 +568,8 @@ class KernelWorkerBase {
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
       uint64_t wait_start_cycle = cycle_trace_recorder.Now();
       WaitForDependency(task_desc.dependent_event,
-                        task_desc.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ? 0 : task_desc.extra_value_2);
+                        (task_desc.task_type == TaskType::TASK_SHMEM_PUT_MEM_SIGNAL ||
+                         task_desc.task_type == TaskType::TASK_SHMEM_GET_MEM) ? 0 : task_desc.extra_value_2);
       uint64_t wait_end_cycle = cycle_trace_recorder.Now();
       cycle_trace_recorder.Record(Derived::PROFILE_DESC_WAIT_DEPENDENCY, task_id, task_desc.task_index, owner_id,
                                   wait_start_cycle, wait_end_cycle);
