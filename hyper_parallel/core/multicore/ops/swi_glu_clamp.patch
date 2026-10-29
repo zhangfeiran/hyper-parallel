@@ -147,10 +147,9 @@ index f672fbb..d7a9d1e 100644
        }
    }
 diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp b/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
-index 68e91c1..c0e584b 100644
 --- a/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
 +++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
-@@ -29,6 +29,7 @@ class SwiGluGradBF16 {
+@@ -29,6 +29,7 @@
      __aicore__ inline void ComputeGradN(uint64_t curTileLen);
  
      calcType beta = 1.0;
@@ -158,7 +157,7 @@ index 68e91c1..c0e584b 100644
      TPipe pipe;
      TQue<QuePosition::VECIN, bufferNum> inQueueA;
      TQue<QuePosition::VECIN, bufferNum> inQueueB;
-@@ -46,6 +47,8 @@ class SwiGluGradBF16 {
+@@ -46,6 +47,8 @@
      TBuf<TPosition::VECCALC> aTempBuffer;
      TBuf<TPosition::VECCALC> lTempBuffer;
      TBuf<TPosition::VECCALC> outputTempBuffer;
@@ -167,7 +166,7 @@ index 68e91c1..c0e584b 100644
  
      GlobalTensor<inType> aGm;
      GlobalTensor<inType> bGm;
-@@ -86,15 +89,54 @@ __aicore__ inline void SwiGluGradBF16<inType, calcType, outType, bufferNum>::Ini
+@@ -86,46 +89,114 @@
  template<typename inType, typename calcType, typename outType, uint16_t bufferNum>
  __aicore__ inline void SwiGluGradBF16<inType, calcType, outType, bufferNum>::Compute(uint64_t tileLength)
  {
@@ -177,9 +176,7 @@ index 68e91c1..c0e584b 100644
      ComputeSigLocal(tileLength);
 -    //----------------N
 -    Mul(nLocal, sigLocal, aLocal, tileLength);
--    ComputeGradN(tileLength);
- 
--    //----------------M
++
 +    if (clampLimit <= 0.0f) {
 +        //----------------N
 +        Mul(nLocal, sigLocal, aLocal, tileLength);
@@ -226,25 +223,20 @@ index 68e91c1..c0e584b 100644
 +    Cast(lLocal, lLocal_, RoundMode::CAST_NONE, tileLength);
 +    PipeBarrier<PIPE_V>();
 +    inQueueL.template FreeTensor(lLocal_);
-     Muls(tempLocal, sigLocal, (calcType)(-1.0), tileLength);
-     PipeBarrier<PIPE_V>();
-     Adds(tempLocal, tempLocal, (calcType)(1.0), tileLength);
-@@ -110,22 +148,43 @@ __aicore__ inline void SwiGluGradBF16<inType, calcType, outType, bufferNum>::Com
-     PipeBarrier<PIPE_V>();
-     Add(mLocal, mLocal, sigLocal, tileLength);
- 
--    LocalTensor<inType> bLocal_ = inQueueB.template DeQue<inType>();
--    auto& bLocal = aLocal;
--    Cast(bLocal, bLocal_, RoundMode::CAST_NONE, tileLength);
--    PipeBarrier<PIPE_V>();
--
-     Mul(mLocal, mLocal, lLocal, tileLength);
-     PipeBarrier<PIPE_V>();
- 
--    LocalTensor<outType> mLocal_ = outQueueM.template AllocTensor<outType>();
--
--    Mul(mLocal, mLocal, bLocal, tileLength);
--    inQueueB.template FreeTensor(bLocal_);
++    Muls(tempLocal, sigLocal, (calcType)(-1.0), tileLength);
++    PipeBarrier<PIPE_V>();
++    Adds(tempLocal, tempLocal, (calcType)(1.0), tileLength);
++    PipeBarrier<PIPE_V>();
++
++    auto& mLocal = nLocal;
++    // Match native SiLU backward: sigmoid * (1 + gate * (1 - sigmoid)).
++    Mul(mLocal, tempLocal, aLocal, tileLength);
++    PipeBarrier<PIPE_V>();
++    Adds(mLocal, mLocal, (calcType)1.0, tileLength);
++    PipeBarrier<PIPE_V>();
++    Mul(mLocal, sigLocal, mLocal, tileLength);
++    PipeBarrier<PIPE_V>();
++
 +    LocalTensor<uint8_t> mask = tmpQueue.Get<uint8_t>();
 +    constexpr int64_t kCompareAlign = 64;
 +    int64_t alignedCount = (tileLength + kCompareAlign - 1) / kCompareAlign * kCompareAlign;
@@ -252,8 +244,7 @@ index 68e91c1..c0e584b 100644
 +    PipeBarrier<PIPE_V>();
 +    CompareScalar(mask, aLocal, clampLimit, CMPMODE::LE, alignedCount);
 +    PipeBarrier<PIPE_V>();
-+    Select(mLocal, mask, mLocal, (calcType)0.0, SELMODE::VSEL_TENSOR_SCALAR_MODE, tileLength);
-+    PipeBarrier<PIPE_V>();
++
 +    bInput = inQueueB.template DeQue<inType>();
 +    Cast(aLocal, bInput, RoundMode::CAST_NONE, tileLength);
 +    PipeBarrier<PIPE_V>();
@@ -262,12 +253,17 @@ index 68e91c1..c0e584b 100644
 +    Maxs(aLocal, aLocal, -clampLimit, tileLength);
 +    PipeBarrier<PIPE_V>();
 +    LocalTensor<outType> mLocalOut = outQueueM.template AllocTensor<outType>();
-+    Mul(mLocal, mLocal, aLocal, tileLength);
++    // Native multiplication backward forms dY * clipped_up before SiLU backward.
++    Mul(aLocal, lLocal, aLocal, tileLength);
++    PipeBarrier<PIPE_V>();
++    Mul(mLocal, aLocal, mLocal, tileLength);
++    PipeBarrier<PIPE_V>();
++    Select(mLocal, mask, mLocal, (calcType)0.0, SELMODE::VSEL_TENSOR_SCALAR_MODE, tileLength);
++    PipeBarrier<PIPE_V>();
 +    Cast(mLocalOut, mLocal, downcastRoundMode_, tileLength);
 +    PipeBarrier<PIPE_V>();
 +    outQueueM.template EnQue<outType>(mLocalOut);
- 
--    Cast(mLocal_, mLocal, downcastRoundMode_, tileLength);
++
 +    // Preserve unclamped B in the spare calculation buffer for the dB mask.
 +    Cast(tempLocal, bInput, RoundMode::CAST_NONE, tileLength);
 +    PipeBarrier<PIPE_V>();
@@ -275,16 +271,55 @@ index 68e91c1..c0e584b 100644
 +    Cast(aLocal, aInput, RoundMode::CAST_NONE, tileLength);
 +    PipeBarrier<PIPE_V>();
 +    Mins(aLocal, aLocal, clampLimit, tileLength);
-     PipeBarrier<PIPE_V>();
++    PipeBarrier<PIPE_V>();
++    // Match native FP32 SiLU division before its multiplication backward.
++    Muls(sigLocal, aLocal, beta, tileLength);
++    PipeBarrier<PIPE_V>();
++    Exp(sigLocal, sigLocal, tileLength);
++    PipeBarrier<PIPE_V>();
++    Adds(sigLocal, sigLocal, (calcType)1.0, tileLength);
++    PipeBarrier<PIPE_V>();
++    Div(nLocal, aLocal, sigLocal, tileLength);
+     ComputeGradN(tileLength);
+-
+-    //----------------M
+-    Muls(tempLocal, sigLocal, (calcType)(-1.0), tileLength);
+-    PipeBarrier<PIPE_V>();
+-    Adds(tempLocal, tempLocal, (calcType)(1.0), tileLength);
+-    PipeBarrier<PIPE_V>();
+-
+-    auto& mLocal = nLocal;
+-    Mul(mLocal, sigLocal, tempLocal, tileLength);
+-    PipeBarrier<PIPE_V>();
+-    Mul(mLocal, mLocal, aLocal, tileLength);
+-    PipeBarrier<PIPE_V>();
+-
+-    Muls(mLocal, mLocal, -beta, tileLength);
+-    PipeBarrier<PIPE_V>();
+-    Add(mLocal, mLocal, sigLocal, tileLength);
+-
+-    LocalTensor<inType> bLocal_ = inQueueB.template DeQue<inType>();
+-    auto& bLocal = aLocal;
+-    Cast(bLocal, bLocal_, RoundMode::CAST_NONE, tileLength);
+-    PipeBarrier<PIPE_V>();
+-
+-    Mul(mLocal, mLocal, lLocal, tileLength);
+-    PipeBarrier<PIPE_V>();
+-
+-    LocalTensor<outType> mLocal_ = outQueueM.template AllocTensor<outType>();
+-
+-    Mul(mLocal, mLocal, bLocal, tileLength);
+-    inQueueB.template FreeTensor(bLocal_);
+-
+-    Cast(mLocal_, mLocal, downcastRoundMode_, tileLength);
+-    PipeBarrier<PIPE_V>();
 -    outQueueM.template EnQue<outType>(mLocal_);
-+    Mul(nLocal, sigLocal, aLocal, tileLength);
-+    ComputeGradN(tileLength);
 +    inQueueA.template FreeTensor(aInput);
 +    inQueueB.template FreeTensor(bInput);
  }
  
  template<typename inType, typename calcType, typename outType, uint16_t bufferNum>
-@@ -135,11 +194,19 @@ __aicore__ inline void SwiGluGradBF16<inType, calcType, outType, bufferNum>::Com
+@@ -135,11 +206,19 @@
      // deque input tensors from VECIN queue
      //calc sigLocal
      LocalTensor<inType> aLocal_ = inQueueA.template DeQue<inType>(); //input a
@@ -295,10 +330,11 @@ index 68e91c1..c0e584b 100644
      Cast(aLocal, aLocal_, RoundMode::CAST_NONE, tileLength);
      PipeBarrier<PIPE_V>();
 -    inQueueA.template FreeTensor(aLocal_);
+-
 +    if (clampLimit <= 0.0f) {
 +        inQueueA.template FreeTensor(aLocal_);
 +    }
- 
++
 +    if (clampLimit > 0.0f) {
 +        Mins(aLocal, aLocal, clampLimit, tileLength);
 +        PipeBarrier<PIPE_V>();
@@ -306,7 +342,7 @@ index 68e91c1..c0e584b 100644
      Muls(sigLocal, aLocal, beta, tileLength);
      PipeBarrier<PIPE_V>();
      Exp(sigLocal, sigLocal, tileLength);
-@@ -155,14 +226,29 @@ __aicore__ inline void SwiGluGradBF16<inType, calcType, outType, bufferNum>::ComputeGradN(uint64_t tileLength)
+@@ -155,14 +234,29 @@
  template<typename inType, typename calcType, typename outType, uint16_t bufferNum>
  __aicore__ inline void SwiGluGradBF16<inType, calcType, outType, bufferNum>::ComputeGradN(uint64_t tileLength)
  {

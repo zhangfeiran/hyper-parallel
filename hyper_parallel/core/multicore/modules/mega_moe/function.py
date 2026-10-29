@@ -26,6 +26,7 @@ from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan, record_plan_stream
 from .route import PreparedTopKRoute, RouteMetadata
+from .torch_route import _restore_torch_output_grad_out, _restore_torch_output_with_state, received_torch_order
 from .workspace import MegaMoeWorkspace
 
 
@@ -117,6 +118,12 @@ def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple
     if not ctx.has_unpermute:
         source.copy_(grad_output)
         return source, None
+    if getattr(ctx.plan.spec, "route_policy", "cann") == "torch":
+        mapping, _, expert_output, probs, scores, token_ids = permutation_inputs
+        grad_probs = _restore_torch_output_grad_out(
+            expert_output, mapping, probs, grad_output, source, scores, token_ids,
+            need_weight_grad=ctx.needs_input_grad[7])
+        return source, grad_probs
     mapping, expert_output, probs = permutation_inputs
     grad_probs = torch.empty_like(probs)
     if ctx.source_rows:
@@ -154,8 +161,8 @@ def _allocate_backward_intermediates(
     reusable_dispatch: Any | None = None,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    grad_weight1 = torch.zeros_like(weight1)
-    grad_weight2 = torch.zeros_like(weight2)
+    ordered = getattr(spec, "route_policy", "cann") == "torch"
+    grad_weight2 = weight2.new_empty(1) if ordered else torch.zeros_like(weight2)
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -171,7 +178,9 @@ def _allocate_backward_intermediates(
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
-    # Empty experts must retain exact zero gradients on the baseline kernel.
+    # Ordered weight gradients are returned by the two external GEMMs; the
+    # disabled task-graph slots retain only distinct non-null ABI pointers.
+    grad_weight1 = weight1.new_empty(1) if ordered else torch.zeros_like(weight1)
     return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
 
 
@@ -248,15 +257,45 @@ def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any
     grad_x = grad_x[:ctx.source_rows]
     if not ctx.has_permutation:
         return grad_x.clone()
-    (unpermute_mapping,) = permutation_inputs
+    unpermute_mapping = permutation_inputs[0]
     spec = ctx.plan.spec
     if ctx.token_rows == 0:
         return grad_x[:0].clone()
+    if getattr(spec, "route_policy", "cann") == "torch":
+        result = grad_x.new_zeros((ctx.token_rows, spec.hidden_size))
+        result.index_put_((unpermute_mapping.div(spec.top_k, rounding_mode="floor"),), grad_x, accumulate=True)
+        return result
     # Consume the shared gradient before release records completion.
     # The permutation gradient owns its reduced [T, H] output.
     return multicore_ops.moe_token_permute_grad(
         grad_x, unpermute_mapping, ctx.token_rows, spec.top_k
     )
+
+
+def _ordered_weight_gradients(
+    saved: _SavedBackwardState, execution: _BackwardExecution, order: torch.Tensor,
+    *, dispatch_ordered: bool = False,
+) -> _BackwardExecution:
+    """Compute each weight gradient once, preserving the Torch receive-sort reduction order."""
+    rows = order.numel()
+    gradients = execution.intermediates
+    if rows:
+        dispatch = saved.dispatch[:rows] if dispatch_ordered else torch.index_select(saved.dispatch[:rows], 0, order)
+        first = load_torch_npu().npu_grouped_matmul(
+            x=[dispatch.T],
+            weight=[torch.index_select(gradients.swiglu_grad[:rows], 0, order)],
+            group_list=saved.group_list, split_item=2, group_type=2,
+        )[0]
+        # The pull gather must not stay live while W2 operands and gradients are allocated.
+        del dispatch
+        second = load_torch_npu().npu_grouped_matmul(
+            x=[torch.index_select(saved.activation[:rows], 0, order).T],
+            weight=[torch.index_select(execution.dispatch[:rows], 0, order)],
+            group_list=saved.group_list, split_item=2, group_type=2,
+        )[0]
+    else:
+        first, second = torch.zeros_like(saved.weight1), torch.zeros_like(saved.weight2)
+    return replace(execution, intermediates=replace(gradients, grad_weight1=first, grad_weight2=second))
 
 
 def _save_forward_state(
@@ -473,7 +512,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         route: RouteMetadata,
         plan: MegaMoePlan,
         workspace: MegaMoeWorkspace,
-        permutation: tuple[Any, Any, Any] | None,
+        permutation: tuple[Any, ...] | None,
         topk_weights: torch.Tensor | None,
         workspace_claimed: bool,
     ) -> Any:
@@ -501,13 +540,16 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         metadata = route
         permutation_inputs = ()
         if permutation is not None:
-            routed_tokens, _, unpermute_mapping = permutation
+            routed_tokens, _, unpermute_mapping = permutation[:3]
             if ctx.needs_input_grad[0] or topk_weights is not None:
                 permutation_inputs = (unpermute_mapping,)
+            if len(permutation) > 3 and permutation[3] is not None:
+                permutation_inputs = (unpermute_mapping, permutation[3])
         ctx.source_rows = routed_tokens.shape[0]
         ctx.token_rows = ctx.source_rows // spec.top_k
         ctx.has_permutation = permutation is not None
         ctx.has_unpermute = topk_weights is not None
+        ctx.dispatch_ordered = False
         if workspace_claimed:
             if not workspace.in_use:
                 raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
@@ -533,19 +575,46 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 weight2,
                 execution,
             )
+            if permutation is not None and len(permutation) > 6 and permutation[6] is not None:
+                stream, counts, ready = permutation[4:7]
+                # Wait only for counts, so row-order construction can overlap the expert kernel.
+                stream.wait_event(ready)
+                counts.record_stream(stream)
+                with torch.npu.stream(stream):
+                    order = received_torch_order(counts, capacity)
+                permutation_inputs = (permutation[2], order)
+            if permutation is not None and len(permutation) > 4 and permutation[4] is not None:
+                # Join after enqueueing the expert kernel, before saved-tensor hooks can read the order.
+                current = torch.npu.current_stream(routed_tokens.device)
+                current.wait_stream(permutation[4])
+                permutation_inputs[1].record_stream(current)
             output = execution.combine[:ctx.source_rows].clone()
             if spec.dispatch_mode == "pull":
                 saved_dispatch = execution.dispatch
             else:
                 # Combine has consumed down_proj before SHMEM dispatch is reused.
-                execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
                 saved_dispatch = execution.intermediates.down_proj
+                if getattr(spec, "route_policy", "cann") == "torch" and len(permutation_inputs) > 1:
+                    # Only the disabled W1-gradient slot consumes saved X in the native graph.
+                    # Snapshot its final row order directly instead of copying and gathering it again.
+                    order = permutation_inputs[1]
+                    rows = order.numel()
+                    torch.index_select(execution.dispatch[:rows], 0, order, out=saved_dispatch[:rows])
+                    ctx.dispatch_ordered = True
+                else:
+                    saved_dispatch.copy_(execution.dispatch[:capacity])
             if ctx.has_unpermute:
-                probs = topk_weights.float().contiguous()
                 ctx.topk_dtype = topk_weights.dtype
-                permutation_inputs += (output, probs)
-                output = (load_torch_npu().npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
-                          if ctx.source_rows else output[:0])
+                if getattr(spec, "route_policy", "cann") == "torch":
+                    combined, scores, token_ids = _restore_torch_output_with_state(
+                        output, unpermute_mapping, topk_weights)
+                    permutation_inputs += (output, topk_weights, scores, token_ids)
+                    output = combined
+                else:
+                    probs = topk_weights.float().contiguous()
+                    permutation_inputs += (output, probs)
+                    output = (load_torch_npu().npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
+                              if ctx.source_rows else output[:0])
             _save_forward_state(
                 ctx,
                 plan,
@@ -586,7 +655,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         workspace.claim()
         try:
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
-            permutation_inputs = permutation_inputs[:1]
+            # Combine activations are no longer needed after staging; retain only route mappings.
+            mapping_count = 2 if getattr(plan.spec, "route_policy", "cann") == "torch" else 1
+            permutation_inputs = permutation_inputs[:mapping_count]
             execution = _prepare_backward_execution(
                 workspace,
                 plan,
@@ -599,6 +670,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 source,
                 execution,
             )
+            if getattr(plan.spec, "route_policy", "cann") == "torch":
+                execution = _ordered_weight_gradients(
+                    saved, execution, permutation_inputs[1], dispatch_ordered=ctx.dispatch_ordered)
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
             execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
@@ -606,7 +680,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution.intermediates.grad_weight2,
                 None, None, None,
             ))
-            grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
+            grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs[:1])
             _release_completed_graph(ctx, workspace)
             return (
                 grad_input,
@@ -696,7 +770,10 @@ def execute_mega_moe_with_permutation(
         route.metadata,
         plan,
         workspace,
-        (route.routed_tokens, topk_ids, route.unpermute_mapping),
+        (route.routed_tokens, topk_ids, route.unpermute_mapping, route.weight_grad_order,
+         route.weight_grad_order_stream,
+         route.received_counts if route.weight_grad_ready_event is not None else None,
+         route.weight_grad_ready_event),
         topk_weights,
         workspace_claimed,
     )

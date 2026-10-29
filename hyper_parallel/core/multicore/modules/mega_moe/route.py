@@ -29,6 +29,7 @@ from hyper_parallel.core.multicore._loader import load_torch_npu
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .spec import MegaMoeSpec, _align_capacity
+from .torch_route import permute_torch_input, received_torch_order
 
 if TYPE_CHECKING:
     from .workspace import MegaMoeWorkspace
@@ -69,6 +70,9 @@ class PreparedTopKRoute:
     received_counts: torch.Tensor
     metadata: RouteMetadata
     maximum_received_slots: int = 0
+    weight_grad_order: torch.Tensor | None = None
+    weight_grad_order_stream: Any | None = None
+    weight_grad_ready_event: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -249,6 +253,19 @@ def _permute_topk_input_out(
     return output, mapping
 
 
+def _permute_for_policy(
+    hidden: torch.Tensor, ids: torch.Tensor, spec: MegaMoeSpec, output: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select route arithmetic without changing the default CANN contract."""
+    if spec.route_policy == "torch":
+        return permute_torch_input(hidden, ids, spec, output)
+    if output is not None:
+        if hidden.shape[0] == 0:
+            return output, ids.reshape(-1)
+        return _permute_topk_input_out(hidden, ids, output)
+    return _permute_topk_input(hidden, ids)
+
+
 def _compute_route_metadata(
     counts: torch.Tensor,
     counts_by_source: torch.Tensor,
@@ -389,6 +406,20 @@ def _pack_host_route(
         group_list=offsets[4],
         expert_capacity=capacity,
     )
+def _prepare_weight_grad_order(
+    counts: torch.Tensor, capacity: int, spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None,
+) -> tuple[torch.Tensor | None, Any | None, Any | None]:
+    """Capture count readiness without delaying submission of the expert kernel."""
+    if spec.route_policy != "torch":
+        return None, None, None
+    if workspace is None:
+        return received_torch_order(counts, capacity), None, None
+    current = torch.npu.current_stream(counts.device)
+    if workspace.weight_grad_stream is None:
+        workspace.weight_grad_stream = torch.npu.Stream(device=counts.device)
+    ready = torch.npu.Event()
+    ready.record(current)
+    return None, workspace.weight_grad_stream, ready
 
 
 def prepare_topk_route(
@@ -432,18 +463,20 @@ def prepare_topk_route(
         else:
             workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
-    if permutation_output is None:
-        routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
-    else:
-        routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
+    routed_tokens, unpermute_mapping = _permute_for_policy(hidden_states, topk_ids, spec, permutation_output)
     received_counts = _finish_count_gather(counts_by_source, count_work, spec)
     expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec)
+    weight_grad_order, order_stream, ready_event = _prepare_weight_grad_order(
+        received_counts, expert_capacity, spec, workspace)
     return PreparedTopKRoute(
         routed_tokens=routed_tokens,
         unpermute_mapping=unpermute_mapping,
         tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum_received_slots,
+        weight_grad_order=weight_grad_order,
+        weight_grad_order_stream=order_stream,
+        weight_grad_ready_event=ready_event,
         metadata=_compute_route_metadata(
             counts,
             counts_by_source,
@@ -599,7 +632,7 @@ def _permute_dynamic_pull(
         raise RuntimeError("Pull permutation requires an initialized, claimed workspace.")
     tokens = hidden_states.shape[0]
     output = workspace.source_buffer[:tokens * spec.top_k]
-    return (_permute_topk_input_out(hidden_states, topk_ids, output) if tokens
+    return (_permute_for_policy(hidden_states, topk_ids, spec, output) if tokens
             else (output, topk_ids.reshape(-1)))
 
 
@@ -618,7 +651,7 @@ def _stage_dynamic_permutation(
         return None
     if (spec.dispatch_mode == "push"
             or _can_stage_pull(hidden_states, spec) and not getattr(workspace, "route_cache_probe_after", 0)):
-        return _permute_topk_input(hidden_states, topk_ids)
+        return _permute_for_policy(hidden_states, topk_ids, spec)
     return None
 
 
@@ -714,7 +747,7 @@ def _prepare_dynamic_route(
         permuted = (_permute_dynamic_pull(hidden_states, topk_ids, spec, workspace) if permuted is None else
                     _publish_staged_pull(permuted, hidden_states, spec, workspace))
     elif permuted is None:
-        permuted = _permute_topk_input(hidden_states, topk_ids)
+        permuted = _permute_for_policy(hidden_states, topk_ids, spec)
     if work is not None:
         work.wait()
     if summary is None:
@@ -725,10 +758,14 @@ def _prepare_dynamic_route(
         if host_rows is not None:
             _cache_host_route(workspace, spec, host_rows, summary, metadata, hidden_states.device)
     received_counts = metadata.combine_size.reshape(spec.ep_size, spec.local_experts)
+    weight_grad_order, order_stream, ready_event = _prepare_weight_grad_order(
+        received_counts, capacity, spec, workspace)
     return PreparedTopKRoute(
         routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum,
+        weight_grad_order=weight_grad_order, weight_grad_order_stream=order_stream,
+        weight_grad_ready_event=ready_event,
         metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens),
     )
 

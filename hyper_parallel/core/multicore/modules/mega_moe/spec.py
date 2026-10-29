@@ -54,6 +54,7 @@ class MegaMoeSpec:
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    route_policy: str = "cann"
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -219,4 +220,5 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        route_policy=specification.get("route_policy", "cann"),
     )

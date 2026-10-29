@@ -49,7 +49,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
-from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue, TaskType
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 
 from .diagnostics import _mega_moe_owner_options
@@ -165,12 +165,21 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
     )
     backward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(backward_graph)
+    if spec.route_policy == "torch":
+        backward_graph.get_op("w1_grad").diagnostic_name = "W1GradFence"
+        backward_graph.get_op("w2_grad").diagnostic_name = "W2GradFence"
     backward_data = build_backward_config(
         backward_graph,
         task_values,
         spec.rank_id,
         spec.num_cube_cores,
     )
+    if spec.route_policy == "torch":
+        # Preserve the event graph while each ordered weight GEMM executes once outside it.
+        for index in range(backward_data.task_num):
+            task = backward_data.all_tasks[index]
+            if task.task_type == TaskType.TASK_GROUPED_MATMUL and task.tiling_data_position in (22, 23):
+                task.task_type = TaskType.TASK_BEGIN_TASK_GRAPH
     return forward_graph, forward_data, backward_graph, backward_data
 
 

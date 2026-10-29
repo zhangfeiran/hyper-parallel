@@ -15,6 +15,8 @@
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
 import unittest
+import weakref
+from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -26,6 +28,9 @@ from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics
 from hyper_parallel.core.multicore.modules.mega_moe import function as function_module
 from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
+from hyper_parallel.core.multicore.modules.mega_moe.torch_route import (
+    _restore_torch_output_with_state, restore_torch_output,
+)
 from tests.common.mark_utils import arg_mark
 
 
@@ -34,6 +39,130 @@ class TestMegaMoeFunction(unittest.TestCase):
     """Exercise real autograd contexts with mocked communication and kernels."""
 
     # pylint: disable=protected-access
+
+    def test_forward_joins_order_after_launch_and_before_saved_tensor_hooks(self) -> None:
+        """Enqueue expert work before joining and protect cross-stream saved-tensor reads."""
+        rows = torch.ones(4, 4)
+        order, side, current = Mock(), Mock(), Mock()
+        context = SimpleNamespace(needs_input_grad=(True,) * 9)
+        spec = SimpleNamespace(dispatch_mode="pull", top_k=2)
+        plan = SimpleNamespace(spec=spec)
+        workspace = Mock(in_use=True)
+        execution = SimpleNamespace(dispatch=rows, source=rows, combine=rows,
+                                    profile_call=Mock(), intermediates=SimpleNamespace(
+                                        up_proj=rows, activation=rows))
+        metadata = SimpleNamespace(expert_capacity=4)
+        trace = []
+        current.wait_stream.side_effect = lambda stream: trace.append(("wait", stream))
+        order.record_stream.side_effect = lambda stream: trace.append(("record", stream))
+        permutation = (rows, torch.zeros(2, 2, dtype=torch.int64), torch.arange(4), order, side)
+        with (
+            patch.object(function_module, "_prepare_forward_execution", return_value=execution),
+            patch.object(function_module, "_launch_forward_kernel",
+                         side_effect=lambda *args: trace.append(("kernel", None))),
+            patch.object(function_module, "_save_forward_state",
+                         side_effect=lambda *args: trace.append(("save", args[-1][1]))),
+            patch.object(torch.npu, "current_stream", return_value=current),
+        ):
+            output = _MegaMoeFunction.forward(context, rows, rows, rows, metadata, plan,
+                                              workspace, permutation, None, True)
+        self.assertTrue(torch.equal(output, rows))
+        self.assertEqual(trace, [("kernel", None), ("wait", side), ("record", current), ("save", order)])
+
+    def test_forward_submits_deferred_order_after_kernel_and_waits_before_save(self) -> None:
+        """Preserve count readiness and allocator lifetimes across the deferred stream."""
+        rows = torch.ones(4, 4)
+        order, side, current, counts, ready = Mock(), Mock(), Mock(), Mock(), Mock()
+        context = SimpleNamespace(needs_input_grad=(True,) * 9)
+        spec = SimpleNamespace(dispatch_mode="pull", top_k=2)
+        plan = SimpleNamespace(spec=spec)
+        workspace = Mock(in_use=True)
+        execution = SimpleNamespace(dispatch=rows, source=rows, combine=rows,
+                                    profile_call=Mock(), intermediates=SimpleNamespace(
+                                        up_proj=rows, activation=rows))
+        metadata = SimpleNamespace(expert_capacity=4)
+        trace = []
+        side.wait_event.side_effect = lambda event: trace.append(("counts_ready", event))
+        counts.record_stream.side_effect = lambda stream: trace.append(("counts_lifetime", stream))
+        current.wait_stream.side_effect = lambda stream: trace.append(("wait", stream))
+        order.record_stream.side_effect = lambda stream: trace.append(("order_lifetime", stream))
+        permutation = (rows, torch.zeros(2, 2, dtype=torch.int64), torch.arange(4), None, side, counts, ready)
+
+        def build_order(actual_counts: Any, capacity: int) -> Any:
+            self.assertIs(actual_counts, counts)
+            self.assertEqual(capacity, 4)
+            trace.append(("build", side))
+            return order
+
+        with (
+            patch.object(function_module, "_prepare_forward_execution", return_value=execution),
+            patch.object(function_module, "_launch_forward_kernel",
+                         side_effect=lambda *args: trace.append(("kernel", None))),
+            patch.object(function_module, "received_torch_order", side_effect=build_order),
+            patch.object(function_module, "_save_forward_state",
+                         side_effect=lambda *args: trace.append(("save", args[-1][1]))),
+            patch.object(torch.npu, "current_stream", return_value=current),
+            patch.object(torch.npu, "stream", side_effect=lambda stream: nullcontext(stream)),
+        ):
+            output = _MegaMoeFunction.forward(context, rows, rows, rows, metadata, plan,
+                                              workspace, permutation, None, True)
+        self.assertTrue(torch.equal(output, rows))
+        self.assertEqual(trace, [("kernel", None), ("counts_ready", ready), ("counts_lifetime", side),
+                                 ("build", side), ("wait", side), ("order_lifetime", current), ("save", order)])
+
+    def test_push_snapshot_preserves_final_row_order_and_empty_capacity(self) -> None:
+        """Save owned, ordered X without changing empty receive storage required by the ABI."""
+        rows = torch.arange(16).reshape(4, 4).float()
+        for capacity, order in ((4, torch.tensor([2, 0, 3, 1])), (1, torch.empty(0, dtype=torch.int64))):
+            with self.subTest(capacity=capacity):
+                context = SimpleNamespace(needs_input_grad=(True,) * 9)
+                plan = SimpleNamespace(spec=SimpleNamespace(dispatch_mode="push", top_k=2, route_policy="torch"))
+                workspace = Mock(in_use=True)
+                snapshot = torch.full((capacity, 4), float("nan"))
+                execution = SimpleNamespace(dispatch=rows[:capacity], source=rows, combine=rows,
+                                            profile_call=Mock(), intermediates=SimpleNamespace(
+                                                up_proj=rows, activation=rows, down_proj=snapshot))
+                permutation = (rows, torch.zeros(2, 2, dtype=torch.int64), torch.arange(4), order)
+                with (
+                    patch.object(function_module, "_prepare_forward_execution", return_value=execution),
+                    patch.object(function_module, "_launch_forward_kernel"),
+                    patch.object(function_module, "_save_forward_state") as save,
+                ):
+                    _MegaMoeFunction.forward(context, rows, rows, rows, SimpleNamespace(expert_capacity=capacity),
+                                              plan, workspace, permutation, None, True)
+                self.assertTrue(context.dispatch_ordered)
+                saved = save.call_args.args[3]
+                self.assertIs(saved, snapshot)
+                self.assertEqual(saved.shape, (capacity, 4))
+                self.assertNotEqual(saved.data_ptr(), execution.dispatch.data_ptr())
+                if order.numel():
+                    torch.testing.assert_close(saved, rows[order])
+                else:
+                    self.assertTrue(saved.isnan().all())
+                    self.assertNotEqual(saved.data_ptr(), 0)
+
+    def test_torch_pull_combine_adjoint_writes_the_leased_source(self) -> None:
+        """Torch combine backward owns no separate expert-gradient staging tensor."""
+        values = torch.arange(24).reshape(6, 4).bfloat16()
+        mapping = torch.tensor([4, 1, 5, 0, 3, 2])
+        weights = torch.tensor([[0.25, -0.0], [1.5, -1.0], [0.125, 2.0]])
+        gradient = torch.arange(12).reshape(3, 4).bfloat16()
+        buffer = torch.full((8, 4), float("nan"), dtype=torch.bfloat16)
+        context = SimpleNamespace(plan=SimpleNamespace(spec=SimpleNamespace(
+            dispatch_mode="pull", route_policy="torch")), workspace=SimpleNamespace(source_buffer=buffer),
+            source_rows=6, has_unpermute=True, needs_input_grad=(True,) * 9)
+        reference_values, reference_weights = values.clone().requires_grad_(), weights.clone().requires_grad_()
+        reference = restore_torch_output(reference_values, mapping, reference_weights)
+        reference.backward(gradient)
+        _, scores, token_ids = _restore_torch_output_with_state(values, mapping, weights)
+        with patch.object(function_module.multicore_ops, "mega_moe_unpermute_grad_out") as cann:
+            source, grad_weights = function_module._stage_backward_source(
+                context, gradient, (mapping, torch.arange(6), values, weights, scores, token_ids))
+        cann.assert_not_called()
+        self.assertEqual(source.data_ptr(), buffer.data_ptr())
+        self.assertTrue(torch.equal(source.view(torch.uint8), reference_values.grad.view(torch.uint8)))
+        self.assertTrue(torch.equal(grad_weights.view(torch.uint8), reference_weights.grad.view(torch.uint8)))
+        self.assertTrue(buffer[6:].isnan().all())
 
     def test_ragged_pull_uses_reserved_source_prefix(self) -> None:
         """Forward and backward retain SHMEM addresses while exposing only actual rows."""
@@ -168,6 +297,66 @@ class TestMegaMoeFunction(unittest.TestCase):
         """Use per-call token counts despite later forwards reusing a larger source buffer."""
         self._check_deferred_backward(permuted=True, vary_tokens=True)
 
+    def test_cann_pull_releases_combine_values_before_backward_scratch(self) -> None:
+        """Default CANN execution must not retain full combine tensors through backward."""
+        output = torch.ones(4, 4)
+        probabilities = torch.ones(2, 2)
+        output_ref, probabilities_ref = weakref.ref(output), weakref.ref(probabilities)
+        workspace = SimpleNamespace(source_buffer=torch.empty(4, 4), claim=Mock(), release=Mock())
+        context = SimpleNamespace(
+            plan=SimpleNamespace(spec=SimpleNamespace(dispatch_mode="pull", route_policy="cann")),
+            workspace=workspace, source_rows=4, has_unpermute=True, topk_dtype=torch.float32,
+            needs_input_grad=(False,) * 7 + (True, False),
+            saved_tensors=(torch.empty(0),) * 12 + (torch.arange(4), output, probabilities),
+        )
+        context.maybe_clear_saved_tensors = lambda: setattr(context, "saved_tensors", None)
+        del output, probabilities
+
+        def stop_before_allocation(*_args: Any) -> None:
+            self.assertIsNone(output_ref())
+            self.assertIsNone(probabilities_ref())
+            raise RuntimeError("checked staging ownership")
+
+        def unpermute_without_retaining_arguments(*_args: Any) -> None:
+            return None
+
+        with (
+            patch.object(function_module.multicore_ops, "mega_moe_unpermute_grad_out",
+                         new=unpermute_without_retaining_arguments),
+            patch.object(function_module, "_prepare_backward_execution", new=stop_before_allocation),
+            self.assertRaisesRegex(RuntimeError, "checked staging ownership"),
+        ):
+            _MegaMoeFunction.backward(context, torch.empty(2, 4))
+        workspace.release.assert_called_once()
+
+    def test_torch_pull_releases_combine_values_before_backward_scratch(self) -> None:
+        """Release integrated combine activations before allocating expert backward scratch."""
+        output = torch.ones(4, 4, dtype=torch.bfloat16)
+        probabilities = torch.ones(2, 2)
+        output_ref, probabilities_ref = weakref.ref(output), weakref.ref(probabilities)
+        workspace = SimpleNamespace(source_buffer=torch.empty_like(output), claim=Mock(), release=Mock())
+        context = SimpleNamespace(
+            plan=SimpleNamespace(spec=SimpleNamespace(dispatch_mode="pull", route_policy="torch")),
+            workspace=workspace, source_rows=4, has_unpermute=True,
+            needs_input_grad=(False,) * 7 + (True, False),
+            saved_tensors=(torch.empty(0),) * 12 + (torch.arange(4), torch.arange(4), output, probabilities,
+                                                    probabilities.reshape(4, 1).bfloat16(), torch.arange(4) // 2),
+        )
+        context.maybe_clear_saved_tensors = lambda: setattr(context, "saved_tensors", None)
+        del output, probabilities
+
+        def stop_before_allocation(*_args: Any) -> None:
+            self.assertIsNone(output_ref())
+            self.assertIsNone(probabilities_ref())
+            raise RuntimeError("checked staging ownership")
+
+        with (
+            patch.object(function_module, "_prepare_backward_execution", new=stop_before_allocation),
+            self.assertRaisesRegex(RuntimeError, "checked staging ownership"),
+        ):
+            _MegaMoeFunction.backward(context, torch.ones(2, 4, dtype=torch.bfloat16))
+        workspace.release.assert_called_once()
+
     def test_non_reentrant_checkpoint_unpacks_saved_tensors_once(self) -> None:
         """Checkpoint recomputation must not fail when backward reads its permutation state."""
         # CPU-only inputs must not select an installed accelerator for autocast replay.
@@ -187,6 +376,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             prepared = SimpleNamespace(
                 routed_tokens=source.detach().repeat_interleave(2, dim=0),
                 metadata=route,
+                weight_grad_order=None, weight_grad_order_stream=None, weight_grad_ready_event=None,
                 unpermute_mapping=(torch.arange(tokens * 2, dtype=torch.int32) if vary_tokens
                                    else torch.tensor([0, 2, 1, 3], dtype=torch.int32)),
             )

@@ -34,6 +34,7 @@ from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
+from .torch_route import restore_torch_output
 from .spec import (
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
@@ -180,7 +181,8 @@ class _MegaMoeExecutionResources:
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
             self.spec.expert_weight_layout,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
-            self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
+            self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens,
+            self.spec.auto_tokens, self.spec.route_policy,
         )
 
     def prepare_auto_workspace(self, tokens: int, received: int, tensor: torch.Tensor) -> None:
@@ -207,7 +209,8 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens")
+                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size",
+                  "auto_tokens", "route_policy")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
@@ -336,6 +339,7 @@ class MegaMoeExperts(MulticoreModule):
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
+        route_policy: str = "cann",
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -361,6 +365,7 @@ class MegaMoeExperts(MulticoreModule):
                 preserves the legacy unclamped path.
             ep_size: Optional compatibility check; normally inferred from explicit ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
+            route_policy: "cann" uses CANN routing; "torch" preserves native Torch EP arithmetic.
             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
                 ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
                 ``[experts, out_features, in_features]`` and accepts Torch linear storage directly. ``EOI`` weights
@@ -384,6 +389,7 @@ class MegaMoeExperts(MulticoreModule):
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
+            "route_policy": route_policy,
         }
         specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
@@ -411,6 +417,7 @@ class MegaMoeExperts(MulticoreModule):
         self.dispatch_split = specification["dispatch_split"]
         self.combine_split = specification["combine_split"]
         self.swiglu_limit = specification["swiglu_limit"]
+        self.route_policy = specification["route_policy"]
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
         self._ep_group = specification["ep_group"]
@@ -432,6 +439,8 @@ class MegaMoeExperts(MulticoreModule):
                 "or 'EOI' ([experts, out_features, in_features]), "
                 f"got {expert_weight_layout!r}."
             )
+        if specification.get("route_policy", "cann") not in ("cann", "torch"):
+            raise ValueError("route_policy must be cann or torch")
         initial_capacity_factor, capacity_growth_factor = _resolve_capacity_factors(
             specification["dispatch_mode"],
             specification["initial_capacity_factor"],
@@ -671,6 +680,8 @@ class MegaMoeExperts(MulticoreModule):
         finally:
             if claimed:
                 resources.workspace.release()
+        if self.route_policy == "torch" and not pull:
+            return restore_torch_output(expert_output, route.unpermute_mapping, topk_weights).reshape_as(hidden_states)
         if pull:
             return expert_output.reshape_as(hidden_states)
         output = restore_topk_output(

@@ -116,6 +116,7 @@ class MegaMoeWorkspace:
     gmm_workspace: Any | None = None
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
+    weight_grad_stream: Any | None = None
     in_use: bool = False
     closing: bool = False
     used: bool = False
@@ -443,6 +444,7 @@ class MegaMoeWorkspace:
                 self.gmm_workspace,
                 self.swiglu_grad_workspace,
                 self.completion_event,
+                self.weight_grad_stream,
             ))
             root_group = self._root_group()
             self.closing = True
@@ -478,5 +480,6 @@ class MegaMoeWorkspace:
         self.dtype = None
         self.device = None
         self.completion_event = None
+        self.weight_grad_stream = None
         self.used = False
         self.closing = True
