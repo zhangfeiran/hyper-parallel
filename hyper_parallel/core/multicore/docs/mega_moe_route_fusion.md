@@ -3,6 +3,9 @@
 `MegaMoeExperts` 可以把路由端点放入 MegaKernel 的 Dispatch 或终止 epilogue，
 前向和反向分别选择。常规输入仍是原始 `[T, H]` hidden states、`[T, K]` Top-K IDs 和 Router weights。
 
+本机 DSV 组件、裁剪 DSV 与 8 层纯 MoE 的性能、显存及数值验收结果见
+[路由融合实验报告](mega_moe_route_fusion_results.md)。
+
 ## HBM 存储约束
 
 前向启用 `permute` 或 `both` 时，路由准备只对 `[T * K, 1]` 标量 route-slot IDs 排序，
