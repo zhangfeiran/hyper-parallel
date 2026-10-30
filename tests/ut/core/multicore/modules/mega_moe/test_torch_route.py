@@ -235,7 +235,9 @@ class TestTorchRoute(unittest.TestCase):
         execution = moe_function._BackwardExecution(torch.ones(3, 4), torch.ones(4, 4), None, None, None, gradients)
         outputs = [torch.ones_like(first), torch.ones_like(second)]
         order = torch.tensor([2, 0, 1])
-        with patch.object(moe_function.load_torch_npu(), "npu_grouped_matmul", side_effect=[[item] for item in outputs]) as gmm:
+        with patch.object(
+            moe_function.load_torch_npu(), "npu_grouped_matmul", side_effect=[[item] for item in outputs],
+        ) as gmm:
             actual = moe_function._ordered_weight_gradients(saved, execution, order)
         self.assertEqual(gmm.call_count, 2)
         self.assertTrue(torch.equal(gmm.call_args_list[0].kwargs["x"][0], saved.dispatch[order].T))
@@ -247,6 +249,29 @@ class TestTorchRoute(unittest.TestCase):
         gmm.assert_not_called()
         self.assertTrue(torch.equal(empty.intermediates.grad_weight1, torch.zeros_like(first)))
         self.assertTrue(torch.equal(empty.intermediates.grad_weight2, torch.zeros_like(second)))
+
+    def test_ordered_wgrad_returns_native_eoi_storage(self) -> None:
+        """Transpose only external GMM results while keeping empty EOI experts exact zero."""
+        raw = torch.arange(12).reshape(3, 4).float()
+        saved = SimpleNamespace(dispatch=raw, activation=raw[:, :2].contiguous(),
+                                group_list=torch.tensor([0, 3]),
+                                weight1=torch.empty(2, 6, 4), weight2=torch.empty(2, 4, 2))
+        execution = moe_function._BackwardExecution(raw, None, None, None, None,
+            moe_function._BackwardIntermediates(None, None, None, raw, None))
+        outputs = [torch.arange(48).reshape(2, 4, 6), torch.arange(16).reshape(2, 2, 4)]
+        with patch.object(moe_function.load_torch_npu(), "npu_grouped_matmul", side_effect=[[x] for x in outputs]):
+            actual = moe_function._ordered_weight_gradients(
+                saved, execution, torch.tensor([2, 0, 1]), expert_weight_layout="EOI")
+        for value, expected in zip((actual.intermediates.grad_weight1, actual.intermediates.grad_weight2), outputs):
+            self.assertTrue(torch.equal(value, expected.transpose(-1, -2)))
+            self.assertTrue(value.is_contiguous())
+        with patch.object(moe_function.load_torch_npu(), "npu_grouped_matmul") as gmm:
+            empty = moe_function._ordered_weight_gradients(
+                saved, execution, torch.empty(0, dtype=torch.int64), expert_weight_layout="EOI")
+        gmm.assert_not_called()
+        for value, weight in zip((empty.intermediates.grad_weight1, empty.intermediates.grad_weight2),
+                                 (saved.weight1, saved.weight2)):
+            self.assertTrue(torch.equal(value, torch.zeros_like(weight)))
 
     def test_preordered_dispatch_skips_only_the_redundant_input_gather(self) -> None:
         """Keep both GEMM operands identical while reducing gathers from four to three."""

@@ -274,7 +274,7 @@ def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any
 
 def _ordered_weight_gradients(
     saved: _SavedBackwardState, execution: _BackwardExecution, order: torch.Tensor,
-    *, dispatch_ordered: bool = False,
+    *, dispatch_ordered: bool = False, expert_weight_layout: str = "EIO",
 ) -> _BackwardExecution:
     """Compute each weight gradient once, preserving the Torch receive-sort reduction order."""
     rows = order.numel()
@@ -293,6 +293,9 @@ def _ordered_weight_gradients(
             weight=[torch.index_select(execution.dispatch[:rows], 0, order)],
             group_list=saved.group_list, split_item=2, group_type=2,
         )[0]
+        if expert_weight_layout == "EOI":
+            first = first.transpose(-1, -2).contiguous()
+            second = second.transpose(-1, -2).contiguous()
     else:
         first, second = torch.zeros_like(saved.weight1), torch.zeros_like(saved.weight2)
     return replace(execution, intermediates=replace(gradients, grad_weight1=first, grad_weight2=second))
@@ -672,7 +675,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             )
             if getattr(plan.spec, "route_policy", "cann") == "torch":
                 execution = _ordered_weight_gradients(
-                    saved, execution, permutation_inputs[1], dispatch_ordered=ctx.dispatch_ordered)
+                    saved, execution, permutation_inputs[1], dispatch_ordered=ctx.dispatch_ordered,
+                    expert_weight_layout=plan.spec.expert_weight_layout)
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
             execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(

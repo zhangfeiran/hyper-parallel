@@ -55,7 +55,7 @@ def _deepseek_v41_grouped_expert_forward(
     still receives the original hidden-state dtype.
     """
     # The shared primitive imports optional torch_npu; keep CPU/GPU imports lazy.
-    from hyper_parallel.components.functional import grouped_matmul  # pylint: disable=C0415
+    from hyper_parallel.components.functional.grouped_matmul import grouped_matmul  # pylint: disable=C0415
 
     group_list = torch.cumsum(
         tokens_per_expert.to(device=hidden_states.device, dtype=torch.int64),

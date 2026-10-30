@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -21,6 +21,8 @@
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
+#include "native_combine.hpp"
+#include "native_combine_grad.hpp"
 
 using namespace AscendC;
 
@@ -299,6 +301,26 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
 
 extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr,
                                                 GM_ADDR *input_list) {
+  using MulticoreRuntime::TaskAiCoreType;
+  if (MulticoreRuntime::getTaskIndexNumByTaskType(runtimeConfigPtr, TaskAiCoreType::TASK_AICORE_CUBE) == 0 &&
+      MulticoreRuntime::getTaskIndexNumByTaskType(runtimeConfigPtr, TaskAiCoreType::TASK_AICORE_VECTOR) == 1) {
+    MulticoreRuntime::TaskDesc first;
+    MulticoreRuntime::getTaskDesc(runtimeConfigPtr, &first, 0);
+    const uint32_t tokens = MulticoreRuntime::getExtraValueFromTiling(input_list[30], 4);
+    if (first.task_type == MulticoreRuntime::TaskType::TASK_NATIVE_BIT_COMBINE) {
+      MulticoreRuntime::NativeBitCombine(
+        input_list[2], input_list[5], input_list[1], input_list[13], tokens,
+        first.outputs[0].dim[1], first.extra_value_0, worker_id, MulticoreRuntime::getNumWorkers(runtimeConfigPtr));
+      return;
+    }
+    if (first.task_type == MulticoreRuntime::TaskType::TASK_NATIVE_BIT_COMBINE_GRAD) {
+      MulticoreRuntime::NativeBitCombineGrad(
+        input_list[2], input_list[9], input_list[5], input_list[1], input_list[12], input_list[13],
+        tokens * first.extra_value_0, first.outputs[0].dim[1], first.extra_value_0, first.extra_value_1,
+        worker_id, MulticoreRuntime::getNumWorkers(runtimeConfigPtr));
+      return;
+    }
+  }
   MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
   worker.Process();

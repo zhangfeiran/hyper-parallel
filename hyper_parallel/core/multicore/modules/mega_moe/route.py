@@ -406,6 +406,8 @@ def _pack_host_route(
         group_list=offsets[4],
         expert_capacity=capacity,
     )
+
+
 def _prepare_weight_grad_order(
     counts: torch.Tensor, capacity: int, spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None,
 ) -> tuple[torch.Tensor | None, Any | None, Any | None]:

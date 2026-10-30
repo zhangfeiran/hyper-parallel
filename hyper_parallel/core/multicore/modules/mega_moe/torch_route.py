@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+from .native_combine import _is_supported, _kernel
 
 if TYPE_CHECKING:
     from .spec import MegaMoeSpec
@@ -77,6 +79,10 @@ def _restore_torch_output_with_state(
     """Return the literal combine and operands retained by its native autograd graph."""
     scores = weights.reshape(-1).to(expert_output.dtype)[source_order].unsqueeze(-1)
     token_ids = source_order.div(weights.shape[1], rounding_mode="floor")
+    if _is_supported(expert_output, source_order, weights):
+        result = _kernel(expert_output.shape[-1], weights.shape[1], expert_output.device.index)(
+            expert_output, scores, source_order)
+        return result, scores, token_ids
     weighted = expert_output * scores
     result = expert_output.new_zeros((weights.shape[0], expert_output.shape[-1]))
     result.index_add_(0, token_ids, weighted)
@@ -87,6 +93,8 @@ def restore_torch_output(
     expert_output: torch.Tensor, source_order: torch.Tensor, weights: torch.Tensor,
 ) -> torch.Tensor:
     """Match native BF16 product rounding, accumulation order and its adjoint."""
+    if _is_supported(expert_output, source_order, weights):
+        return _NativeCombineAutograd.apply(expert_output, source_order, weights)
     return _restore_torch_output_with_state(expert_output, source_order, weights)[0]
 
 
@@ -98,13 +106,41 @@ def _restore_torch_output_grad_out(
     """Write the literal Torch combine adjoint directly into the leased source buffer."""
     if source_order.numel() == 0:
         return torch.zeros_like(weights) if need_weight_grad else None
-    grad_weighted = torch.index_select(grad_output, 0, token_ids)
-    torch.mul(grad_weighted, scores, out=out)
-    if not need_weight_grad:
-        return None
-    # Keep the BF16 product and sum-to-size boundary used by MulBackward0.
-    grad_scores = (grad_weighted * expert_output).sum_to_size(scores.shape).reshape(-1)
+    if _is_supported(expert_output, source_order, weights):
+        product = _kernel(expert_output.shape[-1], weights.shape[1], expert_output.device.index).gradients(
+            expert_output, scores, source_order, grad_output, out, need_weight_grad)
+        if not need_weight_grad:
+            return None
+        grad_scores = product.sum_to_size(scores.shape).reshape(-1)
+    else:
+        grad_weighted = torch.index_select(grad_output, 0, token_ids)
+        torch.mul(grad_weighted, scores, out=out)
+        if not need_weight_grad:
+            return None
+        # Keep the BF16 product and sum-to-size boundary used by MulBackward0.
+        grad_scores = (grad_weighted * expert_output).sum_to_size(scores.shape).reshape(-1)
     grad_weights = torch.zeros(weights.numel(), dtype=expert_output.dtype, device=weights.device)
     # IndexBackward0 accumulates into zero even for unique indices, including signed zero.
     grad_weights.index_put_((source_order,), grad_scores, accumulate=True)
     return grad_weights.reshape(weights.shape).to(weights.dtype)
+
+
+class _NativeCombineAutograd(torch.autograd.Function):
+    """Keep the literal adjoint when the push path uses the fused forward kernel."""
+
+    @staticmethod
+    def forward(ctx: Any, expert: torch.Tensor, source_order: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Retain the same BF16 scores and source identities consumed by the native adjoint."""
+        output, scores, token_ids = _restore_torch_output_with_state(expert, source_order, weights)
+        ctx.save_for_backward(expert, source_order, weights, scores, token_ids)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, None, Any]:
+        """Produce the source gradient and preserve the existing router reduction boundary."""
+        expert, source_order, weights, scores, token_ids = ctx.saved_tensors
+        grad_expert = torch.empty_like(expert)
+        grad_weights = _restore_torch_output_grad_out(
+            expert, source_order, weights, grad_output, grad_expert, scores, token_ids,
+            need_weight_grad=ctx.needs_input_grad[2])
+        return grad_expert if ctx.needs_input_grad[0] else None, None, grad_weights
