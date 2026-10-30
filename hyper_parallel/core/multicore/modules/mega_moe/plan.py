@@ -54,6 +54,8 @@ from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 
 from .diagnostics import _mega_moe_owner_options
 from .spec import MegaMoeSpec
+from .native_combine import _require_payload
+from .native_weight_gradients import build_native_backward, supports_native_weight_gradients
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
 
 
@@ -75,6 +77,7 @@ class MegaMoePlan:
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
+    native_weight_gradients: bool = False
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -165,7 +168,8 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
     )
     backward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(backward_graph)
-    if spec.route_policy == "torch":
+    native_weight_gradients = supports_native_weight_gradients(spec)
+    if spec.route_policy == "torch" and not native_weight_gradients:
         backward_graph.get_op("w1_grad").diagnostic_name = "W1GradFence"
         backward_graph.get_op("w2_grad").diagnostic_name = "W2GradFence"
     backward_data = build_backward_config(
@@ -174,7 +178,10 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         spec.rank_id,
         spec.num_cube_cores,
     )
-    if spec.route_policy == "torch":
+    if native_weight_gradients:
+        backward_graph, backward_data = build_native_backward(backward_graph, backward_data, task_values, spec)
+        attach_mega_moe_l1_view_resolvers(backward_graph)
+    elif spec.route_policy == "torch":
         # Preserve the event graph while each ordered weight GEMM executes once outside it.
         for index in range(backward_data.task_num):
             task = backward_data.all_tasks[index]
@@ -202,7 +209,9 @@ def _prepare_diagnostics(
     }
     return (
         prepare_mega_kernel_diagnostics(forward_graph, forward_config, parameter_count=16, **options),
-        prepare_mega_kernel_diagnostics(backward_graph, backward_config, parameter_count=20, **options),
+        prepare_mega_kernel_diagnostics(backward_graph, backward_config,
+                                       parameter_count=36 if supports_native_weight_gradients(spec) else 20,
+                                       **options),
     )
 
 
@@ -216,6 +225,9 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     Returns:
         Rank-local forward and backward runtime resources.
     """
+    native_weight_gradients = supports_native_weight_gradients(spec)
+    if native_weight_gradients and torch.device(device).type == "npu":
+        _require_payload()
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec)
     fwd_diagnostics, bwd_diagnostics = _prepare_diagnostics(
         spec, forward_graph, forward_config, backward_graph, backward_config, device,
@@ -228,7 +240,8 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     }
     return MegaMoePlan(
         spec=spec,
-        reuse_backward_dispatch=can_reuse_backward_dispatch(
+        native_weight_gradients=native_weight_gradients,
+        reuse_backward_dispatch=not native_weight_gradients and can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
         ),
         forward_graph=forward_graph,

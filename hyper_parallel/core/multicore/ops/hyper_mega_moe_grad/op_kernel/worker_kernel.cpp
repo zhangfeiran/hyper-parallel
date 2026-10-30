@@ -23,6 +23,7 @@
 #include "runtime/worker_kernel.h"
 #include "native_combine.hpp"
 #include "native_combine_grad.hpp"
+#include "native_order.hpp"
 
 using namespace AscendC;
 
@@ -71,6 +72,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         break;
       case TaskType::TASK_SWI_GLU_GRAD:
         ExecuteSwiGluGrad(task_desc);
+        break;
+      case TaskType::TASK_NATIVE_BIT_REORDER:
+        NativeBitReorder(input_list, input_list[TILING_IDX], task_desc);
         break;
       default:
         break;
@@ -310,7 +314,8 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
     if (first.task_type == MulticoreRuntime::TaskType::TASK_NATIVE_BIT_COMBINE) {
       MulticoreRuntime::NativeBitCombine(
         input_list[2], input_list[5], input_list[1], input_list[13], tokens,
-        first.outputs[0].dim[1], first.extra_value_0, worker_id, MulticoreRuntime::getNumWorkers(runtimeConfigPtr));
+        first.outputs[0].dim[1], first.extra_value_0, worker_id, MulticoreRuntime::getNumWorkers(runtimeConfigPtr),
+        first.extra_value_2 != 0);
       return;
     }
     if (first.task_type == MulticoreRuntime::TaskType::TASK_NATIVE_BIT_COMBINE_GRAD) {
@@ -321,6 +326,7 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
       return;
     }
   }
+  MulticoreRuntime::InitNativeOrderInputs(input_list, runtimeConfigPtr);
   MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
   worker.Process();

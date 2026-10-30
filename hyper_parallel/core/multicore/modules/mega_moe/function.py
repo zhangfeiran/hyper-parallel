@@ -27,6 +27,8 @@ from hyper_parallel.core.multicore.torch import ops as multicore_ops
 from .plan import MegaMoePlan, record_plan_stream
 from .route import PreparedTopKRoute, RouteMetadata
 from .torch_route import _restore_torch_output_grad_out, _restore_torch_output_with_state, received_torch_order
+from .native_weight_gradients import allocate_ordered_workspace, ordered_workspace_views
+from .native_combine import _kernel as _native_combine_kernel
 from .workspace import MegaMoeWorkspace
 
 
@@ -90,6 +92,7 @@ class _BackwardExecution:
     gmm_workspace: Any
     swiglu_workspace: Any
     intermediates: _BackwardIntermediates
+    ordered_rows: int = 0
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -159,9 +162,10 @@ def _allocate_backward_intermediates(
     weight1: Any,
     weight2: Any,
     reusable_dispatch: Any | None = None,
+    *, native_weight_gradients: bool = False,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    ordered = getattr(spec, "route_policy", "cann") == "torch"
+    ordered = getattr(spec, "route_policy", "cann") == "torch" and not native_weight_gradients
     grad_weight2 = weight2.new_empty(1) if ordered else torch.zeros_like(weight2)
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
@@ -178,7 +182,7 @@ def _allocate_backward_intermediates(
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
-    # Ordered weight gradients are returned by the two external GEMMs; the
+    # External ordered weight gradients are returned by the two GEMMs; the
     # disabled task-graph slots retain only distinct non-null ABI pointers.
     grad_weight1 = weight1.new_empty(1) if ordered else torch.zeros_like(weight1)
     return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
@@ -246,11 +250,13 @@ def _prepare_backward_execution(
             saved.weight1,
             saved.weight2,
             dispatch[:saved.dispatch.shape[0]] if plan.reuse_backward_dispatch else None,
+            native_weight_gradients=getattr(plan, "native_weight_gradients", False),
         ),
     )
 
 
-def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any, ...]) -> Any:
+def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any, ...],
+                            source_inverse: torch.Tensor | None = None) -> Any:
     """Return an owned input gradient while the workspace lease is held."""
     if not ctx.needs_input_grad[0]:
         return None
@@ -262,6 +268,9 @@ def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any
     if ctx.token_rows == 0:
         return grad_x[:0].clone()
     if getattr(spec, "route_policy", "cann") == "torch":
+        if getattr(ctx.plan, "native_weight_gradients", False):
+            return _native_combine_kernel(spec.hidden_size, spec.top_k, grad_x.device.index).sum(
+                grad_x, unpermute_mapping, inverse_order=source_inverse)
         result = grad_x.new_zeros((ctx.token_rows, spec.hidden_size))
         result.index_put_((unpermute_mapping.div(spec.top_k, rounding_mode="floor"),), grad_x, accumulate=True)
         return result
@@ -463,8 +472,19 @@ def _launch_backward_kernel(
         )
         return
 
+    diagnostic_parameters = kernel_parameters
+    if getattr(plan, "native_weight_gradients", False):
+        views = ordered_workspace_views(
+            execution.swiglu_workspace, execution.ordered_rows, spec.intermediate_size, spec.hidden_size,
+            include_input=spec.dispatch_mode == "pull")
+        du, activation, dy = views[:3]
+        unused = execution.swiglu_workspace[:0]
+        canonical_input = views[3] if spec.dispatch_mode == "pull" else unused
+        diagnostic_parameters += (plan.act_grad_tiling, plan.gate_grad_tiling, plan.w1_grad_tiling,
+                                  plan.w2_grad_tiling, plan.swiglu_grad_tiling, execution.gmm_workspace, du,
+                                  unused, unused, unused, unused, unused, unused, activation, dy, canonical_input)
     with plan.bwd_diagnostics.launch(
-        kernel_parameters,
+        diagnostic_parameters,
         direction="backward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
@@ -548,6 +568,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 permutation_inputs = (unpermute_mapping,)
             if len(permutation) > 3 and permutation[3] is not None:
                 permutation_inputs = (unpermute_mapping, permutation[3])
+        source_inverse = permutation[7] if permutation is not None and len(permutation) > 7 else None
+        ctx.has_source_inverse = source_inverse is not None
         ctx.source_rows = routed_tokens.shape[0]
         ctx.token_rows = ctx.source_rows // spec.top_k
         ctx.has_permutation = permutation is not None
@@ -591,6 +613,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 current = torch.npu.current_stream(routed_tokens.device)
                 current.wait_stream(permutation[4])
                 permutation_inputs[1].record_stream(current)
+                if source_inverse is not None:
+                    source_inverse.record_stream(current)
             output = execution.combine[:ctx.source_rows].clone()
             if spec.dispatch_mode == "pull":
                 saved_dispatch = execution.dispatch
@@ -598,8 +622,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 # Combine has consumed down_proj before SHMEM dispatch is reused.
                 saved_dispatch = execution.intermediates.down_proj
                 if getattr(spec, "route_policy", "cann") == "torch" and len(permutation_inputs) > 1:
-                    # Only the disabled W1-gradient slot consumes saved X in the native graph.
-                    # Snapshot its final row order directly instead of copying and gathering it again.
+                    # Save X in the final row order consumed by its weight-gradient reader,
+                    # avoiding a second snapshot and gather during backward.
                     order = permutation_inputs[1]
                     rows = order.numel()
                     torch.index_select(execution.dispatch[:rows], 0, order, out=saved_dispatch[:rows])
@@ -610,7 +634,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 ctx.topk_dtype = topk_weights.dtype
                 if getattr(spec, "route_policy", "cann") == "torch":
                     combined, scores, token_ids = _restore_torch_output_with_state(
-                        output, unpermute_mapping, topk_weights)
+                        output, unpermute_mapping, topk_weights, inverse_order=source_inverse)
                     permutation_inputs += (output, topk_weights, scores, token_ids)
                     output = combined
                 else:
@@ -618,6 +642,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                     permutation_inputs += (output, probs)
                     output = (load_torch_npu().npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
                               if ctx.source_rows else output[:0])
+            if source_inverse is not None:
+                permutation_inputs += (source_inverse,)
             _save_forward_state(
                 ctx,
                 plan,
@@ -648,12 +674,17 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             Gradients aligned with the differentiable forward inputs.
         """
         plan = ctx.plan
+        native_weight_gradients = getattr(plan, "native_weight_gradients", False)
         workspace = ctx.workspace
         # Non-reentrant checkpoint hooks allow each saved tensor to be unpacked only once.
         saved_tensors = ctx.saved_tensors
         ctx.maybe_clear_saved_tensors()
         saved = _saved_backward_state(saved_tensors)
         permutation_inputs = saved_tensors[12:]
+        source_inverse = None
+        if getattr(ctx, "has_source_inverse", False):
+            source_inverse = permutation_inputs[-1]
+            permutation_inputs = permutation_inputs[:-1]
         del saved_tensors
         workspace.claim()
         try:
@@ -667,13 +698,22 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 saved,
                 grad_output,
             )
+            if native_weight_gradients:
+                order = permutation_inputs[1]
+                if order.numel() > saved.dispatch.shape[0]:
+                    raise RuntimeError("Native fused dW row map exceeds the saved receive buffer.")
+                if plan.spec.dispatch_mode == "push" and not ctx.dispatch_ordered:
+                    raise RuntimeError("Native fused dW requires the canonical forward input snapshot.")
+                execution = replace(execution, ordered_rows=order.numel(), swiglu_workspace=allocate_ordered_workspace(
+                    order, plan.spec.intermediate_size, plan.spec.hidden_size,
+                    include_input=plan.spec.dispatch_mode == "pull"))
             _launch_backward_kernel(
                 plan,
                 saved,
                 source,
                 execution,
             )
-            if getattr(plan.spec, "route_policy", "cann") == "torch":
+            if getattr(plan.spec, "route_policy", "cann") == "torch" and not native_weight_gradients:
                 execution = _ordered_weight_gradients(
                     saved, execution, permutation_inputs[1], dispatch_ordered=ctx.dispatch_ordered,
                     expert_weight_layout=plan.spec.expert_weight_layout)
@@ -684,7 +724,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution.intermediates.grad_weight2,
                 None, None, None,
             ))
-            grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs[:1])
+            grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs[:1], source_inverse)
             _release_completed_graph(ctx, workspace)
             return (
                 grad_input,
@@ -748,6 +788,7 @@ def execute_mega_moe_with_permutation(
     *,
     topk_weights: torch.Tensor | None = None,
     workspace_claimed: bool = False,
+    source_inverse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Include input permutation backward within the workspace lease.
 
@@ -760,6 +801,7 @@ def execute_mega_moe_with_permutation(
         plan: Shape-specific native descriptors.
         workspace: Reusable communication buffers.
         topk_weights: Optional Router probabilities for integrated pull output unpermutation.
+        source_inverse: Optional invocation-owned inverse prepared on the route metadata stream.
         workspace_claimed: Borrow a caller-held forward lease without releasing it.
             Backward always acquires its own lease on the original workspace.
 
@@ -777,7 +819,7 @@ def execute_mega_moe_with_permutation(
         (route.routed_tokens, topk_ids, route.unpermute_mapping, route.weight_grad_order,
          route.weight_grad_order_stream,
          route.received_counts if route.weight_grad_ready_event is not None else None,
-         route.weight_grad_ready_event),
+         route.weight_grad_ready_event, source_inverse),
         topk_weights,
         workspace_claimed,
     )

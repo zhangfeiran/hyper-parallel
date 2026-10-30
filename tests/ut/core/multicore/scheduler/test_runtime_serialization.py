@@ -75,6 +75,15 @@ class TestRuntimeSerialization(unittest.TestCase):
                 self.assertEqual(ctypes.sizeof(cfg), runtime_config_serialized_size(capacity))
                 self.assertEqual(type(cfg).all_event_num_triggers.offset, RUNTIME_HEADER_BYTES)
 
+    def test_native_operand_mode_survives_the_wire_header(self) -> None:
+        """A native operand graph must initialize its virtual device pointers."""
+        cfg = allocate_runtime_config(16)
+        cfg.native_order_intermediate = 2304
+        image = serialize_runtime_config(cfg)
+        encoded = RuntimeConfigC.from_buffer_copy(image[:RUNTIME_HEADER_BYTES])
+        self.assertEqual(encoded.native_order_intermediate, 2304)
+        self.assertEqual(len(image), runtime_config_serialized_size(0))
+
     def test_capacity_includes_terminal_sparse_ids_and_queue_lengths(self) -> None:
         """Neither task_num nor a single queue determines the storage bound."""
         cfg = allocate_runtime_config(4000)

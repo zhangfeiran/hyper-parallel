@@ -15,7 +15,7 @@ namespace MulticoreRuntime {
 
 __aicore__ inline void NativeBitCombine(
   GM_ADDR expert_output, GM_ADDR scores, GM_ADDR inverse, GM_ADDR output,
-  uint32_t tokens, uint32_t hidden, uint32_t top_k, uint32_t worker, uint32_t workers) {
+  uint32_t tokens, uint32_t hidden, uint32_t top_k, uint32_t worker, uint32_t workers, bool sum_only) {
 #ifndef __DAV_C220_CUBE__
   using Element = DTYPE_DISPATCH_TARGET;
   AscendC::GlobalTensor<Element> source;
@@ -60,7 +60,9 @@ __aicore__ inline void NativeBitCombine(
         uint32_t bits;
         float value;
       } score;
-      score.bits = static_cast<uint32_t>(score_bits.GetValue(row)) << 16;
+      if (!sum_only) {
+        score.bits = static_cast<uint32_t>(score_bits.GetValue(row)) << 16;
+      }
       auto input = input_queue.AllocTensor<Element>();
       AscendC::DataCopy(input, source[row * hidden], hidden);
       input_queue.EnQue(input);
@@ -68,12 +70,14 @@ __aicore__ inline void NativeBitCombine(
       AscendC::Cast(product, input, AscendC::RoundMode::CAST_NONE, hidden);
       input_queue.FreeTensor(input);
       AscendC::PipeBarrier<PIPE_V>();
-      AscendC::Muls(product, product, score.value, hidden);
-      AscendC::PipeBarrier<PIPE_V>();
-      AscendC::Cast(rounded, product, AscendC::RoundMode::CAST_RINT, hidden);
-      AscendC::PipeBarrier<PIPE_V>();
-      AscendC::Cast(product, rounded, AscendC::RoundMode::CAST_NONE, hidden);
-      AscendC::PipeBarrier<PIPE_V>();
+      if (!sum_only) {
+        AscendC::Muls(product, product, score.value, hidden);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(rounded, product, AscendC::RoundMode::CAST_RINT, hidden);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(product, rounded, AscendC::RoundMode::CAST_NONE, hidden);
+        AscendC::PipeBarrier<PIPE_V>();
+      }
       AscendC::Add(accumulator, accumulator, product, hidden);
       AscendC::PipeBarrier<PIPE_V>();
     }

@@ -30,7 +30,10 @@ class _LiteralKernel:
         self.hidden = hidden
         self.top_k = top_k
 
-    def __call__(self, expert: torch.Tensor, scores: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
+    def __call__(self, expert: torch.Tensor, scores: torch.Tensor, order: torch.Tensor,
+                 *, inverse_order: torch.Tensor | None = None) -> torch.Tensor:
+        if inverse_order is not None and not torch.equal(order[inverse_order], torch.arange(order.numel())):
+            raise ValueError('The combine inverse does not recover the original rows.')
         output = expert.new_zeros((expert.shape[0] // self.top_k, self.hidden))
         return output.index_add_(0, order // self.top_k, expert * scores)
 
@@ -49,8 +52,31 @@ class TestNativeCombine(unittest.TestCase):
         native_combine._require_payload.cache_clear()
         native_combine._device_supported.cache_clear()
 
+    def test_pure_sum_has_a_distinct_forward_runtime_flag(self) -> None:
+        for sum_only in (False, True):
+            with self.subTest(sum_only=sum_only):
+                image = native_combine._runtime_image(5120, 6, sum_only=sum_only)
+                events = int.from_bytes(image[12:16], "little")
+                task = native_combine.TaskDescC.from_buffer_copy(image, 64 + events * 4)
+                self.assertEqual(task.task_type, native_combine.TaskType.TASK_NATIVE_BIT_COMBINE)
+                self.assertEqual(task.extra_value_2, int(sum_only))
+
+    def test_pure_sum_rejects_unvalidated_geometry_before_device_work(self) -> None:
+        kernel = object.__new__(native_combine._NativeCombine)
+        kernel.hidden, kernel.top_k = 16, 1
+        with self.assertRaisesRegex(ValueError, "H5120/K6"):
+            kernel.sum(torch.empty(0, 16), torch.empty(0, dtype=torch.int64))
+
+    def test_empty_input_sum_returns_without_a_device_launch(self) -> None:
+        kernel = object.__new__(native_combine._NativeCombine)
+        kernel.hidden, kernel.top_k = 5120, 6
+        kernel.dummy = torch.empty(1, dtype=torch.bfloat16)
+        result = kernel.sum(torch.empty(0, 5120, dtype=torch.bfloat16), torch.empty(0, dtype=torch.int64))
+        self.assertEqual(result.shape, (0, 5120))
+        self.assertEqual(result.dtype, torch.bfloat16)
+
     def test_missing_or_wrong_payload_is_rejected_before_device_work(self) -> None:
-        for version in (None, 1, 2):
+        for version in (None, 1, 2, 3, 4, 5, 6):
             namespace = SimpleNamespace()
             if version is not None:
                 namespace.mega_moe_native_combine_version = Mock(return_value=version)
@@ -60,10 +86,10 @@ class TestNativeCombine(unittest.TestCase):
                 patch.object(torch, "ops", SimpleNamespace(hyper_parallel=namespace)),
             ):
                 native_combine._require_payload.cache_clear()
-                if version == 2:
+                if version == 6:
                     native_combine._require_payload()
                 else:
-                    with self.assertRaisesRegex(RuntimeError, "payload ABI 2"):
+                    with self.assertRaisesRegex(RuntimeError, "payload ABI 6"):
                         native_combine._require_payload()
 
     def test_cpu_and_unsupported_shapes_never_query_native_capabilities(self) -> None:
@@ -108,6 +134,29 @@ class TestNativeCombine(unittest.TestCase):
                             bits = torch.int16 if reference.dtype == torch.bfloat16 else torch.int32
                             self.assertTrue(torch.equal(reference.view(bits), candidate.view(bits)))
         create.assert_called_once_with(16, 6, None)
+
+    def test_prepared_inverse_reaches_native_without_regeneration(self) -> None:
+        backend = object.__new__(native_combine._NativeCombine)
+        backend.hidden, backend.top_k = 16, 2
+        backend.config = backend.sum_config = torch.empty(1, dtype=torch.uint8)
+        backend.dummy = torch.empty(1, 1, dtype=torch.bfloat16)
+        backend.dummy_long = torch.empty(1, dtype=torch.int64)
+        backend.dummy_int = torch.empty(1, dtype=torch.int32)
+        backend.dummy_byte = torch.empty(1, dtype=torch.uint8)
+        source = torch.randn(8, 16, dtype=torch.bfloat16)
+        order = torch.tensor([3, 0, 7, 5, 1, 6, 4, 2])
+        inverse = torch.argsort(order)
+        with (patch.object(native_combine, "_inverse_order") as regenerate,
+              patch.object(backend, "_record"),
+              patch.object(native_combine.multicore_ops, "mega_moe_grad") as launch):
+            result = backend(source, torch.ones(8, dtype=torch.bfloat16), order, inverse_order=inverse)
+        self.assertEqual(result.shape, (4, 16))
+        regenerate.assert_not_called()
+        self.assertIs(launch.call_args.args[1], inverse)
+        for invalid in (inverse.int(), inverse[:-1]):
+            with self.subTest(shape=tuple(invalid.shape), dtype=invalid.dtype):
+                with self.assertRaisesRegex(ValueError, "contiguous INT64 permutation"):
+                    backend(source, torch.ones(8, dtype=torch.bfloat16), order, inverse_order=invalid)
 
     def test_gradient_output_cannot_overwrite_a_source(self) -> None:
         backend = object.__new__(native_combine._NativeCombine)

@@ -58,7 +58,7 @@ def _resolve_expert_owner(
     if operator.op_type == OpType.GMM:
         return rank_owner_base + task_desc.task_index // context.num_cube_cores
 
-    if operator.op_type in (OpType.SWIGLU, OpType.SWIGLU_GRAD):
+    if operator.op_type in (OpType.SWIGLU, OpType.SWIGLU_GRAD, OpType.INDEXED_COPY):
         if task_desc.task_split_value == 0:
             raise ValueError("SwiGLU diagnostic owner requires a non-zero task_split_value")
         num_triggers = topology.per_expert_seq // task_desc.task_split_value

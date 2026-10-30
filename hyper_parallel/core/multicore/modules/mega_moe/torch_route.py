@@ -43,7 +43,14 @@ def permute_torch_input(
     """Gather in Torch dispatch order, optionally directly into leased SHMEM."""
     expert_ids = ids.reshape(-1).long()
     destinations = expert_ids.div(spec.local_experts, rounding_mode="floor")
-    order = _sort_keys(destinations * spec.num_experts + expert_ids, spec.ep_size * spec.num_experts)
+    keys = destinations * spec.num_experts + expert_ids
+    if keys.device.type == "npu" and not _SORT_FP32_ENABLED:
+        # Integer Sort on this backend already falls back to the host. Sorting
+        # the small key vector directly preserves its unstable tie order while
+        # avoiding the exposed AiCPU launch. Rebuild it for every dispatch.
+        order = keys.cpu().argsort().to(device=keys.device)
+    else:
+        order = _sort_keys(keys, spec.ep_size * spec.num_experts)
     token_ids = order.div(spec.top_k, rounding_mode="floor")
     if output is None:
         routed = torch.index_select(hidden, 0, token_ids)
@@ -75,13 +82,14 @@ def received_torch_order(counts: torch.Tensor, capacity: int) -> torch.Tensor:
 
 def _restore_torch_output_with_state(
     expert_output: torch.Tensor, source_order: torch.Tensor, weights: torch.Tensor,
+    *, inverse_order: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return the literal combine and operands retained by its native autograd graph."""
     scores = weights.reshape(-1).to(expert_output.dtype)[source_order].unsqueeze(-1)
     token_ids = source_order.div(weights.shape[1], rounding_mode="floor")
     if _is_supported(expert_output, source_order, weights):
         result = _kernel(expert_output.shape[-1], weights.shape[1], expert_output.device.index)(
-            expert_output, scores, source_order)
+            expert_output, scores, source_order, inverse_order=inverse_order)
         return result, scores, token_ids
     weighted = expert_output * scores
     result = expert_output.new_zeros((weights.shape[0], expert_output.shape[-1]))
@@ -91,10 +99,11 @@ def _restore_torch_output_with_state(
 
 def restore_torch_output(
     expert_output: torch.Tensor, source_order: torch.Tensor, weights: torch.Tensor,
+    *, inverse_order: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Match native BF16 product rounding, accumulation order and its adjoint."""
     if _is_supported(expert_output, source_order, weights):
-        return _NativeCombineAutograd.apply(expert_output, source_order, weights)
+        return _NativeCombineAutograd.apply(expert_output, source_order, weights, inverse_order)
     return _restore_torch_output_with_state(expert_output, source_order, weights)[0]
 
 
@@ -129,18 +138,20 @@ class _NativeCombineAutograd(torch.autograd.Function):
     """Keep the literal adjoint when the push path uses the fused forward kernel."""
 
     @staticmethod
-    def forward(ctx: Any, expert: torch.Tensor, source_order: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    def forward(ctx: Any, expert: torch.Tensor, source_order: torch.Tensor, weights: torch.Tensor,
+                inverse_order: torch.Tensor | None = None) -> torch.Tensor:
         """Retain the same BF16 scores and source identities consumed by the native adjoint."""
-        output, scores, token_ids = _restore_torch_output_with_state(expert, source_order, weights)
+        output, scores, token_ids = _restore_torch_output_with_state(
+            expert, source_order, weights, inverse_order=inverse_order)
         ctx.save_for_backward(expert, source_order, weights, scores, token_ids)
         return output
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, None, Any]:
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, None, Any, None]:
         """Produce the source gradient and preserve the existing router reduction boundary."""
         expert, source_order, weights, scores, token_ids = ctx.saved_tensors
         grad_expert = torch.empty_like(expert)
         grad_weights = _restore_torch_output_grad_out(
             expert, source_order, weights, grad_output, grad_expert, scores, token_ids,
             need_weight_grad=ctx.needs_input_grad[2])
-        return grad_expert if ctx.needs_input_grad[0] else None, None, grad_weights
+        return grad_expert if ctx.needs_input_grad[0] else None, None, grad_weights, None

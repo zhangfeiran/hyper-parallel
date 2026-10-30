@@ -65,7 +65,7 @@ __global__ __aicore__ void hyper_mega_moe_grad(
                               workspace,
                               tiling,  // 30
                               all_event_counters,
-                              diagnostic_buffer};
+                              diagnostic_buffer, nullptr, nullptr, nullptr};
       uint32_t idx = GetBlockIdx();
       worker_kernel(idx, runtime_config, input_list);
     } else if constexpr (TRANS_A == 0 && TRANS_B == 1 && AIV_AIC_RATIO == GROUPED_MATMUL_CUBE_ONLY) {

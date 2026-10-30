@@ -35,6 +35,7 @@ from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .torch_route import restore_torch_output
+from .native_combine import _inverse_order
 from .spec import (
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
@@ -666,6 +667,17 @@ class MegaMoeExperts(MulticoreModule):
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
             plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            source_inverse = None
+            if getattr(plan, "native_weight_gradients", False):
+                # The source permutation is ready before the expert launch. Build
+                # its adjoint map beside the expert kernel, then save it per call.
+                stream = route.weight_grad_order_stream
+                if stream is not None and route.weight_grad_ready_event is not None:
+                    stream.wait_event(route.weight_grad_ready_event)
+                    with torch.npu.stream(stream):
+                        source_inverse = _inverse_order(route.unpermute_mapping)
+                else:
+                    source_inverse = _inverse_order(route.unpermute_mapping)
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,
@@ -676,12 +688,15 @@ class MegaMoeExperts(MulticoreModule):
                 resources.workspace,
                 topk_weights=topk_weights if pull else None,
                 workspace_claimed=pull,
+                source_inverse=source_inverse,
             )
         finally:
             if claimed:
                 resources.workspace.release()
         if self.route_policy == "torch" and not pull:
-            return restore_torch_output(expert_output, route.unpermute_mapping, topk_weights).reshape_as(hidden_states)
+            return restore_torch_output(
+                expert_output, route.unpermute_mapping, topk_weights,
+                inverse_order=source_inverse).reshape_as(hidden_states)
         if pull:
             return expert_output.reshape_as(hidden_states)
         output = restore_topk_output(

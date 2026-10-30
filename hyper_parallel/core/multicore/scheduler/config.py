@@ -120,6 +120,7 @@ class TaskType(IntEnum):
     TASK_SHMEM_GET_MEM              = 141
     TASK_NATIVE_BIT_COMBINE         = 142
     TASK_NATIVE_BIT_COMBINE_GRAD    = 143
+    TASK_NATIVE_BIT_REORDER         = 144
 
 
 class EventType(IntEnum):
@@ -230,7 +231,8 @@ class RuntimeConfigC(ctypes.Structure):
         ("aiv_profile_record_capacity", ctypes.c_uint32),
         ("completion_event", ctypes.c_uint32),
         ("protocol_version", ctypes.c_uint32),
-        ("_padding", ctypes.c_uint32 * 6),
+        ("native_order_intermediate", ctypes.c_uint32),
+        ("_padding", ctypes.c_uint32 * 5),
     ]
 
 

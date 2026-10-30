@@ -538,6 +538,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             resources.workspace,
             topk_weights=None,
             workspace_claimed=False,
+            source_inverse=None,
         )
         mock_restore.assert_called_once_with(
             expert_output, route.unpermute_mapping, topk_weights

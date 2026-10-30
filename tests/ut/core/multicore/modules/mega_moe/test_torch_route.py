@@ -34,6 +34,27 @@ from hyper_parallel.distributed.expert_parallel.experts import _aggregate_ep_out
 class TestTorchRoute(unittest.TestCase):
     """Exercise exact routing without distributed initialization or accelerator kernels."""
 
+    def test_source_order_preserves_repeated_keys_empty_inputs_and_float_sort(self) -> None:
+        """Retain literal source indices and the output lease for each sorting policy."""
+        generator = torch.Generator().manual_seed(630)
+        spec = SimpleNamespace(local_experts=6, num_experts=96, ep_size=16, top_k=6)
+        for tokens in (0, 1, 17, 4096):
+            ids = torch.randint(spec.num_experts, (tokens, spec.top_k), generator=generator)
+            hidden = torch.randn(tokens, 7, generator=generator).bfloat16()
+            keys = ids.flatten().div(spec.local_experts, rounding_mode="floor") * spec.num_experts + ids.flatten()
+            for float_sort in (False, True):
+                with self.subTest(tokens=tokens, float_sort=float_sort), patch.object(
+                        torch_route, "_SORT_FP32_ENABLED", float_sort):
+                    expected = (keys.float() if float_sort else keys).argsort()
+                    destination = torch.full((tokens * spec.top_k + 1, 7), float("nan"), dtype=hidden.dtype)
+                    routed, order = torch_route.permute_torch_input(hidden, ids, spec, destination)
+                    self.assertTrue(torch.equal(order, expected), f"Expected order {expected}, got {order}")
+                    expected_values = hidden[expected // spec.top_k]
+                    self.assertTrue(torch.equal(routed, expected_values),
+                                    f"Expected values {expected_values}, got {routed}")
+                    self.assertEqual(routed.untyped_storage().data_ptr(), destination.untyped_storage().data_ptr())
+                    self.assertTrue(destination[-1].isnan().all(), f"Guard row overwritten: {destination[-1]}")
+
     def test_order_preparation_captures_fresh_events_and_reuses_workspace_stream(self) -> None:
         """Capture each count producer without submitting the backward-only row mapping."""
         counts = Mock()

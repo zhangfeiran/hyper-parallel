@@ -161,6 +161,15 @@ def resolve_mega_moe_l1_tensor_view(context: Any) -> L1TensorView:
         return _resolve_grouped_matmul(context)
     if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
         return _resolve_swiglu(context)
+    if task_type == TaskType.TASK_NATIVE_BIT_REORDER:
+        if context.io == "output":
+            return _resolve_swiglu(context)
+        _, start, end = _group_counts(context)
+        width = int(context.tensor_spec.shape[1])
+        return context.make_view(
+            (end - start, width), source_offset_bytes=start * width * int(context.tensor_desc.data_type),
+            note="complete immutable expert source for the indexed copy",
+        )
     if task_type in (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM):
         return _resolve_alltoall(context)
     return context.default_view

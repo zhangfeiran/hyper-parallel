@@ -245,6 +245,8 @@ class TestMegaMoeFunction(unittest.TestCase):
         context = Mock()
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
+        context.plan.native_weight_gradients = False
+        context.has_source_inverse = False
         execution = function_module._BackwardExecution(
             dispatch=torch.ones(1), grad_x=torch.ones(1), event_counters=Mock(),
             gmm_workspace=None, swiglu_workspace=None,
@@ -260,7 +262,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         ):
             result = _MegaMoeFunction.backward(context, gradient)
         unpack.assert_called_once_with()
-        restore.assert_called_once_with(context, execution.grad_x, tensors[12:])
+        restore.assert_called_once_with(context, execution.grad_x, tensors[12:], None)
         self.assertIs(result[0], gradient)
         self.assertIs(result[1], execution.intermediates.grad_weight1)
         self.assertIs(result[2], execution.intermediates.grad_weight2)
