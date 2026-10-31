@@ -328,8 +328,9 @@ def prepare_topk_route(
         received_counts=received_counts,
         maximum_received_slots=maximum_received_slots,
         permute_src_index=permute_src_index,
-        peer_row_ordinals=(_peer_row_ordinals(topk_ids, permute_src_index, counts)
-                           if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap", "peer_token") else None),
+        peer_row_ordinals=(
+            _peer_row_ordinals(topk_ids, permute_src_index, counts)
+            if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap", "peer_token", "peer_tile") else None),
         metadata=_compute_route_metadata(
             counts,
             counts_by_source,

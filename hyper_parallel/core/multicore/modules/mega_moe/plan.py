@@ -56,7 +56,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, SplitSpec, TensorSpec
 
 from .diagnostics import _mega_moe_owner_options
-from .spec import MegaMoeSpec
+from .spec import MegaMoeSpec, _route_metadata_rows
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
 
 
@@ -169,8 +169,14 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
                 task.extra_value_1 = 2
     if spec.forward_ingress_mode == "peer_overlap":
         _configure_owner_prefix(forward_data)
-    elif spec.forward_ingress_mode == "peer_token":
+    elif spec.forward_ingress_mode in ("peer_token", "peer_tile"):
         _configure_token_prefix(forward_graph, forward_data, spec)
+        if spec.forward_ingress_mode == "peer_tile":
+            for task in forward_data.all_tasks[:forward_data.task_num]:
+                if task.task_type == TaskType.TASK_GROUPED_MATMUL and task.outputs[0].input_position == 7:
+                    task.dependent_event = 0xFFFFFFFF
+                    task.extra_value_0 = spec.top_k
+                    task.extra_value_2 = 0x4D54494C
     if spec.forward_ingress_mode != "legacy":
         validate_runtime_config(forward_data, task_values, spec.num_cube_cores)
         _attach_route_metadata_input(forward_graph, spec)
@@ -236,7 +242,7 @@ def _configure_owner_prefix(config: Any) -> None:
 
 def _attach_route_metadata_input(graph: ComputeGraph, spec: MegaMoeSpec) -> None:
     """Expose the complete port-16 binding without adding a Device task."""
-    rows = spec.routed_slots + 8 * spec.num_experts * ((spec.routed_slots + 127) // 128)
+    rows = _route_metadata_rows(spec.routed_slots, spec.num_experts, spec.ep_size, spec.forward_ingress_mode)
     metadata = TensorSpec("route_metadata_workspace", [rows, 16], param_position=16, dtype_size=1)
     node = OperatorNode(
         name="route_metadata", op_type=OpType.AIV_PIPELINE, inputs=[metadata], outputs=[],
@@ -271,7 +277,7 @@ def _configure_token_prefix(graph: ComputeGraph, config: Any, spec: MegaMoeSpec)
         task.task_split_value = spec.dispatch_split
         task.trigger_event = event_base
         task.dependent_event = 0xFFFFFFFF
-        task.extra_value_1 = 5
+        task.extra_value_1 = 6 if spec.forward_ingress_mode == "peer_tile" else 5
         config.all_tasks[index] = task
     for index, task in enumerate(original[old_dispatch_count:], start=token_jobs):
         config.all_tasks[index] = task

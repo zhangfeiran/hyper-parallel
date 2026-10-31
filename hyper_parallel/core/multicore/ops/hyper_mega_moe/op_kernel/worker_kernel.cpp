@@ -53,6 +53,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   __aicore__ inline void PrepareIngressThresholds() {
     TaskDesc first;
     getTaskDesc(this->runtimeConfigPtr, &first, 0);
+    if (first.task_type == TaskType::TASK_MOE_TOKEN_GET && first.extra_value_1 == 6) { return; }
     if (first.task_type != TaskType::TASK_MOE_OWNER_GET && first.task_type != TaskType::TASK_MOE_TOKEN_GET) { return; }
     uint32_t local_experts = getExtraValueFromTiling(input_list[TILING_IDX], 2) /
                              getExtraValueFromTiling(input_list[TILING_IDX], 1);
@@ -78,7 +79,20 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           if (task_desc.extra_value_1 == 1) {
             MulticoreBf16::ExecuteCgmctTask(task_desc, input_list, this->core_num);
           } else if (task_desc.extra_value_1 == 2) {
-            MulticoreBf16::ExecuteBlazeTask(task_desc, input_list, this->core_num);
+            if (task_desc.extra_value_2 == MulticoreBf16::TILE_READY_TAG) {
+              if (task_desc.outputs[0].input_position != 7 || task_desc.extra_value_0 == 0 ||
+                  task_desc.extra_value_0 > 16) { AscendC::Trap(); }
+              uint64_t tokens = getExtraValueFromTiling(input_list[TILING_IDX], 4);
+              uint64_t experts = getExtraValueFromTiling(input_list[TILING_IDX], 2);
+              uint64_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+              uint64_t top_k = task_desc.extra_value_0;
+              auto *table = reinterpret_cast<__gm__ int32_t *>(
+                  input_list[16] + MulticoreBf16::InputTileTableOffset(tokens, top_k, experts));
+              MulticoreBf16::ExecuteBlazeTask<false, true>(
+                  task_desc, input_list, this->core_num, table, MulticoreBf16::InputTileStride(tokens, top_k, ep));
+            } else {
+              MulticoreBf16::ExecuteBlazeTask(task_desc, input_list, this->core_num);
+            }
           } else {
             ExecuteGroupedMatmul(task_desc);
           }

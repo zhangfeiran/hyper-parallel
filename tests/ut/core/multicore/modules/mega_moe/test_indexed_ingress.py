@@ -26,8 +26,10 @@ from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.plan import (
     _build_ingress_config, _build_runtime_artifacts, _ingress_graph, _row_credit_element_offset,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.function import _patch_forward_row_thresholds
-from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_parallel.core.multicore.modules.mega_moe.function import (
+    _patch_forward_row_thresholds, _reset_forward_tile_credits,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec, _route_metadata_rows
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import _workspace_allocation_specs
 from hyper_parallel.core.multicore.scheduler.config import TaskType, validate_runtime_config
 from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_task_values
@@ -239,3 +241,61 @@ class TestIndexedIngress(unittest.TestCase):
             self.assertEqual(prepass.task_num, graph.get_op("dispatch").task_num)
             self.assertEqual(len(ingress.topological_sort()), 2)
             validate_mega_kernel_diagnostic_contract(ingress, prepass, parameter_count=17)
+
+    def test_tile_ingress_preserves_arithmetic_and_queues_except_input_readiness(self) -> None:
+        """Only the marked Up input dependency may change within the canonical math plan."""
+        for n in (128, 2048, 8192):
+            for rank in range(4):
+                with self.subTest(tokens=n, rank=rank):
+                    spec = MegaMoeSpec(n, 5120, 1792, 32, 8, None, n * 8, 4, None, rank, 32,
+                                       dispatch_mode="pull", forward_ingress_mode="peer_tile")
+                    graph, current, _, backward = _build_runtime_artifacts(spec)
+                    _, old, _, old_backward = _build_runtime_artifacts(
+                        replace(spec, forward_ingress_mode="peer_token"))
+                    self.assertEqual(bytes(backward), bytes(old_backward), "Tile readiness changed backward")
+                    self.assertEqual(current.task_num, old.task_num, "Tile mode changed the arithmetic task count")
+                    validate_mega_kernel_diagnostic_contract(graph, current, parameter_count=17)
+                    self.assertEqual(list(current.task_index_num), list(old.task_index_num), "Queues changed")
+                    self.assertEqual(list(current.cube_task_indices), list(old.cube_task_indices), "Cube order changed")
+                    self.assertEqual(list(current.vector_task_indices), list(old.vector_task_indices),
+                                     "Vector producer order changed")
+                    for index in range(current.task_num + 1):
+                        actual, expected = current.all_tasks[index], old.all_tasks[index]
+                        if actual.task_type == TaskType.TASK_MOE_TOKEN_GET:
+                            self.assertEqual(actual.extra_value_1, 6, "Token producer did not select tile credits")
+                            actual.extra_value_1 = 5
+                        elif (actual.task_type == TaskType.TASK_GROUPED_MATMUL
+                              and actual.outputs[0].input_position == 7):
+                            self.assertEqual((actual.dependent_event, actual.extra_value_0, actual.extra_value_2),
+                                             (0xFFFFFFFF, spec.top_k, 0x4D54494C), "Up uses whole-expert readiness")
+                            actual.dependent_event = expected.dependent_event
+                            actual.extra_value_0 = expected.extra_value_0
+                            actual.extra_value_2 = expected.extra_value_2
+                        self.assertEqual(bytes(actual), bytes(expected), f"Arithmetic descriptor changed at {index}")
+                    self.assertEqual(graph.get_op("dispatch").task_num, 4 * n // 128)
+                    self.assertIsNone(_row_credit_element_offset(current, spec), "Tile mode patched old row thresholds")
+
+    def test_tile_counters_follow_the_complete_unchanged_diagnostic_tail(self) -> None:
+        """The local tile table cannot alias a peer route prefix or any per-task counter line."""
+        kwargs = dict(dispatch_mode="pull", routed_slots=65536, receive_capacity=65536,
+                      hidden_size=5120, ep_size=4, num_experts=32, dtype=torch.bfloat16)
+        original = _workspace_allocation_specs(**kwargs, forward_ingress_mode="peer_token")
+        current = _workspace_allocation_specs(**kwargs, forward_ingress_mode="peer_tile")
+        self.assertEqual(current[:-1], original[:-1], "Tile mode changed another symmetric buffer")
+        old_rows = original[-1][1].shape[0]
+        expected_counters = (4 * 65536 // 128) * 8
+        self.assertEqual(current[-1][1].shape, (old_rows + expected_counters // 4, 4),
+                         "The local readiness table is missing or overlaps existing storage")
+
+    def test_tile_credit_reset_preserves_routes_statistics_and_adjacent_storage(self) -> None:
+        """A fresh generation clears only its owned local counter suffix on the launch stream."""
+        spec = MegaMoeSpec(128, 5120, 1792, 32, 8, None, 1024, 4, None, 0, 32,
+                           dispatch_mode="pull", forward_ingress_mode="peer_tile")
+        rows = _route_metadata_rows(spec.routed_slots, spec.num_experts, spec.ep_size, "peer_tile")
+        prefix = _route_metadata_rows(spec.routed_slots, spec.num_experts, spec.ep_size, "peer_token")
+        allocation = torch.arange(1, (rows + 1) * 4 + 1, dtype=torch.int32).reshape(rows + 1, 4)
+        original = allocation.clone()
+        _reset_forward_tile_credits(spec, allocation[:rows])
+        torch.testing.assert_close(allocation[:prefix], original[:prefix])
+        torch.testing.assert_close(allocation[prefix:rows], torch.zeros_like(allocation[prefix:rows]))
+        torch.testing.assert_close(allocation[rows:], original[rows:])

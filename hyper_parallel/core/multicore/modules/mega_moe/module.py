@@ -272,6 +272,7 @@ class MegaMoeExperts(MulticoreModule):
                 "indexed", "peer_dedup", or "peer_overlap". Indexed modes require static pull and Blaze F2.
                 Peer overlap uses owner-first vector queues and dynamic per-expert row credits.
                 Peer token uses original-token jobs and packed fanout metadata.
+                Peer tile publishes input-tile credits to the unchanged Blaze F2 arithmetic.
                 Peer dedup uses a dispatch prepass followed by the original compute graph.
                 It preserves the legacy backward source capacity and receive layout.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
@@ -290,14 +291,15 @@ class MegaMoeExperts(MulticoreModule):
                 one ordered EP membership active in SHMEM at a time.
         """
         reserved_tokens = _resolve_token_capacity(local_num_tokens, max_local_num_tokens, hidden_size, top_k)
-        if forward_ingress_mode not in ("legacy", "indexed", "peer_dedup", "peer_overlap", "peer_token"):
-            raise ValueError("forward_ingress_mode must be legacy, indexed, peer_dedup, peer_overlap or peer_token")
+        if forward_ingress_mode not in ("legacy", "indexed", "peer_dedup", "peer_overlap", "peer_token", "peer_tile"):
+            raise ValueError("forward_ingress_mode must be legacy, indexed, peer_dedup, "
+                             "peer_overlap, peer_token or peer_tile")
         if forward_ingress_mode != "legacy":
             if dispatch_mode != "pull" or max_local_num_tokens is not None:
                 raise ValueError("Indexed forward ingress requires static pull dispatch")
-            if forward_ingress_mode in ("peer_dedup", "peer_overlap", "peer_token") and top_k > 16:
+            if forward_ingress_mode in ("peer_dedup", "peer_overlap", "peer_token", "peer_tile") and top_k > 16:
                 raise ValueError("Peer dedup ingress currently supports top_k at most 16")
-            if forward_ingress_mode in ("peer_overlap", "peer_token") and num_experts // ep_size > 64:
+            if forward_ingress_mode in ("peer_overlap", "peer_token", "peer_tile") and num_experts // ep_size > 64:
                 raise ValueError("Peer overlap supports at most 64 local experts")
             if reserved_tokens * top_k > 2**24:
                 raise ValueError("Indexed scalar route sorting requires at most 2**24 route slots")

@@ -26,6 +26,7 @@ from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan, record_plan_stream
 from .route import _peer_owner_flags, PreparedTopKRoute, RouteMetadata
+from .spec import MegaMoeSpec, _route_metadata_rows
 from .workspace import MegaMoeWorkspace
 
 
@@ -303,6 +304,14 @@ def _patch_forward_row_thresholds(plan: MegaMoePlan, metadata: RouteMetadata, ru
     runtime_config.view(torch.int32)[offset:offset + plan.spec.local_experts].copy_(metadata.expert_row_counts)
 
 
+def _reset_forward_tile_credits(spec: MegaMoeSpec, storage: torch.Tensor) -> None:
+    """Reset only the local readiness table while the caller owns the forward lease."""
+    if spec.forward_ingress_mode != "peer_tile":
+        return
+    prefix_rows = _route_metadata_rows(spec.routed_slots, spec.num_experts, spec.ep_size, "peer_token")
+    storage.view(-1)[prefix_rows * 4:].zero_()
+
+
 def _launch_forward_kernel(
     plan: MegaMoePlan,
     metadata: RouteMetadata,
@@ -545,8 +554,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 # Port 16 is unused by Blaze F2. Keep its read-only metadata in
                 # symmetric storage until the all-rank source-read completion.
                 metadata_storage = _workspace_tensor(workspace.route_metadata, "route_metadata")
+                _reset_forward_tile_credits(spec, metadata_storage)
                 metadata_buffer = metadata_storage[:ctx.source_rows]
-                if spec.forward_ingress_mode == "peer_token":
+                if spec.forward_ingress_mode in ("peer_token", "peer_tile"):
                     # Packed records are indexed by original slot. The gap up to
                     # NK*16 bytes preserves the common diagnostic-tail address.
                     packed = torch.stack((permutation[1].reshape(-1).to(torch.int32), permutation[4]), dim=1)

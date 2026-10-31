@@ -34,7 +34,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.shmem import _lifecycle
 
-from .spec import MegaMoeSpec, _resolve_receive_capacity
+from .spec import MegaMoeSpec, _resolve_receive_capacity, _route_metadata_rows
 
 # The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
 # tensor arguments. Keep non-empty ABI placeholders; native tiling reserves
@@ -69,9 +69,9 @@ def _workspace_allocation_specs(
     if forward_ingress_mode != "legacy":
         # The tail holds one private 128-byte cache line per diagnostic task.
         # Peers never read it; scalar counter stores cannot share cache lines.
-        statistics_rows = 8 * num_experts * ((routed_slots + 127) // 128)
+        metadata_rows = _route_metadata_rows(routed_slots, num_experts, ep_size, forward_ingress_mode)
         allocations += (("route_metadata", allocation_spec(
-            (routed_slots + statistics_rows, 4), torch.int32, _WORKSPACE_ALIGNMENT)),)
+            (metadata_rows, 4), torch.int32, _WORKSPACE_ALIGNMENT)),)
     return allocations
 
 

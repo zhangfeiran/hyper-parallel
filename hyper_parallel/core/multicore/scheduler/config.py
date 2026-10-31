@@ -424,7 +424,7 @@ def _validate_token_task(task: TaskDescC, descriptor_index: int, tsv: TaskSplitV
     blocks = tokens // split
     if blocks == 0 or task.task_split_num != tsv.ep * blocks or task.task_index >= tsv.ep * blocks:
         raise ValueError(f"Token task {descriptor_index} has invalid source block coordinates")
-    if task.inputs[1].dim[3] != tsv.top_k or task.extra_value_0 != 16 or task.extra_value_1 != 5:
+    if task.inputs[1].dim[3] != tsv.top_k or task.extra_value_0 != 16 or task.extra_value_1 not in (5, 6):
         raise ValueError(f"Token task {descriptor_index} has an invalid packed route contract")
 
 

@@ -5,12 +5,14 @@
 #include "blaze/gemm/block/block_scheduler_grouped_matmul.h"
 #include "logical_lane.h"
 #include "problem.h"
+#include "tile_ready.h"
 
 namespace MulticoreBf16 {
-template <class LayoutA, class LayoutB, bool RotateLanes = false>
+template <class LayoutA, class LayoutB, bool RotateLanes = false, bool InputTiles = false>
 __aicore__ inline void RunBlaze(const Problem& problem, GM_ADDR a, GM_ADDR b, GM_ADDR c,
                                const TCubeTiling& tiling, uint32_t logical_cube, uint32_t cubes,
-                               uint32_t expert = 0) {
+                               uint32_t expert = 0, __gm__ int32_t *input_tiles = nullptr,
+                               uint64_t tile_stride = 0) {
   using namespace Blaze::Gemm;
   using RowMajor = asc::te::nd_ext_layout_ptn;
   using Policy = MatmulMultiBlockBasic<0, 0, KernelGroupedMmadNoQuant, 0, MatmulOutputMode::OVERWRITE>;
@@ -47,6 +49,9 @@ __aicore__ inline void RunBlaze(const Problem& problem, GM_ADDR a, GM_ADDR b, GM
   AscendC::TPipe pipe;
   Mmad block;
   block.Init(params);
+  if constexpr (InputTiles) {
+    if (tiling.baseM != INPUT_TILE_ROWS) { AscendC::Trap(); }
+  }
   for (int64_t tile = logical_cube; tile < schedule.GetBlockNums(); tile += cubes) {
     auto block_shape = schedule.template GetBlockShape<Mmad::TRANS_B, bfloat16_t>(tile);
     auto coordinate = schedule.GetBlockCoord(tile);
@@ -58,13 +63,17 @@ __aicore__ inline void RunBlaze(const Problem& problem, GM_ADDR a, GM_ADDR b, GM
                               asc::te::make_shape(static_cast<int64_t>(problem.k), n));
     auto block_c = gm_c.slice(asc::te::make_coord(m_offset, n_offset), asc::te::make_shape(m, n));
     auto block_bias = gm_bias.slice(asc::te::make_coord(int64_t{0}, n_offset), asc::te::make_shape(int64_t{1}, n));
+    if constexpr (InputTiles) {
+      WaitForInputRows(input_tiles, tile_stride, expert, m_offset, m, problem.m);
+    }
     block(block_a, block_b, block_bias, block_c, block_shape);
   }
   AscendC::PipeBarrier<PIPE_ALL>();
 }
 
-template <bool RotateLanes = false, class Task>
-__aicore__ inline void ExecuteBlazeTask(const Task& task, GM_ADDR* inputs, uint32_t cubes) {
+template <bool RotateLanes = false, bool InputTiles = false, class Task>
+__aicore__ inline void ExecuteBlazeTask(const Task& task, GM_ADDR* inputs, uint32_t cubes,
+                                      __gm__ int32_t *input_tiles = nullptr, uint64_t tile_stride = 0) {
   if ASCEND_IS_AIV { return; }
   const uint32_t expert = task.task_index / cubes;
   AscendC::GlobalTensor<int64_t> groups;
@@ -81,14 +90,14 @@ __aicore__ inline void ExecuteBlazeTask(const Task& task, GM_ADDR* inputs, uint3
   GM_ADDR b = inputs[task.inputs[1].input_position] + problem.b * sizeof(bfloat16_t);
   GM_ADDR c = inputs[task.outputs[0].input_position] + problem.c * sizeof(bfloat16_t);
   if (trans_a) {
-    RunBlaze<asc::te::dn_ext_layout_ptn, asc::te::nd_ext_layout_ptn, RotateLanes>(
-        problem, a, b, c, tiling, task.task_index % cubes, cubes, expert);
+    RunBlaze<asc::te::dn_ext_layout_ptn, asc::te::nd_ext_layout_ptn, RotateLanes, InputTiles>(
+        problem, a, b, c, tiling, task.task_index % cubes, cubes, expert, input_tiles, tile_stride);
   } else if (trans_b) {
-    RunBlaze<asc::te::nd_ext_layout_ptn, asc::te::dn_ext_layout_ptn, RotateLanes>(
-        problem, a, b, c, tiling, task.task_index % cubes, cubes, expert);
+    RunBlaze<asc::te::nd_ext_layout_ptn, asc::te::dn_ext_layout_ptn, RotateLanes, InputTiles>(
+        problem, a, b, c, tiling, task.task_index % cubes, cubes, expert, input_tiles, tile_stride);
   } else {
-    RunBlaze<asc::te::nd_ext_layout_ptn, asc::te::nd_ext_layout_ptn, RotateLanes>(
-        problem, a, b, c, tiling, task.task_index % cubes, cubes, expert);
+    RunBlaze<asc::te::nd_ext_layout_ptn, asc::te::nd_ext_layout_ptn, RotateLanes, InputTiles>(
+        problem, a, b, c, tiling, task.task_index % cubes, cubes, expert, input_tiles, tile_stride);
   }
 }
 }  // namespace MulticoreBf16

@@ -25,6 +25,15 @@ import torch
 import torch.distributed as dist
 
 
+def _route_metadata_rows(routed_slots: int, num_experts: int, ep_size: int, mode: str) -> int:
+    """Keep peer-visible records, diagnostic lines and local tile credits disjoint."""
+    rows = routed_slots + 8 * num_experts * ((routed_slots + 127) // 128)
+    if mode == "peer_tile":
+        counters = ((ep_size * routed_slots + 127) // 128) * (num_experts // ep_size)
+        rows += (counters + 3) // 4
+    return rows
+
+
 _COMMUNICATION_SPLIT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
 

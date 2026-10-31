@@ -6,6 +6,8 @@
 #ifndef HYPER_PARALLEL_INDEXED_PULL_H
 #define HYPER_PARALLEL_INDEXED_PULL_H
 
+#include "bf16_gmm/tile_ready.h"
+
 // Forward-only scalar route publication at port 16. Blaze F2 leaves this
 // legacy workspace argument unused; all backward transport remains unchanged.
 namespace MulticoreRuntime {
@@ -145,26 +147,85 @@ namespace MulticoreRuntime {
     GlobalTensor<uint64_t> output;
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(
       metadata + tokens * task.inputs[1].dim[3] * 4 * sizeof(int32_t)) + task.task_index * 16, 16);
-    for (uint32_t column = 0; column < 4; ++column) { output.SetValue(column, statistics[column]); }
+    uint32_t columns = task.task_type == TaskType::TASK_MOE_TOKEN_GET && task.extra_value_1 == 6 ? 6 : 4;
+    for (uint32_t column = 0; column < columns; ++column) { output.SetValue(column, statistics[column]); }
     DataCacheCleanAndInvalid<uint64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(output);
     PipeBarrier<PIPE_ALL>();
   }
 
-  template <typename T, bool Count = false>
+  template <bool Count>
+  __aicore__ inline void AddInputTileInterval(__gm__ int32_t *table, uint64_t stride, int64_t expert,
+                                             int64_t first, int64_t rows, int64_t expert_rows, uint64_t *statistics) {
+    if (first < 0 || rows <= 0 || first + rows > expert_rows) { AscendC::Trap(); }
+    constexpr int64_t TILE_ROWS = MulticoreBf16::INPUT_TILE_ROWS;
+    while (rows > 0) {
+      uint64_t tile = first / TILE_ROWS;
+      if (tile >= stride) { AscendC::Trap(); }
+      int64_t delta = TILE_ROWS - first % TILE_ROWS;
+      if (delta > rows) { delta = rows; }
+      (void)AscendC::AtomicAdd<int32_t>(table + expert * stride + tile, static_cast<int32_t>(delta));
+      if constexpr (Count) { ++statistics[4]; }
+      first += delta;
+      rows -= delta;
+    }
+  }
+
+  template <bool Count>
+  __aicore__ inline void PublishInputTiles(
+      __gm__ int32_t *table, uint64_t stride, __gm__ int64_t *groups, __gm__ int64_t *target_offsets,
+      __ubuf__ int32_t *metadata, __ubuf__ int32_t *counts, __ubuf__ int32_t *firsts,
+      __ubuf__ int32_t *contiguous, int64_t rows, uint32_t top_k, int64_t hidden,
+      int64_t source_pe, int64_t rank, int64_t local_experts, uint64_t *statistics) {
+    for (int64_t expert = 0; expert < local_experts; ++expert) {
+      if (counts[expert] == 0) { continue; }
+      int64_t start = expert == 0 ? 0 : groups[expert - 1];
+      int64_t expert_rows = groups[expert] - start;
+      int64_t destination = target_offsets[source_pe * local_experts + expert] / hidden - start;
+      if (contiguous[expert] != 0) {
+        AddInputTileInterval<Count>(
+            table, stride, expert, destination + firsts[expert], counts[expert], expert_rows, statistics);
+        continue;
+      }
+      // A native scalar sort need not preserve original-slot order. The live
+      // block supplies an exact fallback without inventing credit for a gap.
+      if constexpr (Count) { ++statistics[5]; }
+      for (int64_t row = 0; row < rows; ++row) {
+        for (uint32_t selected = 0; selected < top_k; ++selected) {
+          int64_t slot = (row * top_k + selected) * 2;
+          if (metadata[slot] == rank * local_experts + expert) {
+            AddInputTileInterval<Count>(
+                table, stride, expert, destination + metadata[slot + 1], 1, expert_rows, statistics);
+          }
+        }
+      }
+    }
+  }
+
+  template <typename T, bool Count = false, bool InputTiles = false>
   __aicore__ inline void PullTokenBlocks(
       const TaskDesc &task, __gm__ T *source, __gm__ T *destination, __gm__ int32_t *remote_metadata,
       __gm__ int64_t *target_offsets, __gm__ int32_t *event_counters, uint64_t scratch,
       int64_t token_start, int64_t token_rows, int64_t hidden, uint32_t top_k,
-      int64_t rank, int64_t source_pe, int64_t local_experts, int64_t source_tokens, uint64_t *statistics) {
+      int64_t rank, int64_t source_pe, int64_t local_experts, int64_t source_tokens, uint64_t *statistics,
+      __gm__ int64_t *expert_groups = nullptr, __gm__ int32_t *input_tiles = nullptr, uint64_t tile_stride = 0) {
     constexpr uint64_t META_BYTES = 8192;
     constexpr uint64_t CREDIT_BYTES = 64 * sizeof(int32_t);
     constexpr int64_t CHUNK = 3072;
     auto *metadata = reinterpret_cast<__ubuf__ int32_t *>(scratch);
     auto *credits = reinterpret_cast<__ubuf__ int32_t *>(scratch + META_BYTES);
-    auto *values = reinterpret_cast<__ubuf__ T *>(scratch + META_BYTES + CREDIT_BYTES);
+    auto *firsts = credits + 64;
+    auto *contiguous = firsts + 64;
+    auto *values = reinterpret_cast<__ubuf__ T *>(scratch + META_BYTES + (InputTiles ? 3 : 1) * CREDIT_BYTES);
     for (int64_t expert = 0; expert < local_experts; ++expert) { credits[expert] = 0; }
     int64_t metadata_tokens = META_BYTES / (top_k * 2 * sizeof(int32_t));
     for (int64_t begin = 0; begin < token_rows; begin += metadata_tokens) {
+      if constexpr (InputTiles) {
+        for (int64_t expert = 0; expert < local_experts; ++expert) {
+          credits[expert] = 0;
+          firsts[expert] = 0;
+          contiguous[expert] = 1;
+        }
+      }
       int64_t rows = token_rows - begin < metadata_tokens ? token_rows - begin : metadata_tokens;
       uint64_t metadata_bytes = rows * top_k * 2 * sizeof(int32_t);
       aclshmemi_copy_gm2ub(metadata, remote_metadata + (token_start + begin) * top_k * 2, metadata_bytes);
@@ -201,20 +262,39 @@ namespace MulticoreRuntime {
         }
         for (uint32_t selected = 0; selected < top_k; ++selected) {
           int64_t expert = route[selected * 2];
-          if (expert / local_experts == rank) { ++credits[expert % local_experts]; }
+          if (expert / local_experts == rank) {
+            int64_t local = expert % local_experts;
+            if constexpr (InputTiles) {
+              int32_t ordinal = route[selected * 2 + 1];
+              if (credits[local] == 0) {
+                firsts[local] = ordinal;
+              } else if (ordinal != firsts[local] + credits[local]) {
+                contiguous[local] = 0;
+              }
+            }
+            ++credits[local];
+          }
         }
+      }
+      if constexpr (InputTiles) {
+        PipeBarrier<PIPE_ALL>();
+        PublishInputTiles<Count>(input_tiles, tile_stride, expert_groups, target_offsets, metadata, credits,
+                                 firsts, contiguous, rows, top_k, hidden, source_pe, rank, local_experts, statistics);
+        PipeBarrier<PIPE_ALL>();
       }
     }
     // Keep deltas live across all metadata blocks. Publish each complete row
     // once, after the entire original-token job has drained every fanout store.
-    PipeBarrier<PIPE_ALL>();
-    for (int64_t expert = 0; expert < local_experts; ++expert) {
-      int32_t delta = credits[expert];
-      if (delta != 0) {
-        (void)AscendC::AtomicAdd<int32_t>(event_counters + task.trigger_event + expert, delta);
+    if constexpr (!InputTiles) {
+      PipeBarrier<PIPE_ALL>();
+      for (int64_t expert = 0; expert < local_experts; ++expert) {
+        int32_t delta = credits[expert];
+        if (delta != 0) {
+          (void)AscendC::AtomicAdd<int32_t>(event_counters + task.trigger_event + expert, delta);
+        }
       }
+      PipeBarrier<PIPE_ALL>();
     }
-    PipeBarrier<PIPE_ALL>();
   }
 
   template <typename T>
@@ -235,10 +315,12 @@ namespace MulticoreRuntime {
     int64_t token_rows = tokens - token_start < task.task_split_value ? tokens - token_start : task.task_split_value;
     uint64_t scratch;
     uint64_t capacity;
-    constexpr uint64_t REQUIRED_BYTES = 8192 + 64 * sizeof(int32_t) + 3072 * sizeof(T);
+    bool input_tiles = task.extra_value_1 == 6;
+    uint64_t required_bytes = 8192 + (input_tiles ? 3 : 1) * 64 * sizeof(int32_t) + 3072 * sizeof(T);
     if (top_k == 0 || top_k > 16 || source_pe >= ep || experts / ep > 64 ||
+        (task.extra_value_1 != 5 && !input_tiles) ||
         !hyper_parallel::multicore::shmem::cann::device::query_mte_resources(source_pe, scratch, capacity) ||
-        capacity < REQUIRED_BYTES || scratch + REQUIRED_BYTES > 192 * 1024) {
+        capacity < required_bytes || scratch + required_bytes > 192 * 1024) {
       AscendC::Trap();
     }
     auto *source = reinterpret_cast<__gm__ T *>(plane::remote_ptr(input_list[2], source_pe));
@@ -247,8 +329,22 @@ namespace MulticoreRuntime {
     auto *destination = reinterpret_cast<__gm__ T *>(input_list[0]);
     auto *target_offsets = reinterpret_cast<__gm__ int64_t *>(input_list[1]);
     auto *event_counters = reinterpret_cast<__gm__ int32_t *>(input_list[24]);
-    uint64_t statistics[4] = {0, 0, 0, 0};
-    if (task.inputs[1].dim[2] == 1) {
+    uint64_t statistics[6] = {0, 0, 0, 0, 0, 0};
+    if (input_tiles) {
+      auto *table = reinterpret_cast<__gm__ int32_t *>(
+          input_list[16] + MulticoreBf16::InputTileTableOffset(tokens, top_k, experts));
+      auto *groups = reinterpret_cast<__gm__ int64_t *>(input_list[6]);
+      uint64_t stride = MulticoreBf16::InputTileStride(tokens, top_k, ep);
+      if (task.inputs[1].dim[2] == 1) {
+        PullTokenBlocks<T, true, true>(task, source, destination, metadata, target_offsets, event_counters, scratch,
+                                      token_start, token_rows, hidden, top_k, rank, source_pe, experts / ep,
+                                      tokens, statistics, groups, table, stride);
+      } else {
+        PullTokenBlocks<T, false, true>(task, source, destination, metadata, target_offsets, event_counters, scratch,
+                                       token_start, token_rows, hidden, top_k, rank, source_pe, experts / ep,
+                                       tokens, statistics, groups, table, stride);
+      }
+    } else if (task.inputs[1].dim[2] == 1) {
       PullTokenBlocks<T, true>(task, source, destination, metadata, target_offsets, event_counters, scratch,
                               token_start, token_rows, hidden, top_k, rank, source_pe, experts / ep,
                               tokens, statistics);
