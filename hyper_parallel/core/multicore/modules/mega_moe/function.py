@@ -212,6 +212,7 @@ def _allocate_backward_intermediates(
     weight1: Any,
     weight2: Any,
     reusable_dispatch: Any | None = None,
+    empty_experts: tuple[int, ...] | None = None,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
     gradient_dtype = torch.float32 if spec.replica_slots_per_rank else weight2.dtype
@@ -223,8 +224,16 @@ def _allocate_backward_intermediates(
             (spec.local_experts, spec.intermediate_size, spec.hidden_size), dtype=gradient_dtype,
         )
     else:
-        grad_weight1 = torch.zeros_like(weight1, dtype=gradient_dtype)
-        grad_weight2 = torch.zeros_like(weight2, dtype=gradient_dtype)
+        clear_all = empty_experts is None or len(empty_experts) == weight1.shape[0]
+        allocate = torch.zeros_like if clear_all else torch.empty_like
+        grad_weight1 = allocate(weight1, dtype=gradient_dtype)
+        grad_weight2 = allocate(weight2, dtype=gradient_dtype)
+        if not clear_all:
+            # Complete-K GMM stores overwrite every nonempty home matrix. Only
+            # skipped experts need zero initialization before remote additions.
+            for expert in empty_experts:
+                grad_weight1[expert].zero_()
+                grad_weight2[expert].zero_()
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -296,6 +305,7 @@ def _prepare_backward_execution(
     *,
     has_replica_transfers: bool = True,
     overlap_w13: bool = True,
+    empty_experts: tuple[int, ...] | None = None,
 ) -> _BackwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for backward."""
     dispatch = (torch.empty_like(saved.dispatch) if plan.spec.dispatch_mode == "pull"
@@ -326,6 +336,7 @@ def _prepare_backward_execution(
             saved.weight1,
             saved.weight2,
             dispatch[:saved.dispatch.shape[0]] if reuse_dispatch else None,
+            empty_experts=empty_experts,
         ),
     )
 
@@ -606,16 +617,6 @@ def _native_source(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous()
 
 
-def _native_source(tensor: torch.Tensor) -> torch.Tensor:
-    """Keep a non-null ABI pointer and preserve empty symmetric source storage."""
-    if tensor.shape[0] == 0:
-        row_elements = tensor.shape[1]
-        required_bytes = (tensor.storage_offset() + row_elements) * tensor.element_size()
-        if tensor.untyped_storage().nbytes() >= required_bytes:
-            # Pull derives remote addresses from this local symmetric base even on empty ranks.
-            return tensor.as_strided((1, row_elements), (row_elements, 1))
-        return tensor.new_empty((1, tensor.shape[1]))
-    return tensor.contiguous()
 
 
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
@@ -762,10 +763,11 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         leases = ExitStack()
         try:
             provider = workspace.replica_provider
+            overwrite_guests = has_replica_transfers and getattr(provider, "kernel_gradients", False)
             pool = None if not has_replica_transfers else leases.enter_context(
                 prefetch_weights((saved.weight1, saved.weight2), ctx.replica_route,
                                  backward=True, provider=provider, overlap=True,
-                                 reuse_generation=generation))
+                                 reuse_generation=generation, _overwrite_gradients=overwrite_guests))
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
             permutation_inputs = permutation_inputs[:1]
             kernel_return = has_replica_transfers and getattr(provider, "kernel_gradients", False)
@@ -777,6 +779,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 grad_output,
                 has_replica_transfers=has_replica_transfers,
                 overlap_w13=kernel_w13,
+                empty_experts=(tuple(expert for expert, rows in enumerate(
+                    ctx.replica_route.plan.destination_counts[ctx.replica_route.rank][:saved.weight1.shape[0]])
+                                     if not rows) if has_replica_transfers else None),
             )
             early_return = prepare_kernel_gradient_return(
                 plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,

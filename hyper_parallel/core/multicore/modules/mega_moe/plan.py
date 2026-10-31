@@ -110,13 +110,6 @@ def record_plan_stream(plan: MegaMoePlan, runtime_config: Any) -> None:
             tensor.record_stream(torch.npu.current_stream(tensor.device))
 
 
-def record_plan_stream(plan: MegaMoePlan, runtime_config: Any) -> None:
-    """Protect cached tiling and runtime storage from cross-stream eviction."""
-    tensors = [value for value in vars(plan).values() if isinstance(value, torch.Tensor)]
-    tensors.append(runtime_config)
-    for tensor in tensors:
-        if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu":
-            tensor.record_stream(torch.npu.current_stream(tensor.device))
 
 
 def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:

@@ -37,6 +37,26 @@ from tests.common.mark_utils import arg_mark
 class TestSignalReplicaTransport(unittest.TestCase):
     """Keep host boundary checks alongside real-stream NPU protocol acceptance."""
 
+    def test_complete_store_lease_preserves_gradient_storage_until_kernel_overwrite(self) -> None:
+        """The fused caller opts out of clearing without changing the saved weight generation."""
+        weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16),)
+        storage = torch.empty(signal_storage_bytes(((2, 2),), 1, 2, 2), dtype=torch.uint8)
+        provider = SignalReplicaTransport(MagicMock(), storage, 1, 2)
+        provider._bind(weights)
+        provider.pool.gradients[0].fill_(float("nan"))
+        generation = object()
+        provider._resident_generation = generation
+        provider._resident_ready = ((4096,), 1)
+        route = SimpleNamespace(rank=0, plan=SimpleNamespace(
+            config=SimpleNamespace(replica_slots_per_rank=1, ep_size=2, home_experts=1),
+            transfers=(SimpleNamespace(target_rank=0, target_slot=1),)))
+        with provider.lease(weights, route, backward=True, overlap=True, reuse_generation=generation,
+                            _overwrite_gradients=True) as view:
+            self.assertTrue(torch.isnan(view.gradients[0]).all())
+            self.assertIs(view.weight_generation, generation)
+        with provider.lease(weights, route, backward=True, overlap=True, reuse_generation=generation) as view:
+            torch.testing.assert_close(view.gradients[0], torch.zeros(1, 2, 2))
+
     def test_reused_generation_clears_sparse_guest_prefix_only(self) -> None:
         """Keep inactive gradient storage untouched even when the weight exchange is skipped."""
         weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16),)

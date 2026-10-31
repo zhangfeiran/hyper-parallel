@@ -23,9 +23,16 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
+from torch.utils.checkpoint import DefaultDeviceType
+
+from hyper_parallel.core.activation_memory import checkpoint
+from hyper_parallel.core.expert_parallel.hot_replica import routing as replica_routing
 
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
-from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
+from hyper_parallel.core.expert_parallel.hot_replica.routing import (
+    ReplicaRoute, _GatheredReplicaCounts, prepare_replica_route,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
 from hyper_parallel.core.multicore.modules.mega_moe.route import (
     _expert_capacity,
@@ -461,6 +468,216 @@ class TestMegaMoeRoute(unittest.TestCase):
 
 class TestMegaMoeDynamicMetadata(unittest.TestCase):
     """Keep dynamic validation and the native count ABI independent of count-table policy."""
+
+    def test_cpu_replica_counts_pack_the_same_metadata_without_device_prefixes(self) -> None:
+        """Retained CPU counts cover home-only, guest, empty-source and empty-owner routes."""
+        for mode in ("push", "pull"):
+            for compact in (False, True):
+                for logical in ([[0] * 4, [2, 2, 0, 0]], [[1, 1, 1, 1]] * 2):
+                    plan = build_expert_replica_plan(logical, 1)
+                    if compact and plan.transfers:
+                        continue
+                    host = tuple(map(tuple, logical)) if compact else plan.dispatch_counts
+                    counts = torch.tensor(host, dtype=torch.int32)
+                    summary = tuple((0, sum(row) // 2, 31, sum(row), min(row), max(row), load)
+                                    for row, load in zip(logical, plan.destination_loads))
+                    for rank in range(2):
+                        with self.subTest(mode=mode, compact=compact, logical=logical, rank=rank):
+                            spec = replace(self._spec(), num_experts=counts.shape[1], ep_size=2,
+                                           dispatch_mode=mode, rank_id=rank)
+                            ids = torch.zeros(sum(logical[rank]) // 2, 2, dtype=torch.int32)
+                            hidden = torch.ones(len(ids), spec.hidden_size)
+                            replica = ReplicaRoute(plan, ids, counts, rank, None, home_only=compact,
+                                                   dynamic_summary=summary, _host_counts=host)
+                            permuted = hidden.repeat_interleave(2, dim=0)
+                            workspace = Mock(in_use=True, source_buffer=permuted)
+                            start = rank * spec.local_experts
+                            reference = route_module._compute_route_metadata(
+                                counts[rank], counts, counts[:, start:start + spec.local_experts], spec,
+                                max(1, plan.destination_loads[rank]))
+                            with (patch.object(route_module, "_compute_route_metadata",
+                                               side_effect=AssertionError("device prefixes")),
+                                  patch.object(route_module, "_start_dynamic_gather",
+                                               side_effect=AssertionError("duplicate gather")),
+                                  patch.object(route_module, "_permute_topk_input",
+                                               return_value=(permuted, ids.flatten())),
+                                  patch.object(route_module, "_permute_topk_input_out",
+                                               return_value=(permuted, ids.flatten()))):
+                                actual = prepare_topk_route(
+                                    hidden, ids, torch.ones_like(ids).float(), spec, counts[rank], workspace, replica,
+                                    prepare_workspace=lambda *_: None).metadata
+                            for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
+                                         "combine_src_off", "combine_target_off", "combine_size", "group_list"):
+                                torch.testing.assert_close(getattr(actual, name), getattr(reference, name))
+
+    def test_checkpoint_replays_hot_plan_after_a_skipped_balanced_call(self) -> None:
+        """Skipping zero-copy placement must not shift the following checkpoint cache lookup."""
+        previous = DefaultDeviceType.get_device_type()
+        DefaultDeviceType.set_device_type("cpu")
+        self.addCleanup(DefaultDeviceType.set_device_type, previous)
+        home = replace(self._spec(4), ep_size=2)
+        config = ExpertReplicaConfig(4, 2, 1)
+        physical = replace(home, num_experts=6, logical_num_experts=4, replica_slots_per_rank=1)
+        workspace = Mock(in_use=True, source_buffer=torch.empty(4, 16))
+        decisions = []
+
+        def gather(output: torch.Tensor, payload: torch.Tensor, **_options: Any) -> Mock:
+            output.copy_(payload.repeat(2))
+            return Mock()
+
+        def choose(counts: torch.Tensor, summary: list[list[int]], host: list[list[int]] | None) -> Any:
+            loads = [row[6] for row in summary]
+            if min(loads) == max(loads):
+                decisions.append(None)
+                return None
+            route = prepare_replica_route(
+                torch.tensor([[0, 1], [0, 1]], dtype=torch.int32), config, compact_home=True,
+                target_load=4, receive_capacity=4, dynamic_header=(0, 2, 31),
+                _gathered_counts=_GatheredReplicaCounts(counts, summary, host))
+            decisions.append(route.plan_reused)
+            return (home if route.home_only else physical), route
+
+        def operation(value: torch.Tensor) -> torch.Tensor:
+            with torch.no_grad():
+                for values in ([[0, 1], [2, 3]], [[0, 1], [0, 1]]):
+                    ids = torch.tensor(values, dtype=torch.int32)
+                    counts = torch.bincount(ids.flatten().long(), minlength=4).int()
+                    prepare_topk_route(
+                        value, ids, torch.ones(2, 2), home, counts, workspace, autograd_mask=31,
+                        prepare_workspace=lambda *_: None, _select_replica_route=choose)
+            return value.sin().square()
+
+        value = torch.randn(2, 16, requires_grad=True)
+        with (patch.object(replica_routing, "dist") as distributed,
+              patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
+              patch.object(replica_routing, "build_expert_replica_plan",
+                           wraps=replica_routing.build_expert_replica_plan) as build,
+              patch.object(route_module, "_permute_topk_input",
+                           return_value=(torch.ones(4, 16), torch.arange(4)))):
+            distributed.is_initialized.return_value = True
+            distributed.get_rank.return_value = 0
+            distributed.get_world_size.return_value = 2
+            checkpoint(operation, value, use_reentrant=False).sum().backward()
+        self.assertEqual(decisions, [None, False, None, True])
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(exchange.call_count, 4)
+        torch.testing.assert_close(value.grad, 2 * value.detach().sin() * value.detach().cos())
+
+    def test_shared_home_agreement_rejects_invalid_ids_before_selection(self) -> None:
+        """Untrusted invalid routes fail collectively before allocation or placement."""
+        spec = replace(self._spec(4), ep_size=1)
+        for values in ([[0, 0], [2, 3]], [[-1, 1], [2, 3]], [[0, 4], [2, 3]]):
+            with self.subTest(ids=values):
+                select, grow = Mock(), Mock()
+                ids = torch.tensor(values, dtype=torch.int32)
+                with (patch.object(route_module, "_resolve_counts", side_effect=AssertionError("unsafe recount")),
+                      patch.object(route_module, "_permute_topk_input") as permute):
+                    with self.assertRaisesRegex(RuntimeError, "distinct Top-K"):
+                        prepare_topk_route(torch.ones(2, 16), ids, torch.ones(2, 2), spec, None,
+                                           prepare_workspace=grow, _select_replica_route=select)
+                select.assert_not_called()
+                grow.assert_not_called()
+                permute.assert_not_called()
+
+    def test_replica_selection_defers_only_the_unexecuted_owner_receive_limit(self) -> None:
+        """A raw owner peak may exceed INT32 while a bounded physical placement remains legal."""
+        spec = replace(self._spec(4), hidden_size=1)
+        tokens = 600_000_000
+        payload = torch.tensor([[0, tokens, 31, tokens, tokens, 0, 0]] * 4, dtype=torch.int64)
+        with self.assertRaisesRegex(RuntimeError, "INT32"):
+            route_module._read_dynamic_route(payload, spec)
+        summary, _, rows = route_module._read_dynamic_route(payload, spec, defer_receive_limit=True)
+        self.assertEqual(summary[2], 4 * tokens)
+        self.assertEqual(sum(row[3] for row in rows) // 4, tokens * 2)
+        payload[0, 2] = 0
+        with self.assertRaisesRegex(RuntimeError, "autograd participation"):
+            route_module._read_dynamic_route(payload, spec, defer_receive_limit=True)
+
+    def test_shared_agreement_keeps_one_gather_for_home_guests_and_empty_sources(self) -> None:
+        """Both summary policies select replicas before any receive growth or Pull write."""
+        for experts in (4, 520):
+            for mode in ("push", "pull"):
+                for pattern in ("balanced", "hot", "empty"):
+                    with self.subTest(experts=experts, mode=mode, pattern=pattern):
+                        self._shared_agreement(experts, mode, pattern)
+
+    def _shared_agreement(self, experts: int, mode: str, pattern: str) -> None:
+        """Compare native offsets with the exact selected lossless physical layout."""
+        tokens = 512
+        logical = [[0] * experts for _ in range(2)]
+        for row in logical:
+            row[0] = row[1] = tokens
+        if pattern == "balanced":
+            for row in logical:
+                row[0] = row[1] = tokens // 2
+                row[experts // 2] = row[experts // 2 + 1] = tokens // 2
+        if pattern == "empty":
+            logical[0] = [0] * experts
+        for rank in (0, 1):
+            config = ExpertReplicaConfig(experts, 2, 1)
+            home = replace(self._spec(experts, rank), ep_size=2, dispatch_mode=mode)
+            physical = replace(home, num_experts=config.physical_experts, logical_num_experts=experts,
+                               replica_slots_per_rank=1)
+            payload = torch.tensor([[0, sum(row) // 2, 31, *row] for row in logical], dtype=torch.int32)
+            count = sum(logical[rank]) // 2
+            ids = torch.tensor([[0, 1]] * count, dtype=torch.int32).reshape(count, 2)
+            hidden, probs = torch.ones(count, 16), torch.ones(count, 2)
+            workspace = Mock(in_use=False, source_buffer=None)
+            staged, mapping = torch.empty(count * 2, 16), torch.arange(count * 2, dtype=torch.int32)
+            selected = []
+            grown = []
+
+            def gather(output: torch.Tensor, _source: torch.Tensor, **_options: Any) -> Mock:
+                output.copy_(payload.flatten())
+                return Mock()
+
+            def choose(counts: torch.Tensor, summary: list[list[int]], host: list[list[int]] | None) -> Any:
+                self.assertFalse(grown)
+                self.assertIsNone(workspace.source_buffer)
+                self.assertEqual(host is None, experts == 520)
+                loads = [row[6] for row in summary]
+                if min(loads) == max(loads):
+                    return None
+                with patch("hyper_parallel.core.expert_parallel.hot_replica.routing.dist") as distributed:
+                    distributed.is_initialized.return_value = True
+                    distributed.get_rank.return_value = rank
+                    distributed.get_world_size.return_value = 2
+                    route = prepare_replica_route(
+                        ids, config, compact_home=True, dynamic_header=(0, count, 31),
+                        target_load=sum(loads) // 2, receive_capacity=sum(loads) // 2,
+                        _gathered_counts=_GatheredReplicaCounts(counts, summary, host))
+                selected.append(route)
+                return (home if route.home_only else physical), route
+
+            def grow(plan_tokens: int, maximum: int) -> None:
+                grown.append((plan_tokens, maximum))
+                workspace.source_buffer = torch.empty(plan_tokens * 2, 16)
+                workspace.in_use = True
+
+            with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
+                  patch("hyper_parallel.core.expert_parallel.hot_replica.routing._gather_replica_counts",
+                        side_effect=AssertionError("second gather")),
+                  patch.object(route_module, "_permute_topk_input", return_value=(staged, mapping)) as permute,
+                  patch.object(route_module, "_permute_topk_input_out", return_value=(staged, mapping)) as publish):
+                actual = prepare_topk_route(
+                    hidden, ids, probs, home, payload[rank, 3:], workspace, autograd_mask=31,
+                    prepare_workspace=grow, _select_replica_route=choose)
+            self.assertEqual(exchange.call_count, 1)
+            self.assertEqual(len(grown), 1)
+            self.assertEqual(permute.call_count, int(mode == "push"))
+            self.assertEqual(publish.call_count, int(mode == "pull" and count > 0))
+            replica = selected[0] if selected else None
+            counts = torch.tensor(replica.plan.dispatch_counts if replica and not replica.home_only else logical,
+                                  dtype=torch.int32)
+            spec = physical if replica and not replica.home_only else home
+            start = rank * spec.local_experts
+            reference = route_module._compute_route_metadata(
+                counts[rank], counts, counts[:, start:start + spec.local_experts], spec,
+                actual.metadata.expert_capacity)
+            for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size", "combine_src_off",
+                         "combine_target_off", "combine_size", "group_list"):
+                torch.testing.assert_close(getattr(actual.metadata, name), getattr(reference, name))
+            self.assertIs(actual.metadata.replica_route, replica)
 
     @staticmethod
     def _spec(experts: int = 24, rank: int = 0, automatic: bool = True) -> MegaMoeSpec:

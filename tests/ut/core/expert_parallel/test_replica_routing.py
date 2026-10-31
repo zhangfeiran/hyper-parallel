@@ -24,14 +24,53 @@ from torch.utils.checkpoint import DefaultDeviceType
 from hyper_parallel.core.activation_memory import checkpoint
 from hyper_parallel.core.expert_parallel.hot_replica import (
     ExpertReplicaConfig,
-    build_expert_replica_plan,
     routing,
 )
+from hyper_parallel.core.expert_parallel.hot_replica.planner import _build_expert_replica_plan as build_expert_replica_plan
 from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts, get_recompute_state
 
 
 class TestReplicaRouting(unittest.TestCase):
     """Compare both remap paths with explicit per-expert occurrence quotas."""
+
+    def test_trusted_histogram_skips_recount_and_retains_host_dispatch(self) -> None:
+        """Trusted Router counts and ordinary validation produce identical placements."""
+        config = ExpertReplicaConfig(4, 2, 1)
+        for compact, values in ((True, [[0, 1], [2, 3]]), (False, [[0, 1]] * 4)):
+            with self.subTest(compact=compact):
+                ids = torch.tensor(values, dtype=torch.int32)
+                counts = torch.bincount(ids.flatten().long(), minlength=4).int()
+                payload = torch.cat((counts.long(), torch.tensor([0, 0, len(values), 31])))
+                matrix = payload.expand(2, -1).clone()
+                with (patch.object(routing, "dist") as distributed,
+                      patch.object(routing, "_gather_replica_counts", return_value=matrix) as gather,
+                      patch.object(routing, "_replica_count_payload", side_effect=AssertionError("recount"))):
+                    distributed.is_initialized.return_value = True
+                    distributed.get_rank.return_value = 0
+                    distributed.get_world_size.return_value = 2
+                    route = routing.prepare_replica_route(
+                        ids, config, compact_home=compact, dynamic_header=(0, len(values), 31),
+                        _trusted_counts=counts)
+                torch.testing.assert_close(gather.call_args.args[0], payload)
+                if route.plan_bypassed:
+                    self.assertEqual(route.plan.logical_counts, tuple(map(tuple, matrix[:, :4].tolist())))
+                    self.assertFalse(route.plan.transfers)
+                else:
+                    route.plan.validate()
+                    torch.testing.assert_close(torch.tensor(route._host_counts), route.counts_by_source.long())
+                self.assertEqual(route.home_only, compact)
+                if not compact:
+                    self.assertTrue(route.plan.transfers)
+
+    def test_trusted_histogram_metadata_rejects_invalid_inputs(self) -> None:
+        """Reject malformed trusted counts before starting a collective."""
+        for counts in (torch.ones(3, dtype=torch.int32), torch.ones(4)):
+            with self.subTest(shape=counts.shape, dtype=counts.dtype):
+                with patch.object(routing, "_gather_replica_counts") as gather:
+                    with self.assertRaisesRegex(ValueError, "Trusted replica counts"):
+                        routing.prepare_replica_route(torch.tensor([[0, 1]]), ExpertReplicaConfig(4, 1, 1),
+                                                      _trusted_counts=counts)
+                gather.assert_not_called()
 
     def test_checkpoint_reuses_only_matching_cpu_plans_and_clears_after_replay(self) -> None:
         """A changed resident capacity cannot change the original invocation's replay placement."""
@@ -201,3 +240,29 @@ class TestReplicaRouting(unittest.TestCase):
                         actual = routing._remap_replica_ids(original.T.contiguous().T, plan, slots, lengths)
                         torch.testing.assert_close(actual, expected.reshape_as(original))
                         torch.testing.assert_close(torch.tensor(plan.physical_to_logical)[actual], original)
+
+    def test_validated_native_counts_reuse_the_exact_cpu_plan_without_gathering(self) -> None:
+        """The shared native agreement preserves every source quota and replay header."""
+        config = ExpertReplicaConfig(4, 2, 1)
+        ids = torch.tensor([[0, 1]] * 4, dtype=torch.int32)
+        counts = torch.tensor([[4, 4, 0, 0], [2, 2, 0, 0]], dtype=torch.int64)
+        summary = [[0, 4, 31, 8, 0, 4, 12], [0, 2, 31, 4, 0, 2, 0]]
+        matrix = torch.tensor([row.tolist() + [0] + header[:3] for row, header in zip(counts, summary)])
+        with patch.object(routing, "dist") as distributed:
+            distributed.is_initialized.return_value = True
+            distributed.get_rank.return_value = 0
+            distributed.get_world_size.return_value = 2
+            with patch.object(routing, "_gather_replica_counts", return_value=matrix):
+                expected = routing.prepare_replica_route(ids, config, dynamic_header=(0, 4, 31),
+                                                         target_load=6, receive_capacity=6, compact_home=True)
+            for host in (None, counts.tolist()):
+                with self.subTest(host_counts=host is not None):
+                    with (patch.object(routing, "_gather_replica_counts", side_effect=AssertionError("extra gather")),
+                          patch.object(routing, "_replica_count_payload", side_effect=AssertionError("extra recount"))):
+                        actual = routing.prepare_replica_route(
+                            ids, config, dynamic_header=(0, 4, 31), target_load=6, receive_capacity=6, compact_home=True,
+                            _gathered_counts=routing._GatheredReplicaCounts(counts, summary, host))
+                    self.assertEqual(actual.plan, expected.plan)
+                    self.assertEqual(actual.dynamic_summary, expected.dynamic_summary)
+                    torch.testing.assert_close(actual.physical_ids, expected.physical_ids)
+                    torch.testing.assert_close(actual.counts_by_source, expected.counts_by_source)

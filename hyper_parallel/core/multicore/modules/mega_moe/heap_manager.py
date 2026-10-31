@@ -326,6 +326,29 @@ class _HeapManager:
                 layouts = [layout if item is entry else item.layout for item in self.entries]
             self._restart(layouts, self._budget(self._required_bytes(layouts)))
 
+    def replica_receive_capacity(self, workspace: MegaMoeWorkspace, tokens: int, reservation: int) -> int:
+        """Allow one invocation-sized growth step without reserving symmetric memory.
+
+        All entries and the explicit Heap limit are agreed across the Root. The
+        result depends on those replicated layouts, not rank-local free memory.
+        Actual allocation remains conditional on the selected destination load.
+        """
+        with self.access():
+            entry = self._entry_for_workspace(workspace)
+            spec = entry.bound_spec
+            if spec is None or not spec.auto_tokens or spec.dispatch_mode != 'push':
+                raise RuntimeError('Replica receive allowance requires an automatic Push workspace')
+            factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
+            ceiling = _align_capacity(math.ceil(reservation * factor))
+            if self.heap_limit is None:
+                return ceiling
+            token_capacity = max(spec.local_num_tokens, _align_capacity(tokens))
+            fixed = _workspace_layout(entry.specification, self.dtype, 0, token_capacity).required_bytes
+            other = sum(item.layout.required_bytes for item in self.entries if item is not entry)
+            row_bytes = spec.hidden_size * self.element_size
+            available = max(0, (self.heap_limit - other - fixed) // row_bytes)
+            return min(ceiling, available // 128 * 128)
+
     def ensure_token_capacity(self, workspace: MegaMoeWorkspace, tokens: int, received: int) -> MegaMoeSpec:
         """Grow source and destination storage in one transaction after route agreement.
 

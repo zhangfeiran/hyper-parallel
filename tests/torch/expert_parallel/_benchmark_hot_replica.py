@@ -26,7 +26,6 @@ import torch.distributed as dist
 import torch_npu
 from torch.utils.checkpoint import checkpoint
 
-from hyper_parallel.core.expert_parallel.hot_replica import ExpertReplicaCostModel
 from hyper_parallel.core.expert_parallel.hot_replica.device_kernel import (
     _planner_library,
 )
@@ -85,15 +84,13 @@ def run(args: argparse.Namespace) -> None:
     endpoint = [f"tcp://127.0.0.1:{allocate_port()}" if rank == 0 else None]
     dist.broadcast_object_list(endpoint, src=0)
     os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
-    calibration = None if args.cost_model is None else ExpertReplicaCostModel(
-        **json.loads(Path(args.cost_model).read_text(encoding="utf-8"))["model"])
     torch.manual_seed(715)
     module = MegaMoeExperts(
-        local_num_tokens=args.tokens, hidden_size=args.hidden, intermediate_size=args.intermediate,
+        hidden_size=args.hidden, intermediate_size=args.intermediate,
         num_experts=size * 6, top_k=args.top_k, ep_size=size, ep_group=dist.group.WORLD,
         dispatch_mode=args.backend, replica_slots_per_rank=args.budget, replica_transport=args.replica_transport,
         replica_min_rows=args.replica_min_rows, replica_target_load=args.replica_target_load,
-        replica_planner=args.replica_planner, replica_cost_model=calibration,
+        replica_planner=args.replica_planner,
         replica_minimum_load_reduction=args.replica_minimum_load_reduction,
     ).to(device=device, dtype=torch.bfloat16)
     try:
@@ -151,7 +148,6 @@ def main() -> None:
     parser.add_argument("--replica-min-rows", type=int, default=1024)
     parser.add_argument("--replica-target-load", type=int)
     parser.add_argument("--replica-minimum-load-reduction", type=float)
-    parser.add_argument("--cost-model")
     parser.add_argument("--checkpoint", action="store_true")
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--hidden", type=int, default=5120)

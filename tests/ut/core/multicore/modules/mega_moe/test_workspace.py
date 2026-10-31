@@ -41,6 +41,39 @@ from tests.common.mark_utils import arg_mark
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
 
+    def test_restart_rebinds_replica_storage_and_invalidates_old_address_views(self) -> None:
+        """A committed Heap restart must replace every replica address and cached runtime image."""
+        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=8, intermediate_size=4,
+                               ep_size=2, num_experts=6, dispatch_mode="push", replica_slots_per_rank=1,
+                               replica_transport="shmem_signal_kernel_gradient_bands")
+        workspace = MegaMoeWorkspace(shared=True)
+        with (patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
+                shape, dtype=kw["dtype"])), patch.object(workspace_module.torch.npu, "Event")):
+            workspace.ensure(spec, torch.bfloat16, torch.device("cpu"))
+        previous = workspace.replica_provider
+        previous.epoch = 17
+        base, image = torch.empty(16, dtype=torch.uint8), torch.empty(64, dtype=torch.uint8)
+        workspace.replica_runtime_images[id(base)] = (base, b"old addresses", image)
+        replacements = workspace.describe_restart_allocations(spec, torch.bfloat16, 512)
+        self.assertEqual(len(replacements), 5)
+        self.assertIs(replacements[-1].current, workspace.replica_inbox)
+        self.assertEqual(replacements[-1].target.shape, tuple(workspace.replica_inbox.shape))
+        self.assertTrue(workspace.validate_restart_allocations(spec, torch.bfloat16, 128, replacements))
+        tensors = tuple(torch.empty(item.target.shape, dtype=item.target.dtype) for item in replacements)
+        workspace.validate_restarted_allocations(spec, torch.bfloat16, 512, tensors)
+        with patch.object(workspace_module.shmem, "empty") as allocate:
+            workspace.bind_restarted_allocations(spec, torch.bfloat16, torch.device("cpu"), 512, tensors)
+        allocate.assert_not_called()
+        self.assertIsNot(workspace.replica_provider, previous)
+        self.assertIs(workspace.replica_provider.storage, tensors[-1])
+        self.assertTrue(workspace.replica_provider.gradient_bands)
+        self.assertEqual(workspace.replica_provider.epoch, 0)
+        self.assertIsNone(workspace.replica_provider.pool)
+        self.assertFalse(workspace.replica_runtime_images)
+        self.assertEqual(image.untyped_storage().nbytes(), 0)
+        self.assertEqual(base.untyped_storage().nbytes(), 16)
+        self.assertEqual(workspace.expert_capacity, 512)
+
     def test_pending_backward_prevents_close_without_changing_buffers(self) -> None:
         """An outstanding graph must release its claim before symmetric memory teardown."""
         workspace = workspace_module.MegaMoeWorkspace(shared=False)
@@ -88,6 +121,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         """
         workspace = MegaMoeWorkspace(shared=False)
         base, image = torch.empty(16, dtype=torch.uint8), torch.empty(64, dtype=torch.uint8)
+        workspace.heap_manager = SimpleNamespace(root_group=None, access=nullcontext)
         workspace.replica_runtime_images[id(base)] = (base, b"suffix", image)
         with patch.object(workspace_module.torch.npu, "synchronize") as synchronize, \
                 patch.object(workspace_module.shmem, "host_barrier") as barrier:
@@ -178,9 +212,9 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         specification = {"local_num_tokens": 128, "top_k": 2, "hidden_size": 5120,
                          "intermediate_size": 1792, "num_experts": 28, "ep_size": 4,
                          "logical_num_experts": 24, "replica_slots_per_rank": 1, "initial_capacity_factor": 1.0}
-        before = workspace_module._spec_workspace_bytes(specification, 2)
+        before = workspace_module._spec_workspace_bytes(specification, torch.bfloat16)
         specification["replica_transport"] = "shmem_signal_kernel_gradient"
-        after = workspace_module._spec_workspace_bytes(specification, 2)
+        after = workspace_module._spec_workspace_bytes(specification, torch.bfloat16)
         self.assertEqual(after - before, 5120 * 1792 * 3 * 6 + 5 * 4 * 64 + 2 * 64 + 511)
         spec = SimpleNamespace(hidden_size=8, intermediate_size=4, ep_size=4,
                                replica_slots_per_rank=1, replica_transport="shmem_signal_kernel_gradient")
@@ -188,7 +222,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         with patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
                 shape, dtype=kw["dtype"])), patch.object(workspace_module.shmem, "free"):
             workspace._allocate_replica_storage(spec)
-            self.assertEqual(workspace.heap_state()[0], {workspace.replica_inbox.data_ptr()})
+            self.assertIs(workspace.replica_provider.storage, workspace.replica_inbox)
             previous = workspace.replica_provider
             previous.epoch = 17
             workspace._free_symmetric_tensors()
@@ -206,9 +240,9 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                          "intermediate_size": 1792, "num_experts": 28, "ep_size": 4,
                          "logical_num_experts": 24, "replica_slots_per_rank": 2, "initial_capacity_factor": 1.0,
                          "replica_transport": "shmem_signal_kernel_gradient"}
-        before = workspace_module._spec_workspace_bytes(specification, 2)
+        before = workspace_module._spec_workspace_bytes(specification, torch.bfloat16)
         specification["replica_transport"] = "shmem_signal_kernel_gradient_bands"
-        after = workspace_module._spec_workspace_bytes(specification, 2)
+        after = workspace_module._spec_workspace_bytes(specification, torch.bfloat16)
         self.assertEqual(after - before, 2 * (18 + 9) * 32 * 64)
         spec = SimpleNamespace(hidden_size=8, intermediate_size=4, ep_size=4,
                                replica_slots_per_rank=2, replica_transport=specification["replica_transport"])

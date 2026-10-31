@@ -37,6 +37,19 @@ class _Group:
 class TestReplicaPool(unittest.TestCase):
     """Exercise the pool independently of accelerator and collective setup."""
 
+    def test_complete_overwrite_borrows_stale_gradients_without_clearing(self) -> None:
+        """Only an explicit complete-store caller may consume uncleared guest storage."""
+        pool = ReplicaPool((torch.ones(6, 2, 3),), 6)
+        pool.gradients = (torch.full((6, 2, 3), float("nan")),)
+        original = pool.gradients[0]
+        with pool.lease(backward=True, active_slots=3, _overwrite_gradients=True):
+            self.assertIs(original, pool.gradients[0])
+            self.assertTrue(torch.isnan(original).all())
+            original[:3].fill_(9)
+        with pool.lease(backward=True, active_slots=3):
+            torch.testing.assert_close(original[:3], torch.zeros(3, 2, 3))
+            self.assertTrue(torch.isnan(original[3:]).all())
+
     def test_backward_clears_only_the_active_guest_prefix(self) -> None:
         """Keep inactive storage untouched and clear newly activated slots on later leases."""
         pool = ReplicaPool((torch.ones(6, 2, 3),), 6)

@@ -66,7 +66,7 @@ class TestReplicaAdmission(unittest.TestCase):
 
         with (patch.object(planner, "_bounded_copies", return_value=worse),
               patch.object(planner, "_improve_copies", side_effect=_small_improvement) as improve):
-            result = planner.build_expert_replica_plan(counts, 1, capacity_limit=400,
+            result = planner._build_expert_replica_plan(counts, 1, capacity_limit=400,
                                                       minimum_load_reduction=0.2)
         improve.assert_called_once()
         result.validate()

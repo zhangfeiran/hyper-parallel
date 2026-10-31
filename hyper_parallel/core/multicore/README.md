@@ -220,3 +220,5 @@ pytest -q tests/torch/multicore/test_deepseek_v41_megamoe.py -k megamoe_parallel
 - [架构设计](docs/architecture.md)：计算图、任务切分、多核调度与通算掩盖。
 - [Profiling 与 Tensor dump](docs/mega_kernel_profiling.md)：内部 timeline、中间 Tensor 与离线分析。
 - [私有 SHMEM](docs/shmem.md)：通信、容量与 runtime 生命周期。
+
+- [有上限的专家副本自适应](docs/adaptive_replicas.md)

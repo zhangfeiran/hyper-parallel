@@ -212,7 +212,7 @@ class KernelWorkerBase {
     CycleTraceRecorder trace;
     const bool profiling = isCycleProfileEnabled(runtimeConfigPtr);
     if (profiling) {
-      trace.Init(worker_id_, input_list[Derived::PROFILE_IDX], getAicProfileRecordCapacity(runtimeConfigPtr),
+      trace.Init(worker_id_, input_list[Derived::DIAGNOSTIC_IDX], getAicProfileRecordCapacity(runtimeConfigPtr),
                   getAivProfileRecordCapacity(runtimeConfigPtr));
     }
     if (config[0] == 2) {

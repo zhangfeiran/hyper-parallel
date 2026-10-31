@@ -73,6 +73,12 @@ class ExpertExecutionPlan:
         return tuple(expert for row in self.slot_to_logical for expert in row)
 
     @cached_property
+    def replica_slots_used(self) -> tuple[int, ...]:
+        """Return actual guest counts per rank, independently of the reserved slot cap."""
+        home = self.config.home_experts
+        return tuple(sum(expert >= 0 for expert in row[home:]) for row in self.slot_to_logical)
+
+    @cached_property
     def transfers(self) -> tuple[ExpertReplicaTransfer, ...]:
         """Return transfers in globally identical target/slot order."""
         home = self.config.home_experts

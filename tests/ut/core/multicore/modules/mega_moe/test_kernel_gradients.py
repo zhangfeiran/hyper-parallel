@@ -211,17 +211,17 @@ class TestKernelGradientReturn(unittest.TestCase):
                                        dispatch_mode=mode, replica_slots_per_rank=2, logical_num_experts=8,
                                        replica_transport=transport)
                     _, _, _, original = _build_runtime_artifacts(spec, overlap_w13=False)
-                    with patch.object(plan_module, "_prepare_runtimes", side_effect=lambda _, configs, __: configs):
+                    with patch.object(plan_module.dist, "is_initialized", return_value=False):
                         plan = plan_module.build_mega_moe_plan(spec, torch.device("cpu"))
                     if transport == "p2p":
-                        self.assertIsNone(plan.bwd_runtime_no_replica)
+                        self.assertIsNone(plan.bwd_diagnostics_no_replica)
                         self.assertFalse(plan.replica_w13_events)
-                        self.assertEqual(bytes(plan.bwd_runtime), bytes(original))
+                        self.assertEqual(bytes(plan.bwd_diagnostics._runtime.host_config), bytes(original))
                     else:
-                        self.assertEqual(bytes(plan.bwd_runtime_no_replica), bytes(original))
-                        self.assertNotEqual(bytes(plan.bwd_runtime), bytes(original))
+                        self.assertEqual(bytes(plan.bwd_diagnostics_no_replica._runtime.host_config), bytes(original))
+                        self.assertNotEqual(bytes(plan.bwd_diagnostics._runtime.host_config), bytes(original))
                         self.assertTrue(plan.replica_w13_events)
-                        self.assertTrue(can_reuse_backward_dispatch(plan.bwd_runtime_no_replica, 6, 20))
+                        self.assertTrue(can_reuse_backward_dispatch(plan.bwd_diagnostics_no_replica._runtime.host_config, 6, 20))
                         self.assertTrue(plan.bwd_runtime_no_replica_reuse_dispatch)
-                        self.assertEqual(replica_w2_ready_events(plan.bwd_runtime_no_replica, 6, 20),
+                        self.assertEqual(replica_w2_ready_events(plan.bwd_diagnostics_no_replica._runtime.host_config, 6, 20),
                                          plan.replica_w2_events)

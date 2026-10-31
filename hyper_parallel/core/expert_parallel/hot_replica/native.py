@@ -17,18 +17,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from hyper_parallel.core.utils.communication import differentiable_all_to_all_single
 
 from .capacity import ExpertReplicaConfig
 from .cost import ExpertReplicaCostModel
 from .device import build_device_expert_replica_plan, validate_planner_backend
-from .planner import build_expert_replica_plan
-from .routing import ReplicaRoute, _gather_replica_counts, stable_expert_order
+from .routing import ReplicaRoute, _gather_replica_counts, _plan_replica_route, stable_expert_order
 from .transport import prefetch_weights, return_gradients
 
 
@@ -80,24 +81,48 @@ def _split_gmm(inputs: torch.Tensor, home: torch.Tensor, guest: torch.Tensor,
     return torch.cat(parts) if len(parts) > 1 else parts[0]
 
 
+def _replica_swiglu(up: torch.Tensor, limit: float) -> torch.Tensor:
+    """Evaluate optional clamp and SwiGLU in FP32, restoring the input dtype."""
+    gate, value = up.float().chunk(2, dim=-1)
+    if limit > 0:
+        gate, value = gate.clamp(max=limit), value.clamp(-limit, limit)
+    return (F.silu(gate) * value).to(up.dtype)
+
+
+def _replica_swiglu_backward(gradient: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
+    """Match Torch clamp derivatives, including both inclusive boundary values."""
+    gate, value = up.float().chunk(2, dim=-1)
+    clipped_gate = gate.clamp(max=limit) if limit > 0 else gate
+    clipped_value = value.clamp(-limit, limit) if limit > 0 else value
+    sigmoid = clipped_gate.sigmoid()
+    grad_gate = gradient.float() * clipped_value * sigmoid * (1 + clipped_gate * (1 - sigmoid))
+    grad_value = gradient.float() * F.silu(clipped_gate)
+    if limit > 0:
+        grad_gate = grad_gate * (gate <= limit)
+        grad_value = grad_value * ((value >= -limit) & (value <= limit))
+    return torch.cat((grad_gate, grad_value), dim=-1).to(up.dtype)
+
+
 class _NativeReplicaExperts(torch.autograd.Function):
     """Return gradients to original parameter owners inside the expert backward."""
 
     @staticmethod
     def forward(ctx: Any, inputs: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor,
-                counts: torch.Tensor, route: ReplicaRoute) -> torch.Tensor:
+                counts: torch.Tensor, route: ReplicaRoute, swiglu_limit: float | None) -> torch.Tensor:
         """Prefetch this invocation's weights and execute native grouped SwiGLU."""
         groups = counts.to(torch.int64).cumsum(0)
         with prefetch_weights((weight1, weight2), route) as pool:
             if inputs.shape[0]:
                 up = _split_gmm(inputs, weight1, pool.weights[0], groups, route)
-                activation = _npu_ops().npu_swiglu(up)
+                activation = (_npu_ops().npu_swiglu(up) if swiglu_limit is None
+                              else _replica_swiglu(up, swiglu_limit))
                 output = _split_gmm(activation, weight2, pool.weights[1], groups, route)
             else:
                 up = inputs.new_empty((0, weight1.shape[-1]))
                 activation = inputs.new_empty((0, weight2.shape[1]))
                 output = inputs.clone()
         ctx.route = route
+        ctx.swiglu_limit = swiglu_limit
         ctx.save_for_backward(inputs, weight1, weight2, groups, up, activation)
         return output
 
@@ -113,18 +138,20 @@ class _NativeReplicaExperts(torch.autograd.Function):
                 grad_output = grad_output.contiguous()
                 grad_activation = _split_gmm(grad_output, weight2, pool.weights[1], groups, route,
                                              transpose=True)
-                grad_up = _npu_ops().npu_swiglu_backward(grad_activation, up)
+                grad_up = (_npu_ops().npu_swiglu_backward(grad_activation, up) if ctx.swiglu_limit is None
+                           else _replica_swiglu_backward(grad_activation, up, ctx.swiglu_limit))
                 grad_input = _split_gmm(grad_up, weight1, pool.weights[0], groups, route, transpose=True)
                 _weight_gradient(inputs, grad_up, route, grad1, pool.gradients[0])
                 _weight_gradient(activation, grad_output, route, grad2, pool.gradients[1])
             else:
                 grad_input = grad_output.clone()
             grad1, grad2 = return_gradients((grad1, grad2), route, pool.gradients, consume=True)
-        return grad_input, grad1, grad2, None, None
+        return grad_input, grad1, grad2, None, None, None
 
 
 def native_replica_experts(inputs: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor,
-                           counts: torch.Tensor, route: ReplicaRoute) -> torch.Tensor:
+                           counts: torch.Tensor, route: ReplicaRoute, *,
+                           swiglu_limit: float | None = None) -> torch.Tensor:
     """Execute packed weights [H,D,2I], [H,I,D] with native NPU kernels.
 
     Args:
@@ -133,13 +160,19 @@ def native_replica_experts(inputs: torch.Tensor, weight1: torch.Tensor, weight2:
         weight2: Original owner's down matrices.
         counts: Physical expert row counts.
         route: Invocation-owned placement and source quotas.
+        swiglu_limit: Use FP32 SwiGLU when set; positive values also clamp gate/up.
+            None preserves the ordinary native NPU SwiGLU implementation.
 
     Returns:
         Expert-major BF16 outputs with gradients returned to original owners.
     """
     if inputs.device.type != "npu" or inputs.dtype != torch.bfloat16:
         raise ValueError("native hot replicas currently require BF16 NPU inputs")
-    return _NativeReplicaExperts.apply(inputs, weight1, weight2, counts, route)
+    if swiglu_limit is not None and (
+            isinstance(swiglu_limit, bool) or not isinstance(swiglu_limit, (int, float))
+            or not math.isfinite(swiglu_limit)):
+        raise ValueError("swiglu_limit must be a finite number or None")
+    return _NativeReplicaExperts.apply(inputs, weight1, weight2, counts, route, swiglu_limit)
 
 
 @dataclass(frozen=True)
@@ -156,10 +189,11 @@ class NativeReplicaDispatch:
 def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
                              group: object,
                              *, minimum_replica_rows: int = 0,
-                             cost_model: ExpertReplicaCostModel | None = None,
                              planner_backend: str = "cpu",
                              minimum_load_reduction: float = 0.0,
-                             minimum_saved_rows: int = 0) -> tuple[tuple, NativeReplicaDispatch]:
+                             minimum_saved_rows: int = 0,
+                             _rank_nodes: tuple[int, ...] = (),
+                             _cost_model: ExpertReplicaCostModel | None = None) -> tuple[tuple, NativeReplicaDispatch]:
     """Dispatch existing native expert-major inputs through shared replicas.
 
     Args:
@@ -167,7 +201,6 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
         config: Logical expert topology and per-rank replica budget.
         group: EP process group.
         minimum_replica_rows: Minimum useful row count for a guest copy.
-        cost_model: Optional calibrated model for CPU quota refinement.
         planner_backend: CPU or device placement implementation.
         minimum_load_reduction: Required receive-peak reduction for optional copies.
         minimum_saved_rows: Required absolute receive-peak reduction for optional copies.
@@ -175,7 +208,7 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
     Returns:
         Dispatched inputs and invocation-owned inverse metadata for combine.
     """
-    validate_planner_backend(planner_backend, minimum_replica_rows, cost_model)
+    validate_planner_backend(planner_backend, minimum_replica_rows, _cost_model)
     values, counts = inputs[:2]
     rank = dist.get_rank(group)
     payload = counts.to(torch.int64).contiguous()
@@ -195,10 +228,10 @@ def dispatch_native_replicas(inputs: tuple, config: ExpertReplicaConfig,
         recv_counts = device_counts[:, rank * width:(rank + 1) * width].contiguous()
     else:
         host = gathered.cpu().tolist()
-        plan = build_expert_replica_plan(host, config.replica_slots_per_rank,
-                                         minimum_replica_rows=minimum_replica_rows, cost_model=cost_model,
-                                         minimum_load_reduction=minimum_load_reduction,
-                                         minimum_saved_rows=minimum_saved_rows)
+        plan, _ = _plan_replica_route(host, config, group, rank, adaptive=bool(config.replica_slots_per_rank),
+            minimum_replica_rows=minimum_replica_rows, cost_model=_cost_model,
+            minimum_load_reduction=minimum_load_reduction, minimum_saved_rows=minimum_saved_rows,
+            _rank_nodes=_rank_nodes)
         runs = sorted((expert, slot, plan.dispatch_counts[rank][slot])
                       for slot, expert in enumerate(plan.physical_to_logical) if expert >= 0)
         slots = torch.tensor([slot for _, slot, _ in runs], device=values.device)

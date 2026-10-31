@@ -42,7 +42,8 @@ def _global_peer_rank(group: object, peer: int) -> int:
 def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
                      *, backward: bool = False, provider: object = None,
                      overlap: bool = False,
-                     reuse_generation: object | None = None) -> Iterator[ReplicaPool | ReplicaPrefetch]:
+                     reuse_generation: object | None = None,
+                     _overwrite_gradients: bool = False) -> Iterator[ReplicaPool | ReplicaPrefetch]:
     """Borrow home weights and fill only the shared B guest slots.
 
     Ordinary pool allocations remain valid across push SHMEM heap growth.
@@ -55,6 +56,8 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
     view, after autograd checks the saved parameter versions. Every rank must use
     the same invocation sequence. A provider accepts reuse only while that exact
     generation remains resident; local weight-version cache decisions are unsafe.
+    The internal overwrite flag requires complete-K stores to every active guest
+    gradient before publication. Other consumers retain zero initialization.
     """
     if reuse_generation is not None and not backward:
         raise ValueError("Replica weights may be reused only by their saved backward context")
@@ -63,6 +66,8 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
         options = {"overlap": True} if overlap else {}
         if reuse_generation is not None:
             options["reuse_generation"] = reuse_generation
+        if _overwrite_gradients:
+            options["_overwrite_gradients"] = True
         with provider.lease(weights, route, backward=backward, **options) as pool:
             yield pool
         return

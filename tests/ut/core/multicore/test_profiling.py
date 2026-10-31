@@ -225,12 +225,14 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         runtime_config.num_workers = 48
         for peers in (7, 31, 63):
             with self.subTest(peers=peers):
-                runtime = _prepare_mega_kernel_runtime_config(
-                    runtime_config, tensor_factory=lambda data: data, profile_tensor_factory=lambda data: data,
-                    rank=0, device=object(), device_id=0, replica_gradient_records=2 * peers,
+                runtime = PreparedDiagnosticRuntime(
+                    ComputeGraph(), runtime_config, DiagnosticSpec("Custom", extra_aiv_records=2 * peers),
+                    parameter_count=0, tensor_factory=bytes, rank=0, device_id=0,
                 )
-                self.assertGreaterEqual(runtime_config.aiv_profile_record_capacity, 2 * peers)
+                profile = _PreparedProfileRuntime(runtime)
+                self.assertGreaterEqual(profile._layout.aiv_record_capacity, 2 * peers)
                 self.assertIsNotNone(runtime.normal_tensor)
+                self.assertEqual(runtime_config.aiv_profile_record_capacity, 0)
         for invalid in (-1, True, 1.5):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "nonnegative integer"):
                 _calculate_profile_layout(runtime_config, replica_gradient_records=invalid)
@@ -239,7 +241,7 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         """Mirror Device round-robin assignment for AIC and AIV independently."""
         runtime_config = _runtime_config(128)
         runtime_config.num_workers = 48
-        runtime_config.all_tasks[0] = _four_record_task()
+        runtime_config.all_tasks[0] = _three_record_task()
         runtime_config.task_index_num[0] = 121
         runtime_config.task_index_num[1] = 24
 
@@ -256,7 +258,7 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         """Allocate the complete trace when a long schedule exceeds 256 records."""
         runtime_config = _runtime_config(2048)
         runtime_config.num_workers = 48
-        runtime_config.all_tasks[0] = _four_record_task()
+        runtime_config.all_tasks[0] = _three_record_task()
         runtime_config.task_index_num[0] = 2041
 
         layout = _calculate_profile_layout(runtime_config)

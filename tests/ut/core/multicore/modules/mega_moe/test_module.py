@@ -32,9 +32,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from tests.common.mark_utils import arg_mark
-from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import MegaMoeWorkspace
-from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeExperts(unittest.TestCase):
@@ -42,13 +40,16 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     # pylint: disable=protected-access
 
-    def test_dynamic_constructor_retains_capacity_and_accepts_real_shapes(self) -> None:
-        """Arbitrary including empty inputs do not change the reserved resource specification."""
-        experts = MegaMoeExperts(max_local_num_tokens=257, hidden_size=16, intermediate_size=8,
-                                 num_experts=4, top_k=2)
+    def test_replica_constructor_infers_capacity_for_empty_and_uneven_shapes(self) -> None:
+        """Guest slots preserve automatic input sizing without token-capacity arguments."""
+        experts = MegaMoeExperts(hidden_size=16, intermediate_size=8,
+                                 num_experts=4, top_k=2, ep_size=2, replica_slots_per_rank=1)
         self.addCleanup(experts.close)
-        self.assertIsNone(experts.local_num_tokens)
-        self.assertEqual(experts._resource_group.specification["local_num_tokens"], 384)
+        self.assertFalse(hasattr(experts, "local_num_tokens"))
+        self.assertFalse(hasattr(experts, "max_local_num_tokens"))
+        self.assertEqual(experts._resource_group.specification["local_num_tokens"], 128)
+        self.assertTrue(experts._resource_group.specification["auto_tokens"])
+        self.assertEqual(experts._resource_group.specification["num_experts"], 6)
         with patch.object(experts, "_validate_tensors"):
             for tokens in (0, 1, 127, 128, 129, 257):
                 with self.subTest(tokens=tokens):
@@ -56,17 +57,13 @@ class TestMegaMoeExperts(unittest.TestCase):
                         torch.empty(1, tokens, 16), torch.empty(tokens, 2, dtype=torch.int32),
                         torch.empty(tokens, 2), None, (experts.gate_up_weight, experts.down_weight))
                     self.assertEqual(tuple(result.shape), (tokens, 16))
-        for kwargs in ({}, {"local_num_tokens": 128, "max_local_num_tokens": 256},
-                       {"max_local_num_tokens": 0}, {"max_local_num_tokens": True}, {"max_local_num_tokens": 2**31}):
-            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **kwargs)
-
-    def test_plan_cache_evicts_without_mutating_retained_plans_or_capacity(self) -> None:
-        """A deferred backward retains its old plan after cache eviction and a new shape."""
+    def test_replica_plan_cache_keeps_covered_buckets_and_retained_plans(self) -> None:
+        """Repeated nearby lengths share one covering plan without discarding retained graphs."""
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
-        resources.spec = MegaMoeSpec(4096, 16, 8, 4, 2, None, 8192, 1, None, 0, 24,
-                                    max_local_num_tokens=4096)
-        resources._plans = OrderedDict()
+        resources.spec = MegaMoeSpec(4096, 16, 8, 6, 2, None, 8192, 2, None, 0, 24,
+                                    auto_tokens=True, replica_slots_per_rank=1, logical_num_experts=4)
+        resources._token_capacity = 4096
+        resources._plans = {}
         with patch.object(mega_moe_module, "build_mega_moe_plan",
                           side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
             retained = resources.plan_for_tokens(128, "cpu")
@@ -74,12 +71,12 @@ class TestMegaMoeExperts(unittest.TestCase):
             for tokens in (256, 384, 512, 4096):
                 resources.plan_for_tokens(tokens, "cpu")
             self.assertEqual(len(resources._plans), 4)
-            self.assertNotIn((128, False), resources._plans)
+            self.assertIs(resources._plans[128], retained)
             self.assertEqual(retained.spec.plan_tokens, 128)
             self.assertEqual(retained.spec.routed_slots, 8192)
             self.assertEqual(retained.spec.receive_capacity, 8192)
             self.assertEqual(resources.spec, replace(retained.spec, schedule_tokens=None))
-            self.assertEqual(build.call_count, 5)
+            self.assertEqual(build.call_count, 4)
 
     def test_resource_manifest_rejects_rank_configuration_mismatch(self) -> None:
         """Static and dynamic ranks enter the same check before symmetric allocation."""
@@ -96,12 +93,13 @@ class TestMegaMoeExperts(unittest.TestCase):
                 resources._validate_distributed_configuration(({"local_num_tokens": 128},))
 
     def test_dynamic_plan_cache_separates_home_and_replica_topologies(self) -> None:
-        """Retain each invocation's topology through shape changes and cache eviction."""
+        """Retain separate covering plans for home-only and physical guest topologies."""
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
         resources.spec = MegaMoeSpec(4096, 16, 8, 6, 2, 2.5, 20480, 2, None, 0, 24,
                                     max_local_num_tokens=4096, replica_slots_per_rank=1, logical_num_experts=4)
         resources.home_spec = replace(resources.spec, num_experts=4, replica_slots_per_rank=0)
-        resources._plans = OrderedDict()
+        resources._token_capacity = 4096
+        resources._plans = {}
         with patch.object(mega_moe_module, "build_mega_moe_plan",
                           side_effect=lambda spec, _device: SimpleNamespace(spec=spec)) as build:
             physical = resources.plan_for_tokens(128, "cpu")
@@ -116,7 +114,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             self.assertEqual(build.call_count, 2)
             for tokens in (256, 384, 512, 4096):
                 resources.plan_for_tokens(tokens, "cpu", home_only=True)
-            self.assertEqual(len(resources._plans), 4)
+            self.assertEqual(len(resources._plans), 5)
             self.assertEqual(home.spec.plan_tokens, 128)
             self.assertEqual(physical.spec.replica_slots_per_rank, 1)
             resources.home_spec = None
@@ -130,9 +128,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                                max_local_num_tokens=4096, replica_slots_per_rank=4, logical_num_experts=logical)
             with (self.subTest(logical=logical),
                   patch.object(mega_moe_module, "bind_mega_moe_spec", return_value=spec),
-                  patch.object(mega_moe_module.shmem, "get_heap_manager",
+                  patch.object(mega_moe_module, "_get_heap_manager",
                                return_value=Mock(heap_bytes=1024, growth_records=[])),
-                  patch.object(mega_moe_module.shmem, "acquire"),
                   patch.object(mega_moe_module, "build_mega_moe_plan") as build,
                   patch.object(mega_moe_module, "MegaMoeWorkspace")):
                 resources = mega_moe_module._MegaMoeExecutionResources(
@@ -148,13 +145,14 @@ class TestMegaMoeExperts(unittest.TestCase):
         hidden = torch.ones(64, 16, dtype=torch.bfloat16)
         ids, probabilities = torch.zeros(64, 2, dtype=torch.int32), torch.full((64, 2), 0.5)
         for mode in ("push", "pull"):
-            experts = MegaMoeExperts(max_local_num_tokens=128, hidden_size=16, intermediate_size=8,
+            experts = MegaMoeExperts(hidden_size=16, intermediate_size=8,
                                      num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
                                      replica_slots_per_rank=1).bfloat16()
-            physical = SimpleNamespace(rank_id=0, replica_slots_per_rank=1)
+            physical = SimpleNamespace(rank_id=0, replica_slots_per_rank=1, auto_tokens=False)
             home = SimpleNamespace(rank_id=0, replica_slots_per_rank=0)
             plans = {False: SimpleNamespace(spec=physical), True: SimpleNamespace(spec=home)}
             resources = SimpleNamespace(spec=physical, home_spec=home, plan=None, home_plan=None,
+                                        rank_nodes=(0,) * experts.ep_size,
                                         workspace=Mock(capacity_floor=384, in_use=True), ensure_capacity=Mock(),
                                         plan_for_tokens=Mock(side_effect=lambda _tokens, _device, **kw:
                                                              plans[kw.get('home_only', False)]))
@@ -387,13 +385,14 @@ class TestMegaMoeExperts(unittest.TestCase):
             def gather(output: list, value: Any, kind: str = mismatch, **kwargs: Any) -> None:
                 """Change one peer agreement field while preserving all unrelated metadata."""
                 self.assertIs(kwargs["group"], resources.spec.ep_group)
+                self.assertEqual(value[0], "dynamic_tokens_v4")
                 if kind == "layout":
                     peer_specification = list(value[2][0])
-                    self.assertEqual(peer_specification[-3], "EOI")
-                    peer_specification[-3] = "EIO"
-                    peer = (value[0], value[1], (tuple(peer_specification),))
+                    layout_index = peer_specification.index("EOI")
+                    peer_specification[layout_index] = "EIO"
+                    peer = (value[0], value[1], (tuple(peer_specification),), *value[3:])
                 else:
-                    peer = ("dynamic_tokens_v1", *value[1:]) if kind == "wire" else ("different",)
+                    peer = ("dynamic_tokens_v3", *value[1:]) if kind == "wire" else ("different",)
                 output[:] = [value, peer]
 
             with (self.subTest(mismatch=mismatch),
@@ -466,6 +465,15 @@ class TestMegaMoeExperts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "EOI expert weights must be contiguous"):
             experts._validate_tensors(hidden_states, (noncontiguous_gate_up, noncontiguous_down))
 
+    def test_eoi_replicas_fail_before_resource_registration(self) -> None:
+        """Replica partials require EIO storage while upstream EOI remains available for B0."""
+        with (patch.object(mega_moe_module.MulticoreModule, "__init__",
+                           side_effect=AssertionError("Unexpected resource registration")),
+              self.assertRaisesRegex(ValueError, "Hot replicas require expert_weight_layout='EIO'")):
+            MegaMoeExperts(hidden_size=16, intermediate_size=8,
+                           num_experts=12, top_k=2, ep_size=4,
+                           replica_slots_per_rank=1, expert_weight_layout="EOI")
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_eio_is_the_default_native_graph_layout(self) -> None:
@@ -499,7 +507,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                      "shmem_signal_sdma_bidir", "shmem_signal_sdma_overlap", "shmem_signal_sdma_projection",
                      "shmem_signal_kernel_gradient_adaptive"):
             with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "Unsupported replica_transport"):
-                MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                MegaMoeExperts(hidden_size=16, intermediate_size=8,
                                num_experts=4, top_k=2, ep_size=2, replica_transport=mode)
         create_parameters.assert_not_called()
 
@@ -680,7 +688,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         with patch.object(mega_moe_module, "_create_mega_moe_parameters") as create:
             for target in (0, -1, True, 1.5, "256"):
                 with self.subTest(target=target), self.assertRaisesRegex(ValueError, "replica_target_load"):
-                    MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                    MegaMoeExperts(hidden_size=16, intermediate_size=8,
                                    num_experts=4, top_k=2, ep_size=2, replica_target_load=target)
             create.assert_not_called()
 
@@ -698,15 +706,19 @@ class TestMegaMoeExperts(unittest.TestCase):
         for mode, target, expected in (("push", None, 384), ("push", 256, 256),
                                        ("pull", None, None), ("pull", 256, 256)):
             with self.subTest(mode=mode, target=target):
-                experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                experts = MegaMoeExperts(hidden_size=16, intermediate_size=8,
                                          num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
                                          replica_slots_per_rank=1, replica_target_load=target).bfloat16()
-                resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0, replica_slots_per_rank=1),
+                resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0, replica_slots_per_rank=1,
+                                                                  auto_tokens=False),
+                                            rank_nodes=(0,) * experts.ep_size,
                                             plan=SimpleNamespace(spec=object()),
                                             home_plan=None, home_spec=None,
                                             workspace=Mock(capacity_floor=512), ensure_capacity=Mock())
+                resources.plan_for_tokens = Mock(return_value=resources.plan)
                 replica = SimpleNamespace(physical_ids=ids, counts_by_source=torch.zeros(2, 6), home_only=False)
-                route = SimpleNamespace(routed_tokens=object(), metadata=object(), unpermute_mapping=object(),
+                route = SimpleNamespace(routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
+                                        unpermute_mapping=object(),
                                         maximum_received_slots=256)
                 try:
                     with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
@@ -738,15 +750,19 @@ class TestMegaMoeExperts(unittest.TestCase):
         ids, probabilities = torch.zeros(128, 2, dtype=torch.int32), torch.full((128, 2), 0.5)
         for mode, budget in (("push", 1), ("push", 2), ("pull", 1), ("pull", 2)):
             with self.subTest(mode=mode, budget=budget):
-                experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                experts = MegaMoeExperts(hidden_size=16, intermediate_size=8,
                                          num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
                                          replica_slots_per_rank=budget).bfloat16()
-                spec = SimpleNamespace(rank_id=0, replica_slots_per_rank=budget)
+                spec = SimpleNamespace(rank_id=0, replica_slots_per_rank=budget, auto_tokens=False)
                 resources = SimpleNamespace(spec=spec, plan=SimpleNamespace(spec=spec),
+                                            rank_nodes=(0,) * experts.ep_size,
                                             home_plan=SimpleNamespace(spec=SimpleNamespace(rank_id=0)),
                                             workspace=Mock(capacity_floor=384, in_use=True), ensure_capacity=Mock())
                 resources.home_spec = resources.home_plan.spec
-                route = SimpleNamespace(unpermute_mapping=object(), maximum_received_slots=256)
+                resources.plan_for_tokens = Mock(side_effect=lambda _tokens, _device, *, home_only=False,
+                                                   owner=resources: owner.home_plan if home_only else owner.plan)
+                route = SimpleNamespace(unpermute_mapping=object(), maximum_received_slots=256,
+                                        metadata=SimpleNamespace(plan_tokens=128))
                 try:
                     with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
                           patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
@@ -779,9 +795,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                                receive_capacity=384, ep_size=16, ep_group=object(), rank_id=0, num_cube_cores=24)
             with (self.subTest(logical=logical),
                   patch.object(mega_moe_module, "bind_mega_moe_spec", return_value=spec),
-                  patch.object(mega_moe_module.shmem, "get_heap_manager",
+                  patch.object(mega_moe_module, "_get_heap_manager",
                                return_value=Mock(heap_bytes=1024, growth_records=[])),
-                  patch.object(mega_moe_module.shmem, "acquire"),
                   patch.object(mega_moe_module, "build_mega_moe_plan") as build,
                   patch.object(mega_moe_module, "MegaMoeWorkspace")):
                 resources = mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access

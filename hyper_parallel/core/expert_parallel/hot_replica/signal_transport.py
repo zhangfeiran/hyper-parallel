@@ -235,7 +235,8 @@ class SignalReplicaTransport:
     @contextmanager
     def lease(self, weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
               *, backward: bool = False, overlap: bool = False,
-              reuse_generation: object | None = None) -> Iterator[ReplicaPool | ReplicaPrefetch]:
+              reuse_generation: object | None = None,
+              _overwrite_gradients: bool = False) -> Iterator[ReplicaPool | ReplicaPrefetch]:
         """Reuse only the unchanged generation saved by this forward invocation."""
         if reuse_generation is not None and not backward:
             raise ValueError("Replica weights may be reused only by their saved backward context")
@@ -250,7 +251,8 @@ class SignalReplicaTransport:
             home = route.plan.config.home_experts
             active_slots = max((item.target_slot - home + 1 for item in route.plan.transfers
                                 if item.target_rank == route.rank), default=0) if backward else None
-            with self.pool.lease(backward=backward, active_slots=active_slots):
+            with self.pool.lease(backward=backward, active_slots=active_slots,
+                                 _overwrite_gradients=_overwrite_gradients):
                 if (backward and overlap and reuse_generation is not None
                         and reuse_generation is self._resident_generation and self._resident_ready is not None
                         and self.epoch < _MAX_EPOCH - 2):

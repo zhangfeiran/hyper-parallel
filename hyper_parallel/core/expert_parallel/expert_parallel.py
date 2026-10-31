@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from torch.nn import Module
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
@@ -63,7 +64,8 @@ from hyper_parallel.core.expert_parallel.hot_replica.capacity import (
     ExpertReplicaConfig,
     _integer,
 )
-from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
+from hyper_parallel.core.expert_parallel.hot_replica.policy import _cost_model_enabled, _runtime_cost_model
+from hyper_parallel.core.expert_parallel.hot_replica.topology import _local_node_identity, _node_ids
 from hyper_parallel.core.expert_parallel.hot_replica.device import (
     validate_planner_backend,
 )
@@ -1130,14 +1132,14 @@ class ExpertParallel(BaseExpertParallel):
 
     def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False,
                  *, replica_slots_per_rank: int = 0,
-                 replica_min_rows: int = 0, replica_cost_model: Optional[ExpertReplicaCostModel] = None,
-                 replica_planner: str = "cpu", replica_minimum_load_reduction: Optional[float] = None) -> None:
+                 replica_min_rows: int = 0, replica_planner: str = "cpu",
+                 replica_minimum_load_reduction: Optional[float] = None) -> None:
         """Initialize ExpertParallel.
 
         Args:
-            replica_slots_per_rank: Extra execution slots per EP rank; zero disables hot replication.
+            replica_slots_per_rank: Physical guest slot cap per rank. Positive caps adapt
+                automatically; zero keeps owner-only dispatch. Costs are selected internally.
             replica_planner: Shared CPU or fused device replica quota policy.
-            replica_cost_model: Optional native/p2p offline calibration shared by all EP ranks.
             replica_min_rows: Soft minimum rows per copied expert. Zero retains token balancing.
                 Smaller copies remain when required by the receive bound. Calibrate this
                 threshold for the intended shape; all EP ranks must use the same value.
@@ -1155,24 +1157,38 @@ class ExpertParallel(BaseExpertParallel):
             token_dispatcher = "all_to_all"
         ExpertReplicaConfig(1, 1, replica_slots_per_rank)
         _integer(replica_min_rows, "replica_min_rows", 0)
-        validate_planner_backend(replica_planner, replica_min_rows, replica_cost_model)
+        validate_planner_backend(replica_planner, replica_min_rows, None)
+        self._cost_model_enabled = (_cost_model_enabled()
+                                    if replica_slots_per_rank and replica_planner == 'cpu' else False)
         self.replica_planner = replica_planner
         self.replica_min_rows = replica_min_rows
         if replica_minimum_load_reduction is not None:
             reduction_basis_points(replica_minimum_load_reduction)
         self.replica_minimum_load_reduction = replica_minimum_load_reduction
         self._replicas_enabled = bool(replica_slots_per_rank and replica_minimum_load_reduction != 1.0)
-        if replica_cost_model is not None and (not isinstance(replica_cost_model, ExpertReplicaCostModel)
-                                              or replica_cost_model.backend != "native"):
-            raise ValueError("Native replicas require a native ExpertReplicaCostModel")
-        self.replica_cost_model = replica_cost_model
         if replica_slots_per_rank and (token_dispatcher != "all_to_all" or async_combine):
             raise ValueError("hot replicas require synchronous all_to_all token dispatch")
         self.replica_slots_per_rank = replica_slots_per_rank
+        self._replica_topology_state = None
         self._dispatch_ctx: Optional[DispatchContext] = None
         self.async_combine = async_combine
         self._token_dispatcher_name = token_dispatcher
         self._token_dispatcher = _resolve_token_dispatcher(token_dispatcher)
+
+    def _replica_rank_nodes(self, group: object, size: int) -> tuple[int, ...]:
+        """Bind actual machine identities once per style and process-group lifetime."""
+        if self._replica_topology_state is None or self._replica_topology_state[0] is not group:
+            nodes = (0,) * size
+            if dist.is_initialized() and size > 1:
+                policy = (self.replica_slots_per_rank, self.replica_planner, self.replica_min_rows,
+                          self.replica_minimum_load_reduction, self._cost_model_enabled)
+                peers = [None] * size
+                dist.all_gather_object(peers, (policy, _local_node_identity()), group=group)
+                if any(value[0] != peers[0][0] for value in peers):
+                    raise ValueError('Native replica configurations differ across EP ranks')
+                nodes = _node_ids([value[1] for value in peers])
+            self._replica_topology_state = group, nodes
+        return self._replica_topology_state[1]
 
     def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
         """Dispatch tokens to their assigned ranks via all-to-all.
@@ -1199,14 +1215,19 @@ class ExpertParallel(BaseExpertParallel):
         # pylint: disable=W0212
         if self._replicas_enabled:
             config = ExpertReplicaConfig(inputs[1].numel(), device_mesh.size(), self.replica_slots_per_rank)
-            if self.replica_cost_model is not None:
-                self.replica_cost_model.validate_execution(
-                    "native", module.w1.shape[-1], module.w1.shape[-2], device_mesh.size(), "p2p")
+            group = device_mesh.get_group()
+            rank_nodes = self._replica_rank_nodes(group, device_mesh.size())
+            cost_model = _runtime_cost_model(self._cost_model_enabled, 'native', module.w1.shape[-1],
+                module.w1.shape[-2], device_mesh.size(), 'p2p', inputs[1].numel(), 0, inputs[0].device)
+            reduction = self.replica_minimum_load_reduction
+            if cost_model is not None and reduction is None:
+                reduction = 0.0
             routed, state = dispatch_native_replicas(
-                inputs, config, device_mesh.get_group(),
-                minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
+                inputs, config, group,
+                minimum_replica_rows=self.replica_min_rows, _cost_model=cost_model,
+                _rank_nodes=rank_nodes,
                 planner_backend=self.replica_planner,
-                minimum_load_reduction=resolve_replica_admission(self.replica_minimum_load_reduction)[0])
+                minimum_load_reduction=resolve_replica_admission(reduction)[0])
             module._hot_replica_dispatch = state
             return routed
         dispatch_result = self._token_dispatcher.dispatch(module, inputs, device_mesh)

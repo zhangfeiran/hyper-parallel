@@ -31,10 +31,12 @@ class TestCountKernel(unittest.TestCase):
     def setUp(self) -> None:
         """Isolate the cached device capability from other unit tests."""
         count_kernel._counts_available.cache_clear()  # pylint: disable=protected-access
+        count_kernel._count_expert_limit.cache_clear()  # pylint: disable=protected-access
 
     def tearDown(self) -> None:
         """Discard mocked device capabilities before the next test."""
         count_kernel._counts_available.cache_clear()  # pylint: disable=protected-access
+        count_kernel._count_expert_limit.cache_clear()  # pylint: disable=protected-access
 
     def test_supported_devices_launch_integer_counts(self) -> None:
         """Feature: Exact integer route counts.
@@ -76,7 +78,7 @@ class TestCountKernel(unittest.TestCase):
         Expectation: Fall back before any device capability query or kernel launch.
         """
         cases = (("cpu", torch.int64, (128, 8), 96), ("npu", torch.float32, (128, 8), 96),
-                 ("npu", torch.int64, (128, 9), 96), ("npu", torch.int64, (128, 8), 257),
+                 ("npu", torch.int64, (128, 9), 96), ("npu", torch.int64, (128, 8), 513),
                  ("npu", torch.int64, (128, 8), 0))
         for device, dtype, shape, experts in cases:
             ids = SimpleNamespace(device=Mock(type=device), dtype=dtype, ndim=2, shape=shape)
@@ -86,3 +88,33 @@ class TestCountKernel(unittest.TestCase):
                 self.assertIsNone(count_kernel.try_count_payload(ids, experts))
             available.assert_not_called()
             launch.assert_not_called()
+
+    def test_extended_experts_respect_installed_binary_capacity(self) -> None:
+        """Retain the Torch fallback for old binaries and accelerate E384/E512 with ABI 2."""
+        ids = SimpleNamespace(device=Mock(type="npu"), dtype=torch.int64, ndim=2, shape=(4096, 6))
+        for abi, limit in ((1, 256), (2, 512)):
+            library = Mock()
+            library.replica_counts_abi_version.return_value = abi
+            with patch.object(count_kernel, "_count_library", return_value=library):
+                count_kernel._count_expert_limit.cache_clear()  # pylint: disable=protected-access
+                for experts in (257, 384, 512):
+                    with self.subTest(abi=abi, experts=experts), \
+                            patch.object(count_kernel, "_counts_available", return_value=True), \
+                            patch.object(count_kernel, "launch_route_counts", return_value=sentinel.payload) as launch:
+                        result = count_kernel.try_count_payload(ids, experts)
+                        if experts <= limit:
+                            self.assertIs(result, sentinel.payload)
+                            launch.assert_called_once_with(ids, experts)
+                        else:
+                            self.assertIsNone(result)
+                            launch.assert_not_called()
+
+    def test_direct_extended_launch_rejects_legacy_binary_before_device_work(self) -> None:
+        """Explicit E384 launches fail before allocating or calling the smaller ABI 1 kernel."""
+        ids = SimpleNamespace(device=Mock(type="npu"), dtype=torch.int64, ndim=2, shape=(4096, 6))
+        library = Mock()
+        library.replica_counts_abi_version.return_value = 1
+        with patch.object(count_kernel, "_count_library", return_value=library):
+            with self.assertRaisesRegex(ValueError, "Rebuild the optional replica count library"):
+                count_kernel.launch_route_counts(ids, 384)
+        library.launch_replica_counts.assert_not_called()

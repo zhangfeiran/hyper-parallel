@@ -243,6 +243,12 @@ class MegaMoeWorkspace:
         self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
         self.forward_ready_initialized = False
         self.backward_ready_initialized = False
+        for _, _, image in self.replica_runtime_images.values():
+            image.untyped_storage().resize_(0)
+        self.replica_runtime_images.clear()
+        self.replica_provider = None
+        if self.replica_inbox is not None:
+            self._allocate_replica_storage(spec)
 
     def validate_restarted_allocations(
         self,

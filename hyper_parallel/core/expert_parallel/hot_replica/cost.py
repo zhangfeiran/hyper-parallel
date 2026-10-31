@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 
 from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
+from .topology import _validate_rank_nodes
 
 
 def _nonnegative(value: float, name: str) -> None:
@@ -61,11 +62,23 @@ class ExpertReplicaCostModel:
             retains the forward copy cost; zero represents verified resident reuse.
         minimum_replica_gain_ms: Required gain over a feasible owner-only plan.
             None preserves legacy refinement without a separate admission margin.
+        intra_node_weight_ms: Optional measured forward-copy cost between ranks on one node.
+        inter_node_weight_ms: Optional measured forward-copy cost between different nodes.
+        intra_node_gradient_ms: Optional exposed gradient-return cost on one node.
+        inter_node_gradient_ms: Optional exposed gradient-return cost across nodes.
+        intra_node_backward_weight_ms: Optional nonresident backward-copy cost on one node.
+        inter_node_backward_weight_ms: Optional nonresident backward-copy cost across nodes.
+        weight_fanout_ms: Optional (copies, local_ms, remote_ms) knots for one expert's
+            outgoing forward copies. Different experts and incoming copies are charged
+            separately. Mixed links use a conservative weighted combination of endpoints.
+        _rank_nodes: Internal immutable EP-rank node labels, bound during runtime setup.
 
     Tables start at (0, 0), use nondecreasing times and cover the intended expert
     row counts. Out-of-range plans retain the original policy. Every EP rank
     must use identical calibration data. This is an approximate cost model,
     not a prediction guarantee or runtime calibration/weight cache.
+    Missing link classes retain uniform costs; physical gradient bandwidth must
+    not replace the exposed residual of an overlapping fused gradient schedule.
     """
 
     calibration_version: int
@@ -88,6 +101,14 @@ class ExpertReplicaCostModel:
     planner_overhead_ms: float = 0.0
     backward_weight_ms: float | None = None
     minimum_replica_gain_ms: float | None = None
+    intra_node_weight_ms: float | None = None
+    inter_node_weight_ms: float | None = None
+    intra_node_gradient_ms: float | None = None
+    inter_node_gradient_ms: float | None = None
+    intra_node_backward_weight_ms: float | None = None
+    inter_node_backward_weight_ms: float | None = None
+    weight_fanout_ms: tuple[tuple[int, float, float], ...] = ()
+    _rank_nodes: tuple[int, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         """Freeze measured inputs and reject inconsistent calibration contracts."""
@@ -127,9 +148,76 @@ class ExpertReplicaCostModel:
         for name in ("weight_ms", "gradient_ms", "token_ms_per_row", "minimum_gain_ms", "replica_overhead_ms",
                      "quota_search_budget_ms", "planner_overhead_ms"):
             _nonnegative(getattr(self, name), name)
-        for name in ("backward_weight_ms", "minimum_replica_gain_ms"):
+        for name in ("backward_weight_ms", "minimum_replica_gain_ms", "intra_node_weight_ms", "inter_node_weight_ms",
+                     "intra_node_gradient_ms", "inter_node_gradient_ms", "intra_node_backward_weight_ms",
+                     "inter_node_backward_weight_ms"):
             if getattr(self, name) is not None:
                 _nonnegative(getattr(self, name), name)
+        fanout = tuple(tuple(point) for point in self.weight_fanout_ms)
+        if fanout:
+            if len(fanout) < 2 or fanout[0] != (0, 0, 0) or any(len(point) != 3 for point in fanout):
+                raise ValueError('weight_fanout_ms must start at (0, 0, 0) and contain increasing copy counts')
+            previous = (-1, 0.0, 0.0)
+            for point in fanout:
+                _integer(point[0], 'fanout copies', 0)
+                for duration in point[1:]:
+                    _nonnegative(duration, 'fanout milliseconds')
+                if point[0] <= previous[0] or any(value < old for value, old in zip(point[1:], previous[1:])):
+                    raise ValueError('Fanout copy counts must increase and durations must not decrease')
+                previous = point
+        object.__setattr__(self, 'weight_fanout_ms', fanout)
+        object.__setattr__(self, '_rank_nodes', _validate_rank_nodes(self._rank_nodes, self.ep_size))
+
+    def weight_copy_ms(self, copies: int, local_copies: int) -> float:
+        """Charge one expert's outgoing forward weights without extrapolating fanout knots."""
+        _integer(copies, 'outgoing copies', 0)
+        _integer(local_copies, 'local outgoing copies', 0)
+        if local_copies > copies:
+            raise ValueError('Local outgoing copies cannot exceed all outgoing copies')
+        if not copies:
+            return 0.0
+        local, remote = (row[0] for row in self._link_costs[:2])
+        if not self.weight_fanout_ms or not self._rank_nodes or copies > self.weight_fanout_ms[-1][0]:
+            return local_copies * local + (copies - local_copies) * remote
+        index = bisect_left(self.fanout_knots, copies)
+        left, right = self.weight_fanout_ms[index - 1], self.weight_fanout_ms[index]
+        fraction = (copies - left[0]) / (right[0] - left[0])
+        local_ms, remote_ms = (start + (end - start) * fraction for start, end in zip(left[1:], right[1:]))
+        return (local_copies * local_ms + (copies - local_copies) * remote_ms) / copies
+
+    @cached_property
+    def fanout_knots(self) -> tuple[int, ...]:
+        """Cache copy-count interpolation keys for invocation-local trials."""
+        return tuple(point[0] for point in self.weight_fanout_ms)
+
+    def transfer_ms(self, owner: int, target: int) -> tuple[float, float, float]:
+        """Return forward-copy, backward-copy and exposed gradient costs for one edge.
+
+        Missing node-specific measurements retain the original uniform coefficients.
+        Verified resident backward reuse always suppresses the backward weight copy.
+        """
+        _integer(owner, 'owner rank', 0)
+        _integer(target, 'target rank', 0)
+        if owner >= self.ep_size or target >= self.ep_size:
+            raise ValueError('Replica transfer ranks must belong to the EP group')
+        if not self._rank_nodes:
+            return self._link_costs[2]
+        return self._link_costs[int(self._rank_nodes[owner] != self._rank_nodes[target])]
+
+    @cached_property
+    def _link_costs(self) -> tuple[tuple[float, float, float], ...]:
+        """Resolve optional measurements once while preserving verified backward reuse."""
+        backward = self.weight_ms if self.backward_weight_ms is None else self.backward_weight_ms
+        base = self.weight_ms, backward, self.gradient_ms
+        result = []
+        for prefix in ('intra_node', 'inter_node'):
+            values = tuple(getattr(self, f'{prefix}_{name}_ms') for name in ('weight', 'backward_weight', 'gradient'))
+            weight, backward_copy, gradient = (fallback if value is None else value
+                                               for value, fallback in zip(values, base))
+            if self.backward_weight_ms is None and values[1] is None:
+                backward_copy = weight
+            result.append((weight, 0.0 if backward == 0 else backward_copy, gradient))
+        return tuple(result) + (base,)
 
     def validate_execution(self, backend: str, hidden: int, intermediate: int, ep_size: int, transport: str) -> None:
         """Reject accidental reuse on another shape, backend or transport."""
@@ -187,17 +275,33 @@ class _QuotaCostState:
         self.counts = counts
         self.home = config.home_experts
         self.backward_weight_ms = model.weight_ms if model.backward_weight_ms is None else model.backward_weight_ms
+        self.link_costs = model._link_costs[:2] if model._rank_nodes and len(set(model._link_costs)) > 1 else None
         self.durations = {} if durations is None else durations
-        self.source_totals = [sum(row) for row in counts]
+        self.weight_durations = {}
         self.transfers = [0] * config.ep_size
+        self.local_transfers = [0] * config.ep_size
+        self.outgoing = ([{} for _ in range(config.ep_size)]
+                         if model.weight_fanout_ms and model._rank_nodes else None)
         for target, experts in enumerate(copies):
             for expert, rows in experts.items():
                 owner = expert // self.home
                 if rows and owner != target:
                     self.transfers[target] += 1
                     self.transfers[owner] += 1
+                    if model._rank_nodes and model._rank_nodes[owner] == model._rank_nodes[target]:
+                        self.local_transfers[target] += 1
+                        self.local_transfers[owner] += 1
+                    if self.outgoing is not None:
+                        total, local = self.outgoing[owner].get(expert, (0, 0))
+                        same_node = int(model._rank_nodes[owner] == model._rank_nodes[target])
+                        self.outgoing[owner][expert] = total + 1, local + same_node
         self.costs = [self._rank_cost(rank, self.transfers[rank]) for rank in range(config.ep_size)]
         self.transfer_edges = sum(self.transfers) // 2
+
+    @cached_property
+    def source_totals(self) -> list[int]:
+        """Sum immutable source rows only when token costs or refinement need them."""
+        return [sum(row) for row in self.counts]
 
     def score(self, removed: int = 0) -> float:
         """Charge replay and replica-only scheduling work without assuming overlap."""
@@ -206,25 +310,61 @@ class _QuotaCostState:
         return (self.model.forward_repeats * (max(value[0] for value in self.costs) + host)
                 + max(value[1] for value in self.costs))
 
-    def _rank_cost(self, rank: int, transfers: int) -> tuple[float, float]:
+    def _rank_cost(self, rank: int, transfers: int, local_transfers: int | None = None,
+                   outgoing_removed: tuple[int, int] | None = None) -> tuple[float, float]:
         """Keep the original home/guest accumulation order, without float deltas."""
         experts = self.copies[rank]
+        durations = self.durations
+        token_rate = self.model.token_ms_per_row
         forward, backward = [0.0, 0.0], [0.0, 0.0]
         local = 0
         for expert, rows in experts.items():
             guest = int(expert // self.home != rank)
-            if rows not in self.durations:
-                self.durations[rows] = self.model.compute_ms(rows), self.model.compute_ms(rows, backward=True)
-            forward[guest] += self.durations[rows][0]
-            backward[guest] += self.durations[rows][1]
-            local += min(self.counts[rank][expert], rows)
+            duration = durations.get(rows)
+            if duration is None:
+                duration = self.model.compute_ms(rows), self.model.compute_ms(rows, backward=True)
+                durations[rows] = duration
+            forward[guest] += duration[0]
+            backward[guest] += duration[1]
+            if token_rate:
+                local += min(self.counts[rank][expert], rows)
         # Without measured link concurrency or queue-prefix windows, neither
         # full duplex nor whole-home compute can hide these transfers safely.
         ready = transfers * self.model.weight_ms
-        remote_rows = self.source_totals[rank] + sum(experts.values()) - 2 * local
-        token_phase = remote_rows * self.model.token_ms_per_row / 2
+        backward_copy = transfers * self.backward_weight_ms
+        gradients = transfers * self.model.gradient_ms
+        if transfers and self.link_costs is not None:
+            local_count = self.local_transfers[rank] if local_transfers is None else local_transfers
+            remote_count = transfers - local_count
+            ready, backward_copy, gradients = (transfers * local if local == remote else
+                                               local_count * local + remote_count * remote
+                                               for local, remote in zip(*self.link_costs))
+        if transfers and self.outgoing is not None:
+            ready = self._forward_weights(rank, transfers, local_transfers, outgoing_removed)
+        token_phase = 0.0
+        if token_rate:
+            remote_rows = self.source_totals[rank] + sum(experts.values()) - 2 * local
+            token_phase = remote_rows * token_rate / 2
         return (sum(forward) + ready + token_phase,
-                sum(backward) + transfers * self.backward_weight_ms + transfers * self.model.gradient_ms + token_phase)
+                sum(backward) + backward_copy + gradients + token_phase)
+
+    def _forward_weights(self, rank: int, transfers: int, local_transfers: int | None,
+                         removed: tuple[int, int] | None) -> float:
+        """Amortize only the same expert's sends; retain linear incoming and backward costs."""
+        outgoing, local_outgoing, duration = 0, 0, 0.0
+        for expert, (copies, local) in self.outgoing[rank].items():
+            if removed is not None and removed[0] == expert:
+                copies, local = copies - 1, local - removed[1]
+            key = copies, local
+            if key not in self.weight_durations:
+                self.weight_durations[key] = self.model.weight_copy_ms(copies, local)
+            duration += self.weight_durations[key]
+            outgoing += copies
+            local_outgoing += local
+        local_total = self.local_transfers[rank] if local_transfers is None else local_transfers
+        incoming, local_incoming = transfers - outgoing, local_total - local_outgoing
+        local_ms, remote_ms = (row[0] for row in self.model._link_costs[:2])
+        return duration + local_incoming * local_ms + (incoming - local_incoming) * remote_ms
 
     def trial_score(self, owner: int, target: int, expert: int, unchanged: tuple[float, float]) -> float:
         """Refresh the two changed ranks against the accepted edge counts.
@@ -239,8 +379,12 @@ class _QuotaCostState:
             Separate forward/backward rank maxima for the trial quotas.
         """
         removed = int(not self.copies[target][expert])
+        local_removed = int(bool(removed and self.model._rank_nodes
+                                 and self.model._rank_nodes[owner] == self.model._rank_nodes[target]))
         for rank in (owner, target):
-            self.costs[rank] = self._rank_cost(rank, self.transfers[rank] - removed)
+            self.costs[rank] = self._rank_cost(rank, self.transfers[rank] - removed,
+                                               self.local_transfers[rank] - local_removed,
+                                               (expert, local_removed) if removed and rank == owner else None)
         host = (self.model.planner_overhead_ms
                 + (self.model.replica_overhead_ms if self.transfer_edges > removed else 0.0))
         forward = max(unchanged[0], self.costs[owner][0], self.costs[target][0])
@@ -256,9 +400,15 @@ class _QuotaCostState:
             expert: Logical expert whose edge may now be removed.
         """
         removed = int(not self.copies[target][expert])
+        local_removed = int(bool(removed and self.model._rank_nodes
+                                 and self.model._rank_nodes[owner] == self.model._rank_nodes[target]))
         self.transfer_edges -= removed
+        if removed and self.outgoing is not None:
+            total, local = self.outgoing[owner][expert]
+            self.outgoing[owner][expert] = total - 1, local - local_removed
         for rank in (owner, target):
             self.transfers[rank] -= removed
+            self.local_transfers[rank] -= local_removed
             self.costs[rank] = self._rank_cost(rank, self.transfers[rank])
 
 
@@ -322,7 +472,8 @@ def _prune_small_edges(costs: _QuotaCostState, limit: int, minimum_rows: int, me
 
 def refine_replica_quotas(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
                           config: ExpertReplicaConfig, limit: int, model: ExpertReplicaCostModel,
-                          *, minimum_replica_rows: int = 0) -> None:
+                          *, minimum_replica_rows: int = 0,
+                          _durations: dict[int, tuple[float, float]] | None = None) -> None:
     """Prune cheap small copies, then accept strict worst-rank gains from quota search.
 
     Args:
@@ -333,6 +484,7 @@ def refine_replica_quotas(copies: list[dict[int, int]], counts: tuple[tuple[int,
         model: Matching offline execution-cost calibration.
         minimum_replica_rows: Try cheaper deletions below this row count before
             applying the expensive quota-search budget. Zero preserves the original policy.
+        _durations: Optional interpolation cache owned by the current planner invocation.
     """
     _integer(minimum_replica_rows, "minimum_replica_rows", 0)
     if model.ep_size != config.ep_size:
@@ -346,7 +498,7 @@ def refine_replica_quotas(copies: list[dict[int, int]], counts: tuple[tuple[int,
     if not edges:
         return
     knots = sorted(set(model.row_knots[0] + model.row_knots[1]))
-    costs = _QuotaCostState(model, copies, counts, config)
+    costs = _QuotaCostState(model, copies, counts, config, _durations)
     totals = list(map(sum, zip(*counts)))
     home_copies = [{expert: totals[expert] for expert in range(rank * home, (rank + 1) * home)}
                    for rank in range(config.ep_size)]

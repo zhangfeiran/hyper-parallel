@@ -80,7 +80,7 @@ def _expert_forward(module, executor, values, ids, probabilities, experts):
         output = combine_native_replicas(output, state)
     restored = torch.empty_like(output)
     restored[order] = output
-    return (restored.reshape(values.shape[0], ids.shape[1], -1) * probabilities.unsqueeze(-1)).sum(1)
+    return (restored.reshape(values.shape[0], ids.shape[1], values.shape[-1]) * probabilities.unsqueeze(-1)).sum(1)
 
 
 def _check(actual, expected, label, *, elementwise=True, rtol=2e-2, atol=2e-3):
@@ -88,7 +88,7 @@ def _check(actual, expected, label, *, elementwise=True, rtol=2e-2, atol=2e-3):
     actual, expected = actual.detach().float(), expected.detach().float()
     difference = actual - expected
     relative = float(difference.square().sum().sqrt() / expected.square().sum().sqrt().clamp_min(1e-8))
-    maximum = float(difference.abs().max())
+    maximum = float(difference.abs().max()) if difference.numel() else 0.0
     error = None
     try:
         if elementwise:
@@ -241,9 +241,9 @@ def _run(backend: str, top_k: int, planner: str, transport: str, result_dir: Pat
         dist.broadcast_object_list(endpoint, src=0)
         os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
         mega_moe = importlib.import_module("hyper_parallel.core.multicore").MegaMoeExperts
-        executor = mega_moe(local_num_tokens=tokens, hidden_size=hidden, intermediate_size=intermediate,
+        executor = mega_moe(hidden_size=hidden, intermediate_size=intermediate,
                            num_experts=experts, top_k=top_k, ep_size=size, create_parameters=False,
-                           ep_group=None if planner == "cpu" else mesh.get_group(), dispatch_mode=backend,
+                           ep_group=mesh.get_group(), dispatch_mode=backend,
                            replica_slots_per_rank=1, replica_transport=transport, replica_planner=planner,
                            replica_minimum_load_reduction=0.0,
                            **({"initial_capacity_factor": 1.0} if backend == "push" else {}))

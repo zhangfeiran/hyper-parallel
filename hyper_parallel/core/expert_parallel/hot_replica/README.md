@@ -26,7 +26,7 @@ MegaMoe 的 push/pull 共享规划器，支持两种副本传输：
 from hyper_parallel.core.multicore import MegaMoeExperts
 
 module = MegaMoeExperts(
-    local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
+    hidden_size=5120, intermediate_size=1792,
     num_experts=24, top_k=8, ep_size=4, ep_group=ep_group,
     dispatch_mode="push", replica_slots_per_rank=1,
     replica_transport="shmem_signal_kernel_gradient",
@@ -67,7 +67,6 @@ push 按实际路由需求增长并受此界约束，pull 继续使用路由 sou
 | `replica_min_rows` | 小副本软阈值；Native 默认 0，MegaMoe 默认 1024；容量必需副本继续保留 |
 | `replica_target_load` | 可选正整数；所有 EP rank 一致 |
 | `replica_minimum_load_reduction` | `None` 要求当前路由峰值下降至少 40%；`0.0` 关闭可选副本收益门槛 |
-| `replica_cost_model` | 可选离线成本模型；要求 CPU 规划器且匹配执行配置 |
 
 收益门槛只控制可选副本。若理想平均负载也不能达到门槛，规划器直接使用 home 计划；
 求解后再次检查最终峰值，容量必需的复制继续保留。低层规划 API 的
@@ -115,6 +114,10 @@ cmake --install build/replica-planner \
 规划器 ABI 为 4；ABI 不匹配明确报错。未安装规划器时，显式 device 入口报错。
 融合计数库为可选加速：不支持的 shape/device 或未安装时使用 Torch 整数计数，
 重复专家和越界标记随计数一起参加 collective。Native 接收已有专家计数，不重建 TopK。
+
+Count ABI 2 supports 1 to 512 logical experts, including E384. Rebuild and install the optional count library
+to enable this path. Count ABI 1 remains supported for up to 256 experts; larger shapes retain the Torch fallback.
+This extends the count kernel independently of the device quota planner.
 
 打包时将可选库安装至 native payload 的 `core/expert_parallel/hot_replica/_device_kernel`，
 通过 `HYPER_PARALLEL_NATIVE_OUTPUT_ROOT` 指向该载荷根目录；与 multicore 组合时使用同一个根目录。
@@ -172,3 +175,5 @@ checkpoint 使用 reentrant 完整重算，取证记录有梯度的 forward 所�
 随 inbox 一起释放，在 epoch 回绕时同步清零；普通 owner 信号表保持调用内独占并记录 stream 生命周期。
 无法证明两个投影的生产调度、行带数超过 64 或 Cube 数超过预留的 32 时，保留完整专家返回。
 B=0 和没有实际副本搬运的路由沿用原有执行路径。
+
+正的槽位上限默认启用自适应，不需要传成本模型或 adaptive 开关。成本匹配和调试消融见[自适应说明](../../multicore/docs/adaptive_replicas.md)。

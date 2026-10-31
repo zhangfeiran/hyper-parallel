@@ -17,15 +17,16 @@
 import random
 import unittest
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 from hyper_parallel.core.expert_parallel.hot_replica import (
     ExpertReplicaConfig,
     ExpertReplicaCostModel,
-    build_expert_replica_plan,
     cost,
 )
-from hyper_parallel.core.expert_parallel.hot_replica.planner import _materialize
+from hyper_parallel.core.expert_parallel.hot_replica.planner import (
+    _build_expert_replica_plan as build_expert_replica_plan, _materialize,
+)
 
 
 class TestReplicaCost(unittest.TestCase):
@@ -84,6 +85,24 @@ class TestReplicaCost(unittest.TestCase):
                   "forward_ms": ((0, 0), (8, 1), (16, 1.1), (128, 3)),
                   "backward_ms": ((0, 0), (8, 1), (16, 1.1), (128, 3)), "weight_ms": 0.0, "gradient_ms": 0.0}
         return ExpertReplicaCostModel(**(values | options))
+
+    def test_zero_token_score_does_not_aggregate_source_rows(self) -> None:
+        """An unused token coefficient must not force a source-by-expert sum."""
+        counts, config = ((10, 0, 0, 0), (6, 0, 0, 0)), ExpertReplicaConfig(4, 2, 1)
+        copies = [{0: 8, 1: 0}, {2: 0, 3: 0, 0: 8}]
+        with patch.object(cost._QuotaCostState, 'source_totals', new_callable=PropertyMock,
+                          side_effect=AssertionError('Unexpected source aggregation')):
+            score = cost._QuotaCostState(self._model(), copies, counts, config).score()
+        self.assertGreater(score, 0)
+
+    def test_nonzero_token_score_reuses_source_totals(self) -> None:
+        """Token-sensitive scoring must retain exact invocation-local source totals."""
+        counts, config = ((10, 0, 0, 0), (6, 0, 0, 0)), ExpertReplicaConfig(4, 2, 1)
+        copies = [{0: 8, 1: 0}, {2: 0, 3: 0, 0: 8}]
+        state = cost._QuotaCostState(self._model(token_ms_per_row=.01), copies, counts, config)
+        self.assertEqual(state.source_totals, [10, 6])
+        self.assertIs(state.source_totals, state.source_totals)
+        self.assertGreater(state.score(), cost._QuotaCostState(self._model(), copies, counts, config).score())
 
     def test_small_copy_is_removed_on_score_plateau_before_search_guard(self) -> None:
         """A cheap deletion must not require a strict gain or expensive quota search."""

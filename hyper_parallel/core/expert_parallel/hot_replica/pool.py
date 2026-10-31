@@ -43,8 +43,9 @@ class ReplicaPool:
             raise ValueError("Replica matrix index is out of range")
 
     @contextmanager
-    def lease(self, *, backward: bool = False, active_slots: int | None = None) -> Iterator[ReplicaPool]:
-        """Order consumers and clear the active guest prefix, or every slot when unspecified."""
+    def lease(self, *, backward: bool = False, active_slots: int | None = None,
+              _overwrite_gradients: bool = False) -> Iterator[ReplicaPool]:
+        """Order consumers and clear active guests unless complete overwrites are proven."""
         if active_slots is not None and (type(active_slots) is not int
                                          or not 0 <= active_slots <= self.weights[0].shape[0]):
             raise ValueError("Active guest slots must be an integer within the allocated pool")
@@ -60,7 +61,7 @@ class ReplicaPool:
             if backward:
                 if self.gradients is None:
                     self.gradients = tuple(torch.empty_like(weight, dtype=torch.float32) for weight in self.weights)
-                if active_slots != 0:
+                if active_slots != 0 and not _overwrite_gradients:
                     for gradient in self.gradients:
                         target = gradient if active_slots is None else gradient[:active_slots]
                         target.zero_()

@@ -48,14 +48,14 @@ class TestMegaMoeHeapManager(unittest.TestCase):
     # These tests deliberately inspect the private manager and lifecycle transaction.
     # pylint: disable=protected-access
 
-    def _automatic_workspace(self, mode: str) -> tuple:
+    def _automatic_workspace(self, mode: str, hidden_size: int = 16) -> tuple:
         """Materialize a small symmetric layout using CPU storage for restart validation."""
-        specification = {"local_num_tokens": 128, "hidden_size": 16, "intermediate_size": 8,
+        specification = {"local_num_tokens": 128, "hidden_size": hidden_size, "intermediate_size": 8,
                          "num_experts": 4, "top_k": 2, "ep_size": 2, "dispatch_mode": mode,
                          "initial_capacity_factor": 1.25 if mode == "push" else None, "auto_tokens": True}
         layout = _workspace_layout(specification, torch.bfloat16)
         manager = self._manager_with_reservation(specification, layout)
-        spec = MegaMoeSpec(128, 16, 8, 4, 2, specification["initial_capacity_factor"],
+        spec = MegaMoeSpec(128, hidden_size, 8, 4, 2, specification["initial_capacity_factor"],
                            layout.receive_capacity, 2, None, 0, 24, dispatch_mode=mode,
                            capacity_growth_factor=1.25 if mode == "push" else None, auto_tokens=True)
         workspace = MegaMoeWorkspace(shared=True)
@@ -64,6 +64,33 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             setattr(workspace, name, torch.empty(allocation.shape, dtype=allocation.dtype))
         workspace.completion_event = object()
         return manager, workspace, spec
+
+    def test_replica_admission_uses_one_growth_step_without_reserving_memory(self) -> None:
+        """A planning allowance is bounded by the invocation, not accumulated across steps."""
+        manager, workspace, _ = self._automatic_workspace('push')
+        before = manager.entries[0].layout
+        with patch.object(manager, '_restart', side_effect=AssertionError('Planning cannot allocate')):
+            for _ in range(3):
+                self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720), 38400)
+        self.assertIs(manager.entries[0].layout, before)
+        self.assertEqual(workspace.capacity_floor, before.receive_capacity)
+
+    def test_replica_admission_honors_heap_and_other_workspace_reservations(self) -> None:
+        """Only the bytes left after actual source rows and other entries can admit growth."""
+        manager, workspace, _ = self._automatic_workspace('push', hidden_size=5120)
+        spec = manager.entries[0].specification
+        other = _WorkspaceLayout(2 * 1024 * 1024, (('name', 'other'),), 0)
+        manager.reserve((({'name': 'other'}, other),), allow_resize=True)
+        desired = _workspace_layout(spec, torch.bfloat16, 38400, 4096)
+        minimum = _workspace_layout(spec, torch.bfloat16, 30720, 4096)
+        manager.heap_limit = manager._required_bytes([minimum, other])
+        allowed = manager.replica_receive_capacity(workspace, 4096, 30720)
+        self.assertGreaterEqual(allowed, 30720)
+        self.assertLess(allowed, 38400)
+        actual = _workspace_layout(spec, torch.bfloat16, allowed, 4096)
+        self.assertLessEqual(manager._required_bytes([actual, other]), manager.heap_limit)
+        manager.heap_limit = manager._required_bytes([desired, other])
+        self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720), 38400)
 
     @staticmethod
     def _cpu_restart(**kwargs: Any) -> _lifecycle._RestartResult:

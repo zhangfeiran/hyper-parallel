@@ -35,12 +35,15 @@ from hyper_parallel.core.expert_parallel.hot_replica.capacity import (
     ExpertReplicaConfig,
     _integer,
 )
-from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
+from hyper_parallel.core.expert_parallel.hot_replica.policy import (
+    _calibration_available, _cost_model_enabled, _runtime_cost_model, _soc_name,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.topology import _local_node_identity, _node_ids
 from hyper_parallel.core.expert_parallel.hot_replica.device import (
     validate_planner_backend,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.routing import (
-    prepare_replica_route,
+    ReplicaRoute, _GatheredReplicaCounts, prepare_replica_route,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
     KERNEL_GRADIENT_TRANSPORT_MODES,
@@ -54,9 +57,11 @@ from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
+    MegaMoeSpec,
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
     bind_mega_moe_spec,
+    initial_receive_capacity,
 )
 from .workspace import MegaMoeWorkspace
 
@@ -151,6 +156,12 @@ class _MegaMoeExecutionResources:
         self.spec = bind_mega_moe_spec(specification, tensor)
         self._token_capacity = self.spec.local_num_tokens
         self._plans = {}
+        calibrated = any(item.get('_replica_cost_model_enabled') and _calibration_available(
+            item['dispatch_mode'], item['hidden_size'], item['intermediate_size'], item['ep_size'],
+            item['replica_transport'], item['logical_num_experts'], item['top_k'])
+            for item in active_specifications)
+        self.soc_name = _soc_name(torch.device(tensor.device)) if calibrated else ''
+        self.rank_nodes = (0,) * self.spec.ep_size
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
         reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
@@ -228,6 +239,10 @@ class _MegaMoeExecutionResources:
         if self.spec.dispatch_mode == "pull":
             self.workspace.claim()
 
+    def replica_receive_capacity(self, tokens: int, reservation: int) -> int:
+        """Price bounded optional receive growth before committing the selected plan."""
+        return self.heap_manager.replica_receive_capacity(self.workspace, tokens, reservation)
+
     def can_close(self) -> bool:
         """Report whether neither an active call nor a backward graph needs buffers."""
         return self._workspace_closed or self.workspace.can_close()
@@ -238,15 +253,20 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens")
+                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens",
+                  "_replica_cost_model_enabled",
+                  "replica_slots_per_rank", "replica_transport")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
-        manifest = ("dynamic_tokens_v3", "bfloat16",
-                    tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
+        manifest = ("dynamic_tokens_v4", "bfloat16",
+                    tuple(tuple(spec.get(key) for key in fields) for spec in specifications),
+                    getattr(self, 'soc_name', ''))
         # Resource groups must have the same order as their symmetric allocations.
+        manifest += (_local_node_identity(),)
         manifests = [None] * self.spec.ep_size
         dist.all_gather_object(manifests, manifest, group=self.spec.ep_group)
-        if any(value != manifests[0] for value in manifests):
+        if any(value[:-1] != manifests[0][:-1] for value in manifests):
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
+        self.rank_nodes = _node_ids([value[-1] for value in manifests])
 
     def plan_for_tokens(self, tokens: int, device: Any, *, home_only: bool = False) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
@@ -374,7 +394,6 @@ class MegaMoeExperts(MulticoreModule):
         replica_slots_per_rank: int = 0,
         replica_transport: str = "p2p",
         replica_min_rows: int = 1024,
-        replica_cost_model: ExpertReplicaCostModel | None = None,
         replica_planner: str = "cpu",
         replica_target_load: int | None = None,
         replica_minimum_load_reduction: float | None = None,
@@ -391,7 +410,9 @@ class MegaMoeExperts(MulticoreModule):
             capacity_growth_factor: Push capacity multiplier on overflow, defaulting to 1.25.
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
-            replica_slots_per_rank: Extra expert slots per rank (B); zero preserves legacy routing.
+            replica_slots_per_rank: Physical guest slot cap per rank. Positive caps use
+                adaptive quotas by default; zero keeps owner-only routing. Matching
+                costs are selected internally, with load-driven fallback for unmeasured shapes.
             replica_transport: "p2p" or "shmem_signal_kernel_gradient". The latter uses
                 projection-ready SDMA weights and fused FP32 gradient return.
                 "shmem_signal_kernel_gradient_bands" publishes completed output row bands
@@ -404,7 +425,6 @@ class MegaMoeExperts(MulticoreModule):
                 optional replicas. None requires a 40 percent reduction for each route;
                 zero preserves the earlier placement policy. Capacity-required replicas
                 remain enabled, and all ranks must agree.
-            replica_cost_model: Optional matching offline cost calibration shared by all EP ranks.
             replica_min_rows: Soft minimum rows per copied expert, default 1024. Smaller
                 copies are retained when capacity requires them. Removing a copy can grow
                 the push receive buffer up to its theoretical bound. Calibrate the threshold
@@ -429,7 +449,6 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
-        reserved_tokens = _resolve_token_capacity(local_num_tokens, max_local_num_tokens, hidden_size, top_k)
         if replica_transport not in ("p2p", *KERNEL_GRADIENT_TRANSPORT_MODES):
             raise ValueError("Unsupported replica_transport; expected p2p or a kernel-gradient transport")
         ep_size = _resolve_ep_size(ep_size, ep_group)
@@ -437,7 +456,9 @@ class MegaMoeExperts(MulticoreModule):
         _integer(replica_min_rows, "replica_min_rows", 0)
         if replica_target_load is not None:
             _integer(replica_target_load, "replica_target_load", 1)
-        validate_planner_backend(replica_planner, replica_min_rows, replica_cost_model)
+        validate_planner_backend(replica_planner, replica_min_rows, None)
+        self._cost_model_enabled = (_cost_model_enabled()
+                                    if replica_slots_per_rank and replica_planner == 'cpu' else False)
         self.replica_planner = replica_planner
         self.replica_min_rows = replica_min_rows
         self.replica_target_load = replica_target_load
@@ -445,12 +466,6 @@ class MegaMoeExperts(MulticoreModule):
             reduction_basis_points(replica_minimum_load_reduction)
         self.replica_minimum_load_reduction = replica_minimum_load_reduction
         self.replica_transport = replica_transport
-        if replica_cost_model is not None:
-            if not isinstance(replica_cost_model, ExpertReplicaCostModel):
-                raise ValueError("replica_cost_model must be an ExpertReplicaCostModel")
-            replica_cost_model.validate_execution(dispatch_mode, hidden_size, intermediate_size, ep_size,
-                                                   replica_transport)
-        self.replica_cost_model = replica_cost_model
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT,
             "hidden_size": hidden_size,
@@ -471,6 +486,8 @@ class MegaMoeExperts(MulticoreModule):
             "combine_split": combine_split,
         }
         specification["auto_tokens"] = True
+        if replica_slots_per_rank:
+            specification['_replica_cost_model_enabled'] = self._cost_model_enabled
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -519,6 +536,8 @@ class MegaMoeExperts(MulticoreModule):
                 "or 'EOI' ([experts, out_features, in_features]), "
                 f"got {expert_weight_layout!r}."
             )
+        if expert_weight_layout == "EOI" and specification.get("replica_slots_per_rank", 0):
+            raise ValueError("Hot replicas require expert_weight_layout='EIO'; EOI is supported with B0")
         initial_capacity_factor, capacity_growth_factor = _resolve_capacity_factors(
             specification["dispatch_mode"],
             specification["initial_capacity_factor"],
@@ -661,6 +680,42 @@ class MegaMoeExperts(MulticoreModule):
         self._validate_tensors(hidden_flat, expert_weights)
         return hidden_flat
 
+    def _prepare_replica_route(
+        self, topk_ids: torch.Tensor, resources: _MegaMoeExecutionResources, hidden: torch.Tensor,
+        autograd_mask: int, counts: torch.Tensor | None,
+        gathered: _GatheredReplicaCounts | None = None,
+    ) -> ReplicaRoute:
+        """Resolve the unchanged bounded policy only when placement is needed."""
+        cost_model = _runtime_cost_model(self._cost_model_enabled, self.dispatch_mode,
+            self.hidden_size, self.intermediate_size, self.ep_size, self.replica_transport,
+            self.num_experts, self.top_k, hidden.device)
+        target_load = self.replica_target_load
+        if target_load is None and self.dispatch_mode != "pull" and not resources.spec.auto_tokens:
+            target_load = initial_receive_capacity(self._resource_group.specification)
+        reduction = self.replica_minimum_load_reduction
+        if cost_model is not None and reduction is None:
+            reduction = 0.0
+        admission, saved_rows = resolve_replica_admission(reduction)
+        return prepare_replica_route(
+            topk_ids, self.replica_config, self._ep_group,
+            target_load=target_load,
+            minimum_replica_rows=self.replica_min_rows, _cost_model=cost_model,
+            _rank_nodes=resources.rank_nodes,
+            planner_backend=self.replica_planner,
+            minimum_load_reduction=admission, minimum_saved_rows=saved_rows,
+            compact_home=resources.home_spec is not None,
+            dynamic_header=(int(hidden.shape[0] * max(self.hidden_size, self.top_k) > 2**31 - 1),
+                            hidden.shape[0], autograd_mask),
+            receive_capacity=(initial_receive_capacity(self._resource_group.specification)
+                              if self.dispatch_mode != "pull" and not resources.spec.auto_tokens else None),
+            _auto_capacity_factor=(self.initial_capacity_factor
+                                   if resources.spec.auto_tokens and self.dispatch_mode != "pull" else None),
+            _capacity_budget=(resources.replica_receive_capacity
+                              if resources.spec.auto_tokens and self.dispatch_mode != "pull"
+                              and cost_model is not None else None),
+            _trusted_counts=counts, _gathered_counts=gathered,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -735,33 +790,39 @@ class MegaMoeExperts(MulticoreModule):
                 replica_route = None
                 execution_plan = resources.plan
                 execution_spec = resources.spec
+                integrated = False
                 if self.replica_slots_per_rank:
-                    target_load = self.replica_target_load
-                    if target_load is None and not pull:
-                        target_load = initial_receive_capacity(self._resource_group.specification)
-                    admission, saved_rows = resolve_replica_admission(self.replica_minimum_load_reduction)
-                    replica_route = prepare_replica_route(
-                        topk_ids, self.replica_config, self._ep_group,
-                        target_load=target_load,
-                        minimum_replica_rows=self.replica_min_rows, cost_model=self.replica_cost_model,
-                        planner_backend=self.replica_planner,
-                        minimum_load_reduction=admission, minimum_saved_rows=saved_rows,
-                        compact_home=resources.home_spec is not None,
-                        max_local_num_tokens=self.max_local_num_tokens,
-                        dynamic_header=((int(hidden_flat.shape[0] > self.max_local_num_tokens), hidden_flat.shape[0],
-                                         route_options["autograd_mask"])
-                                        if self.max_local_num_tokens is not None else None),
-                        receive_capacity=(initial_receive_capacity(self._resource_group.specification)
-                                          if not pull else None),
-                    )
-                    if replica_route.home_only:
+                    integrated = automatic and resources.home_spec is not None and self.replica_planner == "cpu"
+                    if integrated:
+                        execution_spec = resources.home_spec
+
+                        def select_replica_route(
+                            counts: torch.Tensor, summary: list[list[int]], host_counts: list[list[int]] | None,
+                        ) -> tuple[MegaMoeSpec, ReplicaRoute] | None:
+                            """Keep equal owner loads in the already-prepared home route."""
+                            loads = [row[6] for row in summary]
+                            if min(loads) == max(loads):
+                                return None
+                            gathered = _GatheredReplicaCounts(counts, summary, host_counts)
+                            proposal = self._prepare_replica_route(
+                                topk_ids, resources, hidden_flat, route_options["autograd_mask"],
+                                tokens_per_expert, gathered)
+                            return (resources.home_spec if proposal.home_only else resources.spec), proposal
+
+                        route_options["_select_replica_route"] = select_replica_route
+                    else:
+                        replica_route = self._prepare_replica_route(
+                            topk_ids, resources, hidden_flat, route_options["autograd_mask"], tokens_per_expert)
+                    if replica_route is not None and replica_route.home_only:
                         execution_plan = resources.home_plan
                         execution_spec = resources.home_spec
                         # Allocate using the reserved physical topology, even
                         # when the first invocation executes only home experts.
-                        resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
-                    topk_ids = replica_route.physical_ids
-                    tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
+                        if not automatic:
+                            resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
+                    if replica_route is not None:
+                        topk_ids = replica_route.physical_ids
+                        tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
                 route = prepare_topk_route(
                     hidden_flat,
                     topk_ids,
@@ -772,11 +833,16 @@ class MegaMoeExperts(MulticoreModule):
                     replica_route=replica_route,
                     **route_options,
                 )
+                if integrated:
+                    replica_route = route.metadata.replica_route
+                    if replica_route is not None:
+                        topk_ids = replica_route.physical_ids
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
             execution_plan = resources.plan_for_tokens(
                 route.metadata.plan_tokens, hidden_flat.device,
-                home_only=replica_route is not None and replica_route.home_only)
+                home_only=(integrated and replica_route is None
+                           or replica_route is not None and replica_route.home_only))
             resources.last_execution_plan = execution_plan
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,

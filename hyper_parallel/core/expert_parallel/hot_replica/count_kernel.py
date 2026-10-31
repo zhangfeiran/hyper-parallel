@@ -22,7 +22,7 @@ from typing import Optional
 import torch
 
 _BLOCKS = 32
-_MAXIMUM_EXPERTS = 256
+_MAXIMUM_EXPERTS = 512
 _MAXIMUM_TOP_K = 8
 _STRIDE_ALIGNMENT = 64
 _DEVICE_PREFIXES = ("Ascend910B", "Ascend910_93")
@@ -49,17 +49,23 @@ def _count_library() -> ctypes.CDLL:
         raise RuntimeError("Rebuild the shared replica counts library: missing launch ABI") from error
     version.argtypes = []
     version.restype = ctypes.c_int
-    if version() != 1:
+    if version() not in (1, 2):
         raise RuntimeError("Rebuild the shared replica counts library: incompatible ABI version")
     launch.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int64] + [ctypes.c_int] * 3
     launch.restype = ctypes.c_int
     return library
 
 
+@lru_cache(maxsize=1)
+def _count_expert_limit() -> int:
+    """Keep older optional binaries on their original expert-count bound."""
+    return 512 if _count_library().replica_counts_abi_version() == 2 else 256
+
+
 def _validate_input(ids: torch.Tensor, num_experts: int) -> None:
     if (ids.device.type != "npu" or ids.dtype != torch.int64 or ids.ndim != 2
             or not 1 <= ids.shape[1] <= _MAXIMUM_TOP_K or not 1 <= num_experts <= _MAXIMUM_EXPERTS):
-        raise ValueError("Fused route counts require an NPU int64 matrix, TopK 1 to 8, and 1 to 256 experts")
+        raise ValueError("Fused route counts require an NPU int64 matrix, TopK 1 to 8, and 1 to 512 experts")
 
 
 def try_count_payload(ids: torch.Tensor, num_experts: int) -> Optional[torch.Tensor]:
@@ -75,7 +81,11 @@ def try_count_payload(ids: torch.Tensor, num_experts: int) -> Optional[torch.Ten
     if (ids.device.type != "npu" or ids.dtype != torch.int64 or ids.ndim != 2
             or not 1 <= ids.shape[1] <= _MAXIMUM_TOP_K or not 1 <= num_experts <= _MAXIMUM_EXPERTS):
         return None
-    return launch_route_counts(ids, num_experts) if _counts_available(ids.device) else None
+    if not _counts_available(ids.device):
+        return None
+    if num_experts > 256 and num_experts > _count_expert_limit():
+        return None
+    return launch_route_counts(ids, num_experts)
 
 
 def launch_route_counts(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -83,13 +93,15 @@ def launch_route_counts(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
 
     Args:
         ids: NPU int64 matrix of per-token logical expert IDs.
-        num_experts: Logical experts, in the supported range 1 to 256.
+        num_experts: Logical experts, in the supported range 1 to 512 with count ABI 2.
 
     Returns:
         Invocation-owned int64 histogram followed by the collective validation flag.
     """
     _validate_input(ids, num_experts)
     library = _count_library()
+    if num_experts > _count_expert_limit():
+        raise ValueError("Rebuild the optional replica count library for more than 256 experts")
     with torch.npu.device(ids.device):
         source = ids.contiguous()
         stride = (num_experts + _STRIDE_ALIGNMENT) // _STRIDE_ALIGNMENT * _STRIDE_ALIGNMENT

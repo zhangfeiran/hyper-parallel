@@ -56,8 +56,6 @@ class MegaMoeSpec:
     replica_slots_per_rank: int = 0
     logical_num_experts: int = 0
     replica_transport: str = "p2p"
-    max_local_num_tokens: int | None = None
-    schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
 
@@ -65,11 +63,6 @@ class MegaMoeSpec:
     def dynamic_tokens(self) -> bool:
         """Report variable-length execution with automatic or bounded storage."""
         return self.auto_tokens or self.max_local_num_tokens is not None
-
-    @property
-    def plan_tokens(self) -> int:
-        """Return schedule coverage independently of reserved source storage."""
-        return self.local_num_tokens if self.schedule_tokens is None else self.schedule_tokens
 
     @property
     def plan_tokens(self) -> int:
@@ -86,9 +79,13 @@ class MegaMoeSpec:
         """Return the bound for dynamic growth without requiring preallocation."""
         if not self.replica_slots_per_rank:
             return _align_capacity(self.ep_size * self.routed_slots)
-        return ExpertReplicaConfig(
+        upper = ExpertReplicaConfig(
             self.logical_num_experts, self.ep_size, self.replica_slots_per_rank,
         ).maximum_receive_rows(self.local_num_tokens, self.top_k)
+        if self.dispatch_mode == 'pull':
+            return ExpertReplicaConfig(self.logical_num_experts, self.ep_size, 0).maximum_receive_rows(
+                self.local_num_tokens, self.top_k)
+        return max(upper, self.receive_capacity)
 
     @property
     def routed_slots(self) -> int:
@@ -126,16 +123,11 @@ def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tu
 
 
 def initial_receive_capacity(specification: Mapping[str, Any]) -> int:
-    """Resolve the initial allocation and apply the optional replica bound."""
+    """Resolve the receive reservation independently of the physical guest slot cap."""
     capacity = _resolve_receive_capacity(
         specification["initial_capacity_factor"],
         specification["local_num_tokens"] * specification["top_k"], specification["ep_size"],
     )
-    budget = specification.get("replica_slots_per_rank", 0)
-    if budget:
-        config = ExpertReplicaConfig(specification["logical_num_experts"], specification["ep_size"], budget)
-        capacity = min(capacity, config.maximum_receive_rows(
-            specification["local_num_tokens"], specification["top_k"]))
     return capacity
 
 

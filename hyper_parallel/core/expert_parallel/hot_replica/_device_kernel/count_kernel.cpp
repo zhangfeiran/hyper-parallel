@@ -20,11 +20,11 @@
 
 namespace {
 constexpr int kBlocks = 32;
-constexpr int kMaximumExperts = 256;
+constexpr int kMaximumExperts = 512;
 constexpr int kMaximumTopK = 8;
 constexpr int kTileRows = 128;
 constexpr int kStrideAlignment = 64;
-constexpr int kMaximumStride = 320;
+constexpr int kMaximumStride = 576;
 }  // namespace
 
 inline __gm__ struct OpSystemRunCfg g_opSystemRunCfg{0};
@@ -101,4 +101,4 @@ extern "C" int launch_replica_counts(void *stream, void *input, void *partials, 
   return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
 }
 
-extern "C" int replica_counts_abi_version() { return 1; }
+extern "C" int replica_counts_abi_version() { return 2; }
