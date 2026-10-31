@@ -24,6 +24,14 @@ import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.modules.engram import local_token_mask
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig, _integer
+from hyper_parallel.core.expert_parallel.hot_replica.native import (
+    combine_native_replicas, dispatch_native_replicas, native_replica_experts,
+)
+from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, stable_expert_order
+from hyper_parallel.core.expert_parallel.hot_replica.topology import _local_node_identity, _node_ids
+from hyper_parallel.distributed._builder.forward_rewriter import _install_bound_forward
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_forward,
@@ -150,10 +158,11 @@ def _routed_and_shared_forward(
             router_num_sequences, sequence_partition_groups=sequence_partition_groups,
         )
 
-    routed = ep_routed_forward(
-        module, hidden_states,
-        router_fn=_resolve_router(router_fn, ep_size=ep_size, fix_router=fix_router), ep_group=ep_group,
-    )
+    router_fn = _resolve_router(router_fn, ep_size=ep_size, fix_router=fix_router)
+    config = getattr(module.experts, "_native_replica_config", None)
+    routed = (_replica_routed_forward(module, hidden_states, router_fn, ep_group, config)
+              if config is not None else
+              ep_routed_forward(module, hidden_states, router_fn=router_fn, ep_group=ep_group))
     return routed + module.shared_experts(hidden_states)
 
 
@@ -197,6 +206,44 @@ def _resolve_router(router_fn: Callable, ep_size: int, fix_router: bool = False,
     return resolved_router
 
 
+def _replica_expert_forward(experts: Any, values: torch.Tensor, counts: torch.Tensor,
+                            route: ReplicaRoute) -> torch.Tensor:
+    """Read current FSDP-unsharded weights inside the experts module boundary."""
+    weights = tuple(parameter.to_local() if isinstance(parameter, DTensor) else parameter
+                    for parameter in (experts.gate_up_proj, experts.down_proj))
+    return native_replica_experts(
+        values, weights[0].transpose(1, 2).contiguous(), weights[1].transpose(1, 2).contiguous(),
+        counts, route, swiglu_limit=float(experts.limit),
+    )
+
+
+def _replica_routed_forward(module: Any, hidden_states: torch.Tensor, router_fn: Callable,
+                           ep_group: Any, config: ExpertReplicaConfig) -> torch.Tensor:
+    """Balance native receives before allocating the expert-major activation."""
+    indices, weights = router_fn(module, hidden_states)
+    states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    order = stable_expert_order(indices.reshape(-1), config.num_experts)
+    counts = torch.zeros(config.num_experts, dtype=torch.int64, device=states.device)
+    flat_ids = indices.reshape(-1).long()
+    counts.scatter_add_(0, flat_ids, torch.ones_like(flat_ids))
+    values = states[torch.div(order, indices.shape[-1], rounding_mode="floor")]
+    # Node identities are invariant for this configured expert subgroup.
+    if module.experts._native_replica_nodes is None:  # pylint: disable=protected-access
+        identities = [None] * config.ep_size
+        dist.all_gather_object(identities, _local_node_identity(), group=ep_group)
+        module.experts._native_replica_nodes = _node_ids(identities)
+    (values, received), dispatch = dispatch_native_replicas(
+        (values, counts), config, ep_group, minimum_replica_rows=0,
+        minimum_load_reduction=0.0, _rank_nodes=module.experts._native_replica_nodes,
+    )
+    output = module.experts(values, received, dispatch.route)
+    output = combine_native_replicas(output, dispatch)
+    unsorted = torch.empty_like(output)
+    unsorted[order] = output
+    routed = (unsorted.reshape(*indices.shape, states.shape[-1]) * weights.unsqueeze(-1)).sum(dim=1)
+    return routed.to(states.dtype).reshape(hidden_states.shape)
+
+
 @local_compute
 def deepseek_v41_ep_compute_fn(
         *,
@@ -207,6 +254,7 @@ def deepseek_v41_ep_compute_fn(
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
         fix_router: bool = False,
+        replica_slots_per_rank: int = 0,
 ) -> Callable:
     """Build V4.1 routed/shared computation with training-aware routing.
 
@@ -221,6 +269,7 @@ def deepseek_v41_ep_compute_fn(
         tp_mesh: Tensor-parallel mesh used to align router metadata and statistics.
         cp_mesh: Context-parallel mesh supplying token-partition statistics groups.
         ep_mesh: Expert-parallel mesh owning the routed experts.
+        replica_slots_per_rank: Native guest-slot cap; positive values enable lossless load balancing.
         use_grouped_gemm: Use the existing V4.1 clamped grouped-GEMM expert path.
         fix_router: Enable benchmark-only balanced destinations while retaining
             learned Top-K weights and their gradients. Normal training and
@@ -249,10 +298,24 @@ def deepseek_v41_ep_compute_fn(
         module.experts.forward_expert_major = MethodType(
             _deepseek_v41_grouped_expert_forward, module.experts,
         )
-    bind_local_expert_forward(
-        module, ep_size, use_grouped_gemm=use_grouped_gemm,
-        apply_gate=None if use_grouped_gemm else apply_gate,
-    )
+    _integer(replica_slots_per_rank, "replica_slots_per_rank", 0)
+    if replica_slots_per_rank:
+        if any(axis is not None and axis.size() > 1 for axis in (tp_mesh, cp_mesh)):
+            raise ValueError("DSV4.1 native replicas require TP=CP=1")
+        module.experts._native_replica_config = ExpertReplicaConfig(
+            module.experts.num_experts, ep_size, replica_slots_per_rank)
+        module.experts.local_expert_count = module.experts._native_replica_config.home_experts
+        module.experts._native_replica_nodes = None
+        module.experts.native_replica_policy = {
+            "budget": replica_slots_per_rank, "transport": "p2p", "planner": "cpu",
+            "min_rows": 0, "minimum_load_reduction": 0.0,
+        }
+        _install_bound_forward(module.experts, _replica_expert_forward)
+    else:
+        bind_local_expert_forward(
+            module, ep_size, use_grouped_gemm=use_grouped_gemm,
+            apply_gate=None if use_grouped_gemm else apply_gate,
+        )
 
     def auxiliary_compute_fn(
             module: Any,

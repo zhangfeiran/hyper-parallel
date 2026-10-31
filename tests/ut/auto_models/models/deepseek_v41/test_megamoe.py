@@ -145,6 +145,23 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
     # White-box assertions verify executor ownership and parameter lifetimes.
     # pylint: disable=protected-access
 
+    def test_replica_policy_reaches_external_weight_executor(self) -> None:
+        """Forward the adaptive cap and transport without allocating duplicate parameters."""
+        for budget, transport in ((0, "p2p"), (1, "shmem_signal_kernel_gradient_bands")):
+            with self.subTest(budget=budget):
+                experts = DeepseekV41MegaMoeExperts(
+                    module=_source(), replica_slots_per_rank=budget, replica_transport=transport)
+                group = object()
+                with patch("hyper_parallel.core.multicore.MegaMoeExperts") as executor:
+                    experts.configure(group, 2, 2)
+                options = executor.call_args.kwargs
+                self.assertEqual(options["replica_slots_per_rank"], budget)
+                self.assertEqual(options["replica_transport"], transport)
+                self.assertIs(options["ep_group"], group)
+                self.assertIs(options["create_parameters"], False)
+                self.assertEqual(set(experts.state_dict()), {"gate_up_proj", "down_proj"})
+                experts.close_runtime()
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_ordered_ep_subgroup_binds_without_world_size_assumption(self) -> None:

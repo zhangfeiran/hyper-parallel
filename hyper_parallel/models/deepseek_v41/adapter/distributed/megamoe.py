@@ -46,7 +46,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None,
                  dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
-                 capacity_growth_factor: float | None = None, initializer_range: float = 0.02) -> None:
+                 capacity_growth_factor: float | None = None, initializer_range: float = 0.02,
+                 replica_slots_per_rank: int = 0, replica_transport: str = "p2p") -> None:
         """Convert a full HF holder before EP partitioning and FSDP construction.
 
         Args:
@@ -57,6 +58,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             initial_capacity_factor: Push initial receive capacity; None uses the executor default.
             capacity_growth_factor: Push capacity growth multiplier; omit for pull.
             initializer_range: Standard deviation used for meta-model random initialization.
+            replica_slots_per_rank: Adaptive guest-slot cap; zero preserves owner-only execution.
+            replica_transport: Weight-copy and gradient-return transport for guest experts.
         """
         super().__init__()
         del module_fqn
@@ -71,6 +74,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         self.dispatch_mode = dispatch_mode
         self.initial_capacity_factor = initial_capacity_factor
         self.capacity_growth_factor = capacity_growth_factor
+        self.replica_slots_per_rank = replica_slots_per_rank
+        self.replica_transport = replica_transport
         source_limit = _swiglu_limit(module.limit)
         if not isinstance(module.act_fn, (nn.SiLU, type(ACT2FN["silu"]))):
             raise ValueError("MegaMoe Trainer replacement requires SiLU")
@@ -118,6 +123,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             dispatch_mode=self.dispatch_mode, initial_capacity_factor=self.initial_capacity_factor,
             capacity_growth_factor=self.capacity_growth_factor, swiglu_limit=self.swiglu_limit,
             create_parameters=False,
+            replica_slots_per_rank=self.replica_slots_per_rank, replica_transport=self.replica_transport,
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,

@@ -14,6 +14,8 @@
 # ============================================================================
 """V4.1 router and native-model auxiliary-loss integration tests."""
 
+from __future__ import annotations
+
 import copy
 import json
 import tempfile
@@ -225,6 +227,7 @@ class TestV41RouterAuxLoss(unittest.TestCase):
         router = Mock(return_value=(torch.empty(2, 3), torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.long)))
         experts = Mock(return_value=torch.zeros(2, 16))
         experts.limit = 0
+        experts._native_replica_config = None
         module = SimpleNamespace(
             gate=router, experts=experts, shared_experts=torch.zeros_like, is_hash=False,
             forward=lambda hidden_states, input_ids=None, router_token_mask=None: hidden_states,
