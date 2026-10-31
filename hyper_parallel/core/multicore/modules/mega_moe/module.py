@@ -168,6 +168,7 @@ class _MegaMoeExecutionResources:
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens,
+            self.spec.forward_ingress_mode,
         )
 
     def can_close(self) -> bool:
@@ -180,7 +181,7 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "ep_size")
+                  "dispatch_split", "combine_split", "swiglu_limit", "ep_size", "forward_ingress_mode")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v1", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
@@ -249,6 +250,7 @@ class MegaMoeExperts(MulticoreModule):
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
+        forward_ingress_mode: str = "legacy",
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -266,6 +268,9 @@ class MegaMoeExperts(MulticoreModule):
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
+            forward_ingress_mode: Experimental Ascend 950 BF16 ingress: "legacy" or
+                "indexed". Indexed requires static pull and uses Blaze F2 forward.
+                It preserves the legacy backward source capacity and receive layout.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
                 Must be a positive multiple of 128 that divides local_num_tokens.
             combine_split: Combine tile rows in forward and backward, with the same
@@ -282,6 +287,13 @@ class MegaMoeExperts(MulticoreModule):
                 one ordered EP membership active in SHMEM at a time.
         """
         reserved_tokens = _resolve_token_capacity(local_num_tokens, max_local_num_tokens, hidden_size, top_k)
+        if forward_ingress_mode not in ("legacy", "indexed"):
+            raise ValueError("forward_ingress_mode must be legacy or indexed")
+        if forward_ingress_mode != "legacy":
+            if dispatch_mode != "pull" or max_local_num_tokens is not None:
+                raise ValueError("Indexed forward ingress requires static pull dispatch")
+            if reserved_tokens * top_k > 2**24:
+                raise ValueError("Indexed scalar route sorting requires at most 2**24 route slots")
         specification = {
             "local_num_tokens": reserved_tokens,
             "hidden_size": hidden_size,
@@ -296,6 +308,7 @@ class MegaMoeExperts(MulticoreModule):
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
+            "forward_ingress_mode": forward_ingress_mode,
         }
         if max_local_num_tokens is not None:
             specification["max_local_num_tokens"] = max_local_num_tokens

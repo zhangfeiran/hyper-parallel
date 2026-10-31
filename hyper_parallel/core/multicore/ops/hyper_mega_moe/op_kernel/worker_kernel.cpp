@@ -25,6 +25,7 @@
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
 #include "runtime/bf16_clamp.h"
+#include "runtime/indexed_pull.h"
 
 using namespace AscendC;
 
@@ -80,7 +81,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteShmemPutMem(task_desc);
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
-        ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
+        if (task_desc.extra_value_0 == 16 && task_desc.inputs[1].dim[3] != 0) {
+          ExecuteIndexedPull<DTYPE_DISPATCH_TARGET>(task_desc, input_list, TILING_IDX);
+        } else {
+          ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
+        }
         break;
       default:
         break;

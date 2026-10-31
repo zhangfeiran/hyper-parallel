@@ -53,18 +53,22 @@ def _workspace_allocation_specs(
     ep_size: int,
     num_experts: int,
     dtype: torch.dtype,
+    forward_ingress_mode: str = "legacy",
 ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
     """Return the single ordered physical Allocation description for a workspace."""
     data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
     data_rows = routed_slots if dispatch_mode == "pull" else receive_capacity
     event_bytes = event_workspace_bytes(ep_size, num_experts)
     allocation_spec = _lifecycle._AllocationSpec  # pylint: disable=protected-access
-    return (
+    allocations = (
         (data_field, allocation_spec((data_rows, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
         ("routed_buffer", allocation_spec((routed_slots, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
         ("forward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
         ("backward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
     )
+    if forward_ingress_mode != "legacy":
+        allocations += (("route_metadata", allocation_spec((routed_slots, 4), torch.int32, _WORKSPACE_ALIGNMENT)),)
+    return allocations
 
 
 def _spec_workspace_bytes(
@@ -90,6 +94,7 @@ def _spec_workspace_bytes(
         ep_size=specification["ep_size"],
         num_experts=specification["num_experts"],
         dtype=dtype,
+        forward_ingress_mode=specification.get("forward_ingress_mode", "legacy"),
     )
     return sum(
         spec.dtype.itemsize * math.prod(spec.shape)
@@ -111,6 +116,7 @@ class MegaMoeWorkspace:
     source_buffer: Any | None = None
     expert_buffer: Any | None = None
     routed_buffer: Any | None = None
+    route_metadata: Any | None = None
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
     gmm_workspace: Any | None = None
@@ -138,6 +144,7 @@ class MegaMoeWorkspace:
             return ()
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
+            forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
             routed_slots=spec.routed_slots,
             receive_capacity=receive_capacity,
             hidden_size=spec.hidden_size,
@@ -167,6 +174,7 @@ class MegaMoeWorkspace:
             return False
         expected = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
+            forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
             routed_slots=spec.routed_slots,
             receive_capacity=current_capacity,
             hidden_size=spec.hidden_size,
@@ -195,6 +203,7 @@ class MegaMoeWorkspace:
         """Bind validated replacement Tensors without allocating or running collectives."""
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
+            forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
             routed_slots=spec.routed_slots,
             receive_capacity=receive_capacity,
             hidden_size=spec.hidden_size,
@@ -225,6 +234,7 @@ class MegaMoeWorkspace:
         """Validate a complete replacement slice without modifying workspace state."""
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
+            forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
             routed_slots=spec.routed_slots,
             receive_capacity=receive_capacity,
             hidden_size=spec.hidden_size,
@@ -292,6 +302,7 @@ class MegaMoeWorkspace:
 
         allocations = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
+            forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
             routed_slots=spec.routed_slots,
             receive_capacity=requested_capacity,
             hidden_size=spec.hidden_size,
@@ -384,13 +395,14 @@ class MegaMoeWorkspace:
         if self.closing:
             remaining = tuple(tensor is not None for tensor in (
                 self.source_buffer, self.expert_buffer, self.routed_buffer,
-                self.forward_event_counters, self.backward_event_counters))
+                self.forward_event_counters, self.backward_event_counters, self.route_metadata))
             if any(peer != remaining for peer in _automatic.exchange(remaining)):
                 raise RuntimeError("partial symmetric teardown differs across ranks; restart the process")
         for field_name in (
             "source_buffer",
             "expert_buffer",
             "routed_buffer",
+            "route_metadata",
             "forward_event_counters",
             "backward_event_counters",
         ):
@@ -424,6 +436,7 @@ class MegaMoeWorkspace:
                 self.source_buffer,
                 self.expert_buffer,
                 self.routed_buffer,
+                self.route_metadata,
                 self.forward_event_counters,
                 self.backward_event_counters,
                 self.gmm_workspace,

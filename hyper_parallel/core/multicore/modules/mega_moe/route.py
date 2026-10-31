@@ -51,12 +51,13 @@ class RouteMetadata:
 class PreparedTopKRoute:
     """Permuted payload and exact metadata for one Router decision."""
 
-    routed_tokens: torch.Tensor
+    routed_tokens: torch.Tensor | None
     unpermute_mapping: torch.Tensor
     tokens_per_expert: torch.Tensor
     received_counts: torch.Tensor
     metadata: RouteMetadata
     maximum_received_slots: int = 0
+    permute_src_index: torch.Tensor | None = None
 
 
 def _validate_topk_inputs(
@@ -236,6 +237,16 @@ def _compute_route_metadata(
     )
 
 
+def _build_route_indices(topk_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sort scalar route slots without constructing Top-K expanded token vectors."""
+    if topk_ids.numel() > 2**24:
+        raise ValueError("Indexed scalar route sorting requires at most 2**24 route slots")
+    route_slots = torch.arange(topk_ids.numel(), dtype=torch.float32, device=topk_ids.device).reshape(-1, 1)
+    permuted_slots, inverse_order = torch_npu.npu_moe_token_permute(route_slots, topk_ids.reshape(-1, 1))
+    return (permuted_slots.reshape(-1).to(torch.int32).contiguous(),
+            inverse_order.reshape(-1).to(torch.int32).contiguous())
+
+
 def prepare_topk_route(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -275,7 +286,11 @@ def prepare_topk_route(
         else:
             workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
-    if permutation_output is None:
+    permute_src_index = None
+    if spec.forward_ingress_mode != "legacy":
+        permute_src_index, unpermute_mapping = _build_route_indices(topk_ids)
+        routed_tokens = None
+    elif permutation_output is None:
         routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     else:
         routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
@@ -287,6 +302,7 @@ def prepare_topk_route(
         tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum_received_slots,
+        permute_src_index=permute_src_index,
         metadata=_compute_route_metadata(
             counts,
             counts_by_source,

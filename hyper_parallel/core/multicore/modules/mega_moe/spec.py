@@ -52,6 +52,7 @@ class MegaMoeSpec:
     swiglu_limit: float | None = None
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
+    forward_ingress_mode: str = "legacy"
 
     @property
     def plan_tokens(self) -> int:
@@ -183,6 +184,9 @@ def bind_mega_moe_spec(
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
+    forward_ingress_mode = specification.get("forward_ingress_mode", "legacy")
+    if forward_ingress_mode != "legacy" and num_cube_cores != 32:
+        raise ValueError("Indexed forward ingress requires the Ascend 950 32-Cube BF16 kernel.")
     initial_capacity_factor = specification["initial_capacity_factor"]
     swiglu_limit = specification["swiglu_limit"]
     receive_capacity = _resolve_receive_capacity(
@@ -208,4 +212,5 @@ def bind_mega_moe_spec(
         dispatch_split=specification.get("dispatch_split", _COMMUNICATION_SPLIT),
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
+        forward_ingress_mode=forward_ingress_mode,
     )

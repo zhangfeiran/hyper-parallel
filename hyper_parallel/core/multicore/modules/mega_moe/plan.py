@@ -49,7 +49,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
-from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue, TaskType
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 
 from .diagnostics import _mega_moe_owner_options
@@ -151,6 +151,17 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         spec.rank_id,
         spec.num_cube_cores,
     )
+    if spec.forward_ingress_mode != "legacy":
+        if spec.num_cube_cores != 32 or spec.dispatch_mode != "pull" or spec.max_local_num_tokens is not None:
+            raise ValueError("Indexed ingress requires the static Ascend 950 pull plan")
+        for task in forward_data.all_tasks[:forward_data.task_num]:
+            if task.task_type == TaskType.TASK_SHMEM_GET_MEM:
+                task.extra_value_0 = 16
+                task.extra_value_1 = 1
+                task.inputs[1].dim[3] = spec.top_k
+            elif task.task_type == TaskType.TASK_GROUPED_MATMUL:
+                # Blaze does not use the legacy GMM workspace tensor at port 16.
+                task.extra_value_1 = 2
     backward_graph = build_backward_graph(
         task_values,
         dispatch_sv=spec.dispatch_split,

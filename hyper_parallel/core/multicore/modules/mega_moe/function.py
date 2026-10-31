@@ -466,7 +466,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         route: RouteMetadata,
         plan: MegaMoePlan,
         workspace: MegaMoeWorkspace,
-        permutation: tuple[Any, Any, Any] | None,
+        permutation: tuple[Any, ...] | None,
         topk_weights: torch.Tensor | None,
         workspace_claimed: bool,
     ) -> Any:
@@ -493,11 +493,21 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
         metadata = route
         permutation_inputs = ()
+        indexed_ingress = getattr(spec, "forward_ingress_mode", "legacy") != "legacy"
+        permute_src_index = None
         if permutation is not None:
-            routed_tokens, _, unpermute_mapping = permutation
+            prepared_rows, _, unpermute_mapping = permutation[:3]
+            if indexed_ingress:
+                if len(permutation) != 4 or permutation[3] is None or prepared_rows is not None:
+                    raise ValueError("Indexed ingress requires scalar route indices and original token rows")
+                permute_src_index = permutation[3]
+            else:
+                routed_tokens = prepared_rows
             if ctx.needs_input_grad[0] or topk_weights is not None:
                 permutation_inputs = (unpermute_mapping,)
-        ctx.source_rows = routed_tokens.shape[0]
+        elif indexed_ingress:
+            raise ValueError("Indexed ingress requires a prepared Top-K route")
+        ctx.source_rows = routed_tokens.shape[0] * (spec.top_k if indexed_ingress else 1)
         ctx.token_rows = ctx.source_rows // spec.top_k
         ctx.has_permutation = permutation is not None
         ctx.has_unpermute = topk_weights is not None
@@ -517,6 +527,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 routed_tokens,
                 capacity,
             )
+            if indexed_ingress:
+                # Port 16 is unused by Blaze F2. Keep its read-only metadata in
+                # symmetric storage until the all-rank source-read completion.
+                metadata_buffer = _workspace_tensor(workspace.route_metadata, "route_metadata")
+                metadata_buffer[:, 0].copy_(permute_src_index)
+                execution = replace(execution, gmm_workspace=metadata_buffer.view(torch.uint8))
             _launch_forward_kernel(
                 plan,
                 metadata,
@@ -679,7 +695,7 @@ def execute_mega_moe_with_permutation(
         route.metadata,
         plan,
         workspace,
-        (route.routed_tokens, topk_ids, route.unpermute_mapping),
+        (route.routed_tokens, topk_ids, route.unpermute_mapping, getattr(route, "permute_src_index", None)),
         topk_weights,
         workspace_claimed,
     )
