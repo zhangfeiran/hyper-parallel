@@ -350,8 +350,10 @@ def _launch_forward_kernel(
         )
         return
 
+    diagnostic_parameters = (kernel_parameters if spec.forward_ingress_mode == "legacy"
+                             else (*kernel_parameters, execution.gmm_workspace))
     with plan.fwd_diagnostics.launch(
-        kernel_parameters,
+        diagnostic_parameters,
         direction="forward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
@@ -544,13 +546,19 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 # symmetric storage until the all-rank source-read completion.
                 metadata_storage = _workspace_tensor(workspace.route_metadata, "route_metadata")
                 metadata_buffer = metadata_storage[:ctx.source_rows]
-                metadata_buffer[:, 0].copy_(permute_src_index)
-                if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap"):
-                    metadata_buffer[:, 2].copy_(permutation[1].reshape(-1))
-                    metadata_buffer[:, 3].copy_(permutation[4])
-                    if spec.forward_ingress_mode == "peer_overlap":
-                        metadata_buffer[:, 1].copy_(_peer_owner_flags(
-                            permutation[1], permute_src_index, spec.local_experts))
+                if spec.forward_ingress_mode == "peer_token":
+                    # Packed records are indexed by original slot. The gap up to
+                    # NK*16 bytes preserves the common diagnostic-tail address.
+                    packed = torch.stack((permutation[1].reshape(-1).to(torch.int32), permutation[4]), dim=1)
+                    metadata_storage.view(-1)[:ctx.source_rows * 2].view(-1, 2).copy_(packed)
+                else:
+                    metadata_buffer[:, 0].copy_(permute_src_index)
+                    if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap"):
+                        metadata_buffer[:, 2].copy_(permutation[1].reshape(-1))
+                        metadata_buffer[:, 3].copy_(permutation[4])
+                        if spec.forward_ingress_mode == "peer_overlap":
+                            metadata_buffer[:, 1].copy_(_peer_owner_flags(
+                                permutation[1], permute_src_index, spec.local_experts))
                 execution = replace(execution, gmm_workspace=metadata_storage.view(torch.uint8))
             if getattr(plan, "ingress_diagnostics", None) is not None:
                 ingress_plan = replace(plan, fwd_diagnostics=plan.ingress_diagnostics, ingress_diagnostics=None)

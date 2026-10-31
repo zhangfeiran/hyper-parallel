@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from copy import copy
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -50,7 +51,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_up_proj_tiling_bytes,
 )
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue, TaskType
-from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
+from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, SplitSpec, TensorSpec
 
 from .diagnostics import _mega_moe_owner_options
 from .spec import MegaMoeSpec
@@ -166,6 +167,10 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
                 task.extra_value_1 = 2
     if spec.forward_ingress_mode == "peer_overlap":
         _configure_owner_prefix(forward_data)
+    elif spec.forward_ingress_mode == "peer_token":
+        _configure_token_prefix(forward_graph, forward_data, spec)
+    if spec.forward_ingress_mode != "legacy":
+        _attach_route_metadata_input(forward_graph, spec)
     backward_graph = build_backward_graph(
         task_values,
         dispatch_sv=spec.dispatch_split,
@@ -205,7 +210,9 @@ def _prepare_diagnostics(
         **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
     }
     return (
-        prepare_mega_kernel_diagnostics(forward_graph, forward_config, parameter_count=16, **options),
+        prepare_mega_kernel_diagnostics(
+            forward_graph, forward_config, parameter_count=17 if spec.forward_ingress_mode != "legacy" else 16,
+            **options),
         prepare_mega_kernel_diagnostics(backward_graph, backward_config, parameter_count=20, **options),
     )
 
@@ -224,9 +231,80 @@ def _configure_owner_prefix(config: Any) -> None:
         config.vector_task_indices[position] = index
 
 
+def _attach_route_metadata_input(graph: ComputeGraph, spec: MegaMoeSpec) -> None:
+    """Expose the complete port-16 binding without adding a Device task."""
+    rows = spec.routed_slots + 8 * spec.num_experts * ((spec.routed_slots + 127) // 128)
+    metadata = TensorSpec("route_metadata_workspace", [rows, 16], param_position=16, dtype_size=1)
+    node = OperatorNode(
+        name="route_metadata", op_type=OpType.AIV_PIPELINE, inputs=[metadata], outputs=[],
+        param_positions=[16], split_value=1,
+        split_spec=SplitSpec(split_inputs=None, task_num_fn=lambda _: 0),
+        tiling_position=-1, fill_config=None,
+    )
+    graph.add_op(node).add_edge(node, graph.get_op("dispatch"))
+    source = graph.get_op("dispatch").inputs[1]
+    source.shape = [spec.local_num_tokens, spec.hidden_size]
+
+
+def _configure_token_prefix(graph: ComputeGraph, config: Any, spec: MegaMoeSpec) -> None:
+    """Compact canonical descriptors while preserving every math and Combine queue."""
+    dispatch = graph.get_op("dispatch")
+    old_dispatch_count = dispatch.task_num
+    token_jobs = spec.ep_size * (spec.local_num_tokens // spec.dispatch_split)
+    if token_jobs > old_dispatch_count or token_jobs == 0:
+        raise RuntimeError("Token dispatch exceeds the canonical descriptor reservation")
+    if any(bytes(event).strip(b"\0") for event in config.all_events):
+        raise RuntimeError("Token compaction cannot remap auxiliary EventDesc task references")
+    original = [type(task).from_buffer_copy(bytes(task)) for task in config.all_tasks[:config.task_num + 1]]
+    queues = [list(indices[:count]) for indices, count in zip(
+        (config.cube_task_indices, config.vector_task_indices, config.mix_task_indices), config.task_index_num[:3])]
+    event_base = original[0].trigger_event
+    for index in range(token_jobs):
+        task = original[index]
+        task.task_type = TaskType.TASK_MOE_TOKEN_GET
+        task.task_index = index
+        task.task_split_num = token_jobs
+        task.task_split_value = spec.dispatch_split
+        task.trigger_event = event_base
+        task.dependent_event = 0xFFFFFFFF
+        task.extra_value_1 = 5
+        config.all_tasks[index] = task
+    for index, task in enumerate(original[old_dispatch_count:], start=token_jobs):
+        config.all_tasks[index] = task
+    shift = old_dispatch_count - token_jobs
+    for kind, (indices, queued) in enumerate(zip(
+            (config.cube_task_indices, config.vector_task_indices, config.mix_task_indices), queues)):
+        retained = [int(index) - shift for index in queued if index >= old_dispatch_count]
+        if kind == 1:
+            retained = list(range(token_jobs)) + retained
+        config.task_index_num[kind] = len(retained)
+        for position, index in enumerate(retained):
+            indices[position] = index
+    config.task_num -= shift
+    dispatch.task_num = token_jobs
+    dispatch.diagnostic_name = "DispatchToken"
+    dispatch.split_spec = replace(dispatch.split_spec, task_num_fn=lambda topology: (
+        topology.ep * (topology.per_expert_seq_to_other // spec.dispatch_split)))
+
+
+def _ingress_graph(forward_graph: ComputeGraph) -> ComputeGraph:
+    """Describe only the tasks actually scheduled by the independent prepass."""
+    graph = ComputeGraph()
+    metadata = copy(forward_graph.get_op("route_metadata"))
+    metadata.predecessors = []
+    metadata.successors = []
+    graph.add_op(metadata)
+    dispatch = copy(forward_graph.get_op("dispatch"))
+    dispatch.predecessors = []
+    dispatch.successors = []
+    dispatch.diagnostic_name = "DispatchDedup"
+    graph.add_op(dispatch).add_edge(metadata, dispatch)
+    return graph
+
+
 def _row_credit_element_offset(config: Any, spec: MegaMoeSpec) -> int | None:
     """Resolve the device INT32 threshold slice from actual Up-projection dependencies."""
-    if spec.forward_ingress_mode != "peer_overlap":
+    if spec.forward_ingress_mode not in ("peer_overlap", "peer_token"):
         return None
     start = int(config.all_tasks[0].trigger_event)
     for task in config.all_tasks[:config.task_num]:
@@ -242,6 +320,7 @@ def _build_ingress_config(forward_config: Any) -> Any:
     config = type(forward_config).from_buffer_copy(bytes(forward_config))
     task_ids = [int(config.vector_task_indices[index]) for index in range(config.task_index_num[1])]
     gets = [index for index in task_ids if config.all_tasks[index].task_type == TaskType.TASK_SHMEM_GET_MEM]
+    config.task_num = len(gets)
     config.task_index_num[0] = 0
     config.task_index_num[1] = len(gets)
     config.all_event_num_triggers[0] = len(gets)
@@ -274,7 +353,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         topology = _build_task_values(spec)
         topology.rank_id = spec.rank_id
         ingress_diagnostics = prepare_mega_kernel_diagnostics(
-            forward_graph, _build_ingress_config(forward_config), parameter_count=16,
+            _ingress_graph(forward_graph), _build_ingress_config(forward_config), parameter_count=17,
             kernel_name="mega_moe_ingress", device=device,
             rank=dist.get_rank() if dist.is_initialized() else spec.rank_id,
             **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),

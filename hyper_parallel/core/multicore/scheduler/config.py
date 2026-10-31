@@ -119,6 +119,7 @@ class TaskType(IntEnum):
     TASK_GATE_GRAD_ZEROS                  = 140
     TASK_SHMEM_GET_MEM              = 141
     TASK_MOE_OWNER_GET              = 142
+    TASK_MOE_TOKEN_GET              = 143
 
 
 class EventType(IntEnum):
@@ -482,6 +483,7 @@ def validate_runtime_config(
             TaskType.TASK_SHMEM_PUT_MEM_SIGNAL,
             TaskType.TASK_SHMEM_GET_MEM,
             TaskType.TASK_MOE_OWNER_GET,
+            TaskType.TASK_MOE_TOKEN_GET,
         ):
             continue
         _validate_task_bounds(task, descriptor_index)

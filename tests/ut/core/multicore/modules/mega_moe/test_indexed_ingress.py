@@ -24,12 +24,13 @@ import torch
 from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.plan import (
-    _build_ingress_config, _build_runtime_artifacts, _row_credit_element_offset,
+    _build_ingress_config, _build_runtime_artifacts, _ingress_graph, _row_credit_element_offset,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.function import _patch_forward_row_thresholds
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import _workspace_allocation_specs
 from hyper_parallel.core.multicore.scheduler.config import TaskType
+from hyper_parallel.core.multicore.diagnostics import validate_mega_kernel_diagnostic_contract
 
 
 class TestIndexedIngress(unittest.TestCase):
@@ -195,3 +196,44 @@ class TestIndexedIngress(unittest.TestCase):
         flags = route_module._peer_owner_flags(ids, slots, 4)
         expected = torch.tensor([1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0], dtype=torch.int32)
         torch.testing.assert_close(flags, expected[slots.long()])
+
+    def test_token_jobs_compact_descriptors_preserve_math_and_cover_all_graph_tasks(self) -> None:
+        """Include N128 where dividing the token-job count by E would produce zero."""
+        for n in (128, 2048, 8192):
+            for rank in range(4):
+                spec = MegaMoeSpec(n, 5120, 1792, 32, 8, None, n * 8, 4, None, rank, 32,
+                                   dispatch_mode="pull", forward_ingress_mode="peer_token")
+                graph, current, _, backward = _build_runtime_artifacts(spec)
+                _, reference, _, old_backward = _build_runtime_artifacts(replace(spec, forward_ingress_mode="indexed"))
+                self.assertEqual(bytes(backward), bytes(old_backward), "Token jobs changed backward bytes")
+                jobs = 4 * n // 128
+                old_jobs = 32 * n // 128
+                shift = old_jobs - jobs
+                self.assertEqual(graph.get_op("dispatch").task_num, jobs)
+                self.assertEqual(current.task_num, reference.task_num - shift)
+                self.assertEqual(list(current.vector_task_indices[:jobs]), list(range(jobs)))
+                for i in range(jobs):
+                    task = current.all_tasks[i]
+                    self.assertEqual((task.task_type, task.task_index, task.trigger_event, task.extra_value_1),
+                                     (TaskType.TASK_MOE_TOKEN_GET, i, rank * 8 + 1, 5))
+                for i in range(old_jobs, reference.task_num + 1):
+                    self.assertEqual(bytes(current.all_tasks[i - shift]), bytes(reference.all_tasks[i]),
+                                     f"Math/Combine/terminal descriptor changed at {i}")
+                validate_mega_kernel_diagnostic_contract(graph, current, parameter_count=17)
+                with self.assertRaises(ValueError):
+                    validate_mega_kernel_diagnostic_contract(graph, current, parameter_count=16)
+                self.assertEqual(graph.get_op("route_metadata").task_num, 0)
+                self.assertEqual(graph.get_op("route_metadata").param_positions, [16])
+                self.assertEqual(graph.get_op("dispatch").inputs[1].shape, [n, 5120])
+
+    def test_prepass_diagnostic_graph_queues_every_declared_task(self) -> None:
+        """The prepass cannot advertise unscheduled GMM/SwiGLU/Combine stages to tools."""
+        for n in (128, 8192):
+            spec = MegaMoeSpec(n, 5120, 1792, 32, 8, None, n * 8, 4, None, 0, 32,
+                               dispatch_mode="pull", forward_ingress_mode="peer_dedup")
+            graph, config, _, _ = _build_runtime_artifacts(spec)
+            ingress = _ingress_graph(graph)
+            prepass = _build_ingress_config(config)
+            self.assertEqual(prepass.task_num, graph.get_op("dispatch").task_num)
+            self.assertEqual(len(ingress.topological_sort()), 2)
+            validate_mega_kernel_diagnostic_contract(ingress, prepass, parameter_count=17)

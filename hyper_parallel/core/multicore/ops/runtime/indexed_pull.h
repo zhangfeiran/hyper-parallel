@@ -150,6 +150,117 @@ namespace MulticoreRuntime {
     PipeBarrier<PIPE_ALL>();
   }
 
+  template <typename T, bool Count = false>
+  __aicore__ inline void PullTokenBlocks(
+      const TaskDesc &task, __gm__ T *source, __gm__ T *destination, __gm__ int32_t *remote_metadata,
+      __gm__ int64_t *target_offsets, __gm__ int32_t *event_counters, uint64_t scratch,
+      int64_t token_start, int64_t token_rows, int64_t hidden, uint32_t top_k,
+      int64_t rank, int64_t source_pe, int64_t local_experts, int64_t source_tokens, uint64_t *statistics) {
+    constexpr uint64_t META_BYTES = 8192;
+    constexpr uint64_t CREDIT_BYTES = 64 * sizeof(int32_t);
+    constexpr int64_t CHUNK = 3072;
+    auto *metadata = reinterpret_cast<__ubuf__ int32_t *>(scratch);
+    auto *credits = reinterpret_cast<__ubuf__ int32_t *>(scratch + META_BYTES);
+    auto *values = reinterpret_cast<__ubuf__ T *>(scratch + META_BYTES + CREDIT_BYTES);
+    for (int64_t expert = 0; expert < local_experts; ++expert) { credits[expert] = 0; }
+    int64_t metadata_tokens = META_BYTES / (top_k * 2 * sizeof(int32_t));
+    for (int64_t begin = 0; begin < token_rows; begin += metadata_tokens) {
+      int64_t rows = token_rows - begin < metadata_tokens ? token_rows - begin : metadata_tokens;
+      uint64_t metadata_bytes = rows * top_k * 2 * sizeof(int32_t);
+      aclshmemi_copy_gm2ub(metadata, remote_metadata + (token_start + begin) * top_k * 2, metadata_bytes);
+      if constexpr (Count) { statistics[2] += metadata_bytes; }
+      AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+      AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+      for (int64_t row = 0; row < rows; ++row) {
+        auto *route = metadata + row * top_k * 2;
+        bool wanted = false;
+        for (uint32_t selected = 0; selected < top_k; ++selected) {
+          if (route[selected * 2] / local_experts == rank) { wanted = true; break; }
+        }
+        if (!wanted) { continue; }
+        if constexpr (Count) { ++statistics[3]; }
+        int64_t token = token_start + begin + row;
+        for (int64_t col = 0; col < hidden; col += CHUNK) {
+          int64_t elements = hidden - col < CHUNK ? hidden - col : CHUNK;
+          uint64_t bytes = elements * sizeof(T);
+          aclshmemi_copy_gm2ub(values, source + token * hidden + col, bytes);
+          if constexpr (Count) { statistics[0] += bytes; }
+          AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
+          AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
+          for (uint32_t selected = 0; selected < top_k; ++selected) {
+            int64_t expert = route[selected * 2];
+            if (expert / local_experts != rank) { continue; }
+            int64_t ordinal = route[selected * 2 + 1];
+            if (ordinal < 0 || ordinal >= source_tokens) { AscendC::Trap(); }
+            int64_t offset = target_offsets[source_pe * local_experts + expert % local_experts];
+            aclshmemi_copy_ub2gm(destination + offset + ordinal * hidden + col, values, bytes);
+            if constexpr (Count) { statistics[1] += bytes; }
+          }
+          AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+          AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        }
+        for (uint32_t selected = 0; selected < top_k; ++selected) {
+          int64_t expert = route[selected * 2];
+          if (expert / local_experts == rank) { ++credits[expert % local_experts]; }
+        }
+      }
+    }
+    // Keep deltas live across all metadata blocks. Publish each complete row
+    // once, after the entire original-token job has drained every fanout store.
+    PipeBarrier<PIPE_ALL>();
+    for (int64_t expert = 0; expert < local_experts; ++expert) {
+      int32_t delta = credits[expert];
+      if (delta != 0) {
+        (void)AscendC::AtomicAdd<int32_t>(event_counters + task.trigger_event + expert, delta);
+      }
+    }
+    PipeBarrier<PIPE_ALL>();
+  }
+
+  template <typename T>
+  __aicore__ inline void ExecuteTokenPull(const TaskDesc &task, GM_ADDR *input_list, uint32_t tiling_index) {
+#ifdef __DAV_CUBE__
+    AscendC::Trap();
+#else
+    namespace plane = hyper_parallel::multicore::shmem::data_plane;
+    int64_t ep = getExtraValueFromTiling(input_list[tiling_index], 1);
+    int64_t experts = getExtraValueFromTiling(input_list[tiling_index], 2);
+    int64_t hidden = getExtraValueFromTiling(input_list[tiling_index], 3);
+    int64_t tokens = getExtraValueFromTiling(input_list[tiling_index], 4);
+    int64_t rank = getExtraValueFromTiling(input_list[tiling_index], 0) % ep;
+    uint32_t top_k = task.inputs[1].dim[3];
+    int64_t blocks = (tokens + task.task_split_value - 1) / task.task_split_value;
+    int64_t source_pe = task.task_index / blocks;
+    int64_t token_start = (task.task_index % blocks) * task.task_split_value;
+    int64_t token_rows = tokens - token_start < task.task_split_value ? tokens - token_start : task.task_split_value;
+    uint64_t scratch;
+    uint64_t capacity;
+    constexpr uint64_t REQUIRED_BYTES = 8192 + 64 * sizeof(int32_t) + 3072 * sizeof(T);
+    if (top_k == 0 || top_k > 16 || source_pe >= ep || experts / ep > 64 ||
+        !hyper_parallel::multicore::shmem::cann::device::query_mte_resources(source_pe, scratch, capacity) ||
+        capacity < REQUIRED_BYTES || scratch + REQUIRED_BYTES > 192 * 1024) {
+      AscendC::Trap();
+    }
+    auto *source = reinterpret_cast<__gm__ T *>(plane::remote_ptr(input_list[2], source_pe));
+    auto *metadata = reinterpret_cast<__gm__ int32_t *>(plane::remote_ptr(input_list[16], source_pe));
+    if (source == nullptr || metadata == nullptr) { AscendC::Trap(); }
+    auto *destination = reinterpret_cast<__gm__ T *>(input_list[0]);
+    auto *target_offsets = reinterpret_cast<__gm__ int64_t *>(input_list[1]);
+    auto *event_counters = reinterpret_cast<__gm__ int32_t *>(input_list[24]);
+    uint64_t statistics[4] = {0, 0, 0, 0};
+    if (task.inputs[1].dim[2] == 1) {
+      PullTokenBlocks<T, true>(task, source, destination, metadata, target_offsets, event_counters, scratch,
+                              token_start, token_rows, hidden, top_k, rank, source_pe, experts / ep,
+                              tokens, statistics);
+    } else {
+      PullTokenBlocks<T, false>(task, source, destination, metadata, target_offsets, event_counters, scratch,
+                               token_start, token_rows, hidden, top_k, rank, source_pe, experts / ep,
+                              tokens, statistics);
+    }
+    StoreIngressStatistics(task, input_list[16], tokens, statistics);
+#endif
+  }
+
   template <typename T>
   __aicore__ inline void ExecuteIndexedPull(const TaskDesc &task, GM_ADDR *input_list, uint32_t tiling_index) {
 #ifdef __DAV_CUBE__

@@ -237,7 +237,7 @@ def _compute_route_metadata(
         ).to(torch.int64),
         expert_capacity=expert_capacity,
         expert_row_counts=(received_counts.sum(0, dtype=torch.int32)
-                           if spec.forward_ingress_mode == "peer_overlap" else None),
+                           if spec.forward_ingress_mode in ("peer_overlap", "peer_token") else None),
     )
 
 
@@ -329,7 +329,7 @@ def prepare_topk_route(
         maximum_received_slots=maximum_received_slots,
         permute_src_index=permute_src_index,
         peer_row_ordinals=(_peer_row_ordinals(topk_ids, permute_src_index, counts)
-                           if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap") else None),
+                           if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap", "peer_token") else None),
         metadata=_compute_route_metadata(
             counts,
             counts_by_source,

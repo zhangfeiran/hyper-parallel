@@ -53,7 +53,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   __aicore__ inline void PrepareIngressThresholds() {
     TaskDesc first;
     getTaskDesc(this->runtimeConfigPtr, &first, 0);
-    if (first.task_type != TaskType::TASK_MOE_OWNER_GET) { return; }
+    if (first.task_type != TaskType::TASK_MOE_OWNER_GET && first.task_type != TaskType::TASK_MOE_TOKEN_GET) { return; }
     uint32_t local_experts = getExtraValueFromTiling(input_list[TILING_IDX], 2) /
                              getExtraValueFromTiling(input_list[TILING_IDX], 1);
     // The host patched this image on the launch stream. Expected values remain
@@ -94,6 +94,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         break;
       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
         ExecuteShmemPutMem(task_desc);
+        break;
+      case TaskType::TASK_MOE_TOKEN_GET:
+        ExecuteTokenPull<DTYPE_DISPATCH_TARGET>(task_desc, input_list, TILING_IDX);
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
       case TaskType::TASK_MOE_OWNER_GET:
