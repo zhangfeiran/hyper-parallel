@@ -415,6 +415,19 @@ def _validate_shmem_task(task: TaskDescC, descriptor_index: int, tsv: TaskSplitV
         )
 
 
+def _validate_token_task(task: TaskDescC, descriptor_index: int, tsv: TaskSplitValue) -> None:
+    """Validate original-token jobs without the expert-partitioned SHMEM rule."""
+    split = int(task.task_split_value)
+    tokens = tsv.per_expert_seq_to_other
+    if split <= 0 or tokens % split:
+        raise ValueError(f"Token task {descriptor_index} does not partition the source token rows")
+    blocks = tokens // split
+    if blocks == 0 or task.task_split_num != tsv.ep * blocks or task.task_index >= tsv.ep * blocks:
+        raise ValueError(f"Token task {descriptor_index} has invalid source block coordinates")
+    if task.inputs[1].dim[3] != tsv.top_k or task.extra_value_0 != 16 or task.extra_value_1 != 5:
+        raise ValueError(f"Token task {descriptor_index} has an invalid packed route contract")
+
+
 def _validate_runtime_task_queues(cfg: RuntimeConfigC, event_capacity: int) -> None:
     """Validate scheduled task IDs and their event ranges."""
     queues = (cfg.cube_task_indices, cfg.vector_task_indices, cfg.mix_task_indices)
@@ -492,6 +505,8 @@ def validate_runtime_config(
             _validate_swiglu_task(task, descriptor_index, group_size)
         elif task_type == TaskType.TASK_GROUPED_MATMUL:
             _validate_gmm_task(task, descriptor_index, num_cube_cores * local_experts)
+        elif task_type == TaskType.TASK_MOE_TOKEN_GET:
+            _validate_token_task(task, descriptor_index, tsv)
         else:
             _validate_shmem_task(task, descriptor_index, tsv)
 

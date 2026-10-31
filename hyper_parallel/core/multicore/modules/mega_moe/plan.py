@@ -50,7 +50,9 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
-from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue, TaskType
+from hyper_parallel.core.multicore.scheduler.config import (
+    TaskAiCoreType, TaskSplitValue, TaskType, validate_runtime_config,
+)
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, SplitSpec, TensorSpec
 
 from .diagnostics import _mega_moe_owner_options
@@ -170,6 +172,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
     elif spec.forward_ingress_mode == "peer_token":
         _configure_token_prefix(forward_graph, forward_data, spec)
     if spec.forward_ingress_mode != "legacy":
+        validate_runtime_config(forward_data, task_values, spec.num_cube_cores)
         _attach_route_metadata_input(forward_graph, spec)
     backward_graph = build_backward_graph(
         task_values,
@@ -262,6 +265,7 @@ def _configure_token_prefix(graph: ComputeGraph, config: Any, spec: MegaMoeSpec)
     for index in range(token_jobs):
         task = original[index]
         task.task_type = TaskType.TASK_MOE_TOKEN_GET
+        task.task_aicore_type = TaskAiCoreType.TASK_AICORE_VECTOR
         task.task_index = index
         task.task_split_num = token_jobs
         task.task_split_value = spec.dispatch_split

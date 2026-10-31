@@ -29,7 +29,8 @@ from hyper_parallel.core.multicore.modules.mega_moe.plan import (
 from hyper_parallel.core.multicore.modules.mega_moe.function import _patch_forward_row_thresholds
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import _workspace_allocation_specs
-from hyper_parallel.core.multicore.scheduler.config import TaskType
+from hyper_parallel.core.multicore.scheduler.config import TaskType, validate_runtime_config
+from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_task_values
 from hyper_parallel.core.multicore.diagnostics import validate_mega_kernel_diagnostic_contract
 
 
@@ -219,6 +220,7 @@ class TestIndexedIngress(unittest.TestCase):
                 for i in range(old_jobs, reference.task_num + 1):
                     self.assertEqual(bytes(current.all_tasks[i - shift]), bytes(reference.all_tasks[i]),
                                      f"Math/Combine/terminal descriptor changed at {i}")
+                validate_runtime_config(current, _build_task_values(spec), spec.num_cube_cores)
                 validate_mega_kernel_diagnostic_contract(graph, current, parameter_count=17)
                 with self.assertRaises(ValueError):
                     validate_mega_kernel_diagnostic_contract(graph, current, parameter_count=16)

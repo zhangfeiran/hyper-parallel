@@ -54,21 +54,21 @@ class TestTorchOps(unittest.TestCase):
         ):
             ops._load_native()
 
-    def test_successful_registration_is_cached(self):
+    def test_successful_registration_is_cached(self) -> None:
         """Load the adapter only once across repeated operation calls."""
         with (
             patch.object(ops, "get_multicore_paths", return_value=(Path("vendor"), Path("good.so"))),
             patch.object(ops, "preload_vendor_library") as preload,
             patch.object(ops.torch.ops, "load_library") as load,
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version",
-                         return_value=1, create=True) as version,
+                         return_value=5, create=True) as version,
             patch.object(ops.torch.ops.hyper_parallel, "mega_moe_grad", self._backward_op(), create=True) as backward,
         ):
             ops._load_native()
             ops._load_native()
             preload.assert_called_once_with(Path("vendor"))
             load.assert_called_once_with("good.so")
-            for protocol, alias, message in ((0, "a", "transport ABI"), (1, "e", "storage reuse")):
+            for protocol, alias, message in ((0, "a", "transport ABI"), (5, "e", "storage reuse")):
                 ops._load_native.cache_clear()
                 version.return_value = protocol
                 backward.default._schema = self._backward_op(alias).default._schema
