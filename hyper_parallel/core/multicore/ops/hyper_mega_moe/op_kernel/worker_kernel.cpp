@@ -75,6 +75,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         break;
       case TaskType::TASK_GROUPED_MATMUL:
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        if (task_desc.extra_value_2 == MulticoreBf16::TILE_READY_TAG &&
+            (task_desc.extra_value_1 != 2 || task_desc.outputs[0].input_position != 7 ||
+             task_desc.extra_value_0 == 0 || task_desc.extra_value_0 > 16 ||
+             task_desc.dependent_event != EVENT_INVALID_ID ||
+             !AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value)) {
+          AscendC::Trap();
+        }
         if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
           if (task_desc.extra_value_1 == 1) {
             MulticoreBf16::ExecuteCgmctTask(task_desc, input_list, this->core_num);

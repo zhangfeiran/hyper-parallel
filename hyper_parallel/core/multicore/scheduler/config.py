@@ -392,6 +392,10 @@ def _validate_swiglu_task(task: TaskDescC, descriptor_index: int, group_size: in
 
 def _validate_gmm_task(task: TaskDescC, descriptor_index: int, expected_tasks: int) -> None:
     """Validate that every local expert owns one task per Cube core."""
+    if task.extra_value_2 == 0x4D54494C and (
+            task.extra_value_1 != 2 or task.dependent_event != 0xFFFFFFFF
+            or not 1 <= task.extra_value_0 <= 16 or task.outputs[0].input_position != 7):
+        raise ValueError(f"GMM task {descriptor_index} has an invalid tile-ready input contract")
     if task.task_split_num != expected_tasks:
         raise ValueError(
             f"GMM task {descriptor_index} has task_split_num {task.task_split_num}; "

@@ -299,3 +299,19 @@ class TestIndexedIngress(unittest.TestCase):
         torch.testing.assert_close(allocation[:prefix], original[:prefix])
         torch.testing.assert_close(allocation[prefix:rows], torch.zeros_like(allocation[prefix:rows]))
         torch.testing.assert_close(allocation[rows:], original[rows:])
+
+    def test_tile_ready_rejects_unsupported_selector_and_dependency_contract(self) -> None:
+        """A marked Up task cannot silently enter generic GMM without its input fence."""
+        spec = MegaMoeSpec(128, 5120, 1792, 32, 8, None, 1024, 4, None, 0, 32,
+                           dispatch_mode="pull", forward_ingress_mode="peer_tile")
+        reference = _build_runtime_artifacts(spec)[1]
+        for field, value in (("extra_value_1", 0), ("extra_value_1", 3),
+                             ("extra_value_0", 0), ("extra_value_0", 17), ("dependent_event", 1)):
+            with self.subTest(field=field, value=value):
+                config = type(reference).from_buffer_copy(bytes(reference))
+                task = next(task for task in config.all_tasks[:config.task_num]
+                            if task.task_type == TaskType.TASK_GROUPED_MATMUL
+                            and task.outputs[0].input_position == 7)
+                setattr(task, field, value)
+                with self.assertRaisesRegex(ValueError, "tile-ready"):
+                    validate_runtime_config(config, _build_task_values(spec), spec.num_cube_cores)

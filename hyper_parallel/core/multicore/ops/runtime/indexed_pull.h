@@ -6,7 +6,7 @@
 #ifndef HYPER_PARALLEL_INDEXED_PULL_H
 #define HYPER_PARALLEL_INDEXED_PULL_H
 
-#include "bf16_gmm/tile_ready.h"
+#include "../bf16_gmm/tile_ready.h"
 
 // Forward-only scalar route publication at port 16. Blaze F2 leaves this
 // legacy workspace argument unused; all backward transport remains unchanged.
