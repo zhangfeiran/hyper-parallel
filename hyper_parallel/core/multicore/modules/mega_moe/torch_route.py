@@ -116,10 +116,15 @@ def _restore_torch_output_grad_out(
     if source_order.numel() == 0:
         return torch.zeros_like(weights) if need_weight_grad else None
     if _is_supported(expert_output, source_order, weights):
+        source_ordered = (need_weight_grad and weights.dtype == torch.float32
+                          and (expert_output.shape[-1], weights.shape[1]) == (5120, 6))
         product = _kernel(expert_output.shape[-1], weights.shape[1], expert_output.device.index).gradients(
-            expert_output, scores, source_order, grad_output, out, need_weight_grad)
+            expert_output, scores, source_order, grad_output, out, need_weight_grad,
+            source_ordered=source_ordered)
         if not need_weight_grad:
             return None
+        if source_ordered:
+            return product.reshape(weights.shape)
         grad_scores = product.reshape(-1)
     else:
         grad_weighted = torch.index_select(grad_output, 0, token_ids)

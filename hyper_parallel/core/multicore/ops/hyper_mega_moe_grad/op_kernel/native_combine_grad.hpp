@@ -16,19 +16,23 @@ namespace MulticoreRuntime {
 __aicore__ inline void NativeBitCombineGrad(
   GM_ADDR expert_output, GM_ADDR grad_output, GM_ADDR scores, GM_ADDR source_order,
   GM_ADDR grad_expert, GM_ADDR product_output, uint32_t rows, uint32_t hidden, uint32_t top_k,
-  uint32_t need_weight_grad, uint32_t worker, uint32_t workers, bool reduce_scores) {
+  uint32_t need_weight_grad, uint32_t worker, uint32_t workers, uint32_t score_mode) {
 #ifndef __DAV_C220_CUBE__
   using Element = DTYPE_DISPATCH_TARGET;
+  const bool reduce_scores = score_mode != 0;
+  const bool restore_scores = score_mode == 2;
   AscendC::GlobalTensor<Element> expert;
   AscendC::GlobalTensor<Element> dy;
   AscendC::GlobalTensor<Element> dx;
   AscendC::GlobalTensor<Element> product;
+  AscendC::GlobalTensor<float> restored_scores;
   AscendC::GlobalTensor<uint16_t> score_bits;
   AscendC::GlobalTensor<int64_t> order;
   expert.SetGlobalBuffer(reinterpret_cast<__gm__ Element *>(expert_output));
   dy.SetGlobalBuffer(reinterpret_cast<__gm__ Element *>(grad_output));
   dx.SetGlobalBuffer(reinterpret_cast<__gm__ Element *>(grad_expert));
   product.SetGlobalBuffer(reinterpret_cast<__gm__ Element *>(product_output));
+  restored_scores.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(product_output));
   score_bits.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t *>(scores));
   order.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(source_order));
   AscendC::TPipe pipe;
@@ -49,7 +53,8 @@ __aicore__ inline void NativeBitCombineGrad(
   auto float_dy = dy_buffer.Get<float>();
   auto float_product = product_buffer.Get<float>();
   for (uint32_t row = worker; row < rows; row += workers) {
-    const int64_t token = order.GetValue(row) / top_k;
+    const int64_t source_row = order.GetValue(row);
+    const int64_t token = source_row / top_k;
     union {
       uint32_t bits;
       float value;
@@ -99,11 +104,24 @@ __aicore__ inline void NativeBitCombineGrad(
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(result_product, sum_buffer.Get<float>(), AscendC::RoundMode::CAST_RINT, 1);
         AscendC::PipeBarrier<PIPE_V>();
+        if (restore_scores) {
+          AscendC::Cast(float_product, result_product, AscendC::RoundMode::CAST_NONE, 1);
+          AscendC::PipeBarrier<PIPE_V>();
+          // IndexBackward accumulates into positive zero even for a permutation.
+          AscendC::Adds(result_product.ReinterpretCast<float>(), float_product, 0.0f, 1);
+          AscendC::PipeBarrier<PIPE_V>();
+        }
       }
       product_queue.EnQue(result_product);
       result_product = product_queue.DeQue<Element>();
-      AscendC::DataCopy(product[static_cast<int64_t>(row) * (reduce_scores ? 16 : hidden)],
-                        result_product, reduce_scores ? 16 : hidden);
+      if (restore_scores) {
+        constexpr uint32_t score_block = 32 / sizeof(float);
+        AscendC::DataCopy(restored_scores[source_row * score_block],
+                          result_product.ReinterpretCast<float>(), score_block);
+      } else {
+        AscendC::DataCopy(product[static_cast<int64_t>(row) * (reduce_scores ? 16 : hidden)],
+                          result_product, reduce_scores ? 16 : hidden);
+      }
       product_queue.FreeTensor(result_product);
     }
   }
