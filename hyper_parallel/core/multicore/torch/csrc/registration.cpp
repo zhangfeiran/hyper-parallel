@@ -18,7 +18,7 @@ TORCH_LIBRARY(hyper_parallel, m) {
     "mega_moe_unpermute_grad_out(Tensor permuted_tokens, Tensor grad_output, "
     "Tensor sorted_indices, Tensor probs, Tensor(a!) grad_permuted, Tensor(b!) grad_probs) "
     "-> (Tensor(a!), Tensor(b!))");
-  m.def("mega_moe_transport_version() -> int", []() -> int64_t { return 3; });
+  m.def("mega_moe_transport_version() -> int", []() -> int64_t { return 4; });
   // -------------------------------------------------------------------------
   // mega_moe: MoE-FFN forward operator (wraps aclnnHyperMegaMoe)
   //

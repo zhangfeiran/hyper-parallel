@@ -25,7 +25,7 @@ import torch_npu
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan, record_plan_stream
-from .route import PreparedTopKRoute, RouteMetadata
+from .route import _peer_owner_flags, PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
 
 
@@ -293,6 +293,16 @@ def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
         workspace.release_graph(ctx)
 
 
+def _patch_forward_row_thresholds(plan: MegaMoePlan, metadata: RouteMetadata, runtime_config: Any) -> None:
+    """Update the actual ordinary/profile/dump image under the same workspace lease."""
+    offset = getattr(plan, "row_credit_element_offset", None)
+    if offset is None:
+        return
+    if metadata.expert_row_counts is None:
+        raise RuntimeError("Owner overlap requires per-expert receive row counts")
+    runtime_config.view(torch.int32)[offset:offset + plan.spec.local_experts].copy_(metadata.expert_row_counts)
+
+
 def _launch_forward_kernel(
     plan: MegaMoePlan,
     metadata: RouteMetadata,
@@ -322,6 +332,7 @@ def _launch_forward_kernel(
         metadata.combine_size * spec.hidden_size,
     )
     if not plan.fwd_diagnostics.is_active:
+        _patch_forward_row_thresholds(plan, metadata, plan.fwd_runtime_config)
         record_plan_stream(plan, plan.fwd_runtime_config)
         multicore_ops.mega_moe(
             *kernel_parameters,
@@ -344,6 +355,7 @@ def _launch_forward_kernel(
         direction="forward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
+        _patch_forward_row_thresholds(plan, metadata, diagnostic_call.runtime_config)
         record_plan_stream(plan, diagnostic_call.runtime_config)
         multicore_ops.mega_moe_with_diagnostic_buffer(
             *kernel_parameters,
@@ -533,9 +545,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 metadata_storage = _workspace_tensor(workspace.route_metadata, "route_metadata")
                 metadata_buffer = metadata_storage[:ctx.source_rows]
                 metadata_buffer[:, 0].copy_(permute_src_index)
-                if spec.forward_ingress_mode == "peer_dedup":
+                if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap"):
                     metadata_buffer[:, 2].copy_(permutation[1].reshape(-1))
                     metadata_buffer[:, 3].copy_(permutation[4])
+                    if spec.forward_ingress_mode == "peer_overlap":
+                        metadata_buffer[:, 1].copy_(_peer_owner_flags(
+                            permutation[1], permute_src_index, spec.local_experts))
                 execution = replace(execution, gmm_workspace=metadata_storage.view(torch.uint8))
             if getattr(plan, "ingress_diagnostics", None) is not None:
                 ingress_plan = replace(plan, fwd_diagnostics=plan.ingress_diagnostics, ingress_diagnostics=None)

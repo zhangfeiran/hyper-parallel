@@ -50,6 +50,21 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   static constexpr int64_t GMM_MATMUL_M_FIELDS_BYTES =
     offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
 
+  __aicore__ inline void PrepareIngressThresholds() {
+    TaskDesc first;
+    getTaskDesc(this->runtimeConfigPtr, &first, 0);
+    if (first.task_type != TaskType::TASK_MOE_OWNER_GET) { return; }
+    uint32_t local_experts = getExtraValueFromTiling(input_list[TILING_IDX], 2) /
+                             getExtraValueFromTiling(input_list[TILING_IDX], 1);
+    // The host patched this image on the launch stream. Expected values remain
+    // constant for this invocation; invalidate read-only per-core cache entries.
+    for (uint32_t expert = 0; expert < local_experts; ++expert) {
+      DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+        this->all_event_num_triggers[first.trigger_event + expert]);
+    }
+    PipeBarrier<PIPE_ALL>();
+  }
+
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     switch (task_desc.task_type) {
       case TaskType::TASK_BEGIN_TASK_GRAPH:
@@ -81,6 +96,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteShmemPutMem(task_desc);
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
+      case TaskType::TASK_MOE_OWNER_GET:
         if (task_desc.extra_value_0 == 16 && task_desc.inputs[1].dim[3] != 0) {
           ExecuteIndexedPull<DTYPE_DISPATCH_TARGET>(task_desc, input_list, TILING_IDX);
         } else {
@@ -301,5 +317,6 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
                                                 GM_ADDR *input_list) {
   MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
+  worker.PrepareIngressThresholds();
   worker.Process();
 }

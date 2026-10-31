@@ -23,7 +23,10 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
-from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_ingress_config, _build_runtime_artifacts
+from hyper_parallel.core.multicore.modules.mega_moe.plan import (
+    _build_ingress_config, _build_runtime_artifacts, _row_credit_element_offset,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.function import _patch_forward_row_thresholds
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import _workspace_allocation_specs
 from hyper_parallel.core.multicore.scheduler.config import TaskType
@@ -148,3 +151,47 @@ class TestIndexedIngress(unittest.TestCase):
             expected_slots = [slot for slot in slots.tolist() if int(ids.flatten()[slot]) == expert]
             torch.testing.assert_close(received[expert], values[torch.tensor(expected_slots).long() // 4])
             torch.testing.assert_close(writes[expert], torch.ones_like(writes[expert]))
+
+    def test_owner_prefix_keeps_all_queues_and_backward_but_changes_credit_unit(self) -> None:
+        """Every worker finishes all its reads before any compute wait; no stage is dropped."""
+        for rank in (0, 3):
+            spec = MegaMoeSpec(512, 5120, 1792, 32, 8, None, 4096, 4, None, rank, 32,
+                               dispatch_mode="pull", forward_ingress_mode="peer_overlap")
+            current = _build_runtime_artifacts(spec)
+            reference = _build_runtime_artifacts(replace(spec, forward_ingress_mode="indexed"))
+            self.assertEqual(bytes(current[3]), bytes(reference[3]), "Overlap changed legacy backward")
+            config = current[1]
+            old = reference[1]
+            queued = [int(config.vector_task_indices[i]) for i in range(config.task_index_num[1])]
+            old_queued = [int(old.vector_task_indices[i]) for i in range(old.task_index_num[1])]
+            self.assertEqual(set(queued), set(old_queued), "A compute/Combine/terminate task was lost")
+            owners = [i for i in queued if config.all_tasks[i].task_type == TaskType.TASK_MOE_OWNER_GET]
+            self.assertEqual(queued[:len(owners)], owners, "An owner was placed after a compute wait")
+            for i in owners:
+                task = config.all_tasks[i]
+                self.assertEqual((task.dependent_event, task.extra_value_1), (0xFFFFFFFF, 4))
+            self.assertEqual(_row_credit_element_offset(config, spec),
+                             type(config).all_event_num_triggers.offset // 4 + rank * 8 + 1)
+
+    def test_selected_runtime_threshold_patch_is_owned_and_exact_including_zero(self) -> None:
+        """Ordinary and independent profiler images receive the same row-based thresholds."""
+        counts = torch.tensor([0, 128, 3, 4096, 1, 0, 24, 50], dtype=torch.int32)
+        plan = SimpleNamespace(row_credit_element_offset=32, spec=SimpleNamespace(local_experts=8))
+        metadata = SimpleNamespace(expert_row_counts=counts)
+        template = torch.zeros(256, dtype=torch.uint8)
+        ordinary = template.clone()
+        profiler = template.clone()
+        for image in (ordinary, profiler):
+            _patch_forward_row_thresholds(plan, metadata, image)
+            torch.testing.assert_close(image.view(torch.int32)[32:40], counts)
+            self.assertEqual(int(image.view(torch.int32)[:32].sum()), 0, "Runtime header was overwritten")
+            self.assertEqual(int(image.view(torch.int32)[40:].sum()), 0, "Adjacent event thresholds changed")
+        self.assertEqual(int(template.sum()), 0, "Patching selected images changed the immutable template")
+
+    def test_owner_flags_skip_only_later_slots_on_the_same_peer(self) -> None:
+        """Top-K order and repeated peer ownership are independent of expert sort order."""
+        ids = torch.tensor([[3, 0, 2, 1], [6, 7, 0, 4], [2, 0, 7, 1]], dtype=torch.int32)
+        slots = torch.argsort(ids.flatten(), stable=True).int()
+        flags = route_module._peer_owner_flags(ids, slots, 4)
+        expected = torch.tensor([1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0], dtype=torch.int32)
+        torch.testing.assert_close(flags, expected[slots.long()])

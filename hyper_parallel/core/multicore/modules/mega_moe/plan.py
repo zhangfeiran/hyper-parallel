@@ -76,6 +76,7 @@ class MegaMoePlan:
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
     ingress_diagnostics: MegaKernelDiagnostics | None = None
+    row_credit_element_offset: int | None = None
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -163,6 +164,8 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
             elif task.task_type == TaskType.TASK_GROUPED_MATMUL:
                 # Blaze does not use the legacy GMM workspace tensor at port 16.
                 task.extra_value_1 = 2
+    if spec.forward_ingress_mode == "peer_overlap":
+        _configure_owner_prefix(forward_data)
     backward_graph = build_backward_graph(
         task_values,
         dispatch_sv=spec.dispatch_split,
@@ -205,6 +208,33 @@ def _prepare_diagnostics(
         prepare_mega_kernel_diagnostics(forward_graph, forward_config, parameter_count=16, **options),
         prepare_mega_kernel_diagnostics(backward_graph, backward_config, parameter_count=20, **options),
     )
+
+
+def _configure_owner_prefix(config: Any) -> None:
+    """Put every independent owner GET before every compute-dependent vector task."""
+    queued = [int(config.vector_task_indices[i]) for i in range(config.task_index_num[1])]
+    owners = [i for i in queued if config.all_tasks[i].task_type == TaskType.TASK_SHMEM_GET_MEM]
+    owner_set = set(owners)
+    for index in owners:
+        task = config.all_tasks[index]
+        task.task_type = TaskType.TASK_MOE_OWNER_GET
+        task.extra_value_1 = 4
+        task.dependent_event = 0xFFFFFFFF
+    for position, index in enumerate(owners + [i for i in queued if i not in owner_set]):
+        config.vector_task_indices[position] = index
+
+
+def _row_credit_element_offset(config: Any, spec: MegaMoeSpec) -> int | None:
+    """Resolve the device INT32 threshold slice from actual Up-projection dependencies."""
+    if spec.forward_ingress_mode != "peer_overlap":
+        return None
+    start = int(config.all_tasks[0].trigger_event)
+    for task in config.all_tasks[:config.task_num]:
+        if task.task_type == TaskType.TASK_GROUPED_MATMUL and task.outputs[0].input_position == 7:
+            expert = task.task_index // spec.num_cube_cores
+            if task.dependent_event != start + expert:
+                raise RuntimeError("Owner row-credit events do not match the Up projection")
+    return type(config).all_event_num_triggers.offset // 4 + start
 
 
 def _build_ingress_config(forward_config: Any) -> Any:
@@ -258,6 +288,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     return MegaMoePlan(
         spec=spec,
         ingress_diagnostics=ingress_diagnostics,
+        row_credit_element_offset=_row_credit_element_offset(forward_config, spec),
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
         ),

@@ -45,6 +45,7 @@ class RouteMetadata:
     expert_capacity: int
     local_num_tokens: int | None = None
     plan_tokens: int | None = None
+    expert_row_counts: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -235,6 +236,8 @@ def _compute_route_metadata(
             local_destination_prefix[:, -1] + local_destination_counts[:, -1]
         ).to(torch.int64),
         expert_capacity=expert_capacity,
+        expert_row_counts=(received_counts.sum(0, dtype=torch.int32)
+                           if spec.forward_ingress_mode == "peer_overlap" else None),
     )
 
 
@@ -258,6 +261,15 @@ def _peer_row_ordinals(
     positions = torch.arange(slots.numel(), dtype=torch.int32, device=slots.device)
     sorted_ordinals = positions - prefix[ids[slots]]
     return torch.empty_like(sorted_slots).scatter_(0, slots, sorted_ordinals)
+
+
+def _peer_owner_flags(topk_ids: torch.Tensor, sorted_slots: torch.Tensor, local_experts: int) -> torch.Tensor:
+    """Identify the first Top-K slot selecting each peer before any remote metadata reads."""
+    peers = topk_ids // local_experts
+    selected = torch.arange(topk_ids.shape[1], device=topk_ids.device)
+    earlier = selected[None, :] < selected[:, None]
+    duplicate = ((peers[:, :, None] == peers[:, None, :]) & earlier).any(-1)
+    return (~duplicate).reshape(-1).to(torch.int32)[sorted_slots.to(torch.int64)]
 
 
 def prepare_topk_route(
@@ -317,7 +329,7 @@ def prepare_topk_route(
         maximum_received_slots=maximum_received_slots,
         permute_src_index=permute_src_index,
         peer_row_ordinals=(_peer_row_ordinals(topk_ids, permute_src_index, counts)
-                           if spec.forward_ingress_mode == "peer_dedup" else None),
+                           if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap") else None),
         metadata=_compute_route_metadata(
             counts,
             counts_by_source,

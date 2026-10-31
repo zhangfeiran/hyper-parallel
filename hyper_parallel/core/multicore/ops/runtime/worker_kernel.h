@@ -398,7 +398,8 @@ class KernelWorkerBase {
       WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
     }
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
-    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL &&
+        task_desc.task_type != TaskType::TASK_MOE_OWNER_GET) {
       TriggerEvent(task_desc.trigger_event);
     }
   }
@@ -420,7 +421,8 @@ class KernelWorkerBase {
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     PipeBarrier<PIPE_ALL>();
     CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_AFTER);
-    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL &&
+        task_desc.task_type != TaskType::TASK_MOE_OWNER_GET) {
       TriggerEvent(task_desc.trigger_event);
     }
   }
@@ -456,7 +458,8 @@ class KernelWorkerBase {
     uint64_t compute_end_cycle = cycle_trace_recorder.Now();
     cycle_trace_recorder.Record(profile_desc_id, task_id, task_desc.task_index, owner_id, compute_start_cycle,
                                 compute_end_cycle);
-    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL &&
+        task_desc.task_type != TaskType::TASK_MOE_OWNER_GET) {
       uint64_t trigger_start_cycle = cycle_trace_recorder.Now();
       TriggerEvent(task_desc.trigger_event);
       uint64_t trigger_end_cycle = cycle_trace_recorder.Now();

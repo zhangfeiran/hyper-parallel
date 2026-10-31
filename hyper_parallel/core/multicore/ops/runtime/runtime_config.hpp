@@ -103,6 +103,7 @@ enum class TaskType : uint32_t {
   TASK_GATE_GRAD_ADD_SELECTED = 139,
   TASK_GATE_GRAD_ZEROS = 140,
   TASK_SHMEM_GET_MEM = 141,
+  TASK_MOE_OWNER_GET = 142,
 };
 
 enum class EventType : uint32_t {

@@ -55,21 +55,33 @@ namespace MulticoreRuntime {
     }
   }
 
-  template <typename T, bool Count = false>
+  template <typename T, bool Count = false, bool Publish = false>
   __aicore__ inline void PullPeerRows(
       __gm__ T *source, __gm__ T *destination, __gm__ int32_t *remote_metadata,
       __ubuf__ int32_t *sorted_metadata, uint64_t scratch, int64_t rows, int64_t hidden,
       uint32_t top_k, uint32_t source_tokens, int64_t rank, int64_t source_pe, int64_t local_experts,
-      __gm__ int64_t *target_offsets, uint64_t *statistics) {
+      __gm__ int64_t *target_offsets, uint64_t *statistics,
+      __gm__ int32_t *event_counters, uint32_t event_base) {
     constexpr int64_t CHUNK = 3072;
     // Match the indexed bridge chunk while honoring the SDK 16 KiB UB lease.
     constexpr uint64_t TOKEN_METADATA_BYTES = 16 * 4 * sizeof(int32_t);
     auto *token_metadata = reinterpret_cast<__ubuf__ int32_t *>(scratch);
-    auto *values = reinterpret_cast<__ubuf__ T *>(scratch + TOKEN_METADATA_BYTES);
-    if (top_k == 0 || top_k > 16 || scratch + TOKEN_METADATA_BYTES + CHUNK * sizeof(T) > 192 * 1024) {
+    constexpr uint64_t CREDIT_BYTES = Publish ? 64 * sizeof(int32_t) : 0;
+    auto *credits = reinterpret_cast<__ubuf__ int32_t *>(scratch + TOKEN_METADATA_BYTES);
+    auto *values = reinterpret_cast<__ubuf__ T *>(scratch + TOKEN_METADATA_BYTES + CREDIT_BYTES);
+    if constexpr (Publish) {
+      if (local_experts > 64) { AscendC::Trap(); }
+      for (int64_t expert = 0; expert < local_experts; ++expert) { credits[expert] = 0; }
+    }
+    if (top_k == 0 || top_k > 16 || scratch + TOKEN_METADATA_BYTES + CREDIT_BYTES + CHUNK * sizeof(T) > 192 * 1024) {
       AscendC::Trap();
     }
     for (int64_t row = 0; row < rows; ++row) {
+      if constexpr (Publish) {
+        // Scalar owner flags arrive with the sorted metadata block. Nonowners
+        // never fetch the token's K-record fanout metadata.
+        if (sorted_metadata[row * 4 + 1] == 0) { continue; }
+      }
       int64_t slot = sorted_metadata[row * 4];
       int64_t token = slot / top_k;
       if (slot < 0 || token >= source_tokens) { AscendC::Trap(); }
@@ -108,6 +120,22 @@ namespace MulticoreRuntime {
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
       }
+      if constexpr (Publish) {
+        for (uint32_t selected = 0; selected < top_k; ++selected) {
+          int64_t expert = token_metadata[selected * 4 + 2];
+          if (expert / local_experts == rank) { ++credits[expert % local_experts]; }
+        }
+      }
+    }
+    if constexpr (Publish) {
+      // One credit per complete original route row, after every H chunk and
+      // destination store drains. No TPipe may overwrite live route metadata.
+      PipeBarrier<PIPE_ALL>();
+      for (int64_t expert = 0; expert < local_experts; ++expert) {
+        int32_t delta = credits[expert];
+        if (delta != 0) { (void)AscendC::AtomicAdd<int32_t>(event_counters + event_base + expert, delta); }
+      }
+      PipeBarrier<PIPE_ALL>();
     }
   }
 
@@ -177,20 +205,43 @@ namespace MulticoreRuntime {
       // than querying FetchEventID through the previous task's pipe pointer.
       AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
       AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-      if (task.extra_value_1 == 2) {
+      if (task.extra_value_1 == 2 || task.extra_value_1 == 4) {
         int64_t rank = getExtraValueFromTiling(input_list[tiling_index], 0) % ep;
-        if (task.inputs[1].dim[2] == 1) {
-          PullPeerRows<T, true>(remote_data,
-          reinterpret_cast<__gm__ T *>(input_list[task.outputs[0].input_position]), remote_metadata, metadata,
-          scratch_ub + META_ROWS * 4 * sizeof(int32_t), rows, hidden, task.inputs[1].dim[3], tokens,
-          rank, source_pe, experts / ep,
-          reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[0].input_position]), statistics);
+        uint32_t current_expert = (task.task_index / tiles) % (experts / ep);
+        uint32_t event_base = task.trigger_event - current_expert;
+        auto *event_counters = reinterpret_cast<__gm__ int32_t *>(input_list[24]);
+        if (task.extra_value_1 == 4) {
+          if (task.inputs[1].dim[2] == 1) {
+            PullPeerRows<T, true, true>(remote_data,
+            reinterpret_cast<__gm__ T *>(input_list[task.outputs[0].input_position]), remote_metadata, metadata,
+            scratch_ub + META_ROWS * 4 * sizeof(int32_t), rows, hidden, task.inputs[1].dim[3], tokens,
+            rank, source_pe, experts / ep,
+            reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[0].input_position]), statistics,
+            event_counters, event_base);
+          } else {
+            PullPeerRows<T, false, true>(remote_data,
+            reinterpret_cast<__gm__ T *>(input_list[task.outputs[0].input_position]), remote_metadata, metadata,
+            scratch_ub + META_ROWS * 4 * sizeof(int32_t), rows, hidden, task.inputs[1].dim[3], tokens,
+            rank, source_pe, experts / ep,
+            reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[0].input_position]), statistics,
+            event_counters, event_base);
+          }
         } else {
-          PullPeerRows<T, false>(remote_data,
-          reinterpret_cast<__gm__ T *>(input_list[task.outputs[0].input_position]), remote_metadata, metadata,
-          scratch_ub + META_ROWS * 4 * sizeof(int32_t), rows, hidden, task.inputs[1].dim[3], tokens,
-          rank, source_pe, experts / ep,
-          reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[0].input_position]), statistics);
+          if (task.inputs[1].dim[2] == 1) {
+            PullPeerRows<T, true, false>(remote_data,
+            reinterpret_cast<__gm__ T *>(input_list[task.outputs[0].input_position]), remote_metadata, metadata,
+            scratch_ub + META_ROWS * 4 * sizeof(int32_t), rows, hidden, task.inputs[1].dim[3], tokens,
+            rank, source_pe, experts / ep,
+            reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[0].input_position]), statistics,
+            event_counters, event_base);
+          } else {
+            PullPeerRows<T, false, false>(remote_data,
+            reinterpret_cast<__gm__ T *>(input_list[task.outputs[0].input_position]), remote_metadata, metadata,
+            scratch_ub + META_ROWS * 4 * sizeof(int32_t), rows, hidden, task.inputs[1].dim[3], tokens,
+            rank, source_pe, experts / ep,
+            reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[0].input_position]), statistics,
+            event_counters, event_base);
+          }
         }
       } else {
         if (task.inputs[1].dim[2] == 1) {
