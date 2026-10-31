@@ -16,7 +16,7 @@ namespace MulticoreRuntime {
 __aicore__ inline void NativeBitCombineGrad(
   GM_ADDR expert_output, GM_ADDR grad_output, GM_ADDR scores, GM_ADDR source_order,
   GM_ADDR grad_expert, GM_ADDR product_output, uint32_t rows, uint32_t hidden, uint32_t top_k,
-  uint32_t need_weight_grad, uint32_t worker, uint32_t workers) {
+  uint32_t need_weight_grad, uint32_t worker, uint32_t workers, bool reduce_scores) {
 #ifndef __DAV_C220_CUBE__
   using Element = DTYPE_DISPATCH_TARGET;
   AscendC::GlobalTensor<Element> expert;
@@ -38,12 +38,14 @@ __aicore__ inline void NativeBitCombineGrad(
   AscendC::TQue<AscendC::TPosition::VECOUT, 1> product_queue;
   AscendC::TBuf<AscendC::TPosition::VECCALC> dy_buffer;
   AscendC::TBuf<AscendC::TPosition::VECCALC> product_buffer;
+  AscendC::TBuf<AscendC::TPosition::VECCALC> sum_buffer;
   pipe.InitBuffer(dy_queue, 1, hidden * sizeof(Element));
   pipe.InitBuffer(expert_queue, 1, hidden * sizeof(Element));
   pipe.InitBuffer(dx_queue, 1, hidden * sizeof(Element));
   pipe.InitBuffer(product_queue, 1, hidden * sizeof(Element));
   pipe.InitBuffer(dy_buffer, hidden * sizeof(float));
   pipe.InitBuffer(product_buffer, hidden * sizeof(float));
+  pipe.InitBuffer(sum_buffer, 32);
   auto float_dy = dy_buffer.Get<float>();
   auto float_product = product_buffer.Get<float>();
   for (uint32_t row = worker; row < rows; row += workers) {
@@ -80,9 +82,28 @@ __aicore__ inline void NativeBitCombineGrad(
       AscendC::PipeBarrier<PIPE_V>();
       auto result_product = product_queue.AllocTensor<Element>();
       AscendC::Cast(result_product, float_product, AscendC::RoundMode::CAST_RINT, hidden);
+      if (reduce_scores) {
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(float_product, result_product, AscendC::RoundMode::CAST_NONE, hidden);
+        AscendC::PipeBarrier<PIPE_V>();
+        // Preserve the deployed BF16 ReduceSum's FP32 addition tree, including the tail order.
+        AscendC::Add(float_product, float_product, float_product[2048], 2048);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(float_product, float_product, float_product[4096], 1024);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t width = 1024; width >= 64; width /= 2) {
+          AscendC::Add(float_product, float_product, float_product[width], width);
+          AscendC::PipeBarrier<PIPE_V>();
+        }
+        AscendC::WholeReduceSum(sum_buffer.Get<float>(), float_product, 64, 1, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(result_product, sum_buffer.Get<float>(), AscendC::RoundMode::CAST_RINT, 1);
+        AscendC::PipeBarrier<PIPE_V>();
+      }
       product_queue.EnQue(result_product);
       result_product = product_queue.DeQue<Element>();
-      AscendC::DataCopy(product[static_cast<int64_t>(row) * hidden], result_product, hidden);
+      AscendC::DataCopy(product[static_cast<int64_t>(row) * (reduce_scores ? 16 : hidden)],
+                        result_product, reduce_scores ? 16 : hidden);
       product_queue.FreeTensor(result_product);
     }
   }

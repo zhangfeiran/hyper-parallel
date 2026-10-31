@@ -322,7 +322,7 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
       MulticoreRuntime::NativeBitCombineGrad(
         input_list[2], input_list[9], input_list[5], input_list[1], input_list[12], input_list[13],
         tokens * first.extra_value_0, first.outputs[0].dim[1], first.extra_value_0, first.extra_value_1,
-        worker_id, MulticoreRuntime::getNumWorkers(runtimeConfigPtr));
+        worker_id, MulticoreRuntime::getNumWorkers(runtimeConfigPtr), first.extra_value_2 != 0);
       return;
     }
   }

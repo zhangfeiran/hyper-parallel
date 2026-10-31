@@ -120,7 +120,7 @@ def _restore_torch_output_grad_out(
             expert_output, scores, source_order, grad_output, out, need_weight_grad)
         if not need_weight_grad:
             return None
-        grad_scores = product.sum_to_size(scores.shape).reshape(-1)
+        grad_scores = product.reshape(-1)
     else:
         grad_weighted = torch.index_select(grad_output, 0, token_ids)
         torch.mul(grad_weighted, scores, out=out)

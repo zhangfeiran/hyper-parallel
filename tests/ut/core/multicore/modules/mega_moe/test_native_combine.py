@@ -41,7 +41,7 @@ class _LiteralKernel:
                   dy: torch.Tensor, out: torch.Tensor, need_weight_grad: bool) -> torch.Tensor:
         gathered = dy.index_select(0, order // self.top_k)
         torch.mul(gathered, scores, out=out)
-        return gathered * expert if need_weight_grad else expert[:0]
+        return (gathered * expert).sum(dim=-1) if need_weight_grad else expert[:0]
 
 
 class TestNativeCombine(unittest.TestCase):
@@ -51,6 +51,40 @@ class TestNativeCombine(unittest.TestCase):
         native_combine._kernel.cache_clear()
         native_combine._require_payload.cache_clear()
         native_combine._device_supported.cache_clear()
+
+    def test_fused_scores_require_the_validated_backward_geometry(self) -> None:
+        image = native_combine._runtime_image(5120, 6, backward=True, reduce_scores=True)
+        events = int.from_bytes(image[12:16], "little")
+        task = native_combine.TaskDescC.from_buffer_copy(image, 64 + events * 4)
+        self.assertEqual(task.extra_value_2, 1)
+        for hidden, top_k, backward in [(16, 6, True), (5120, 2, True), (5120, 6, False)]:
+            with self.subTest(hidden=hidden, top_k=top_k, backward=backward):
+                with self.assertRaisesRegex(ValueError, "backward H5120/K6"):
+                    native_combine._runtime_image(hidden, top_k, backward=backward, reduce_scores=True)
+
+    def test_fused_score_buffer_is_one_aligned_row_per_source(self) -> None:
+        backend = object.__new__(native_combine._NativeCombine)
+        backend.hidden, backend.top_k = 5120, 6
+        backend.grad_configs = (torch.empty(1), torch.empty(1))
+        backend.dummy = torch.empty(1, 1, dtype=torch.bfloat16)
+        backend.dummy_long = torch.empty(1, dtype=torch.int64)
+        backend.dummy_int = torch.empty(1, dtype=torch.int32)
+        backend.dummy_byte = torch.empty(1, dtype=torch.uint8)
+        expert = torch.ones(12, 5120, dtype=torch.bfloat16)
+        out = torch.empty_like(expert)
+
+        def launch(*args: object) -> None:
+            """Fill the padded output while checking the private DMA contract."""
+            product = args[13]
+            self.assertEqual(product.shape, (12, 16))
+            product.fill_(0.5)
+
+        with patch.object(backend, "_record"), patch.object(native_combine.multicore_ops, "mega_moe_grad", launch):
+            result = backend.gradients(expert, torch.ones(12, 1, dtype=torch.bfloat16), torch.arange(12),
+                                       torch.ones(2, 5120, dtype=torch.bfloat16), out, True)
+        self.assertEqual(result.shape, (12,))
+        self.assertEqual(result.untyped_storage().nbytes(), 12 * 16 * 2)
+        self.assertTrue(torch.equal(result, torch.full((12,), 0.5, dtype=torch.bfloat16)))
 
     def test_pure_sum_has_a_distinct_forward_runtime_flag(self) -> None:
         for sum_only in (False, True):
@@ -76,7 +110,7 @@ class TestNativeCombine(unittest.TestCase):
         self.assertEqual(result.dtype, torch.bfloat16)
 
     def test_missing_or_wrong_payload_is_rejected_before_device_work(self) -> None:
-        for version in (None, 1, 2, 3, 4, 5, 6):
+        for version in (None, 1, 2, 3, 4, 5, 6, 7):
             namespace = SimpleNamespace()
             if version is not None:
                 namespace.mega_moe_native_combine_version = Mock(return_value=version)
@@ -86,10 +120,10 @@ class TestNativeCombine(unittest.TestCase):
                 patch.object(torch, "ops", SimpleNamespace(hyper_parallel=namespace)),
             ):
                 native_combine._require_payload.cache_clear()
-                if version == 6:
+                if version == 7:
                     native_combine._require_payload()
                 else:
-                    with self.assertRaisesRegex(RuntimeError, "payload ABI 6"):
+                    with self.assertRaisesRegex(RuntimeError, "payload ABI 7"):
                         native_combine._require_payload()
 
     def test_cpu_and_unsupported_shapes_never_query_native_capabilities(self) -> None:

@@ -45,16 +45,18 @@ def _require_payload() -> None:
     try:
         version = torch.ops.hyper_parallel.mega_moe_native_combine_version()
     except AttributeError as error:
-        raise RuntimeError("Native-bit combine requires payload ABI 6; rebuild the multicore component.") from error
-    if version != 6:
-        raise RuntimeError(f"Native-bit combine requires payload ABI 6, got {version}; rebuild the component.")
+        raise RuntimeError("Native-bit combine requires payload ABI 7; rebuild the multicore component.") from error
+    if version != 7:
+        raise RuntimeError(f"Native-bit combine requires payload ABI 7, got {version}; rebuild the component.")
 
 
 def _runtime_image(hidden: int, top_k: int, backward: bool = False, need_weight_grad: bool = True,
-                   *, sum_only: bool = False) -> bytes:
+                   *, sum_only: bool = False, reduce_scores: bool = False) -> bytes:
     """Reject unsupported rows before the private native entry can consume them."""
     if not 0 < top_k <= 8 or not 16 <= hidden <= 8192 or hidden % 16:
         raise ValueError('Native combine requires top_k in [1,8] and aligned hidden in [16,8192].')
+    if reduce_scores and (not backward or (hidden, top_k) != (5120, 6)):
+        raise ValueError("Fused score reduction requires backward H5120/K6.")
     config = allocate_runtime_config(1, 1024, 1)
     config.num_workers = 48
     config.task_num = 1
@@ -67,7 +69,7 @@ def _runtime_image(hidden: int, top_k: int, backward: bool = False, need_weight_
     task.dependent_event = 0xFFFFFFFF
     task.extra_value_0 = top_k
     task.extra_value_1 = int(need_weight_grad)
-    task.extra_value_2 = int(sum_only)
+    task.extra_value_2 = int(reduce_scores if backward else sum_only)
     task.outputs[0].dim[0] = 1
     task.outputs[0].dim[1] = hidden
     config.all_tasks[0] = task
@@ -83,8 +85,11 @@ class _NativeCombine:
         device = torch.device('npu', device_index)
         self.config = _tensor_from_bytes(_runtime_image(hidden, top_k), device)
         self.sum_config = _tensor_from_bytes(_runtime_image(hidden, top_k, sum_only=True), device)
-        self.grad_configs = tuple(_tensor_from_bytes(_runtime_image(hidden, top_k, True, need), device)
-                                  for need in (False, True))
+        self.grad_configs = tuple(
+            _tensor_from_bytes(_runtime_image(
+                hidden, top_k, True, need, reduce_scores=(hidden, top_k) == (5120, 6) and need), device)
+            for need in (False, True)
+        )
         self.hidden, self.top_k = hidden, top_k
         self.dummy = torch.empty((1, 1), device=device, dtype=torch.bfloat16)
         self.dummy_long = torch.zeros(1, device=device, dtype=torch.int64)
@@ -143,14 +148,16 @@ class _NativeCombine:
 
     def gradients(self, expert: torch.Tensor, scores: torch.Tensor, source_order: torch.Tensor,
                   grad_output: torch.Tensor, out: torch.Tensor, need_weight_grad: bool) -> torch.Tensor:
-        """Gather dY and form exact BF16 products without a gathered-dY HBM tensor."""
+        """Gather dY and return BF16 row scores after the native product-rounding boundary."""
         tokens = grad_output.shape[0]
         if expert.shape != out.shape or not out.is_contiguous():
             raise ValueError('Native combine gradient output must match the contiguous expert rows.')
         if any(out.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
                for value in (expert, scores, grad_output)):
             raise ValueError('Native combine gradient output must not alias a source operand.')
-        product = torch.empty_like(expert) if need_weight_grad else self.dummy
+        reduce_scores = (self.hidden, self.top_k) == (5120, 6) and need_weight_grad
+        product = (torch.empty((expert.shape[0], 16), device=expert.device, dtype=expert.dtype) if reduce_scores
+                   else torch.empty_like(expert) if need_weight_grad else self.dummy)
         config = self.grad_configs[int(need_weight_grad)]
         self._record(config, expert.device)
         multicore_ops.mega_moe_grad(
@@ -162,7 +169,9 @@ class _NativeCombine:
             self.dummy_byte, self.dummy_byte, config, self.dummy_byte,
             0, 1, 1, self.hidden, tokens,
         )
-        return product
+        if not need_weight_grad:
+            return self.dummy
+        return product[:, 0] if reduce_scores else product.sum(dim=-1)
 
 
 @lru_cache(maxsize=8)
