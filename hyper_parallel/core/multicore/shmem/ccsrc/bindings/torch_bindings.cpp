@@ -113,7 +113,7 @@ std::string_view ToString(DeviceModel model) {
 }
 
 std::string_view ToString(DataEngine engine) {
-  return engine == DataEngine::Mte ? "mte" : "Unknown";
+  return engine == DataEngine::Mte ? "mte" : (engine == DataEngine::MteUdma ? "mte_udma" : "Unknown");
 }
 
 std::string_view ToString(DfxOperation operation) {

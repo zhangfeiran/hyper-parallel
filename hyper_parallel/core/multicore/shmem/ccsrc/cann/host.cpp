@@ -116,6 +116,10 @@ runtime::Result<data_op_engine_type_t> DataEngineMask(runtime::DataEngine data_e
   if (data_engine == runtime::DataEngine::Mte) {
     return runtime::Result<data_op_engine_type_t>::Success(ACLSHMEM_DATA_OP_MTE);
   }
+  if (data_engine == runtime::DataEngine::MteUdma) {
+    return runtime::Result<data_op_engine_type_t>::Success(
+      static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA));
+  }
   return runtime::Result<data_op_engine_type_t>::Failure(
     InvalidArgument("data_engine must be a supported Runtime DataEngine value"));
 }
@@ -185,6 +189,13 @@ runtime::Status initialize(const InitOptions &options) {
   const int32_t tls_status = aclshmemx_set_conf_store_tls(false, nullptr, 0);
   if (tls_status != ACLSHMEM_SUCCESS) {
     return CannFailure("aclshmemx_set_conf_store_tls", tls_status);
+  }
+
+  if (options.data_engine == runtime::DataEngine::MteUdma) {
+    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 32);
+    if (qp_status != ACLSHMEM_SUCCESS) {
+      return CannFailure("aclshmemx_set_qp_num", qp_status);
+    }
   }
 
   aclshmemx_init_attr_t attributes{};

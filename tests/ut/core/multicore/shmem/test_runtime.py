@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for the private SHMEM reference-counted lifecycle."""
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -55,17 +56,20 @@ class TestRuntimeLifecycle(unittest.TestCase):
             _validate_shutdown=Mock(),
             _shutdown=Mock(),
             _debug_state=Mock(return_value={
-                "config": {"heap_size_bytes": 128},
+                "config": {"heap_size_bytes": 128, "data_engine": "mte"},
                 "device_index": 0,
                 "active_allocations": [],
             }),
         )
         self.framework_patch = patch.object(_lifecycle, "_torch_modules", return_value=(self.torch, self.dist))
         self.native_patch = patch.object(_lifecycle, "_load_native", return_value=self.native)
+        self.engine_patch = patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte"})
         self.framework_patch.start()
         self.native_patch.start()
+        self.engine_patch.start()
         self.addCleanup(self.framework_patch.stop)
         self.addCleanup(self.native_patch.stop)
+        self.addCleanup(self.engine_patch.stop)
         self.addCleanup(self._reset_runtime)
         self._reset_runtime()
 
@@ -118,6 +122,28 @@ class TestRuntimeLifecycle(unittest.TestCase):
         _lifecycle.release()
         self.native._shutdown.assert_not_called()
         _lifecycle.release()
+
+    def test_active_runtime_rejects_changed_data_engine(self) -> None:
+        """Reject a new user before it can reinterpret the active device state."""
+        _lifecycle.acquire(self.world)
+
+        with patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma"}):
+            with self.assertRaisesRegex(RuntimeError, "data engine differs"):
+                _lifecycle.acquire(self.world)
+
+        self.assertEqual(_lifecycle._reference_count(), 1)
+        _lifecycle.release()
+
+    def test_active_udma_runtime_accepts_the_same_data_engine(self) -> None:
+        """Keep the shared QP engine fixed while adding an equivalent owner."""
+        self.native._debug_state.return_value["config"]["data_engine"] = "mte_udma"
+
+        with patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma"}):
+            _lifecycle.acquire(self.world)
+            _lifecycle.acquire(self.world)
+            self.assertEqual(_lifecycle._reference_count(), 2)
+            _lifecycle.release()
+            _lifecycle.release()
 
     def test_different_root_is_rejected(self) -> None:
         """Reject a later ProcessGroup with a different ordered membership."""
@@ -306,7 +332,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
         def debug_state() -> dict:
             """Expose the mutable mocked Allocation registry."""
             return {
-                "config": {"heap_size_bytes": 256},
+                "config": {"heap_size_bytes": 256, "data_engine": "mte"},
                 "device_index": 0,
                 "active_allocations": list(active_allocations),
             }
@@ -384,7 +410,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.torch.npu.current_device.return_value = 0
 
         self.native._debug_state.return_value = {
-            "config": {"heap_size_bytes": 128},
+            "config": {"heap_size_bytes": 128, "data_engine": "mte"},
             "device_index": 0,
             "active_allocations": [{"allocation_base": 1234, "allocation_bytes": 16}],
         }
@@ -419,7 +445,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
             )
         self.torch.npu.is_current_stream_capturing.return_value = False
         self.native._debug_state.return_value = {
-            "config": {"heap_size_bytes": 128}, "device_index": 0, "active_allocations": [],
+            "config": {"heap_size_bytes": 128, "data_engine": "mte"}, "device_index": 0, "active_allocations": [],
         }
 
         def peer_preflight_error(output: list, value: object, **_kwargs: object) -> None:

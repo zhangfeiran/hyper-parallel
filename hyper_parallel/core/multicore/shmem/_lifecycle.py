@@ -21,6 +21,7 @@ __all__ = [
     "release",
 ]
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -144,8 +145,10 @@ def _subgroup_unique_id(native: Any, dist: Any, group: Any, rank: int, ranks: tu
 
 def _validate_active_root(selected_group: Any, dist: Any, heap_size_bytes: int | None) -> None:
     """Check that another owner can join the currently initialized root."""
+    config = _load_native()._debug_state()["config"]  # pylint: disable=protected-access
+    if config["data_engine"] != os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte"):
+        raise RuntimeError("SHMEM data engine differs from the active Runtime")
     if heap_size_bytes is not None:
-        config = _load_native()._debug_state()["config"]  # pylint: disable=protected-access
         if config["heap_size_bytes"] < heap_size_bytes:
             raise RuntimeError("active SHMEM heap is smaller than the requested managed layout")
     if dist.is_initialized() != _root_uses_distributed:
@@ -403,13 +406,17 @@ def _restart(
                 raise RuntimeError("current NPU device differs from the SHMEM Runtime device")
             if torch.npu.is_current_stream_capturing():
                 raise RuntimeError("SHMEM restart is unavailable during graph capture")
+            requested_engine = os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte")
+            if native_state["config"]["data_engine"] != requested_engine:
+                raise RuntimeError("SHMEM restart cannot change the active data engine")
             business_state = preflight_hook()
             current_manifest, target_manifest = _validate_replacements(
                 replacements,
                 native_state,
                 heap_size_bytes,
             )
-            preflight_state = heap_size_bytes, business_state, current_manifest, target_manifest
+            preflight_state = (heap_size_bytes, business_state, current_manifest, target_manifest,
+                               native_state["config"]["data_engine"])
 
         stages_ms = {
             "preflight_ms": _reconfiguration_stage(preflight, value=lambda: preflight_state),

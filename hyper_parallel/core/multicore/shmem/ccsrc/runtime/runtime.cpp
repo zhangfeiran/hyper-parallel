@@ -40,7 +40,7 @@ const char *StateName(State state) {
 }
 
 const char *DataEngineName(DataEngine engine) {
-  return engine == DataEngine::Mte ? "mte" : "unknown";
+  return engine == DataEngine::Mte ? "mte" : (engine == DataEngine::MteUdma ? "mte_udma" : "unknown");
 }
 
 DfxPhase PhaseForDeviceStatus(const Status &status) {
@@ -85,6 +85,11 @@ Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
       std::string("SHMEM backend=") + kBackendSocType + " does not match soc_name=" + device_identity_->soc_name +
         "; rebuild with: bash build.sh --strict on --soc-list " + soc_list);
     return FailInitialization(DfxPhase::Validation, root.root_rank, error, __FILE__, __LINE__);
+  }
+
+  if (config.data_engine == DataEngine::MteUdma && device_identity_->model != DeviceModel::kAscend950) {
+    return FailInitialization(DfxPhase::Validation, root.root_rank,
+      MakeError(ErrorCode::UnsupportedCapability, "MTE|UDMA requires Ascend950"), __FILE__, __LINE__);
   }
 
   allocations_.emplace(device_identity_->device_index, next_allocation_id_);
@@ -339,9 +344,11 @@ Status Runtime::ValidateInitialInput(const RootWorldInfo &root, const Config &co
                      "root_rank must be in [0, root_size) and root_size must be positive, but got root_rank=" +
                        std::to_string(root.root_rank) + ", root_size=" + std::to_string(root.root_size));
   }
-  if (config.heap_size_bytes == 0 || config.timeout_seconds == 0 || config.data_engine != DataEngine::Mte) {
+  if (config.heap_size_bytes == 0 || config.timeout_seconds == 0 ||
+      (config.data_engine != DataEngine::Mte && config.data_engine != DataEngine::MteUdma)) {
     return MakeError(ErrorCode::InvalidConfig,
-                     "Runtime Config requires positive heap/timeout values and the MTE data engine");
+                     "Runtime Config requires positive heap/timeout values and a supported "
+                     "MTE or MTE|UDMA data engine");
   }
   if (config.bootstrap_endpoint_base.empty() || config.bootstrap_endpoint_base.size() > kMaxBootstrapEndpointBytes) {
     return MakeError(ErrorCode::InvalidConfig, "bootstrap_endpoint_base must contain between 1 and " +
