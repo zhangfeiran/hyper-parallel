@@ -498,7 +498,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         if permutation is not None:
             prepared_rows, _, unpermute_mapping = permutation[:3]
             if indexed_ingress:
-                if len(permutation) != 4 or permutation[3] is None or prepared_rows is not None:
+                if len(permutation) < 4 or permutation[3] is None or prepared_rows is not None:
                     raise ValueError("Indexed ingress requires scalar route indices and original token rows")
                 permute_src_index = permutation[3]
             else:
@@ -530,9 +530,19 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             if indexed_ingress:
                 # Port 16 is unused by Blaze F2. Keep its read-only metadata in
                 # symmetric storage until the all-rank source-read completion.
-                metadata_buffer = _workspace_tensor(workspace.route_metadata, "route_metadata")
+                metadata_storage = _workspace_tensor(workspace.route_metadata, "route_metadata")
+                metadata_buffer = metadata_storage[:ctx.source_rows]
                 metadata_buffer[:, 0].copy_(permute_src_index)
-                execution = replace(execution, gmm_workspace=metadata_buffer.view(torch.uint8))
+                if spec.forward_ingress_mode == "peer_dedup":
+                    metadata_buffer[:, 2].copy_(permutation[1].reshape(-1))
+                    metadata_buffer[:, 3].copy_(permutation[4])
+                execution = replace(execution, gmm_workspace=metadata_storage.view(torch.uint8))
+            if getattr(plan, "ingress_diagnostics", None) is not None:
+                ingress_plan = replace(plan, fwd_diagnostics=plan.ingress_diagnostics, ingress_diagnostics=None)
+                _launch_forward_kernel(ingress_plan, metadata, execution.source, weight1, weight2, execution)
+                # Same-stream reset follows the complete ingress kernel. Keep
+                # persistent ready generations for the following full graph.
+                execution = replace(execution, event_counters=workspace.prepare_event_counters(forward=True))
             _launch_forward_kernel(
                 plan,
                 metadata,
@@ -695,7 +705,8 @@ def execute_mega_moe_with_permutation(
         route.metadata,
         plan,
         workspace,
-        (route.routed_tokens, topk_ids, route.unpermute_mapping, getattr(route, "permute_src_index", None)),
+        (route.routed_tokens, topk_ids, route.unpermute_mapping, getattr(route, "permute_src_index", None),
+         getattr(route, "peer_row_ordinals", None)),
         topk_weights,
         workspace_claimed,
     )

@@ -67,7 +67,11 @@ def _workspace_allocation_specs(
         ("backward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
     )
     if forward_ingress_mode != "legacy":
-        allocations += (("route_metadata", allocation_spec((routed_slots, 4), torch.int32, _WORKSPACE_ALIGNMENT)),)
+        # The tail holds one private 128-byte cache line per diagnostic task.
+        # Peers never read it; scalar counter stores cannot share cache lines.
+        statistics_rows = 8 * num_experts * ((routed_slots + 127) // 128)
+        allocations += (("route_metadata", allocation_spec(
+            (routed_slots + statistics_rows, 4), torch.int32, _WORKSPACE_ALIGNMENT)),)
     return allocations
 
 

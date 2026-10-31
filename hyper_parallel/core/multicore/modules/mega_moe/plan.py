@@ -75,6 +75,7 @@ class MegaMoePlan:
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
+    ingress_diagnostics: MegaKernelDiagnostics | None = None
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -157,7 +158,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         for task in forward_data.all_tasks[:forward_data.task_num]:
             if task.task_type == TaskType.TASK_SHMEM_GET_MEM:
                 task.extra_value_0 = 16
-                task.extra_value_1 = 1
+                task.extra_value_1 = 3 if spec.forward_ingress_mode == "peer_dedup" else 1
                 task.inputs[1].dim[3] = spec.top_k
             elif task.task_type == TaskType.TASK_GROUPED_MATMUL:
                 # Blaze does not use the legacy GMM workspace tensor at port 16.
@@ -206,6 +207,24 @@ def _prepare_diagnostics(
     )
 
 
+def _build_ingress_config(forward_config: Any) -> Any:
+    """Queue only independent owner GETs; rely on outer all-worker/peer completion."""
+    config = type(forward_config).from_buffer_copy(bytes(forward_config))
+    task_ids = [int(config.vector_task_indices[index]) for index in range(config.task_index_num[1])]
+    gets = [index for index in task_ids if config.all_tasks[index].task_type == TaskType.TASK_SHMEM_GET_MEM]
+    config.task_index_num[0] = 0
+    config.task_index_num[1] = len(gets)
+    config.all_event_num_triggers[0] = len(gets)
+    for position, index in enumerate(gets):
+        config.vector_task_indices[position] = index
+        task = config.all_tasks[index]
+        task.dependent_event = 0xFFFFFFFF
+        # Dummy 0 is never waited on. No per-expert credit is published here.
+        task.trigger_event = 0
+        task.extra_value_1 = 2
+    return config
+
+
 def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     """Build trimmed dense forward/backward runtime images without fusion slots.
 
@@ -220,6 +239,16 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     fwd_diagnostics, bwd_diagnostics = _prepare_diagnostics(
         spec, forward_graph, forward_config, backward_graph, backward_config, device,
     )
+    ingress_diagnostics = None
+    if spec.forward_ingress_mode == "peer_dedup":
+        topology = _build_task_values(spec)
+        topology.rank_id = spec.rank_id
+        ingress_diagnostics = prepare_mega_kernel_diagnostics(
+            forward_graph, _build_ingress_config(forward_config), parameter_count=16,
+            kernel_name="mega_moe_ingress", device=device,
+            rank=dist.get_rank() if dist.is_initialized() else spec.rank_id,
+            **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
+        )
     gmm_options = {
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
@@ -228,6 +257,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     }
     return MegaMoePlan(
         spec=spec,
+        ingress_diagnostics=ingress_diagnostics,
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
         ),

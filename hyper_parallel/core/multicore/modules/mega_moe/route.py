@@ -58,6 +58,7 @@ class PreparedTopKRoute:
     metadata: RouteMetadata
     maximum_received_slots: int = 0
     permute_src_index: torch.Tensor | None = None
+    peer_row_ordinals: torch.Tensor | None = None
 
 
 def _validate_topk_inputs(
@@ -247,6 +248,18 @@ def _build_route_indices(topk_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Te
             inverse_order.reshape(-1).to(torch.int32).contiguous())
 
 
+def _peer_row_ordinals(
+    topk_ids: torch.Tensor, sorted_slots: torch.Tensor, counts: torch.Tensor,
+) -> torch.Tensor:
+    """Map each original route slot to its exact row within its source expert."""
+    slots = sorted_slots.to(torch.int64)
+    ids = topk_ids.reshape(-1).to(torch.int64)
+    prefix = counts.cumsum(0, dtype=torch.int32) - counts
+    positions = torch.arange(slots.numel(), dtype=torch.int32, device=slots.device)
+    sorted_ordinals = positions - prefix[ids[slots]]
+    return torch.empty_like(sorted_slots).scatter_(0, slots, sorted_ordinals)
+
+
 def prepare_topk_route(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -303,6 +316,8 @@ def prepare_topk_route(
         received_counts=received_counts,
         maximum_received_slots=maximum_received_slots,
         permute_src_index=permute_src_index,
+        peer_row_ordinals=(_peer_row_ordinals(topk_ids, permute_src_index, counts)
+                           if spec.forward_ingress_mode == "peer_dedup" else None),
         metadata=_compute_route_metadata(
             counts,
             counts_by_source,

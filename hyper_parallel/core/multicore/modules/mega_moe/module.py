@@ -269,7 +269,8 @@ class MegaMoeExperts(MulticoreModule):
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             forward_ingress_mode: Experimental Ascend 950 BF16 ingress: "legacy" or
-                "indexed". Indexed requires static pull and uses Blaze F2 forward.
+                "indexed", or "peer_dedup". Indexed modes require static pull and Blaze F2.
+                Peer dedup uses a dispatch prepass followed by the original compute graph.
                 It preserves the legacy backward source capacity and receive layout.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
                 Must be a positive multiple of 128 that divides local_num_tokens.
@@ -287,11 +288,13 @@ class MegaMoeExperts(MulticoreModule):
                 one ordered EP membership active in SHMEM at a time.
         """
         reserved_tokens = _resolve_token_capacity(local_num_tokens, max_local_num_tokens, hidden_size, top_k)
-        if forward_ingress_mode not in ("legacy", "indexed"):
-            raise ValueError("forward_ingress_mode must be legacy or indexed")
+        if forward_ingress_mode not in ("legacy", "indexed", "peer_dedup"):
+            raise ValueError("forward_ingress_mode must be legacy, indexed or peer_dedup")
         if forward_ingress_mode != "legacy":
             if dispatch_mode != "pull" or max_local_num_tokens is not None:
                 raise ValueError("Indexed forward ingress requires static pull dispatch")
+            if forward_ingress_mode == "peer_dedup" and top_k > 16:
+                raise ValueError("Peer dedup ingress currently supports top_k at most 16")
             if reserved_tokens * top_k > 2**24:
                 raise ValueError("Indexed scalar route sorting requires at most 2**24 route slots")
         specification = {
