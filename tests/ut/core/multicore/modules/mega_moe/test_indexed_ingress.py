@@ -306,7 +306,8 @@ class TestIndexedIngress(unittest.TestCase):
                            dispatch_mode="pull", forward_ingress_mode="peer_tile")
         reference = _build_runtime_artifacts(spec)[1]
         for field, value in (("extra_value_1", 0), ("extra_value_1", 3),
-                             ("extra_value_0", 0), ("extra_value_0", 17), ("dependent_event", 1)):
+                             ("extra_value_0", 0), ("extra_value_0", 4), ("extra_value_0", 17),
+                             ("dependent_event", 1)):
             with self.subTest(field=field, value=value):
                 config = type(reference).from_buffer_copy(bytes(reference))
                 task = next(task for task in config.all_tasks[:config.task_num]
@@ -315,3 +316,15 @@ class TestIndexedIngress(unittest.TestCase):
                 setattr(task, field, value)
                 with self.assertRaisesRegex(ValueError, "tile-ready"):
                     validate_runtime_config(config, _build_task_values(spec), spec.num_cube_cores)
+
+    def test_tile_ready_accepts_matching_supported_topk(self) -> None:
+        """The public topology, token jobs and marked consumer share one packed-record geometry."""
+        for top_k in (1, 2, 4, 8, 16):
+            with self.subTest(top_k=top_k):
+                spec = MegaMoeSpec(128, 5120, 1792, 32, top_k, None, 128 * top_k, 4, None, 0, 32,
+                                   dispatch_mode="pull", forward_ingress_mode="peer_tile")
+                config = _build_runtime_artifacts(spec)[1]
+                marked = [task for task in config.all_tasks[:config.task_num]
+                          if task.extra_value_2 == 0x4D54494C]
+                self.assertTrue(marked, "No tile-aware consumer is reachable")
+                self.assertEqual({task.extra_value_0 for task in marked}, {top_k}, "Top-K differs across consumers")

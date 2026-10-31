@@ -49,14 +49,16 @@ __aicore__ inline void RunBlaze(const Problem& problem, GM_ADDR a, GM_ADDR b, GM
   AscendC::TPipe pipe;
   Mmad block;
   block.Init(params);
-  if constexpr (InputTiles) {
-    if (tiling.baseM != INPUT_TILE_ROWS) { AscendC::Trap(); }
-  }
   for (int64_t tile = logical_cube; tile < schedule.GetBlockNums(); tile += cubes) {
     auto block_shape = schedule.template GetBlockShape<Mmad::TRANS_B, bfloat16_t>(tile);
     auto coordinate = schedule.GetBlockCoord(tile);
     const int64_t m = asc::te::get<0>(block_shape), n = asc::te::get<1>(block_shape);
     const int64_t m_offset = asc::te::get<0>(coordinate), n_offset = asc::te::get<1>(coordinate);
+    if constexpr (InputTiles) {
+      // Tail scheduling can reserve empty virtual blocks. They must not load A
+      // or wait for nonexistent rows, and still reach the original task join.
+      if (m <= 0 || n <= 0) { continue; }
+    }
     auto block_a = gm_a.slice(asc::te::make_coord(m_offset, int64_t{0}),
                               asc::te::make_shape(m, static_cast<int64_t>(problem.k)));
     auto block_b = gm_b.slice(asc::te::make_coord(int64_t{0}, n_offset),

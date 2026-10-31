@@ -390,11 +390,12 @@ def _validate_swiglu_task(task: TaskDescC, descriptor_index: int, group_size: in
         )
 
 
-def _validate_gmm_task(task: TaskDescC, descriptor_index: int, expected_tasks: int) -> None:
+def _validate_gmm_task(task: TaskDescC, descriptor_index: int, expected_tasks: int, top_k: int) -> None:
     """Validate that every local expert owns one task per Cube core."""
     if task.extra_value_2 == 0x4D54494C and (
             task.extra_value_1 != 2 or task.dependent_event != 0xFFFFFFFF
-            or not 1 <= task.extra_value_0 <= 16 or task.outputs[0].input_position != 7):
+            or task.extra_value_0 != top_k or not 1 <= task.extra_value_0 <= 16
+            or task.outputs[0].input_position != 7):
         raise ValueError(f"GMM task {descriptor_index} has an invalid tile-ready input contract")
     if task.task_split_num != expected_tasks:
         raise ValueError(
@@ -508,7 +509,7 @@ def validate_runtime_config(
         if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
             _validate_swiglu_task(task, descriptor_index, group_size)
         elif task_type == TaskType.TASK_GROUPED_MATMUL:
-            _validate_gmm_task(task, descriptor_index, num_cube_cores * local_experts)
+            _validate_gmm_task(task, descriptor_index, num_cube_cores * local_experts, tsv.top_k)
         elif task_type == TaskType.TASK_MOE_TOKEN_GET:
             _validate_token_task(task, descriptor_index, tsv)
         else:
