@@ -85,11 +85,11 @@ def test_device_replica_boundaries_npu() -> None:
                                                          target_load=target)
             torch.npu.current_stream().wait_stream(stream)
             oracle = build_expert_replica_plan(counts, budget, minimum_replica_rows=minimum, target_load=target)
-            retained.append((plan, oracle))
-    for plan, oracle in reversed(retained):
+            retained.append((plan, oracle, (budget, minimum, target)))
+    for plan, oracle, case in reversed(retained):
         summary = plan.host_summary()
         if summary.slot_to_logical != oracle.slot_to_logical or summary.destination_counts != oracle.destination_counts:
-            raise AssertionError("AIV plan differs from CPU policy")
+            raise AssertionError(f"AIV plan differs from CPU policy for {case}: actual={summary}, expected={oracle}")
         torch.testing.assert_close(plan.dispatch_counts.cpu(), torch.tensor(oracle.dispatch_counts, dtype=torch.int32))
         with _NoReadback():
             order, _ = plan.source_runs(0)
@@ -97,7 +97,7 @@ def test_device_replica_boundaries_npu() -> None:
         expected = torch.where(logical >= 0, logical, plan.config.num_experts).float().argsort(stable=True)
         torch.testing.assert_close(order, expected)
         torch.testing.assert_close(plan.source_counts, plan.dispatch_counts[:, expected].to(torch.int64))
-    if len({plan.control.data_ptr() for plan, _ in retained}) != len(retained):
+    if len({plan.control.data_ptr() for plan, _, _ in retained}) != len(retained):
         raise AssertionError("Live plans alias their control storage")
     print(f"DEVICE_STREAM_PARITY_OK retained={len(retained)}", flush=True)
 

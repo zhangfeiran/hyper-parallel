@@ -36,6 +36,18 @@ endif()
 
 find_package(ASC REQUIRED)
 
+# CANN versions choose different default directories for supported-op metadata.
+set(ASCEND_FRAMEWORK_TYPE tensorflow)
+
+find_path(CANN_OP_COMMON_INCLUDE log/log.h
+    PATHS
+        "${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/op_common"
+        "${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/op_common"
+    NO_DEFAULT_PATH
+    REQUIRED
+)
+get_filename_component(CANN_OP_COMMON_PARENT "${CANN_OP_COMMON_INCLUDE}" DIRECTORY)
+
 set(package_name hyper_parallel_multicore_nn)
 npu_op_package(${package_name}
     TYPE RUN

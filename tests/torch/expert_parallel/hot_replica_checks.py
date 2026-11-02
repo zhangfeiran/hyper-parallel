@@ -20,7 +20,10 @@ import hashlib
 import json
 import os
 import subprocess
+from functools import wraps
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 import torch
 
@@ -29,7 +32,15 @@ from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute
 
 def deferred_ids(tokens: int, top_k: int, experts: int, invocation: int,
                  device: torch.device) -> torch.Tensor:
-    """Rotate a legal hot set while retaining K distinct experts per token."""
+    """Rotate a legal hot set while retaining K distinct experts per token.
+
+    Args:
+        tokens: Local token count.
+        top_k: Distinct experts selected for each token.
+        experts: Logical expert count.
+        invocation: First or second retained invocation.
+        device: Device hosting the routing IDs.
+    """
     if not 1 <= top_k <= experts or invocation not in (0, 1):
         raise ValueError("Deferred routes require 1 <= K <= E and invocation 0 or 1")
     positions = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k)
@@ -37,7 +48,11 @@ def deferred_ids(tokens: int, top_k: int, experts: int, invocation: int,
 
 
 def saved_route(output: torch.Tensor) -> ReplicaRoute:
-    """Read the route actually saved by autograd, without replacing its planner."""
+    """Read the route actually saved by autograd, without replacing its planner.
+
+    Args:
+        output: Expert output with a live backward graph.
+    """
     pending, visited = [output.grad_fn], set()
     while pending:
         node = pending.pop()
@@ -52,8 +67,40 @@ def saved_route(output: torch.Tensor) -> ReplicaRoute:
     raise AssertionError("Candidate output has no saved replica route")
 
 
+def replica_forward(executor: torch.nn.Module, *args: Any, **kwargs: Any) -> torch.Tensor:
+    """Observe the real planner when the home fast path drops its autograd route.
+
+    Args:
+        executor: Replica-enabled expert module.
+        *args: Positional forward arguments passed unchanged.
+        **kwargs: Keyword forward arguments passed unchanged.
+    """
+    observed = []
+    prepare = executor._prepare_replica_route
+
+    @wraps(prepare)
+    def _record(*planner_args: Any, **planner_kwargs: Any) -> ReplicaRoute:
+        route = prepare(*planner_args, **planner_kwargs)
+        observed[:] = [route]
+        return route
+
+    with patch.object(executor, "_prepare_replica_route", side_effect=_record):
+        output = executor(*args, **kwargs)
+    if observed and observed[0].home_only:
+        output._replica_home_route = observed[0]
+    return output
+
+
 def route_evidence(output: torch.Tensor, planner: str, *, home_route: ReplicaRoute | None = None) -> dict:
-    """Fail if the requested planner was bypassed, and describe its actual plan."""
+    """Fail if the requested planner was bypassed, and describe its actual plan.
+
+    Args:
+        output: Actual expert output.
+        planner: Requested CPU or device planner.
+        home_route: Observed home-only route when autograd omits that metadata.
+    """
+    if home_route is None:
+        home_route = getattr(output, "_replica_home_route", None)
     if home_route is not None and home_route.plan.transfers:
         raise AssertionError("A home-only route cannot bypass saved replica-plan checks")
     route = saved_route(output) if home_route is None else home_route
@@ -65,7 +112,11 @@ def route_evidence(output: torch.Tensor, planner: str, *, home_route: ReplicaRou
 
 
 def file_identity(path: Path) -> dict:
-    """Identify the file actually loaded rather than an intended build directory."""
+    """Identify the file actually loaded rather than an intended build directory.
+
+    Args:
+        path: Loaded source or native library path.
+    """
     path = path.resolve()
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 

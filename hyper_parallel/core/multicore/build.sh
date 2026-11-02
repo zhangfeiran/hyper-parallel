@@ -13,7 +13,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 source "${PROJECT_ROOT}/scripts/native/cann_version.sh"
-HP_MINIMUM_CANN_VERSION="9.1.0"
+HP_MINIMUM_CANN_VERSION="8.5.0"
 BUILD_DIR="${PROJECT_ROOT}/build"
 NATIVE_ROOT="${BUILD_DIR}/native"
 WORK_ROOT="${NATIVE_ROOT}/work/multicore"
@@ -281,6 +281,11 @@ function validate_multicore_vendor() {
             for artifact in "${artifacts[@]}"; do
                 require_nonempty_artifact "${artifact}" "${soc} ${op_name} kernel metadata"
             done
+            if ! "${PYTHON_BIN}" "${SCRIPT_DIR}/_build/validate_kernel_metadata.py" \
+                --root "${vendor_root}/op_impl/ai_core/tbe/kernel/${soc}/${op_name}"; then
+                fail "CANN_KERNEL_DEBUG_METADATA_ENABLED" \
+                    "Production ${soc} ${op_name} kernel metadata enables device debug output." 12
+            fi
         done
         require_nonempty_artifact \
             "${vendor_root}/op_impl/ai_core/tbe/config/${soc}/aic-${soc}-ops-info.json" \
@@ -469,6 +474,7 @@ function calculate_vendor_fingerprint() {
                 hyper_parallel/core/multicore/build.sh \
                 hyper_parallel/core/multicore/_build/assemble_multicore_source.py \
                 hyper_parallel/core/multicore/_build/merge_multicore_vendors.py \
+                hyper_parallel/core/multicore/_build/validate_kernel_metadata.py \
                 hyper_parallel/core/multicore/cmake/hardening.cmake \
                 hyper_parallel/core/multicore/shmem/_build/shmem_sdk.sh
             while IFS= read -r -d '' source_file; do

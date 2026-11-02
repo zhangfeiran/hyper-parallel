@@ -6,7 +6,7 @@
 - 当前 Python 的开发头文件，以及 `setuptools`、`wheel`、`pybind11`
 - Git
 - GCC/G++（支持 C++17）、GNU Make、binutils、coreutils、tar、sed、awk
-- CANN >= 9.1.0 的完整 toolkit/ops 开发环境（Ascend NPU 开发需要）
+- CANN >= 8.5.0 的完整 toolkit/ops 开发环境（Ascend NPU 开发需要；发布构建基线为 9.1.0）
 - CMake ≥ 3.18
 - Ninja（native target 需要）
 

@@ -50,6 +50,7 @@ from tests.torch.expert_parallel.hot_replica_checks import (
     deferred_ids,
     execution_identity,
     file_identity,
+    replica_forward,
     route_evidence,
 )
 from tests.torch.expert_parallel.test_hot_replica import TRAINING_CASES
@@ -65,7 +66,7 @@ def _expert_forward(module, executor, values, ids, probabilities, experts):
     if executor not in (None, "native_fp32"):
         packed = torch.cat((_local(module.w1), _local(module.w3)), dim=1).transpose(1, 2).contiguous()
         down = _local(module.w2).transpose(1, 2).contiguous()
-        return executor(values, ids, probabilities, expert_weights=(packed, down))
+        return replica_forward(executor, values, ids, probabilities, expert_weights=(packed, down))
     order = torch.argsort(ids.flatten(), stable=True)
     expanded = values[:, None, :].expand(-1, ids.shape[1], -1).reshape(-1, values.shape[-1])
     counts = torch.bincount(ids.flatten(), minlength=experts)
@@ -105,6 +106,43 @@ def _check(actual, expected, label, *, elementwise=True, rtol=2e-2, atol=2e-3):
     return {"relative_l2": relative, "max_abs": maximum}
 
 
+def _deferred_backward_checks(pending, streams, main_stream, base, candidate):
+    """Compare retained invocations in reverse order with the same stream dependencies."""
+    checks = []
+    previous_backward = None
+    for invocation, (expected, actual, values, other, probabilities, other_probabilities) in reversed(
+            list(enumerate(pending))):
+        gradient = torch.randn_like(expected)
+        stream = None if not streams else streams[1 - invocation % 2]
+        if stream is not None:
+            stream.wait_stream(main_stream)
+            stream.wait_stream(streams[invocation % 2])
+            if previous_backward is not None:
+                stream.wait_stream(previous_backward)
+        with nullcontext() if stream is None else torch.npu.stream(stream):
+            expected.backward(gradient)
+            actual.backward(gradient)
+            checks.append({"output": _check(actual, expected, "deferred output"),
+                           "dx": _check(other.grad, values.grad, "deferred dx"),
+                           "dprob": _check(other_probabilities.grad, probabilities.grad, "deferred dprob"),
+                           **{name: _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad),
+                                           "deferred accumulated " + name, elementwise=False)
+                              for name in ("w1", "w2", "w3")}})
+        previous_backward = stream
+    if previous_backward is not None:
+        main_stream.wait_stream(previous_backward)
+    return checks
+
+
+def _validate_deferred_plans(plans, capacities, growth):
+    """Require the same distinct active plans and receive growth as the lifetime fixture."""
+    active = plans[1]["transfers"] if growth else all(plan["transfers"] for plan in plans)
+    if plans[0] == plans[1] or not active:
+        raise AssertionError(f"Deferred acceptance requires distinct plans and active replicas: {plans}")
+    if growth and capacities[1] <= capacities[0]:
+        raise AssertionError(f"Expected heap growth with an old forward alive: {capacities}")
+
+
 def _deferred_backward(base, candidate, executor, experts, rank, device, tokens, hidden, top_k, reference,
                        replica_planner, *, growth=False, cross_stream=False):
     """Keep different plans live, then run backward in reverse invocation order."""
@@ -139,34 +177,8 @@ def _deferred_backward(base, candidate, executor, experts, rank, device, tokens,
             resources = executor._get_execution_resources(other)
             capacities.append(resources.workspace.capacity_floor)
         pending.append((expected, actual, values, other, probabilities, other_probabilities))
-    active = plans[1]["transfers"] if growth else all(plan["transfers"] for plan in plans)
-    if plans[0] == plans[1] or not active:
-        raise AssertionError(f"Deferred acceptance requires distinct plans and active replicas: {plans}")
-    if growth and capacities[1] <= capacities[0]:
-        raise AssertionError(f"Expected heap growth with an old forward alive: {capacities}")
-    checks = []
-    previous_backward = None
-    for invocation, (expected, actual, values, other, probabilities, other_probabilities) in reversed(
-            list(enumerate(pending))):
-        gradient = torch.randn_like(expected)
-        stream = None if not streams else streams[1 - invocation % 2]
-        if stream is not None:
-            stream.wait_stream(main_stream)
-            stream.wait_stream(streams[invocation % 2])
-            if previous_backward is not None:
-                stream.wait_stream(previous_backward)
-        with nullcontext() if stream is None else torch.npu.stream(stream):
-            expected.backward(gradient)
-            actual.backward(gradient)
-            checks.append({"output": _check(actual, expected, "deferred output"),
-                           "dx": _check(other.grad, values.grad, "deferred dx"),
-                           "dprob": _check(other_probabilities.grad, probabilities.grad, "deferred dprob"),
-                           **{name: _check(_local(getattr(candidate, name).grad), _local(getattr(base, name).grad),
-                                           "deferred accumulated " + name, elementwise=False)
-                              for name in ("w1", "w2", "w3")}})
-        previous_backward = stream
-    if previous_backward is not None:
-        main_stream.wait_stream(previous_backward)
+    _validate_deferred_plans(plans, capacities, growth)
+    checks = _deferred_backward_checks(pending, streams, main_stream, base, candidate)
     return {"invocations": checks, "plans": plans, "capacities": capacities,
             "streams": [stream.npu_stream for stream in streams]}
 
@@ -218,6 +230,46 @@ def _kernel_wait_stress(base, candidate, executor, experts, rank, device, tokens
     return {"checks": checks, "publications": publications, "global_ready_words": totals.cpu().tolist()}
 
 
+def _execution_evidence(executor, other, steps, backend, planner, transport, shape):
+    """Record the exact native payloads and transport exercised by the training fixture."""
+    tokens, hidden, intermediate, top_k = shape
+    identity = execution_identity()
+    identity.update(torch_npu=torch_npu.__version__, backend=backend, budget=1,
+                    shape=[tokens, hidden, intermediate, top_k], requested_planner=planner,
+                    actual_planner=steps[0]["plan"]["planner"], requested_transport=transport,
+                    actual_transport=transport, reference="native-fp32")
+    if planner == "device":
+        library = importlib.import_module(
+            "hyper_parallel.core.expert_parallel.hot_replica.device_kernel")._planner_library()
+        identity["planner_payload"] = {**file_identity(Path(library._name)), "abi": library.planner_abi_version()}
+    if executor is None:
+        if any(name.startswith("hyper_parallel.core.multicore") for name in sys.modules):
+            raise AssertionError("Native execution imported multicore")
+    else:
+        resources = executor._get_execution_resources(other)
+        provider = resources.workspace.replica_provider
+        if transport == KERNEL_GRADIENT_TRANSPORT:
+            if provider.gradient_scratch_bytes > hidden * intermediate * 3 * 4:
+                raise AssertionError(f"Gradient scratch exceeds one FP32 expert: {provider.gradient_scratch_bytes}")
+            identity["kernel_gradient_matrices"] = provider.last_kernel_gradient_matrices
+            if sorted(identity["kernel_gradient_matrices"]) != [0, 1]:
+                raise AssertionError(f"Both projections must return through the kernel: {identity}")
+        loader = importlib.import_module("hyper_parallel.core.multicore._loader")
+        vendor, adapter = loader.get_multicore_paths()
+        identity["multicore_payload"] = [file_identity(adapter),
+                                         file_identity(vendor / "op_api/lib/libcust_opapi.so")]
+        identity["multicore_kernels"] = [file_identity(path) for path in sorted(vendor.rglob("*.o"))]
+        identity["multicore_transport_abi"] = torch.ops.hyper_parallel.mega_moe_transport_version()
+        identity["shmem_binding"] = file_identity(Path(sys.modules["hyper_parallel_shmem_torch"].__file__))
+    return identity
+
+
+def _training_route_evidence(candidate, actual, backend, planner):
+    """Inspect native home controls or the actual saved multicore invocation route."""
+    route = candidate._hot_replica_dispatch.route if backend == "native" else None
+    return route_evidence(actual, planner, home_route=route if route and not route.plan.transfers else None)
+
+
 def _run(backend: str, top_k: int, planner: str, transport: str, result_dir: Path) -> None:
     """Compare B=1 training and saved-plan lifetimes with the native FP32 reference."""
     rank, size = dist.get_rank(), dist.get_world_size()
@@ -245,6 +297,7 @@ def _run(backend: str, top_k: int, planner: str, transport: str, result_dir: Pat
                            num_experts=experts, top_k=top_k, ep_size=size, create_parameters=False,
                            ep_group=mesh.get_group(), dispatch_mode=backend,
                            replica_slots_per_rank=1, replica_transport=transport, replica_planner=planner,
+                           replica_min_rows=0,
                            replica_minimum_load_reduction=0.0,
                            **({"initial_capacity_factor": 1.0} if backend == "push" else {}))
     optimizer_base = torch.optim.SGD(base.parameters(), lr=0.01, momentum=0.9)
@@ -265,8 +318,7 @@ def _run(backend: str, top_k: int, planner: str, transport: str, result_dir: Pat
             candidate.zero_grad(set_to_none=True)
             expected = _expert_forward(base, "native_fp32", x, ids, probs, experts)
             actual = _expert_forward(candidate, executor, other, ids, other_probs, experts)
-            route = candidate._hot_replica_dispatch.route if backend == "native" else None
-            plan = route_evidence(actual, planner, home_route=route if route and not route.plan.transfers else None)
+            plan = _training_route_evidence(candidate, actual, backend, planner)
             gradient = torch.randn_like(expected)
             expected.backward(gradient)
             actual.backward(gradient)
@@ -285,34 +337,8 @@ def _run(backend: str, top_k: int, planner: str, transport: str, result_dir: Pat
             steps.append(checks)
         deferred = _deferred_backward(*arguments, cross_stream=backend != "native")
         kernel_wait = _kernel_wait_stress(*arguments) if transport == KERNEL_GRADIENT_TRANSPORT else None
-        identity = execution_identity()
-        identity.update(torch_npu=torch_npu.__version__, backend=backend, budget=1,
-                        shape=[tokens, hidden, intermediate, top_k], requested_planner=planner,
-                        actual_planner=steps[0]["plan"]["planner"], requested_transport=transport,
-                        actual_transport=transport, reference="native-fp32")
-        if planner == "device":
-            library = importlib.import_module(
-                "hyper_parallel.core.expert_parallel.hot_replica.device_kernel")._planner_library()
-            identity["planner_payload"] = {**file_identity(Path(library._name)), "abi": library.planner_abi_version()}
-        if executor is None:
-            if any(name.startswith("hyper_parallel.core.multicore") for name in sys.modules):
-                raise AssertionError("Native execution imported multicore")
-        else:
-            resources = executor._get_execution_resources(other)
-            provider = resources.workspace.replica_provider
-            if transport == KERNEL_GRADIENT_TRANSPORT:
-                if provider.gradient_scratch_bytes > hidden * intermediate * 3 * 4:
-                    raise AssertionError(f"Gradient scratch exceeds one FP32 expert: {provider.gradient_scratch_bytes}")
-                identity["kernel_gradient_matrices"] = provider.last_kernel_gradient_matrices
-                if sorted(identity["kernel_gradient_matrices"]) != [0, 1]:
-                    raise AssertionError(f"Both projections must return through the kernel: {identity}")
-            loader = importlib.import_module("hyper_parallel.core.multicore._loader")
-            vendor, adapter = loader.get_multicore_paths()
-            identity["multicore_payload"] = [file_identity(adapter),
-                                             file_identity(vendor / "op_api/lib/libcust_opapi.so")]
-            identity["multicore_kernels"] = [file_identity(path) for path in sorted(vendor.rglob("*.o"))]
-            identity["multicore_transport_abi"] = torch.ops.hyper_parallel.mega_moe_transport_version()
-            identity["shmem_binding"] = file_identity(Path(sys.modules["hyper_parallel_shmem_torch"].__file__))
+        identity = _execution_evidence(executor, other, steps, backend, planner, transport,
+                                       (tokens, hidden, intermediate, top_k))
         result_dir.mkdir(parents=True, exist_ok=True)
         (result_dir / f"{backend}-b1-rank{rank}.json").write_text(json.dumps(
             {"identity": identity, "steps": steps, "growth_deferred": growth,
@@ -325,7 +351,14 @@ def _run(backend: str, top_k: int, planner: str, transport: str, result_dir: Pat
 @pytest.mark.parametrize("case,backend,planner,transport", TRAINING_CASES,
                          ids=[case[0] for case in TRAINING_CASES])
 def test_replica_training_npu(case: str, backend: str, planner: str, transport: str) -> None:
-    """Exercise final transports, planners and invocation/stream lifetimes."""
+    """Exercise final transports, planners and invocation/stream lifetimes.
+
+    Args:
+        case: Named execution variant.
+        backend: Native, push or pull expert execution.
+        planner: CPU or device policy implementation.
+        transport: Replica weight and gradient transport.
+    """
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl", timeout=timedelta(seconds=180))
     try:

@@ -19,7 +19,6 @@
 #define HOT_OUTPUT __gm__
 #include "./algorithm.h"
 using AscendC::CacheLine;
-using AscendC::DataCacheCleanAndInvalid;
 using AscendC::DataCopyExtParams;
 using AscendC::DataCopyPad;
 using AscendC::DataCopyPadExtParams;
@@ -52,7 +51,7 @@ __global__ __aicore__ void replica_planner(GM_ADDR input, GM_ADDR output, GM_ADD
          minimum, admission, saved_rows);
   GlobalTensor<int64_t> control;
   control.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(output));
-  DataCacheCleanAndInvalid<int64_t, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>(control);
+  AscendC::DataCacheCleanAndInvalid<int64_t, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>(control);
 }
 extern "C" int launch_planner(void *stream, void *counts, void *control, void *dispatch, int ranks, int experts,
                               int budget, int64_t capacity, int64_t target, int64_t minimum, int64_t admission,

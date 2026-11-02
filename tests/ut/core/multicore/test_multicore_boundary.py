@@ -33,6 +33,54 @@ from tests.common.mark_utils import arg_mark
 class TestMulticoreBoundary(unittest.TestCase):
     """Check the component contract without initializing a native runtime."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_cann_header_layout_and_supported_op_metadata(self) -> None:
+        """Feature: CANN build compatibility.
+
+        Description: Configure the vendor against SDK fixtures with either header layout.
+        Expectation: Headers resolve within the selected SDK and metadata uses the canonical directory.
+        """
+        vendor_cmake = Path(multicore.__file__).parent / "cmake/vendor/CMakeLists.txt"
+        project = """
+cmake_minimum_required(VERSION 3.18)
+project(cann_layout_fixture LANGUAGES C CXX)
+set(ASCEND_CANN_PACKAGE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cann")
+set(ASC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fake_asc")
+set(HP_MULTICORE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/operators" CACHE PATH "" FORCE)
+set(HP_SHMEM_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/shmem" CACHE PATH "" FORCE)
+set(expected_headers "${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/@HEADER_LAYOUT@/op_common")
+file(MAKE_DIRECTORY "${expected_headers}/log")
+file(WRITE "${expected_headers}/log/log.h" "")
+include("@VENDOR_CMAKE@")
+if(NOT CANN_OP_COMMON_INCLUDE STREQUAL expected_headers)
+    message(FATAL_ERROR "Selected headers differ: ${CANN_OP_COMMON_INCLUDE}")
+endif()
+"""
+        files = {
+            "fake_asc/ASCConfig.cmake": """
+set(ASCEND_FRAMEWORK_TYPE plugin)
+macro(npu_op_package)
+    if(NOT ASCEND_FRAMEWORK_TYPE STREQUAL "tensorflow")
+        message(FATAL_ERROR "Noncanonical supported-op metadata directory")
+    endif()
+endmacro()
+""",
+            "op_host/CMakeLists.txt": "",
+            "op_kernel/CMakeLists.txt": "",
+            "operators/hyper_mega_moe/op_host/hyper_mega_moe_def.cpp": "",
+            "operators/hyper_mega_gate/op_host/hyper_mega_gate_route_def.cpp": "",
+            "operators/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_def.cpp": "",
+            "shmem/include/shmem.h": "",
+        }
+        for layout in ("include", "pkg_inc"):
+            with self.subTest(layout=layout):
+                cmake_lists = project.replace("@HEADER_LAYOUT@", layout).replace(
+                    "@VENDOR_CMAKE@", vendor_cmake.as_posix()
+                )
+                result = self._run_cmake_project(cmake_lists, files, build=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     @staticmethod
     def _run_cmake_project(
         cmake_lists: str,

@@ -15,7 +15,7 @@ if ! declare -F hp_cann_version_at_least >/dev/null; then
     source "${_HP_NATIVE_SCRIPT_DIR}/../../../../../scripts/native/cann_version.sh"
 fi
 unset _HP_NATIVE_SCRIPT_DIR
-HP_MINIMUM_CANN_VERSION="9.1.0"
+HP_MINIMUM_CANN_VERSION="8.5.0"
 
 function hp_prepare_shmem_sdk() {
     local project_root=$1

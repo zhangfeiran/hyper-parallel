@@ -1,0 +1,209 @@
+diff --git a/src/device/utils/shmemi_kernel_debug.h b/src/device/utils/shmemi_kernel_debug.h
+--- a/src/device/utils/shmemi_kernel_debug.h
++++ b/src/device/utils/shmemi_kernel_debug.h
+@@ -12,13 +12,21 @@
+ #ifndef SHMEMI_KERNEL_DEBUG_H
+ #define SHMEMI_KERNEL_DEBUG_H
+ 
+-#if defined(ASCENDC_DEBUG) && defined(ASCENDC_DUMP) && (ASCENDC_DUMP == 1) && defined(DEBUG_MODE)
++#if defined(ACLSHMEM_PRODUCTION_KERNEL) && ACLSHMEM_PRODUCTION_KERNEL
++#define ACLSHMEM_DEBUG_FUNC(func, ...) ((void)0)
++#define ACLSHMEM_DEBUG_PRINTF(...) ((void)0)
++#define ACLSHMEM_KERNEL_DEBUG_ENABLED 0
++#elif defined(ASCENDC_DEBUG) && defined(ASCENDC_DUMP) && (ASCENDC_DUMP == 1) && defined(DEBUG_MODE)
+ #define ACLSHMEM_DEBUG_FUNC(func, ...) do { func(__VA_ARGS__); } while(0)
++#define ACLSHMEM_DEBUG_PRINTF(...) do { AscendC::printf(__VA_ARGS__); } while(0)
++#define ACLSHMEM_KERNEL_DEBUG_ENABLED 1
+ #else
+ #define ACLSHMEM_DEBUG_FUNC(func, ...) ((void)0)
++#define ACLSHMEM_DEBUG_PRINTF(...) ((void)0)
++#define ACLSHMEM_KERNEL_DEBUG_ENABLED 0
+ #endif
+ 
+-
++#if ACLSHMEM_KERNEL_DEBUG_ENABLED
+ template<class... Args>
+ ACLSHMEM_DEVICE void aclshmemi_kernel_abort(__gm__ const char* fmt, Args&&... args)
+ {
+@@ -32,4 +40,17 @@
+     AscendC::printf(fmt, args...);
+ }
+ 
+-#endif
+\ No newline at end of file
++#else
++template<class... Args>
++ACLSHMEM_DEVICE void aclshmemi_kernel_abort(__gm__ const char*, Args&&...)
++{
++    trap();
++}
++
++template<class... Args>
++ACLSHMEM_DEVICE void aclshmemi_kernel_printf(__gm__ const char*, Args&&...)
++{
++}
++#endif
++
++#endif
+diff --git a/src/device/gm2gm/engine/shmem_device_udma.hpp b/src/device/gm2gm/engine/shmem_device_udma.hpp
+--- a/src/device/gm2gm/engine/shmem_device_udma.hpp
++++ b/src/device/gm2gm/engine/shmem_device_udma.hpp
+@@ -60,7 +60,7 @@
+ ACLSHMEM_DEVICE void aclshmemi_dump_cqe(__gm__ aclshmemi_jfc_cqe_ctx_t* cqe_addr)
+ {
+     if (cqe_addr == nullptr) {
+-        AscendC::printf("CQE: nullptr pointer\n");
++        ACLSHMEM_DEBUG_PRINTF("CQE: nullptr pointer\n");
+         return;
+     }
+     uint32_t s_r = cqe_addr->s_r;
+@@ -76,19 +76,19 @@
+     uint32_t local_num_h = cqe_addr->local_num_h;
+     uint32_t rmt_idx = cqe_addr->rmt_idx;
+     uint32_t tpn = cqe_addr->tpn;
+-    AscendC::printf(
++    ACLSHMEM_DEBUG_PRINTF(
+         "CQE: DW0 - s_r: %d, is_jetty: %d, owner: %d, inline_en: %d, opcode: %d, fd: %d, substatus: %d, status: %d\n",
+         s_r, is_jetty, owner, inline_en, opcode, fd, substatus, status);
+-    AscendC::printf("CQE: DW1 - entry_idx: %d, local_num_l: %d\n", entry_idx, local_num_l);
+-    AscendC::printf("CQE: DW2 - local_num_h: %d, rmt_idx: %d\n", local_num_h, rmt_idx);
+-    AscendC::printf("CQE: DW3 - tpn: %d\n", tpn);
+-    AscendC::printf("CQE: DW4 - byte_cnt: %d\n", cqe_addr->byte_cnt);
+-    AscendC::printf("CQE: DW5-DW6 - userData: 0x%x%x\n", cqe_addr->user_data_h, cqe_addr->user_data_l);
+-    AscendC::printf(
++    ACLSHMEM_DEBUG_PRINTF("CQE: DW1 - entry_idx: %d, local_num_l: %d\n", entry_idx, local_num_l);
++    ACLSHMEM_DEBUG_PRINTF("CQE: DW2 - local_num_h: %d, rmt_idx: %d\n", local_num_h, rmt_idx);
++    ACLSHMEM_DEBUG_PRINTF("CQE: DW3 - tpn: %d\n", tpn);
++    ACLSHMEM_DEBUG_PRINTF("CQE: DW4 - byte_cnt: %d\n", cqe_addr->byte_cnt);
++    ACLSHMEM_DEBUG_PRINTF("CQE: DW5-DW6 - userData: 0x%x%x\n", cqe_addr->user_data_h, cqe_addr->user_data_l);
++    ACLSHMEM_DEBUG_PRINTF(
+         "CQE: DW7-DW10 - rmt_eid: [0x%x, 0x%x, 0x%x, 0x%x]\n", cqe_addr->rmt_eid[0], cqe_addr->rmt_eid[1],
+         cqe_addr->rmt_eid[2], cqe_addr->rmt_eid[3]);
+-    AscendC::printf("CQE: DW11-DW12 - data: 0x%x%x\n", cqe_addr->data_h, cqe_addr->data_l);
+-    AscendC::printf(
++    ACLSHMEM_DEBUG_PRINTF("CQE: DW11-DW12 - data: 0x%x%x\n", cqe_addr->data_h, cqe_addr->data_l);
++    ACLSHMEM_DEBUG_PRINTF(
+         "CQE: DW13-DW15 - inline_data: [0x%x, 0x%x, 0x%x]\n", cqe_addr->inline_data[0], cqe_addr->inline_data[1],
+         cqe_addr->inline_data[2]);
+ }
+@@ -154,7 +154,7 @@
+ ACLSHMEM_DEVICE void aclshmemi_dump_wqe(__gm__ uint8_t* wqe_addr, uint32_t atomic_len)
+ {
+     if (wqe_addr == nullptr) {
+-        AscendC::printf("WQE: nullptr pointer\n");
++        ACLSHMEM_DEBUG_PRINTF("WQE: nullptr pointer\n");
+         return;
+     }
+     __gm__ aclshmemi_sqe_ctx_t* sqe_ctx = (__gm__ aclshmemi_sqe_ctx_t*)wqe_addr;
+@@ -164,7 +164,7 @@
+     auto nf = sqe_ctx->nf;
+     auto token_en = sqe_ctx->token_en;
+     auto rmt_jetty_type = sqe_ctx->rmt_jetty_type;
+-    AscendC::printf(
++    ACLSHMEM_DEBUG_PRINTF(
+         "WQE: sqe_bb_idx: %x flag: %x rsv0: %x nf: %x token_en: %x rmt_jetty_type: %x\n", sqe_bb_idx, flag, rsv0, nf,
+         token_en, rmt_jetty_type);
+     auto owner = sqe_ctx->owner;
+@@ -173,26 +173,26 @@
+     auto rsv1 = sqe_ctx->rsv1;
+     auto inline_msg_len = sqe_ctx->inline_msg_len;
+     auto tp_id = sqe_ctx->tp_id;
+-    AscendC::printf(
++    ACLSHMEM_DEBUG_PRINTF(
+         "WQE: owner: %x target_hint: %x opcode: %x rsv1: %x inline_msg_len: %x tp_id: %x\n", owner, target_hint, opcode,
+         rsv1, inline_msg_len, tp_id);
+     auto sge_num = sqe_ctx->sge_num;
+     auto rmt_jetty_or_seg_id = sqe_ctx->rmt_jetty_or_seg_id;
+     auto rsv2 = sqe_ctx->rsv2;
+-    AscendC::printf("WQE: sge_num: %x rmt_jetty_or_seg_id: %x rsv2: %x\n", sge_num, rmt_jetty_or_seg_id, rsv2);
++    ACLSHMEM_DEBUG_PRINTF("WQE: sge_num: %x rmt_jetty_or_seg_id: %x rsv2: %x\n", sge_num, rmt_jetty_or_seg_id, rsv2);
+     auto rmt_eid_l = sqe_ctx->rmt_eid_l;
+     auto rmt_eid_h = sqe_ctx->rmt_eid_h;
+-    AscendC::printf("WQE: rmt_eid: %x, %x\n", rmt_eid_l, rmt_eid_h);
++    ACLSHMEM_DEBUG_PRINTF("WQE: rmt_eid: %x, %x\n", rmt_eid_l, rmt_eid_h);
+     auto rmt_token_value = sqe_ctx->rmt_token_value;
+     auto udf_type = sqe_ctx->udf_type;
+     auto reduce_data_type = sqe_ctx->reduce_data_type;
+     auto reduce_opcode = sqe_ctx->reduce_opcode;
+     auto rmt_addr_l_or_token_id = sqe_ctx->rmt_addr_l_or_token_id;
+     auto rmt_addr_h_or_token_value = sqe_ctx->rmt_addr_h_or_token_value;
+-    AscendC::printf(
++    ACLSHMEM_DEBUG_PRINTF(
+         "WQE: rmt_token_value: %x udf_type: %x reduce_data_type: %x reduce_opcode: %x\n", rmt_token_value, udf_type,
+         reduce_data_type, reduce_opcode);
+-    AscendC::printf(
++    ACLSHMEM_DEBUG_PRINTF(
+         "WQE: rmt_addr_l_or_token_id: %x rmt_addr_h_or_token_value: %x\n", rmt_addr_l_or_token_id,
+         rmt_addr_h_or_token_value);
+     if (opcode == static_cast<uint32_t>(aclshmemi_udma_opcode_t::UDMA_OP_WRITE_WITH_NOTIFY)) {
+@@ -204,7 +204,7 @@
+         auto notify_addr_h = notify_ctx->notify_addr_h;
+         auto notify_data_l = notify_ctx->notify_data_l;
+         auto notify_data_h = notify_ctx->notify_data_h;
+-        AscendC::printf(
++        ACLSHMEM_DEBUG_PRINTF(
+             "WQE: notify_token_id: %x notify_token_value: %x notify_addr_l: %x notify_addr_h: %x notify_data_l: %x "
+             "notify_data_h: %x \n",
+             notify_token_id, notify_token_value, notify_addr_l, notify_addr_h, notify_data_l, notify_data_h);
+@@ -215,7 +215,7 @@
+             (__gm__ uint8_t*)sqe_ctx + sizeof(aclshmemi_sqe_ctx_t) + sizeof(aclshmemi_sge_ctx_t);
+         uint64_t add_lo = (atomic_len == sizeof(uint32_t)) ? static_cast<uint64_t>(*(__gm__ uint32_t*)amo_data_addr) :
+                                                              *(__gm__ uint64_t*)amo_data_addr;
+-        AscendC::printf("SGE: add_data: 0x%llx \n", (unsigned long long)add_lo);
++        ACLSHMEM_DEBUG_PRINTF("SGE: add_data: 0x%llx \n", (unsigned long long)add_lo);
+     } else if (opcode == static_cast<uint32_t>(aclshmemi_udma_opcode_t::UDMA_OP_CAS)) {
+         __gm__ uint8_t* amo_data_addr =
+             (__gm__ uint8_t*)sqe_ctx + sizeof(aclshmemi_sqe_ctx_t) + sizeof(aclshmemi_sge_ctx_t);
+@@ -224,7 +224,7 @@
+         uint64_t cond_lo = (atomic_len == sizeof(uint32_t)) ?
+                                static_cast<uint64_t>(*(__gm__ uint32_t*)(amo_data_addr + atomic_len)) :
+                                *(__gm__ uint64_t*)(amo_data_addr + atomic_len);
+-        AscendC::printf(
++        ACLSHMEM_DEBUG_PRINTF(
+             "SGE: cond_data: 0x%llx, swap_data: 0x%llx\n", (unsigned long long)cond_lo, (unsigned long long)swap_lo);
+     }
+ }
+@@ -232,14 +232,14 @@
+ ACLSHMEM_DEVICE void aclshmemi_dump_sge(__gm__ uint8_t* wqe_addr, uint32_t sge_num)
+ {
+     if (wqe_addr == nullptr) {
+-        AscendC::printf("WQE: nullptr pointer\n");
++        ACLSHMEM_DEBUG_PRINTF("WQE: nullptr pointer\n");
+         return;
+     }
+     __gm__ aclshmemi_sge_ctx_t* sge_ctx = (__gm__ aclshmemi_sge_ctx_t*)(wqe_addr + sizeof(aclshmemi_sqe_ctx_t));
+     for (size_t i = 0; i < sge_num; i++) {
+         auto sge_len = sge_ctx->len;
+         auto sge_rmt_addr = sge_ctx->va;
+-        AscendC::printf("SGE: sge idx: %d, va: %p sge_len: %d\n", i, sge_rmt_addr, sge_len);
++        ACLSHMEM_DEBUG_PRINTF("SGE: sge idx: %d, va: %p sge_len: %d\n", i, sge_rmt_addr, sge_len);
+         sge_ctx++;
+     }
+ }
+@@ -343,7 +343,7 @@
+ {
+     uint32_t rmt_jetty_type = remote_mem_info->rmt_jetty_type;
+     if (rmt_jetty_type != ACLSHMEM_UDMA_REMOTE_JETTY_TYPE) {
+-        AscendC::printf(
++        ACLSHMEM_DEBUG_PRINTF(
+             "udma_post_send: remote jetty type %u is not %u\n", rmt_jetty_type, ACLSHMEM_UDMA_REMOTE_JETTY_TYPE);
+         trap();
+     }
+@@ -419,7 +419,7 @@
+     auto depth = qp_ctx_entry->depth;
+     bool valid = (shm::UDMA_SQ_BASKBLK_CNT == depth);
+     if (!valid) {
+-        AscendC::printf("sq depth [%d] is not equal with baskblkcnt [%d].\n", depth, shm::UDMA_SQ_BASKBLK_CNT);
++        ACLSHMEM_DEBUG_PRINTF("sq depth [%d] is not equal with baskblkcnt [%d].\n", depth, shm::UDMA_SQ_BASKBLK_CNT);
+         trap();
+     }
+ }
+@@ -427,7 +427,7 @@
+ ACLSHMEM_DEVICE void assert_not_self_send(uint32_t pe)
+ {
+     if (pe == static_cast<uint32_t>(aclshmem_my_pe())) {
+-        AscendC::printf("udma_post_send: pe(%d) == my_pe, self-send not allowed\n", pe);
++        ACLSHMEM_DEBUG_PRINTF("udma_post_send: pe(%d) == my_pe, self-send not allowed\n", pe);
+         trap();
+     }
+ }

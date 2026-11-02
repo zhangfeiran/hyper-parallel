@@ -18,7 +18,7 @@
 
 ## 运行
 
-按[构建说明](../../docs/build.md)准备匹配的 Torch/torch_npu、CANN9.1.0或更高版本及 native payload。
+按[构建说明](../../docs/build.md)准备匹配的 Torch/torch_npu、CANN8.5.0或更高版本及 native payload。
 本例使用 **TP1，EP 等于 torchrun 的总 rank 数**；脚本默认单机8卡。
 每 rank 默认 B1×4096、H5120、两层、专家与共享专家 I1792。
 专家总数默认 `6 × EP`，TopK 默认 `min(8, 专家总数)`；EP16 对应 E96/K8，EP8 对应 E48/K8，EP4 对应 E24/K8。

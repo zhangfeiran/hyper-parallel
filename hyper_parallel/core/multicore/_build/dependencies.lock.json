@@ -20,7 +20,7 @@
   },
   "local_compatibility": {
     "cann": [
-      ">=9.1.0"
+      ">=8.5.0"
     ]
   },
   "components": {
@@ -111,6 +111,11 @@
             "path": "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_4_task_primitives.patch",
             "sha256": "12434fae310dca30b53bc285a0a54af49e221275c52b9b3437302d2f851c005e",
             "purpose": "expose task-local Prepare, PhiRms, and PreviousX worker primitives"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/mhc_tiling_cann_compat.patch",
+            "sha256": "9cdd9cdaaea272d18e15465af56bb63b5da0f18651f4677d17aadbf9d2902b24",
+            "purpose": "use the legacy deterministic setting when the selected CANN SDK has no GetDeterministicLevel API"
           }
         ],
         "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation"
@@ -135,6 +140,11 @@
             "sha256": "3ec6f508509a70add2bb55671acf32cbfa77ef4eb2f75e2a56da2080607c2eb5",
             "upstream_issue": "https://gitcode.com/cann/shmem/issues/704",
             "purpose": "provide the HP-private hpshmem_log sink interface"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/shmem/_build/patches/cann_kernel_debug.patch",
+            "sha256": "560836f951a2b05f07f72ecc946517f76cacf0825a1ca74900e99ea36cadb600",
+            "purpose": "suppress production device printf metadata on CANN 8.5 while preserving abort traps and opt-in debug output"
           }
         ],
         "packaging_policy": {
@@ -153,6 +163,6 @@
     "shmem": "d30702bb55d0",
     "ops_nn": "v9.1.0.pre",
     "ops_transformer": "v9.1.0.pre",
-    "multicore_input": "locked ops-nn and ops-transformer kernel source plus the selected installed CANN >=9.1.0 toolchain"
+    "multicore_input": "locked ops-nn and ops-transformer kernel source plus the selected installed CANN >=8.5.0 toolchain"
   }
 }

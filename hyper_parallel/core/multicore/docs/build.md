@@ -2,7 +2,7 @@
 
 ## 编译
 
-准备配套的 Torch / torch_npu、CANN toolkit/ops >= 9.1.0，以及 Python 开发头文件、
+准备配套的 Torch / torch_npu、CANN toolkit/ops >= 8.5.0，以及 Python 开发头文件、
 pybind11、CMake >= 3.18、GCC/G++、GNU Make、Git。先激活所选 CANN 环境。
 
 从仓库根目录编译并打包：
@@ -27,6 +27,22 @@ SHMEM构建使用锁定的上游Git源码，并仅在隔离副本应用经过SHA
 和正反向 vendor；依赖版本固定在 `_build/dependencies.lock.json`。
 默认目标是 `ascend910b,ascend910_93`；可以通过 `--soc-list` 选择其中的目标。
 不同 Python、CPU、Torch/PTA 或 CANN 构建环境的制品不能默认互换。
+
+CANN 8.5.0 使用与设备型号匹配的完整 Toolkit 和 ops 包，例如 A3 设备使用 A3 ops。
+在 HOME 中安装时，先激活 `$HOME/Ascend/cann-8.5.0/set_env.sh`，再执行上述构建命令。
+切换 CANN 时在干净的 shell 中重新构建，避免继承其他版本的库和 Python 路径。
+发布制品的默认构建基线仍为 CANN 9.1.0；本地兼容构建不代表旧版 CANN 可以直接加载该发布制品。
+
+构建按所选 SDK 的实际文件布局查找 `include/op_common` 或 `pkg_inc/op_common`。
+锁定的 `mhc_tiling_cann_compat.patch` 在 SDK 提供 `GetDeterministicLevel()` 时保留其级别值，
+否则使用旧接口 `GetDeterministic()`；旧接口的确定性开关不会转换为新的 batch consistency 级别。
+
+热副本的 device planner/count 可选库需要另外使用同一 CANN 构建，安装到源码或 native payload 后再组包。
+具体命令见[热副本说明](../../expert_parallel/hot_replica/README.md)。
+
+生产 kernel 通过锁定的 `cann_kernel_debug.patch` 和 `ACLSHMEM_PRODUCTION_KERNEL` 禁用
+SHMEM 的设备端 printf，同时保留 abort trap。构建会检查编译器生成的 metadata，
+拒绝启用 printf 或超出生产限制的 debug buffer，不修改已经生成的 metadata。
 
 组件会在生成私有 SHMEM、复用缓存、生成单 SoC vendor、合并多 SoC vendor 和安装 Torch adapter 后校验
 最终制品。校验覆盖 ACLNN API、kernel object/metadata、ELF 架构、私有 SONAME、运行时依赖及共享库安全
