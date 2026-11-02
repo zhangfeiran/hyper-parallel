@@ -168,18 +168,27 @@ def _pruning_capacity(counts: tuple[tuple[int, ...], ...], loads: list[int],
 
 
 def _replacement_rows(copies: list[dict[int, int]], loads: list[int], home: int, target: int,
-                      expert: int, rows: int, limit: int) -> list[tuple[int, int, int]] | None:
+                      expert: int, rows: int, limit: int,
+                      copies_by_owner: list[list[tuple[int, int]]]) -> list[tuple[int, int, int]] | None:
     """Concentrate necessary work in existing copies before removing a small copy."""
     owner = expert // home
     needed = max(loads[owner] + rows - limit, 0)
     if not needed:
         return []
+    if not copies_by_owner:
+        # Direct removals need no search. Once consolidation is needed, its
+        # index remains complete because pruning never creates guest slots.
+        copies_by_owner.extend([] for _ in copies)
+        for rank, row in enumerate(copies):
+            for logical, count in row.items():
+                logical_owner = logical // home
+                if logical_owner != rank and count > 0:
+                    copies_by_owner[logical_owner].append((rank, logical))
     available = dict(copies[owner])
     available[expert] += rows
-    headroom = [limit - load + (rows if rank == target else 0) for rank, load in enumerate(loads)]
-    existing = sorted((-count, rank, logical) for rank, row in enumerate(copies) if rank != owner
-                      for logical, count in row.items() if logical // home == owner and count > 0
-                      and (rank, logical) != (target, expert))
+    existing = sorted((-copies[rank][logical], rank, logical) for rank, logical in copies_by_owner[owner]
+                      if copies[rank].get(logical, 0) > 0 and (rank, logical) != (target, expert))
+    headroom = {rank: limit - loads[rank] + (rows if rank == target else 0) for _, rank, _ in existing}
     replacements = []
     for _, rank, logical in existing:
         if not needed:
@@ -204,11 +213,13 @@ def _prune_small_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, .
     current = [sum(row.values()) for row in copies]
     candidates = sorted((rows, target, expert) for target, row in enumerate(copies)
                         for expert, rows in row.items() if expert // home != target and 0 < rows < minimum_rows)
+    copies_by_owner = []
     for _, target, expert in candidates:
         rows = copies[target].get(expert, 0)
         if not 0 < rows < minimum_rows:
             continue
-        replacements = _replacement_rows(copies, current, home, target, expert, rows, limit)
+        replacements = _replacement_rows(copies, current, home, target, expert, rows, limit,
+                                         copies_by_owner)
         if replacements is None:
             continue
         owner = expert // home
