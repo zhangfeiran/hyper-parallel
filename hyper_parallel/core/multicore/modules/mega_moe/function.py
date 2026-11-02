@@ -35,6 +35,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.transport import (
 )
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
+from .inactive_tasks import GuestTaskPrefix, apply_guest_task_prefix, select_guest_task_prefix
 from .kernel_gradients import prepare_kernel_gradient_return
 from .plan import MegaMoePlan, record_plan_stream
 from .route import PreparedTopKRoute, RouteMetadata
@@ -135,6 +136,8 @@ class _ForwardExecution:
     gmm_workspace: Any
     intermediates: _ForwardIntermediates
     runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
+    task_prefix: GuestTaskPrefix | None = None
+    prefix_cache: dict[int, tuple[Any, int]] | None = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +152,8 @@ class _BackwardExecution:
     intermediates: _BackwardIntermediates
     diagnostics: Any = None
     runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
+    task_prefix: GuestTaskPrefix | None = None
+    prefix_cache: dict[int, tuple[Any, int]] | None = None
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -283,6 +288,7 @@ def _prepare_forward_execution(
     combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
     return _ForwardExecution(
         runtime_cache=workspace.replica_runtime_images,
+        prefix_cache=workspace.replica_task_prefixes,
         dispatch=dispatch,
         source=source,
         combine=combine,
@@ -320,6 +326,7 @@ def _prepare_backward_execution(
             reuse_dispatch = getattr(plan, "bwd_runtime_no_replica_reuse_dispatch", False)
     return _BackwardExecution(
         runtime_cache=workspace.replica_runtime_images,
+        prefix_cache=workspace.replica_task_prefixes,
         dispatch=dispatch,
         grad_x=grad_x,
         diagnostics=diagnostics,
@@ -402,7 +409,9 @@ def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
 
 def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool = False,
                    gradient_return: torch.Tensor | None = None, home_only: bool = False,
-                   cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None) -> torch.Tensor:
+                   cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None,
+                   task_prefix: GuestTaskPrefix | None = None,
+                   prefix_cache: dict[int, tuple[Any, int]] | None = None) -> torch.Tensor:
     """Append split addresses after profiler preparation, retaining the base ABI."""
     if gradient_return is not None and (not backward or getattr(pool, "projection_ready", None) is None):
         raise ValueError("Kernel gradient metadata requires a projection-ready backward lease")
@@ -426,7 +435,8 @@ def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool =
                 struct.pack("<II8Q", 0x53505754, 4, *values, *bases, epoch))
     else:
         data = struct.pack("<II5Q", 0x53505754, 2, *values)
-    return _runtime_image(base, data, cache, static=projection_ready is None)
+    runtime = _runtime_image(base, data, cache, static=projection_ready is None)
+    return apply_guest_task_prefix(runtime, task_prefix, base=base, cache=prefix_cache)
 
 
 def _runtime_image(base: torch.Tensor, data: bytes,
@@ -488,7 +498,8 @@ def _launch_forward_kernel(
             plan.swiglu_tiling,
             plan.down_proj_tiling,
             _split_runtime(plan.fwd_runtime_config, pool, weight1.shape[0],
-                           home_only=pool is None and bool(spec.replica_slots_per_rank), cache=execution.runtime_cache),
+                           home_only=pool is None and bool(spec.replica_slots_per_rank), cache=execution.runtime_cache,
+                           task_prefix=execution.task_prefix, prefix_cache=execution.prefix_cache),
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -511,7 +522,8 @@ def _launch_forward_kernel(
             plan.swiglu_tiling,
             plan.down_proj_tiling,
             _split_runtime(diagnostic_call.runtime_config, pool, weight1.shape[0],
-                           home_only=pool is None and bool(spec.replica_slots_per_rank)),
+                           home_only=pool is None and bool(spec.replica_slots_per_rank),
+                           task_prefix=execution.task_prefix),
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
             spec.rank_id,
@@ -568,7 +580,10 @@ def _launch_backward_kernel(
             execution.gmm_workspace,
             execution.swiglu_workspace,
             _split_runtime(diagnostics.runtime_config, pool, saved.weight1.shape[0], backward=True,
-                           gradient_return=gradient_return, home_only=pool is None and bool(spec.replica_slots_per_rank), cache=execution.runtime_cache),
+                           gradient_return=gradient_return,
+                           home_only=pool is None and bool(spec.replica_slots_per_rank),
+                           cache=execution.runtime_cache, task_prefix=execution.task_prefix,
+                           prefix_cache=execution.prefix_cache),
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -594,7 +609,9 @@ def _launch_backward_kernel(
             execution.gmm_workspace,
             execution.swiglu_workspace,
             _split_runtime(diagnostic_call.runtime_config, pool, saved.weight1.shape[0], backward=True,
-                           gradient_return=gradient_return, home_only=pool is None and bool(spec.replica_slots_per_rank)),
+                           gradient_return=gradient_return,
+                           home_only=pool is None and bool(spec.replica_slots_per_rank),
+                           task_prefix=execution.task_prefix),
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
             spec.rank_id,
@@ -694,6 +711,10 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 routed_tokens,
                 capacity,
             )
+            if spec.replica_slots_per_rank and plan.fwd_task_prefixes:
+                slots = None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical[
+                    ctx.replica_route.rank]
+                execution = replace(execution, task_prefix=select_guest_task_prefix(plan.fwd_task_prefixes, slots))
             _launch_forward_kernel(
                 plan,
                 metadata,
@@ -783,6 +804,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                     ctx.replica_route.plan.destination_counts[ctx.replica_route.rank][:saved.weight1.shape[0]])
                                      if not rows) if has_replica_transfers else None),
             )
+            if plan.spec.replica_slots_per_rank and plan.bwd_task_prefixes:
+                prefixes = (plan.bwd_task_prefixes if execution.diagnostics is plan.bwd_diagnostics
+                            else plan.bwd_no_replica_task_prefixes)
+                slots = None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical[
+                    ctx.replica_route.rank]
+                execution = replace(execution, task_prefix=select_guest_task_prefix(prefixes, slots))
             early_return = prepare_kernel_gradient_return(
                 plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,
                 None if pool is None else pool.gradients[1],
