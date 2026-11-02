@@ -28,6 +28,7 @@ from ._metadata import _async_device_bytes
 from ._observer import _get_replica_observer
 from .capacity import _integer
 from .pool import ReplicaPool, ReplicaPrefetch
+from .residency import _ReplicaWeightCache
 from .routing import ReplicaRoute
 from .transport import _gradient_accumulators
 
@@ -118,6 +119,8 @@ class SignalReplicaTransport:
         self._lock = threading.Lock()
         self._streams, self._gradient_streams, self._gradient_scratch = {}, {}, {}
         self._resident_generation = self._resident_ready = None
+        self._weight_cache = _ReplicaWeightCache()
+        self._last_weight_copy_counts = (0, 0)
         self.last_kernel_gradient_matrices = ()
 
     @property
@@ -221,6 +224,7 @@ class SignalReplicaTransport:
             self.runtime.host_barrier()
             self.epoch = 0
             self._resident_generation = self._resident_ready = None
+            self._weight_cache.clear()
         self.epoch += 1
         return self.epoch
 
@@ -238,7 +242,7 @@ class SignalReplicaTransport:
               *, backward: bool = False, overlap: bool = False,
               reuse_generation: object | None = None,
               _overwrite_gradients: bool = False) -> Iterator[ReplicaPool | ReplicaPrefetch]:
-        """Reuse only the unchanged generation saved by this forward invocation."""
+        """Keep invocation epochs fresh while owners reuse unchanged resident payloads."""
         if reuse_generation is not None and not backward:
             raise ValueError("Replica weights may be reused only by their saved backward context")
         if (route.plan.config.replica_slots_per_rank != self.slots
@@ -251,6 +255,7 @@ class SignalReplicaTransport:
         try:
             if observer is not None:
                 observation = observer.begin_lease(route, backward, id(self))
+            self._last_weight_copy_counts = (0, 0)
             self._bind(weights)
             # Transfers are immutable host metadata; inactive guests have no kernel readers or gradient return.
             home = route.plan.config.home_experts
@@ -279,6 +284,10 @@ class SignalReplicaTransport:
                         else:
                             prefetched.wait_weights()
                             yield self.pool
+        except BaseException:
+            self._weight_cache.clear()
+            self._resident_generation = self._resident_ready = None
+            raise
         finally:
             try:
                 if observer is not None:
@@ -297,6 +306,8 @@ class SignalReplicaTransport:
         home = route.plan.config.home_experts
         incoming = [item for item in route.plan.transfers if item.target_rank == route.rank]
         outgoing = [item for item in route.plan.transfers if item.owner_rank == route.rank]
+        copies = self._weight_cache.prepare(weights, route)
+        self._last_weight_copy_counts = (len(outgoing) - len(copies.reused), len(copies.reused))
         value = _async_device_bytes(struct.pack("<i", epoch), weights[0].device).view(torch.int32)
         for item in incoming:
             self._publish(0, route.rank, item.target_slot - home, item.owner_rank, epoch)
@@ -307,8 +318,8 @@ class SignalReplicaTransport:
             self._wait(0, item.target_rank, item.target_slot - home, epoch)
             if observer is not None:
                 observer.end(stamp)
-        sources = {item.owner_slot: tuple(weight[item.owner_slot].contiguous() for weight in weights)
-                   for item in outgoing}
+        sources = {slot: tuple(weight[slot].contiguous() for weight in weights)
+                   for slot in copies.required_owner_slots}
 
         def _wait(matrix_index):
             for item in incoming:
@@ -332,19 +343,26 @@ class SignalReplicaTransport:
                     slot = item.target_slot - home
                     value.record_stream(stream)
                     for index in order:
-                        source = sources[item.owner_slot][index]
-                        source.record_stream(stream)
-                        stamp = (observer.begin("WeightPrefetchSubmit", epoch=epoch,
-                                                projection="W13" if index == 0 else "W2",
-                                                expert=item.logical_expert, peer=item.target_rank,
-                                                physical_slot=item.target_slot,
-                                                bytes=source.numel() * source.element_size())
-                                 if observer is not None else None)
-                        self.runtime.put(self.pool.weights[index][slot], source, item.target_rank, use_sdma=True)
+                        if (item.target_rank, item.target_slot) not in copies.reused:
+                            source = sources[item.owner_slot][index]
+                            source.record_stream(stream)
+                            stamp = (observer.begin("WeightPrefetchSubmit", epoch=epoch,
+                                                    projection="W13" if index == 0 else "W2",
+                                                    expert=item.logical_expert, peer=item.target_rank,
+                                                    physical_slot=item.target_slot,
+                                                    bytes=source.numel() * source.element_size())
+                                     if observer is not None else None)
+                            self.runtime.put(self.pool.weights[index][slot], source, item.target_rank, use_sdma=True)
+                            if observer is not None:
+                                observer.end(stamp)
+                        elif observer is not None:
+                            observer.event("WeightPayloadReuse", epoch=epoch, reuse_hit=True,
+                                           projection="W13" if index == 0 else "W2",
+                                           expert=item.logical_expert, peer=item.target_rank,
+                                           physical_slot=item.target_slot, bytes=0)
+                        # A hit skips payload bytes, never the current invocation's readiness.
                         self.runtime.put(self.projection_signals[index, slot, :1], value,
                                          item.target_rank, use_sdma=True)
-                        if observer is not None:
-                            observer.end(stamp)
             ready = (tuple(signal.data_ptr() for signal in self.projection_signals), epoch)
             prefetched = ReplicaPrefetch(self.pool, _wait, projection_ready=ready)
             try:
@@ -355,6 +373,7 @@ class SignalReplicaTransport:
                     self._publish(2, route.rank, item.target_slot - home, item.owner_rank, epoch)
                 for item in outgoing:
                     self._wait(2, item.target_rank, item.target_slot - home, epoch)
+        self._weight_cache.commit(copies)
 
     @contextmanager
     def _copy_streams(self, keys: list[int], cache: dict[int, Any],

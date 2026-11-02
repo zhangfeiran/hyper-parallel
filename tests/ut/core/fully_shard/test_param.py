@@ -349,7 +349,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         self.assertEqual([t.numel() for t in hsdp_param.unsharded_param_buffers], [4, 2])
         self.assertEqual(hsdp_param.unsharded_param_buffers[1].dtype, torch.float16)
 
-    def test_init_unsharded_param_plain_and_dtensor(self):
+    def test_init_unsharded_param_plain_and_dtensor(self) -> None:
         """Stable unsharded parameter initialization should restore plain and DTensor values."""
         hsdp_param = _new_param()
         del hsdp_param._unsharded_param
@@ -365,16 +365,17 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
             (Shard(0),),
             origin_is_dtensor=True,
         )
+        converted = torch.arange(4, dtype=torch.float32)
         with patch(
             "hyper_parallel.core.fully_shard.hsdp_param.DTensor.from_local",
-            return_value="dtensor",
+            return_value=converted,
         ) as mock_from:
             with patch(
                 "hyper_parallel.core.fully_shard.hsdp_param.nn.Parameter",
                 side_effect=lambda value, **unused_kwargs: value,
             ):
                 hsdp_param.init_unsharded_param()
-        self.assertEqual(hsdp_param.unsharded_param, "dtensor")
+        self.assertIs(hsdp_param.unsharded_param, converted)
         mock_from.assert_called_once()
 
     def test_init_unsharded_param_hides_dim0_padding(self):

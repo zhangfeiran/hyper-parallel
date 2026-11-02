@@ -37,6 +37,53 @@ from tests.common.mark_utils import arg_mark
 class TestSignalReplicaTransport(unittest.TestCase):
     """Keep host boundary checks alongside real-stream NPU protocol acceptance."""
 
+    def test_resident_payload_hit_still_publishes_fresh_projection_ready(self) -> None:
+        """Owners skip matrices across microbatches without reusing a readiness epoch."""
+        weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16), torch.ones(1, 2, 1, dtype=torch.bfloat16))
+        runtime = MagicMock()
+        storage = torch.empty(signal_storage_bytes(((2, 2), (2, 1)), 1, 2, 2), dtype=torch.uint8)
+        provider = SignalReplicaTransport(runtime, storage, 1, 2)
+        transfer = SimpleNamespace(owner_rank=0, owner_slot=0, target_rank=1, target_slot=1)
+        route = SimpleNamespace(rank=0, plan=SimpleNamespace(
+            config=SimpleNamespace(replica_slots_per_rank=1, ep_size=2, home_experts=1),
+            transfers=(transfer,)))
+        with patch.object(torch, "cpu", MagicMock()), patch.object(torch.Tensor, "record_stream"):
+            with provider.lease(weights, route, overlap=True) as first:
+                initial_epoch = first.projection_ready[1]
+            self.assertEqual(provider._last_weight_copy_counts, (1, 0))
+            runtime.put.reset_mock()
+            with provider.lease(weights, route, overlap=True) as second:
+                self.assertGreater(second.projection_ready[1], initial_epoch)
+                self.assertIsNot(second.weight_generation, first.weight_generation)
+            self.assertEqual(provider._last_weight_copy_counts, (0, 1))
+            self.assertEqual(runtime.put.call_count, len(weights))
+            self.assertTrue(all(call.args[1].dtype == torch.int32 for call in runtime.put.call_args_list))
+            weights[0].add_(1)
+            runtime.put.reset_mock()
+            with provider.lease(weights, route, overlap=True):
+                pass
+            self.assertEqual(provider._last_weight_copy_counts, (1, 0))
+            self.assertEqual(runtime.put.call_count, 2 * len(weights))
+
+    def test_failed_consumer_invalidates_payload_evidence(self) -> None:
+        """A caller error cannot leave a reusable generation after protocol cleanup."""
+        weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16),)
+        runtime = MagicMock()
+        storage = torch.empty(signal_storage_bytes(((2, 2),), 1, 2, 2), dtype=torch.uint8)
+        provider = SignalReplicaTransport(runtime, storage, 1, 2)
+        transfer = SimpleNamespace(owner_rank=0, owner_slot=0, target_rank=1, target_slot=1)
+        route = SimpleNamespace(rank=0, plan=SimpleNamespace(
+            config=SimpleNamespace(replica_slots_per_rank=1, ep_size=2, home_experts=1),
+            transfers=(transfer,)))
+        with patch.object(torch, "cpu", MagicMock()), patch.object(torch.Tensor, "record_stream"):
+            with self.assertRaisesRegex(RuntimeError, "consumer failed"):
+                with provider.lease(weights, route, overlap=True):
+                    raise RuntimeError("consumer failed")
+            self.assertIsNone(provider._resident_generation)
+            with provider.lease(weights, route, overlap=True):
+                pass
+            self.assertEqual(provider._last_weight_copy_counts, (1, 0))
+
     def test_complete_store_lease_preserves_gradient_storage_until_kernel_overwrite(self) -> None:
         """The fused caller opts out of clearing without changing the saved weight generation."""
         weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16),)
