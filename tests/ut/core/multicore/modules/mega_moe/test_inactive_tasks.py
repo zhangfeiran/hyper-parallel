@@ -15,16 +15,22 @@
 """Real runtime queue checks for unmapped guest suffix pruning."""
 
 from collections import Counter
+from types import SimpleNamespace
+import struct
 import unittest
 from unittest.mock import patch
 
 import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import inactive_tasks
+from hyper_parallel.core.multicore.modules.mega_moe import function as kernels
+from hyper_parallel.core.multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments
+from hyper_parallel.core.multicore.diagnostics.dump.api import TensorDumpConfig, _TensorDumpCall
+from hyper_parallel.core.multicore.diagnostics.dump import l1
 from hyper_parallel.core.multicore.modules.mega_moe.inactive_tasks import (
     apply_guest_task_prefix, build_guest_task_prefixes, select_guest_task_prefix,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts
+from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts, _prepare_diagnostics
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.scheduler.config import RuntimeConfigC, TaskType
 from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
@@ -140,6 +146,65 @@ class TestGuestTaskPrefixes(unittest.TestCase):
             self.assertEqual(copy.call_count, calls + 8)
         with self.assertRaisesRegex(ValueError, 'exclusive'):
             apply_guest_task_prefix(base, prefixes[0], base=base)
+
+    def test_l1_keeps_requested_padding_tasks_and_profile_retains_pruning(self) -> None:
+        """A real L1 record plan remains scheduled through the native launch boundary."""
+        spec = MegaMoeSpec(1024, 128, 128, 12, 2, 1.25, 4096, 1, None, 0, 8,
+                           replica_slots_per_rank=6, logical_num_experts=6)
+        graph, config, bgraph, bconfig = _build_runtime_artifacts(spec)
+        forward, _ = _prepare_diagnostics(spec, graph, config, bgraph, bconfig, 'cpu')
+        parameters = [torch.zeros(1, dtype=torch.bfloat16) for _ in range(16)]
+        parameters[6] = torch.zeros(12, dtype=torch.int64)
+        dump_config = TensorDumpConfig('/tmp/unused-dump-output', level='L1', stages='SwiGLU', io='input', owner_ids=7)
+        prepared = l1._prepare_l1_dump(forward._runtime, graph, parameters, dump_config, rank=0, device='cpu')
+        prefix = build_guest_task_prefixes(config, home_experts=6)[1]
+        expected = {record.task_id for record in prepared.records}
+        self.assertTrue(expected)
+        metadata = SimpleNamespace(group_list=parameters[6])
+        for name in ('dispatch_target_off', 'dispatch_src_off', 'dispatch_size',
+                     'combine_target_off', 'combine_src_off', 'combine_size'):
+            setattr(metadata, name, torch.zeros(1, dtype=torch.int64))
+        arguments = LaunchArguments(prepared.runtime_config, torch.zeros(16), prepared.buffer, torch.zeros(16))
+
+        def image(base: torch.Tensor, data: bytes, *_args, **_kwargs) -> torch.Tensor:
+            """Emulate only the current-stream metadata append on CPU storage."""
+            return torch.cat((base, torch.frombuffer(bytearray(data), dtype=torch.uint8)))
+
+        for preserves in (True, False):
+            with self.subTest(preserves=preserves):
+                call = (_TensorDumpCall(prepared_l1=prepared, arguments=arguments) if preserves
+                        else DiagnosticCall(arguments))
+                self.assertEqual(call.preserves_task_queues, preserves)
+                plan = SimpleNamespace(spec=spec, fwd_runtime_config=forward.runtime_config,
+                    fwd_diagnostics=SimpleNamespace(is_active=True, launch=lambda *_a, **_kw: call),
+                    up_proj_tiling=None, swiglu_tiling=None, down_proj_tiling=None)
+                execution = kernels._ForwardExecution(
+                    dispatch=parameters[0], source=parameters[0], combine=parameters[0],
+                    event_counters=torch.zeros(16), gmm_workspace=parameters[0],
+                    intermediates=kernels._ForwardIntermediates(parameters[0], parameters[0], parameters[0]),
+                    task_prefix=prefix)
+                with (patch.object(kernels, '_runtime_image', side_effect=image),
+                      patch.object(kernels.multicore_ops, 'mega_moe_with_diagnostic_buffer') as native):
+                    kernels._launch_forward_kernel(plan, metadata, parameters[0],
+                                                   torch.zeros(6, 1), torch.zeros(6, 1), execution)
+                submitted = native.call_args.args[20]
+                actual = type(config).from_buffer_copy(submitted[:prepared.runtime_config.numel()].numpy().tobytes())
+                scheduled = set(actual.cube_task_indices[:actual.task_index_num[0]]) | set(
+                    actual.vector_task_indices[:actual.task_index_num[1]])
+                if preserves:
+                    self.assertTrue(expected <= scheduled)
+                else:
+                    self.assertTrue(expected.isdisjoint(scheduled))
+                # Simulate status writes only for tasks that the submitted queue can execute.
+                for record in prepared.records:
+                    status = l1.L1_DUMP_STATUS_CAPTURED if record.task_id in scheduled else 0
+                    start = record.record_offset + 7 * 4
+                    prepared.buffer[start:start + 4] = torch.tensor(list(struct.pack('<I', status)), dtype=torch.uint8)
+                if preserves:
+                    self.assertEqual(len(l1._decode_l1_dump(prepared)), len(prepared.records))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'record was not captured'):
+                        l1._decode_l1_dump(prepared)
 
 
 if __name__ == '__main__':
