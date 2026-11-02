@@ -28,7 +28,7 @@ import torch.distributed as dist
 
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 
-from .cost import ExpertReplicaCostModel
+from .cost import ExpertReplicaCostModel, _default_schedule
 from .critical_path import execution_fingerprint
 
 
@@ -91,25 +91,24 @@ def _critical_path_identity(backend: str, hidden: int, intermediate: int, ep_siz
 @lru_cache(maxsize=128)
 def _resolve_cost_model(backend: str, hidden: int, intermediate: int, ep_size: int, transport: str,
                         num_experts: int, top_k: int, soc_name: str,
-                        checkpointed: bool, execution_signature: str | None = None) -> ExpertReplicaCostModel | None:
+                        checkpointed: bool, execution_signature: str | None = None,
+                        execution_schedule: str | None = None) -> ExpertReplicaCostModel | None:
     """Match an existing calibration; unmeasured executions keep load-driven planning."""
     key = backend, hidden, intermediate, ep_size, transport, num_experts, top_k, soc_name
-    model = _calibrations().get(key + (execution_signature,)) if execution_signature is not None else None
-    model = model or _calibrations().get(key)
+    schedule = execution_schedule if execution_schedule is not None else _default_schedule(backend, transport)
+    model = _matching_schedule_model(key, execution_signature, schedule)
     table_soc = soc_name
     if model is None:
         table_soc = _SHARED_SOC_CALIBRATIONS.get(soc_name, soc_name)
         shared_key = key[:-1] + (table_soc,)
-        model = (_calibrations().get(shared_key + (execution_signature,))
-                 if execution_signature is not None else None)
-        model = model or _calibrations().get(shared_key)
+        model = _matching_schedule_model(shared_key, execution_signature, schedule)
     if not dist.is_initialized() or dist.get_rank() == 0:
         _LOGGER.info('Replica cost calibration: status=%s backend=%s shape=%s/%s ep=%s experts=%s top_k=%s '
-                     'actual_soc=%s table_soc=%s checkpointed=%s fanout=%s critical_path=%s signature=%s',
+                     'actual_soc=%s table_soc=%s checkpointed=%s fanout=%s critical_path=%s signature=%s schedule=%s',
                      'matched' if model is not None else 'fallback', backend, hidden, intermediate, ep_size,
                      num_experts, top_k, soc_name, table_soc if model is not None else 'none', checkpointed,
                      bool(model is not None and model.weight_fanout_ms),
-                     bool(model is not None and model.critical_path is not None), execution_signature)
+                     bool(model is not None and model.critical_path is not None), execution_signature, schedule)
     if model is None:
         return None
     return replace(model, forward_repeats=2 if checkpointed else 1,
@@ -120,6 +119,16 @@ def _resolve_cost_model(backend: str, hidden: int, intermediate: int, ep_size: i
                                                  model.inter_node_weight_ms))
 
 
+def _matching_schedule_model(key: tuple, signature: str | None, schedule: str) -> ExpertReplicaCostModel | None:
+    """Reject old queue measurements on both signed and legacy lookup paths."""
+    keys = (key + (signature,), key) if signature is not None else (key,)
+    for candidate in keys:
+        model = _calibrations().get(candidate)
+        if model is not None and model.schedule == schedule:
+            return model
+    return None
+
+
 @lru_cache(maxsize=16)
 def _soc_name(device: torch.device) -> str:
     """Query selected hardware once without probing a device from CPU-only setup."""
@@ -128,12 +137,12 @@ def _soc_name(device: torch.device) -> str:
 
 def _runtime_cost_model(enabled: bool, backend: str, hidden: int, intermediate: int, ep_size: int,
                         transport: str, num_experts: int, top_k: int,
-                        device: torch.device, *, execution_signature: str | None = None) -> ExpertReplicaCostModel | None:
+                        device: torch.device, *, execution_signature: str | None = None,
+                        execution_schedule: str | None = None) -> ExpertReplicaCostModel | None:
     """Resolve invocation costs after device selection and checkpoint context binding."""
     if not enabled or not _calibration_available(backend, hidden, intermediate, ep_size, transport,
                                                 num_experts, top_k):
         return None
     arguments = (backend, hidden, intermediate, ep_size, transport, num_experts, top_k,
                  _soc_name(device), get_recompute_state() is not None)
-    return (_resolve_cost_model(*arguments) if execution_signature is None else
-            _resolve_cost_model(*arguments, execution_signature))
+    return _resolve_cost_model(*arguments, execution_signature, execution_schedule)

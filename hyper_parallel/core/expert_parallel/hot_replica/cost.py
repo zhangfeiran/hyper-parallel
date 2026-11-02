@@ -33,6 +33,14 @@ def _nonnegative(value: float, name: str) -> None:
         raise ValueError(f"{name} must be a finite nonnegative number")
 
 
+def _default_schedule(backend: str, transport: str) -> str:
+    """Identify the original calibrated queue contract for one backend."""
+    if backend == 'native':
+        return 'native_grouped_v1'
+    return {'shmem_signal_kernel_gradient_bands': 'fixed_queue_gradient_bands_v1',
+            'shmem_signal_kernel_gradient': 'fixed_queue_w13_first_v1'}.get(transport, 'fixed_queue_v1')
+
+
 @dataclass(frozen=True)
 class ExpertReplicaCostModel:
     """Offline-calibrated millisecond costs for one shape and execution backend.
@@ -128,14 +136,15 @@ class ExpertReplicaCostModel:
                 raise ValueError('Critical-path template requires Push/Pull SHMEM gradient bands')
         if isinstance(self.calibration_version, bool) or self.calibration_version != 2:
             raise ValueError("Regenerate replica calibration with calibration_version=2")
-        expected_schedule = ("native_grouped_v1" if self.backend == "native" else
-                             "fixed_queue_gradient_bands_v1" if
-                             self.transport == "shmem_signal_kernel_gradient_bands" else
-                             "fixed_queue_w13_first_v1" if self.transport == "shmem_signal_kernel_gradient" else
-                             "fixed_queue_v1")
-        if self.schedule is not None and self.schedule != expected_schedule:
+        expected_schedule = _default_schedule(self.backend, self.transport)
+        schedules = (expected_schedule,)
+        if expected_schedule == 'fixed_queue_gradient_bands_v1':
+            schedules += ('fixed_queue_unmapped_guest_suffix_v1',)
+        if self.schedule is not None and self.schedule not in schedules:
             raise ValueError("Replica calibration schedule does not match the execution")
-        object.__setattr__(self, "schedule", expected_schedule)
+        if self.schedule == 'fixed_queue_unmapped_guest_suffix_v1' and self.critical_path is not None:
+            raise ValueError('Critical-path template does not support the unmapped guest schedule')
+        object.__setattr__(self, "schedule", self.schedule or expected_schedule)
         if self.gradient_dtype != "float32":
             raise ValueError("Replica cost calibration requires float32 weight partials")
         if self.backend not in ("native", "push", "pull") or not isinstance(self.transport, str) or not self.transport:

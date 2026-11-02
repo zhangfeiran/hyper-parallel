@@ -60,6 +60,7 @@ from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capaci
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
+from .inactive_tasks import UNMAPPED_GUEST_SUFFIX_SCHEDULE
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
@@ -98,6 +99,8 @@ def _critical_execution_signature(module: Any, resources: Any) -> str:
                     rank_nodes=resources.rank_nodes, checkpointed=get_recompute_state() is not None,
                     native_payload=_critical_native_fingerprint(), policy_abi='dynamic_tokens_v4',
                     template='replica_ready_ack_v1', weight_dtype='bfloat16', partial_dtype='float32')
+    if module.replica_slots_per_rank:
+        metadata['runtime_schedule'] = UNMAPPED_GUEST_SUFFIX_SCHEDULE
     return execution_fingerprint(metadata)
 
 
@@ -729,7 +732,8 @@ class MegaMoeExperts(MulticoreModule):
         gathered: _GatheredReplicaCounts | None = None,
     ) -> ReplicaRoute:
         """Resolve the unchanged bounded policy only when placement is needed."""
-        selection = {}
+        selection = ({'execution_schedule': UNMAPPED_GUEST_SUFFIX_SCHEDULE}
+                     if self.replica_slots_per_rank else {})
         if self._cost_model_enabled and _critical_path_available(
                 self.dispatch_mode, self.hidden_size, self.intermediate_size, self.ep_size,
                 self.replica_transport, self.num_experts, self.top_k):

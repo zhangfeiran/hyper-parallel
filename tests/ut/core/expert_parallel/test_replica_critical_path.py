@@ -223,6 +223,11 @@ class TestReplicaCriticalPath(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'Critical-path template'):
                 self.model(**changes)
 
+    def test_original_template_rejects_the_unmapped_guest_schedule(self) -> None:
+        """A new fingerprint cannot rename the old dependency estimator as a new graph."""
+        with self.assertRaisesRegex(ValueError, 'Critical-path template'):
+            self.model(schedule='fixed_queue_unmapped_guest_suffix_v1')
+
     def test_profile_selection_requires_the_exact_execution_fingerprint(self) -> None:
         """A changed kernel, dtype or topology cannot consume a device profile."""
         key = ('push', 16, 8, 2, 'shmem_signal_kernel_gradient_bands', 4, 2, 'test_soc')

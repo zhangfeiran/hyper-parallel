@@ -14,6 +14,8 @@
 
 import inspect
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -22,6 +24,8 @@ from hyper_parallel.core.expert_parallel import ExpertParallel
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica import policy
 from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore.modules.mega_moe import module as mega_module
+from hyper_parallel.core.multicore.modules.mega_moe.inactive_tasks import UNMAPPED_GUEST_SUFFIX_SCHEDULE
 
 
 class TestReplicaPublicPolicy(unittest.TestCase):
@@ -104,3 +108,109 @@ class TestReplicaPublicPolicy(unittest.TestCase):
         self.assertEqual(first.replica_slots_used, (0, 0, 0, 0))
         self.assertEqual(max(second.replica_slots_used), 2)
         self.assertEqual(max(second.destination_loads), 75)
+
+
+class TestReplicaScheduleSelection(unittest.TestCase):
+    """Keep changed runtime queues separate from legacy calibration measurements."""
+
+    arguments = ('push', 5120, 2304, 64, 'shmem_signal_kernel_gradient_bands', 384, 6, 'Ascend910_9392')
+    schedule = 'fixed_queue_unmapped_guest_suffix_v1'
+
+    def setUp(self) -> None:
+        """Retain real packaged coefficients only as synthetic selector fixtures."""
+        policy._resolve_cost_model.cache_clear()
+        self.addCleanup(policy._resolve_cost_model.cache_clear)
+        self.legacy = policy._calibrations()[self.arguments]
+
+    def test_new_schedule_rejects_legacy_profile_and_shared_soc_alias(self) -> None:
+        """A runtime graph change cannot silently inherit the old eight-field profile."""
+        for soc in ('Ascend910_9392', 'Ascend910_9382'):
+            with self.subTest(soc=soc):
+                arguments = self.arguments[:-1] + (soc,)
+                self.assertIsNone(policy._resolve_cost_model(
+                    *arguments, True, execution_schedule=self.schedule))
+
+    def test_schedule_participates_in_the_resolver_cache_key(self) -> None:
+        """Interleaved old and new runtimes must not share a cached legacy match."""
+        ordinary = policy._resolve_cost_model(*self.arguments, True)
+        changed = policy._resolve_cost_model(*self.arguments, True, execution_schedule=self.schedule)
+        self.assertEqual(ordinary.schedule, self.legacy.schedule)
+        self.assertIsNone(changed)
+        self.assertEqual(policy._resolve_cost_model(*self.arguments, True), ordinary)
+
+    def test_matching_new_schedule_uses_only_its_declared_profile(self) -> None:
+        """Synthetic profile identity tests do not constitute new runtime calibration."""
+        measured = replace(self.legacy, schedule=self.schedule)
+        with patch.object(policy, '_calibrations', return_value={self.arguments: measured}):
+            matched = policy._resolve_cost_model(*self.arguments, True, execution_schedule=self.schedule)
+            stale = policy._resolve_cost_model(*self.arguments, True)
+        self.assertEqual(matched.schedule, self.schedule)
+        self.assertIsNone(stale)
+
+    def test_critical_signature_cannot_bypass_legacy_schedule_filter(self) -> None:
+        """Even an exact signed key cannot authorize a different runtime schedule."""
+        with patch.object(policy, '_calibrations', return_value={self.arguments: self.legacy,
+                                                               self.arguments + ('a' * 64,): self.legacy}):
+            self.assertIsNone(policy._resolve_cost_model(
+                *self.arguments, True, 'a' * 64, execution_schedule=self.schedule))
+            self.assertIsNone(policy._resolve_cost_model(
+                *self.arguments, True, 'b' * 64, execution_schedule=self.schedule))
+
+    def test_runtime_without_matching_schedule_retains_uncalibrated_adaptation(self) -> None:
+        """A mismatch returns no cost model instead of disabling the resident budget."""
+        with patch.object(policy, '_soc_name', return_value='Ascend910_9392'):
+            self.assertIsNone(policy._runtime_cost_model(
+                True, *self.arguments[:-1], torch.device('cpu'), execution_schedule=self.schedule))
+        plan = build_expert_replica_plan([[50] * 6 + [0] * 18] + [[0] * 24] * 3,
+                                         6, capacity_limit=75)
+        plan.validate()
+        self.assertTrue(plan.transfers)
+        self.assertLessEqual(max(plan.destination_loads), 75)
+
+    def test_disabled_policy_does_not_probe_hardware_for_new_schedule(self) -> None:
+        """The existing hidden switch remains sufficient for all runtime schedules."""
+        with patch.object(policy, '_soc_name', side_effect=AssertionError('Unexpected device query')):
+            self.assertIsNone(policy._runtime_cost_model(
+                False, *self.arguments[:-1], torch.device('cpu'), execution_schedule=self.schedule))
+
+    def test_new_schedule_does_not_relax_other_transport_contracts(self) -> None:
+        """Only the new kernel-gradient-bands graph can declare the new schedule."""
+        for changes in ({'backend': 'native', 'transport': 'p2p'}, {'transport': 'p2p'},
+                        {'transport': 'shmem_signal_kernel_gradient'}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'schedule'):
+                replace(self.legacy, schedule=self.schedule, **changes)
+
+    def test_actual_replica_module_selects_schedule_without_critical_profiles(self) -> None:
+        """Legacy tables must be isolated even when no critical fingerprint is requested."""
+        self.assertEqual(self.schedule, UNMAPPED_GUEST_SUFFIX_SCHEDULE)
+        owner = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+                               ep_size=2, replica_slots_per_rank=1)
+        self.addCleanup(owner.close)
+        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=True), home_spec=object(), rank_nodes=(0, 1))
+        with (patch.object(mega_module, '_critical_path_available', return_value=False),
+              patch.object(mega_module, '_runtime_cost_model', return_value=None) as resolve,
+              patch.object(mega_module, 'prepare_replica_route', return_value=object()) as prepare):
+            owner._prepare_replica_route(torch.zeros(1, 2, dtype=torch.int32), resources,
+                                         torch.zeros(1, 16), 31, None)
+        self.assertEqual(resolve.call_args.kwargs['execution_schedule'], self.schedule)
+        self.assertIsNone(prepare.call_args.kwargs['_cost_model'])
+        self.assertEqual(prepare.call_args.kwargs['minimum_load_reduction'], .4)
+
+    def test_schedule_changes_replica_fingerprint_but_preserves_b0(self) -> None:
+        """Only the changed guest graph invalidates the existing execution identity."""
+        for budget in (0, 1):
+            owner = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+                                   ep_size=2, replica_slots_per_rank=budget)
+            self.addCleanup(owner.close)
+            resources = SimpleNamespace(spec=SimpleNamespace(expert_weight_layout='EIO', swiglu_limit=10.,
+                                                             dispatch_split=128, combine_split=128),
+                                        rank_nodes=(0, 1))
+            with (self.subTest(budget=budget),
+                  patch.object(mega_module, '_critical_native_fingerprint', return_value='a' * 64),
+                  patch.object(mega_module, 'execution_fingerprint', return_value='fingerprint') as fingerprint):
+                mega_module._critical_execution_signature(owner, resources)
+                metadata = fingerprint.call_args.args[0]
+                if budget:
+                    self.assertEqual(metadata['runtime_schedule'], self.schedule)
+                else:
+                    self.assertNotIn('runtime_schedule', metadata)
