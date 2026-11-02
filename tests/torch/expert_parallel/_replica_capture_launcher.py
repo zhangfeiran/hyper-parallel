@@ -31,7 +31,9 @@ def main() -> None:
     parser.add_argument('--worker-module', required=True, choices=(
         'tests.torch.expert_parallel._benchmark_replica_links',
         'tests.torch.expert_parallel._benchmark_replica_contention',
-        'tests.torch.expert_parallel._benchmark_replica_critical_path'))
+        'tests.torch.expert_parallel._benchmark_replica_critical_path',
+        'tests.torch.expert_parallel._replica_cluster_fsdp',
+        'tests.torch.expert_parallel._replica_cluster_causal'))
     parser.add_argument('--placement-output', type=Path, required=True)
     args, remaining = parser.parse_known_args()
     local, workers = int(os.environ['LOCAL_RANK']), int(os.environ['LOCAL_WORLD_SIZE'])

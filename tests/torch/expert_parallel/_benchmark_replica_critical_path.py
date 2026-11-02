@@ -172,10 +172,14 @@ def main() -> None:
                         options={key:value for key,value in options.items() if key!='cost_model'},
                         config=asdict(plan.config), source_counts=plan.logical_counts,
                         slots=plan.slot_to_logical, dispatch=plan.dispatch_counts, estimate=predicted,
-                        plan_reuses=0, calls=0, planner_cpu_wall_ms=[])
+                        plan_reuses=0, calls=0, planner_cpu_wall_ms=[], planner_phase_calls=[])
                 decisions[identity]['plan_reuses'] += int(reused)
                 decisions[identity]['calls'] += 1
                 decisions[identity]['planner_cpu_wall_ms'].append(planner_cpu_ms)
+                state = get_recompute_state()
+                decisions[identity]['planner_phase_calls'].append(dict(
+                    phase='recompute' if state is not None and state.is_recomputing else 'forward',
+                    reused=reused, cpu_wall_ms=planner_cpu_ms))
                 active['decision'] = identity
                 return plan, reused
 
