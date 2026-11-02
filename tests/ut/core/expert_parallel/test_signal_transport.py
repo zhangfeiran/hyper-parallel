@@ -37,6 +37,40 @@ from tests.common.mark_utils import arg_mark
 class TestSignalReplicaTransport(unittest.TestCase):
     """Keep host boundary checks alongside real-stream NPU protocol acceptance."""
 
+    def test_observer_reports_payload_hits_without_reporting_matrix_transfers(self) -> None:
+        """Observe actual matrix traffic while fresh readiness survives a cache hit."""
+        weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16), torch.ones(1, 2, 1, dtype=torch.bfloat16))
+        runtime, observer = MagicMock(), MagicMock()
+        storage = torch.empty(signal_storage_bytes(((2, 2), (2, 1)), 1, 2, 2), dtype=torch.uint8)
+        provider = SignalReplicaTransport(runtime, storage, 1, 2)
+        transfer = SimpleNamespace(owner_rank=0, owner_slot=0, logical_expert=0, target_rank=1, target_slot=1)
+        route = SimpleNamespace(rank=0, plan=SimpleNamespace(
+            config=SimpleNamespace(replica_slots_per_rank=1, ep_size=2, home_experts=1),
+            transfers=(transfer,)))
+        observer_path = "hyper_parallel.core.expert_parallel.hot_replica.signal_transport._get_replica_observer"
+        with patch(observer_path, return_value=observer), patch.object(torch, "cpu", MagicMock()), \
+                patch.object(torch.Tensor, "record_stream"):
+            with provider.lease(weights, route, overlap=True) as first:
+                initial_epoch = first.projection_ready[1]
+            submitted = [call for call in observer.begin.call_args_list if call.args[0] == "WeightPrefetchSubmit"]
+            self.assertEqual(len(submitted), 2)
+            self.assertEqual(sum(call.kwargs["bytes"] for call in submitted), 12)
+            observer.reset_mock()
+            runtime.put.reset_mock()
+
+            with provider.lease(weights, route, overlap=True) as second:
+                self.assertGreater(second.projection_ready[1], initial_epoch)
+
+        self.assertEqual(provider._last_weight_copy_counts, (0, 1))
+        self.assertEqual(runtime.put.call_count, 2)
+        self.assertTrue(all(call.args[1].dtype == torch.int32 for call in runtime.put.call_args_list))
+        self.assertFalse(any(call.args[0] == "WeightPrefetchSubmit" for call in observer.begin.call_args_list))
+        hits = [call for call in observer.event.call_args_list if call.args[0] == "WeightPayloadReuse"]
+        self.assertEqual(len(hits), 2)
+        self.assertEqual({call.kwargs["projection"] for call in hits}, {"W13", "W2"})
+        self.assertTrue(all(call.kwargs["reuse_hit"] and call.kwargs["bytes"] == 0 for call in hits))
+        observer.end_lease.assert_called_once()
+
     def test_resident_payload_hit_still_publishes_fresh_projection_ready(self) -> None:
         """Owners skip matrices across microbatches without reusing a readiness epoch."""
         weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16), torch.ones(1, 2, 1, dtype=torch.bfloat16))
