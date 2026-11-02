@@ -25,6 +25,7 @@ from dataclasses import asdict, replace
 from datetime import timedelta
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -70,14 +71,15 @@ def _relative(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float((value - expected).norm() / expected.norm().clamp_min(1e-8))
 
 
-def _routes(tokens: int, experts: int, top_k: int, pattern: str) -> tuple[torch.Tensor, torch.Tensor]:
+def _routes(tokens: int, experts: int, top_k: int, pattern: str,
+            hot_fraction: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
     """Build distinct TopK fixtures without depending on an experiment branch."""
     ids = torch.arange(tokens*top_k).reshape(tokens, top_k) % experts
     hot = torch.arange(top_k).expand(tokens, top_k)
-    if pattern=='middle':
-        ids[:tokens//2] = hot[:tokens//2]
-    elif pattern!='balanced':
-        ids = hot.contiguous()
+    fraction = hot_fraction / 2 if pattern == 'middle' else hot_fraction
+    if pattern != 'balanced':
+        hot_tokens = min(tokens, math.ceil(tokens * fraction))
+        ids[:hot_tokens] = hot[:hot_tokens]
     return ids, torch.bincount(ids.flatten(), minlength=experts)
 
 
@@ -92,6 +94,8 @@ def main() -> None:
     parser.add_argument('--ep-size', type=int, default=4)
     parser.add_argument('--top-k', type=int, default=6)
     parser.add_argument('--repeats', type=int, default=1)
+    parser.add_argument('--hot-fraction', type=float, default=1.0)
+    parser.add_argument('--profile-ranks', default='')
     parser.add_argument('--observations-only', action='store_true')
     parser.add_argument('--synthetic-correctness', action='store_true')
     parser.add_argument('--profile-directory', type=Path)
@@ -111,6 +115,11 @@ def main() -> None:
         raise ValueError('Measured and synthetic profiles cannot be combined')
     if args.repeats < 1:
         raise ValueError('repeats must be positive')
+    if not 0 <= args.hot_fraction <= 1:
+        raise ValueError('hot-fraction must be in [0, 1]')
+    profile_ranks = {int(value) for value in args.profile_ranks.split(',') if value}
+    if any(value < 0 or value >= world for value in profile_ranks):
+        raise ValueError('profile-ranks must name global ranks in this job')
     args.output.mkdir(parents=True, exist_ok=True)
     original_profiles = policy._calibrations
     models = dict(original_profiles())
@@ -214,7 +223,7 @@ def main() -> None:
                             tokens = (0, 128, args.tokens, 512)[rank % 4]
                         if pattern=='empty':
                             tokens = 0
-                        ids, counts = _routes(tokens, args.experts, args.top_k, pattern)
+                        ids, counts = _routes(tokens, args.experts, args.top_k, pattern, args.hot_fraction)
                         generator = torch.Generator().manual_seed(1000 + rank * 100 + step)
                         values = torch.randn(tokens, args.hidden, generator=generator).to(device).bfloat16()
                         values.requires_grad_()
@@ -240,6 +249,21 @@ def main() -> None:
                             return output
 
                         optimizer.zero_grad(set_to_none=True)
+                        profiled = rank in profile_ranks and step == 3 * args.repeats - 1
+                        profiler = None
+                        if profiled:
+                            directory = args.output / 'profiler' / f'{mode}-b{budget}' / f'rank{rank}'
+                            profiler = torch_npu.profiler.profile(
+                                activities=[torch_npu.profiler.ProfilerActivity.CPU,
+                                            torch_npu.profiler.ProfilerActivity.NPU],
+                                schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
+                                record_shapes=False, profile_memory=False, with_stack=False,
+                                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(directory)),
+                                experimental_config=torch_npu.profiler._ExperimentalConfig(
+                                    profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                                    aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+                                    data_simplification=False))
+                            profiler.start()
                         dist.barrier()
                         torch.npu.synchronize()
                         started = time.perf_counter()
@@ -248,6 +272,10 @@ def main() -> None:
                         optimizer.step()
                         torch.npu.synchronize()
                         elapsed = time.perf_counter()-started
+                        if profiler is not None:
+                            profiler.step()
+                            profiler.stop()
+                        dist.barrier()
                         phase_events = [{'phase':phase,'device_ms':begin.elapsed_time(end)}
                                         for phase,begin,end in events]
                         tensors = dict(output=result,input_grad=values.grad,router_grad=probabilities.grad)
@@ -269,6 +297,8 @@ def main() -> None:
                         steps.append(dict(step=step,pattern=pattern,tokens=tokens,wall_seconds=elapsed,
                             device_events=phase_events,errors=errors,decision=active.get('decision'),finite=finite,
                             execution_signature=active.get('execution_signature'),
+                            profiled=profiled,
+                            profile_capture_step=bool(profile_ranks) and step == 3 * args.repeats - 1,
                             native_bypasses=active.get('native_bypasses',0)))
                         del result, values, probabilities, gradient, tensors
                     if budget and args.synthetic_correctness:
@@ -280,6 +310,8 @@ def main() -> None:
                                    for d in decisions.values()):
                             raise RuntimeError('Critical-path planner never executed a replica')
                 report = dict(mode=mode,budget=budget,rank=rank,steps=steps,decisions=decisions,
+                    configuration={key: str(value) if isinstance(value, Path) else value
+                                   for key, value in vars(args).items()},
                     synthetic_calibration=args.synthetic_correctness,
                     observations_only=args.observations_only,
                     scope='Component correctness and device observations; not performance acceptance',
