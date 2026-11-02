@@ -176,6 +176,7 @@ cd "${HYPER_ROOT}"
 command=("${PYTHON_BIN}" -m tests.torch.expert_parallel.replica_cluster_stages
     --source "${HYPER_ROOT}" --bundle "${BUNDLE_ROOT}" --run-root "${RUN_ROOT}"
     --phases "${PHASES:-gate,fsdp,timing,diagnostic,causal}" --order "${ORDER}")
+if [[ ${REPLICA_SCHEDULE_CAPTURE:-0} == 1 ]]; then command+=(--schedule-capture); fi
 if [[ ${DRY_RUN} == 1 ]]; then
     "${command[@]}" --dry-run
 else

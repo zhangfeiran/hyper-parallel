@@ -27,6 +27,7 @@ import time
 from typing import Any
 
 from tests.torch.expert_parallel.replica_cluster_cases import cluster_cases
+from tests.torch.expert_parallel.replica_schedule_capture import install_graph, schedule_cases, verify_pair
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -121,10 +122,11 @@ def main() -> None:
     parser.add_argument('--phases', default='gate,fsdp,timing,diagnostic,causal')
     parser.add_argument('--order', default='AB')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--schedule-capture', action='store_true')
     args = parser.parse_args()
     nodes, node = int(os.environ['NNODES']), int(os.environ['NODE_RANK'])
     port_base = int(os.environ['MASTER_PORT_BASE'])
-    cases = cluster_cases(args.phases, args.order)
+    cases = schedule_cases(args.phases, args.order) if args.schedule_capture else cluster_cases(args.phases, args.order)
     outcomes = []
     table_hash = hashlib.sha256(json.dumps(cases, sort_keys=True).encode()).hexdigest()
     output = args.run_root / 'nodes' / f'node_{node}'
@@ -175,6 +177,10 @@ def main() -> None:
         planner = args.source / 'hyper_parallel/core/expert_parallel/hot_replica/planner.py'
         shutil.copyfile(args.bundle / 'controls' / f'planner-{case["planner"]}.py', planner)
         record['planner_sha256'] = hashlib.sha256(planner.read_bytes()).hexdigest()
+        if case.get('graph') is not None:
+            control = os.environ.get('CONTROL_SOURCE')
+            record['graph_source_control'] = install_graph(
+                args.source, args.bundle, case['graph'], Path(control) if control else None)
         process = None
 
         def interrupted(signum: int, _frame: Any) -> None:
@@ -200,6 +206,12 @@ def main() -> None:
             record.update(status='passed', returncode=0)
             write_json(output / f'{label}-stage.json', record)
             wait_cohort(args.run_root, label, nodes, deadline)
+            if case.get('graph') == 'suffix':
+                pair = verify_pair(args.run_root, case['pair'], nodes * 16)
+                pair_label = f'{label}-numeric-pair'
+                write_json(output / f'{pair_label}-stage.json', dict(
+                    status='passed', table_sha256=table_hash, **pair))
+                wait_cohort(args.run_root, pair_label, nodes, deadline)
             outcomes.append(dict(label=label, status='passed'))
             if label == 'gate-d2-pull':
                 if node == 0:

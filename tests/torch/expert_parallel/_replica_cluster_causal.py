@@ -41,12 +41,14 @@ import torch_npu  # noqa: F401
 from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
 from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts, is_recomputing
+from hyper_parallel.core.expert_parallel.hot_replica.residency import _ReplicaWeightCache
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
 from hyper_parallel.core.multicore.diagnostics import profiler, schedule
 from hyper_parallel.core.multicore._loader import get_multicore_paths
 from tests.torch.expert_parallel.replica_cluster_fixture import load_fixture, local_routes, plan_digest
 from tests.torch.expert_parallel.replica_cluster_fixed_probe import FixedPlanProbe
+from tests.torch.expert_parallel.replica_schedule_capture import weight_submission_summary
 from hyper_parallel.core.multicore.modules.mega_moe.module import (
     _critical_execution_signature, _critical_native_fingerprint,
 )
@@ -63,8 +65,9 @@ class CheckedPlans(MegaMoeExperts):
             route = super()._prepare_replica_route(topk_ids, resources, hidden, autograd_mask, counts, gathered)
             if probe is not None:
                 probe.accept(route)
-            self.checked_plans.append(route.plan)
-            self.actual_execution_signatures.add(_critical_execution_signature(self, resources))
+            if probe is None or probe.record_observations:
+                self.checked_plans.append(route.plan)
+                self.actual_execution_signatures.add(_critical_execution_signature(self, resources))
             return route
 
 
@@ -100,7 +103,9 @@ def summarize_trace(trace: dict[str, Any]) -> dict[str, Any]:
                             "local_return_tail_after_cube_tasks_us":
                             max(0, max(returned) - max(cube_done)) / frequency if cube_done and returned else None,
                             "pending_scope": "HeadPendingWindow includes service of other bands; not pure wait"})
+    host_events = trace.get('replicaHostObservations', {}).get('events', [])
     return {"invocations": invocations, "dropped_records": trace["megaKernelCycleTrace"]["droppedRecordCount"],
+            "weight_submissions": weight_submission_summary(host_events),
             "host_dropped": trace.get("replicaHostObservations", {}).get("dropped_events", 0),
             "cross_rank_latency": None, "clock_alignment": "not calibrated across dies or Host/Device"}
 
@@ -140,8 +145,10 @@ def write_observations(args: argparse.Namespace, module: CheckedPlans, cpus: lis
         if hashlib.sha256(plan_bytes).hexdigest() != module.fixture_plan_sha256:
             raise RuntimeError("Serialized final plan SHA differs from the actual fixture")
         facts = module.fixed_probe.facts()
+        measured_calls = 2 * (args.timing_warmup + args.measure_iterations) if args.measure_iterations else 0
         expected_calls = 2 * (args.warmup + 2)
-        if (facts['guard_calls'] != expected_calls or facts['accepted_routes'] != expected_calls
+        if (facts['guard_calls'] != expected_calls + measured_calls
+                or facts['accepted_routes'] != expected_calls + measured_calls
                 or facts['metadata_uploads'] != expected_calls or facts['host_stage_drops']):
             raise RuntimeError(f"Fixed-plan replay reachability is incomplete: {facts}")
     else:
@@ -168,6 +175,9 @@ def write_observations(args: argparse.Namespace, module: CheckedPlans, cpus: lis
     }, sort_keys=True).encode()).hexdigest() for mode in ('OFF', 'causal_v1')}
     manifest = {"rank": rank, "ep_rank": ep_rank, "ep_group_global_ranks": group_ranks, "cpus": cpus,
                 "args": vars(args), "fixed_route_sha256": tensor_hash(cpu_ids),
+                "pure_timing": dict(samples=module.pure_samples, warmup=args.timing_warmup,
+                    iterations=args.measure_iterations, observations=False, profiler=False,
+                    scope='Fixed-plan F+full recompute+B+AdamW; strict plan binding remains, no dynamic planner'),
                 "actual_plan_sha256": hashlib.sha256(plan_bytes).hexdigest(), "actual_plan_checks": len(plans),
                 "runtime_calls": module.runtime_calls, "backend": args.backend,
                 "tensor_hashes_exact": True, "tensor_sha256": actual_hashes, "observations": summary,
@@ -243,6 +253,7 @@ def run(args: argparse.Namespace, cpus: list[int]) -> None:
     module.fixture_provenance = fixture
     module.fixture_plan_sha256 = fixture['plan_sha256'] if args.budget and not args.dynamic_plan else None
     module.runtime_calls = []
+    module.pure_samples = []
     module.fixture_file = Path(args.fixture)
     generator = torch.Generator().manual_seed(1000 + rank * 100 + fixture['original_step'])
     hidden = torch.randn(args.tokens, args.hidden, generator=generator).to(device).bfloat16().requires_grad_()
@@ -264,9 +275,6 @@ def run(args: argparse.Namespace, cpus: list[int]) -> None:
             event.record()
             markers[name] = (event, time.perf_counter_ns())
 
-    for name, parameter in module.named_parameters():
-        hooks.append(parameter.register_post_accumulate_grad_hook(lambda value, name=name: gradient_ready(value, name)))
-
     def step() -> torch.Tensor:
         optimizer.zero_grad(set_to_none=True)
         hidden.grad = probs.grad = None
@@ -279,6 +287,21 @@ def run(args: argparse.Namespace, cpus: list[int]) -> None:
         return output
 
     try:
+        if args.measure_iterations:
+            with fixed_probe.installed(observations=False):
+                for index in range(args.timing_warmup + args.measure_iterations):
+                    dist.barrier()
+                    torch.npu.synchronize()
+                    started = time.perf_counter()
+                    value = step()
+                    elapsed_ms = (time.perf_counter() - started) * 1000
+                    del value
+                    if index >= args.timing_warmup:
+                        module.pure_samples.append(dict(sample_index=index - args.timing_warmup,
+                                                       local_step_ms=elapsed_ms))
+        for name, parameter in module.named_parameters():
+            hooks.append(parameter.register_post_accumulate_grad_hook(
+                lambda value, name=name: gradient_ready(value, name)))
         context = fixed_probe.installed() if fixed_probe is not None else nullcontext()
         original_forward = _MegaMoeFunction.forward
 
@@ -344,11 +367,18 @@ def main() -> None:
     parser.add_argument("--skew", choices=("moderate", "strong"), required=True)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--outer-capture", action="store_true")
+    parser.add_argument("--force-residency-miss", action="store_true")
+    parser.add_argument("--measure-iterations", type=int, default=0)
+    parser.add_argument("--timing-warmup", type=int, default=6)
     parser.add_argument("--outer-ranks", nargs="+", type=int, default=[0, 16, 63])
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     if min(args.ep_size, args.hidden, args.intermediate, args.tokens) <= 0 or args.warmup < 1:
         raise ValueError("Positive dimensions and at least one warmup step are required")
+    if args.measure_iterations < 0 or args.timing_warmup < 1:
+        raise ValueError('Timing iterations must be nonnegative and timing warmup positive')
+    if args.measure_iterations and (args.dynamic_plan or not args.budget):
+        raise ValueError('Uninstrumented fixed-plan timing requires a positive literal-plan budget')
     if not args.dynamic_plan and os.environ.get("HYPER_PARALLEL_REPLICA_COST_MODEL") != "0":
         raise ValueError("This literal-plan diagnostic disables production scoring; the saved plan is injected exactly")
     if args.dynamic_plan and os.environ.get("HYPER_PARALLEL_REPLICA_COST_MODEL") != "1":
@@ -356,8 +386,16 @@ def main() -> None:
     cpus = bind_cpu()
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl", timeout=timedelta(seconds=600))
+    original_prepare = _ReplicaWeightCache.prepare
+
+    def forced_miss(cache: Any, weights: Any, route: Any) -> Any:
+        cache.clear()
+        return original_prepare(cache, weights, route)
+
     try:
-        run(args, cpus)
+        with patch.object(_ReplicaWeightCache, 'prepare', forced_miss if args.force_residency_miss
+                          else original_prepare):
+            run(args, cpus)
     finally:
         dist.destroy_process_group()
 

@@ -48,15 +48,17 @@ class FixedPlanProbe:
         self._runtime_resources: dict[str, Any] | None = None
         self._stages: list[dict[str, Any]] = []
         self._stage_limit = 128
+        self.record_observations = True
 
     def capacity_allowance(self, maximum_tokens: int, top_k: int, target_load: int | None,
                            receive_capacity: int | None, factor: float | None,
-                           budget: Any = None) -> tuple[int, int]:
+                           budget: Any = None) -> tuple[int | None, int | None]:
         """Restore only the recorded allowance; keep downstream hard limits and heap growth."""
         del budget
         expected_target = self.original_options['target_load']
         expected_receive = self.original_options['receive_capacity']
-        if (maximum_tokens != self.tokens or top_k != self.top_k or factor != 1.25
+        expected_factor = 1.25 if self.fixture['model_configuration']['backend'] == 'push' else None
+        if (maximum_tokens != self.tokens or top_k != self.top_k or factor != expected_factor
                 or target_load not in (None, expected_target)
                 or receive_capacity not in (None, expected_receive)):
             raise ValueError('Fixed-plan capacity input differs from the recorded diagnostic domain')
@@ -66,7 +68,7 @@ class FixedPlanProbe:
     def select(self, counts: Any, config: Any, group: Any, rank: int, **options: Any) -> tuple[Any, bool]:
         """Return the saved layout only after exact source/config/topology/hard-bound agreement."""
         del group
-        started = perf_counter_ns()
+        started = perf_counter_ns() if self.record_observations else 0
         if self._call_prepare_ns:
             self._stamp('CountPreparationToReplay', self._call_prepare_ns,
                         scope='Remaining compact/count preparation, may include full D2H; not pure copy duration')
@@ -99,6 +101,7 @@ class FixedPlanProbe:
         if (hidden.shape[0] != self.tokens or hidden.shape[-1] != model['hidden_size']
                 or spec.hidden_size != model['hidden_size'] or spec.intermediate_size != model['intermediate_size']
                 or spec.ep_size != model['ep_size'] or spec.top_k != model['top_k']
+                or spec.dispatch_mode != model['backend']
                 or spec.logical_num_experts != model['num_experts']
                 or spec.replica_slots_per_rank != model['replica_slots_per_rank']
                 or spec.expert_weight_layout != 'EIO' or str(hidden.dtype) != 'torch.bfloat16'
@@ -108,7 +111,7 @@ class FixedPlanProbe:
         previous = self._active_ordinal
         self._active_ordinal = self.accepted_routes
         before = self.guard_calls
-        self._call_prepare_ns = perf_counter_ns()
+        self._call_prepare_ns = perf_counter_ns() if self.record_observations else 0
         self._runtime_resources = {'physical_experts': spec.num_experts, 'local_experts': spec.local_experts,
                                    'replica_slots_per_rank': spec.replica_slots_per_rank,
                                    'rank_nodes': list(resources.rank_nodes), 'autograd_mask': autograd_mask}
@@ -122,13 +125,15 @@ class FixedPlanProbe:
 
     def accept(self, route: Any) -> None:
         """Reject home/compact shortcuts and verify the final plan passed to metadata upload."""
-        if route.home_only or plan_digest(route.plan) != self.digest:
+        if route.home_only or (route.plan is not self.plan and plan_digest(route.plan) != self.digest):
             raise RuntimeError('Final execution layout differs from the actual saved fixture')
         self._last_accepted_ordinal = self.accepted_routes
         self.accepted_routes += 1
 
     def _stamp(self, kind: str, start_ns: int, **metadata: Any) -> None:
         """Retain bounded Host intervals; no SDMA completion or CPU exposure claim."""
+        if not self.record_observations:
+            return
         observer = _get_replica_observer()
         if observer is None:
             return
@@ -147,8 +152,18 @@ class FixedPlanProbe:
             self._stage_drops += 1
 
     @contextmanager
-    def installed(self) -> Iterator[FixedPlanProbe]:
+    def installed(self, observations: bool = True) -> Iterator[FixedPlanProbe]:
         """Replace policy only inside this diagnostic; retain all normal remap/allocation code."""
+        if not observations:
+            previous = self.record_observations
+            self.record_observations = False
+            try:
+                with (patch.object(routing, '_plan_replica_route', self.select),
+                      patch.object(routing, '_automatic_capacity_options', self.capacity_allowance)):
+                    yield self
+            finally:
+                self.record_observations = previous
+            return
         read = native_routes._read_dynamic_route
         upload = routing._upload_route_metadata
         forward = kernels._launch_forward_kernel
