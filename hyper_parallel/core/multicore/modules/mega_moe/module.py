@@ -795,6 +795,8 @@ class MegaMoeExperts(MulticoreModule):
                     integrated = automatic and resources.home_spec is not None and self.replica_planner == "cpu"
                     if integrated:
                         execution_spec = resources.home_spec
+                        # Capturing the callback's owning dictionary retains the input autograd graph.
+                        route_mask = route_options["autograd_mask"]
 
                         def select_replica_route(
                             counts: torch.Tensor, summary: list[list[int]], host_counts: list[list[int]] | None,
@@ -805,7 +807,7 @@ class MegaMoeExperts(MulticoreModule):
                                 return None
                             gathered = _GatheredReplicaCounts(counts, summary, host_counts)
                             proposal = self._prepare_replica_route(
-                                topk_ids, resources, hidden_flat, route_options["autograd_mask"],
+                                topk_ids, resources, hidden_flat, route_mask,
                                 tokens_per_expert, gathered)
                             return (resources.home_spec if proposal.home_only else resources.spec), proposal
 

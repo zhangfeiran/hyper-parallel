@@ -14,7 +14,9 @@
 # ============================================================================
 """Unit tests for the model-facing MegaMoe module."""
 
+import gc
 import unittest
+import weakref
 from collections import OrderedDict
 from dataclasses import replace
 from itertools import product
@@ -39,6 +41,63 @@ class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
 
     # pylint: disable=protected-access
+
+    def test_automatic_replica_callbacks_release_inputs_without_cyclic_gc(self) -> None:
+        """Route callbacks must release each input and its upstream graph immediately."""
+        enabled = gc.isenabled()
+        gc.collect()
+        gc.disable()
+        try:
+            for mode, budget in product(("push", "pull"), (0, 1, 6)):
+                with self.subTest(mode=mode, budget=budget):
+                    experts = MegaMoeExperts(hidden_size=16, intermediate_size=8,
+                                             num_experts=4, top_k=2, ep_size=2, dispatch_mode=mode,
+                                             replica_slots_per_rank=budget)
+                    self.addCleanup(experts.close)
+                    resources = SimpleNamespace(
+                        spec=SimpleNamespace(auto_tokens=True, rank_id=0), home_spec=object(),
+                        home_plan=None, plan=None,
+                        workspace=SimpleNamespace(release=lambda: None),
+                        prepare_auto_workspace=lambda *_args: None,
+                        plan_for_tokens=lambda *_args, **_kwargs: None)
+
+                    def select_route(ids: torch.Tensor, _resources: Any, _hidden: torch.Tensor,
+                                     mask: int, *_args: Any) -> Any:
+                        self.assertEqual(mask, 15)
+                        return SimpleNamespace(home_only=True, physical_ids=ids)
+
+                    def prepare_route(hidden: torch.Tensor, *_args: Any, **options: Any) -> Any:
+                        options["prepare_workspace"](hidden.shape[0], 128)
+                        callback = options.get("_select_replica_route")
+                        replica = None
+                        if callback is not None:
+                            _, replica = callback(torch.zeros(2, 4), [[0] * 6 + [1], [0] * 6 + [2]], None)
+                        return SimpleNamespace(metadata=SimpleNamespace(replica_route=replica, plan_tokens=128),
+                                               unpermute_mapping=None, maximum_received_slots=128)
+
+                    # Recording mocks would retain input tensors and hide the actual lifetime contract.
+                    with (patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
+                          patch.object(experts, "_validate_forward_inputs", new=lambda hidden, *_args: hidden),
+                          patch.object(experts, "_get_execution_resources", new=lambda _hidden: resources),
+                          patch.object(experts, "_prepare_replica_route", new=select_route),
+                          patch.object(mega_moe_module, "prepare_topk_route", new=prepare_route),
+                          patch.object(mega_moe_module, "execute_mega_moe_with_permutation",
+                                       new=lambda hidden, *_args, **_kwargs: torch.zeros_like(hidden)),
+                          patch.object(mega_moe_module, "restore_topk_output", new=lambda output, *_args: output)):
+                        inputs, producers = [], []
+                        for _ in range(32):
+                            producer = torch.ones(128, 16, requires_grad=True)
+                            hidden = producer.square()
+                            inputs.append(weakref.ref(hidden))
+                            producers.append(weakref.ref(producer))
+                            result = experts(hidden, torch.zeros(128, 2, dtype=torch.int32), torch.ones(128, 2))
+                            del result, hidden, producer
+                    self.assertEqual(sum(reference() is not None for reference in inputs), 0)
+                    self.assertEqual(sum(reference() is not None for reference in producers), 0)
+        finally:
+            gc.collect()
+            if enabled:
+                gc.enable()
 
     def test_replica_constructor_infers_capacity_for_empty_and_uneven_shapes(self) -> None:
         """Guest slots preserve automatic input sizing without token-capacity arguments."""
