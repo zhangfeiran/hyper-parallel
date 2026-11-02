@@ -206,6 +206,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           if (band_flags != nullptr) {
             MulticoreRuntime::GradientBandProducer producer;
             producer.Set(band_flags, band_epoch, band_rows);
+            producer.SetProfile(this->replica_trace_, task_desc.outputs[0].input_position == 18,
+                                getExtraValueFromTiling(input_list[TILING_IDX], 0) % ep, data_index);
             producer.Begin(band_output_rows, this->worker_id_, this->core_num);
             producer.PublishEmpty();
           }
@@ -277,7 +279,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                        output_base + output_0_offset, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
                        getTransposeData(task_desc.inputs[1].transpose_flag),
-                       task_desc.outputs[0].data_type == sizeof(float), band_flags, band_epoch, band_rows);
+                       task_desc.outputs[0].data_type == sizeof(float), band_flags, band_epoch, band_rows,
+                       this->replica_trace_, task_desc.outputs[0].input_position == 18,
+                       getExtraValueFromTiling(input_list[TILING_IDX], 0) % ep, data_index);
       }
       return;
     }

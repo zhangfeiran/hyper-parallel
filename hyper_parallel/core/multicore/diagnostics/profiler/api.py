@@ -33,6 +33,8 @@ from hyper_parallel.core.multicore.diagnostics.common.session import (
 from hyper_parallel.core.multicore.diagnostics.profiler.cycle_trace import _PreparedProfileRuntime
 from hyper_parallel.core.multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments, LaunchContext
 from hyper_parallel.core.multicore.diagnostics.common.schedule import DiagnosticAction
+from hyper_parallel.core.expert_parallel.hot_replica._observer import _set_replica_observer
+from hyper_parallel.core.multicore.diagnostics.profiler.replica import ReplicaHostCapture
 
 
 @dataclass
@@ -44,6 +46,7 @@ class _RawInvocation:
     direction: str
     step: int
     invocation_id: int
+    replica_lease_id: int | None = None
 
 
 @dataclass
@@ -76,9 +79,12 @@ class _TraceAccumulator:
             "rank": metadata.get("rank", invocation.runtime.rank),
             "deviceId": metadata.get("deviceId", invocation.runtime.device_id),
             "anchorCycle": metadata["anchorCycle"],
+            "cycleFrequencyMHz": metadata["cycleFrequencyMHz"],
             "recordCount": metadata["recordCount"],
             "droppedRecordCount": metadata["droppedRecordCount"],
         })
+        if invocation.replica_lease_id is not None:
+            self.invocation_metadata[-1]["replicaLeaseId"] = invocation.replica_lease_id
         self._append_events(trace["traceEvents"], invocation, shift_us)
 
     def _append_events(
@@ -103,6 +109,8 @@ class _TraceAccumulator:
                 "step": invocation.step,
                 "direction": invocation.direction,
             }
+            if invocation.replica_lease_id is not None:
+                copied_event["args"]["replica_lease_id"] = invocation.replica_lease_id
             self.trace_events.append(copied_event)
 
 
@@ -188,6 +196,9 @@ class TorchMegaKernelProfiler:
         self._raw_invocations: list[_RawInvocation] = []
         self._last_trace: dict[str, Any] | None = None
         self._window_index = 0
+        self._replica_capture = ReplicaHostCapture(
+            lambda: self.is_capture_enabled() and self._action is not DiagnosticAction.WARMUP,
+            lambda: self._step)
 
     @property
     def step_num(self) -> int:
@@ -202,6 +213,11 @@ class TorchMegaKernelProfiler:
     def __enter__(self) -> TorchMegaKernelProfiler:
         """Activate this profiler as the process-local MegaKernel session."""
         _activate_session("profiler", self)
+        try:
+            _set_replica_observer(self._replica_capture)
+        except BaseException:
+            _deactivate_session(self)
+            raise
         self._entered = True
         return self
 
@@ -218,6 +234,7 @@ class TorchMegaKernelProfiler:
                 self._release_profile_buffer(call, cache=False)
             self._pending.clear()
             self._release_profile_buffer_pool()
+            _set_replica_observer(None)
             _deactivate_session(self)
             self._profile_runtimes.clear()
             self._entered = False
@@ -316,6 +333,7 @@ class TorchMegaKernelProfiler:
             profile_buffer_key=profile_buffer_key,
             invocation_id=invocation_id,
         )
+        call.replica_lease_id = self._replica_capture.current_lease
         self._pending.append(call)
         return call
 
@@ -407,6 +425,7 @@ class TorchMegaKernelProfiler:
                         direction=call.direction,
                         step=call.step,
                         invocation_id=call.invocation_id,
+                        replica_lease_id=getattr(call, "replica_lease_id", None),
                     )
                 )
             self._release_profile_buffer(call, cache=True)
@@ -426,6 +445,7 @@ class TorchMegaKernelProfiler:
     def _finalize_window(self) -> None:
         try:
             self._last_trace = self._build_trace(self._raw_invocations)
+            self._last_trace["replicaHostObservations"] = self._replica_capture.take()
         finally:
             self._raw_invocations.clear()
         self._window_index += 1

@@ -77,7 +77,7 @@
           },
           {
             "path": "hyper_parallel/core/multicore/ops/grouped_matmul_bands.patch",
-            "sha256": "8c01c3232358bf8fc9363adaf78414e05a1c67bb94a5d4526d14c81281865ddc",
+            "sha256": "7b7ef9d8aa6eee1c33fc55481333115b50d09667563af3690b45a23aa8c7c0db",
             "purpose": "publish complete-K gradient row bands after final GM write fences"
           }
         ],

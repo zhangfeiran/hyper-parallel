@@ -25,6 +25,7 @@ from typing import Any, Iterator
 import torch
 
 from ._metadata import _async_device_bytes
+from ._observer import _get_replica_observer
 from .capacity import _integer
 from .pool import ReplicaPool, ReplicaPrefetch
 from .routing import ReplicaRoute
@@ -245,7 +246,11 @@ class SignalReplicaTransport:
             raise ValueError("Signal transport topology does not match the replica route")
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Concurrent signal replica leases are unsupported")
+        observer = _get_replica_observer()
+        observation = None
         try:
+            if observer is not None:
+                observation = observer.begin_lease(route, backward, id(self))
             self._bind(weights)
             # Transfers are immutable host metadata; inactive guests have no kernel readers or gradient return.
             home = route.plan.config.home_experts
@@ -256,10 +261,14 @@ class SignalReplicaTransport:
                 if (backward and overlap and reuse_generation is not None
                         and reuse_generation is self._resident_generation and self._resident_ready is not None
                         and self.epoch < _MAX_EPOCH - 2):
+                    if observer is not None:
+                        observer.event("WeightGenerationReuse", reuse_hit=True, epoch=self._resident_ready[1])
                     yield ReplicaPrefetch(self.pool, self.pool.wait_weights,
                                           projection_ready=self._resident_ready,
                                           weight_generation=self._resident_generation)
                 else:
+                    if observer is not None:
+                        observer.event("WeightGenerationReuse", reuse_hit=False)
                     self._resident_generation = self._resident_ready = None
                     with self._overlapped_prefetch(weights, route, backward=backward) as prefetched:
                         if overlap:
@@ -271,13 +280,20 @@ class SignalReplicaTransport:
                             prefetched.wait_weights()
                             yield self.pool
         finally:
-            self._lock.release()
+            try:
+                if observer is not None:
+                    observer.end_lease(observation)
+            finally:
+                self._lock.release()
 
     @contextmanager
     def _overlapped_prefetch(self, weights: tuple[torch.Tensor, ...],
                              route: ReplicaRoute, *, backward: bool = False) -> Iterator[ReplicaPrefetch]:
         # Weight readers remain live while backward reserves W2 and W13 epochs.
         epoch = self._advance(reserve=2 if backward else 0)
+        observer = _get_replica_observer()
+        if observer is not None:
+            observer.event("WeightEpoch", epoch=epoch, backward=backward)
         home = route.plan.config.home_experts
         incoming = [item for item in route.plan.transfers if item.target_rank == route.rank]
         outgoing = [item for item in route.plan.transfers if item.owner_rank == route.rank]
@@ -286,14 +302,24 @@ class SignalReplicaTransport:
             self._publish(0, route.rank, item.target_slot - home, item.owner_rank, epoch)
         # Complete credit waits before a fused kernel occupies the AIV workers.
         for item in outgoing:
+            stamp = (observer.begin("CreditWaitSubmit", epoch=epoch, peer=item.target_rank,
+                                    physical_slot=item.target_slot) if observer is not None else None)
             self._wait(0, item.target_rank, item.target_slot - home, epoch)
+            if observer is not None:
+                observer.end(stamp)
         sources = {item.owner_slot: tuple(weight[item.owner_slot].contiguous() for weight in weights)
                    for item in outgoing}
 
         def _wait(matrix_index):
             for item in incoming:
+                stamp = (observer.begin("WeightConsumerWaitSubmit", epoch=epoch,
+                                        projection="W13" if matrix_index == 0 else "W2",
+                                        expert=item.logical_expert, peer=item.owner_rank,
+                                        physical_slot=item.target_slot) if observer is not None else None)
                 self.runtime.wait_signal(self.projection_signals[matrix_index, item.target_slot - home, :1],
                                          epoch, comparison="ge")
+                if observer is not None:
+                    observer.end(stamp)
 
         order = tuple(range(len(weights)))
         if backward:
@@ -308,9 +334,17 @@ class SignalReplicaTransport:
                     for index in order:
                         source = sources[item.owner_slot][index]
                         source.record_stream(stream)
+                        stamp = (observer.begin("WeightPrefetchSubmit", epoch=epoch,
+                                                projection="W13" if index == 0 else "W2",
+                                                expert=item.logical_expert, peer=item.target_rank,
+                                                physical_slot=item.target_slot,
+                                                bytes=source.numel() * source.element_size())
+                                 if observer is not None else None)
                         self.runtime.put(self.pool.weights[index][slot], source, item.target_rank, use_sdma=True)
                         self.runtime.put(self.projection_signals[index, slot, :1], value,
                                          item.target_rank, use_sdma=True)
+                        if observer is not None:
+                            observer.end(stamp)
             ready = (tuple(signal.data_ptr() for signal in self.projection_signals), epoch)
             prefetched = ReplicaPrefetch(self.pool, _wait, projection_ready=ready)
             try:

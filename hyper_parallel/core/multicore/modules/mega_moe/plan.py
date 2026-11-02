@@ -215,11 +215,19 @@ def _prepare_diagnostics(
         "rank": dist.get_rank() if dist.is_initialized() else spec.rank_id,
         **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
     }
-    gradient_records = (2 * (spec.ep_size - 1) * spec.replica_slots_per_rank
-                        if spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES else 0)
+    copies = (spec.ep_size - 1) * spec.replica_slots_per_rank
+    groups = min(4, spec.num_cube_cores)
+    bands_per_worker = (64 + groups - 1) // groups
+    gradient_records = (2 * copies * (5 * bands_per_worker + 3) + 3
+                        if copies and spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES else 0)
+    producer_records = (2 * spec.local_experts * 64 if gradient_records else 0)
+    weight_records = 2 * spec.replica_slots_per_rank
     return (
-        prepare_mega_kernel_diagnostics(forward_graph, forward_config, parameter_count=16, **options),
-        prepare_mega_kernel_diagnostics(backward_graph, backward_config, parameter_count=20, extra_aiv_records=gradient_records, **options),
+        prepare_mega_kernel_diagnostics(forward_graph, forward_config, parameter_count=16,
+                                        extra_aic_records=weight_records, **options),
+        prepare_mega_kernel_diagnostics(backward_graph, backward_config, parameter_count=20,
+                                        extra_aiv_records=gradient_records,
+                                        extra_aic_records=producer_records + weight_records, **options),
     )
 
 
