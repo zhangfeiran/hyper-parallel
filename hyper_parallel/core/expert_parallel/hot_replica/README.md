@@ -183,7 +183,8 @@ B=0 和没有实际副本搬运的路由沿用原有执行路径。
 The CPU planner can use a small CPython extension for integer-matrix validation
 and ordered calibrated compute accumulation. It retains the existing placement,
 capacity, topology, copy/gradient costs, candidate order and admission policy.
-Unsupported Python integer ranges keep the reference path. The extension has no
+Unsupported Python integer ranges, dictionary subclasses and nonzero integer
+time knots keep the reference path. The extension has no
 Torch, CANN, SHMEM or NPU link dependency. Editable installs and wheel builds
 attempt this optional extension automatically; an unavailable compiler leaves
 the Python implementation usable.
@@ -191,7 +192,7 @@ the Python implementation usable.
 For critical-path scoring, the native primitive prepares home compute sums and
 ordered guest durations from immutable knots and quotas. Token row accounting
 remains in Python. The reference retains all dependency scheduling, communication
-resource ordering, gradient releases and ACK semantics. ABI version 2 is
+resource ordering, gradient releases and ACK semantics. ABI version 3 is
 required for this additional primitive; model subclasses retain their custom
 Python interpolation contract.
 

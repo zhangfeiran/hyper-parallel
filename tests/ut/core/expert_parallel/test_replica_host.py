@@ -15,6 +15,7 @@
 """Differential checks for optional CPU planner primitives without NPU work."""
 
 from dataclasses import asdict, fields
+from collections import OrderedDict
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import random
@@ -139,7 +140,7 @@ class TestReplicaHost(unittest.TestCase):
         Expectation: A descriptive ValueError rejects extrapolation.
         """
         with self.assertRaisesRegex(ValueError, "exceed"):
-            self.native.rank_compute({0: 4097}, None, 1, 0, {}, ((0, 0), (4096, 1)), ((0, 0), (4096, 2)))
+            self.native.rank_compute({0: 4097}, None, 1, 0, {}, ((0, 0.), (4096, 1.)), ((0, 0.), (4096, 2.)))
 
     def test_large_integer_curve_uses_reference_fallback(self) -> None:
         """Feature: Python integer fallback.
@@ -234,9 +235,13 @@ class TestReplicaHost(unittest.TestCase):
                                critical_path=calibration)
         model = CustomModel(**{field.name: getattr(original, field.name) for field in fields(original)})
         with patch.object(host, "_native_backend", return_value=self.native), patch.object(
-                host, "_ordered_compute", side_effect=AssertionError("Custom models need the Python contract")):
+                cost, "_ordered_compute", side_effect=AssertionError("Custom models need the Python contract")):
             result = calibration.estimate(model, [{0: 4}, {1: 0, 0: 4}], ((8, 0), (0, 0)),
                                           ExpertReplicaConfig(2, 2, 1), trace=True)
+        with patch.object(host, "_native_backend", return_value=None):
+            reference = calibration.estimate(model, [{0: 4}, {1: 0, 0: 4}], ((8, 0), (0, 0)),
+                                             ExpertReplicaConfig(2, 2, 1), trace=True)
+        self.assertEqual(self._bits(asdict(result)), self._bits(asdict(reference)))
         self.assertGreater(result.total_ms, 0)
 
     def test_critical_path_range_errors_preserve_reference_messages(self) -> None:
@@ -257,3 +262,107 @@ class TestReplicaHost(unittest.TestCase):
                         calibration.estimate(model, copies, ((4098, 0), (0, 0)), config)
                     outcomes.append(str(caught.exception))
             self.assertEqual(outcomes[0], outcomes[1])
+
+    def test_ordered_dict_fallback_preserves_public_trace_and_legacy_sums(self) -> None:
+        """Feature: Dictionary subclass fallback.
+        Description: Reorder owned experts and guests through OrderedDict.move_to_end.
+        Expectation: Public calibration traces and legacy sums retain Python items order.
+        """
+        curve = ((0, 0.), (1, .1), (2, .2), (3, .3), (4096, 409.6))
+        owner = OrderedDict(((0, 1), (1, 2), (2, 3)))
+        owner.move_to_end(0)
+        guests = OrderedDict(((0, 0), (1, 0), (2, 1), (3, 100)))
+        guests.move_to_end(2)
+        cases = (([owner, {3: 0, 4: 0, 5: 0}], ((1, 2, 3, 0, 0, 0), (0,) * 6), 6, 1),
+                 ([guests, {2: 0, 3: 0}], ((0, 0, 1, 100), (0,) * 4), 4, 2))
+        for copies, counts, experts, budget in cases:
+            calibration = DeviceCriticalPathCalibration("a" * 64, curve, curve, .01, .02, (0, 1),
+                                                       overlap_verified=True)
+            model = self._model(2, forward_ms=curve, backward_ms=curve, critical_path=calibration,
+                                transport="shmem_signal_kernel_gradient_bands", _rank_nodes=(0, 1))
+            config = ExpertReplicaConfig(experts, 2, budget)
+            traces, costs = [], []
+            for backend in (None, self.native):
+                with patch.object(host, "_native_backend", return_value=backend):
+                    traces.append(self._bits(asdict(calibration.estimate(model, copies, counts, config, trace=True))))
+                    legacy = self._model(2, forward_ms=curve, backward_ms=curve)
+                    costs.append(cost._QuotaCostState(legacy, copies, counts, config).score().hex())
+            self.assertEqual(traces[0], traces[1])
+            self.assertEqual(costs[0], costs[1])
+            self.assertIsNone(self.native.ordered_compute(copies[0], config.home_experts, 0, curve, curve, True))
+
+    def test_integer_time_interpolation_retains_exact_python_division(self) -> None:
+        """Feature: Integer time-knot fallback.
+        Description: Interpolate a legal int64 knot immediately above the FP64 exact range.
+        Expectation: Public and legacy scores retain the reference division bits.
+        """
+        curve = ((0, 0), (2**53 + 1, 78))
+        calibration = DeviceCriticalPathCalibration("a" * 64, curve, curve, .01, .02, (0, 1))
+        model = self._model(2, forward_ms=curve, backward_ms=curve, critical_path=calibration,
+                            transport="shmem_signal_kernel_gradient_bands", _rank_nodes=(0, 1))
+        config, copies, counts = ExpertReplicaConfig(2, 2, 1), [{0: 4096}, {1: 0}], ((4096, 0), (0, 0))
+        traces, costs = [], []
+        for backend in (None, self.native):
+            with patch.object(host, "_native_backend", return_value=backend):
+                result = calibration.estimate(model, copies, counts, config, trace=True)
+                self.assertEqual(result.forward_ms.hex(), "0x1.37fffffffffffp-35")
+                traces.append(self._bits(asdict(result)))
+                legacy = self._model(2, forward_ms=curve, backward_ms=curve)
+                costs.append(cost._QuotaCostState(legacy, copies, counts, config).score().hex())
+        self.assertEqual(traces[0], traces[1])
+        self.assertEqual(costs[0], costs[1])
+        self.assertIsNone(self.native.ordered_compute(copies[0], 1, 0, curve, curve, False))
+
+    def test_duration_cache_subclass_keeps_python_get_semantics(self) -> None:
+        """Feature: Legacy duration-cache fallback.
+        Description: Supply a dictionary subclass with an overridden get method.
+        Expectation: Native availability cannot bypass the cache's Python behavior.
+        """
+        class CustomDurations(dict):
+            """Make the mapping's Python lookup observably different from its storage."""
+
+            def get(self, key: int, default: object = None) -> tuple[float, float]:
+                """Return a deliberate custom duration for every row count."""
+                return .5, .75
+
+        values = []
+        for backend in (None, self.native):
+            with patch.object(host, "_native_backend", return_value=backend):
+                state = cost._QuotaCostState(self._model(2), [{0: 4}, {1: 0}], ((4, 0), (0, 0)),
+                                             ExpertReplicaConfig(2, 2, 1), CustomDurations())
+                values.append(state.score().hex())
+        self.assertEqual(values[0], values[1])
+
+    def test_supported_plain_dict_hook_is_observed_at_actual_call_site(self) -> None:
+        """Feature: Reachable concrete-model hook.
+        Description: Spy on the alias called by the cost model using supported float knots.
+        Expectation: Every rank and phase reaches the existing ordered native primitive.
+        """
+        calibration = DeviceCriticalPathCalibration("a" * 64, ((0, 0.), (4096, 4.)),
+                                                   ((0, 0.), (4096, 8.)), .01, .02, (0, 1))
+        model = self._model(2, critical_path=calibration, transport="shmem_signal_kernel_gradient_bands",
+                            _rank_nodes=(0, 1))
+        with patch.object(host, "_native_backend", return_value=self.native), patch.object(
+                cost, "_ordered_compute", wraps=cost._ordered_compute) as called:
+            calibration.estimate(model, [{0: 4}, {1: 0, 0: 4}], ((8, 0), (0, 0)), ExpertReplicaConfig(2, 2, 1))
+        self.assertEqual(called.call_count, 4)
+
+    def test_stale_optional_binary_cannot_bypass_the_new_domain_contract(self) -> None:
+        """Feature: Native domain ABI.
+        Description: Present a binary advertising the previous optional CPU ABI.
+        Expectation: Loading fails explicitly instead of accepting old domain behavior.
+        """
+        class StaleBinary:
+            """Represent the previously accepted optional module contract."""
+
+            @staticmethod
+            def abi_version() -> int:
+                """Report the previous ABI without loading any hardware code."""
+                return 2
+
+        host._native_backend.cache_clear()
+        self.addCleanup(host._native_backend.cache_clear)
+        with patch.dict("os.environ", {"HYPER_PARALLEL_REPLICA_HOST_NATIVE": "1"}), patch.object(
+                host.Path, "is_file", return_value=True), patch.object(host, "import_module", return_value=StaleBinary()):
+            with self.assertRaisesRegex(RuntimeError, "incompatible ABI"):
+                host._native_backend()

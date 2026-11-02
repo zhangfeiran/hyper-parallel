@@ -69,7 +69,14 @@ bool Point(PyObject *table, Py_ssize_t index, int64_t *rows, double *duration) {
     return false;
   }
   PyObject *value = PyTuple_GET_ITEM(point, 1);
-  if (!PyFloat_CheckExact(value) && !PyLong_CheckExact(value)) return false;
+  if (PyLong_CheckExact(value)) {
+    int64_t integer = 0;
+    // Python retains exact integer multiplication until division for integer
+    // time knots. Only zero is safe to promote before that operation.
+    if (!Integer(value, &integer) || integer != 0) return false;
+  } else if (!PyFloat_CheckExact(value)) {
+    return false;
+  }
   *duration = PyFloat_AsDouble(value);
   return !PyErr_Occurred();
 }
@@ -114,9 +121,11 @@ bool Duration(PyObject *cache, PyObject *rows_object, int64_t rows, PyObject *fo
   PyObject *cached = PyDict_GetItemWithError(cache, rows_object);
   if (cached == nullptr && PyErr_Occurred()) return false;
   if (cached != nullptr) {
-    if (!PyTuple_Check(cached) || PyTuple_GET_SIZE(cached) != 2) return false;
+    if (!PyTuple_CheckExact(cached) || PyTuple_GET_SIZE(cached) != 2) return false;
     for (Py_ssize_t phase = 0; phase < 2; ++phase) {
-      (*result)[phase] = PyFloat_AsDouble(PyTuple_GET_ITEM(cached, phase));
+      PyObject *value = PyTuple_GET_ITEM(cached, phase);
+      if (!PyFloat_CheckExact(value) && !PyLong_CheckExact(value)) return false;
+      (*result)[phase] = PyFloat_AsDouble(value);
       if (PyErr_Occurred()) return false;
     }
     return true;
@@ -147,9 +156,11 @@ PyObject *RankCompute(PyObject *, PyObject *arguments) {
   if (!PyArg_ParseTuple(arguments, "OOiiOOO", &experts, &source, &home, &rank, &cache, &forward, &backward)) {
     return nullptr;
   }
-  if (!PyDict_Check(experts) || !PyDict_Check(cache) || !PyTuple_Check(forward) || !PyTuple_Check(backward) ||
-      PyTuple_GET_SIZE(forward) < 2 || PyTuple_GET_SIZE(backward) < 2 ||
-      (source != Py_None && !PyTuple_Check(source)) || home <= 0 || rank < 0) {
+  // Dict subclasses can change items()/get() semantics without changing the
+  // underlying PyDict_Next order, so the Python reference must handle them.
+  if (!PyDict_CheckExact(experts) || !PyDict_CheckExact(cache)) Py_RETURN_NONE;
+  if (!PyTuple_Check(forward) || !PyTuple_Check(backward) || PyTuple_GET_SIZE(forward) < 2 ||
+      PyTuple_GET_SIZE(backward) < 2 || (source != Py_None && !PyTuple_Check(source)) || home <= 0 || rank < 0) {
     PyErr_SetString(PyExc_ValueError, "Invalid replica host compute inputs");
     return nullptr;
   }
@@ -219,7 +230,8 @@ PyObject *OrderedCompute(PyObject *, PyObject *arguments) {
   if (!PyArg_ParseTuple(arguments, "OiiOOp", &experts, &home, &rank, &compute, &owner, &enabled)) {
     return nullptr;
   }
-  if (!PyDict_Check(experts) || !PyTuple_Check(compute) || !PyTuple_Check(owner) || PyTuple_GET_SIZE(compute) < 2 ||
+  if (!PyDict_CheckExact(experts)) Py_RETURN_NONE;
+  if (!PyTuple_Check(compute) || !PyTuple_Check(owner) || PyTuple_GET_SIZE(compute) < 2 ||
       PyTuple_GET_SIZE(owner) < 2 || home <= 0 || rank < 0) {
     PyErr_SetString(PyExc_ValueError, "Invalid replica host phase inputs");
     return nullptr;
@@ -234,7 +246,7 @@ PyObject *OrderedCompute(PyObject *, PyObject *arguments) {
   return Py_BuildValue("(dN)", home_ms, PyList_AsTuple(guests.Get()));
 }
 
-PyObject *AbiVersion(PyObject *, PyObject *) { return PyLong_FromLong(2); }
+PyObject *AbiVersion(PyObject *, PyObject *) { return PyLong_FromLong(3); }
 
 PyMethodDef methods[] = {
   {"abi_version", AbiVersion, METH_NOARGS, "Return the host primitive ABI version."},

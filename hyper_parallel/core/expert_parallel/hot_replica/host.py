@@ -34,7 +34,7 @@ def _native_backend() -> ModuleType | None:
     if not path.is_file():
         return None
     module = import_module(f"{__package__}._host_kernel._replica_host")
-    if module.abi_version() != 2:
+    if module.abi_version() != 3:
         raise RuntimeError("Rebuild the optional replica host primitives: incompatible ABI")
     return module
 
