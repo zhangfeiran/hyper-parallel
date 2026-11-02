@@ -259,6 +259,8 @@ def _compact_home_cost_dominates(
     totals: list[int], rows: list[list[int]], config: ExpertReplicaConfig, model: ExpertReplicaCostModel,
 ) -> bool:
     """Apply the existing adaptive planner's optimistic bound to compact statistics."""
+    if model.critical_path is not None:
+        return False
     measured = min(model.forward_ms[-1][0], model.backward_ms[-1][0])
     if max(totals) > measured:
         return False

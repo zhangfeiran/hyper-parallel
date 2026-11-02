@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from functools import lru_cache
 import json
 import logging
@@ -29,6 +29,7 @@ import torch.distributed as dist
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 
 from .cost import ExpertReplicaCostModel
+from .critical_path import execution_fingerprint
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,6 +54,8 @@ def _calibrations() -> dict[tuple, ExpertReplicaCostModel]:
         selector = payload['selector']
         key = (model.backend, model.hidden_size, model.intermediate_size, model.ep_size, model.transport,
                selector['num_experts'], selector['top_k'], selector['soc_name'])
+        if model.critical_path is not None:
+            key += (model.critical_path.execution_signature,)
         if key in models:
             raise ValueError(f'Duplicate replica calibration: {key}')
         models[key] = model
@@ -68,22 +71,45 @@ def _calibration_available(backend: str, hidden: int, intermediate: int, ep_size
 
 
 @lru_cache(maxsize=128)
+def _critical_path_available(backend: str, hidden: int, intermediate: int, ep_size: int, transport: str,
+                             num_experts: int, top_k: int) -> bool:
+    """Avoid payload hashing on executions with no critical-path profile."""
+    prefix = backend, hidden, intermediate, ep_size, transport, num_experts, top_k
+    return any(key[:7] == prefix and model.critical_path is not None
+               for key, model in _calibrations().items())
+
+
+@lru_cache(maxsize=128)
+def _critical_path_identity(backend: str, hidden: int, intermediate: int, ep_size: int, transport: str,
+                            num_experts: int, top_k: int) -> str:
+    """Bind the existing group agreement to the same immutable cost profiles."""
+    prefix = backend, hidden, intermediate, ep_size, transport, num_experts, top_k
+    profiles = [(key, asdict(model)) for key, model in _calibrations().items() if key[:7] == prefix]
+    return execution_fingerprint({'profiles':sorted(profiles, key=lambda item:repr(item[0]))})
+
+
+@lru_cache(maxsize=128)
 def _resolve_cost_model(backend: str, hidden: int, intermediate: int, ep_size: int, transport: str,
                         num_experts: int, top_k: int, soc_name: str,
-                        checkpointed: bool) -> ExpertReplicaCostModel | None:
+                        checkpointed: bool, execution_signature: str | None = None) -> ExpertReplicaCostModel | None:
     """Match an existing calibration; unmeasured executions keep load-driven planning."""
     key = backend, hidden, intermediate, ep_size, transport, num_experts, top_k, soc_name
-    model = _calibrations().get(key)
+    model = _calibrations().get(key + (execution_signature,)) if execution_signature is not None else None
+    model = model or _calibrations().get(key)
     table_soc = soc_name
     if model is None:
         table_soc = _SHARED_SOC_CALIBRATIONS.get(soc_name, soc_name)
-        model = _calibrations().get(key[:-1] + (table_soc,))
+        shared_key = key[:-1] + (table_soc,)
+        model = (_calibrations().get(shared_key + (execution_signature,))
+                 if execution_signature is not None else None)
+        model = model or _calibrations().get(shared_key)
     if not dist.is_initialized() or dist.get_rank() == 0:
         _LOGGER.info('Replica cost calibration: status=%s backend=%s shape=%s/%s ep=%s experts=%s top_k=%s '
-                     'actual_soc=%s table_soc=%s checkpointed=%s fanout=%s',
+                     'actual_soc=%s table_soc=%s checkpointed=%s fanout=%s critical_path=%s signature=%s',
                      'matched' if model is not None else 'fallback', backend, hidden, intermediate, ep_size,
                      num_experts, top_k, soc_name, table_soc if model is not None else 'none', checkpointed,
-                     bool(model is not None and model.weight_fanout_ms))
+                     bool(model is not None and model.weight_fanout_ms),
+                     bool(model is not None and model.critical_path is not None), execution_signature)
     if model is None:
         return None
     return replace(model, forward_repeats=2 if checkpointed else 1,
@@ -102,10 +128,12 @@ def _soc_name(device: torch.device) -> str:
 
 def _runtime_cost_model(enabled: bool, backend: str, hidden: int, intermediate: int, ep_size: int,
                         transport: str, num_experts: int, top_k: int,
-                        device: torch.device) -> ExpertReplicaCostModel | None:
+                        device: torch.device, *, execution_signature: str | None = None) -> ExpertReplicaCostModel | None:
     """Resolve invocation costs after device selection and checkpoint context binding."""
     if not enabled or not _calibration_available(backend, hidden, intermediate, ep_size, transport,
                                                 num_experts, top_k):
         return None
-    return _resolve_cost_model(backend, hidden, intermediate, ep_size, transport, num_experts, top_k,
-                               _soc_name(device), get_recompute_state() is not None)
+    arguments = (backend, hidden, intermediate, ep_size, transport, num_experts, top_k,
+                 _soc_name(device), get_recompute_state() is not None)
+    return (_resolve_cost_model(*arguments) if execution_signature is None else
+            _resolve_cost_model(*arguments, execution_signature))

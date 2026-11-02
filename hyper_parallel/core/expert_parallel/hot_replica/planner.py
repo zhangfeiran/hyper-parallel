@@ -399,18 +399,39 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
 
     def score(copies: list[dict[int, int]]) -> float | None:
         """Exclude candidates outside measured compute coverage."""
-        if max(rows for row in copies for rows in row.values()) > measured:
+        coverage = measured
+        if model.critical_path is not None and not any(
+                rows and expert // config.home_experts != rank
+                for rank, row in enumerate(copies) for expert, rows in row.items()):
+            coverage = model.critical_path.owner_coverage
+        if max(rows for row in copies for rows in row.values()) > coverage:
             return None
         return _QuotaCostState(model, copies, counts, config, durations).score()
 
     best = home if max(loads) <= resident else None
     best_score = score(home) if best is not None else None
     margin = max(model.minimum_gain_ms, model.minimum_replica_gain_ms or 0)
+    baseline_score = best_score
+    if model.critical_path is not None:
+        margin = max(margin, 2 * model.critical_path.uncertainty_ms)
+        if best_score is not None:
+            baseline_score = model.critical_path.estimate(model, home, counts, config, baseline=True).total_ms
     average = sum(loads) / config.ep_size
     rates = [min(duration / rows for rows, duration in table if rows)
              for table in (model.forward_ms, model.backward_ms)]
     optimistic = (model.forward_repeats * (rates[0] * average + model.planner_overhead_ms
                                          + model.replica_overhead_ms) + rates[1] * average)
+    # The old separable lower bound does not describe shared resource queues.
+    if model.critical_path is not None:
+        optimistic = float('-inf')
+
+    def improves(value: float | None) -> bool:
+        if value is None:
+            return False
+        reference = best_score
+        if baseline_score is not None and model.critical_path is not None:
+            reference = min(baseline_score, best_score) if best_score is not None else baseline_score
+        return reference is None or value + margin < reference
     if best_score is not None and best_score <= optimistic + margin:
         return best, (best_score, optimistic)
     fallback = (max(loads), 0, home) if max(loads) <= limit else None
@@ -422,13 +443,13 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
         copies = _bounded_copies(loads, totals, candidate_config, edges=edges)
         peak = max(sum(row.values()) for row in copies)
         guests = sum(expert // config.home_experts != rank for rank, row in enumerate(copies) for expert in row)
-        if peak > limit:
+        if peak > limit and model.critical_path is None:
             continue
-        if fallback is None or (peak, guests) < fallback[:2]:
+        if peak <= limit and (fallback is None or (peak, guests) < fallback[:2]):
             fallback = peak, guests, copies
         if peak <= resident:
             candidate_score = score(copies)
-            if candidate_score is not None and (best_score is None or candidate_score + margin < best_score):
+            if improves(candidate_score):
                 best, best_score = copies, candidate_score
         # The bounded skeleton deliberately keeps thin guest quotas. Admission
         # must also compare the completed load policy before rejecting replicas.
@@ -440,6 +461,11 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
         _prune_small_copies(completed, counts, loads, candidate_config, minimum_replica_rows, ceiling)
         completed_copies = completed
         completed_peak = max(sum(row.values()) for row in completed)
+        if model.critical_path is not None and completed_peak <= limit:
+            completed_guests = sum(expert // config.home_experts != rank and bool(rows)
+                                   for rank, row in enumerate(completed) for expert, rows in row.items())
+            if fallback is None or (completed_peak, completed_guests) < fallback[:2]:
+                fallback = completed_peak, completed_guests, completed
         if completed_peak <= resident:
             # More slots can leave the completion unchanged. Preserve insertion
             # order as well as quotas because it determines floating-point sums.
@@ -447,12 +473,12 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
                          and all(tuple(row) == tuple(previous) for row, previous in zip(completed, previous_completed)))
             candidate_score = completed_score if unchanged else score(completed)
             completed_score = candidate_score
-            if candidate_score is not None and (best_score is None or candidate_score + margin < best_score):
+            if improves(candidate_score):
                 best, best_score = completed, candidate_score
         if best_score is not None and best_score <= optimistic + margin:
             break
     if best_score is not None:
-        return best, (best_score, optimistic)
+        return best, None if model.critical_path is not None else (best_score, optimistic)
     if fallback is None:
         raise ValueError("Adaptive replica cap cannot satisfy capacity_limit")
     return fallback[2], None
@@ -605,6 +631,10 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
         def refine(copies: list[dict[int, int]],
                    bounds: tuple[float, float] | None) -> list[dict[int, int]]:
             """Apply the same pruning and admission before comparing final placements."""
+            # Every candidate was scored with the complete device resource graph.
+            # Incremental two-rank scores cannot account for shared queue changes.
+            if cost_model is not None and cost_model.critical_path is not None:
+                return copies
             peak = max(sum(row.values()) for row in copies)
             ceiling = min(limit, max(receive_capacity or 0, peak)) if receive_capacity is not None else limit
             if cost_model is not None:

@@ -92,6 +92,30 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         manager.heap_limit = manager._required_bytes([desired, other])
         self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720), 38400)
 
+    def test_critical_path_admission_separates_target_from_explicit_heap_limit(self) -> None:
+        """A calibrated candidate may use hard-budget headroom without allocating during planning."""
+        manager, workspace, _ = self._automatic_workspace('push', hidden_size=5120)
+        entry = manager.entries[0]
+        desired = _workspace_layout(entry.specification, torch.bfloat16, 60000, 4096)
+        manager.heap_limit = manager._required_bytes([desired])
+        before = entry.layout
+        with patch.object(manager, '_restart', side_effect=AssertionError('Planning cannot allocate')):
+            allowed = manager.replica_receive_capacity(workspace, 4096, 30720, use_hard_budget=True)
+            self.assertGreaterEqual(allowed, 59904)
+            self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720), 38400)
+        layout = _workspace_layout(entry.specification, torch.bfloat16, allowed, 4096)
+        self.assertLessEqual(manager._required_bytes([layout]), manager.heap_limit)
+        self.assertIs(entry.layout, before)
+
+    def test_critical_path_without_explicit_budget_uses_only_committed_capacity(self) -> None:
+        """No instantaneous free-memory guess authorizes unbounded receive growth."""
+        manager, workspace, _ = self._automatic_workspace('push')
+        entry = manager.entries[0]
+        self.assertIsNone(manager.heap_limit)
+        self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720, use_hard_budget=True), 38400)
+        entry.layout = _WorkspaceLayout(entry.layout.required_bytes, entry.layout.collective_signature, 60000)
+        self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720, use_hard_budget=True), 60000)
+
     @staticmethod
     def _cpu_restart(**kwargs: Any) -> _lifecycle._RestartResult:
         """Run the real preflight then provide ordinary replacement tensors."""

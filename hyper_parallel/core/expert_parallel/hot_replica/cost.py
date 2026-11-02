@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 
 from .capacity import ExpertReplicaConfig, _integer
+from .critical_path import DeviceCriticalPathCalibration
 from .plan import ExpertExecutionPlan
 from .topology import _validate_rank_nodes
 
@@ -72,13 +73,15 @@ class ExpertReplicaCostModel:
             outgoing forward copies. Different experts and incoming copies are charged
             separately. Mixed links use a conservative weighted combination of endpoints.
         _rank_nodes: Internal immutable EP-rank node labels, bound during runtime setup.
+        critical_path: Optional exact-signature device dependency calibration. It
+            replaces residual-based scoring with physical services and resource queues.
 
     Tables start at (0, 0), use nondecreasing times and cover the intended expert
     row counts. Out-of-range plans retain the original policy. Every EP rank
     must use identical calibration data. This is an approximate cost model,
     not a prediction guarantee or runtime calibration/weight cache.
-    Missing link classes retain uniform costs; physical gradient bandwidth must
-    not replace the exposed residual of an overlapping fused gradient schedule.
+    Missing link classes retain uniform costs. Legacy scoring uses exposed
+    gradient residuals; critical-path scoring requires separate physical services.
     """
 
     calibration_version: int
@@ -109,9 +112,19 @@ class ExpertReplicaCostModel:
     inter_node_backward_weight_ms: float | None = None
     weight_fanout_ms: tuple[tuple[int, float, float], ...] = ()
     _rank_nodes: tuple[int, ...] = field(default=(), repr=False)
+    critical_path: DeviceCriticalPathCalibration | None = None
 
     def __post_init__(self) -> None:
         """Freeze measured inputs and reject inconsistent calibration contracts."""
+        if isinstance(self.critical_path, dict):
+            object.__setattr__(self, 'critical_path', DeviceCriticalPathCalibration(**self.critical_path))
+        if self.critical_path is not None:
+            if not isinstance(self.critical_path, DeviceCriticalPathCalibration):
+                raise ValueError('critical_path must contain a matching device calibration')
+            if len(self.critical_path.communication_domains) != self.ep_size:
+                raise ValueError('Critical-path communication domains must match EP size')
+            if self.backend not in ('push', 'pull') or self.transport != 'shmem_signal_kernel_gradient_bands':
+                raise ValueError('Critical-path template requires Push/Pull SHMEM gradient bands')
         if isinstance(self.calibration_version, bool) or self.calibration_version != 2:
             raise ValueError("Regenerate replica calibration with calibration_version=2")
         expected_schedule = ("native_grouped_v1" if self.backend == "native" else
@@ -274,6 +287,9 @@ class _QuotaCostState:
         self.copies = copies
         self.counts = counts
         self.home = config.home_experts
+        self.config = config
+        if model.critical_path is not None:
+            return
         self.backward_weight_ms = model.weight_ms if model.backward_weight_ms is None else model.backward_weight_ms
         self.link_costs = model._link_costs[:2] if model._rank_nodes and len(set(model._link_costs)) > 1 else None
         self.durations = {} if durations is None else durations
@@ -305,6 +321,10 @@ class _QuotaCostState:
 
     def score(self, removed: int = 0) -> float:
         """Charge replay and replica-only scheduling work without assuming overlap."""
+        if self.model.critical_path is not None:
+            if removed:
+                raise ValueError('Critical-path scoring requires final explicit quotas')
+            return self.model.critical_path.estimate(self.model, self.copies, self.counts, self.config).total_ms
         host = (self.model.planner_overhead_ms
                 + (self.model.replica_overhead_ms if self.transfer_edges > removed else 0.0))
         return (self.model.forward_repeats * (max(value[0] for value in self.costs) + host)
