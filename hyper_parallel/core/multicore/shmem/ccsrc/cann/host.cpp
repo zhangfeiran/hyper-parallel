@@ -192,9 +192,20 @@ runtime::Status initialize(const InitOptions &options) {
   }
 
   if (options.data_engine == runtime::DataEngine::MteUdma) {
-    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 32);
+    if (options.udma_qp_num != 16U && options.udma_qp_num != 32U) {
+      return InvalidArgument("UDMA QP count must be 16 or 32");
+    }
+    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, options.udma_qp_num);
     if (qp_status != ACLSHMEM_SUCCESS) {
       return CannFailure("aclshmemx_set_qp_num", qp_status);
+    }
+    uint32_t actual_qps = 0;
+    const int32_t get_status = aclshmemx_get_qp_num(ACLSHMEM_DATA_OP_UDMA, &actual_qps);
+    if (get_status != ACLSHMEM_SUCCESS) {
+      return CannFailure("aclshmemx_get_qp_num", get_status);
+    }
+    if (actual_qps != options.udma_qp_num) {
+      return InvalidArgument("UDMA QP count does not match the requested configuration");
     }
   }
 

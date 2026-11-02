@@ -1,5 +1,5 @@
 /**
- * Copyright 2024 Huawei Technologies Co., Ltd
+ * Copyright 2024-2026 Huawei Technologies Co., Ltd
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -81,11 +81,16 @@ class PutMemSignalKernel {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
     if (target_pe_ != aclshmem_my_pe() &&
         (aclshmemi_get_state()->topo_list[target_pe_] & ACLSHMEM_TRANSPORT_UDMA) != 0) {
-      // Legacy odd workers own disjoint QPs. Completion precedes the original ADD credit.
+      // Host validation gives each peer/QP pair one odd-worker owner.
       const uint32_t worker = AscendC::GetBlockIdx();
       if (worker % 2 == 0 || worker / 2 >= 32) {
         AscendC::Trap();
       }
+      const uint32_t qp_count = aclshmemi_udma_qp_info_fetch()->qp_num;
+      if (qp_count != 16 && qp_count != 32) {
+        AscendC::Trap();
+      }
+      const uint32_t qp = qp_count == 16 ? worker / 4 : worker / 2;
       AscendC::TBuf<AscendC::TPosition::VECOUT> staging;
       pipe.InitBuffer(staging, ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE);
       auto scratch = reinterpret_cast<__ubuf__ uint8_t *>(staging.Get<uint8_t>().GetPhyAddr());
@@ -94,8 +99,8 @@ class PutMemSignalKernel {
       auto source = reinterpret_cast<__gm__ uint8_t *>(src_ptr);
       while (remaining > 0) {
         const uint32_t bytes = remaining < (1ULL << 28) ? remaining : (1ULL << 28);
-        aclshmemx_udma_qp_put_nbi<uint8_t>(destination, source, scratch, bytes, target_pe_, worker / 2, 0);
-        aclshmemx_udma_qp_quiet(target_pe_, worker / 2);
+        aclshmemx_udma_qp_put_nbi<uint8_t>(destination, source, scratch, bytes, target_pe_, qp, 0);
+        aclshmemx_udma_qp_quiet(target_pe_, qp);
         destination += bytes;
         source += bytes;
         remaining -= bytes;

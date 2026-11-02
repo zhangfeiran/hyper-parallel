@@ -106,3 +106,13 @@ class TestSubmissionOrder(unittest.TestCase):
                 else:
                     order.claim.assert_not_called()
                     order.release.assert_not_called()
+
+    def test_workspace_rejects_a_changed_qp_bank_before_claim(self) -> None:
+        """Refuse environment changes before touching a shared submission lease."""
+        with patch.dict(os.environ, {'HYPER_PARALLEL_SHMEM_DATA_ENGINE': 'mte_udma',
+                                     'HYPER_PARALLEL_SHMEM_UDMA_QP_NUM': '16'}):
+            workspace = workspace_module.MegaMoeWorkspace(shared=False)
+            with patch.dict(os.environ, {'HYPER_PARALLEL_SHMEM_UDMA_QP_NUM': '32'}):
+                with self.assertRaisesRegex(RuntimeError, 'QP count differs'):
+                    workspace.claim()
+        self.assertFalse(workspace.in_use)

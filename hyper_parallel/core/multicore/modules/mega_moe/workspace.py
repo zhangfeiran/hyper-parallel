@@ -33,6 +33,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
     mega_moe_event_capacity,
 )
 from hyper_parallel.core.multicore.shmem import _lifecycle
+from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 
 from .spec import MegaMoeSpec, _resolve_receive_capacity, _route_metadata_rows
 from .udma_order import SUBMISSION_ORDER, validate_transport
@@ -138,10 +139,12 @@ class MegaMoeWorkspace:
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
     uses_udma: bool = field(init=False, repr=False)
+    udma_qp_count: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Bind process-wide QP ownership to this workspace's data engine."""
         self.uses_udma = validate_transport()
+        self.udma_qp_count = configured_udma_qp_count()
 
     def describe_restart_allocations(
         self,
@@ -383,6 +386,8 @@ class MegaMoeWorkspace:
     def claim(self) -> None:
         """Claim the serial workspace and order it after the previous stream."""
         with self._access(), self.lock:
+            if configured_udma_qp_count() != self.udma_qp_count:
+                raise RuntimeError("UDMA QP count differs from the bound workspace")
             if self.closing:
                 raise RuntimeError("cannot claim a closing MegaMoe workspace.")
             if self.in_use:

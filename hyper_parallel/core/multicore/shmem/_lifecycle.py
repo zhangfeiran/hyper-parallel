@@ -30,7 +30,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 from .. import _automatic
-from ._runtime import _load_native, _torch_modules
+from ._runtime import _load_native, _torch_modules, configured_udma_qp_count
 
 if TYPE_CHECKING:
     import torch
@@ -148,6 +148,8 @@ def _validate_active_root(selected_group: Any, dist: Any, heap_size_bytes: int |
     config = _load_native()._debug_state()["config"]  # pylint: disable=protected-access
     if config["data_engine"] != os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte"):
         raise RuntimeError("SHMEM data engine differs from the active Runtime")
+    if config.get("udma_qp_num", 32) != configured_udma_qp_count():
+        raise RuntimeError("SHMEM UDMA QP count differs from the active Runtime")
     if heap_size_bytes is not None:
         if config["heap_size_bytes"] < heap_size_bytes:
             raise RuntimeError("active SHMEM heap is smaller than the requested managed layout")
@@ -409,6 +411,8 @@ def _restart(
             requested_engine = os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte")
             if native_state["config"]["data_engine"] != requested_engine:
                 raise RuntimeError("SHMEM restart cannot change the active data engine")
+            if native_state["config"].get("udma_qp_num", 32) != configured_udma_qp_count():
+                raise RuntimeError("SHMEM restart cannot change the active UDMA QP count")
             business_state = preflight_hook()
             current_manifest, target_manifest = _validate_replacements(
                 replacements,
@@ -416,7 +420,7 @@ def _restart(
                 heap_size_bytes,
             )
             preflight_state = (heap_size_bytes, business_state, current_manifest, target_manifest,
-                               native_state["config"]["data_engine"])
+                               native_state["config"]["data_engine"], configured_udma_qp_count())
 
         stages_ms = {
             "preflight_ms": _reconfiguration_stage(preflight, value=lambda: preflight_state),

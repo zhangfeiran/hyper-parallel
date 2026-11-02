@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.multicore import _automatic, shmem
+from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
@@ -169,6 +170,7 @@ class _MegaMoeExecutionResources:
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens,
             self.spec.forward_ingress_mode,
+            self.workspace.udma_qp_count,
         )
 
     def can_close(self) -> bool:
@@ -184,7 +186,8 @@ class _MegaMoeExecutionResources:
                   "dispatch_split", "combine_split", "swiglu_limit", "ep_size", "forward_ingress_mode")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v1", "bfloat16",
-                    tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
+                    tuple(tuple(spec.get(key) for key in fields) for spec in specifications),
+                    configured_udma_qp_count())
         # Resource groups must have the same order as their symmetric allocations.
         manifests = [None] * self.spec.ep_size
         dist.all_gather_object(manifests, manifest, group=self.spec.ep_group)

@@ -54,10 +54,12 @@ from hyper_parallel.core.multicore.scheduler.config import (
     TaskAiCoreType, TaskSplitValue, TaskType, validate_runtime_config,
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, SplitSpec, TensorSpec
+from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 
 from .diagnostics import _mega_moe_owner_options
 from .spec import MegaMoeSpec, _route_metadata_rows
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
+from .udma_order import validate_udma_qp_owners
 
 
 @dataclass(frozen=True)
@@ -198,6 +200,11 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         spec.rank_id,
         spec.num_cube_cores,
     )
+    qp_count = configured_udma_qp_count()
+    if qp_count != 32:
+        for config in (forward_data, backward_data):
+            validate_udma_qp_owners(config, ep_size=spec.ep_size, num_experts=spec.num_experts,
+                                    rank_id=spec.rank_id, qp_count=qp_count)
     return forward_graph, forward_data, backward_graph, backward_data
 
 

@@ -134,6 +134,18 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertEqual(_lifecycle._reference_count(), 1)
         _lifecycle.release()
 
+    def test_active_runtime_rejects_changed_qp_count(self) -> None:
+        """Retain the original QP bank and consumer reference after a rejected join."""
+        self.native._debug_state.return_value['config'].update(data_engine='mte_udma', udma_qp_num=16)
+        with patch.dict(os.environ, {'HYPER_PARALLEL_SHMEM_DATA_ENGINE': 'mte_udma',
+                                     'HYPER_PARALLEL_SHMEM_UDMA_QP_NUM': '16'}):
+            _lifecycle.acquire(self.world)
+            with patch.dict(os.environ, {'HYPER_PARALLEL_SHMEM_UDMA_QP_NUM': '32'}):
+                with self.assertRaisesRegex(RuntimeError, 'QP count differs'):
+                    _lifecycle.acquire(self.world)
+            self.assertEqual(_lifecycle._reference_count(), 1)
+            _lifecycle.release()
+
     def test_active_udma_runtime_accepts_the_same_data_engine(self) -> None:
         """Keep the shared QP engine fixed while adding an equivalent owner."""
         self.native._debug_state.return_value["config"]["data_engine"] = "mte_udma"
