@@ -147,6 +147,38 @@ class TestGuestTaskPrefixes(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'exclusive'):
             apply_guest_task_prefix(base, prefixes[0], base=base)
 
+    def test_partial_copy_failure_invalidates_the_previous_prefix(self) -> None:
+        """A failed 7-to-9 upload cannot make a later 7 retry skip restoration."""
+        spec = MegaMoeSpec(1024, 128, 128, 12, 2, 1.25, 4096, 1, None, 0, 8,
+                           replica_slots_per_rank=6, logical_num_experts=6)
+        config = _build_runtime_artifacts(spec)[1]
+        prefixes = build_guest_task_prefixes(config, home_experts=6)
+        base = torch.frombuffer(bytearray(serialize_runtime_config(config)), dtype=torch.uint8)
+        runtime = base.clone()
+        cache = {}
+        apply_guest_task_prefix(runtime, prefixes[1], base=base, cache=cache)
+        expected = runtime.clone()
+        original = inactive_tasks._copy_device_bytes
+        submissions = 0
+
+        def copy(data: bytes, destination: torch.Tensor) -> None:
+            """Fail after one real partial update without swallowing the exception."""
+            nonlocal submissions
+            submissions += 1
+            if submissions == 2:
+                raise RuntimeError('Injected metadata submission failure')
+            original(data, destination)
+
+        with patch.object(inactive_tasks, '_copy_device_bytes', side_effect=copy):
+            with self.assertRaisesRegex(RuntimeError, 'Injected metadata'):
+                apply_guest_task_prefix(runtime, prefixes[3], base=base, cache=cache)
+        self.assertNotIn(id(base), cache)
+        self.assertFalse(torch.equal(runtime, expected))
+        with patch.object(inactive_tasks, '_copy_device_bytes', wraps=original) as restore:
+            apply_guest_task_prefix(runtime, prefixes[1], base=base, cache=cache)
+        self.assertEqual(restore.call_count, 4)
+        torch.testing.assert_close(runtime, expected)
+
     def test_l1_keeps_requested_padding_tasks_and_profile_retains_pruning(self) -> None:
         """A real L1 record plan remains scheduled through the native launch boundary."""
         spec = MegaMoeSpec(1024, 128, 128, 12, 2, 1.25, 4096, 1, None, 0, 8,

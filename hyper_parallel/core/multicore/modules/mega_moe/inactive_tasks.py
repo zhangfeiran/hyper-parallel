@@ -182,6 +182,9 @@ def apply_guest_task_prefix(runtime: torch.Tensor, prefix: GuestTaskPrefix | Non
     for offset, payload in prefix.patches:
         if offset < 0 or offset + len(payload) > base.numel():
             raise ValueError('Guest task patch exceeds the physical runtime body')
+    # A failed submission can leave a partially rewritten body; never advertise its old prefix.
+    if cache is not None:
+        cache.pop(id(base), None)
     for offset, payload in prefix.patches:
         _copy_device_bytes(payload, runtime[offset:offset + len(payload)])
     if cache is not None:
