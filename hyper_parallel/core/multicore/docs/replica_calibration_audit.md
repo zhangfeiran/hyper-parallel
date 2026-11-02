@@ -101,3 +101,23 @@ samples. For each matched backend and EP group, reduce per-step rank maxima befo
 median/p95. Profile steps are declared and excluded globally. F/R/B kernel events,
 component wall time, planning wall time and exposed host time remain separate.
 Do not treat this screening as fresh-process ABBA or whole-model non-regression.
+
+## Bounded candidate reachability audit
+
+```bash
+python scripts/audit_replica_candidates.py --fixtures /path/to/actual-push-fixtures \
+  --output /path/to/separate-candidate-audit.json
+```
+
+The script requires exact original-plan reproduction, equal source histograms,
+equal effective legacy cost models and matching policy fields other than the
+recorded theoretical capacity bound. It pads a captured B1 layout into the B6
+physical configuration without redistributing any source quota, then checks its
+original hard/receive constraints and scores it under the same B6 model.
+
+An isolated serial trace records thin candidates and actual scoring reachability.
+A separately labeled CPU probe relaxes only the intermediate search bound while
+retaining the receive allowance and rechecking the selected result against the
+original bound. This distinguishes an excluded feasible completion from an
+unfavorable score. It does not apply a planner fix, change coefficients, execute
+the alternative layout or establish device performance.
