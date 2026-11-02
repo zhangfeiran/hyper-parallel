@@ -222,3 +222,25 @@ tests compile the actual source and require exact plans and FP64 score bits:
 ```bash
 python -m pytest -q tests/ut/core/expert_parallel/test_replica_host.py
 ```
+
+## Experimental recompute metadata reuse
+
+The internal fresh-process switch `HYPER_PARALLEL_REPLICA_METADATA_REUSE=1`
+retains invocation-owned integer dispatch and source-run descriptors after the
+existing exact CPU plan replay guard succeeds. Current token IDs still rebuild
+their mapping and permutation. Counts readback, validation, candidate selection
+and the count/header wire protocol remain unchanged.
+
+Compact home-only decisions retain an owned logical count matrix instead of
+creating guest dispatch metadata. Upload-ready events and consumer stream
+records protect cross-stream use. Clearing the invocation registry drops only
+cache references; saved tensors and allocator stream tracking retain active
+consumers. B0 and non-checkpoint execution do not create this cache.
+
+The switch defaults to disabled pending accelerator numerical and lifecycle
+validation. CPU tests cover exact hits, changed counts/policy, current-ID remap,
+early-stop cleanup, later retained-graph replay and mocked stream ordering:
+
+```bash
+python -m pytest -q tests/ut/core/expert_parallel/test_replica_metadata_replay.py
+```

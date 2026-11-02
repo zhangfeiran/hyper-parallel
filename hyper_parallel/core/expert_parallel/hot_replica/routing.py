@@ -29,7 +29,7 @@ import torch.distributed as dist
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 
 from .admission import reduction_basis_points
-from ._metadata import _async_device_bytes
+from ._metadata import _async_device_bytes, _recompute_metadata
 from .capacity import ExpertReplicaConfig, _integer, align_capacity
 from .cost import ExpertReplicaCostModel
 from .count_kernel import try_count_payload
@@ -180,6 +180,11 @@ def stable_expert_order(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
 def _upload_route_metadata(plan: ExpertExecutionPlan, rank: int,
                            device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Upload one owned buffer with aligned int64 runs and int32 dispatch counts."""
+    cache, recomputing = _recompute_metadata(plan)
+    if cache is not None and recomputing:
+        cached = cache.lookup(plan, rank, device, "dispatch")
+        if cached is not None:
+            return cached
     runs = plan.source_runs[rank] if plan.transfers else ()
     slots = tuple(slot for slot, _ in runs)
     lengths = tuple(count for _, count in runs)
@@ -191,7 +196,26 @@ def _upload_route_metadata(plan: ExpertExecutionPlan, rank: int,
     run_bytes = 16 * len(runs)
     indices = packed[:run_bytes].view(torch.int64).reshape(2, len(runs))
     dispatch = packed[run_bytes:].view(torch.int32).reshape(plan.config.ep_size, plan.config.physical_experts)
-    return indices[0], indices[1], dispatch
+    result = indices[0], indices[1], dispatch
+    if cache is not None and not recomputing:
+        cache.remember(plan, rank, device, "dispatch", result)
+    return result
+
+
+def _home_route_counts(plan: ExpertExecutionPlan, rank: int, logical_counts: torch.Tensor) -> torch.Tensor:
+    """Retain owned compact counts without creating guest dispatch metadata."""
+    cache, recomputing = _recompute_metadata(plan)
+    if cache is not None and recomputing:
+        cached = cache.lookup(plan, rank, logical_counts.device, "home")
+        if cached is not None:
+            return cached[0]
+    counts = logical_counts.to(torch.int32).contiguous()
+    if cache is not None and not recomputing:
+        # A no-op conversion may still alias a producer's reusable count buffer.
+        if counts is logical_counts:
+            counts = counts.clone()
+        cache.remember(plan, rank, logical_counts.device, "home", (counts,))
+    return counts
 
 
 def _remap_replica_ids(ids: torch.Tensor, plan: ExpertExecutionPlan,
@@ -530,7 +554,7 @@ def prepare_replica_route(
         tuple(row[config.num_experts + 1:]) + (sum(counts), min(counts), max(counts), load)
         for row, counts, load in zip(host, logical_host, plan.destination_loads)))
     if compact_home and not plan.transfers:
-        return ReplicaRoute(plan, topk_ids, logical_counts.to(torch.int32).contiguous(),
+        return ReplicaRoute(plan, topk_ids, _home_route_counts(plan, rank, logical_counts),
                             rank, group, home_only=True, dynamic_summary=dynamic_summary, plan_reused=reused,
                             _host_counts=tuple(map(tuple, logical_host)))
     slots, lengths, device_counts = _upload_route_metadata(plan, rank, ids.device)
