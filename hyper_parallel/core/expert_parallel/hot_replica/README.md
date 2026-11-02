@@ -177,3 +177,47 @@ checkpoint 使用 reentrant 完整重算，取证记录有梯度的 forward 所�
 B=0 和没有实际副本搬运的路由沿用原有执行路径。
 
 正的槽位上限默认启用自适应，不需要传成本模型或 adaptive 开关。成本匹配和调试消融见[自适应说明](../../multicore/docs/adaptive_replicas.md)。
+
+## Optional native host primitives
+
+The CPU planner can use a small CPython extension for integer-matrix validation
+and ordered calibrated compute accumulation. It retains the existing placement,
+capacity, topology, copy/gradient costs, candidate order and admission policy.
+Unsupported Python integer ranges keep the reference path. The extension has no
+Torch, CANN, SHMEM or NPU link dependency. Editable installs and wheel builds
+attempt this optional extension automatically; an unavailable compiler leaves
+the Python implementation usable.
+
+For critical-path scoring, the native primitive prepares home compute sums and
+ordered guest durations from immutable knots and quotas. Token row accounting
+remains in Python. The reference retains all dependency scheduling, communication
+resource ordering, gradient releases and ACK semantics. ABI version 2 is
+required for this additional primitive; model subclasses retain their custom
+Python interpolation contract.
+
+To build it separately, use the same Python interpreter used for training:
+
+```bash
+cmake -S hyper_parallel/core/expert_parallel/hot_replica/_host_kernel \
+  -B build/replica-host -DPython3_EXECUTABLE="$(command -v python)" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/replica-host --parallel 4
+cmake --install build/replica-host \
+  --prefix "$PWD/hyper_parallel/core/expert_parallel/hot_replica/_host_kernel"
+```
+
+The optional binary is detected once per process. Missing binaries preserve the
+Python implementation. An installed binary with an incompatible ABI fails at
+load time. The internal regression switch
+`HYPER_PARALLEL_REPLICA_HOST_NATIVE=0` selects the reference in a fresh process;
+no model or adaptive constructor argument is added.
+
+For a native wheel payload, install the same target into
+`$HYPER_PARALLEL_NATIVE_OUTPUT_ROOT/core/expert_parallel/hot_replica/_host_kernel`
+before assembling the wheel. Float contraction and fast-math are disabled to
+preserve the reference interpolation and accumulation order. CPU differential
+tests compile the actual source and require exact plans and FP64 score bits:
+
+```bash
+python -m pytest -q tests/ut/core/expert_parallel/test_replica_host.py
+```

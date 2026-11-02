@@ -21,7 +21,7 @@ import stat
 import platform
 import subprocess
 from importlib import import_module
-from setuptools import setup, find_packages, find_namespace_packages, Distribution
+from setuptools import setup, find_packages, find_namespace_packages, Distribution, Extension
 from setuptools.command.egg_info import egg_info
 from setuptools.command.build_py import build_py
 from setuptools.command.install import install
@@ -246,6 +246,13 @@ if __name__ == '__main__':
         ),
         platforms=[get_platform()],
         include_package_data=True,
+        ext_modules=[Extension(
+            'hyper_parallel.core.expert_parallel.hot_replica._host_kernel._replica_host',
+            sources=['hyper_parallel/core/expert_parallel/hot_replica/_host_kernel/host.cpp'],
+            language='c++',
+            extra_compile_args=['-std=c++17', '-O3', '-fno-fast-math', '-ffp-contract=off'],
+            optional=True,
+        )],
         scripts=['hyper_parallel/core/multicore/scripts/hyper_parallel_multicore_set_env.bash'],
         package_data={
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],

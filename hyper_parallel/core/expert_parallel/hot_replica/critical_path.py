@@ -247,19 +247,24 @@ class DeviceCriticalPathCalibration:
         enabled = bool(edges)
         home_ends, compute_ends, guest_ready = [], [], {}
         for rank, row in enumerate(copies):
+            owner_curve = self.home_backward_ms if backward else self.home_forward_ms
+            native = (model._phase_inputs(row, home, rank, backward, None if enabled else owner_curve)
+                      if type(self) is DeviceCriticalPathCalibration else None)
             home_duration = 0.0
-            for expert, rows in row.items():
-                if expert // home == rank:
-                    home_duration += (model.compute_ms(rows, backward=backward) if enabled else
-                                      _interpolate(self.home_backward_ms if backward else self.home_forward_ms, rows))
+            if native is None:
+                for expert, rows in row.items():
+                    if expert // home == rank:
+                        home_duration += (model.compute_ms(rows, backward=backward) if enabled else
+                                          _interpolate(owner_curve, rows))
+            else:
+                home_duration = native[0]
             compute = (f'cube:{rank}',)
             home_end = timeline.add(f'{prefix}:home:{rank}', home_duration, barrier, compute)
             home_ends.append(home_end)
             finish = home_end
-            for expert, rows in row.items():
-                if not rows or expert // home == rank:
-                    continue
-                duration = model.compute_ms(rows, backward=backward)
+            guests = (((expert, model.compute_ms(rows, backward=backward)) for expert, rows in row.items()
+                       if rows and expert // home != rank) if native is None else native[1])
+            for expert, duration in guests:
                 finish = timeline.add(f'{prefix}:guest:{rank}:{expert}', duration,
                                       max(home_end, ready[rank, expert]), compute)
                 guest_ready[rank, expert] = finish - duration, finish

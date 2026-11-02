@@ -26,6 +26,7 @@ from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
 from .cost import ExpertReplicaCostModel, _QuotaCostState, refine_replica_quotas
 from .topology import _validate_rank_nodes
+from .host import _validate_counts
 
 
 def _counts_matrix(counts: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:
@@ -33,6 +34,8 @@ def _counts_matrix(counts: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ..
     rows = tuple(tuple(row) for row in counts)
     if not rows or not rows[0]:
         raise ValueError("counts_by_source must be a nonempty rectangular matrix")
+    if _validate_counts(rows):
+        return rows
     for row in rows:
         if len(row) != len(rows[0]):
             raise ValueError("counts_by_source must be rectangular")

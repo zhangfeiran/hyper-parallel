@@ -25,6 +25,7 @@ from .capacity import ExpertReplicaConfig, _integer
 from .critical_path import DeviceCriticalPathCalibration
 from .plan import ExpertExecutionPlan
 from .topology import _validate_rank_nodes
+from .host import _ordered_compute, _rank_compute
 
 
 def _nonnegative(value: float, name: str) -> None:
@@ -256,6 +257,14 @@ class ExpertReplicaCostModel:
         right_rows, right_ms = table[index]
         return left_ms + (right_ms - left_ms) * (rows - left_rows) / (right_rows - left_rows)
 
+    def _phase_inputs(self, experts: dict[int, int], home: int, rank: int,
+                      backward: bool, owner: tuple | None) -> tuple | None:
+        """Prepare ordered inputs only for the concrete model's interpolation contract."""
+        if type(self) is not ExpertReplicaCostModel:
+            return None
+        compute = self.backward_ms if backward else self.forward_ms
+        return _ordered_compute(experts, home, rank, compute, compute if owner is None else owner, owner is None)
+
     def estimate_ms(self, plan: ExpertExecutionPlan) -> float:
         """Score separate phase bottlenecks, excluding invariant optimizer work.
 
@@ -338,16 +347,24 @@ class _QuotaCostState:
         token_rate = self.model.token_ms_per_row
         forward, backward = [0.0, 0.0], [0.0, 0.0]
         local = 0
-        for expert, rows in experts.items():
-            guest = int(expert // self.home != rank)
-            duration = durations.get(rows)
-            if duration is None:
-                duration = self.model.compute_ms(rows), self.model.compute_ms(rows, backward=True)
-                durations[rows] = duration
-            forward[guest] += duration[0]
-            backward[guest] += duration[1]
-            if token_rate:
-                local += min(self.counts[rank][expert], rows)
+        # Subclasses may override interpolation; only the concrete model has
+        # the native primitive's exact compute_ms contract.
+        native = (_rank_compute(experts, self.counts[rank] if token_rate else None, self.home, rank,
+                                durations, self.model.forward_ms, self.model.backward_ms)
+                  if type(self.model) is ExpertReplicaCostModel else None)
+        if native is None:
+            for expert, rows in experts.items():
+                guest = int(expert // self.home != rank)
+                duration = durations.get(rows)
+                if duration is None:
+                    duration = self.model.compute_ms(rows), self.model.compute_ms(rows, backward=True)
+                    durations[rows] = duration
+                forward[guest] += duration[0]
+                backward[guest] += duration[1]
+                if token_rate:
+                    local += min(self.counts[rank][expert], rows)
+        else:
+            forward, backward, local = [native[0]], [native[1]], native[2]
         # Without measured link concurrency or queue-prefix windows, neither
         # full duplex nor whole-home compute can hide these transfers safely.
         ready = transfers * self.model.weight_ms
