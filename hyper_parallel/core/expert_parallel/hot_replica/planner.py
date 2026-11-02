@@ -441,13 +441,13 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
     edges = _balanced_edges(loads, totals, config.home_experts)
     completed_copies = None
     completed_score = None
+    deferred = []
     for budget in range(1, min(config.replica_slots_per_rank, config.home_experts) + 1):
         candidate_config = ExpertReplicaConfig(config.num_experts, config.ep_size, budget)
         copies = _bounded_copies(loads, totals, candidate_config, edges=edges)
         peak = max(sum(row.values()) for row in copies)
         guests = sum(expert // config.home_experts != rank for rank, row in enumerate(copies) for expert in row)
-        if peak > limit and model.critical_path is None:
-            continue
+        overflow = peak > limit and model.critical_path is None
         if peak <= limit and (fallback is None or (peak, guests) < fallback[:2]):
             fallback = peak, guests, copies
         if peak <= resident:
@@ -456,15 +456,18 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
                 best, best_score = copies, candidate_score
         # The bounded skeleton deliberately keeps thin guest quotas. Admission
         # must also compare the completed load policy before rejecting replicas.
-        previous_completed = completed_copies
+        # Complete overflowing seeds independently, preserving the original
+        # feasible candidate chain and its gain-margin comparisons.
+        previous_completed = None if overflow else completed_copies
         completed = [dict(row) for row in (copies if previous_completed is None else previous_completed)]
         _improve_copies(completed, candidate_config, min(target, resident))
         completed_peak = max(sum(row.values()) for row in completed)
         ceiling = min(limit, max(receive_capacity or 0, completed_peak)) if receive_capacity is not None else limit
         _prune_small_copies(completed, counts, loads, candidate_config, minimum_replica_rows, ceiling)
-        completed_copies = completed
+        if not overflow:
+            completed_copies = completed
         completed_peak = max(sum(row.values()) for row in completed)
-        if model.critical_path is not None and completed_peak <= limit:
+        if completed_peak <= limit:
             completed_guests = sum(expert // config.home_experts != rank and bool(rows)
                                    for rank, row in enumerate(completed) for expert, rows in row.items())
             if fallback is None or (completed_peak, completed_guests) < fallback[:2]:
@@ -475,11 +478,17 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
             unchanged = (previous_completed is not None and completed == previous_completed
                          and all(tuple(row) == tuple(previous) for row, previous in zip(completed, previous_completed)))
             candidate_score = completed_score if unchanged else score(completed)
-            completed_score = candidate_score
-            if improves(candidate_score):
-                best, best_score = completed, candidate_score
+            if overflow:
+                deferred.append((completed, candidate_score))
+            else:
+                completed_score = candidate_score
+                if improves(candidate_score):
+                    best, best_score = completed, candidate_score
         if best_score is not None and best_score <= optimistic + margin:
             break
+    for completed, candidate_score in deferred:
+        if improves(candidate_score):
+            best, best_score = completed, candidate_score
     if best_score is not None:
         return best, None if model.critical_path is not None else (best_score, optimistic)
     if fallback is None:
