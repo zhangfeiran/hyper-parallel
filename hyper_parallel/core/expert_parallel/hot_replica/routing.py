@@ -212,7 +212,7 @@ def _upload_route_metadata(plan: ExpertExecutionPlan, rank: int,
         cached = cache.lookup(plan, rank, device, "dispatch")
         if cached is not None:
             return cached
-    runs = plan.source_runs[rank] if plan.transfers else ()
+    runs = plan.source_runs_for(rank) if plan.transfers else ()
     slots = tuple(slot for slot, _ in runs)
     lengths = tuple(count for _, count in runs)
     counts = tuple(count for row in plan.dispatch_counts for count in row)

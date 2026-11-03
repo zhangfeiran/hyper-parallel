@@ -62,10 +62,20 @@ class ExpertExecutionPlan:
         return tuple(sum(row) for row in self.destination_counts)
 
     @cached_property
+    def _source_slot_order(self) -> tuple[int, ...]:
+        """Share stable expert/slot ordering without materializing every source row."""
+        return tuple(slot for _, slot in sorted((expert, slot)
+                     for slot, expert in enumerate(self.physical_to_logical) if expert >= 0))
+
+    @cached_property
     def source_runs(self) -> tuple[tuple[tuple[int, int], ...], ...]:
         """Return stable logical-expert runs as physical slot and source quota."""
-        order = sorted((expert, slot) for slot, expert in enumerate(self.physical_to_logical) if expert >= 0)
-        return tuple(tuple((slot, row[slot]) for _, slot in order) for row in self.dispatch_counts)
+        return tuple(self.source_runs_for(rank) for rank in range(len(self.dispatch_counts)))
+
+    def source_runs_for(self, rank: int) -> tuple[tuple[int, int], ...]:
+        """Return one source row without materializing runs for every source rank."""
+        source = self.dispatch_counts[rank]
+        return tuple((slot, source[slot]) for slot in self._source_slot_order)
 
     @cached_property
     def physical_to_logical(self) -> tuple[int, ...]:
