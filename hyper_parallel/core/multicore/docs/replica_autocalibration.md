@@ -8,7 +8,11 @@ in this pipeline.
 
 The model-owned JSON manifest contains `hidden_size`, `intermediate_size`,
 `num_experts`, `top_k`, `ep_size`, `local_num_tokens`, `checkpointed: true`,
-`dispatch_modes`, `replica_caps`, and `swiglu_limit`. It may also contain the model
+`dispatch_modes`, `replica_caps`, `checkpoint_contract`, and `swiglu_limit`. The
+checkpoint contract is `reentrant` for a no-grad original forward and grad-enabled
+replay, as used by PanGu; `nonreentrant` is the default for Hyper checkpointing.
+The original call-boundary grad mode is remembered in the shared invocation and
+bound into the same execution signature for both phases. It may also contain the model
 family as descriptive metadata; selection never relies on its name. For PanGu
 504B the relevant dimensions are H5120/I1792/E384/K8. The initial comparison uses
 EP64 and maximum source tokens4096.

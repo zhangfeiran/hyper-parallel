@@ -77,6 +77,19 @@ from .workspace import MegaMoeWorkspace
 
 ExpertWeightLayout = Literal["EIO", "EOI"]
 _EXPERT_WEIGHT_LAYOUTS = frozenset(("EIO", "EOI"))
+_CHECKPOINT_GRAD_MODE_KEY = object()
+
+
+def _checkpoint_contract() -> str:
+    """Remember original call-boundary grad mode across one checkpoint invocation."""
+    state = get_recompute_state()
+    if state is None:
+        return 'none'
+    original_grad = state.get_resource(
+        _CHECKPOINT_GRAD_MODE_KEY, lambda: None if state.is_recomputing else torch.is_grad_enabled())
+    if original_grad is None:
+        return 'unknown'
+    return 'nonreentrant' if original_grad else 'reentrant'
 
 
 @lru_cache(maxsize=1)
@@ -99,6 +112,7 @@ def _critical_execution_signature(module: Any, resources: Any, *, execution_toke
     metadata.update(weight_layout=resources.spec.expert_weight_layout, swiglu_limit=resources.spec.swiglu_limit,
                     dispatch_split=resources.spec.dispatch_split, combine_split=resources.spec.combine_split,
                     rank_nodes=resources.rank_nodes, checkpointed=get_recompute_state() is not None,
+                    checkpoint_contract=_checkpoint_contract(),
                     native_payload=_critical_native_fingerprint(), policy_abi='dynamic_tokens_v4',
                     cube_cores=getattr(resources.spec, 'num_cube_cores', None),
                     global_world_size=dist.get_world_size() if dist.is_initialized() else module.ep_size,
@@ -831,6 +845,8 @@ class MegaMoeExperts(MulticoreModule):
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
+        # Prime before internal no-grad route preparation; replay uses this original mode.
+        _checkpoint_contract()
         route_options = {"autograd_mask": (
             int(torch.is_grad_enabled()) | (int(hidden_flat.requires_grad) << 1)
             | (int(weights[0].requires_grad) << 2) | (int(weights[1].requires_grad) << 3)

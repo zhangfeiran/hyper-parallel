@@ -38,7 +38,10 @@ from hyper_parallel.core.expert_parallel.hot_replica.calibration_catalog import 
 from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
 from hyper_parallel.core.expert_parallel.hot_replica.planner import _build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.residency import _ReplicaWeightCache
+from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
+from hyper_parallel.core.multicore.modules.mega_moe import module as mega
 from hyper_parallel.core.multicore.modules.mega_moe.inactive_tasks import UNMAPPED_GUEST_SUFFIX_SCHEDULE
+from tests.torch.expert_parallel._replica_autocalibration_worker import _checkpoint_operation
 
 
 class TestAutomaticReplicaCalibration(unittest.TestCase):
@@ -59,12 +62,52 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
             root = Path(temp)
             manifest = self.manifest(root)
             for key, value in (('ep_size', 3), ('top_k', 5), ('hidden_size', 0), ('checkpointed', False),
-                               ('dtype', 'float32'), ('replica_caps', [True]), ('frames', 3)):
+                               ('dtype', 'float32'), ('replica_caps', [True]), ('frames', 3),
+                               ('checkpoint_contract', 'unknown')):
                 with self.subTest(key=key):
                     payload = manifest | {key: value}
                     (root / 'model.json').write_text(json.dumps(payload))
                     with self.assertRaises(ValueError):
                         load_manifest(root / 'model.json')
+
+    def test_checkpoint_contract_matches_grad_modes_rng_and_execution_signature(self) -> None:
+        """Reentrant PanGu and nonreentrant Hyper replay retain distinct stable F/R signatures."""
+        module = SimpleNamespace(dispatch_mode='push', hidden_size=16, intermediate_size=8, ep_size=2,
+            num_experts=4, top_k=1, replica_transport='shmem_signal_kernel_gradient_bands', replica_slots_per_rank=1)
+        resources = SimpleNamespace(rank_nodes=(0, 0), spec=SimpleNamespace(expert_weight_layout='EIO',
+            swiglu_limit=None, dispatch_split=1, combine_split=1, num_cube_cores=24))
+        signatures = {}
+        for contract in ('nonreentrant', 'reentrant'):
+            with self.subTest(contract=contract):
+                phases = []
+                hidden, probabilities = torch.tensor([.5, 1.], requires_grad=True), torch.ones(2, requires_grad=True)
+                torch.manual_seed(7)
+                baseline = (hidden * probabilities * torch.rand_like(hidden)).sin()
+                expected = torch.autograd.grad(baseline.sum(), (hidden, probabilities))
+
+                def operation(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+                    state = get_recompute_state()
+                    mode = mega._checkpoint_contract()
+                    with torch.no_grad():
+                        signature = mega._critical_execution_signature(module, resources, execution_tokens=128)
+                    phases.append((state.is_recomputing, torch.is_grad_enabled(), mode,
+                                   state.invocation_id, signature))
+                    return (values * weights * torch.rand_like(values)).sin()
+
+                torch.manual_seed(7)
+                with patch.object(mega, '_critical_native_fingerprint', return_value='a' * 64):
+                    result = _checkpoint_operation(operation, hidden, probabilities, contract=contract)
+                    result.sum().backward()
+                self.assertEqual([(row[0], row[1], row[2]) for row in phases],
+                    [(False, contract == 'nonreentrant', contract), (True, True, contract)])
+                self.assertIs(phases[0][3], phases[1][3])
+                self.assertEqual(phases[0][4], phases[1][4])
+                self.assertTrue(torch.equal(result, baseline))
+                self.assertTrue(torch.equal(hidden.grad, expected[0]))
+                self.assertTrue(torch.equal(probabilities.grad, expected[1]))
+                self.assertIsNone(get_recompute_state())
+                signatures[contract] = phases[0][4]
+        self.assertNotEqual(signatures['nonreentrant'], signatures['reentrant'])
 
     def test_nonnegative_fit_recovers_identifiable_rank_max_services(self) -> None:
         """A known nonnegative max-linear service is recovered without a physical-service claim."""

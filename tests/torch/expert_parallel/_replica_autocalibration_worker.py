@@ -25,15 +25,16 @@ import os
 from pathlib import Path
 import socket
 import time
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from hyper_parallel.core.activation_memory import checkpoint
-from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
+from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts, get_recompute_state
 from hyper_parallel.core.expert_parallel.hot_replica import policy, routing
 from hyper_parallel.core.expert_parallel.hot_replica.autocalibration import calibration_ids, load_manifest
 from hyper_parallel.core.expert_parallel.hot_replica.calibration_catalog import runtime_contract
@@ -43,6 +44,21 @@ from hyper_parallel.core.expert_parallel.hot_replica.planner import _home_layout
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega
 from hyper_parallel.core.multicore.modules.mega_moe.inactive_tasks import UNMAPPED_GUEST_SUFFIX_SCHEDULE
+
+
+def _checkpoint_operation(operation: Callable, *arguments: torch.Tensor, contract: str) -> torch.Tensor:
+    """Match the model's checkpoint F/R grad modes while sharing Hyper invocation state."""
+    if contract == 'nonreentrant':
+        return checkpoint(operation, *arguments, early_stop=False)
+    if contract != 'reentrant':
+        raise ValueError(f'Unsupported checkpoint contract: {contract}')
+    forward, replay = create_recompute_contexts()
+
+    def wrapped(*values: torch.Tensor) -> torch.Tensor:
+        with replay if torch.is_grad_enabled() else forward:
+            return operation(*values)
+
+    return torch_checkpoint(wrapped, *arguments, use_reentrant=True, preserve_rng_state=True)
 
 
 def _profiles(directory: Path | None) -> dict:
@@ -134,7 +150,8 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
                     dist.barrier(group=group)
                     torch.npu.synchronize()
                     started = time.perf_counter()
-                    result = checkpoint(operation, values, probabilities, early_stop=False)
+                    result = _checkpoint_operation(operation, values, probabilities,
+                                                   contract=manifest['checkpoint_contract'])
                     backward_first = torch.npu.Event(enable_timing=True)
                     backward_last = torch.npu.Event(enable_timing=True)
                     backward_first.record()

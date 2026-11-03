@@ -45,8 +45,11 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ValueError('The first automatic calibration contract requires real checkpoint replay')
     defaults = {'dispatch_modes': ['push', 'pull'], 'replica_caps': [1, 2, 6], 'dtype': 'bfloat16',
                 'gradient_dtype': 'float32', 'expert_weight_layout': 'EIO', 'swiglu_limit': None,
-                'residency_mode': 'force_normal_miss', 'frames': 12, 'samples': 3, 'warmup': 1}
+                'residency_mode': 'force_normal_miss', 'checkpoint_contract': 'nonreentrant',
+                'frames': 12, 'samples': 3, 'warmup': 1}
     result = defaults | value
+    if result['checkpoint_contract'] not in ('reentrant', 'nonreentrant'):
+        raise ValueError('checkpoint_contract must be reentrant or nonreentrant')
     if (result['dtype'], result['gradient_dtype'], result['expert_weight_layout'], result['residency_mode']) != (
             'bfloat16', 'float32', 'EIO', 'force_normal_miss'):
         raise ValueError('Automatic calibration requires BF16/EIO, FP32 partials and force_normal_miss')
