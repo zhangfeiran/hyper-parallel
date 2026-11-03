@@ -19,6 +19,8 @@ Combines:
 - TaskSplitValue / init_task_split_value  — TP/EP/seq topology + per-rank counters
 - ctypes.Structure mirrors of runtime_head.hpp — passed as binary blobs to C++ kernels
 """
+from __future__ import annotations
+
 import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
@@ -285,6 +287,8 @@ class TaskSplitValue:
     all_expert_num: int = 32
     top_k:          int = 8
     dispatch_mode: str = "push"
+    expert_rows_bound: int | None = None
+    source_expert_rows_bound: int | None = None
 
     def __post_init__(self) -> None:
         """Reject topology values that would invalidate runtime arithmetic."""
@@ -308,6 +312,13 @@ class TaskSplitValue:
             raise ValueError(
                 f"all_expert_num ({self.all_expert_num}) must be divisible by ep ({self.ep})."
             )
+        bounds = (("expert_rows_bound", self.expert_rows_bound, self.seq_all // self.top_k),
+                  ("source_expert_rows_bound", self.source_expert_rows_bound,
+                   self.seq_all // (self.ep * self.top_k)))
+        for name, bound, maximum in bounds:
+            invalid = not isinstance(bound, int) or isinstance(bound, bool)
+            if bound is not None and (invalid or not 0 < bound <= maximum):
+                raise ValueError(f"{name} must be a positive integer no larger than {maximum}")
 
     # ── Derived properties ────────────────────────────────────────────────────
     @property
@@ -323,7 +334,7 @@ class TaskSplitValue:
     @property
     def per_expert_seq(self) -> int:
         """Sequence length per expert (across all EP ranks)."""
-        return self.seq_all // self.top_k
+        return self.expert_rows_bound if self.expert_rows_bound is not None else self.seq_all // self.top_k
 
     @property
     def per_rank_seq(self) -> int:
@@ -333,7 +344,8 @@ class TaskSplitValue:
     @property
     def per_expert_seq_to_other(self) -> int:
         """Sequence length per expert when sending to other ranks."""
-        return self.seq_all // (self.ep * self.top_k)
+        return (self.source_expert_rows_bound if self.source_expert_rows_bound is not None
+                else self.seq_all // (self.ep * self.top_k))
 
     @property
     def all_event_num(self) -> int:

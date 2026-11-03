@@ -92,44 +92,7 @@ class KernelWorkerBase {
       AscendC::Trap();
     }
     const uint64_t base_bytes = getAtomicAddValuesOffset(runtimeConfigPtr) + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
-    if (runtime_bytes != base_bytes) {
-      if (runtime_bytes != base_bytes + 48 && runtime_bytes != base_bytes + 72 &&
-          runtime_bytes != base_bytes + 80) {
-        AscendC::Trap();
-      }
-      __gm__ uint64_t *extension = reinterpret_cast<__gm__ uint64_t *>(runtimeConfigPtr + base_bytes);
-      const bool kernel_gradients = runtime_bytes == base_bytes + 80;
-      const bool projection_ready = runtime_bytes != base_bytes + 48;
-      const uint64_t magic = kernel_gradients ? 0x0000000553505754ULL :
-                             projection_ready ? 0x0000000453505754ULL : 0x0000000253505754ULL;
-      if (extension[0] != magic || extension[1] == 0 || extension[1] >= local_experts) {
-        AscendC::Trap();
-      }
-      home_experts_ = extension[1];
-      for (uint32_t index = 0; index < 4; ++index) {
-        replica_matrix_bases_[index] = reinterpret_cast<GM_ADDR>(extension[index + 2]);
-      }
-      if (projection_ready) {
-        const uint64_t epoch = extension[8];
-        if (epoch == 0 || epoch > INT32_MAX) {
-          AscendC::Trap();
-        }
-        for (uint32_t index = 0; index < 2; ++index) {
-          const uint64_t address = extension[6 + index];
-          if (address == 0 || address % DATA_CACHE_LINE_SIZE != 0) {
-            AscendC::Trap();
-          }
-          replica_ready_[index] = reinterpret_cast<GM_ADDR>(address);
-        }
-        replica_epoch_ = static_cast<int32_t>(epoch);
-      }
-      if (kernel_gradients) {
-        if (extension[9] == 0 || extension[9] % DATA_CACHE_LINE_SIZE != 0) {
-          AscendC::Trap();
-        }
-        replica_gradient_config_ = reinterpret_cast<GM_ADDR>(extension[9]);
-      }
-    }
+    InitReplicaMatrices(runtimeConfigPtr, runtime_bytes, base_bytes, local_experts);
     this->runtime_task_capacity = getRuntimeTaskCapacity(runtimeConfigPtr);
     this->runtime_event_capacity = getRuntimeEventCapacity(runtimeConfigPtr);
 #ifdef __DAV_C220_CUBE__
@@ -188,6 +151,53 @@ class KernelWorkerBase {
   }
 
  protected:
+  __aicore__ inline void InitProjectionReady(__gm__ uint64_t *extension) {
+    const uint64_t epoch = extension[8];
+    if (epoch == 0 || epoch > INT32_MAX) {
+      AscendC::Trap();
+    }
+    for (uint32_t index = 0; index < 2; ++index) {
+      const uint64_t address = extension[6 + index];
+      if (address == 0 || address % DATA_CACHE_LINE_SIZE != 0) {
+        AscendC::Trap();
+      }
+      replica_ready_[index] = reinterpret_cast<GM_ADDR>(address);
+    }
+    replica_epoch_ = static_cast<int32_t>(epoch);
+  }
+
+  __aicore__ inline void InitReplicaMatrices(__gm__ uint8_t *runtime_ptr, uint64_t runtime_bytes,
+                                            uint64_t base_bytes, uint64_t local_experts) {
+    if (runtime_bytes == base_bytes) {
+      return;
+    }
+    if (runtime_bytes != base_bytes + 48 && runtime_bytes != base_bytes + 72 &&
+        runtime_bytes != base_bytes + 80) {
+      AscendC::Trap();
+    }
+    __gm__ uint64_t *extension = reinterpret_cast<__gm__ uint64_t *>(runtime_ptr + base_bytes);
+    const bool kernel_gradients = runtime_bytes == base_bytes + 80;
+    const bool projection_ready = runtime_bytes != base_bytes + 48;
+    const uint64_t magic = kernel_gradients ? 0x0000000553505754ULL :
+                           projection_ready ? 0x0000000453505754ULL : 0x0000000253505754ULL;
+    if (extension[0] != magic || extension[1] == 0 || extension[1] > local_experts) {
+      AscendC::Trap();
+    }
+    home_experts_ = extension[1];
+    for (uint32_t index = 0; index < 4; ++index) {
+      replica_matrix_bases_[index] = reinterpret_cast<GM_ADDR>(extension[index + 2]);
+    }
+    if (projection_ready) {
+      InitProjectionReady(extension);
+    }
+    if (kernel_gradients) {
+      if (extension[9] == 0 || extension[9] % DATA_CACHE_LINE_SIZE != 0) {
+        AscendC::Trap();
+      }
+      replica_gradient_config_ = reinterpret_cast<GM_ADDR>(extension[9]);
+    }
+  }
+
   __aicore__ inline GM_ADDR GetExpertMatrix(
       uint32_t position, int64_t expert, int64_t matrix_bytes, uint32_t replica_index) const {
     if (expert >= home_experts_) {
@@ -437,13 +447,9 @@ class KernelWorkerBase {
           WaitBandProducer(owner_flags + signal_offset, epoch);
           WaitBandProducer(reinterpret_cast<GM_ADDR>(remote) + signal_offset, epoch);
         }
-        const uint64_t start = profiling ? trace.Now() : 0;
         AddReplicaGradient(reinterpret_cast<GM_ADDR>(config[5]) + (owner * elements + offset) * sizeof(float),
                            reinterpret_cast<GM_ADDR>(config[6]) + (slot * elements + offset) * sizeof(float),
                            count, peer, partition.worker, partition.workers);
-        if (profiling) {
-          trace.Record(profile_desc, band, peer, config[1] * (home_experts_ + config[2]) + owner, start, trace.Now());
-        }
       }
     }
 #endif

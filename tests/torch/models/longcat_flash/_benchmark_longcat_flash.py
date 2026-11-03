@@ -58,7 +58,8 @@ def _build(args: argparse.Namespace, rank: int) -> tuple:
         source = LongcatFlashExperts(config)
         experts = LongcatFlashMegaMoeExperts(module=source,
             backend="native" if args.backend == "native" else "megamoe",
-            swiglu_precision=args.swiglu_precision,
+            swiglu_precision=args.swiglu_precision, routing_backend=args.routing_backend,
+            optimize_tasks=not args.no_optimize_tasks,
             dispatch_mode="push" if args.backend == "native" else args.backend,
             context={"ep_size": args.ep, "ep": args.ep > 1})
     torch.npu.manual_seed(22000 + rank)
@@ -149,6 +150,8 @@ def _phase(args: argparse.Namespace, tensors: tuple, backward: bool) -> dict:
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("native", "push", "pull"), required=True)
+    parser.add_argument("--routing-backend", choices=("torch", "triton"), default="torch")
+    parser.add_argument("--no-optimize-tasks", action="store_true")
     parser.add_argument("--swiglu-precision", choices=("hf", "fused"), default="hf")
     parser.add_argument("--ep", type=int, default=4)
     parser.add_argument("--tokens", type=int, default=2048)
@@ -197,7 +200,8 @@ def main() -> None:
     experts.close_runtime()
     torch.npu.synchronize()
     report = {"rank": rank, "pid": os.getpid(), "backend": args.backend,
-              "swiglu_precision": args.swiglu_precision,
+              "swiglu_precision": args.swiglu_precision, "routing_backend": args.routing_backend,
+              "optimize_tasks": not args.no_optimize_tasks,
               "shape": {name: getattr(args, name) for name in
                         ("ep", "tokens", "hidden", "intermediate", "real", "zero", "top_k")},
               "scope": "expert component; learned routing precomputed; no optimizer or Router projection",

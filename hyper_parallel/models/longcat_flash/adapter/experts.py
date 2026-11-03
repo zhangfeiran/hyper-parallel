@@ -63,7 +63,8 @@ class LongcatFlashMegaMoeExperts(nn.Module):
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None, backend: str = "megamoe",
                  dispatch_mode: str = "push", replica_slots_per_rank: int = 0,
-                 expert_weight_layout: str = "EOI", swiglu_precision: str = "hf") -> None:
+                 expert_weight_layout: str = "EOI", swiglu_precision: str = "hf",
+                 optimize_tasks: bool = True, routing_backend: str = "torch") -> None:
         """Bind a complete HF expert module before EP and FSDP sharding.
 
         Args:
@@ -74,6 +75,8 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             dispatch_mode: MegaMoE push or pull transport.
             replica_slots_per_rank: Optional real-expert guest budget.
             expert_weight_layout: EOI avoids copies; EIO enables current hot replicas.
+            routing_backend: Ordered Torch routing, or explicit optional Ascend Triton fusion.
+            optimize_tasks: Use exact route bounds and one-expert MegaMoE task addressing.
             swiglu_precision: HF BF16 intermediate casts, or explicit native fused arithmetic.
         """
         super().__init__()
@@ -88,6 +91,12 @@ class LongcatFlashMegaMoeExperts(nn.Module):
         self.identity_expert = module.identity_expert
         if swiglu_precision not in ("hf", "fused"):
             raise ValueError("LongCat swiglu_precision must be hf or fused")
+        if not isinstance(optimize_tasks, bool):
+            raise ValueError("LongCat optimize_tasks must be boolean")
+        if routing_backend not in ("torch", "triton"):
+            raise ValueError("LongCat routing_backend must be torch or triton")
+        self.routing_backend = routing_backend
+        self.optimize_tasks = optimize_tasks
         self.swiglu_precision = swiglu_precision
         self.backend, self.dispatch_mode = backend, dispatch_mode
         self.replica_slots_per_rank = replica_slots_per_rank
@@ -178,6 +187,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
                 num_experts=self.num_experts, top_k=1, ep_group=ep_group, ep_size=ep_size,
                 create_parameters=False, expert_weight_layout=self.expert_weight_layout,
                 swiglu_hf_bf16=self.swiglu_precision == "hf",
+                route_task_bounds=self.optimize_tasks, single_expert_tasks=self.optimize_tasks,
                 dispatch_mode=self.dispatch_mode, replica_slots_per_rank=self.replica_slots_per_rank,
             )
         self._configured = True
@@ -203,6 +213,14 @@ class LongcatFlashMegaMoeExperts(nn.Module):
         return native_expert_forward(hidden, ids, expert_weights, self._ep_group,
                                      self.ep_size, self.num_experts, self.expert_weight_layout)
 
+    def _validate_checkpoint_packing(self) -> None:
+        """Check a newly loaded packing marker once before executing expert matrices."""
+        marker = self._buffers.get("_checkpoint_ep_size")
+        if marker is not None and marker._version != self._packing_checked_version:
+            if int(marker.item()) != self.ep_size:
+                raise ValueError("checkpoint EP packing differs; export to HF before changing EP size")
+            self._packing_checked_version = marker._version
+
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor) -> torch.Tensor:
         """Execute real experts and add weighted identities without changing routing.
@@ -213,14 +231,19 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             top_k_weights: Differentiable original slot weights.
         """
         original_shape = hidden_states.shape
-        marker = self._buffers.get("_checkpoint_ep_size")
-        if marker is not None and marker._version != self._packing_checked_version:
-            if int(marker.item()) != self.ep_size:
-                raise ValueError("checkpoint EP packing differs; export to HF before changing EP size")
-            self._packing_checked_version = marker._version
+        self._validate_checkpoint_packing()
         hidden = hidden_states.reshape(-1, self.hidden_size)
         if top_k_index.shape != top_k_weights.shape or top_k_index.shape[0] != hidden.shape[0]:
             raise ValueError("LongCat routes must match the input token rows")
+        if self.routing_backend == "triton":
+            if hidden.device.type != "npu":
+                raise ValueError("LongCat Triton routing requires NPU inputs")
+            # Triton is an optional dependency, required only for this explicit route backend.
+            from hyper_parallel.models.longcat_flash.adapter.fused_routing import (  # pylint: disable=C0415
+                fused_expert_forward,
+            )
+
+            return fused_expert_forward(self, hidden, top_k_index, top_k_weights).reshape(original_shape)
         route_error = ((top_k_index < 0) | (top_k_index >= self.total_experts)).any()
         order = top_k_index.argsort(dim=-1)
         top_k_index = top_k_index.gather(1, order)
@@ -263,7 +286,7 @@ class _NativeExecutor:
     """Expose the same packed-assignment contract for the native reference."""
 
     def __init__(self, module: LongcatFlashMegaMoeExperts) -> None:
-        """Bind the portable expert implementation.
+        """Bind the selected real-expert implementation.
 
         Args:
             module: The parameter-owning expert holder.

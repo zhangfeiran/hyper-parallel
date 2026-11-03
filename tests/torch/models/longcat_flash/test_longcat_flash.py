@@ -42,3 +42,15 @@ def test_longcat_empty_routes() -> None:
     """
     torchrun_case(file_name=str(Path(__file__).with_name("_test_longcat_empty_routes.py")),
                   case_name="test_longcat_empty_routes", num_proc=2)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard",
+          essential_mark="essential")
+def test_longcat_ordered_route_kernels() -> None:
+    """Feature: Ordered BF16 route fusion with the production LongCat hidden width.
+
+    Description: Compare learned, all-identity, all-real and empty routes using an isolated expert stand-in.
+    Expectation: Output, input gradients and routing gradients are identical to the Torch route implementation.
+    """
+    torchrun_case(file_name=str(Path(__file__).with_name("_test_longcat_ordered_route_kernels.py")),
+                  case_name="test_longcat_ordered_route_kernels", num_proc=1)

@@ -185,19 +185,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         if (value == 0) {
           return;
         }
-        for (uint32_t i = 0; i < expert_num_single_rank; i++) {
-          if (i > data_index) {
-            grouped_list_tensor_real.SetValue(i, value);
-          } else if (i == data_index) {
-            grouped_list_tensor_real.SetValue(i, value);
-          } else {
-            grouped_list_tensor_real.SetValue(i, 0);
-          }
-        }
         if (this->home_experts_ > 0) {
           grouped_list_tensor_real.SetValue(0, value);
+          cacheWriteThrough(grouped_list_real, sizeof(int64_t));
+        } else {
+          for (uint32_t i = 0; i < expert_num_single_rank; i++) {
+            grouped_list_tensor_real.SetValue(i, i >= data_index ? value : 0);
+          }
+          cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
         }
-        cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
 
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
         __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);

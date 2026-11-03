@@ -59,6 +59,10 @@ class MegaMoeSpec:
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
     swiglu_hf_bf16: bool = False
+    single_expert_tasks: bool = False
+    route_task_bounds: bool = False
+    schedule_expert_rows: int | None = None
+    schedule_source_expert_rows: int | None = None
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -243,6 +247,8 @@ def bind_mega_moe_spec(
         num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit,
         swiglu_hf_bf16=specification.get("swiglu_hf_bf16", False),
+        single_expert_tasks=specification.get("single_expert_tasks", False),
+        route_task_bounds=specification.get("route_task_bounds", False),
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),

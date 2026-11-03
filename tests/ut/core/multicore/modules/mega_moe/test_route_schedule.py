@@ -1,0 +1,186 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Exact route task bounds, source-capacity invariance and immutable cached plans."""
+
+from dataclasses import replace
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import torch
+
+from tests.common.mark_utils import arg_mark
+
+from hyper_parallel.core.multicore.modules.mega_moe import module as module_impl
+from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
+from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.route import RouteSchedule, _route_schedule
+from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
+
+
+def make_spec(ep: int = 4) -> MegaMoeSpec:
+    """Construct an automatic, non-replica CPU-only execution specification."""
+    return MegaMoeSpec(local_num_tokens=128, hidden_size=6144, intermediate_size=2048,
+                       num_experts=512, top_k=1, initial_capacity_factor=1.25,
+                       receive_capacity=128, ep_size=ep, ep_group=None, rank_id=0,
+                       num_cube_cores=24, auto_tokens=True, route_task_bounds=True)
+
+
+class TestRouteSchedule(unittest.TestCase):
+    """Route bounds cover every owner without changing source or workspace shape."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_global_bounds_and_local_empty_matrices(self) -> None:
+        """Feature: Exact route task bounds.
+
+        Description: Compare host/device counts across EP1, EP4 and EP16 owners.
+        Expectation: Global maxima agree and empty matrix IDs match each owner's range.
+        """
+        for ep in (1, 4, 16):
+            generator = torch.Generator().manual_seed(513 + ep)
+            counts = torch.randint(0, 65, (ep, 512), generator=generator, dtype=torch.int32)
+            counts[:, ::7] = 0
+            original = counts.clone()
+            host = counts.tolist()
+            for rank in range(ep):
+                spec = replace(make_spec(ep), rank_id=rank)
+                schedule = _route_schedule(counts, spec)
+                self.assertEqual(schedule, _route_schedule(None, spec, host))
+                self.assertEqual(schedule.expert_rows, max(sum(row[e] for row in host) for e in range(512)))
+                self.assertEqual(schedule.source_expert_rows, int(counts.max()))
+                start = rank * spec.local_experts
+                expected = tuple(e for e in range(spec.local_experts)
+                                 if not any(row[start + e] for row in host))
+                self.assertEqual(schedule.empty_experts, expected)
+            torch.testing.assert_close(counts, original, rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_empty_and_skewed_routes_retain_exact_coverage(self) -> None:
+        """Feature: Empty and skewed route scheduling.
+
+        Description: Move all traffic into one expert after an empty route.
+        Expectation: Every active row is covered and inactive owners retain zero-safe initialization.
+        """
+        counts = torch.zeros((4, 512), dtype=torch.int32)
+        empty = _route_schedule(counts, make_spec())
+        self.assertEqual(empty, RouteSchedule(0, 0, tuple(range(128))))
+        counts[:, 9] = torch.tensor([32, 128, 8192, 4096])
+        schedule = _route_schedule(counts, make_spec())
+        self.assertEqual(schedule.expert_rows, 12448)
+        self.assertEqual(schedule.source_expert_rows, 8192)
+        self.assertNotIn(9, schedule.empty_experts)
+        self.assertEqual(len(schedule.empty_experts), 127)
+        other = _route_schedule(counts, replace(make_spec(), rank_id=2))
+        self.assertEqual(other.empty_experts, tuple(range(128)))
+        self.assertEqual(other.expert_rows, schedule.expert_rows)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_static_and_replica_paths_keep_legacy_schedules(self) -> None:
+        """Feature: Optional task bounds.
+
+        Description: Disable bounds or select static and replica execution.
+        Expectation: Each path retains its existing schedule policy.
+        """
+        self.assertIsNone(_route_schedule(None, replace(make_spec(), route_task_bounds=False)))
+        self.assertIsNone(_route_schedule(None, replace(make_spec(), auto_tokens=False)))
+        self.assertIsNone(_route_schedule(None, replace(make_spec(), replica_slots_per_rank=1)))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_task_extents_do_not_resize_native_tensor_operands(self) -> None:
+        """Feature: Lossless schedule compaction.
+
+        Description: Compare graph operands before and after bounding task extents.
+        Expectation: Task counts decrease while native tensor shapes and argument positions remain identical.
+        """
+        baseline = TaskSplitValue(tp=1, ep=4, seq_size=16384, all_expert_num=512, top_k=1)
+        bounded = replace(baseline, expert_rows_bound=256, source_expert_rows_bound=128)
+        self.assertEqual(bounded.per_rank_seq, baseline.per_rank_seq)
+        self.assertEqual(bounded.seq_all, baseline.seq_all)
+        graphs = [build_forward_graph(values, hidden_size=6144, intermediate_size=2048,
+                                      expert_weight_layout="EOI") for values in (baseline, bounded)]
+        operands = [{tensor.name: (tensor.shape, tensor.param_position)
+                     for node in graph.topological_sort() for tensor in (*node.inputs, *node.outputs)}
+                    for graph in graphs]
+        self.assertEqual(operands[0], operands[1])
+        for name in ("dispatch", "swiglu", "combine"):
+            nodes = [next(node for node in graph.topological_sort() if node.name == name) for graph in graphs]
+            counts = [node.split_spec.task_num_fn(values) for node, values in zip(nodes, (baseline, bounded))]
+            self.assertGreater(counts[0], counts[1])
+            self.assertGreater(counts[1], 0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_plan_cache_reuses_bounds_and_retains_old_backward_plan(self) -> None:
+        """Feature: Immutable bounded task plans.
+
+        Description: Reuse equal bounds and generate varying skew until cache eviction.
+        Expectation: Bounds select covering plans and retained backward plans remain unchanged.
+        """
+        resources = object.__new__(module_impl._MegaMoeExecutionResources)
+        resources.spec, resources.home_spec = make_spec(), None
+        resources._token_capacity, resources._plans = 8192, {}
+        with patch.object(module_impl, "build_mega_moe_plan",
+                          side_effect=lambda spec, _device: SimpleNamespace(spec=spec)):
+            first = resources.plan_for_tokens(4096, "cpu", schedule=RouteSchedule(200, 64, ()))
+            same = resources.plan_for_tokens(4096, "cpu", schedule=RouteSchedule(255, 127, (2,)))
+            self.assertIs(first, same)
+            self.assertEqual(first.spec.schedule_expert_rows, 256)
+            self.assertEqual(first.spec.schedule_source_expert_rows, 128)
+            skewed = resources.plan_for_tokens(4096, "cpu", schedule=RouteSchedule(7000, 4096, ()))
+            self.assertIsNot(first, skewed)
+            self.assertEqual(skewed.spec.schedule_expert_rows, 8192)
+            self.assertEqual(first.spec.schedule_expert_rows, 256)
+            for tokens in (4096, 8192):
+                for expert_bits in range(7, (tokens * 4).bit_length()):
+                    for source_bits in range(7, min(tokens, 1 << expert_bits).bit_length()):
+                        resources.plan_for_tokens(tokens, "cpu",
+                                                  schedule=RouteSchedule(1 << expert_bits, 1 << source_bits, ()))
+            self.assertLessEqual(len(resources._plans), 64)
+            self.assertEqual(first.spec.schedule_expert_rows, 256)
+            for invalid in (RouteSchedule(16385, 1, ()), RouteSchedule(1, 4097, ())):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(RuntimeError, "per-expert task bounds"):
+                    resources.plan_for_tokens(4096, "cpu", schedule=invalid)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_invalid_task_bounds_fail_before_serialization(self) -> None:
+        """Feature: Task bound validation.
+
+        Description: Supply noninteger, zero and out-of-capacity extents.
+        Expectation: Invalid bounds fail before runtime serialization.
+        """
+        for name, maximum in (("expert_rows_bound", 512), ("source_expert_rows_bound", 128)):
+            for value in (True, 0, -1, 1.5, maximum + 1):
+                with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
+                    TaskSplitValue(tp=1, ep=4, seq_size=128, all_expert_num=512, top_k=1, **{name: value})
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_single_expert_tasks_require_boolean_and_distinct_resources(self) -> None:
+        """Feature: Optional one-expert GMM addressing.
+
+        Description: Validate option types and attempt resource sharing across different GMM modes.
+        Expectation: Invalid types and incompatible mutable tiling images cannot enter shared execution.
+        """
+        arguments = {"hidden_size": 16, "intermediate_size": 8, "num_experts": 4, "top_k": 2}
+        for invalid in (0, 1, None, "true"):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "single_expert_tasks"):
+                MegaMoeExperts(**arguments, single_expert_tasks=invalid)
+        ordinary = MegaMoeExperts(**arguments)
+        single = MegaMoeExperts(**arguments, single_expert_tasks=True)
+        self.addCleanup(ordinary.close)
+        self.addCleanup(single.close)
+        self.assertFalse(ordinary.single_expert_tasks)
+        self.assertTrue(single.single_expert_tasks)
+        with self.assertRaises(ValueError):
+            MegaMoeExperts.share_execution_resources([ordinary, single])

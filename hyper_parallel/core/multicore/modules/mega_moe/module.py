@@ -96,6 +96,8 @@ def _critical_execution_signature(module: Any, resources: Any) -> str:
                  'replica_transport', 'replica_slots_per_rank')}
     metadata.update(weight_layout=resources.spec.expert_weight_layout, swiglu_limit=resources.spec.swiglu_limit,
                     swiglu_hf_bf16=resources.spec.swiglu_hf_bf16,
+                    single_expert_tasks=resources.spec.single_expert_tasks,
+                    route_task_bounds=resources.spec.route_task_bounds,
                     dispatch_split=resources.spec.dispatch_split, combine_split=resources.spec.combine_split,
                     rank_nodes=resources.rank_nodes, checkpointed=get_recompute_state() is not None,
                     native_payload=_critical_native_fingerprint(), policy_abi='dynamic_tokens_v4',
@@ -219,7 +221,8 @@ class _MegaMoeExecutionResources:
                 self.home_spec = None
                 self.home_plan = None
                 if self.spec.replica_slots_per_rank:
-                    home_spec = replace(self.spec, num_experts=self.spec.logical_num_experts, replica_slots_per_rank=0)
+                    home_spec = replace(self.spec, num_experts=self.spec.logical_num_experts,
+                                        replica_slots_per_rank=0, route_task_bounds=False)
                     if (mega_moe_event_capacity(home_spec.num_experts, home_spec.ep_size)
                             == mega_moe_event_capacity(self.spec.num_experts, self.spec.ep_size)):
                         self.home_spec = home_spec
@@ -302,7 +305,8 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "swiglu_hf_bf16", "expert_weight_layout",
+                  "dispatch_split", "combine_split", "swiglu_limit", "swiglu_hf_bf16", "single_expert_tasks",
+                  "route_task_bounds", "expert_weight_layout",
                   "ep_size", "auto_tokens",
                   "_replica_cost_model_enabled", "_replica_critical_path_identity",
                   "replica_slots_per_rank", "replica_transport")
@@ -320,7 +324,8 @@ class _MegaMoeExecutionResources:
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
         self.rank_nodes = _node_ids([value[-1] for value in manifests])
 
-    def plan_for_tokens(self, tokens: int, device: Any, *, home_only: bool = False) -> Any:
+    def plan_for_tokens(self, tokens: int, device: Any, *, home_only: bool = False,
+                        schedule: Any = None) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
 
         Args:
@@ -338,13 +343,27 @@ class _MegaMoeExecutionResources:
                                f"requested={tokens}, capacity={self._token_capacity}")
         bucket = 1 << (max(128, tokens) - 1).bit_length()
         key = (bucket, True) if home_only else bucket
+        schedule_tokens = min(bucket, self._token_capacity)
+        bounds = {}
+        if schedule is not None:
+            if (schedule.expert_rows > schedule_tokens * spec.ep_size
+                    or schedule.source_expert_rows > schedule_tokens):
+                raise RuntimeError("MegaMoe route counts exceed supported per-expert task bounds")
+            expert = min(schedule_tokens * spec.ep_size,
+                         1 << (max(128, schedule.expert_rows) - 1).bit_length())
+            source = min(schedule_tokens,
+                         1 << (max(128, schedule.source_expert_rows) - 1).bit_length())
+            key = (bucket, home_only, expert, source)
+            bounds = {"schedule_expert_rows": expert, "schedule_source_expert_rows": source}
         plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
-            schedule_tokens = min(bucket, self._token_capacity)
-            plan = build_mega_moe_plan(replace(spec, schedule_tokens=schedule_tokens), device)
-            # INT32 route bounds allow at most 25 buckets starting at 128 rows.
-            # A growing partial bucket replaces its plan; backward keeps the old object.
+            plan = build_mega_moe_plan(replace(spec, schedule_tokens=schedule_tokens, **bounds), device)
             self._plans[key] = plan
+        if schedule is not None:
+            # Backward retains its immutable plan when a later route evicts the cache entry.
+            self._plans[key] = self._plans.pop(key)
+            while len(self._plans) > 64:
+                self._plans.pop(next(iter(self._plans)))
         return plan
 
     def close(self) -> None:
@@ -435,6 +454,8 @@ class MegaMoeExperts(MulticoreModule):
         top_k: int,
         swiglu_limit: float | None = None,
         swiglu_hf_bf16: bool = False,
+        single_expert_tasks: bool = False,
+        route_task_bounds: bool = False,
         ep_size: int | None = None,
         ep_group: Any | None = None,
         create_parameters: bool = True,
@@ -491,6 +512,10 @@ class MegaMoeExperts(MulticoreModule):
                 constraints and default as dispatch_split. Sharing requires equal splits.
             swiglu_hf_bf16: Round BF16 SiLU and multiply intermediates as separate
                 operators; defaults to False and cannot be combined with a clamp.
+            route_task_bounds: Bound automatic task plans by exact current route counts.
+                Defaults to False; allocation capacity and receive strides remain unchanged.
+            single_expert_tasks: Address each task's matrix as a one-expert GMM group.
+                Defaults to False; does not change expert ownership or arithmetic.
             swiglu_limit: Optional positive, finite float32-representable clamp
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
@@ -534,6 +559,8 @@ class MegaMoeExperts(MulticoreModule):
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
             "swiglu_hf_bf16": swiglu_hf_bf16,
+            "single_expert_tasks": single_expert_tasks,
+            "route_task_bounds": route_task_bounds,
             "ep_size": _resolve_ep_size(ep_size, ep_group),
             "ep_group": ep_group,
             "expert_weight_layout": expert_weight_layout,
@@ -579,6 +606,8 @@ class MegaMoeExperts(MulticoreModule):
         self.combine_split = specification["combine_split"]
         self.swiglu_limit = specification["swiglu_limit"]
         self.swiglu_hf_bf16 = specification.get("swiglu_hf_bf16", False)
+        self.single_expert_tasks = specification.get("single_expert_tasks", False)
+        self.route_task_bounds = specification.get("route_task_bounds", False)
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
         self._ep_group = specification["ep_group"]
@@ -623,6 +652,10 @@ class MegaMoeExperts(MulticoreModule):
         hf_bf16 = specification.get("swiglu_hf_bf16", False)
         if not isinstance(hf_bf16, bool) or (hf_bf16 and swiglu_limit is not None):
             raise ValueError("swiglu_hf_bf16 must be boolean and cannot be combined with swiglu_limit")
+        if not isinstance(specification.get("route_task_bounds", False), bool):
+            raise ValueError("route_task_bounds must be boolean")
+        if not isinstance(specification.get("single_expert_tasks", False), bool):
+            raise ValueError("single_expert_tasks must be boolean")
         return {
             **specification,
             "initial_capacity_factor": initial_capacity_factor,
@@ -937,10 +970,12 @@ class MegaMoeExperts(MulticoreModule):
                 hidden_flat, topk_ids, topk_weights, tokens_per_expert, resources, route_options)
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
-            execution_plan = resources.plan_for_tokens(
-                route.metadata.plan_tokens, hidden_flat.device,
-                home_only=(integrated and replica_route is None
-                           or replica_route is not None and replica_route.home_only))
+            plan_options = {"home_only": (integrated and replica_route is None
+                                           or replica_route is not None and replica_route.home_only)}
+            schedule = getattr(route.metadata, "schedule", None)
+            if schedule is not None:
+                plan_options["schedule"] = schedule
+            execution_plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device, **plan_options)
             resources.last_execution_plan = execution_plan
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,

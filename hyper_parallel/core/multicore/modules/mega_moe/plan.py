@@ -152,6 +152,8 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
         all_expert_num=spec.num_experts,
         top_k=spec.top_k,
         dispatch_mode=spec.dispatch_mode,
+        expert_rows_bound=spec.schedule_expert_rows,
+        source_expert_rows_bound=spec.schedule_source_expert_rows,
     )
 
 

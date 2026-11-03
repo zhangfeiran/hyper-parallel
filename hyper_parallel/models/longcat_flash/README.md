@@ -30,8 +30,40 @@ PyTorch reference on every device. Empty sources still participate when
 other ranks have real assignments. A globally identity-only call leaves expert gradients unused.
 
 Compaction materializes ordinary `[R, H]` scratch for the real assignments. It avoids identity traffic and
-identity FFN work, but does not implement indexed reads from an unexpanded source. It is a correctness
-and integration baseline; throughput and HBM improvements need paired measurements.
+identity FFN work, but does not implement indexed reads from an unexpanded source. Account for this
+scratch separately from source, receive and private SHMEM storage when measuring memory.
+
+`optimize_tasks: true` is the LongCat adapter default. It enables the optional generic MegaMoE
+`route_task_bounds` and `single_expert_tasks` capabilities. Exact global
+expert counts bound task scheduling; allocation capacities and communication strides remain unchanged.
+Nonempty experts overwrite their complete gradient matrices, so only empty experts need initialization.
+Each GMM task addresses its own expert matrix directly. Rebuild and activate the matching native payload
+after updating the source; the runtime must accept an all-home execution with no guest slots.
+Bounded plans apply to non-replica execution; enabled guest configurations retain the original route planner.
+Set `optimize_tasks: false` to retain the earlier task paths.
+
+The optional `routing_backend: triton` fuses local combine and ordered input-gradient accumulation.
+It retains every per-slot BF16 rounding boundary and the original FP32 probability reductions. Expert IDs
+are sorted through exactly representable FP32 values to avoid the Ascend int64 AICPU fallback. Launches
+are split when needed to respect the backend grid limit without cropping token rows. This backend requires
+Ascend BF16 states, FP32 router probabilities and an installed compatible `triton-ascend`; it fails explicitly
+when its requirements are missing. `routing_backend: torch` remains the portable default and does not
+import Triton. The same fused routing is available to the native GMM performance control.
+
+For an explicit fused-routing replacement, use these implementation options in the existing expert plan:
+
+```yaml
+implementation:
+  _target_: hyper_parallel.models.longcat_flash.adapter.experts.LongcatFlashMegaMoeExperts
+  backend: megamoe
+  optimize_tasks: true
+  routing_backend: triton
+  swiglu_precision: hf
+```
+
+Use `backend: native` with the same routing and activation options for the stronger native control.
+Numerical and performance acceptance remain separate, and a component speedup does not establish an
+end-to-end training speedup.
 
 ## Parameter and checkpoint layouts
 

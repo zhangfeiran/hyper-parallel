@@ -63,7 +63,13 @@ class _RecomputedReplicaWeights:
         self.cursor = 0
 
     def remember(self, generation: object | None, route: Any, *, recomputing: bool) -> _ReplicaWeightGeneration:
-        """Refresh only the matching invocation and globally identical placement."""
+        """Refresh only the matching invocation and globally identical placement.
+
+        Args:
+            generation: Current native weight generation.
+            route: Replica placement retained by the invocation.
+            recomputing: Whether this invocation replays a checkpointed forward.
+        """
         placement = (route.plan.config, route.plan.transfers)
         if not recomputing:
             holder = _ReplicaWeightGeneration(generation)
@@ -366,6 +372,8 @@ def _save_forward_state(
     """Save owned forward tensors and route state for backward."""
     ctx.plan = plan
     ctx.workspace = workspace
+    schedule = getattr(metadata, "schedule", None)
+    ctx.empty_experts = None if schedule is None else schedule.empty_experts
     ctx.save_for_backward(
         saved_dispatch,
         up_proj,
@@ -390,6 +398,11 @@ def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
     keep_graph = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)  # pylint: disable=protected-access
     if keep_graph is not None and not keep_graph():
         workspace.release_graph(ctx)
+
+
+def _single_expert_addresses(spec: Any, pool: Any) -> bool:
+    """Select per-matrix GMM addressing for replicas or the optional ordinary task path."""
+    return pool is None and (bool(spec.replica_slots_per_rank) or getattr(spec, "single_expert_tasks", False))
 
 
 def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool = False,
@@ -483,7 +496,8 @@ def _launch_forward_kernel(
             plan.swiglu_tiling,
             plan.down_proj_tiling,
             _split_runtime(plan.fwd_runtime_config, pool, weight1.shape[0],
-                           home_only=pool is None and bool(spec.replica_slots_per_rank), cache=execution.runtime_cache,
+                           home_only=_single_expert_addresses(spec, pool),
+                           cache=execution.runtime_cache,
                            task_prefix=execution.task_prefix, prefix_cache=execution.prefix_cache),
             execution.event_counters,
             spec.rank_id,
@@ -507,7 +521,7 @@ def _launch_forward_kernel(
             plan.swiglu_tiling,
             plan.down_proj_tiling,
             _split_runtime(diagnostic_call.runtime_config, pool, weight1.shape[0],
-                           home_only=pool is None and bool(spec.replica_slots_per_rank),
+                           home_only=_single_expert_addresses(spec, pool),
                            task_prefix=None if diagnostic_call.preserves_task_queues else execution.task_prefix),
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
@@ -566,7 +580,7 @@ def _launch_backward_kernel(
             execution.swiglu_workspace,
             _split_runtime(diagnostics.runtime_config, pool, saved.weight1.shape[0], backward=True,
                            gradient_return=gradient_return,
-                           home_only=pool is None and bool(spec.replica_slots_per_rank),
+                           home_only=_single_expert_addresses(spec, pool),
                            cache=execution.runtime_cache, task_prefix=execution.task_prefix,
                            prefix_cache=execution.prefix_cache),
             execution.event_counters,
@@ -595,7 +609,7 @@ def _launch_backward_kernel(
             execution.swiglu_workspace,
             _split_runtime(diagnostic_call.runtime_config, pool, saved.weight1.shape[0], backward=True,
                            gradient_return=gradient_return,
-                           home_only=pool is None and bool(spec.replica_slots_per_rank),
+                           home_only=_single_expert_addresses(spec, pool),
                            task_prefix=None if diagnostic_call.preserves_task_queues else execution.task_prefix),
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
@@ -622,6 +636,72 @@ def _native_source(tensor: torch.Tensor) -> torch.Tensor:
 
 
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
+def _prepare_forward_context(ctx: Any, routed_tokens: Any, route: RouteMetadata, plan: MegaMoePlan,
+                             workspace: MegaMoeWorkspace, permutation: tuple | None,
+                             topk_weights: torch.Tensor | None, workspace_claimed: bool) -> tuple:
+    """Bind retained route state and acquire the unchanged directional workspace lease."""
+    spec = plan.spec
+    if topk_weights is not None and (spec.dispatch_mode != "pull" or permutation is None):
+        raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
+    ctx.replica_route = route.replica_route
+    permutation_inputs = ()
+    if permutation is not None:
+        routed_tokens, _, unpermute_mapping = permutation
+        if ctx.needs_input_grad[0] or topk_weights is not None:
+            permutation_inputs = (unpermute_mapping,)
+    ctx.source_rows = routed_tokens.shape[0]
+    ctx.token_rows = ctx.source_rows // spec.top_k
+    ctx.has_permutation = permutation is not None
+    ctx.has_unpermute = topk_weights is not None
+    if workspace_claimed:
+        if not workspace.in_use:
+            raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
+    else:
+        if not spec.auto_tokens:
+            workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
+        workspace.claim()
+    has_replica_transfers = ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers)
+    return spec, routed_tokens, permutation_inputs, has_replica_transfers
+
+
+def _backward_empty_experts(ctx: Any, transfers: bool, home_experts: int) -> tuple[int, ...] | None:
+    """Resolve empty home matrices from the exact selected execution route."""
+    if not transfers:
+        return getattr(ctx, "empty_experts", None)
+    counts = ctx.replica_route.plan.destination_counts[ctx.replica_route.rank][:home_experts]
+    return tuple(expert for expert, rows in enumerate(counts) if not rows)
+
+
+def _backward_task_prefix(ctx: Any, execution: Any, plan: MegaMoePlan) -> Any:
+    """Select the same immutable active guest suffix retained by this invocation."""
+    if plan.spec.replica_slots_per_rank and plan.bwd_task_prefixes:
+        prefixes = (plan.bwd_task_prefixes if execution.diagnostics is plan.bwd_diagnostics
+                    else plan.bwd_no_replica_task_prefixes)
+        slots = None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical[
+            ctx.replica_route.rank]
+        return replace(execution, task_prefix=select_guest_task_prefix(prefixes, slots))
+    return execution
+
+
+def _finish_weight_gradients(ctx: Any, execution: Any, transfers: bool, pool: Any,
+                             provider: Any, early_return: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """Complete the existing replica gradient return and preserve ordinary owned matrices."""
+    if provider is not None and hasattr(provider, "last_kernel_gradient_matrices"):
+        provider.last_kernel_gradient_matrices = () if early_return is None else early_return.matrices
+    grad_weight1 = execution.intermediates.grad_weight1
+    grad_weight2 = execution.intermediates.grad_weight2
+    if transfers:
+        if early_return is not None and 0 in early_return.matrices:
+            pass  # The fused kernel owns both returns through their final ACKs.
+        elif early_return is not None:
+            grad_weight1, = return_gradients(
+                (grad_weight1,), ctx.replica_route, pool.gradients[:1], provider, consume=True)
+        else:
+            grad_weight1, grad_weight2 = return_gradients(
+                (grad_weight1, grad_weight2), ctx.replica_route, pool.gradients, provider, consume=True)
+    return grad_weight1, grad_weight2
+
+
 class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
     """Autograd bridge for the in-place forward/backward custom ops."""
 
@@ -657,29 +737,10 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         Returns:
             Owned expert-major output rows.
         """
-        spec = plan.spec
-        if topk_weights is not None and (spec.dispatch_mode != "pull" or permutation is None):
-            raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
+        spec, routed_tokens, permutation_inputs, has_replica_transfers = _prepare_forward_context(
+            ctx, routed_tokens, route, plan, workspace, permutation, topk_weights, workspace_claimed)
         metadata = route
-        ctx.replica_route = route.replica_route
         home_weights = (weight1, weight2)
-        permutation_inputs = ()
-        if permutation is not None:
-            routed_tokens, _, unpermute_mapping = permutation
-            if ctx.needs_input_grad[0] or topk_weights is not None:
-                permutation_inputs = (unpermute_mapping,)
-        ctx.source_rows = routed_tokens.shape[0]
-        ctx.token_rows = ctx.source_rows // spec.top_k
-        ctx.has_permutation = permutation is not None
-        ctx.has_unpermute = topk_weights is not None
-        if workspace_claimed:
-            if not workspace.in_use:
-                raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
-        else:
-            if not spec.auto_tokens:
-                workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
-            workspace.claim()
-        has_replica_transfers = ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers)
         execution = None
         leases = ExitStack()
         try:
@@ -720,7 +781,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 probs = topk_weights.float().contiguous()
                 ctx.topk_dtype = topk_weights.dtype
                 permutation_inputs += (output, probs)
-                output = (load_torch_npu().npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
+                output = (load_torch_npu().npu_moe_token_unpermute(output, permutation_inputs[0], probs=probs)
                           if ctx.source_rows else output[:0])
             _save_forward_state(
                 ctx,
@@ -785,16 +846,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 grad_output,
                 has_replica_transfers=has_replica_transfers,
                 overlap_w13=kernel_w13,
-                empty_experts=(tuple(expert for expert, rows in enumerate(
-                    ctx.replica_route.plan.destination_counts[ctx.replica_route.rank][:saved.weight1.shape[0]])
-                                     if not rows) if has_replica_transfers else None),
+                empty_experts=_backward_empty_experts(ctx, has_replica_transfers, saved.weight1.shape[0]),
             )
-            if plan.spec.replica_slots_per_rank and plan.bwd_task_prefixes:
-                prefixes = (plan.bwd_task_prefixes if execution.diagnostics is plan.bwd_diagnostics
-                            else plan.bwd_no_replica_task_prefixes)
-                slots = None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical[
-                    ctx.replica_route.rank]
-                execution = replace(execution, task_prefix=select_guest_task_prefix(prefixes, slots))
+            execution = _backward_task_prefix(ctx, execution, plan)
             early_return = prepare_kernel_gradient_return(
                 plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,
                 None if pool is None else pool.gradients[1],
@@ -802,19 +856,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 guest_w13=None if pool is None else pool.gradients[0]) if kernel_return else None
             _launch_backward_kernel(plan, saved, source, execution, pool,
                                     None if early_return is None else early_return.metadata)
-            if provider is not None and hasattr(provider, "last_kernel_gradient_matrices"):
-                provider.last_kernel_gradient_matrices = () if early_return is None else early_return.matrices
-            grad_weight1 = execution.intermediates.grad_weight1
-            grad_weight2 = execution.intermediates.grad_weight2
-            if has_replica_transfers:
-                if early_return is not None and 0 in early_return.matrices:
-                    pass  # The fused kernel owns both returns through their final ACKs.
-                elif early_return is not None:
-                    grad_weight1, = return_gradients(
-                        (grad_weight1,), ctx.replica_route, pool.gradients[:1], provider, consume=True)
-                else:
-                    grad_weight1, grad_weight2 = return_gradients(
-                        (grad_weight1, grad_weight2), ctx.replica_route, pool.gradients, provider, consume=True)
+            grad_weight1, grad_weight2 = _finish_weight_gradients(
+                ctx, execution, has_replica_transfers, pool, provider, early_return)
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
             execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
