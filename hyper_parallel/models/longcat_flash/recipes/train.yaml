@@ -38,15 +38,6 @@ fsdp_config:
     reduce_dtype: float32
     cast_forward_inputs: false
 plan_overrides:
-- match:
-  - model.layers.*.input_layernorm.[01]
-  - model.layers.*.post_attention_layernorm.[01]
-  - model.norm
-  replace:
-    kind: module
-    source_type: transformers.models.longcat_flash.modeling_longcat_flash.LongcatFlashRMSNorm
-    implementation:
-      _target_: hyper_parallel.components.modules.rms_norm.RMSNorm
 - match: model.layers.*.self_attn.[01]
   replace:
     kind: module
