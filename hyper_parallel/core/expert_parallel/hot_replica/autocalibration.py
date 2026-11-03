@@ -338,7 +338,9 @@ def fit_directory(manifest: dict[str, Any], source: Path, output: Path, *, verif
             catalog.append({'file': filename, 'sha256': hashlib.sha256(raw).hexdigest()})
     accepted = all(row['status'] == ('passed' if verify else 'candidate') for row in results)
     report = {'status': ('validated' if verify else 'candidate') if accepted else 'failed', 'profiles': results,
-              'runtime_contract': contract, 'script_only': True}
+              'runtime_contract': contract, 'script_only': True, 'collection_complete': True,
+              'calibration_status': ('validated' if verify else 'candidate') if accepted else 'rejected',
+              'catalog_published': bool(accepted and verify)}
     (output / 'fit-report.json').write_text(json.dumps(report, indent=2) + '\n')
     if accepted and verify:
         artifact = {'schema_version': 1, 'status': 'validated', 'runtime_contract': contract, 'profiles': catalog}
@@ -366,7 +368,7 @@ def main() -> None:
         raise SystemExit(1) from error
     print(json.dumps(report, indent=2))
     if report['status'] == 'failed':
-        raise SystemExit('Calibration gates failed; heuristic fallback remains available')
+        raise SystemExit(20)
 
 
 if __name__ == '__main__':

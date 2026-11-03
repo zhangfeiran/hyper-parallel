@@ -32,7 +32,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from hyper_parallel.core.expert_parallel.hot_replica import policy
+from hyper_parallel.core.expert_parallel.hot_replica import policy, autocalibration
 from hyper_parallel.core.expert_parallel.hot_replica.autocalibration import (
     calibration_ids, fit_directory, fit_nonnegative_services, load_manifest, plan_features,
 )
@@ -229,8 +229,22 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
                 fit_directory(manifest, root / 'collect', root / 'models')
             report = fit_directory(manifest, root / 'verify', root / 'models', verify=True)
             self.assertEqual(report['status'], 'failed')
+            self.assertTrue(report['collection_complete'])
+            self.assertEqual(report['calibration_status'], 'rejected')
+            self.assertFalse(report['catalog_published'])
             self.assertTrue(report['profiles'][0]['harmful_false_admissions'])
             self.assertFalse((root / 'models/catalog.json').exists())
+
+    def test_cli_distinguishes_quality_rejection_from_runtime_failure(self) -> None:
+        """A completed capture rejected by quality gates has a dedicated launcher outcome."""
+        with (patch.object(sys, 'argv', ['autocalibration', '--manifest', '/unused/model.json',
+                '--input', '/unused/collect', '--output', '/unused/models']),
+              patch.object(autocalibration, 'load_manifest', return_value={}),
+              patch.object(autocalibration, 'fit_directory', return_value={'status': 'failed'}),
+              patch('builtins.print')):
+            with self.assertRaises(SystemExit) as error:
+                autocalibration.main()
+            self.assertEqual(error.exception.code, 20)
 
     def test_catalog_checksum_environment_and_exact_signature_gates(self) -> None:
         """An external artifact cannot silently load for another execution or edited source."""
