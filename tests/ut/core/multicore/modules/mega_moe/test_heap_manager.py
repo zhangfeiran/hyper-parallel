@@ -186,9 +186,9 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         )
         manager._runtime_attached = True
         bound_specs = (
-            SimpleNamespace(dispatch_mode="push", routed_slots=2, hidden_size=4, ep_size=1, num_experts=2),
-            SimpleNamespace(dispatch_mode="push", routed_slots=2, hidden_size=4, ep_size=1, num_experts=2),
-            SimpleNamespace(dispatch_mode="pull", routed_slots=3, hidden_size=4, ep_size=1, num_experts=2),
+            SimpleNamespace(dispatch_mode="push", routed_slots=2, top_k=1, hidden_size=4, ep_size=1, num_experts=2),
+            SimpleNamespace(dispatch_mode="push", routed_slots=2, top_k=1, hidden_size=4, ep_size=1, num_experts=2),
+            SimpleNamespace(dispatch_mode="pull", routed_slots=3, top_k=1, hidden_size=4, ep_size=1, num_experts=2),
         )
         workspaces = [MegaMoeWorkspace(shared=True), MegaMoeWorkspace(shared=False), MegaMoeWorkspace(shared=False)]
         materialized_indices = (0, 2)

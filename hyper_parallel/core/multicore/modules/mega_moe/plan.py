@@ -200,6 +200,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
         shared_intermediate_size=spec.shared_intermediate_size if spec.backward_shared_expert else 0,
+        indexed_backward=spec.backward_ingress_mode == "indexed",
     )
     backward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(backward_graph)
@@ -210,6 +211,16 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         spec.num_cube_cores,
         shared_placement=spec.shared_placement,
     )
+    if spec.backward_ingress_mode == "indexed":
+        if spec.num_cube_cores != 32 or spec.dispatch_mode != "pull" or spec.forward_ingress_mode != "indexed":
+            raise ValueError("Indexed backward requires the static Ascend 950 indexed pull plan")
+        for task in backward_data.all_tasks[:backward_data.task_num]:
+            if task.task_type == TaskType.TASK_SHMEM_GET_MEM:
+                task.extra_value_0, task.extra_value_1 = 25, 8
+                task.inputs[1].dim[3] = spec.top_k
+            elif task.task_type == TaskType.TASK_GROUPED_MATMUL and task.inputs[0].tensor_type != 2:
+                task.extra_value_1 = 3
+        validate_runtime_config(backward_data, task_values, spec.num_cube_cores)
     if spec.shared_intermediate_size:
         clamp = struct.unpack("<I", struct.pack("<f", spec.swiglu_limit or 0.0))[0]
         for config in (forward_data, backward_data):

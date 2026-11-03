@@ -126,7 +126,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
 
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Retain expanded event storage when allocating through the SHMEM API."""
-        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
+        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, top_k=2, hidden_size=16,
                                ep_size=64, num_experts=1024, dispatch_mode="push")
         workspace = MegaMoeWorkspace(shared=True)
         with (

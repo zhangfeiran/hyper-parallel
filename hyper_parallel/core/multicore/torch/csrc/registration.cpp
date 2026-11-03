@@ -12,6 +12,7 @@
 #include <torch/library.h>
 
 TORCH_LIBRARY(hyper_parallel, m) {
+  m.def("mega_moe_indexed_backward_version() -> int", []() -> int64_t { return 1; });
   m.def("mega_moe_shared_version() -> int", []() -> int64_t { return 4; });
   m.def("moe_token_permute_out(Tensor tokens, Tensor indices, Tensor(a!) output, Tensor(b!) mapping) "
         "-> (Tensor(a!), Tensor(b!))");

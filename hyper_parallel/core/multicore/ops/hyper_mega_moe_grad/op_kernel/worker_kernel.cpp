@@ -26,6 +26,9 @@
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
 #include "runtime/bf16_clamp.h"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+#include "runtime/indexed_backward.h"
+#endif
 
 using namespace AscendC;
 
@@ -87,7 +90,20 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteShmemPutMem(task_desc);
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        if (task_desc.extra_value_1 == 8) {
+          BackwardIndexed::ExecuteGet<DTYPE_DISPATCH_TARGET>(task_desc, input_list, TILING_IDX);
+          break;
+        }
+#endif
         ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
+        break;
+      case TaskType::TASK_MOE_ROUTE_GRAD:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+#ifndef __DAV_CUBE__
+        BackwardIndexed::ProbabilityGradient<DTYPE_DISPATCH_TARGET>(input_list, task_desc).Run();
+#endif
+#endif
         break;
       case TaskType::TASK_SWI_GLU_GRAD:
         ExecuteSwiGluGrad(task_desc);

@@ -93,6 +93,18 @@ def _load_native() -> None:
         ) from error
 
 
+@lru_cache(maxsize=1)
+def require_indexed_backward_support() -> None:
+    """Reject an older native bundle before submitting indexed backward tasks."""
+    _load_native()
+    try:
+        version = torch.ops.hyper_parallel.mega_moe_indexed_backward_version()
+    except (AttributeError, RuntimeError) as error:
+        raise RuntimeError("Indexed backward requires its matching native bundle; rebuild multicore") from error
+    if version != 1:
+        raise RuntimeError(f"Indexed backward native version must be 1, got {version}")
+
+
 # ---------------------------------------------------------------------------
 
 

@@ -169,7 +169,8 @@ class _MegaMoeExecutionResources:
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens,
-            self.spec.forward_ingress_mode, self.spec.shared_intermediate_size, self.spec.shared_placement,
+            self.spec.forward_ingress_mode, self.spec.backward_ingress_mode,
+            self.spec.shared_intermediate_size, self.spec.shared_placement,
             self.spec.forward_shared_expert, self.spec.backward_shared_expert,
             self.workspace.udma_qp_count,
         )
@@ -185,6 +186,7 @@ class _MegaMoeExecutionResources:
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
                   "dispatch_split", "combine_split", "swiglu_limit", "ep_size", "forward_ingress_mode",
+                  "backward_ingress_mode",
                   "shared_intermediate_size", "shared_placement", "forward_shared_expert", "backward_shared_expert")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v1", "bfloat16",
@@ -256,6 +258,7 @@ class MegaMoeExperts(MulticoreModule):
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
         forward_ingress_mode: str = "legacy",
+        backward_ingress_mode: str = "legacy",
         shared_intermediate_size: int = 0,
         shared_placement: str = "idle",
         forward_shared_expert: bool = True,
@@ -284,6 +287,9 @@ class MegaMoeExperts(MulticoreModule):
                 Peer tile publishes input-tile credits to the unchanged Blaze F2 arithmetic.
                 Peer dedup uses a dispatch prepass followed by the original compute graph.
                 It preserves the legacy backward source capacity and receive layout.
+            backward_ingress_mode: Experimental "indexed" backward publishes original dY rows and
+                computes route-weight gradients in the backward graph. Requires indexed forward,
+                static pull on Ascend 950, and hidden size divisible by 32 and at most 8192.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
                 Must be a positive multiple of 128 that divides local_num_tokens.
             combine_split: Combine tile rows in forward and backward, with the same
@@ -313,6 +319,15 @@ class MegaMoeExperts(MulticoreModule):
         if shared_intermediate_size and max_local_num_tokens is not None:
             raise ValueError("Shared expert fusion requires static token rows")
         reserved_tokens = _resolve_token_capacity(local_num_tokens, max_local_num_tokens, hidden_size, top_k)
+        if backward_ingress_mode not in ("legacy", "indexed"):
+            raise ValueError("backward_ingress_mode must be legacy or indexed")
+        if backward_ingress_mode == "indexed":
+            if forward_ingress_mode != "indexed" or dispatch_mode != "pull" or max_local_num_tokens is not None:
+                raise ValueError("Indexed backward ingress requires indexed forward and static pull dispatch")
+            if hidden_size > 8192 or hidden_size % 32:
+                raise ValueError("Indexed backward ingress requires hidden_size divisible by 32 and at most 8192")
+            if top_k > 32:
+                raise ValueError("Indexed backward ingress currently supports top_k at most 32")
         if forward_ingress_mode not in ("legacy", "indexed", "peer_dedup", "peer_overlap", "peer_token", "peer_tile"):
             raise ValueError("forward_ingress_mode must be legacy, indexed, peer_dedup, "
                              "peer_overlap, peer_token or peer_tile")
@@ -340,6 +355,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
             "forward_ingress_mode": forward_ingress_mode,
+            "backward_ingress_mode": backward_ingress_mode,
             "shared_intermediate_size": shared_intermediate_size,
             "shared_placement": shared_placement,
             "forward_shared_expert": forward_shared_expert,

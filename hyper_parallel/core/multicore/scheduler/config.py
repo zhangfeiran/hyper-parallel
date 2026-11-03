@@ -120,6 +120,7 @@ class TaskType(IntEnum):
     TASK_SHMEM_GET_MEM              = 141
     TASK_MOE_OWNER_GET              = 142
     TASK_MOE_TOKEN_GET              = 143
+    TASK_MOE_ROUTE_GRAD             = 144
 
 
 class EventType(IntEnum):

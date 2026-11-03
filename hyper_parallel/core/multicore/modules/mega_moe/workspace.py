@@ -36,6 +36,7 @@ from hyper_parallel.core.multicore.shmem import _lifecycle
 from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 
 from .spec import MegaMoeSpec, _resolve_receive_capacity, _route_metadata_rows
+from .indexed_backward import BACKWARD_METADATA_PREFIX_ROWS
 from .udma_order import SUBMISSION_ORDER, validate_transport
 
 # The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
@@ -56,10 +57,16 @@ def _workspace_allocation_specs(
     num_experts: int,
     dtype: torch.dtype,
     forward_ingress_mode: str = "legacy",
+    backward_ingress_mode: str = "legacy",
+    top_k: int = 1,
 ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
     """Return the single ordered physical Allocation description for a workspace."""
     data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
     data_rows = routed_slots if dispatch_mode == "pull" else receive_capacity
+    if backward_ingress_mode == "indexed":
+        if dispatch_mode != "pull" or forward_ingress_mode != "indexed" or top_k <= 0:
+            raise ValueError("Compact backward allocations require paired indexed pull ingress")
+        data_rows = routed_slots // top_k
     event_bytes = event_workspace_bytes(ep_size, num_experts)
     allocation_spec = _lifecycle._AllocationSpec  # pylint: disable=protected-access
     allocations = (
@@ -74,6 +81,9 @@ def _workspace_allocation_specs(
         metadata_rows = _route_metadata_rows(routed_slots, num_experts, ep_size, forward_ingress_mode)
         allocations += (("route_metadata", allocation_spec(
             (metadata_rows, 4), torch.int32, _WORKSPACE_ALIGNMENT)),)
+    if backward_ingress_mode == "indexed":
+        allocations += (("backward_route_metadata", allocation_spec(
+            (BACKWARD_METADATA_PREFIX_ROWS + routed_slots, 4), torch.int32, _WORKSPACE_ALIGNMENT)),)
     return allocations
 
 
@@ -101,6 +111,8 @@ def _spec_workspace_bytes(
         num_experts=specification["num_experts"],
         dtype=dtype,
         forward_ingress_mode=specification.get("forward_ingress_mode", "legacy"),
+        backward_ingress_mode=specification.get("backward_ingress_mode", "legacy"),
+        top_k=specification["top_k"],
     )
     return sum(
         spec.dtype.itemsize * math.prod(spec.shape)
@@ -123,6 +135,8 @@ class MegaMoeWorkspace:
     expert_buffer: Any | None = None
     routed_buffer: Any | None = None
     route_metadata: Any | None = None
+    backward_route_metadata: Any | None = None
+    backward_ingress_mode: str = "legacy"
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
     gmm_workspace: Any | None = None
@@ -158,6 +172,8 @@ class MegaMoeWorkspace:
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
             forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
+            backward_ingress_mode=getattr(spec, "backward_ingress_mode", "legacy"),
+            top_k=spec.top_k,
             routed_slots=spec.routed_slots,
             receive_capacity=receive_capacity,
             hidden_size=spec.hidden_size,
@@ -188,6 +204,8 @@ class MegaMoeWorkspace:
         expected = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
             forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
+            backward_ingress_mode=getattr(spec, "backward_ingress_mode", "legacy"),
+            top_k=spec.top_k,
             routed_slots=spec.routed_slots,
             receive_capacity=current_capacity,
             hidden_size=spec.hidden_size,
@@ -217,6 +235,8 @@ class MegaMoeWorkspace:
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
             forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
+            backward_ingress_mode=getattr(spec, "backward_ingress_mode", "legacy"),
+            top_k=spec.top_k,
             routed_slots=spec.routed_slots,
             receive_capacity=receive_capacity,
             hidden_size=spec.hidden_size,
@@ -229,6 +249,7 @@ class MegaMoeWorkspace:
         for tensor, (field_name, _) in zip(tensors, targets):
             setattr(self, field_name, tensor)
         self.dispatch_mode = spec.dispatch_mode
+        self.backward_ingress_mode = getattr(spec, "backward_ingress_mode", "legacy")
         self.dtype = dtype
         self.device = device
         self.expert_capacity = receive_capacity
@@ -248,6 +269,8 @@ class MegaMoeWorkspace:
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
             forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
+            backward_ingress_mode=getattr(spec, "backward_ingress_mode", "legacy"),
+            top_k=spec.top_k,
             routed_slots=spec.routed_slots,
             receive_capacity=receive_capacity,
             hidden_size=spec.hidden_size,
@@ -304,6 +327,7 @@ class MegaMoeWorkspace:
         if self.expert_buffer is not None or self.source_buffer is not None:
             compatible = (
                 self.dispatch_mode == spec.dispatch_mode
+                and self.backward_ingress_mode == getattr(spec, "backward_ingress_mode", "legacy")
                 and self.dtype == dtype
                 and self.device == device
                 and self.routed_slots == spec.routed_slots
@@ -316,6 +340,8 @@ class MegaMoeWorkspace:
         allocations = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
             forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
+            backward_ingress_mode=getattr(spec, "backward_ingress_mode", "legacy"),
+            top_k=spec.top_k,
             routed_slots=spec.routed_slots,
             receive_capacity=requested_capacity,
             hidden_size=spec.hidden_size,
@@ -324,6 +350,7 @@ class MegaMoeWorkspace:
             dtype=dtype,
         )
         self.dispatch_mode = spec.dispatch_mode
+        self.backward_ingress_mode = getattr(spec, "backward_ingress_mode", "legacy")
         self.dtype = dtype
         self.device = device
         self.expert_capacity = requested_capacity
@@ -414,7 +441,8 @@ class MegaMoeWorkspace:
         if self.closing:
             remaining = tuple(tensor is not None for tensor in (
                 self.source_buffer, self.expert_buffer, self.routed_buffer,
-                self.forward_event_counters, self.backward_event_counters, self.route_metadata))
+                self.forward_event_counters, self.backward_event_counters,
+                self.route_metadata, self.backward_route_metadata))
             if any(peer != remaining for peer in _automatic.exchange(remaining)):
                 raise RuntimeError("partial symmetric teardown differs across ranks; restart the process")
         for field_name in (
@@ -422,6 +450,7 @@ class MegaMoeWorkspace:
             "expert_buffer",
             "routed_buffer",
             "route_metadata",
+            "backward_route_metadata",
             "forward_event_counters",
             "backward_event_counters",
         ):

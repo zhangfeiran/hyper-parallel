@@ -62,6 +62,7 @@ class MegaMoeSpec:
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
     forward_ingress_mode: str = "legacy"
+    backward_ingress_mode: str = "legacy"
     shared_intermediate_size: int = 0
     shared_placement: str = "idle"
     forward_shared_expert: bool = True
@@ -200,6 +201,9 @@ def bind_mega_moe_spec(
     forward_ingress_mode = specification.get("forward_ingress_mode", "legacy")
     if forward_ingress_mode != "legacy" and num_cube_cores != 32:
         raise ValueError("Indexed forward ingress requires the Ascend 950 32-Cube BF16 kernel.")
+    backward_ingress_mode = specification.get("backward_ingress_mode", "legacy")
+    if backward_ingress_mode != "legacy" and num_cube_cores != 32:
+        raise ValueError("Indexed backward ingress requires the Ascend 950 32-Cube BF16 kernel.")
     initial_capacity_factor = specification["initial_capacity_factor"]
     swiglu_limit = specification["swiglu_limit"]
     receive_capacity = _resolve_receive_capacity(
@@ -226,6 +230,7 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         forward_ingress_mode=forward_ingress_mode,
+        backward_ingress_mode=backward_ingress_mode,
         shared_intermediate_size=specification.get("shared_intermediate_size", 0),
         shared_placement=specification.get("shared_placement", "idle"),
         forward_shared_expert=specification.get("forward_shared_expert", True),

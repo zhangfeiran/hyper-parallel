@@ -29,6 +29,7 @@ from .route import _peer_owner_flags, PreparedTopKRoute, RouteMetadata
 from .spec import MegaMoeSpec, _route_metadata_rows
 from .workspace import MegaMoeWorkspace
 from .shared import pointer_table, shared_forward_buffers, shared_backward_buffers
+from .indexed_backward import publish_backward_route
 
 
 @dataclass(frozen=True)
@@ -121,11 +122,15 @@ def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple
     if not ctx.has_unpermute:
         source.copy_(grad_output)
         return source, None
+    if getattr(ctx.plan.spec, "backward_ingress_mode", "legacy") == "indexed":
+        mapping, expert_output, probs, sorted_slots = permutation_inputs
+        return publish_backward_route(ctx.workspace, grad_output, mapping, expert_output, probs, sorted_slots,
+                                      needs_probability_grad=ctx.needs_input_grad[7])
     mapping, expert_output, probs = permutation_inputs
     grad_probs = torch.empty_like(probs)
     if ctx.source_rows:
         multicore_ops.mega_moe_unpermute_grad_out(expert_output, grad_output, mapping, probs, source, grad_probs)
-    return source, grad_probs.to(ctx.topk_dtype) if ctx.needs_input_grad[7] else None
+    return source, grad_probs if ctx.needs_input_grad[7] else None
 
 
 def _allocate_forward_intermediates(
@@ -222,7 +227,9 @@ def _prepare_backward_execution(
         dispatch=dispatch,
         grad_x=grad_x,
         event_counters=workspace.prepare_event_counters(forward=False),
-        gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
+        gmm_workspace=(_workspace_tensor(workspace.backward_route_metadata, "backward_route_metadata").view(torch.uint8)
+                       if getattr(plan.spec, "backward_ingress_mode", "legacy") == "indexed" else
+                       _workspace_tensor(workspace.gmm_workspace, "gmm_workspace")),
         swiglu_workspace=_workspace_tensor(
             workspace.swiglu_grad_workspace,
             "swiglu_grad_workspace",
@@ -405,6 +412,8 @@ def _launch_backward_kernel(
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
+    if getattr(spec, "backward_ingress_mode", "legacy") == "indexed":
+        multicore_ops.require_indexed_backward_support()
     gradients = execution.intermediates
     kernel_parameters = (
         execution.dispatch,
@@ -638,6 +647,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 probs = topk_weights.float().contiguous()
                 ctx.topk_dtype = topk_weights.dtype
                 permutation_inputs += (output, probs)
+                if getattr(spec, "backward_ingress_mode", "legacy") == "indexed":
+                    permutation_inputs += (permute_src_index,)
                 output = (torch_npu.npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
                           if ctx.source_rows else output[:0])
             _save_forward_state(
@@ -698,7 +709,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             if grad_output is None:
                 grad_output = saved.weight1.new_zeros(ctx.routed_output_shape)
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
-            permutation_inputs = permutation_inputs[:1]
+            # Indexed tasks read the output snapshot through an indirect pointer.
+            # Retain its ownership across scratch allocation and kernel submission.
             execution = _prepare_backward_execution(
                 workspace,
                 plan,
@@ -720,6 +732,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 source,
                 execution,
             )
+            permutation_inputs = permutation_inputs[:1]
+            if grad_topk_weights is not None:
+                grad_topk_weights = grad_topk_weights.to(ctx.topk_dtype)
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
             execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
