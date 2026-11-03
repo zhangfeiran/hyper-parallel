@@ -16,10 +16,17 @@
 
 from dataclasses import replace
 import os
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts
+from hyper_parallel.core.multicore.modules.mega_moe.plan import build_mega_moe_plan
+from hyper_parallel.core.multicore.modules.mega_moe import function as moe_function
+from hyper_parallel.core.multicore.diagnostics import api as diagnostic_api
+from hyper_parallel.core.multicore.diagnostics.common.call import DiagnosticCall
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.shared_schedule import bind_shared_diagnostic_graph
 from hyper_parallel.core.multicore.diagnostics.common.graph import validate_mega_kernel_diagnostic_contract
@@ -28,6 +35,35 @@ from hyper_parallel.core.multicore.scheduler.config import TaskType
 
 class TestA5SharedFusion(unittest.TestCase):
     """Keep routed scheduling and local shared ownership independently verifiable."""
+
+    def test_native_shared_backward_uses_the_routed_profile_binding(self) -> None:
+        """Run the real backward launch boundary with an active CPU-only diagnostic session."""
+        spec = MegaMoeSpec(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
+                           num_experts=32, top_k=8, initial_capacity_factor=None,
+                           receive_capacity=32768, ep_size=4, ep_group=None, rank_id=0,
+                           num_cube_cores=32, dispatch_mode="pull", forward_ingress_mode="indexed",
+                           shared_intermediate_size=2048)
+        plan = build_mega_moe_plan(spec, "cpu")
+        tensor = torch.zeros(1)
+        saved = SimpleNamespace(**{key: tensor for key in (
+            "dispatch_target_off", "dispatch_src_off", "dispatch_size", "activation", "weight2", "up_proj",
+            "weight1", "combine_target_off", "combine_src_off", "combine_size", "dispatch", "group_list",
+        )})
+        execution = moe_function._BackwardExecution(
+            dispatch=tensor, grad_x=tensor, event_counters=tensor,
+            gmm_workspace=tensor, swiglu_workspace=tensor,
+            intermediates=moe_function._BackwardIntermediates(*(tensor for _ in range(5))),
+        )
+        session = Mock()
+        session.is_capture_enabled.return_value = True
+        session.prepare_call.side_effect = lambda context: DiagnosticCall(context.ordinary_arguments())
+        with (
+            patch.object(diagnostic_api, "_get_active_session", return_value=session),
+            patch.object(moe_function.multicore_ops, "mega_moe_grad_with_diagnostic_buffer") as native,
+        ):
+            moe_function._launch_backward_kernel(plan, saved, tensor, execution)
+        session.prepare_call.assert_called_once()
+        native.assert_called_once()
 
     def test_shared_width_2048_keeps_current_routed_task_contracts(self) -> None:
         """Strip local shared tasks and recover every original routed descriptor's semantics."""

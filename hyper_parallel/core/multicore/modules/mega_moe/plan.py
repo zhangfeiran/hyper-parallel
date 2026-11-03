@@ -249,7 +249,7 @@ def _prepare_diagnostics(
             parameter_count=28 if spec.shared_intermediate_size else (17 if spec.forward_ingress_mode != "legacy" else 16),
             **options),
         prepare_mega_kernel_diagnostics(
-            backward_graph, backward_config, parameter_count=35 if spec.shared_intermediate_size else 20, **options),
+            backward_graph, backward_config, parameter_count=20, **options),
     )
 
 
