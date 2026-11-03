@@ -195,6 +195,113 @@ class TestQuotaAdmission(unittest.TestCase):
         self.assertTrue(first.home_only and second.home_only)
         self.assertEqual(first.dynamic_summary, second.dynamic_summary)
 
+    def test_recompute_reuses_rejected_quotas_while_owner_still_fits(self) -> None:
+        """A changed allocator allowance need not repeat the same rejected quota search."""
+        ids, gathered = self.gathered(self.counts())
+        for budget in (1, 2, 6):
+            with self.subTest(budget=budget):
+                with (patch.object(routing, 'dist') as distributed,
+                      patch.object(routing, '_uncalibrated_copies', wraps=routing._uncalibrated_copies) as search,
+                      patch.object(routing, 'build_expert_replica_plan', side_effect=AssertionError('Full planner'))):
+                    distributed.is_initialized.return_value = True
+                    distributed.get_world_size.return_value = 64
+                    distributed.get_rank.return_value = 0
+                    forward, replay = create_recompute_contexts()
+                    options = dict(compact_home=True, minimum_load_reduction=.4, dynamic_header=(0, 4096, 31),
+                                   _auto_capacity_factor=1.25, _gathered_counts=gathered)
+                    with forward:
+                        first = routing.prepare_replica_route(
+                            ids, ExpertReplicaConfig(384, 64, budget), **options,
+                            _capacity_budget=Mock(return_value=300000))
+                    with replay:
+                        second = routing.prepare_replica_route(
+                            ids, ExpertReplicaConfig(384, 64, budget), **options,
+                            _capacity_budget=Mock(return_value=80000))
+                self.assertEqual(search.call_count, 1)
+                self.assertTrue(first.home_only and second.home_only)
+                self.assertEqual(first.dynamic_summary, second.dynamic_summary)
+
+    def test_rejected_quota_cache_invalidates_changed_inputs(self) -> None:
+        """Changed expert totals or admission policy must be evaluated again."""
+        counts = self.counts()
+        for change in ('totals', 'admission', 'target'):
+            with self.subTest(change=change):
+                changed = list(counts)
+                if change == 'totals':
+                    changed[0], changed[1] = changed[0] + 1, changed[1] - 1
+                first_ids, first_counts = self.gathered(counts)
+                replay_ids, replay_counts = self.gathered(changed)
+                with (patch.object(routing, 'dist') as distributed,
+                      patch.object(routing, '_uncalibrated_copies', wraps=routing._uncalibrated_copies) as search):
+                    distributed.is_initialized.return_value = True
+                    distributed.get_world_size.return_value = 64
+                    distributed.get_rank.return_value = 0
+                    forward, replay = create_recompute_contexts()
+                    options = dict(compact_home=True, dynamic_header=(0, 4096, 31),
+                                   _capacity_budget=Mock(return_value=300000))
+                    with forward:
+                        first = routing.prepare_replica_route(
+                            first_ids, ExpertReplicaConfig(384, 64, 2), **options,
+                            minimum_load_reduction=.4, _auto_capacity_factor=1.25, _gathered_counts=first_counts)
+                    with replay:
+                        second = routing.prepare_replica_route(
+                            replay_ids, ExpertReplicaConfig(384, 64, 2), **options,
+                            minimum_load_reduction=.3 if change == 'admission' else .4,
+                            _auto_capacity_factor=1.0 if change == 'target' else 1.25,
+                            _gathered_counts=replay_counts)
+                self.assertEqual(search.call_count, 2)
+                self.assertTrue(first.home_only)
+                self.assertEqual(bool(second.plan.transfers), change != 'totals')
+
+    def test_rejected_quota_cache_does_not_override_required_capacity(self) -> None:
+        """A replay owner that no longer fits must reach the complete capacity planner."""
+        ids, gathered = self.gathered(self.counts())
+        with (patch.object(routing, 'dist') as distributed,
+              patch.object(routing, 'build_expert_replica_plan', wraps=routing.build_expert_replica_plan) as build):
+            distributed.is_initialized.return_value = True
+            distributed.get_world_size.return_value = 64
+            distributed.get_rank.return_value = 0
+            forward, replay = create_recompute_contexts()
+            options = dict(compact_home=True, minimum_load_reduction=.4, dynamic_header=(0, 4096, 31),
+                           _auto_capacity_factor=1.25, _gathered_counts=gathered)
+            with forward:
+                first = routing.prepare_replica_route(ids, ExpertReplicaConfig(384, 64, 2), **options,
+                                                       _capacity_budget=Mock(return_value=300000))
+            with replay:
+                second = routing.prepare_replica_route(ids, ExpertReplicaConfig(384, 64, 2), **options,
+                                                        _capacity_budget=Mock(return_value=60000))
+        self.assertTrue(first.home_only)
+        self.assertEqual(build.call_count, 1)
+        self.assertTrue(second.plan.transfers)
+        self.assertLessEqual(max(second.plan.destination_loads), 60000)
+
+    def test_rejected_quotas_preserve_mixed_checkpoint_call_order(self) -> None:
+        """A rejected call must consume exactly its own cache entry before a profitable call."""
+        home_ids, home_counts = self.gathered(self.counts())
+        counts = [4096] + [4096 * 7 // 383 + int(index < 4096 * 7 % 383) for index in range(383)]
+        guest_ids, guest_counts = self.gathered(counts)
+        with (patch.object(routing, 'dist') as distributed,
+              patch.object(routing, '_uncalibrated_copies', wraps=routing._uncalibrated_copies) as search,
+              patch.object(routing, 'build_expert_replica_plan', wraps=routing.build_expert_replica_plan) as build):
+            distributed.is_initialized.return_value = True
+            distributed.get_world_size.return_value = 64
+            distributed.get_rank.return_value = 0
+            forward, replay = create_recompute_contexts()
+            options = dict(compact_home=True, minimum_load_reduction=.4, dynamic_header=(0, 4096, 31),
+                           _auto_capacity_factor=1.25, _capacity_budget=Mock(return_value=300000))
+            config = ExpertReplicaConfig(384, 64, 2)
+            with forward:
+                home = routing.prepare_replica_route(home_ids, config, **options, _gathered_counts=home_counts)
+                guest = routing.prepare_replica_route(guest_ids, config, **options, _gathered_counts=guest_counts)
+            with replay:
+                home_replay = routing.prepare_replica_route(home_ids, config, **options, _gathered_counts=home_counts)
+                guest_replay = routing.prepare_replica_route(guest_ids, config, **options, _gathered_counts=guest_counts)
+        self.assertEqual(search.call_count, 2)
+        self.assertEqual(build.call_count, 1)
+        self.assertTrue(home.home_only and home_replay.home_only)
+        self.assertTrue(guest_replay.plan_reused)
+        self.assertIs(guest.plan, guest_replay.plan)
+
 
 if __name__ == '__main__':
     unittest.main()

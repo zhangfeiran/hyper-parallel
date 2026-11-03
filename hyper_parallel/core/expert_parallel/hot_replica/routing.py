@@ -106,8 +106,26 @@ class ReplicaRoute:
     _host_counts: tuple[tuple[int, ...], ...] | None = None
 
 
+@dataclass(frozen=True)
+class _RejectedReplicaQuotas:
+    """Retain source-independent rejection evidence without holding device tensors."""
+
+    config: ExpertReplicaConfig
+    totals: tuple[int, ...]
+    loads: tuple[int, ...]
+    target: int
+    admission: int
+    saved_rows: int
+
+    def matches(self, config: ExpertReplicaConfig, totals: list[int], loads: tuple[int, ...],
+                target: int, admission: int, saved_rows: int) -> bool:
+        """Require the same quota inputs and benefit policy after fresh count agreement."""
+        return (self.config == config and self.totals == tuple(totals) and self.loads == loads
+                and (self.target, self.admission, self.saved_rows) == (target, admission, saved_rows))
+
+
 class _RecomputedReplicaPlans:
-    """Retain immutable CPU plans and skipped-call markers for one invocation."""
+    """Retain immutable CPU plans and home-decision evidence for one invocation."""
 
     def __init__(self) -> None:
         """Initialize ordered call records without retaining any device tensors."""
@@ -128,7 +146,7 @@ class _RecomputedReplicaPlans:
         return plan if plan is not None and signature == expected and counts == plan.logical_counts else None
 
 
-def _record_home_decision() -> None:
+def _record_home_decision(decision: _RejectedReplicaQuotas | None = None) -> None:
     """Preserve replay ordering even when a call never enters the CPU planner."""
     state = get_recompute_state()
     if state is None:
@@ -138,7 +156,7 @@ def _record_home_decision() -> None:
         if cache.cursor < len(cache.entries):
             cache.cursor += 1
     else:
-        cache.entries.append((None, None))
+        cache.entries.append((decision, None))
 
 
 def _plan_replica_route(counts: Any, config: ExpertReplicaConfig, group: object, rank: int,
@@ -341,6 +359,7 @@ def _try_compact_home_route(
     # A larger allowance must not replace the original checkpoint graph with
     # a newly affordable home-only shortcut during recomputation.
     state = get_recompute_state()
+    cache = None
     if state is not None and state.is_recomputing:
         cache = state.get_resource(_RecomputedReplicaPlans, _RecomputedReplicaPlans)
         if cache.cursor < len(cache.entries) and cache.entries[cache.cursor][1] is not None:
@@ -405,6 +424,7 @@ def _try_compact_home_route(
     resident = min(upper, receive_capacity) if receive_capacity is not None else upper
     if peak > upper:
         return None
+    decision = None
     balanced = min(destination_loads) == peak
     if not balanced:
         if peak > resident:
@@ -420,18 +440,27 @@ def _try_compact_home_route(
                     totals = list(map(sum, zip(*gathered_counts.host_counts)))
                 else:
                     totals = logical.sum(0, dtype=torch.int64).cpu().tolist()
-                candidate = _uncalibrated_copies(
-                    totals, list(destination_loads), config, upper, resident, max(average, target_load or 0))
-                if candidate is not None and _optional_peak_is_useful(
-                        max(sum(row.values()) for row in candidate), destination_loads,
-                        resident, admission, minimum_saved_rows):
-                    return _UncalibratedCandidate(config, tuple(totals), candidate, upper, resident,
-                                                  max(average, target_load or 0))
+                target = max(average, target_load or 0)
+                previous = None
+                if cache is not None and cache.cursor < len(cache.entries):
+                    previous = cache.entries[cache.cursor][0]
+                # Allocator limits above the owner peak cannot change the
+                # target-driven quota search or its optional-benefit rejection.
+                if not (isinstance(previous, _RejectedReplicaQuotas) and previous.matches(
+                        config, totals, destination_loads, target, admission, minimum_saved_rows)):
+                    candidate = _uncalibrated_copies(totals, list(destination_loads), config, upper, resident, target)
+                    if candidate is not None and _optional_peak_is_useful(
+                            max(sum(row.values()) for row in candidate), destination_loads,
+                            resident, admission, minimum_saved_rows):
+                        return _UncalibratedCandidate(config, tuple(totals), candidate, upper, resident, target)
+                if state is not None and not state.is_recomputing:
+                    decision = _RejectedReplicaQuotas(config, tuple(totals), destination_loads,
+                                                      target, admission, minimum_saved_rows)
         elif not _compact_home_cost_dominates(totals, rows, config, cost_model):
             return None
     counts = logical.to(torch.int32).contiguous()
     plan = _HomeOnlyPlan(config, counts, destination_loads)
-    _record_home_decision()
+    _record_home_decision(decision)
     dynamic_summary = tuple(tuple(row[1:8]) for row in rows)
     return ReplicaRoute(plan, topk_ids, counts, rank, group, home_only=True,
                         dynamic_summary=dynamic_summary, plan_bypassed=True)
