@@ -28,7 +28,7 @@ from .plan import MegaMoePlan, record_plan_stream
 from .route import _peer_owner_flags, PreparedTopKRoute, RouteMetadata
 from .spec import MegaMoeSpec, _route_metadata_rows
 from .workspace import MegaMoeWorkspace
-from .shared import pointer_table, shared_forward_buffers, shared_backward_buffers
+from .shared import pointer_table, shared_forward_buffers
 
 
 @dataclass(frozen=True)
@@ -643,22 +643,31 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 weight1,
                 weight2,
                 metadata,
-                permutation_inputs + shared_saved,
+                permutation_inputs,
             )
-            return (output, shared_output) if ctx.has_shared else output
+            if ctx.has_shared:
+                ctx.mark_non_differentiable(shared_output, shared_up, shared_activation)
+                ctx.set_materialize_grads(False)
+                return output, shared_output, shared_up, shared_activation
+            return output
         finally:
             if not workspace_claimed:
                 workspace.release()
 
     @staticmethod
     # pylint: disable-next=arguments-differ
-    def backward(ctx: Any, grad_output: Any, grad_shared_output: Any = None) -> tuple[Any, ...]:
+    def backward(
+        ctx: Any, grad_output: Any, grad_shared_output: Any = None,
+        grad_shared_up: Any = None, grad_shared_activation: Any = None,
+    ) -> tuple[Any, ...]:
         """Launch the legacy backward op into zero-safe gradient buffers.
 
         Args:
             ctx: Autograd context populated by ``forward``.
             grad_output: Expert-major output gradient rows.
-            grad_shared_output: Token-major shared output gradient when fusion is enabled.
+            grad_shared_output: Unused non-differentiable shared forward output.
+            grad_shared_up: Unused non-differentiable shared preactivation.
+            grad_shared_activation: Unused non-differentiable shared activation.
 
         Returns:
             Gradients aligned with the differentiable forward inputs.
@@ -669,9 +678,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         saved_tensors = ctx.saved_tensors
         ctx.maybe_clear_saved_tensors()
         saved = _saved_backward_state(saved_tensors)
-        has_shared = getattr(ctx, "has_shared", False) is True
-        shared_saved = saved_tensors[-5:] if has_shared else ()
-        permutation_inputs = saved_tensors[12:-5] if has_shared else saved_tensors[12:]
+        permutation_inputs = saved_tensors[12:]
         del saved_tensors
         workspace.claim()
         try:
@@ -683,10 +690,6 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 saved,
                 grad_output,
             )
-            shared_tensors = ()
-            if has_shared:
-                shared_tensors, pointers = shared_backward_buffers(grad_shared_output, shared_saved, idle_vectors=True)
-                execution = replace(execution, shared_ptrs=pointers)
             _launch_backward_kernel(
                 plan,
                 saved,
@@ -701,12 +704,6 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None, None, None,
             ))
             grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
-            shared_dw1 = shared_dw2 = None
-            if has_shared:
-                if grad_input is not None:
-                    grad_input = grad_input + shared_tensors[8]
-                shared_dw1 = shared_tensors[10].t()
-                shared_dw2 = shared_tensors[2].t()
             _release_completed_graph(ctx, workspace)
             return (
                 grad_input,
@@ -718,11 +715,66 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None,
                 grad_topk_weights,
                 None,
-                shared_dw1,
-                shared_dw2,
+                None,
+                None,
             )
         finally:
             workspace.release()
+
+
+class _NativeSharedBackward(torch.autograd.Function):
+    """Keep native shared gradients independent of the routed kernel's completion."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, source: torch.Tensor, first: torch.Tensor, second: torch.Tensor,
+        up: torch.Tensor, activation: torch.Tensor, output: torch.Tensor, limit: float | None,
+    ) -> torch.Tensor:
+        """Attach native backward to the shared forward result and owned intermediates.
+
+        Args:
+            ctx: Autograd state retaining this invocation's tensors.
+            source: Original token rows before TopK expansion.
+            first: Current dense gate/up weight.
+            second: Current dense down-projection weight.
+            up: Owned gate/up result produced by the fused forward.
+            activation: Owned shared activation produced by the fused forward.
+            output: Owned shared output produced by the fused forward.
+            limit: Optional SwiGLU branch clamp, matching the native MLP.
+
+        Returns:
+            The shared output with an independent native backward node.
+        """
+        ctx.save_for_backward(source, first, second, up, activation)
+        ctx.limit = limit
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[Any, ...]:
+        """Use the same dense layouts and activation derivative as native shared MLP.
+
+        Args:
+            ctx: Invocation-specific saved tensors and gradient requirements.
+            gradient: Token-major shared output gradient.
+
+        Returns:
+            Input and weight gradients followed by non-differentiable state slots.
+        """
+        source, first, second, up, activation = ctx.saved_tensors
+        grad_activation = torch.mm(gradient, second)
+        activation_input = up
+        if ctx.limit is not None and ctx.limit > 0:
+            gate, branch = up.chunk(2, dim=-1)
+            activation_input = torch.cat((gate.clamp(max=ctx.limit), branch.clamp(-ctx.limit, ctx.limit)), dim=-1)
+        grad_up = torch.ops.npu.npu_swiglu_backward(grad_activation, activation_input, -1)
+        if ctx.limit is not None and ctx.limit > 0:
+            grad_gate, grad_branch = grad_up.chunk(2, dim=-1)
+            grad_up = torch.cat((torch.where(gate <= ctx.limit, grad_gate, 0),
+                                 torch.where((branch >= -ctx.limit) & (branch <= ctx.limit), grad_branch, 0)), dim=-1)
+        grad_source = torch.mm(grad_up, first) if ctx.needs_input_grad[0] else None
+        grad_first = torch.mm(grad_up.t(), source) if ctx.needs_input_grad[1] else None
+        grad_second = torch.mm(gradient.t(), activation) if ctx.needs_input_grad[2] else None
+        return grad_source, grad_first, grad_second, None, None, None, None
 
 
 def execute_mega_moe(
@@ -785,7 +837,7 @@ def execute_mega_moe_with_permutation(
         Owned expert-major rows, or token-major rows when topk_weights is provided,
         differentiable with respect to input tokens, expert weights and Router probabilities.
     """
-    return _MegaMoeFunction.apply(
+    result = _MegaMoeFunction.apply(
         hidden_states,
         weight1.contiguous(),
         weight2.contiguous(),
@@ -796,6 +848,14 @@ def execute_mega_moe_with_permutation(
          getattr(route, "peer_row_ordinals", None)),
         topk_weights,
         workspace_claimed,
-        shared_weight1,
-        shared_weight2,
+        shared_weight1.detach() if shared_weight1 is not None else None,
+        shared_weight2.detach() if shared_weight2 is not None else None,
     )
+    if shared_weight1 is None:
+        return result
+    routed_output, shared_output, shared_up, shared_activation = result
+    shared_output = _NativeSharedBackward.apply(
+        hidden_states, shared_weight1, shared_weight2, shared_up, shared_activation,
+        shared_output, plan.spec.swiglu_limit,
+    )
+    return routed_output, shared_output

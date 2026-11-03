@@ -22,12 +22,15 @@ import torch
 import torch.nn.functional as functional
 
 from hyper_parallel.core.multicore.modules.mega_moe import function as moe_function
-from hyper_parallel.core.multicore.modules.mega_moe import shared as shared_module
 
 
-def shared_math(source: torch.Tensor, first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+def shared_math(
+    source: torch.Tensor, first: torch.Tensor, second: torch.Tensor, limit: float | None = None,
+) -> torch.Tensor:
     """Compute an independent dense SwiGLU reference."""
     gate, up = functional.linear(source, first).chunk(2, dim=-1)
+    if limit is not None:
+        gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
     return functional.linear(functional.silu(gate) * up, second)
 
 
@@ -39,16 +42,16 @@ class TestSharedFunction(unittest.TestCase):
 
     def test_deferred_shared_outputs_and_all_parameter_gradients(self) -> None:
         """Release poisoning must not invalidate shared saved tensors or owned outputs."""
-        for input_grad in (False, True):
-            with self.subTest(input_grad=input_grad):
-                self._check_deferred(input_grad)
+        for input_grad, limit in ((False, None), (True, None), (True, 1.25)):
+            with self.subTest(input_grad=input_grad, limit=limit):
+                self._check_deferred(input_grad, limit)
 
-    def _check_deferred(self, input_grad: bool) -> None:
+    def _check_deferred(self, input_grad: bool, limit: float | None) -> None:
         """Emulate routed zeros and compare the integrated shared gradients to Torch."""
         torch.manual_seed(73)
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0, ep_size=2,
                                num_experts=4, top_k=2, dispatch_mode="push", shared_intermediate_size=2,
-                               forward_ingress_mode="legacy")
+                               forward_ingress_mode="legacy", swiglu_limit=limit)
         plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, ingress_diagnostics=None)
         workspace = Mock(expert_buffer=torch.zeros(8, 4), routed_buffer=torch.zeros(4, 4),
                          gmm_workspace=torch.zeros(512, dtype=torch.uint8), swiglu_grad_workspace=torch.zeros(1))
@@ -56,6 +59,9 @@ class TestSharedFunction(unittest.TestCase):
                                                  workspace.routed_buffer.fill_(float("nan")))
         w1 = torch.randn(4, 4, requires_grad=True)
         w2 = torch.randn(4, 2, requires_grad=True)
+        if limit is not None:
+            with torch.no_grad():
+                w1[:, 0].copy_(torch.tensor([limit, -limit, limit, -limit]))
         ref1, ref2 = w1.detach().clone().requires_grad_(), w2.detach().clone().requires_grad_()
         routed1, routed2 = torch.ones(2, 4, 4, requires_grad=True), torch.ones(2, 2, 4, requires_grad=True)
 
@@ -64,36 +70,36 @@ class TestSharedFunction(unittest.TestCase):
             source, first, second, up, activation, output, _scratch = execution.shared_ptrs
             up.copy_(functional.linear(source, first))
             gate, branch = up.chunk(2, dim=-1)
+            if limit is not None:
+                gate, branch = gate.clamp(max=limit), branch.clamp(-limit, limit)
             activation.copy_(functional.silu(gate) * branch)
             output.copy_(functional.linear(activation, second))
             execution.dispatch.zero_()
             execution.combine.zero_()
 
         def backward_kernel(_plan, _saved, _gradient, execution) -> None:
-            """Emulate device derivatives while leaving autograd binding to production code."""
-            dy, _, dw2, second, _, _, _, first, dx, source, dw1 = execution.shared_ptrs
-            with torch.enable_grad():
-                local_x = source.detach().clone().requires_grad_()
-                local_1 = first.detach().clone().requires_grad_()
-                local_2 = second.detach().clone().requires_grad_()
-                gradients = torch.autograd.grad(shared_math(local_x, local_1, local_2),
-                                                (local_x, local_1, local_2), dy)
-            dx.copy_(gradients[0])
-            dw1.copy_(gradients[1].t())
-            dw2.copy_(gradients[2].t())
+            """Keep routed derivatives zero while shared uses its independent native node."""
             execution.grad_x.zero_()
+
+        def activation_backward(gradient: torch.Tensor, up: torch.Tensor, _dim: int) -> torch.Tensor:
+            """Emulate only the native activation derivative on CPU."""
+            with torch.enable_grad():
+                value = up.detach().clone().requires_grad_()
+                gate, branch = value.chunk(2, dim=-1)
+                output = functional.silu(gate) * branch
+                return torch.autograd.grad(output, value, gradient)[0]
 
         calls = []
         with (
             patch.object(moe_function, "pointer_table", side_effect=lambda tensors, **_: tensors),
-            patch.object(shared_module, "pointer_table", side_effect=lambda tensors, **_: tensors),
+            patch.object(moe_function.torch.ops.npu, "npu_swiglu_backward", side_effect=activation_backward),
             patch.object(moe_function, "_launch_forward_kernel", side_effect=forward_kernel),
             patch.object(moe_function, "_launch_backward_kernel", side_effect=backward_kernel),
             patch.object(moe_function.multicore_ops, "moe_token_permute_grad",
                          side_effect=lambda grad, _mapping, rows, top_k: grad.reshape(rows, top_k, 4).sum(1)),
         ):
             for _ in range(2):
-                source = torch.randn(2, 4, requires_grad=input_grad)
+                source = (torch.randn(2, 4) if limit is None else torch.eye(4)[:2]).requires_grad_(input_grad)
                 reference = source.detach().clone().requires_grad_(input_grad)
                 route = SimpleNamespace(expert_capacity=3, group_list=torch.tensor([0, 3]))
                 for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
@@ -101,10 +107,11 @@ class TestSharedFunction(unittest.TestCase):
                     setattr(route, name, torch.zeros(4, dtype=torch.int64))
                 prepared = SimpleNamespace(metadata=route, routed_tokens=source.detach().repeat_interleave(2, dim=0),
                                            unpermute_mapping=torch.arange(4, dtype=torch.int32))
-                _, output = moe_function.execute_mega_moe_with_permutation(
+                routed_output, shared_output = moe_function.execute_mega_moe_with_permutation(
                     source, torch.zeros(2, 2, dtype=torch.int32), routed1, routed2, prepared, plan, workspace,
                     shared_weight1=w1, shared_weight2=w2)
-                expected = shared_math(reference, ref1, ref2)
+                output = shared_output + routed_output.reshape(2, 2, 4).sum(1)
+                expected = shared_math(reference, ref1, ref2, limit)
                 torch.testing.assert_close(output, expected)
                 calls.append((source, reference, output, expected, torch.randn_like(output)))
             for source, reference, output, expected, dy in reversed(calls):

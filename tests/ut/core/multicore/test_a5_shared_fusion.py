@@ -49,8 +49,12 @@ class TestA5SharedFusion(unittest.TestCase):
                                                      (fused[2], fused[3], baseline[3])):
                         shared = [task for task in config.all_tasks[:config.task_num]
                                   if task.inputs[0].tensor_type == 2]
-                        self.assertTrue(shared)
-                        self.assertTrue(any(op.name.startswith("shared_") for op in graph.topological_sort()))
+                        if graph is fused[2]:
+                            self.assertFalse(shared)
+                            self.assertEqual(bytes(config), bytes(original))
+                        else:
+                            self.assertTrue(shared)
+                            self.assertTrue(any(op.name.startswith("shared_") for op in graph.topological_sort()))
                         for queue_name, index in (("cube_task_indices", 0), ("vector_task_indices", 1)):
                             actual = [config.all_tasks[i] for i in getattr(config, queue_name)[:config.task_index_num[index]]
                                       if config.all_tasks[i].inputs[0].tensor_type != 2]

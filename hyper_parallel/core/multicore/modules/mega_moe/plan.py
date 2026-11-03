@@ -189,6 +189,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
     if spec.forward_ingress_mode != "legacy":
         validate_runtime_config(forward_data, task_values, spec.num_cube_cores)
         _attach_route_metadata_input(forward_graph, spec)
+    task_values.shared_expert = False
     backward_graph = build_backward_graph(
         task_values,
         dispatch_sv=spec.dispatch_split,
@@ -198,7 +199,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
-        shared_intermediate_size=spec.shared_intermediate_size,
+        shared_intermediate_size=0,
     )
     backward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(backward_graph)
@@ -409,8 +410,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         ingress_diagnostics=ingress_diagnostics,
         shared_forward_runtime=(_tensor_from_bytes(shared_tiling_bytes(spec, backward=False), device)
                                 if spec.shared_intermediate_size else None),
-        shared_backward_runtime=(_tensor_from_bytes(shared_tiling_bytes(spec, backward=True), device)
-                                 if spec.shared_intermediate_size else None),
+        shared_backward_runtime=None,
         row_credit_element_offset=_row_credit_element_offset(forward_config, spec),
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
