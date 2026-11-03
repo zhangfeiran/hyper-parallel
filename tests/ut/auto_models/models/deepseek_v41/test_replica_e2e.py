@@ -14,6 +14,7 @@
 # ============================================================================
 """Validate the full DSV replica recipe and its actual model adapter boundary."""
 
+from itertools import product
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -29,10 +30,14 @@ from examples.training_demo.deepseek_v41 import deepseek_v41_replica_e2e as runn
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import deepseek_v41_ep_compute_fn
 
+from tests.common.mark_utils import arg_mark
+
 
 class TestReplicaRecipe(unittest.TestCase):
     """Exercise parsed recipes through real factories without distributed setup."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_budget_reaches_adapter_and_keeps_safe_training_policy(self) -> None:
         """Feature: Replica training recipe.
         Description: Resolve nine recipes and invoke their actual replica adapters on meta parameters.
@@ -40,60 +45,62 @@ class TestReplicaRecipe(unittest.TestCase):
         """
         with TemporaryDirectory() as directory:
             work = Path(directory)
-            for backend, mode in (("owner_ep", "push"), ("megamoe", "push"), ("megamoe", "pull")):
-                for budget in (0, 1, 6):
-                    with self.subTest(backend=backend, mode=mode, budget=budget):
-                        args = SimpleNamespace(
-                            model_dir=directory, engram_assets=str(work / "assets.json"), experts=384,
-                            modality="text", packing_mode="packed", steps=3, warmup_steps=1,
-                            empty_cache_steps=1, random_init_seed=42, activation_checkpoint="full",
-                            ep_size=64, edp_shard_size=2, data=str(work / "input.jsonl"),
-                            validation_crop=True, num_hidden_layers=8, vision_num_hidden_layers=1,
-                            full_model=False, engram_storage_backend="host", backend=backend,
-                            dispatch_mode=mode, capacity_factor=None, replica_slots_per_rank=budget,
-                            replica_transport="p2p" if backend == "owner_ep" else "shmem_signal_kernel_gradient_bands",
-                        )
-                        config = benchmark._recipe(args, work, 128)
-                        recipe = yaml.safe_load((work / "recipe.yaml").read_text())
-                        self.assertEqual(config.fsdp_config.edp_shard_size, 2)
-                        self.assertEqual(recipe["fsdp_config"]["dp_shard_size"], 128)
-                        self.assertEqual(recipe["activation_checkpoint"]["selection"]["layer_count"], 8)
-                        self.assertEqual(recipe["model"]["engram_storage_backend"], "host")
-                        self.assertFalse(recipe["checkpoint"]["save_ckpt"])
-                        with torch.device("meta"):
-                            source = DeepseekV4Experts(SimpleNamespace(
-                                num_local_experts=384, hidden_size=16, intermediate_size=24,
-                                hidden_act="silu", swiglu_limit=10.0))
-                        if backend == "megamoe":
-                            options = next(entry["replace_module"] for entry in recipe["plan_overrides"]
-                                           if entry.get("match") == "model.layers.*.mlp.experts")
-                            options = {key: value for key, value in options.items() if key != "_target_"}
-                            if budget == 0:
-                                self.assertNotIn("replica_slots_per_rank", options)
-                                self.assertNotIn("replica_transport", options)
-                            adapter = DeepseekV41MegaMoeExperts(module=source, **options)
-                            with patch("hyper_parallel.core.multicore.MegaMoeExperts") as executor:
-                                adapter.configure("ep-group", 64, 6)
-                            self.assertEqual(executor.call_args.kwargs["replica_slots_per_rank"], budget)
-                            if budget:
-                                self.assertEqual(executor.call_args.kwargs["replica_transport"], args.replica_transport)
+            cases = product((("owner_ep", "push"), ("megamoe", "push"), ("megamoe", "pull")), (0, 1, 6))
+            for (backend, mode), budget in cases:
+                with self.subTest(backend=backend, mode=mode, budget=budget):
+                    args = SimpleNamespace(
+                        model_dir=directory, engram_assets=str(work / "assets.json"), experts=384,
+                        modality="text", packing_mode="packed", steps=3, warmup_steps=1,
+                        empty_cache_steps=1, random_init_seed=42, activation_checkpoint="full",
+                        ep_size=64, edp_shard_size=2, data=str(work / "input.jsonl"),
+                        validation_crop=True, num_hidden_layers=8, vision_num_hidden_layers=1,
+                        full_model=False, engram_storage_backend="host", backend=backend,
+                        dispatch_mode=mode, capacity_factor=None, replica_slots_per_rank=budget,
+                        replica_transport="p2p" if backend == "owner_ep" else "shmem_signal_kernel_gradient_bands",
+                    )
+                    config = benchmark._recipe(args, work, 128)
+                    recipe = yaml.safe_load((work / "recipe.yaml").read_text())
+                    self.assertEqual(config.fsdp_config.edp_shard_size, 2)
+                    self.assertEqual(recipe["fsdp_config"]["dp_shard_size"], 128)
+                    self.assertEqual(recipe["activation_checkpoint"]["selection"]["layer_count"], 8)
+                    self.assertEqual(recipe["model"]["engram_storage_backend"], "host")
+                    self.assertFalse(recipe["checkpoint"]["save_ckpt"])
+                    with torch.device("meta"):
+                        source = DeepseekV4Experts(SimpleNamespace(
+                            num_local_experts=384, hidden_size=16, intermediate_size=24,
+                            hidden_act="silu", swiglu_limit=10.0))
+                    if backend == "megamoe":
+                        options = next(entry["replace"]["implementation"] for entry in recipe["plan_overrides"]
+                                       if entry.get("match") == "model.layers.*.mlp.experts")
+                        options = {key: value for key, value in options.items() if key != "_target_"}
+                        if budget == 0:
+                            self.assertNotIn("replica_slots_per_rank", options)
+                            self.assertNotIn("replica_transport", options)
+                        adapter = DeepseekV41MegaMoeExperts(module=source, **options)
+                        with patch("hyper_parallel.core.multicore.MegaMoeExperts") as executor:
+                            adapter.configure("ep-group", 64, 6)
+                        self.assertEqual(executor.call_args.kwargs["replica_slots_per_rank"], budget)
+                        if budget:
+                            self.assertEqual(executor.call_args.kwargs["replica_transport"], args.replica_transport)
+                    else:
+                        options = next(entry["replace"]["implementation"] for entry in recipe["plan_overrides"]
+                                       if entry.get("match") == "model.layers.*.mlp.forward")
+                        options = {key: value for key, value in options.items() if key != "_target_"}
+                        block = SimpleNamespace(gate=MagicMock(), experts=source, shared_experts=MagicMock(),
+                                                is_hash=False, forward=lambda value: value)
+                        mesh = MagicMock()
+                        mesh.__getitem__.return_value.size.return_value = 64
+                        compute = deepseek_v41_ep_compute_fn(
+                            module=block, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=mesh, **options)
+                        self.assertTrue(callable(compute))
+                        if budget:
+                            self.assertEqual(source.native_replica_policy["budget"], budget)
                         else:
-                            options = next(entry["local_compute_fn"] for entry in recipe["plan_overrides"]
-                                           if entry.get("match") == "model.layers.*.mlp")
-                            options = {key: value for key, value in options.items() if key != "_target_"}
-                            block = SimpleNamespace(gate=MagicMock(), experts=source, shared_experts=MagicMock(),
-                                                    is_hash=False, forward=lambda value: value)
-                            mesh = MagicMock()
-                            mesh.__getitem__.return_value.size.return_value = 64
-                            compute = deepseek_v41_ep_compute_fn(
-                                module=block, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=mesh, **options)
-                            self.assertTrue(callable(compute))
-                            if budget:
-                                self.assertEqual(source.native_replica_policy["budget"], budget)
-                            else:
-                                self.assertNotIn("replica_slots_per_rank", options)
-                                self.assertFalse(hasattr(source, "native_replica_policy"))
+                            self.assertNotIn("replica_slots_per_rank", options)
+                            self.assertFalse(hasattr(source, "native_replica_policy"))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_cli_validates_native_transport_and_budget(self) -> None:
         """Feature: Replica command parsing.
         Description: Reject unsupported native transports and invalid caps before recipe creation.
@@ -109,6 +116,8 @@ class TestReplicaRecipe(unittest.TestCase):
                     benchmark._arguments([*base, *options])
             self.assertEqual(benchmark._arguments([*base, '--replica-slots-per-rank', '6']).replica_slots_per_rank, 6)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_pure_timing_registers_no_route_hooks(self) -> None:
         """Feature: Uninstrumented execution.
         Description: Disable route diagnostics on a real MoE-shaped module boundary.
@@ -128,6 +137,8 @@ class TestReplicaRecipe(unittest.TestCase):
 class TestReplicaMatrix(unittest.TestCase):
     """Check stage selection and generated commands before cluster scheduling."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_nine_commands_parse_into_actual_training_recipe(self) -> None:
         """Feature: Cluster stage reachability.
         Description: Feed every generated stage command through the real benchmark parser and recipe resolver.

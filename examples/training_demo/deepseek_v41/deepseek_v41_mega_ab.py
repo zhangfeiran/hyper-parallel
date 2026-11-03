@@ -44,7 +44,16 @@ class ReferenceMhc(PipelinedMhcModule):
     def advance(self, previous_output: torch.Tensor, residual: torch.Tensor,
                 previous_pre_mix: torch.Tensor, previous_post_mix: torch.Tensor,
                 previous_residual_mix: torch.Tensor, norm_weight: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Run post, coefficient prediction, pre mixing and RMSNorm without MegaMhc."""
+        """Run post, coefficient prediction, pre mixing and RMSNorm without MegaMhc.
+
+        Args:
+            previous_output: Value supplied by the benchmark or autograd callback.
+            residual: Value supplied by the benchmark or autograd callback.
+            previous_pre_mix: Value supplied by the benchmark or autograd callback.
+            previous_post_mix: Value supplied by the benchmark or autograd callback.
+            previous_residual_mix: Value supplied by the benchmark or autograd callback.
+            norm_weight: Value supplied by the benchmark or autograd callback.
+        """
         return _reference_shifted_boundary(
             self, previous_output, residual, previous_pre_mix, previous_post_mix,
             previous_residual_mix, norm_weight, self.norm_eps,
@@ -52,19 +61,26 @@ class ReferenceMhc(PipelinedMhcModule):
 
 
 def select_kernels(recipe: dict[str, Any], enabled: bool, *, gate_enabled: bool | None = None) -> None:
-    """Select mHC and Gate together by default, or separate Gate for diagnosis."""
+    """Select mHC and Gate together by default, or separate Gate for diagnosis.
+
+    Args:
+        recipe: Value supplied by the benchmark or autograd callback.
+        enabled: Value supplied by the benchmark or autograd callback.
+        gate_enabled: Value supplied by the benchmark or autograd callback.
+    """
     if gate_enabled is None:
         gate_enabled = enabled
     for entry in recipe['plan_overrides']:
-        target = entry.get('replace_module', {}).get('_target_', '')
+        target = entry.get('replace', {}).get('implementation', {}).get('_target_', '')
         if target.endswith('.DeepseekV41HyperMegaMhc') and not enabled:
-            entry['replace_module'] = {
+            entry['replace']['implementation'] = {
                 '_target_': 'examples.training_demo.deepseek_v41.deepseek_v41_mega_ab.ReferenceMhc',
             }
     if not gate_enabled:
         recipe['plan_overrides'] = [
             entry for entry in recipe['plan_overrides']
-            if not entry.get('replace_module', {}).get('_target_', '').endswith('.DeepseekV41MegaGate')
+            if not entry.get('replace', {}).get('implementation', {}).get('_target_', '').endswith(
+                '.DeepseekV41MegaGate')
         ]
 
 
@@ -145,11 +161,19 @@ class ModuleTiming:
         self.records.append(record)
 
         def output_ready(_gradients: Any) -> None:
-            """Open the interval when the first used output gradient arrives."""
+            """Open the interval when the first used output gradient arrives.
+
+            Args:
+                _gradients: Value supplied by the benchmark or autograd callback.
+            """
             record['start'] = self._event()
 
         def input_ready(_gradients: Any) -> None:
-            """Close the interval after all used input gradients are available."""
+            """Close the interval after all used input gradients are available.
+
+            Args:
+                _gradients: Value supplied by the benchmark or autograd callback.
+            """
             record['end'] = self._event()
             record['completed'] = True
 

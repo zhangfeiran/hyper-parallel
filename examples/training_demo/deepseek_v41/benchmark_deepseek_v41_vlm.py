@@ -48,62 +48,29 @@ from hyper_parallel.models.deepseek_v41.adapter.policies import activation_check
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedDSAAttentionBase
 
 
-def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
-    modality = getattr(args, "modality", "vlm")
-    filename = "train_deepseek_v41_vlm_online.yaml" if modality == "vlm" else "train_deepseek_v41_online.yaml"
-    recipe = yaml.safe_load(Path(__file__).with_name(filename).read_text(encoding="utf-8"))
-    # Exact FQNs are validated even when the optional drafter is absent.
-    if recipe["model"].get("dspark_depth", 0) == 0:
-        recipe["plan_overrides"] = [
-            entry for entry in recipe["plan_overrides"]
-            if not isinstance(entry["match"], str)
-            or (entry["match"] != "dspark" and not entry["match"].startswith("dspark."))
-        ]
-    recipe["model"].update(config_path=args.model_dir, engram_assets_path=args.engram_assets,
-                          num_routed_experts=args.experts, root_owned_vision=modality == "vlm")
-    recipe["model_init_dtype"] = "float32"
-    packing_mode = getattr(args, "packing_mode", "packed")
-    recipe["dataloader"].update(token_budget=1 if packing_mode == "dynamic" else 4096,
-                                min_buffered_samples=1 if packing_mode == "dynamic" else 16)
-    recipe["training"].update(train_iters=args.steps, global_batch_size=world,
-                               empty_cache_steps=args.empty_cache_steps, seed=args.random_init_seed)
-    recipe["activation_checkpoint"]["mode"] = args.activation_checkpoint
-    if args.activation_checkpoint == "full":
-        recipe["activation_checkpoint"]["selection"] = {
-            "source": "model_adapter_safe_regions", "layer_count": 0,
-        }
-    ep_size = world if args.ep_size is None else args.ep_size
-    recipe["accelerator"]["ep_size"] = ep_size
-    edp_shard_size = args.edp_shard_size or world // ep_size
-    recipe["fsdp_config"].update(dp_shard_size=world, edp_shard_size=edp_shard_size)
-    recipe["dataset"]["data_path"] = args.data
-    if modality == "vlm":
-        recipe["dataset"]["model_assets"]["config_path"] = args.model_dir
-    else:
-        recipe["dataset"]["model_assets"]["tokenizer"]["pretrained_model_name_or_path"] = args.model_dir
-    if args.validation_crop:
-        recipe["model"].update(
-            text_parameter_divisor=1, vision_parameter_divisor=1,
-            num_hidden_layers=args.num_hidden_layers or 4,
-            vision_num_hidden_layers=(args.vision_num_hidden_layers or 1) if modality == "vlm" else None,
-            exercise_post_training_indexer=False,
-        )
+def _validate_full_model_assets(args: argparse.Namespace, text: dict, assets: dict) -> None:
+    """Require the host assets and expert count to describe the released model."""
+    expected = {
+        "num_hidden_layers": text["num_hidden_layers"],
+        "bucket_base": text["engram_vocab_size"],
+        "layer_ids": text["engram_layer_ids"],
+        "num_embeddings": text["engram_num_embeddings"],
+        "compressed_vocab_size": text["engram_compressed_vocab_size"],
+    }
+    for key, value in expected.items():
+        if assets.get(key) != value:
+            raise ValueError(f"Full-model Engram mismatch for {key}: {assets.get(key)} != {value}")
+    if args.experts != text["n_routed_experts"]:
+        raise ValueError("Full-model expert count must match the released config")
+
+
+def _set_full_model_crop(recipe: dict, args: argparse.Namespace, work: Path, ep_size: int, modality: str) -> None:
+    """Preserve released dimensions while selecting the explicitly requested depth."""
     if args.full_model:
         source = json.loads((Path(args.model_dir) / "config.json").read_text(encoding="utf-8"))
         text, vision = source["text_config"], source["vision_config"]
         assets = json.loads(Path(args.engram_assets).read_text(encoding="utf-8"))
-        expected = {
-            "num_hidden_layers": text["num_hidden_layers"],
-            "bucket_base": text["engram_vocab_size"],
-            "layer_ids": text["engram_layer_ids"],
-            "num_embeddings": text["engram_num_embeddings"],
-            "compressed_vocab_size": text["engram_compressed_vocab_size"],
-        }
-        for key, value in expected.items():
-            if assets.get(key) != value:
-                raise ValueError(f"Full-model Engram mismatch for {key}: {assets.get(key)} != {value}")
-        if args.experts != text["n_routed_experts"]:
-            raise ValueError("Full-model expert count must match the released config")
+        _validate_full_model_assets(args, text, assets)
         depth = args.num_hidden_layers or text["num_hidden_layers"]
         vision_depth = (args.vision_num_hidden_layers or vision["num_hidden_layers"]) if modality == "vlm" else None
         if not 4 <= depth <= text["num_hidden_layers"]:
@@ -130,44 +97,56 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
         for override in recipe["plan_overrides"]:
             if isinstance(override["match"], str):
                 override["match"] = override["match"].replace("model.vision.blocks.0.", "model.vision.blocks.*.")
-    if args.activation_checkpoint == "full":
-        depth = recipe["model"].get("num_hidden_layers")
-        if depth is None:
-            source = json.loads((Path(args.model_dir) / "config.json").read_text(encoding="utf-8"))
-            depth = source["text_config"]["num_hidden_layers"]
-        recipe["activation_checkpoint"]["selection"]["layer_count"] = depth
+
+
+def _set_engram_backend(recipe: dict, args: argparse.Namespace) -> None:
+    """Resolve host storage and its optimizer from the effective AdamW settings."""
     recipe["model"]["engram_storage_backend"] = args.engram_storage_backend
     if args.engram_storage_backend == "host":
         adamw = recipe["optimizer"]["adamw_config"]
         recipe["model"]["engram_sparse_adam_config"] = {
-            "lr": adamw["adamw_lr"], "betas": adamw["adamw_betas"], "eps": adamw["adamw_eps"],
+            "lr": adamw.get("lr", adamw.get("adamw_lr")),
+            "betas": adamw.get("betas", adamw.get("adamw_betas")),
+            "eps": adamw.get("eps", adamw.get("adamw_eps")),
         }
         for override in recipe["plan_overrides"]:
-            if override.get("module_type", "").endswith(".DeepseekV41Engram"):
-                override["replace_module"]["_target_"] = (
+            if override.get("replace", {}).get("implementation", {}).get("_target_", "").endswith(".EngramModule"):
+                override["replace"]["implementation"]["_target_"] = (
                     "hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule"
                 )
-    compute = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel."
-    # The shared recipes enable MegaMoe; each benchmark selects its own backend.
-    recipe["plan_overrides"] = [
-        entry for entry in recipe["plan_overrides"]
-        if not entry.get("replace_module", {}).get("_target_", "").endswith(".DeepseekV41MegaMoeExperts")
-    ]
-    moe_override = next(entry for entry in recipe["plan_overrides"]
-                        if entry["match"] == "model.layers.*.mlp" and "local_compute_fn" in entry)
-    moe_override["local_compute_fn"] = {
-        "_target_": compute + "deepseek_v41_ep_compute_fn", "use_grouped_gemm": True,
-    }
+
+
+def _replica_options(args: argparse.Namespace) -> tuple[int, str]:
+    """Resolve the explicit replica budget and its backend transport default."""
     replica_slots = getattr(args, "replica_slots_per_rank", 0)
     replica_transport = getattr(args, "replica_transport", None)
     if replica_transport is None:
         replica_transport = "p2p" if args.backend == "owner_ep" else "shmem_signal_kernel_gradient_bands"
     if replica_slots < 0:
         raise ValueError("replica_slots_per_rank must be nonnegative")
+    return replica_slots, replica_transport
+
+
+def _set_backend(recipe: dict, args: argparse.Namespace) -> None:
+    """Select native or MegaMoE execution through the current method-replacement schema."""
+    compute = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel."
+    # The shared recipes enable MegaMoe; each benchmark selects its own backend.
+    recipe["plan_overrides"] = [
+        entry for entry in recipe["plan_overrides"]
+        if not entry.get("replace", {}).get("implementation", {}).get("_target_", "").endswith(
+            ".DeepseekV41MegaMoeExperts")
+    ]
+    moe_override = next(entry for entry in recipe["plan_overrides"]
+                        if entry["match"] == "model.layers.*.mlp.forward"
+                        and entry.get("replace", {}).get("kind") == "method")
+    moe_override["replace"]["implementation"] = {
+        "_target_": compute + "deepseek_v41_ep_compute_fn", "use_grouped_gemm": True,
+    }
+    replica_slots, replica_transport = _replica_options(args)
     if args.backend == "owner_ep" and replica_slots:
         if replica_transport != "p2p":
             raise ValueError("Native DSV replicas require replica_transport=p2p")
-        moe_override["local_compute_fn"]["replica_slots_per_rank"] = replica_slots
+        moe_override["replace"]["implementation"]["replica_slots_per_rank"] = replica_slots
     if args.backend == "megamoe":
         replacement = {
             "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts",
@@ -179,12 +158,14 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
             replacement["initial_capacity_factor"] = args.capacity_factor
         recipe["plan_overrides"].insert(0, {
             "match": "model.layers.*.mlp.experts",
-            "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts",
-            "replace_module": replacement,
+            "replace": {"kind": "module", "implementation": replacement},
         })
         moe_override.pop("when", None)
-        moe_override["local_compute_fn"] = {"_target_": compute + "deepseek_v41_megamoe_compute_fn"}
-    recipe["checkpoint"].update(save_ckpt=False, restore_from=None, checkpoint_dir=str(work / "unused-checkpoint"))
+        moe_override["replace"]["implementation"] = {"_target_": compute + "deepseek_v41_megamoe_compute_fn"}
+
+
+def _set_kernels(recipe: dict, args: argparse.Namespace) -> None:
+    """Apply the declared independent mHC, gate, attention and normalization choices."""
     mega_kernels = getattr(args, "mega_kernels", None)
     if mega_kernels is not None:
         if (args.backend == "megamoe") != (mega_kernels != "off"):
@@ -192,16 +173,75 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
         select_kernels(recipe, mega_kernels in ("moe_mhc", "on"),
                        gate_enabled=mega_kernels in ("moe_gate", "on"))
     for override in recipe["plan_overrides"]:
-        replacement = override.get("replace_module", {})
+        replacement = override.get("replace", {}).get("implementation", {})
         if replacement.get("_target_", "").endswith(".SharedCompressedDSAAttention"):
             replacement["use_fused_ops"] = getattr(args, "use_fused_attention", False)
     if getattr(args, "use_fused_rmsnorm", False):
         # Attention owns its descendants; replacement plans reject nested targets.
         recipe["plan_overrides"].append({
             "match": ["model.norm", "*.input_layernorm", "*.post_attention_layernorm"],
-            "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4RMSNorm",
-            "replace_module": {"_target_": "hyper_parallel.components.modules.rms_norm.RMSNorm"},
+            "replace": {"kind": "module", "implementation": {
+                "_target_": "hyper_parallel.components.modules.rms_norm.RMSNorm"}},
         })
+
+
+def _set_recipe_inputs(recipe: dict, args: argparse.Namespace, world: int, modality: str) -> int:
+    """Resolve matched workload, topology, local assets and optional smoke dimensions."""
+    packing_mode = getattr(args, "packing_mode", "packed")
+    recipe["dataloader"].update(token_budget=1 if packing_mode == "dynamic" else 4096,
+                                min_buffered_samples=1 if packing_mode == "dynamic" else 16)
+    recipe["training"].update(train_iters=args.steps, global_batch_size=world,
+                               empty_cache_steps=args.empty_cache_steps, seed=args.random_init_seed)
+    recipe["activation_checkpoint"]["mode"] = args.activation_checkpoint
+    if args.activation_checkpoint == "full":
+        recipe["activation_checkpoint"]["selection"] = {
+            "source": "model_adapter_safe_regions", "layer_count": 0,
+        }
+    ep_size = world if args.ep_size is None else args.ep_size
+    recipe["accelerator"]["ep_size"] = ep_size
+    edp_shard_size = args.edp_shard_size or world // ep_size
+    recipe["fsdp_config"].update(dp_shard_size=world, edp_shard_size=edp_shard_size)
+    recipe["dataset"]["data_path"] = args.data
+    if modality == "vlm":
+        recipe["dataset"]["model_assets"]["config_path"] = args.model_dir
+    else:
+        recipe["dataset"]["model_assets"]["tokenizer"]["pretrained_model_name_or_path"] = args.model_dir
+    if args.validation_crop:
+        recipe["model"].update(
+            text_parameter_divisor=1, vision_parameter_divisor=1,
+            num_hidden_layers=args.num_hidden_layers or 4,
+            vision_num_hidden_layers=(args.vision_num_hidden_layers or 1) if modality == "vlm" else None,
+            exercise_post_training_indexer=False,
+        )
+    return ep_size
+
+
+def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
+    modality = getattr(args, "modality", "vlm")
+    filename = "train_deepseek_v41_vlm_online.yaml" if modality == "vlm" else "train_deepseek_v41_online.yaml"
+    recipe = yaml.safe_load(Path(__file__).with_name(filename).read_text(encoding="utf-8"))
+    # Exact FQNs are validated even when the optional drafter is absent.
+    if recipe["model"].get("dspark_depth", 0) == 0:
+        recipe["plan_overrides"] = [
+            entry for entry in recipe["plan_overrides"]
+            if not isinstance(entry["match"], str)
+            or (entry["match"] != "dspark" and not entry["match"].startswith("dspark."))
+        ]
+    recipe["model"].update(config_path=args.model_dir, engram_assets_path=args.engram_assets,
+                          num_routed_experts=args.experts, root_owned_vision=modality == "vlm")
+    recipe["model_init_dtype"] = "float32"
+    ep_size = _set_recipe_inputs(recipe, args, world, modality)
+    _set_full_model_crop(recipe, args, work, ep_size, modality)
+    if args.activation_checkpoint == "full":
+        depth = recipe["model"].get("num_hidden_layers")
+        if depth is None:
+            source = json.loads((Path(args.model_dir) / "config.json").read_text(encoding="utf-8"))
+            depth = source["text_config"]["num_hidden_layers"]
+        recipe["activation_checkpoint"]["selection"]["layer_count"] = depth
+    _set_engram_backend(recipe, args)
+    _set_backend(recipe, args)
+    recipe["checkpoint"].update(save_ckpt=False, restore_from=None, checkpoint_dir=str(work / "unused-checkpoint"))
+    _set_kernels(recipe, args)
     path = work / "recipe.yaml"
     path.write_text(yaml.safe_dump(recipe), encoding="utf-8")
     return parse_training_args([str(path)])
@@ -246,7 +286,11 @@ class _BatchIdentity:
 
         @wraps(self.get_batch)
         def capture(iterator: Any) -> Any:
-            """Keep batch inputs only until their post-step identity is recorded."""
+            """Keep batch inputs only until their post-step identity is recorded.
+
+            Args:
+                iterator: Value supplied by the benchmark or autograd callback.
+            """
             batch = self.get_batch(iterator)
             self.batches.append(batch)
             return batch
@@ -286,7 +330,12 @@ class _RouteDiagnostics:
 
     def _record_rows(self, name: str) -> Any:
         def hook(_module: torch.nn.Module, inputs: tuple) -> None:
-            """Record rows without changing the source tensor."""
+            """Record rows without changing the source tensor.
+
+            Args:
+                _module: Value supplied by the benchmark or autograd callback.
+                inputs: Value supplied by the benchmark or autograd callback.
+            """
             self.token_rows[name] = inputs[0].numel() // inputs[0].shape[-1]
         return hook
 
@@ -335,6 +384,41 @@ def _step(trainer: Any, iterator: Any, step: int, work: Path,
     with (work / "steps.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(row) + "\n")
     return row
+
+
+def _validate_run_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Validate transport and timing before creating a training recipe."""
+    if args.replica_transport is None:
+        args.replica_transport = "p2p" if args.backend == "owner_ep" else "shmem_signal_kernel_gradient_bands"
+    if args.replica_slots_per_rank < 0:
+        parser.error("replica-slots-per-rank must be nonnegative")
+    if args.backend == "owner_ep" and args.replica_slots_per_rank and args.replica_transport != "p2p":
+        parser.error("native replicas require --replica-transport p2p")
+    if args.empty_cache_steps < 0:
+        parser.error("empty-cache-steps must be nonnegative")
+    if not 0 <= args.warmup_steps < args.steps:
+        parser.error("warmup-steps must be nonnegative and smaller than steps")
+
+
+def _validate_depths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Reject depth overrides without an explicitly selected crop mode."""
+    for depth in (args.num_hidden_layers, args.vision_num_hidden_layers):
+        if depth is not None and (not (args.full_model or args.validation_crop) or depth <= 0):
+            parser.error("depth overrides require --full-model or --validation-crop and positive values")
+
+
+def _validate_topology(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Reject unsupported dimensions before opening distributed resources."""
+    world = int(os.environ.get("WORLD_SIZE", "16"))
+    ep_size = world if args.ep_size is None else args.ep_size
+    if world < 1 or ep_size < 2 or world % ep_size or args.steps < 1 or args.experts < 6 or args.experts % ep_size:
+        parser.error("requires positive steps, EP >= 2 dividing WORLD_SIZE, and experts >= 6 divisible by EP")
+    _validate_depths(args, parser)
+    if args.edp_shard_size is not None:
+        if args.edp_shard_size <= 0 or (world // ep_size) % args.edp_shard_size:
+            parser.error("edp-shard-size must be positive and divide WORLD_SIZE/EP")
+    if args.dispatch_mode == "pull" and args.capacity_factor is not None:
+        parser.error("pull comparison must not impose a push receive-capacity bound")
 
 
 def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -387,28 +471,8 @@ def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    if args.replica_transport is None:
-        args.replica_transport = "p2p" if args.backend == "owner_ep" else "shmem_signal_kernel_gradient_bands"
-    if args.replica_slots_per_rank < 0:
-        parser.error("replica-slots-per-rank must be nonnegative")
-    if args.backend == "owner_ep" and args.replica_slots_per_rank and args.replica_transport != "p2p":
-        parser.error("native replicas require --replica-transport p2p")
-    if args.empty_cache_steps < 0:
-        parser.error("empty-cache-steps must be nonnegative")
-    if not 0 <= args.warmup_steps < args.steps:
-        parser.error("warmup-steps must be nonnegative and smaller than steps")
-    world = int(os.environ.get("WORLD_SIZE", "16"))
-    ep_size = world if args.ep_size is None else args.ep_size
-    if world < 1 or ep_size < 2 or world % ep_size or args.steps < 1 or args.experts < 6 or args.experts % ep_size:
-        parser.error("requires positive steps, EP >= 2 dividing WORLD_SIZE, and experts >= 6 divisible by EP")
-    for depth in (args.num_hidden_layers, args.vision_num_hidden_layers):
-        if depth is not None and (not (args.full_model or args.validation_crop) or depth <= 0):
-            parser.error("depth overrides require --full-model or --validation-crop and positive values")
-    if args.edp_shard_size is not None:
-        if args.edp_shard_size <= 0 or (world // ep_size) % args.edp_shard_size:
-            parser.error("edp-shard-size must be positive and divide WORLD_SIZE/EP")
-    if args.dispatch_mode == "pull" and args.capacity_factor is not None:
-        parser.error("pull comparison must not impose a push receive-capacity bound")
+    _validate_run_args(args, parser)
+    _validate_topology(args, parser)
     return args
 
 
@@ -427,34 +491,30 @@ def _attention_module_counts(model: torch.nn.Module) -> dict[str, int]:
             "reference": sum(not module.use_fused_ops for module in modules)}
 
 
-def main() -> None:
-    """Run fixed-horizon training, preserving epoch order and both timing scopes."""
-    args = _arguments()
-    rank, world = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "16"))
-    work = Path(args.output) / f"rank{rank}"
-    work.mkdir(parents=True, exist_ok=True)
-    config = _recipe(args, work, world)
-    if args.dry_run:
-        return
-    if args.native_lib:
-        _loader._component_root = args.native_lib.resolve
-    activation_checkpointing.ATTENTION_RECOMPUTE_TIER = args.attention_recompute_tier
-    trainer = (VLMTrainer if args.modality == "vlm" else TextTrainer)(config)
-    module_counts = _mega_module_counts(trainer.base.model)
-    attention_counts = _attention_module_counts(trainer.base.model)
+def _fused_norm_count(args: argparse.Namespace, model: torch.nn.Module, rank: int) -> int | None:
+    """Verify the explicitly requested normalization replacement is complete."""
     fused_norm_count = None
     if getattr(args, "use_fused_rmsnorm", False):
         # The selected replacement requires the optional NPU normalization backend.
         from hyper_parallel.components.modules.rms_norm import RMSNorm  # pylint: disable=import-outside-toplevel
-        from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4RMSNorm
-        fused_norm_count = sum(isinstance(module, RMSNorm) for module in trainer.base.model.modules())
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import (  # pylint: disable=C0415
+            DeepseekV4RMSNorm,
+        )
+        fused_norm_count = sum(isinstance(module, RMSNorm) for module in model.modules())
         reference_norm_count = sum(
             isinstance(module, DeepseekV4RMSNorm) and ".self_attn." not in name
-            for name, module in trainer.base.model.named_modules()
+            for name, module in model.named_modules()
         )
         if not fused_norm_count or reference_norm_count:
             raise RuntimeError(f"Rank {rank}: incomplete RMSNorm fusion: "
                                f"fused={fused_norm_count}, reference={reference_norm_count}")
+    return fused_norm_count
+
+
+def _check_replacements(args: argparse.Namespace, model: torch.nn.Module, rank: int) -> tuple:
+    """Require the final runtime tree to match the requested kernel choices."""
+    module_counts = _mega_module_counts(model)
+    attention_counts = _attention_module_counts(model)
     if args.num_hidden_layers is not None:
         expected_attention = {"fused": args.num_hidden_layers if args.use_fused_attention else 0,
                               "reference": 0 if args.use_fused_attention else args.num_hidden_layers}
@@ -467,18 +527,12 @@ def main() -> None:
                     "mega_gate": depth if args.mega_kernels in ("moe_gate", "on") else 0}
         if module_counts != expected:
             raise RuntimeError(f"Rank {rank}: expected Mega modules {expected}, got {module_counts}")
-    experts = [module for module in trainer.base.model.modules() if isinstance(module, DeepseekV41MegaMoeExperts)]
-    initialization = initialize_random_shards(trainer, seed=args.random_init_seed, backend=args.backend)
-    (work / "initialization.json").write_text(json.dumps(initialization, indent=2), encoding="utf-8")
-    dist.barrier()
-    trainer.on_train_begin()
-    torch.npu.reset_peak_memory_stats()
-    diagnostics = _RouteDiagnostics(
-        trainer.base.model, enabled=not getattr(args, "disable_route_diagnostics", False))
-    if args.record_input_identity:
-        diagnostics.input_identity = _BatchIdentity(trainer)
-    timing_class = ModuleTiming if args.mega_kernels is not None else MoeTiming
-    moe_timing = timing_class(trainer.base.model) if args.moe_timing else None
+    return module_counts, attention_counts, _fused_norm_count(args, model, rank)
+
+
+def _train_rows(trainer: Any, args: argparse.Namespace, work: Path,
+                diagnostics: _RouteDiagnostics, moe_timing: Any) -> list:
+    """Run the complete requested horizon and close all measurement hooks."""
     rows = []
     try:
         for epoch in range(trainer.base.train_epochs):
@@ -502,6 +556,36 @@ def main() -> None:
             moe_timing.close()
     if len(rows) != args.steps:
         raise RuntimeError(f"Incomplete training: {len(rows)} of {args.steps} steps")
+    return rows
+
+
+def main() -> None:
+    """Run fixed-horizon training, preserving epoch order and both timing scopes."""
+    args = _arguments()
+    rank, world = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "16"))
+    work = Path(args.output) / f"rank{rank}"
+    work.mkdir(parents=True, exist_ok=True)
+    config = _recipe(args, work, world)
+    if args.dry_run:
+        return
+    if args.native_lib:
+        _loader._component_root = args.native_lib.resolve
+    activation_checkpointing.ATTENTION_RECOMPUTE_TIER = args.attention_recompute_tier
+    trainer = (VLMTrainer if args.modality == "vlm" else TextTrainer)(config)
+    module_counts, attention_counts, fused_norm_count = _check_replacements(args, trainer.base.model, rank)
+    experts = [module for module in trainer.base.model.modules() if isinstance(module, DeepseekV41MegaMoeExperts)]
+    initialization = initialize_random_shards(trainer, seed=args.random_init_seed, backend=args.backend)
+    (work / "initialization.json").write_text(json.dumps(initialization, indent=2), encoding="utf-8")
+    dist.barrier()
+    trainer.on_train_begin()
+    torch.npu.reset_peak_memory_stats()
+    diagnostics = _RouteDiagnostics(
+        trainer.base.model, enabled=not getattr(args, "disable_route_diagnostics", False))
+    if args.record_input_identity:
+        diagnostics.input_identity = _BatchIdentity(trainer)
+    timing_class = ModuleTiming if args.mega_kernels is not None else MoeTiming
+    moe_timing = timing_class(trainer.base.model) if args.moe_timing else None
+    rows = _train_rows(trainer, args, work, diagnostics, moe_timing)
     measured = rows[args.warmup_steps:]
     result = {"vision_enabled": args.modality == "vlm", **vars(args), "native_lib": str(args.native_lib),
               "rank": rank, "world_size": world,

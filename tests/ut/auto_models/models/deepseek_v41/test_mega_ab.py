@@ -31,43 +31,66 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import Deep
 from tests.ut.auto_models.models.deepseek_v41.test_moe_timing import CpuEvent
 from tests.ut.auto_models.models.deepseek_v41.test_host_recompute import _tiny_model
 
+from tests.common.mark_utils import arg_mark
+
 
 class TestMegaAb(unittest.TestCase):
     """Observers preserve real model gradients and compare the same mHC protocol."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_recipe_preserves_unrelated_replacements(self) -> None:
-        """Switch only the requested Mega mHC/Gate replacements."""
+        """Feature: Distributed replica benchmark recipe.
+        Description: Switch only the requested Mega mHC/Gate replacements.
+        Expectation: Resolved current-schema configuration preserves the asserted execution choices.
+        """
         original = {'plan_overrides': [
-            {'match': 'mhc', 'replace_module': {'_target_': 'example.DeepseekV41HyperMegaMhc'}},
-            {'match': 'gate', 'replace_module': {'_target_': 'example.DeepseekV41MegaGate'}},
-            {'match': 'other', 'replace_module': {'_target_': 'example.Other'}},
+            {'match': 'mhc', 'replace': {'kind': 'module',
+             'implementation': {'_target_': 'example.DeepseekV41HyperMegaMhc'}}},
+            {'match': 'gate', 'replace': {'kind': 'module',
+             'implementation': {'_target_': 'example.DeepseekV41MegaGate'}}},
+            {'match': 'other', 'replace': {'kind': 'module',
+             'implementation': {'_target_': 'example.Other'}}},
         ]}
         recipe = deepcopy(original)
         select_kernels(recipe, True)
         self.assertEqual(recipe, original)
         select_kernels(recipe, False)
         self.assertEqual(len(recipe['plan_overrides']), 2)
-        self.assertTrue(recipe['plan_overrides'][0]['replace_module']['_target_'].endswith('.ReferenceMhc'))
+        self.assertTrue(recipe['plan_overrides'][0]['replace']['implementation']['_target_'].endswith('.ReferenceMhc'))
         self.assertEqual(recipe['plan_overrides'][1], original['plan_overrides'][2])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_mhc_and_gate_can_be_isolated_for_crash_capture(self) -> None:
-        """Separate either optional kernel while preserving experts and unrelated rules."""
+        """Feature: Distributed replica benchmark recipe.
+        Description: Separate either optional kernel while preserving experts and unrelated rules.
+        Expectation: Resolved current-schema configuration preserves the asserted execution choices.
+        """
         original = {'plan_overrides': [
-            {'match': 'mhc', 'replace_module': {'_target_': 'example.DeepseekV41HyperMegaMhc'}},
-            {'match': 'gate', 'replace_module': {'_target_': 'example.DeepseekV41MegaGate'}},
-            {'match': 'experts', 'replace_module': {'_target_': 'example.DeepseekV41MegaMoeExperts'}},
+            {'match': 'mhc', 'replace': {'kind': 'module',
+             'implementation': {'_target_': 'example.DeepseekV41HyperMegaMhc'}}},
+            {'match': 'gate', 'replace': {'kind': 'module',
+             'implementation': {'_target_': 'example.DeepseekV41MegaGate'}}},
+            {'match': 'experts', 'replace': {'kind': 'module',
+             'implementation': {'_target_': 'example.DeepseekV41MegaMoeExperts'}}},
         ]}
         for mhc, gate in ((False, False), (True, False), (False, True), (True, True)):
             with self.subTest(mhc=mhc, gate=gate):
                 recipe = deepcopy(original)
                 select_kernels(recipe, mhc, gate_enabled=gate)
-                targets = [entry['replace_module']['_target_'] for entry in recipe['plan_overrides']]
+                targets = [entry['replace']['implementation']['_target_'] for entry in recipe['plan_overrides']]
                 self.assertEqual('example.DeepseekV41HyperMegaMhc' in targets, mhc)
                 self.assertEqual('example.DeepseekV41MegaGate' in targets, gate)
                 self.assertIn('example.DeepseekV41MegaMoeExperts', targets)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_real_decoder_recompute_and_all_group_gradients(self) -> None:
-        """Exercise tuple-output mHC/Gate and nested model replay for 40 steps."""
+        """Feature: Distributed benchmark evidence.
+        Description: Exercise tuple-output mHC/Gate and nested model replay for 40 steps.
+        Expectation: The asserted workload, configuration, and terminal evidence contracts hold.
+        """
         with TemporaryDirectory() as directory, patch.object(DefaultDeviceType, 'get_device_type', return_value='cpu'):
             model = _tiny_model(directory)
             for layer in model.model.layers:
@@ -102,16 +125,26 @@ class TestMegaAb(unittest.TestCase):
                 timing.clear()
                 self.assertFalse(timing.grad_hooks)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_incomplete_run_has_no_ratios(self) -> None:
-        """Keep missing or failed jobs out of the module speedup table."""
+        """Feature: Distributed benchmark evidence.
+        Description: Keep missing or failed jobs out of the module speedup table.
+        Expectation: The asserted workload, configuration, and terminal evidence contracts hold.
+        """
         with TemporaryDirectory() as directory:
             report = summarize(Path(directory), 8, 16, 40, 10)
         self.assertFalse(report['complete'])
         self.assertFalse(report['speedup_eligible'])
         self.assertEqual(report['module_speed_ratios'], {})
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_statistics_take_rank_max_after_module_sum(self) -> None:
-        """Reject a sum of unrelated per-module rank maxima."""
+        """Feature: Distributed benchmark evidence.
+        Description: Reject a sum of unrelated per-module rank maxima.
+        Expectation: The asserted workload, configuration, and terminal evidence contracts hold.
+        """
         records=[]
         for rank in range(2):
             groups={}
@@ -126,8 +159,13 @@ class TestMegaAb(unittest.TestCase):
         self.assertEqual(result['gate']['forward']['mean_ms'],44)
         self.assertEqual(result['mhc']['forward_plus_backward']['mean_ms'],176)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_completed_first_pair_survives_all_on_failure(self) -> None:
-        """Keep the MegaMoe comparison available when the final case aborts."""
+        """Feature: Distributed benchmark evidence.
+        Description: Keep the MegaMoe comparison available when the final case aborts.
+        Expectation: The asserted workload, configuration, and terminal evidence contracts hold.
+        """
         signature = [{'initialization': {'seed': 42}, 'rows': [(1, 2, {'layer': 4096})]}]
         stats = {'moe': {'forward': {'mean_ms': 20.0, 'median_ms': 18.0}}}
         def case_result(_root: Path, _nodes: Path, _count: int, _cards: int, _steps: int,
