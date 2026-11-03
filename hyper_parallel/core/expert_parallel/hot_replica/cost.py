@@ -42,10 +42,13 @@ def _default_schedule(backend: str, transport: str) -> str:
 
 
 def _effective_group_features(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
-                              home: int, nodes: tuple[int, ...]) -> tuple[float, ...]:
+                              home: int, nodes: tuple[int, ...],
+                              source_totals: list[int] | None = None) -> tuple[float, ...]:
     """Summarize group component maxima without treating synchronized rank waits as local work."""
     if len(nodes) != len(copies):
         raise ValueError('Effective group scoring requires the measured EP topology')
+    if source_totals is None:
+        source_totals = [sum(row) for row in counts]
     local, remote = [0] * len(copies), [0] * len(copies)
     for target, experts in enumerate(copies):
         for expert, rows in experts.items():
@@ -59,7 +62,7 @@ def _effective_group_features(copies: list[dict[int, int]], counts: tuple[tuple[
         tasks.append(sum(rows > 0 for rows in experts.values()))
         received.append(sum(experts.values()))
         hits = sum(min(counts[rank][expert], rows) for expert, rows in experts.items())
-        tokens.append((sum(counts[rank]) + received[-1] - 2 * hits) / 2)
+        tokens.append((source_totals[rank] + received[-1] - 2 * hits) / 2)
     return max(tasks), max(received), max(local), max(remote), max(tokens), int(any(local) or any(remote))
 
 
@@ -373,7 +376,8 @@ class _QuotaCostState:
         if self.model.effective_group_ms:
             if removed:
                 raise ValueError('Effective group scoring requires final explicit quotas')
-            features = _effective_group_features(self.copies, self.counts, self.home, self.model._rank_nodes)
+            features = _effective_group_features(self.copies, self.counts, self.home, self.model._rank_nodes,
+                                                 self.source_totals)
             return sum(value * coefficient for value, coefficient in zip(features, self.model.effective_group_ms))
         if self.model.critical_path is not None:
             if removed:

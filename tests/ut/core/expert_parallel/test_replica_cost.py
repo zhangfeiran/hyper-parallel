@@ -104,6 +104,28 @@ class TestReplicaCost(unittest.TestCase):
         self.assertIs(state.source_totals, state.source_totals)
         self.assertGreater(state.score(), cost._QuotaCostState(self._model(), copies, counts, config).score())
 
+    def test_group_quota_trials_sum_each_immutable_source_once(self) -> None:
+        """Quota changes must refresh their score without rescanning immutable source rows."""
+        counts, config = ((10, 0, 0, 0), (6, 0, 0, 0)), ExpertReplicaConfig(4, 2, 1)
+        copies = [{0: 8, 1: 0}, {2: 0, 3: 0, 0: 8}]
+        model = self._model(effective_group_ms=(.5, 1., 2., 3., .25, 4.), _rank_nodes=(0, 1))
+        state = cost._QuotaCostState(model, copies, counts, config)
+        trials = (8, 3, 0, 7, 8)
+        expected, actual = [], []
+        with patch.object(cost, 'sum', wraps=sum, create=True) as aggregate:
+            for quota in trials:
+                copies[0][0], copies[1][0] = 16 - quota, quota
+                actual.append(state.trial_score(0, 1, 0, (0., 0.)))
+                actual.append(state.score())
+            source_sums = [sum(call.args[0] is row for call in aggregate.call_args_list) for row in counts]
+        for quota in trials:
+            copies[0][0], copies[1][0] = 16 - quota, quota
+            features = cost._effective_group_features(copies, counts, config.home_experts, model._rank_nodes)
+            expected.extend([sum(value * coefficient for value, coefficient
+                                 in zip(features, model.effective_group_ms))] * 2)
+        self.assertEqual(actual, expected)
+        self.assertEqual(source_sums, [1, 1])
+
     def test_small_copy_is_removed_on_score_plateau_before_search_guard(self) -> None:
         """A cheap deletion must not require a strict gain or expensive quota search."""
         counts = ((10, 0, 0, 0, 20, 0, 0, 0),) + ((0,) * 8,) * 3
