@@ -25,6 +25,7 @@
 #endif
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
+#include "runtime/empty_tail_credit.h"
 #include "runtime/bf16_clamp.h"
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
 #include "runtime/indexed_backward.h"
@@ -334,8 +335,20 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     int32_t start = value * task_desc.task_split_value * hidden_size;
     int32_t end = (value + 1) * task_desc.task_split_value * hidden_size;
     if (start >= size_) {
-      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1, ACLSHMEM_SIGNAL_ADD,
-                          target_pe);
+      int32_t credit = 1;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+      if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+        // The experimental tag keeps the same binary's original path available.
+        if (task_desc.extra_value_1 == 1) {
+          credit = EmptyTailCompletionCredit(value, single_expert_task_num, size_, send_data_size_);
+          if (credit == 0) {
+            return;
+          }
+        }
+      }
+#endif
+      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event,
+                          credit, ACLSHMEM_SIGNAL_ADD, target_pe);
       return;
     } else {
       if (end > size_) {
