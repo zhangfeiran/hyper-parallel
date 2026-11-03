@@ -34,10 +34,12 @@ import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import policy, autocalibration
 from hyper_parallel.core.expert_parallel.hot_replica.autocalibration import (
-    calibration_ids, fit_directory, fit_nonnegative_services, load_manifest, plan_features,
+    MEASUREMENT_CONTRACT, calibration_ids, fit_directory, fit_nonnegative_services, load_manifest, plan_features,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.calibration_catalog import external_profiles, runtime_contract
-from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
+from hyper_parallel.core.expert_parallel.hot_replica.cost import (
+    ExpertReplicaCostModel, _QuotaCostState, _effective_group_features,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.planner import _build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.residency import _ReplicaWeightCache
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
@@ -65,7 +67,7 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
             manifest = self.manifest(root)
             for key, value in (('ep_size', 3), ('top_k', 5), ('hidden_size', 0), ('checkpointed', False),
                                ('dtype', 'float32'), ('replica_caps', [True]), ('frames', 3),
-                               ('checkpoint_contract', 'unknown')):
+                               ('checkpoint_contract', 'unknown'), ('measurement_contract', 'legacy')):
                 with self.subTest(key=key):
                     payload = manifest | {key: value}
                     (root / 'model.json').write_text(json.dumps(payload))
@@ -182,12 +184,15 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
             for frame in range(manifest['frames']):
                 for sample in range(manifest['samples']):
                     records.append({'group_leader': 0, 'frame': frame, 'sample': sample,
+                        'measurement_contract': MEASUREMENT_CONTRACT,
                         'config': asdict(plan.config), 'source_counts': plan.logical_counts,
                         'slots': plan.slot_to_logical, 'dispatch': plan.dispatch_counts, 'rank_nodes': [0, 1],
                         'rank_phase_ms': [dict(forward=peak, recompute=peak, backward=peak)] * 2,
+                        'rank_component_ms': [400 if harmful and budget else peak * 3] * 2,
                         'wall_rank_max_ms': 400 if harmful and budget else peak * 3,
                         'profile_on': False, 'finite': True, 'cost_model_matched': bool(budget)})
             report = {'manifest': manifest, 'backend': 'push', 'budget': budget, 'completed': True,
+                'rank_nodes': [0, 1],
                 'world_size': 2, 'ep_members': [0, 1], 'soc_name': 'cpu-test',
                 'execution_signature': 'a' * 64, 'schedule': UNMAPPED_GUEST_SUFFIX_SCHEDULE,
                 'runtime_contract': runtime_contract(), 'records': records}
@@ -245,6 +250,84 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
             with self.assertRaises(SystemExit) as error:
                 autocalibration.main()
             self.assertEqual(error.exception.code, 20)
+
+    def test_effective_group_score_reaches_planner_and_quota_trials(self) -> None:
+        """A topology coefficient changes real admission, including the exact Python quota scorer."""
+        counts = ((100, 0, 0, 0), (0, 0, 0, 0))
+        options = dict(adaptive=True, target_load=50, receive_capacity=100, capacity_limit=100,
+                       _rank_nodes=(0, 1))
+        models = [ExpertReplicaCostModel(calibration_version=2, backend='push', hidden_size=16,
+            intermediate_size=8, ep_size=2, transport='shmem_signal_kernel_gradient_bands',
+            forward_ms=((0, 0.), (200, 200 / 3)), backward_ms=((0, 0.), (200, 200 / 3)),
+            weight_ms=0., gradient_ms=0., forward_repeats=2,
+            effective_group_ms=(0., 1., 0., penalty, 0., 0.), _rank_nodes=(0, 1)) for penalty in (10., 100.)]
+        with patch('hyper_parallel.core.expert_parallel.hot_replica.cost._rank_compute',
+                   side_effect=AssertionError('Effective group scoring cannot use the legacy native scorer')):
+            cheap = _build_expert_replica_plan(counts, 1, cost_model=models[0], **options)
+            expensive = _build_expert_replica_plan(counts, 1, cost_model=models[1], **options)
+        cheap.validate()
+        expensive.validate()
+        self.assertEqual(len(cheap.transfers), 1)
+        self.assertEqual(len(expensive.transfers), 0)
+        self.assertLess(models[0].estimate_ms(cheap), models[0].estimate_ms(expensive))
+        copies = [{expert: rows for expert, rows in zip(slots, rows_by_slot) if expert >= 0}
+                  for slots, rows_by_slot in zip(cheap.slot_to_logical, cheap.destination_counts)]
+        state = _QuotaCostState(models[0], copies, cheap.logical_counts, cheap.config)
+        for expert in list(copies[1]):
+            if expert // cheap.config.home_experts == 0:
+                copies[0][expert] += copies[1].pop(expert)
+        self.assertEqual(state.trial_score(0, 1, 0, (0., 0.)), models[0].estimate_ms(expensive))
+
+    def test_group_features_match_extracted_plan_and_require_topology(self) -> None:
+        """Offline and runtime features have identical task, row, link and token definitions."""
+        counts = ((100, 5, 0, 0), (0, 0, 5, 0))
+        plan = _build_expert_replica_plan(counts, 1, target_load=55, capacity_limit=105, _rank_nodes=(0, 1))
+        raw = dict(config=asdict(plan.config), source_counts=plan.logical_counts,
+                   slots=plan.slot_to_logical, dispatch=plan.dispatch_counts, rank_nodes=(0, 1))
+        copies = [{expert: count for expert, count in zip(slots, values) if expert >= 0}
+                  for slots, values in zip(plan.slot_to_logical, plan.destination_counts)]
+        expected = plan_features(raw)[0][0][:, [0, 1, 4, 5, 8, 9]].max(axis=0)
+        self.assertTrue(np.array_equal(_effective_group_features(copies, plan.logical_counts, 2, (0, 1)), expected))
+        with self.assertRaisesRegex(ValueError, 'measured EP topology'):
+            _effective_group_features(copies, plan.logical_counts, 2, ())
+
+    def test_cumulative_measurement_contract_retains_phase_max_diagnostic(self) -> None:
+        """Different critical ranks cannot turn the phase-max sum into an elapsed component duration."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = self.manifest(root)
+            self.observations(root / 'collect', manifest)
+            report = json.loads((root / 'collect/push-b1-group0.json').read_text())
+            row = report['records'][0]
+            row['rank_phase_ms'] = [dict(forward=100., recompute=10., backward=10.),
+                                    dict(forward=10., recompute=100., backward=10.)]
+            row['rank_component_ms'] = [121., 121.]
+            sample = autocalibration._samples([report], 1)[0]
+            self.assertEqual(sample['observed_ms'], 120.)
+            self.assertEqual(sample['component_rank_max_ms'], 121.)
+            self.assertEqual(sample['phase_rank_max_sum_ms'], 210.)
+            del row['measurement_contract']
+            with self.assertRaisesRegex(ValueError, 'fresh rank-cumulative'):
+                autocalibration._samples([report], 1)
+
+    def test_group_training_cv_identifies_services_without_holdout(self) -> None:
+        """Complete route families, including all repeat samples, stay in one TRAIN-only fold."""
+        rng = np.random.default_rng(17)
+        beta = np.array([.3, .8, .6, 1.2, .1, .5])
+        rows = []
+        for frame in range(12):
+            if frame % 3 == 2:
+                continue
+            for _ in range(3):
+                features = rng.uniform(.1, 4., (2, 4, 10))
+                observed = float(features[0][:, [0, 1, 4, 5, 8, 9]].max(axis=0) @ beta)
+                rows.append(dict(frame=frame, features=features, observed_ms=observed, rank_nodes=(0, 0, 1, 1)))
+        actual, report = autocalibration._fit_services(rows)
+        self.assertLess(float(np.linalg.norm(actual - beta)), .001)
+        self.assertLess(report['cross_validation']['relative_error_p95'], .001)
+        self.assertEqual(report['measurement_contract'], MEASUREMENT_CONTRACT)
+        with self.assertRaisesRegex(ValueError, 'TRAIN frames only'):
+            autocalibration._fit_services(rows + [rows[0] | {'frame': 2}])
 
     def test_catalog_checksum_environment_and_exact_signature_gates(self) -> None:
         """An external artifact cannot silently load for another execution or edited source."""

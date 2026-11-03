@@ -36,7 +36,9 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from hyper_parallel.core.activation_memory import checkpoint
 from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts, get_recompute_state
 from hyper_parallel.core.expert_parallel.hot_replica import policy, routing
-from hyper_parallel.core.expert_parallel.hot_replica.autocalibration import calibration_ids, load_manifest
+from hyper_parallel.core.expert_parallel.hot_replica.autocalibration import (
+    MEASUREMENT_CONTRACT, calibration_ids, load_manifest,
+)
 from hyper_parallel.core.expert_parallel.hot_replica.calibration_catalog import runtime_contract
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
@@ -150,6 +152,8 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
                     dist.barrier(group=group)
                     torch.npu.synchronize()
                     started = time.perf_counter()
+                    component_first = torch.npu.Event(enable_timing=True)
+                    component_first.record()
                     result = _checkpoint_operation(operation, values, probabilities,
                                                    contract=manifest['checkpoint_contract'])
                     backward_first = torch.npu.Event(enable_timing=True)
@@ -165,11 +169,15 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
                     phases = {name: sum(first.elapsed_time(last) for phase, first, last in events if phase == name)
                               for name in ('forward', 'recompute', 'backward')}
                     phases['backward'] = backward_first.elapsed_time(backward_last) - phases['recompute']
+                    component_ms = component_first.elapsed_time(backward_last)
                     if phases['backward'] <= 0:
                         raise RuntimeError('Invalid nonpositive backward duration after exact replay subtraction')
+                    if sum(phases.values()) > component_ms + .1 + .01 * component_ms:
+                        raise RuntimeError('Cumulative F/R/B exceeds the whole component interval')
                     finite = all(bool(torch.isfinite(value).all()) for value in
                                  (result, values.grad, probabilities.grad, *[p.grad for p in module.parameters()]))
                     local = {'phase_ms': phases, 'wall_ms': wall_ms, 'counts': local_counts, 'finite': finite,
+                             'component_ms': component_ms,
                              'signature': active['signature'], 'matched': active.get('cost_model_matched', False),
                              'planner_cpu_ms': active.get('planner_cpu_ms', 0.)}
                     gathered = [None] * size
@@ -187,10 +195,16 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
                             plan = _materialize(counts, copies, config, rank_nodes=nodes)
                         plan.validate()
                         records.append({'group_leader': global_rank, 'frame': frame, 'sample': sample,
+                            'measurement_contract': MEASUREMENT_CONTRACT,
                             'execution_signature': active['signature'], 'maximum_source_tokens': maximum_tokens,
                             'config': asdict(plan.config), 'source_counts': plan.logical_counts,
                             'slots': plan.slot_to_logical, 'dispatch': plan.dispatch_counts, 'rank_nodes': nodes,
                             'rank_phase_ms': [row['phase_ms'] for row in gathered],
+                            'rank_component_ms': [row['component_ms'] for row in gathered],
+                            'component_rank_max_ms': max(row['component_ms'] for row in gathered),
+                            'rank_cumulative_f_r_b_max_ms': max(sum(row['phase_ms'].values()) for row in gathered),
+                            'phase_rank_max_sum_ms': sum(max(row['phase_ms'][phase] for row in gathered)
+                                                        for phase in ('forward', 'recompute', 'backward')),
                             'wall_rank_max_ms': max(row['wall_ms'] for row in gathered),
                             'planner_cpu_ms': max(row['planner_cpu_ms'] for row in gathered),
                             'finite': True, 'profile_on': False,

@@ -41,6 +41,28 @@ def _default_schedule(backend: str, transport: str) -> str:
             'shmem_signal_kernel_gradient': 'fixed_queue_w13_first_v1'}.get(transport, 'fixed_queue_v1')
 
 
+def _effective_group_features(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
+                              home: int, nodes: tuple[int, ...]) -> tuple[float, ...]:
+    """Summarize group component maxima without treating synchronized rank waits as local work."""
+    if len(nodes) != len(copies):
+        raise ValueError('Effective group scoring requires the measured EP topology')
+    local, remote = [0] * len(copies), [0] * len(copies)
+    for target, experts in enumerate(copies):
+        for expert, rows in experts.items():
+            owner = expert // home
+            if rows and owner != target:
+                edges = local if nodes[owner] == nodes[target] else remote
+                edges[owner] += 1
+                edges[target] += 1
+    tasks, received, tokens = [], [], []
+    for rank, experts in enumerate(copies):
+        tasks.append(sum(rows > 0 for rows in experts.values()))
+        received.append(sum(experts.values()))
+        hits = sum(min(counts[rank][expert], rows) for expert, rows in experts.items())
+        tokens.append((sum(counts[rank]) + received[-1] - 2 * hits) / 2)
+    return max(tasks), max(received), max(local), max(remote), max(tokens), int(any(local) or any(remote))
+
+
 @dataclass(frozen=True)
 class ExpertReplicaCostModel:
     """Offline-calibrated millisecond costs for one shape and execution backend.
@@ -122,9 +144,17 @@ class ExpertReplicaCostModel:
     weight_fanout_ms: tuple[tuple[int, float, float], ...] = ()
     _rank_nodes: tuple[int, ...] = field(default=(), repr=False)
     critical_path: DeviceCriticalPathCalibration | None = None
+    effective_group_ms: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         """Freeze measured inputs and reject inconsistent calibration contracts."""
+        coefficients = tuple(self.effective_group_ms)
+        if coefficients:
+            if len(coefficients) != 6 or self.critical_path is not None:
+                raise ValueError('Effective group calibration requires six coefficients and no physical template')
+            for value in coefficients:
+                _nonnegative(value, 'Effective group milliseconds')
+        object.__setattr__(self, 'effective_group_ms', coefficients)
         if isinstance(self.critical_path, dict):
             object.__setattr__(self, 'critical_path', DeviceCriticalPathCalibration(**self.critical_path))
         if self.critical_path is not None:
@@ -340,6 +370,11 @@ class _QuotaCostState:
 
     def score(self, removed: int = 0) -> float:
         """Charge replay and replica-only scheduling work without assuming overlap."""
+        if self.model.effective_group_ms:
+            if removed:
+                raise ValueError('Effective group scoring requires final explicit quotas')
+            features = _effective_group_features(self.copies, self.counts, self.home, self.model._rank_nodes)
+            return sum(value * coefficient for value, coefficient in zip(features, self.model.effective_group_ms))
         if self.model.critical_path is not None:
             if removed:
                 raise ValueError('Critical-path scoring requires final explicit quotas')
@@ -361,7 +396,7 @@ class _QuotaCostState:
         # the native primitive's exact compute_ms contract.
         native = (_rank_compute(experts, self.counts[rank] if token_rate else None, self.home, rank,
                                 durations, self.model.forward_ms, self.model.backward_ms)
-                  if type(self.model) is ExpertReplicaCostModel else None)
+                  if type(self.model) is ExpertReplicaCostModel and not self.model.effective_group_ms else None)
         if native is None:
             for expert, rows in experts.items():
                 guest = int(expert // self.home != rank)
@@ -425,6 +460,8 @@ class _QuotaCostState:
         Returns:
             Separate forward/backward rank maxima for the trial quotas.
         """
+        if self.model.effective_group_ms:
+            return self.score()
         removed = int(not self.copies[target][expert])
         local_removed = int(bool(removed and self.model._rank_nodes
                                  and self.model._rank_nodes[owner] == self.model._rank_nodes[target]))

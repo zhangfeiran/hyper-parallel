@@ -33,38 +33,50 @@ frames, one warmup and three recorded samples per frame.
 
 The script owns collection, fitting, private model-in-loop verification and
 publication. All nodes and all worker ranks must complete each capture before
-the fitter starts. A peer failure stops the other local worker groups. Failed
-gates retain observations and logs, exit nonzero and publish no catalog.
+the fitter starts. A peer failure stops the other local worker groups. Quality
+rejection after complete collection exits20, reports `collection_complete: true`
+and `calibration_status: rejected`, and publishes no catalog. Runtime or input
+failures exit1. The outer launcher can continue explicitly with heuristic controls.
 
 ## Observation and fit semantics
 
 F/R events surround the whole public MegaMoE invocation, including prefetch,
 route preparation and output restoration. An outer backward event interval
 contains recompute and backward; subtracting the measured replay interval gives
-the remaining backward service. Maxima are taken separately for F, R and B. The
-events use rank-local stream clocks; no cross-device timestamp alignment is
-assumed. Component wall samples include the optimizer and are retained separately.
+the remaining backward service. The versioned measurement contract is
+`rank_cumulative_f_r_b_v2`: add F/R/B on each rank, then take the rank maximum.
+The old sum of three separate phase maxima is permanently retained as a diagnostic;
+different ranks can own these maxima, so their sum is not elapsed component time.
+A whole-component event stops after backward and before optimizer work. Every
+rank's cumulative F/R/B must fit inside that interval within timing tolerance.
+Host wall samples including the optimizer remain separate diagnostics. Events
+use rank-local stream clocks; no cross-device timestamp alignment is assumed.
 
-The first model is an empirical rank-local full-step service predictor. Convex
-nonnegative least squares fits all rank observations with an identifiable six
-term basis: active expert tasks, expert rows, local/remote matrix edges, token
-rows and active-path overhead. A training-only four term basis is considered if
-the richer basis is unidentifiable. A structurally impossible link class, such
-as inter-node copies for an entirely single-node EP group, is excluded. Every
-retained design must have full rank and bounded condition number.
+The model uses group component maxima for active expert tasks, expert rows,
+local/remote matrix edges, token rows and active-path overhead. Convex nonnegative
+least squares fits the cumulative-rank target. Basis selection uses TRAIN-only
+cross-validation, grouping the same route kind and source-size regime across
+all repeats, EP groups and B0/positive-cap observations. An unidentifiable basis
+is rejected in every fold. Structurally impossible link classes are excluded.
+The retained basis has full rank and bounded condition number. Cold observations
+are retained; the gain margin includes worst underprediction from grouped CV.
 
-The runtime legacy scorer encodes this effective full-step predictor with shared
-F/B terms. This allocation does not identify physical GEMM, gradient-band ready
-fractions, ACK services or overlap. The artifact explicitly makes no physical
-service or verified-overlap claim. Raw separate F/R/B measurements remain available
-for future richer models. No old DSV41 coefficient is scaled to the new model.
+The internal `effective_group_ms` field selects the same scorer for runtime
+admission and quota trials, including owner-only candidates. Its six nonnegative
+coefficients are empirical; they do not identify physical GEMM, ready/ACK services
+or overlap. New group tables use Python scoring because the legacy native scorer
+does not implement this aggregation; unrelated host primitives may remain native.
+Legacy row curves retain coverage and conservative lower-bound roles. Tables
+without this field preserve legacy behavior. No DSV41 coefficient is rescaled.
 
 Frame indices congruent to2 modulo3 are untouched holdouts. Publication requires
 held-out relative error, worst underprediction, and harmful false-admission gates,
 followed by another actual runtime capture loading only the candidate tables.
 Every non-balanced lookup must resolve the exact candidate; balanced owner-only
 bypass is recorded and allowed. Holdouts never refit coefficients. Failed fits
-can be rerun offline after improving the scripts using the retained capture.
+can be diagnosed offline using the retained capture. Old captures are never
+relabelled as v2 acceptance data. A fresh v2 collection and a separate fresh
+model-in-loop verification are required before publishing the new tables.
 
 ## Artifacts and matching
 

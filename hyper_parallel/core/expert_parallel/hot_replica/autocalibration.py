@@ -32,6 +32,8 @@ from .capacity import ExpertReplicaConfig
 from .cost import ExpertReplicaCostModel
 from .plan import ExpertExecutionPlan
 
+MEASUREMENT_CONTRACT = 'rank_cumulative_f_r_b_v2'
+
 
 def load_manifest(path: Path) -> dict[str, Any]:
     """Validate a model-owned manifest without importing the model or probing devices."""
@@ -46,10 +48,13 @@ def load_manifest(path: Path) -> dict[str, Any]:
     defaults = {'dispatch_modes': ['push', 'pull'], 'replica_caps': [1, 2, 6], 'dtype': 'bfloat16',
                 'gradient_dtype': 'float32', 'expert_weight_layout': 'EIO', 'swiglu_limit': None,
                 'residency_mode': 'force_normal_miss', 'checkpoint_contract': 'nonreentrant',
+                'measurement_contract': MEASUREMENT_CONTRACT,
                 'frames': 12, 'samples': 3, 'warmup': 1}
     result = defaults | value
     if result['checkpoint_contract'] not in ('reentrant', 'nonreentrant'):
         raise ValueError('checkpoint_contract must be reentrant or nonreentrant')
+    if result['measurement_contract'] != MEASUREMENT_CONTRACT:
+        raise ValueError('Automatic calibration requires fresh rank-cumulative F/R/B component timing')
     if (result['dtype'], result['gradient_dtype'], result['expert_weight_layout'], result['residency_mode']) != (
             'bfloat16', 'float32', 'EIO', 'force_normal_miss'):
         raise ValueError('Automatic calibration requires BF16/EIO, FP32 partials and force_normal_miss')
@@ -167,6 +172,8 @@ def _samples(reports: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]
         if report['budget'] != budget:
             continue
         for row in report['records']:
+            if row.get('measurement_contract') != MEASUREMENT_CONTRACT:
+                raise ValueError('Capture requires fresh rank-cumulative F/R/B component timing')
             if row.get('execution_signature', report['execution_signature']) != report['execution_signature']:
                 raise ValueError('Observation changed its live execution or token domain')
             if row.get('profile_on') is not False or not row.get('finite'):
@@ -179,7 +186,14 @@ def _samples(reports: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]
                                 + max(rank['recompute'] for rank in durations)) / 2,
                                max(rank['backward'] for rank in durations)])
             local_target = np.array([rank['forward'] + rank['recompute'] + rank['backward'] for rank in durations])
-            result.append(row | {'features': features, 'target': target, 'local_target': local_target, 'plan': plan})
+            component = np.array(row['rank_component_ms'])
+            if (component.shape != local_target.shape or not np.isfinite(component).all()
+                    or np.any(component <= 0) or np.any(local_target > component + .1 + .01 * component)):
+                raise ValueError('Cumulative F/R/B must fit inside each measured whole component interval')
+            result.append(row | {'features': features, 'target': target, 'local_target': local_target, 'plan': plan,
+                                 'observed_ms': float(max(local_target)),
+                                 'component_rank_max_ms': float(max(component)),
+                                 'phase_rank_max_sum_ms': float(2 * target[0] + target[1])})
     return result
 
 
@@ -197,39 +211,56 @@ def _candidate(manifest: dict[str, Any], report: dict[str, Any], budget: int,
         intra_node_weight_ms=float(beta[2] / 3), inter_node_weight_ms=float(beta[3] / 3),
         intra_node_gradient_ms=float(beta[2] / 3), inter_node_gradient_ms=float(beta[3] / 3),
         intra_node_backward_weight_ms=0., inter_node_backward_weight_ms=0.,
+        effective_group_ms=tuple(float(value) for value in beta), _rank_nodes=tuple(report['rank_nodes']),
         schedule=report['schedule'], minimum_gain_ms=margin, minimum_replica_gain_ms=margin)
     return {'selector': {'soc_name': report['soc_name'], 'num_experts': manifest['num_experts'],
                          'top_k': manifest['top_k'], 'execution_signature': report['execution_signature']},
             'model': asdict(model), 'budget': budget,
             'provenance': {'measurement_semantics': 'effective_fused_execution_coefficients',
+                           'measurement_contract': MEASUREMENT_CONTRACT,
                            'physical_service_claim': False, 'overlap_verified': False,
-                           'scope': 'Phase-shared effective full-step predictor; phase allocation is an encoding, '
+                           'scope': 'Group component maxima predict rank-cumulative F/R/B, '
                                     'not identified physical compute/band/ACK services'}}
 
 
 def _fit_services(train: list[dict[str, Any]]) -> tuple[np.ndarray, dict[str, Any]]:
-    """Choose an identifiable effective basis using training data alone."""
-    features = np.stack([row['features'][0][:, [0, 1, 4, 5, 8, 9]] for row in train])
-    target = np.concatenate([row['local_target'] for row in train])
+    """Select identifiable group-service components by grouped TRAIN-only cross-validation."""
+    if any(row['frame'] % 3 == 2 for row in train):
+        raise ValueError('Service fitting accepts TRAIN frames only')
+    features = np.stack([row['features'][0][:, [0, 1, 4, 5, 8, 9]].max(axis=0) for row in train])
+    target = np.array([row['observed_ms'] for row in train])
+    folds = np.array([row['frame'] % 4 + 4 * int(4 <= row['frame'] % 12 < 8) for row in train])
     nodes = train[0]['rank_nodes']
     possible = {2: len(set(nodes)) < len(nodes), 3: len(set(nodes)) > 1}
-    errors = []
-    for basis in ((0, 1, 2, 3, 4, 5), (1, 2, 3, 5)):
+    candidates, errors = [], []
+    bases = ((0, 1, 2, 3, 4, 5), (1, 2, 3, 5), (0, 1, 4, 5), (1, 4, 5),
+             (0, 1, 5), (1, 3, 4, 5), (0, 3, 4, 5))
+    for basis in bases:
         columns = [column for column in basis if possible.get(column, True)]
         try:
-            values, fit = fit_nonnegative_services(features[:, :, columns].reshape(-1, len(columns)), target)
+            predicted = np.zeros_like(target)
+            for fold in sorted(set(folds)):
+                fit_rows, valid_rows = folds != fold, folds == fold
+                values, _ = fit_nonnegative_services(features[fit_rows][:, columns], target[fit_rows])
+                predicted[valid_rows] = features[valid_rows][:, columns] @ values
+            relative = np.abs(predicted - target) / np.maximum(target, 1e-6)
+            cv = dict(relative_error_p95=float(np.quantile(relative, .95)),
+                      worst_underprediction_ms=float(max(target - predicted)))
+            candidates.append((cv['relative_error_p95'], len(columns), columns, cv))
         except ValueError as error:
             errors.append(str(error))
-            continue
-        beta = np.zeros(6)
-        beta[columns] = values
-        group_target = np.array([2 * row['target'][0] + row['target'][1] for row in train])
-        group_error = np.max(features @ beta, axis=1) - group_target
-        fit.update(basis=columns, parameterization='rank_local_phase_shared_full_step_nnls',
-                   separate_phase_services_identified=False, rejected_training_bases=errors)
-        fit['train_group_absolute_error_p95_ms'] = float(np.quantile(np.abs(group_error), .95))
-        return beta, fit
-    raise ValueError(f'No identifiable effective service basis: {errors}')
+    if not candidates:
+        raise ValueError(f'No identifiable TRAIN cross-validation basis: {errors}')
+    _, _, columns, cv = min(candidates, key=lambda row: (row[0], row[1], row[2]))
+    values, fit = fit_nonnegative_services(features[:, columns], target)
+    beta = np.zeros(6)
+    beta[columns] = values
+    fit.update(basis=columns, parameterization='group_component_max_nnls_v1',
+               measurement_contract=MEASUREMENT_CONTRACT, cross_validation=cv,
+               cross_validation_rankings=[dict(basis=row[2], **row[3]) for row in sorted(candidates)],
+               separate_phase_services_identified=False, rejected_training_bases=errors)
+    fit['train_group_absolute_error_p95_ms'] = fit['train_absolute_error_p95_ms']
+    return beta, fit
 
 
 def validate_profile(payload: dict[str, Any], samples: list[dict[str, Any]], baseline: list[dict[str, Any]],
@@ -241,7 +272,7 @@ def validate_profile(payload: dict[str, Any], samples: list[dict[str, Any]], bas
     for row in samples:
         effective = ExpertReplicaCostModel(**(payload['model'] | {'_rank_nodes': tuple(row['rank_nodes'])}))
         predicted = effective.estimate_ms(row['plan'])
-        observed = 2 * row['target'][0] + row['target'][1]
+        observed = row['observed_ms']
         errors.append(abs(predicted - observed) / max(observed, 1e-6))
         under.append(observed - predicted)
         key = row['group_leader'], row['frame'], row['sample']
@@ -249,7 +280,7 @@ def validate_profile(payload: dict[str, Any], samples: list[dict[str, Any]], bas
             raise ValueError('Missing matched B0 holdout')
         owner = reference[key]
         predicted_gain = effective.estimate_ms(owner['plan']) - predicted
-        observed_gain = owner['wall_rank_max_ms'] - row['wall_rank_max_ms']
+        observed_gain = owner['component_rank_max_ms'] - row['component_rank_max_ms']
         if predicted_gain > model.minimum_gain_ms and observed_gain < -model.minimum_gain_ms:
             harmful.append({'frame': row['frame'], 'predicted_gain_ms': predicted_gain,
                             'observed_wall_gain_ms': observed_gain})
@@ -325,7 +356,8 @@ def fit_directory(manifest: dict[str, Any], source: Path, output: Path, *, verif
                 beta, fit = _fit_services(train)
                 host = max(row.get('planner_cpu_ms', 0.) for row in train)
                 margin = max(.05, 2 * max(fit['train_absolute_error_p95_ms'],
-                                         fit['train_group_absolute_error_p95_ms']) + host)
+                                         fit['train_group_absolute_error_p95_ms']) + host,
+                             max(0., fit.get('cross_validation', {}).get('worst_underprediction_ms', 0.)) + host)
                 coverage = max(max(max(rank) for rank in row['plan'].destination_counts) for row in train)
                 payload = _candidate(manifest, selected[0], budget, beta, margin, coverage)
                 payload['fit'] = fit
