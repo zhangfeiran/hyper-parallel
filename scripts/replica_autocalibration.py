@@ -29,6 +29,9 @@ import time
 from typing import Any
 
 
+QUALITY_REJECTED_EXIT = 20
+
+
 def _write(path: Path, value: Any) -> None:
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(value, indent=2) + '\n')
@@ -161,6 +164,7 @@ def main() -> None:
     node_root.mkdir(parents=True, exist_ok=True)
     (node_root / 'started').mkdir()
     terminal = 1
+    outcome = None
     try:
         for phase in ('collect', 'fit', 'verify', 'publish'):
             if phase in ('collect', 'verify'):
@@ -184,13 +188,37 @@ def main() -> None:
                     except BaseException:
                         _write(args.output / f'{phase}-done.json', {'exit_status': 1, 'node': node})
                         raise
-                    _write(args.output / f'{phase}-done.json', {'exit_status': status, 'node': node})
-                _wait([args.output / f'{phase}-done.json'], timeout)
-        terminal = 0
+                    rejected = status == QUALITY_REJECTED_EXIT
+                    _write(args.output / f'{phase}-done.json', {
+                        'exit_status': 0 if rejected else status, 'worker_exit_status': status,
+                        'quality_rejected': rejected, 'node': node})
+                phase_result = _wait([args.output / f'{phase}-done.json'], timeout)[0]
+                if phase_result.get('quality_rejected'):
+                    if node == 0:
+                        if (args.output / 'models/catalog.json').exists():
+                            raise RuntimeError('Rejected calibration unexpectedly published a catalog')
+                        _write(args.output / 'outcome.json', {
+                            'exit_status': 0, 'status': 'rejected', 'collection_complete': True,
+                            'catalog_published': False, 'rejected_phase': phase,
+                            'worker_exit_status': QUALITY_REJECTED_EXIT,
+                            'report': str(args.output / 'models/fit-report.json'),
+                            'runtime_environment': {}})
+                    outcome = _wait([args.output / 'outcome.json'], timeout)[0]
+                    break
+        if outcome is None:
+            if node == 0:
+                _write(args.output / 'outcome.json', {
+                    'exit_status': 0, 'status': 'validated', 'collection_complete': True,
+                    'catalog_published': True, 'calibration_directory': str(args.output / 'models'),
+                    'runtime_environment': {
+                        'HYPER_PARALLEL_REPLICA_CALIBRATION_DIR': str(args.output / 'models')}})
+            outcome = _wait([args.output / 'outcome.json'], timeout)[0]
+        terminal = QUALITY_REJECTED_EXIT if outcome['status'] == 'rejected' else 0
     finally:
         _write(node_root / 'terminal.json', {'exit_status': terminal, 'node': node})
-    print(json.dumps({'status': 'validated', 'calibration_directory': str(args.output / 'models'),
-                      'runtime_environment': {'HYPER_PARALLEL_REPLICA_CALIBRATION_DIR': str(args.output / 'models')}}))
+    print(json.dumps(outcome))
+    if terminal == QUALITY_REJECTED_EXIT:
+        raise SystemExit(QUALITY_REJECTED_EXIT)
 
 
 if __name__ == '__main__':
