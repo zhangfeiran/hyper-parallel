@@ -157,6 +157,25 @@ class TestQuotaAdmission(unittest.TestCase):
         self.assertIs(first.plan, second.plan)
         self.assertTrue(second.plan_reused)
 
+    def test_native_counts_reach_planner_without_rebuilding_host_rows(self) -> None:
+        """Native-agreed source rows stay invocation owned and unchanged through full planning."""
+        counts = [4096] + [4096 * 7 // 383 + int(index < 4096 * 7 % 383) for index in range(383)]
+        ids, gathered = self.gathered(counts)
+        original = tuple(map(tuple, gathered.host_counts))
+        with (patch.object(routing, 'dist') as distributed,
+              patch.object(routing, '_plan_replica_route', wraps=routing._plan_replica_route) as build):
+            distributed.is_initialized.return_value = True
+            distributed.get_world_size.return_value = 64
+            distributed.get_rank.return_value = 0
+            route = routing.prepare_replica_route(
+                ids, ExpertReplicaConfig(384, 64, 2), compact_home=True,
+                minimum_replica_rows=1024, minimum_load_reduction=.4,
+                dynamic_header=(0, 4096, 31), _auto_capacity_factor=1.25,
+                _capacity_budget=Mock(return_value=300000), _gathered_counts=gathered)
+        self.assertEqual(id(build.call_args.args[0]), id(gathered.host_counts))
+        self.assertEqual(tuple(map(tuple, gathered.host_counts)), original)
+        self.assertTrue(route.plan.transfers)
+
     def test_changed_policy_or_totals_recompute_prepared_quotas(self) -> None:
         """A previously affordable proposal cannot override a changed target or source histogram."""
         counts = ((100, 0, 0, 0), (0, 0, 0, 0))

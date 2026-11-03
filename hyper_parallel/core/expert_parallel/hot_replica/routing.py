@@ -602,14 +602,12 @@ def prepare_replica_route(
     # split sizing; no per-expert device-to-host reads occur below.
     if _gathered_counts is None:
         host = matrix.cpu().tolist()
+        if any(row[config.num_experts] for row in host):
+            raise ValueError("hot replication requires in-range, distinct expert IDs per token")
+        logical_host = [row[:config.num_experts] for row in host]
     else:
         logical_host = (_gathered_counts.host_counts if _gathered_counts.host_counts is not None
                         else logical_counts.cpu().tolist())
-        host = [list(counts) + [0] + list(summary[:3])
-                for counts, summary in zip(logical_host, _gathered_counts.source_summary)]
-    if any(row[config.num_experts] for row in host):
-        raise ValueError("hot replication requires in-range, distinct expert IDs per token")
-    logical_host = [row[:config.num_experts] for row in host]
     # Every planner must use the same bound when source ranks have unequal or zero rows.
     maximum_tokens = max(sum(row) for row in logical_host) // top_k
     target_load, receive_capacity = _automatic_capacity_options(
@@ -636,9 +634,17 @@ def prepare_replica_route(
     if max(plan.destination_loads) > upper:
         raise RuntimeError("replica planner exceeded the theoretical receive bound")
     # Distinct logical Top-K counts bound every physical split, including home-only plans.
-    dynamic_summary = (None if dynamic_header is None else tuple(
-        tuple(row[config.num_experts + 1:]) + (sum(counts), min(counts), max(counts), load)
-        for row, counts, load in zip(host, logical_host, plan.destination_loads)))
+    dynamic_summary = None
+    if dynamic_header is not None:
+        if _gathered_counts is None:
+            dynamic_summary = tuple(
+                tuple(row[config.num_experts + 1:]) + (sum(counts), min(counts), max(counts), load)
+                for row, counts, load in zip(host, logical_host, plan.destination_loads))
+        else:
+            # Native agreement already validated these source controls and
+            # statistics. Only destination loads change with replica placement.
+            dynamic_summary = tuple(tuple(row[:6]) + (load,) for row, load in
+                                    zip(_gathered_counts.source_summary, plan.destination_loads))
     if compact_home and not plan.transfers:
         return ReplicaRoute(plan, topk_ids, _home_route_counts(plan, rank, logical_counts),
                             rank, group, home_only=True, dynamic_summary=dynamic_summary, plan_reused=reused,
