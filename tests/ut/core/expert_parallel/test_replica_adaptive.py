@@ -105,6 +105,31 @@ class TestAdaptiveReplicas(unittest.TestCase):
         self.assertTrue(plan.transfers)
         self.assertEqual(max(plan.destination_loads), 75)
 
+    def test_over_capacity_seed_can_complete_within_the_hard_and_receive_limits(self) -> None:
+        """A thin seed is not a capacity proof when its existing guests can take more rows."""
+        counts = (tuple([100] * 6 + [0] * 18),) + ((0,) * 24,) * 3
+        model = self.model(weight_ms=100, backward_weight_ms=0)
+        for hard_limit in (300, 400):
+            with self.subTest(hard_limit=hard_limit):
+                plan = build_expert_replica_plan(counts, 1, adaptive=True, cost_model=model,
+                                                target_load=150, capacity_limit=hard_limit, receive_capacity=300)
+                plan.validate()
+                self.assertEqual(plan.logical_counts, counts)
+                self.assertEqual(plan.destination_loads, (300, 100, 100, 100))
+                self.assertEqual(plan.replica_slots_used, (0, 1, 1, 1))
+                self.assertEqual(model.estimate_ms(plan), 900.)
+
+    def test_unmeasured_completed_seed_is_a_legal_capacity_fallback(self) -> None:
+        """Lack of measured coverage cannot hide a legal mandatory completion."""
+        counts = (tuple([100] * 6 + [0] * 18),) + ((0,) * 24,) * 3
+        model = self.model(forward_ms=((0, 0), (75, 75)), backward_ms=((0, 0), (75, 75)))
+        plan = build_expert_replica_plan(counts, 1, adaptive=True, cost_model=model,
+                                        target_load=150, capacity_limit=300, receive_capacity=200)
+        plan.validate()
+        self.assertEqual(plan.logical_counts, counts)
+        self.assertEqual(plan.destination_loads, (300, 100, 100, 100))
+        self.assertEqual(plan.replica_slots_used, (0, 1, 1, 1))
+
     def test_soft_capacity_does_not_force_optional_growth(self) -> None:
         """A cheaper owner exceeding the resident reservation cannot replace a fitting replica plan."""
         counts = [[100] * 3 + [0] * 9] + [[0] * 12] * 3
@@ -252,7 +277,7 @@ class TestAdaptiveReplicas(unittest.TestCase):
         """A hard capacity failure must not silently add slots or return an oversized dispatch."""
         counts = [[100] * 3 + [0] * 9] + [[0] * 12] * 3
         with self.assertRaisesRegex(ValueError, 'cannot satisfy capacity_limit'):
-            build_expert_replica_plan(counts, 1, adaptive=True, cost_model=self.model(), capacity_limit=75)
+            build_expert_replica_plan(counts, 1, adaptive=True, cost_model=self.model(), capacity_limit=74)
 
     def test_replay_model_and_receive_limits_are_independent(self) -> None:
         """Repeated forward costs can alter admission while physical capacity remains fixed."""

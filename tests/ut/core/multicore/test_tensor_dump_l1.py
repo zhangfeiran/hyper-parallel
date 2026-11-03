@@ -266,6 +266,7 @@ class TestL1DumpExport(unittest.TestCase):
             task_document = json.loads(task_path.read_text(encoding="utf-8"))
 
             self.assertEqual(manifest["level"], "L1")
+            self.assertEqual(manifest["taskQueuePolicy"], "full_queue_for_tensor_dump")
             self.assertEqual(manifest["schemaVersion"], 4)
             self.assertEqual(manifest["tensorSerialization"], "torch.save")
             self.assertEqual(manifest["tensorFileLayout"], "stage_only")

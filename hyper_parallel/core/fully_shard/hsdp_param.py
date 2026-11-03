@@ -739,6 +739,7 @@ class HSDPParamV2:
             # mutates the sharded local shard alone (the non-dim-0 unpack path
             # materializes a contiguous copy, so a stale ``.data`` would not see
             # the update).
+            self._mark_unsharded_materialization()
             return
 
         unsharded_param = torch.as_strided(
@@ -757,6 +758,14 @@ class HSDPParamV2:
             unsharded_param,
             requires_grad=self.sharded_param.requires_grad,
         )
+        self._mark_unsharded_materialization()
+
+    def _mark_unsharded_materialization(self) -> None:
+        """Invalidate value caches without changing preserved autograd versions."""
+        value = self._unsharded_param
+        if isinstance(value, DTensor):
+            value = value.to_local()
+        value._hp_materialization_token = object()
 
     def to_sharded(self) -> None:
         """Install the sharded parameter on managed modules and update state."""

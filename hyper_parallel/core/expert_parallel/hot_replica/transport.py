@@ -55,7 +55,9 @@ def prefetch_weights(weights: tuple[torch.Tensor, ...], route: ReplicaRoute,
     A backward may pass the opaque weight_generation saved from its own forward
     view, after autograd checks the saved parameter versions. Every rank must use
     the same invocation sequence. A provider accepts reuse only while that exact
-    generation remains resident; local weight-version cache decisions are unsafe.
+    generation remains resident; receiver-local cache decisions are unsafe.
+    Signal owners may skip unchanged payload puts using global slot-write history,
+    while preserving every current credit, readiness publication and acknowledgement.
     The internal overwrite flag requires complete-K stores to every active guest
     gradient before publication. Other consumers retain zero initialization.
     """

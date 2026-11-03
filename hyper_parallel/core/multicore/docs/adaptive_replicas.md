@@ -1,5 +1,8 @@
 # 有上限的专家副本自适应
 
+For the optional exact-signature device dependency scorer, see
+[Replica device critical-path model](replica_critical_path.md).
+
 `replica_slots_per_rank` 表示每个 rank 的物理 guest 槽位上限 `B_max`。
 大于零时默认根据实际直方图自适应选择副本；零表示 owner-only。
 业务代码不传入成本模型，也不需要设置 adaptive 开关。

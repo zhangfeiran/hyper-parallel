@@ -142,6 +142,7 @@ class MegaMoeWorkspace:
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
     replica_runtime_images: dict[int, tuple[Any, bytes, Any]] = field(default_factory=dict, repr=False)
+    replica_task_prefixes: dict[int, tuple[Any, int]] = field(default_factory=dict, repr=False)
     in_use: bool = False
     closing: bool = False
     used: bool = False
@@ -246,6 +247,7 @@ class MegaMoeWorkspace:
         for _, _, image in self.replica_runtime_images.values():
             image.untyped_storage().resize_(0)
         self.replica_runtime_images.clear()
+        self.replica_task_prefixes.clear()
         self.replica_provider = None
         if self.replica_inbox is not None:
             self._allocate_replica_storage(spec)
@@ -457,6 +459,7 @@ class MegaMoeWorkspace:
         for _, _, image in self.replica_runtime_images.values():
             image.untyped_storage().resize_(0)
         self.replica_runtime_images.clear()
+        self.replica_task_prefixes.clear()
         for field_name in ("gmm_workspace", "swiglu_grad_workspace"):
             tensor = getattr(self, field_name)
             if tensor is None:

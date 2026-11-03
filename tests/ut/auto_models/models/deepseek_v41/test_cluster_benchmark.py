@@ -373,6 +373,28 @@ class TestClusterSummary(unittest.TestCase):
         self.assertEqual(report["cases"]["native"]["measured_physical_peak_mib"], 3000)
         self.assertTrue(report["comparisons"]["push_vs_native"]["performance_eligible"])
 
+    def test_missing_route_rows_require_explicit_uninstrumented_mode(self) -> None:
+        """Feature: Pure end-to-end timing.
+        Description: Remove route observations with and without the explicit all-rank opt-out.
+        Expectation: Keep audited timing only for an explicit opt-out and report unknown token rows.
+        """
+        for disabled in (True, False):
+            for rank in range(2):
+                folder = self.root / 'native' / f'rank{rank}'
+                result = json.loads((folder / 'result.json').read_text())
+                result['disable_route_diagnostics'] = disabled
+                for row in result['steps_detail']:
+                    row['moe_input_rows'] = {}
+                (folder / 'result.json').write_text(json.dumps(result))
+                (folder / 'steps.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in result['steps_detail']))
+            if disabled:
+                case, _ = _summarize_case(self.root, self.root / 'nodes', 1, 2, 3, 1, 'native')
+                self.assertIsNone(case['actual_token_min_max'])
+                self.assertEqual(case['median_seconds'], 1.5)
+            else:
+                with self.assertRaisesRegex(RuntimeError, 'Missing route observations'):
+                    _summarize_case(self.root, self.root / 'nodes', 1, 2, 3, 1, 'native')
+
     def test_tail_steps_cannot_change_clean_time_or_hbm(self) -> None:
         """A slow profiler/export tail is retained in artifacts and excluded from clean statistics."""
         for rank in range(2):

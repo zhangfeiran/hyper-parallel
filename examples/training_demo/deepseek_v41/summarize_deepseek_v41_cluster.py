@@ -165,6 +165,9 @@ def _summarize_case(run_root: Path, node_root: Path, nodes: int, cards_per_node:
         }
     actual_tokens = [value for result in records for row in result["steps_detail"][measured_slice]
                      for value in row["moe_input_rows"].values()]
+    route_diagnostics_disabled = all(result.get("disable_route_diagnostics", False) for result in records)
+    if not actual_tokens and not route_diagnostics_disabled:
+        raise RuntimeError(f"Missing route observations without explicit opt-out: {label}")
     measured_rows = [row for result in records for row in result['steps_detail'][measured_slice]]
     case = {
         "status": "complete", "moe_timing": _moe_statistics(records, warmup_steps),
@@ -173,7 +176,8 @@ def _summarize_case(run_root: Path, node_root: Path, nodes: int, cards_per_node:
         "measured_rank_max_seconds": times,
         "mean_seconds": statistics.mean(times), "median_seconds": statistics.median(times),
         "minimum_seconds": min(times), "maximum_seconds": max(times),
-        "actual_token_min_max": [min(actual_tokens), max(actual_tokens)],
+        "actual_token_min_max": [min(actual_tokens), max(actual_tokens)] if actual_tokens else None,
+        "route_diagnostics_disabled": route_diagnostics_disabled,
         "peak_allocated_bytes": max(result["peak_allocated_bytes"] for result in records),
         "peak_reserved_bytes": max(result["peak_reserved_bytes"] for result in records),
         "measured_peak_allocated_bytes": (max(row['peak_allocated_bytes'] for row in measured_rows)

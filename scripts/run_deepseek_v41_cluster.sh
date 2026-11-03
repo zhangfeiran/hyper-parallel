@@ -13,8 +13,9 @@ CLEAN_INCLUDE_PULL=${CLEAN_INCLUDE_PULL:-0}
 CLEAN_PROFILE_TAIL=${CLEAN_PROFILE_TAIL:-0}
 CPU_PLACEMENT_ABBA=${CPU_PLACEMENT_ABBA:-0}
 CLEAN_NUMA_TAIL=${CLEAN_NUMA_TAIL:-0}
+REPLICA_E2E=${REPLICA_E2E:-0}
 DSV41_CRASH_CAPTURE=${DSV41_CRASH_CAPTURE:-0}
-for flag in CLEAN_INCLUDE_PULL CLEAN_PROFILE_TAIL CPU_PLACEMENT_ABBA CLEAN_NUMA_TAIL DSV41_CRASH_CAPTURE; do
+for flag in CLEAN_INCLUDE_PULL CLEAN_PROFILE_TAIL CPU_PLACEMENT_ABBA CLEAN_NUMA_TAIL DSV41_CRASH_CAPTURE REPLICA_E2E; do
     [[ ${!flag} == 0 || ${!flag} == 1 ]] || { echo "ERROR: Invalid ${flag}" >&2; exit 1; }
 done
 [[ ${DSV41_CRASH_CAPTURE} == 0 || ${CLEAN_NUMA_TAIL} == 1 ]] || {
@@ -55,7 +56,10 @@ CPU_PLACEMENT_ABBA=1 compares inherited CPUs and NUMA CPU partitions, Native/Pus
 CLEAN_NUMA_TAIL=1 binds CPUs before initialization, measures steps 21-100, and profiles Level0 steps 103-104.
 CASE_SYNC_TIMEOUT=600 bounds the cleanup barrier after workers have exited.
 HBM_INTERVAL=1 samples physical HBM and process ownership on every node.
-ACTIVATION_CHECKPOINT=full. ATTENTION_RECOMPUTE_TIER=all; expert replicas are disabled.
+ACTIVATION_CHECKPOINT=full. ATTENTION_RECOMPUTE_TIER=all.
+REPLICA_SLOTS_PER_RANK=0 by default; positive caps enable adaptive expert replicas.
+REPLICA_TRANSPORT=p2p or shmem_signal_kernel_gradient_bands (MegaMoe only).
+Use run_dsv41_replica_e2e_cluster.sh for nine selectable, uninstrumented B0/B1/B6 comparisons.
 Full checkpointing recomputes decoder layers and all attention roles.
 PROFILE=1 selects packed native/push only and profiles one local rank per node.
 PROFILE_START_STEP=3 PROFILE_END_STEP=5 (exclusive); profiler timings are diagnostic.
@@ -111,7 +115,20 @@ done
 [[ ${WARMUP_STEPS} =~ ^[0-9]+$ && ${WARMUP_STEPS} -lt ${TRAIN_ITERS} ]] || die "Invalid WARMUP_STEPS"
 [[ ${MODALITY} == vlm || ${MODALITY} == text ]] || die "Invalid MODALITY"
 [[ ${EMPTY_CACHE_STEPS} =~ ^[0-9]+$ ]] || die "Invalid EMPTY_CACHE_STEPS"
-[[ ${REPLICA_SLOTS_PER_RANK:-0} == 0 ]] || die "Expert replicas are not supported on this branch"
+REPLICA_SLOTS_PER_RANK=${REPLICA_SLOTS_PER_RANK:-0}
+REPLICA_TRANSPORT=${REPLICA_TRANSPORT:-p2p}
+[[ ${REPLICA_SLOTS_PER_RANK} =~ ^[0-9]+$ ]] || die "Invalid REPLICA_SLOTS_PER_RANK"
+case ${REPLICA_TRANSPORT} in p2p|shmem_signal_kernel_gradient|shmem_signal_kernel_gradient_bands) ;;
+    *) die "Invalid REPLICA_TRANSPORT";; esac
+[[ ${CLEAN_MEGA_ABBA} == 0 || ${REPLICA_SLOTS_PER_RANK} == 0 ]] || \
+    die "Use REPLICA_E2E for replica comparisons; CLEAN_MEGA_ABBA is B0-only"
+if [[ ${REPLICA_E2E} == 1 ]]; then
+    [[ ${PROFILE}:${MOE_TIMING}:${MEGA_AB}:${CLEAN_MEGA_ABBA} == 0:0:0:0 ]] || die "Replica E2E requires pure timing"
+    [[ ${MODALITY}:${ACTIVATION_CHECKPOINT}:${ENGRAM_STORAGE_BACKEND}:${ATTENTION_RECOMPUTE_TIER} == text:full:host:all ]] || \
+        die "Replica E2E requires text, full recompute and Host Engram"
+    (( NNODES == 8 && NUM_CARDS == 16 && EP_SIZE == 64 && NUM_HIDDEN_LAYERS == 8 )) || \
+        die "Replica E2E requires safe8 text, 128 dies and EP64"
+fi
 [[ ${MOE_TIMING} == 0 || ${MOE_TIMING} == 1 ]] || die "Invalid MOE_TIMING"
 [[ ${CASE_SYNC_TIMEOUT} =~ ^[1-9][0-9]*$ ]] || die "Invalid CASE_SYNC_TIMEOUT"
 [[ ${HBM_INTERVAL} =~ ^[1-9][0-9]*$ ]] || die "HBM_INTERVAL must be a positive integer"
@@ -126,6 +143,7 @@ WORLD_SIZE=$((NNODES * NUM_CARDS))
 EDP_SHARD_SIZE=${EDP_SHARD_SIZE:-$((WORLD_SIZE / EP_SIZE))}
 [[ ${EDP_SHARD_SIZE} =~ ^[1-9][0-9]*$ ]] || die "Invalid EDP_SHARD_SIZE"
 (( WORLD_SIZE / EP_SIZE % EDP_SHARD_SIZE == 0 )) || die "EDP_SHARD_SIZE must divide WORLD_SIZE/EP"
+[[ ${REPLICA_E2E} == 0 || ${EDP_SHARD_SIZE} == 2 ]] || die "Replica E2E requires expert FSDP2"
 (( NUM_HIDDEN_LAYERS >= 4 && NUM_HIDDEN_LAYERS <= 40 )) || die "Language depth must be in [4, 40]"
 (( VISION_NUM_HIDDEN_LAYERS <= 32 )) || die "Vision depth must be in [1, 32]"
 (( MASTER_PORT_BASE + 223 < 65536 )) || die "MASTER_PORT_BASE is too large"
@@ -198,7 +216,7 @@ if [[ ${DRY_RUN} != 1 ]]; then
     NATIVE_LIB=${HYPER_ROOT}/build/native/payload/hyper_parallel/core/multicore/lib
     set +u
     source "${NATIVE_LIB}/set_env.bash"
-    if [[ ${DSV41_CRASH_CAPTURE} == 1 ]]; then
+    if [[ ${DSV41_CRASH_CAPTURE} == 1 || ${REPLICA_E2E} == 1 ]]; then
         FUSED_ATTN_ENV_FILE=${FUSED_ATTN_ENV_FILE:-${BUNDLE_ROOT}/fused_ops/vendors/dsv41_fused_transformer/bin/set_env.bash}
         [[ -f ${FUSED_ATTN_ENV_FILE} ]] || die "Missing fused attention operator environment: ${FUSED_ATTN_ENV_FILE}"
         source "${FUSED_ATTN_ENV_FILE}"
@@ -262,7 +280,13 @@ cann = Path(os.environ['ASCEND_HOME_PATH']) / 'share/info/runtime/version.info'
 if 'Version=9.1.0' not in cann.read_text().splitlines():
     raise RuntimeError(f'Expected CANN 9.1.0: {cann}')
 _load_native()
-if os.environ.get('DSV41_CRASH_CAPTURE') == '1':
+if os.environ.get('REPLICA_E2E') == '1':
+    from hyper_parallel.core.expert_parallel.hot_replica.host import _native_backend
+    host = _native_backend()
+    if host is None:
+        raise RuntimeError('Replica E2E requires the compiled host planner; rebuild the editable source')
+    print(f'Replica host primitives: ABI={host.abi_version()} path={host.__file__}', flush=True)
+if os.environ.get('DSV41_CRASH_CAPTURE') == '1' or os.environ.get('REPLICA_E2E') == '1':
     import cann_ops_transformer
     from hyper_parallel.components.functional.lightning_indexer import _load_indexer_op as load_indexer
     from hyper_parallel.components.functional.sparse_flash_mla import _load_attention_ops as load_attention
@@ -289,6 +313,17 @@ fi
 export MASTER_ADDR NODE_RANK
 export PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER:-1}
 export TORCH_SHOW_CPP_STACKTRACES=${TORCH_SHOW_CPP_STACKTRACES:-1}
+if [[ ${REPLICA_E2E} == 1 ]]; then
+    export HYPER_ROOT NNODES NUM_CARDS EP_SIZE EDP_SHARD_SIZE MASTER_PORT_BASE
+    export RUN_ROOT MODEL_DIR DATA ENGRAM NATIVE_LIB SHMEM_HOST TRAIN_ITERS WARMUP_STEPS
+    replica_options=()
+    if [[ ${DRY_RUN} == 1 ]]; then
+        replica_options+=(--dry-run)
+        export PYTHONPATH=${HYPER_ROOT}
+        PYTHON_BIN=${BASE_PYTHON}
+    fi
+    exec "${PYTHON_BIN}" -m examples.training_demo.deepseek_v41.deepseek_v41_replica_e2e "${replica_options[@]}"
+fi
 if [[ ${CLEAN_MEGA_ABBA} == 1 ]]; then
     export HYPER_ROOT NNODES NUM_CARDS EP_SIZE EDP_SHARD_SIZE MASTER_PORT_BASE
     export RUN_ROOT MODEL_DIR DATA ENGRAM NATIVE_LIB SHMEM_HOST
@@ -368,6 +403,8 @@ for index in "${indices[@]}"; do
         --model-dir "${MODEL_DIR}" --engram-assets "${ENGRAM}" --data "${DATA}"
         --random-init-seed "${RANDOM_INIT_SEED}" --native-lib "${NATIVE_LIB}" --output "${RUN_ROOT}/${packing}/${label}"
         --backend "${backend}" --dispatch-mode "${mode}")
+    command+=(--replica-slots-per-rank "${REPLICA_SLOTS_PER_RANK}")
+    if [[ ${backend} == megamoe ]]; then command+=(--replica-transport "${REPLICA_TRANSPORT}"); fi
     [[ ${MOE_TIMING} == 0 ]] || command+=(--moe-timing)
     if [[ ${MEGA_AB} == 1 ]]; then
         mega_kernels=off
@@ -376,7 +413,7 @@ for index in "${indices[@]}"; do
         command+=(--mega-kernels "${mega_kernels}")
     fi
     echo "Case=${packing}/${label} world=${WORLD_SIZE} EP=${EP_SIZE} FSDP=${WORLD_SIZE} EDP_SHARD=${EDP_SHARD_SIZE}"
-    echo "Depth=${NUM_HIDDEN_LAYERS}+${VISION_NUM_HIDDEN_LAYERS} E384 TP1 CP1 MBS1 maxS4096 B=0 modality=${MODALITY}"
+    echo "Depth=${NUM_HIDDEN_LAYERS}+${VISION_NUM_HIDDEN_LAYERS} E384 TP1 CP1 MBS1 maxS4096 B=${REPLICA_SLOTS_PER_RANK} modality=${MODALITY}"
     echo "Engram=${ENGRAM_STORAGE_BACKEND} activation_checkpoint=${ACTIVATION_CHECKPOINT} decoder_attention_tier=${ATTENTION_RECOMPUTE_TIER}"
     echo "Warmup=${WARMUP_STEPS} measured=$((TRAIN_ITERS - WARMUP_STEPS)) actual_tokens=true"
     printf '%q ' "${command[@]}"; printf '\n'

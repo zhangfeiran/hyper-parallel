@@ -211,7 +211,8 @@ class TestMegaMoeFunction(unittest.TestCase):
         spec = SimpleNamespace(replica_slots_per_rank=1, hidden_size=2, intermediate_size=1,
                                top_k=1, dispatch_mode="pull" if pull else "push", auto_tokens=False, expert_weight_layout="EIO")
         runtime = SimpleNamespace(normal_tensor=None)
-        plan = SimpleNamespace(spec=spec, fwd_diagnostics=MegaKernelDiagnostics(runtime),
+        plan = SimpleNamespace(spec=spec, fwd_task_prefixes=(), bwd_task_prefixes=(),
+                               fwd_diagnostics=MegaKernelDiagnostics(runtime),
                                bwd_diagnostics=MegaKernelDiagnostics(runtime), reuse_backward_dispatch=False)
         route = SimpleNamespace(replica_route=replica, expert_capacity=2, group_list=torch.tensor([2]))
         for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
@@ -279,6 +280,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         context = Mock()
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
+        context.plan.spec.replica_slots_per_rank = 0
         context.replica_route = None
         context.workspace.replica_provider = None
         execution = function_module._BackwardExecution(
@@ -550,7 +552,7 @@ class TestMegaMoeFunction(unittest.TestCase):
                                intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
                                dispatch_mode="pull" if pull else "push", expert_weight_layout="EIO", auto_tokens=False)
-        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=reuse)
+        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=reuse, fwd_task_prefixes=(), bwd_task_prefixes=())
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)

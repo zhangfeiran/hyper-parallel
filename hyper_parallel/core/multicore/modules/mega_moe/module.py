@@ -18,10 +18,12 @@ from __future__ import annotations
 
 __all__ = ["MegaMoeExperts"]
 
+import hashlib
 import math
 import struct
 from collections.abc import Mapping
 from dataclasses import replace
+from functools import lru_cache
 from typing import Any, Literal
 
 import torch
@@ -36,8 +38,12 @@ from hyper_parallel.core.expert_parallel.hot_replica.capacity import (
     _integer,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.policy import (
-    _calibration_available, _cost_model_enabled, _runtime_cost_model, _soc_name,
+    _calibration_available, _cost_model_enabled, _critical_path_available, _critical_path_identity,
+    _runtime_cost_model, _soc_name,
 )
+from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
+from hyper_parallel.core.expert_parallel.hot_replica.critical_path import execution_fingerprint
+from hyper_parallel.core.multicore._loader import get_multicore_paths
 from hyper_parallel.core.expert_parallel.hot_replica.topology import _local_node_identity, _node_ids
 from hyper_parallel.core.expert_parallel.hot_replica.device import (
     validate_planner_backend,
@@ -54,6 +60,7 @@ from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capaci
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
+from .inactive_tasks import UNMAPPED_GUEST_SUFFIX_SCHEDULE
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
@@ -68,6 +75,33 @@ from .workspace import MegaMoeWorkspace
 
 ExpertWeightLayout = Literal["EIO", "EOI"]
 _EXPERT_WEIGHT_LAYOUTS = frozenset(("EIO", "EOI"))
+
+
+@lru_cache(maxsize=1)
+def _critical_native_fingerprint() -> str:
+    """Hash the deployed adapter and vendor kernels once, outside steady-state scoring."""
+    vendor, adapter = get_multicore_paths()
+    digest = hashlib.sha256(adapter.read_bytes())
+    for path in sorted(vendor.rglob('*')):
+        if path.is_file() and path.suffix in ('.so', '.o', '.json'):
+            digest.update(str(path.relative_to(vendor)).encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _critical_execution_signature(module: Any, resources: Any) -> str:
+    """Bind calibration to the actual static execution and normalized EP topology."""
+    metadata = {name: getattr(module, name) for name in
+                ('dispatch_mode', 'hidden_size', 'intermediate_size', 'ep_size', 'num_experts', 'top_k',
+                 'replica_transport', 'replica_slots_per_rank')}
+    metadata.update(weight_layout=resources.spec.expert_weight_layout, swiglu_limit=resources.spec.swiglu_limit,
+                    dispatch_split=resources.spec.dispatch_split, combine_split=resources.spec.combine_split,
+                    rank_nodes=resources.rank_nodes, checkpointed=get_recompute_state() is not None,
+                    native_payload=_critical_native_fingerprint(), policy_abi='dynamic_tokens_v4',
+                    template='replica_ready_ack_v1', weight_dtype='bfloat16', partial_dtype='float32')
+    if module.replica_slots_per_rank:
+        metadata['runtime_schedule'] = UNMAPPED_GUEST_SUFFIX_SCHEDULE
+    return execution_fingerprint(metadata)
 
 
 def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
@@ -243,6 +277,10 @@ class _MegaMoeExecutionResources:
         """Price bounded optional receive growth before committing the selected plan."""
         return self.heap_manager.replica_receive_capacity(self.workspace, tokens, reservation)
 
+    def critical_path_receive_capacity(self, tokens: int, reservation: int) -> int:
+        """Use committed storage or an explicit hard Heap budget for calibrated candidates."""
+        return self.heap_manager.replica_receive_capacity(self.workspace, tokens, reservation, use_hard_budget=True)
+
     def can_close(self) -> bool:
         """Report whether neither an active call nor a backward graph needs buffers."""
         return self._workspace_closed or self.workspace.can_close()
@@ -254,12 +292,14 @@ class _MegaMoeExecutionResources:
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
                   "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens",
-                  "_replica_cost_model_enabled",
+                  "_replica_cost_model_enabled", "_replica_critical_path_identity",
                   "replica_slots_per_rank", "replica_transport")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v4", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications),
                     getattr(self, 'soc_name', ''))
+        if any(spec.get('_replica_critical_path_identity') for spec in specifications):
+            manifest += (_critical_native_fingerprint(),)
         # Resource groups must have the same order as their symmetric allocations.
         manifest += (_local_node_identity(),)
         manifests = [None] * self.spec.ep_size
@@ -488,6 +528,12 @@ class MegaMoeExperts(MulticoreModule):
         specification["auto_tokens"] = True
         if replica_slots_per_rank:
             specification['_replica_cost_model_enabled'] = self._cost_model_enabled
+            if self._cost_model_enabled and _critical_path_available(
+                    dispatch_mode, hidden_size, intermediate_size, ep_size,
+                    replica_transport, num_experts, top_k):
+                specification['_replica_critical_path_identity'] = _critical_path_identity(
+                    dispatch_mode, hidden_size, intermediate_size, ep_size,
+                    replica_transport, num_experts, top_k)
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -686,9 +732,15 @@ class MegaMoeExperts(MulticoreModule):
         gathered: _GatheredReplicaCounts | None = None,
     ) -> ReplicaRoute:
         """Resolve the unchanged bounded policy only when placement is needed."""
+        selection = ({'execution_schedule': UNMAPPED_GUEST_SUFFIX_SCHEDULE}
+                     if self.replica_slots_per_rank else {})
+        if self._cost_model_enabled and _critical_path_available(
+                self.dispatch_mode, self.hidden_size, self.intermediate_size, self.ep_size,
+                self.replica_transport, self.num_experts, self.top_k):
+            selection['execution_signature'] = _critical_execution_signature(self, resources)
         cost_model = _runtime_cost_model(self._cost_model_enabled, self.dispatch_mode,
             self.hidden_size, self.intermediate_size, self.ep_size, self.replica_transport,
-            self.num_experts, self.top_k, hidden.device)
+            self.num_experts, self.top_k, hidden.device, **selection)
         target_load = self.replica_target_load
         if target_load is None and self.dispatch_mode != "pull" and not resources.spec.auto_tokens:
             target_load = initial_receive_capacity(self._resource_group.specification)
@@ -710,7 +762,8 @@ class MegaMoeExperts(MulticoreModule):
                               if self.dispatch_mode != "pull" and not resources.spec.auto_tokens else None),
             _auto_capacity_factor=(self.initial_capacity_factor
                                    if resources.spec.auto_tokens and self.dispatch_mode != "pull" else None),
-            _capacity_budget=(resources.replica_receive_capacity
+            _capacity_budget=((resources.critical_path_receive_capacity if cost_model.critical_path is not None
+                               else resources.replica_receive_capacity)
                               if resources.spec.auto_tokens and self.dispatch_mode != "pull"
                               and cost_model is not None else None),
             _trusted_counts=counts, _gathered_counts=gathered,

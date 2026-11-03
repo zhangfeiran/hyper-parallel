@@ -24,6 +24,7 @@ from torch.utils.checkpoint import DefaultDeviceType
 from hyper_parallel.core.activation_memory import checkpoint
 from hyper_parallel.core.expert_parallel.hot_replica import (
     ExpertReplicaConfig,
+    _metadata,
     routing,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.planner import _build_expert_replica_plan as build_expert_replica_plan
@@ -140,8 +141,9 @@ class TestReplicaRouting(unittest.TestCase):
         self.addCleanup(DefaultDeviceType.set_device_type, previous)
         config = ExpertReplicaConfig(4, 2, 1)
         group, observations = object(), []
-        for tokens, peer_tokens in ((4, 4), (0, 4), (3, 0), (0, 0), (7, 2), (2, 7)):
-            with self.subTest(tokens=tokens, peer_tokens=peer_tokens):
+        cases = ((4, 4), (0, 4), (3, 0), (0, 0), (7, 2), (2, 7))
+        for tokens, peer_tokens, reuse in ((tokens, peer, reuse) for reuse in (False, True) for tokens, peer in cases):
+            with self.subTest(tokens=tokens, peer_tokens=peer_tokens, reuse=reuse):
                 ids = torch.zeros((tokens, 1), dtype=torch.int64)
                 matrix = torch.tensor([[tokens, 0, 0, 0, 0], [peer_tokens, 0, 0, 0, 0]])
                 capacity = [1]
@@ -155,6 +157,7 @@ class TestReplicaRouting(unittest.TestCase):
                     return source.sin().square()
 
                 with (patch.object(routing, "dist") as distributed,
+                      patch.object(_metadata, "_metadata_reuse_enabled", return_value=reuse),
                       patch.object(routing, "_gather_replica_counts", side_effect=lambda *_: matrix.clone()) as gather,
                       patch.object(routing, "build_expert_replica_plan", wraps=build_expert_replica_plan) as build):
                     distributed.is_initialized.return_value = True
@@ -169,7 +172,8 @@ class TestReplicaRouting(unittest.TestCase):
                 self.assertFalse(before[0])
                 self.assertTrue(after[0])
                 self.assertIs(before[1], after[1])
-                self.assertNotEqual(before[2].data_ptr(), after[2].data_ptr())
+                self.assertEqual(before[2].data_ptr() == after[2].data_ptr(), reuse)
+                torch.testing.assert_close(before[2], after[2])
                 torch.testing.assert_close(value.grad, 2*value.detach().sin()*value.detach().cos())
 
     def test_count_payload_retains_global_validation_flags(self) -> None:

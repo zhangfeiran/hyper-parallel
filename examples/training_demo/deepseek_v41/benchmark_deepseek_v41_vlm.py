@@ -158,11 +158,21 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
     moe_override["local_compute_fn"] = {
         "_target_": compute + "deepseek_v41_ep_compute_fn", "use_grouped_gemm": True,
     }
+    replica_slots = getattr(args, "replica_slots_per_rank", 0)
+    replica_transport = getattr(args, "replica_transport", "p2p")
+    if replica_slots < 0:
+        raise ValueError("replica_slots_per_rank must be nonnegative")
+    if args.backend == "owner_ep" and replica_slots:
+        if replica_transport != "p2p":
+            raise ValueError("Native DSV replicas require replica_transport=p2p")
+        moe_override["local_compute_fn"]["replica_slots_per_rank"] = replica_slots
     if args.backend == "megamoe":
         replacement = {
             "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts",
             "dispatch_mode": args.dispatch_mode,
         }
+        if replica_slots:
+            replacement.update(replica_slots_per_rank=replica_slots, replica_transport=replica_transport)
         if args.dispatch_mode == "push" and args.capacity_factor is not None:
             replacement["initial_capacity_factor"] = args.capacity_factor
         recipe["plan_overrides"].insert(0, {
@@ -259,13 +269,18 @@ class _BatchIdentity:
 class _RouteDiagnostics:
     """Record actual source token rows without retaining activations."""
 
-    def __init__(self, model: torch.nn.Module) -> None:
-        """Attach observations to each routed-plus-shared MoE boundary."""
+    def __init__(self, model: torch.nn.Module, *, enabled: bool = True) -> None:
+        """Attach optional observations to each routed-plus-shared MoE boundary.
+
+        Args:
+            model: Training model containing routed MoE boundaries.
+            enabled: Register no route hooks when pure end-to-end timing is requested.
+        """
         self.token_rows: dict[str, int] = {}
         self.input_identity: _BatchIdentity | None = None
         self.hooks = [module.register_forward_pre_hook(self._record_rows(name))
                       for name, module in model.named_modules()
-                      if name.endswith(".mlp") and hasattr(module, "gate")]
+                      if enabled and name.endswith(".mlp") and hasattr(module, "gate")]
 
     def _record_rows(self, name: str) -> Any:
         def hook(_module: torch.nn.Module, inputs: tuple) -> None:
@@ -320,7 +335,7 @@ def _step(trainer: Any, iterator: Any, step: int, work: Path,
     return row
 
 
-def _arguments() -> argparse.Namespace:
+def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--engram-assets", required=True)
@@ -328,6 +343,11 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("owner_ep", "megamoe"), required=True)
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
     parser.add_argument("--capacity-factor", type=float)
+    parser.add_argument("--replica-slots-per-rank", type=int, default=0,
+                        help="Adaptive expert replica cap; zero retains owner-only execution")
+    parser.add_argument("--replica-transport", default="p2p",
+                        choices=("p2p", "shmem_signal_kernel_gradient", "shmem_signal_kernel_gradient_bands"))
+    parser.add_argument("--disable-route-diagnostics", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--modality", choices=("text", "vlm"), default="vlm")
     parser.add_argument("--empty-cache-steps", type=int, default=1)
@@ -363,7 +383,11 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--native-lib", type=Path)
     parser.add_argument("--output", required=True)
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.replica_slots_per_rank < 0:
+        parser.error("replica-slots-per-rank must be nonnegative")
+    if args.backend == "owner_ep" and args.replica_slots_per_rank and args.replica_transport != "p2p":
+        parser.error("native replicas require --replica-transport p2p")
     if args.empty_cache_steps < 0:
         parser.error("empty-cache-steps must be nonnegative")
     if not 0 <= args.warmup_steps < args.steps:
@@ -444,7 +468,8 @@ def main() -> None:
     dist.barrier()
     trainer.on_train_begin()
     torch.npu.reset_peak_memory_stats()
-    diagnostics = _RouteDiagnostics(trainer.base.model)
+    diagnostics = _RouteDiagnostics(
+        trainer.base.model, enabled=not getattr(args, "disable_route_diagnostics", False))
     if args.record_input_identity:
         diagnostics.input_identity = _BatchIdentity(trainer)
     timing_class = ModuleTiming if args.mega_kernels is not None else MoeTiming

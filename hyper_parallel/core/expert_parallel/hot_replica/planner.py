@@ -26,6 +26,7 @@ from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
 from .cost import ExpertReplicaCostModel, _QuotaCostState, refine_replica_quotas
 from .topology import _validate_rank_nodes
+from .host import _validate_counts
 
 
 def _counts_matrix(counts: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:
@@ -33,6 +34,8 @@ def _counts_matrix(counts: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ..
     rows = tuple(tuple(row) for row in counts)
     if not rows or not rows[0]:
         raise ValueError("counts_by_source must be a nonempty rectangular matrix")
+    if _validate_counts(rows):
+        return rows
     for row in rows:
         if len(row) != len(rows[0]):
             raise ValueError("counts_by_source must be rectangular")
@@ -165,18 +168,27 @@ def _pruning_capacity(counts: tuple[tuple[int, ...], ...], loads: list[int],
 
 
 def _replacement_rows(copies: list[dict[int, int]], loads: list[int], home: int, target: int,
-                      expert: int, rows: int, limit: int) -> list[tuple[int, int, int]] | None:
+                      expert: int, rows: int, limit: int,
+                      copies_by_owner: list[list[tuple[int, int]]]) -> list[tuple[int, int, int]] | None:
     """Concentrate necessary work in existing copies before removing a small copy."""
     owner = expert // home
     needed = max(loads[owner] + rows - limit, 0)
     if not needed:
         return []
+    if not copies_by_owner:
+        # Direct removals need no search. Once consolidation is needed, its
+        # index remains complete because pruning never creates guest slots.
+        copies_by_owner.extend([] for _ in copies)
+        for rank, row in enumerate(copies):
+            for logical, count in row.items():
+                logical_owner = logical // home
+                if logical_owner != rank and count > 0:
+                    copies_by_owner[logical_owner].append((rank, logical))
     available = dict(copies[owner])
     available[expert] += rows
-    headroom = [limit - load + (rows if rank == target else 0) for rank, load in enumerate(loads)]
-    existing = sorted((-count, rank, logical) for rank, row in enumerate(copies) if rank != owner
-                      for logical, count in row.items() if logical // home == owner and count > 0
-                      and (rank, logical) != (target, expert))
+    existing = sorted((-copies[rank][logical], rank, logical) for rank, logical in copies_by_owner[owner]
+                      if copies[rank].get(logical, 0) > 0 and (rank, logical) != (target, expert))
+    headroom = {rank: limit - loads[rank] + (rows if rank == target else 0) for _, rank, _ in existing}
     replacements = []
     for _, rank, logical in existing:
         if not needed:
@@ -201,11 +213,13 @@ def _prune_small_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, .
     current = [sum(row.values()) for row in copies]
     candidates = sorted((rows, target, expert) for target, row in enumerate(copies)
                         for expert, rows in row.items() if expert // home != target and 0 < rows < minimum_rows)
+    copies_by_owner = []
     for _, target, expert in candidates:
         rows = copies[target].get(expert, 0)
         if not 0 < rows < minimum_rows:
             continue
-        replacements = _replacement_rows(copies, current, home, target, expert, rows, limit)
+        replacements = _replacement_rows(copies, current, home, target, expert, rows, limit,
+                                         copies_by_owner)
         if replacements is None:
             continue
         owner = expert // home
@@ -399,60 +413,95 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
 
     def score(copies: list[dict[int, int]]) -> float | None:
         """Exclude candidates outside measured compute coverage."""
-        if max(rows for row in copies for rows in row.values()) > measured:
+        coverage = measured
+        if model.critical_path is not None and not any(
+                rows and expert // config.home_experts != rank
+                for rank, row in enumerate(copies) for expert, rows in row.items()):
+            coverage = model.critical_path.owner_coverage
+        if max(rows for row in copies for rows in row.values()) > coverage:
             return None
         return _QuotaCostState(model, copies, counts, config, durations).score()
 
     best = home if max(loads) <= resident else None
     best_score = score(home) if best is not None else None
     margin = max(model.minimum_gain_ms, model.minimum_replica_gain_ms or 0)
+    baseline_score = best_score
+    if model.critical_path is not None:
+        margin = max(margin, 2 * model.critical_path.uncertainty_ms)
+        if best_score is not None:
+            baseline_score = model.critical_path.estimate(model, home, counts, config, baseline=True).total_ms
     average = sum(loads) / config.ep_size
     rates = [min(duration / rows for rows, duration in table if rows)
              for table in (model.forward_ms, model.backward_ms)]
     optimistic = (model.forward_repeats * (rates[0] * average + model.planner_overhead_ms
                                          + model.replica_overhead_ms) + rates[1] * average)
+    # The old separable lower bound does not describe shared resource queues.
+    if model.critical_path is not None:
+        optimistic = float('-inf')
+
+    def improves(value: float | None) -> bool:
+        if value is None:
+            return False
+        reference = best_score
+        if baseline_score is not None and model.critical_path is not None:
+            reference = min(baseline_score, best_score) if best_score is not None else baseline_score
+        return reference is None or value + margin < reference
     if best_score is not None and best_score <= optimistic + margin:
         return best, (best_score, optimistic)
     fallback = (max(loads), 0, home) if max(loads) <= limit else None
     edges = _balanced_edges(loads, totals, config.home_experts)
     completed_copies = None
     completed_score = None
+    deferred = []
     for budget in range(1, min(config.replica_slots_per_rank, config.home_experts) + 1):
         candidate_config = ExpertReplicaConfig(config.num_experts, config.ep_size, budget)
         copies = _bounded_copies(loads, totals, candidate_config, edges=edges)
         peak = max(sum(row.values()) for row in copies)
         guests = sum(expert // config.home_experts != rank for rank, row in enumerate(copies) for expert in row)
-        if peak > limit:
-            continue
-        if fallback is None or (peak, guests) < fallback[:2]:
+        overflow = peak > limit and model.critical_path is None
+        if peak <= limit and (fallback is None or (peak, guests) < fallback[:2]):
             fallback = peak, guests, copies
         if peak <= resident:
             candidate_score = score(copies)
-            if candidate_score is not None and (best_score is None or candidate_score + margin < best_score):
+            if improves(candidate_score):
                 best, best_score = copies, candidate_score
         # The bounded skeleton deliberately keeps thin guest quotas. Admission
         # must also compare the completed load policy before rejecting replicas.
-        previous_completed = completed_copies
+        # Complete overflowing seeds independently, preserving the original
+        # feasible candidate chain and its gain-margin comparisons.
+        previous_completed = None if overflow else completed_copies
         completed = [dict(row) for row in (copies if previous_completed is None else previous_completed)]
         _improve_copies(completed, candidate_config, min(target, resident))
         completed_peak = max(sum(row.values()) for row in completed)
         ceiling = min(limit, max(receive_capacity or 0, completed_peak)) if receive_capacity is not None else limit
         _prune_small_copies(completed, counts, loads, candidate_config, minimum_replica_rows, ceiling)
-        completed_copies = completed
+        if not overflow:
+            completed_copies = completed
         completed_peak = max(sum(row.values()) for row in completed)
+        if completed_peak <= limit:
+            completed_guests = sum(expert // config.home_experts != rank and bool(rows)
+                                   for rank, row in enumerate(completed) for expert, rows in row.items())
+            if fallback is None or (completed_peak, completed_guests) < fallback[:2]:
+                fallback = completed_peak, completed_guests, completed
         if completed_peak <= resident:
             # More slots can leave the completion unchanged. Preserve insertion
             # order as well as quotas because it determines floating-point sums.
             unchanged = (previous_completed is not None and completed == previous_completed
                          and all(tuple(row) == tuple(previous) for row, previous in zip(completed, previous_completed)))
             candidate_score = completed_score if unchanged else score(completed)
-            completed_score = candidate_score
-            if candidate_score is not None and (best_score is None or candidate_score + margin < best_score):
-                best, best_score = completed, candidate_score
+            if overflow:
+                deferred.append((completed, candidate_score))
+            else:
+                completed_score = candidate_score
+                if improves(candidate_score):
+                    best, best_score = completed, candidate_score
         if best_score is not None and best_score <= optimistic + margin:
             break
+    for completed, candidate_score in deferred:
+        if improves(candidate_score):
+            best, best_score = completed, candidate_score
     if best_score is not None:
-        return best, (best_score, optimistic)
+        return best, None if model.critical_path is not None else (best_score, optimistic)
     if fallback is None:
         raise ValueError("Adaptive replica cap cannot satisfy capacity_limit")
     return fallback[2], None
@@ -605,6 +654,10 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
         def refine(copies: list[dict[int, int]],
                    bounds: tuple[float, float] | None) -> list[dict[int, int]]:
             """Apply the same pruning and admission before comparing final placements."""
+            # Every candidate was scored with the complete device resource graph.
+            # Incremental two-rank scores cannot account for shared queue changes.
+            if cost_model is not None and cost_model.critical_path is not None:
+                return copies
             peak = max(sum(row.values()) for row in copies)
             ceiling = min(limit, max(receive_capacity or 0, peak)) if receive_capacity is not None else limit
             if cost_model is not None:

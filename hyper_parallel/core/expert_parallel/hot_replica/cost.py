@@ -22,13 +22,23 @@ from dataclasses import dataclass, field
 from functools import cached_property
 
 from .capacity import ExpertReplicaConfig, _integer
+from .critical_path import DeviceCriticalPathCalibration
 from .plan import ExpertExecutionPlan
 from .topology import _validate_rank_nodes
+from .host import _ordered_compute, _rank_compute
 
 
 def _nonnegative(value: float, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be a finite nonnegative number")
+
+
+def _default_schedule(backend: str, transport: str) -> str:
+    """Identify the original calibrated queue contract for one backend."""
+    if backend == 'native':
+        return 'native_grouped_v1'
+    return {'shmem_signal_kernel_gradient_bands': 'fixed_queue_gradient_bands_v1',
+            'shmem_signal_kernel_gradient': 'fixed_queue_w13_first_v1'}.get(transport, 'fixed_queue_v1')
 
 
 @dataclass(frozen=True)
@@ -72,13 +82,15 @@ class ExpertReplicaCostModel:
             outgoing forward copies. Different experts and incoming copies are charged
             separately. Mixed links use a conservative weighted combination of endpoints.
         _rank_nodes: Internal immutable EP-rank node labels, bound during runtime setup.
+        critical_path: Optional exact-signature device dependency calibration. It
+            replaces residual-based scoring with physical services and resource queues.
 
     Tables start at (0, 0), use nondecreasing times and cover the intended expert
     row counts. Out-of-range plans retain the original policy. Every EP rank
     must use identical calibration data. This is an approximate cost model,
     not a prediction guarantee or runtime calibration/weight cache.
-    Missing link classes retain uniform costs; physical gradient bandwidth must
-    not replace the exposed residual of an overlapping fused gradient schedule.
+    Missing link classes retain uniform costs. Legacy scoring uses exposed
+    gradient residuals; critical-path scoring requires separate physical services.
     """
 
     calibration_version: int
@@ -109,19 +121,30 @@ class ExpertReplicaCostModel:
     inter_node_backward_weight_ms: float | None = None
     weight_fanout_ms: tuple[tuple[int, float, float], ...] = ()
     _rank_nodes: tuple[int, ...] = field(default=(), repr=False)
+    critical_path: DeviceCriticalPathCalibration | None = None
 
     def __post_init__(self) -> None:
         """Freeze measured inputs and reject inconsistent calibration contracts."""
+        if isinstance(self.critical_path, dict):
+            object.__setattr__(self, 'critical_path', DeviceCriticalPathCalibration(**self.critical_path))
+        if self.critical_path is not None:
+            if not isinstance(self.critical_path, DeviceCriticalPathCalibration):
+                raise ValueError('critical_path must contain a matching device calibration')
+            if len(self.critical_path.communication_domains) != self.ep_size:
+                raise ValueError('Critical-path communication domains must match EP size')
+            if self.backend not in ('push', 'pull') or self.transport != 'shmem_signal_kernel_gradient_bands':
+                raise ValueError('Critical-path template requires Push/Pull SHMEM gradient bands')
         if isinstance(self.calibration_version, bool) or self.calibration_version != 2:
             raise ValueError("Regenerate replica calibration with calibration_version=2")
-        expected_schedule = ("native_grouped_v1" if self.backend == "native" else
-                             "fixed_queue_gradient_bands_v1" if
-                             self.transport == "shmem_signal_kernel_gradient_bands" else
-                             "fixed_queue_w13_first_v1" if self.transport == "shmem_signal_kernel_gradient" else
-                             "fixed_queue_v1")
-        if self.schedule is not None and self.schedule != expected_schedule:
+        expected_schedule = _default_schedule(self.backend, self.transport)
+        schedules = (expected_schedule,)
+        if expected_schedule == 'fixed_queue_gradient_bands_v1':
+            schedules += ('fixed_queue_unmapped_guest_suffix_v1',)
+        if self.schedule is not None and self.schedule not in schedules:
             raise ValueError("Replica calibration schedule does not match the execution")
-        object.__setattr__(self, "schedule", expected_schedule)
+        if self.schedule == 'fixed_queue_unmapped_guest_suffix_v1' and self.critical_path is not None:
+            raise ValueError('Critical-path template does not support the unmapped guest schedule')
+        object.__setattr__(self, "schedule", self.schedule or expected_schedule)
         if self.gradient_dtype != "float32":
             raise ValueError("Replica cost calibration requires float32 weight partials")
         if self.backend not in ("native", "push", "pull") or not isinstance(self.transport, str) or not self.transport:
@@ -243,6 +266,14 @@ class ExpertReplicaCostModel:
         right_rows, right_ms = table[index]
         return left_ms + (right_ms - left_ms) * (rows - left_rows) / (right_rows - left_rows)
 
+    def _phase_inputs(self, experts: dict[int, int], home: int, rank: int,
+                      backward: bool, owner: tuple | None) -> tuple | None:
+        """Prepare ordered inputs only for the concrete model's interpolation contract."""
+        if type(self) is not ExpertReplicaCostModel:
+            return None
+        compute = self.backward_ms if backward else self.forward_ms
+        return _ordered_compute(experts, home, rank, compute, compute if owner is None else owner, owner is None)
+
     def estimate_ms(self, plan: ExpertExecutionPlan) -> float:
         """Score separate phase bottlenecks, excluding invariant optimizer work.
 
@@ -274,6 +305,9 @@ class _QuotaCostState:
         self.copies = copies
         self.counts = counts
         self.home = config.home_experts
+        self.config = config
+        if model.critical_path is not None:
+            return
         self.backward_weight_ms = model.weight_ms if model.backward_weight_ms is None else model.backward_weight_ms
         self.link_costs = model._link_costs[:2] if model._rank_nodes and len(set(model._link_costs)) > 1 else None
         self.durations = {} if durations is None else durations
@@ -305,6 +339,10 @@ class _QuotaCostState:
 
     def score(self, removed: int = 0) -> float:
         """Charge replay and replica-only scheduling work without assuming overlap."""
+        if self.model.critical_path is not None:
+            if removed:
+                raise ValueError('Critical-path scoring requires final explicit quotas')
+            return self.model.critical_path.estimate(self.model, self.copies, self.counts, self.config).total_ms
         host = (self.model.planner_overhead_ms
                 + (self.model.replica_overhead_ms if self.transfer_edges > removed else 0.0))
         return (self.model.forward_repeats * (max(value[0] for value in self.costs) + host)
@@ -318,16 +356,24 @@ class _QuotaCostState:
         token_rate = self.model.token_ms_per_row
         forward, backward = [0.0, 0.0], [0.0, 0.0]
         local = 0
-        for expert, rows in experts.items():
-            guest = int(expert // self.home != rank)
-            duration = durations.get(rows)
-            if duration is None:
-                duration = self.model.compute_ms(rows), self.model.compute_ms(rows, backward=True)
-                durations[rows] = duration
-            forward[guest] += duration[0]
-            backward[guest] += duration[1]
-            if token_rate:
-                local += min(self.counts[rank][expert], rows)
+        # Subclasses may override interpolation; only the concrete model has
+        # the native primitive's exact compute_ms contract.
+        native = (_rank_compute(experts, self.counts[rank] if token_rate else None, self.home, rank,
+                                durations, self.model.forward_ms, self.model.backward_ms)
+                  if type(self.model) is ExpertReplicaCostModel else None)
+        if native is None:
+            for expert, rows in experts.items():
+                guest = int(expert // self.home != rank)
+                duration = durations.get(rows)
+                if duration is None:
+                    duration = self.model.compute_ms(rows), self.model.compute_ms(rows, backward=True)
+                    durations[rows] = duration
+                forward[guest] += duration[0]
+                backward[guest] += duration[1]
+                if token_rate:
+                    local += min(self.counts[rank][expert], rows)
+        else:
+            forward, backward, local = [native[0]], [native[1]], native[2]
         # Without measured link concurrency or queue-prefix windows, neither
         # full duplex nor whole-home compute can hide these transfers safely.
         ready = transfers * self.model.weight_ms

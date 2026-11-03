@@ -247,8 +247,8 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 24)
-        self.assertEqual(layout.aiv_required_records, 4)
+        self.assertEqual(layout.aic_required_records, 26)
+        self.assertEqual(layout.aiv_required_records, 6)
         self.assertEqual(layout.aic_record_capacity, 32)
         self.assertEqual(layout.aiv_record_capacity, 16)
         self.assertEqual(layout.buffer_size, 53760)
@@ -263,7 +263,7 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
 
         layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 344)
+        self.assertEqual(layout.aic_required_records, 346)
         self.assertEqual(layout.aic_record_capacity, 352)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",

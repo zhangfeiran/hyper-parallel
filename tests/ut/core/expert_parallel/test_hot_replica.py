@@ -25,6 +25,7 @@ import torch
 from hyper_parallel.core.expert_parallel.hot_replica import (
     ExpertReplicaConfig,
     build_expert_replica_plan,
+    planner,
     transport,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.routing import (
@@ -111,6 +112,28 @@ class TestHotReplica(unittest.TestCase):
                 self.assertEqual(len(plan.transfers), 1)
                 self.assertLessEqual(max(plan.destination_loads), upper)
                 self.assertGreater(max(plan.destination_loads), 8192)
+
+    def test_copy_consolidation_uses_updated_guest_rows_after_removals(self) -> None:
+        """Preserve capacity and ordered choices when earlier removals grow another guest."""
+        counts = ((9, 7, 4, 4, 3, 4, 2, 4),) + ((0,) * 8,) * 3
+        copies = [{0: 6, 1: 4}, {2: 4, 3: 4, 0: 2}, {4: 3, 5: 4, 0: 1, 1: 2}, {6: 2, 7: 4, 1: 1}]
+        expected = [{0: 9, 1: 1}, {2: 4, 3: 4}, {4: 3, 5: 4, 1: 3}, {6: 2, 7: 4, 1: 3}]
+
+        planner._prune_small_copies(copies, counts, [16, 8, 7, 6], ExpertReplicaConfig(8, 4, 2), 3, 10)
+
+        self.assertEqual([list(row.items()) for row in copies], [list(row.items()) for row in expected])
+        self.assertEqual([sum(row.get(expert, 0) for row in copies) for expert in range(8)], list(counts[0]))
+        self.assertLessEqual(max(sum(row.values()) for row in copies), 10)
+
+    def test_direct_copy_removal_precedes_indexed_consolidation(self) -> None:
+        """Build replacement evidence after an earlier direct removal changed the quotas."""
+        counts = ((8, 7, 4, 4, 3, 4, 2, 4),) + ((0,) * 8,) * 3
+        copies = [{0: 5, 1: 4}, {2: 4, 3: 4, 0: 2}, {4: 3, 5: 4, 0: 1, 1: 2}, {6: 2, 7: 4, 1: 1}]
+        expected = [{0: 6, 1: 4}, {2: 4, 3: 4, 0: 2}, {4: 3, 5: 4, 1: 3}, {6: 2, 7: 4}]
+
+        planner._prune_small_copies(copies, counts, [15, 8, 7, 6], ExpertReplicaConfig(8, 4, 2), 3, 10)
+
+        self.assertEqual([list(row.items()) for row in copies], [list(row.items()) for row in expected])
 
     def test_copy_threshold_rejects_invalid_policy_or_infeasible_capacity(self):
         """Invalid thresholds and impossible receive limits fail before execution."""

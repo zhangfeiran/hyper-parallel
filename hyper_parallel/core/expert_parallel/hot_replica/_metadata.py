@@ -14,7 +14,87 @@
 # ============================================================================
 """Owned asynchronous uploads for small replica protocol descriptors."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
+import os
+from typing import Any
+
 import torch
+
+from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
+
+from .plan import ExpertExecutionPlan
+
+
+@lru_cache(maxsize=1)
+def _metadata_reuse_enabled() -> bool:
+    """Keep the unvalidated device experiment behind one internal switch."""
+    return os.environ.get("HYPER_PARALLEL_REPLICA_METADATA_REUSE", "0") == "1"
+
+
+@dataclass(frozen=True)
+class _UploadedRouteMetadata:
+    """Retain only an immutable CPU plan, integer descriptors and upload readiness."""
+
+    plan: ExpertExecutionPlan
+    values: tuple[torch.Tensor, ...]
+    ready: Any | None
+
+
+class _RecomputedRouteMetadata:
+    """Reuse descriptors only after the existing exact CPU plan replay succeeds."""
+
+    def __init__(self) -> None:
+        """Initialize an invocation-local registry without retaining activations."""
+        self.entries: dict[tuple[int, int, torch.device, str], _UploadedRouteMetadata] = {}
+
+    def clear(self) -> None:
+        """Release cache references while saved graphs and stream events retain their uses."""
+        self.entries.clear()
+
+    @staticmethod
+    def _key(plan: ExpertExecutionPlan, rank: int, device: torch.device, kind: str) -> tuple:
+        """Normalize CPU aliases while retaining accelerator device indices."""
+        device = torch.device("cpu") if device.type == "cpu" else device
+        return id(plan), rank, device, kind
+
+    def lookup(self, plan: ExpertExecutionPlan, rank: int, device: torch.device,
+               kind: str) -> tuple[torch.Tensor, ...] | None:
+        """Order the replay stream after upload and retain every asynchronous read."""
+        entry = self.entries.get(self._key(plan, rank, device, kind))
+        if entry is None or entry.plan is not plan:
+            return None
+        if device.type != "cpu":
+            stream = getattr(torch, device.type).current_stream(device)
+            stream.wait_event(entry.ready)
+            for value in entry.values:
+                value.record_stream(stream)
+        return entry.values
+
+    def remember(self, plan: ExpertExecutionPlan, rank: int, device: torch.device,
+                 kind: str, values: tuple[torch.Tensor, ...]) -> None:
+        """Publish exclusively owned integer metadata after its current-stream upload."""
+        if any(value.requires_grad or value.grad_fn is not None or value.dtype not in (torch.int32, torch.int64)
+               for value in values):
+            raise ValueError("Replica metadata reuse requires graph-free integer descriptors")
+        ready = None
+        if device.type != "cpu":
+            backend = getattr(torch, device.type)
+            ready = backend.Event()
+            ready.record(backend.current_stream(device))
+        self.entries[self._key(plan, rank, device, kind)] = _UploadedRouteMetadata(plan, values, ready)
+
+
+def _recompute_metadata(plan: ExpertExecutionPlan) -> tuple[_RecomputedRouteMetadata | None, bool]:
+    """Find a cache only for enabled positive-B checkpoint invocations."""
+    if not plan.config.replica_slots_per_rank or not _metadata_reuse_enabled():
+        return None, False
+    state = get_recompute_state()
+    if state is None:
+        return None, False
+    return state.get_resource(_RecomputedRouteMetadata, _RecomputedRouteMetadata), state.is_recomputing
 
 
 def _owned_host_bytes(data: bytes, device: torch.device) -> torch.Tensor:
