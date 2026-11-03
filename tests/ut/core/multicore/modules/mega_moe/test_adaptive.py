@@ -237,6 +237,11 @@ class TestAdaptiveExecution(unittest.TestCase):
                                                        torch.empty(8, 16, dtype=torch.bfloat16), mask, None)
                     self.assertEqual(prepare.call_args.kwargs['_replica_transfer_row_credit'], credit)
                     self.assertIsNone(prepare.call_args.kwargs['_cost_model'])
+            forward, _ = create_recompute_contexts()
+            with forward, patch.object(module_api, 'prepare_replica_route') as prepare:
+                expert._prepare_replica_route(torch.zeros(8, 1, dtype=torch.int32), resources,
+                                               torch.empty(8, 16, dtype=torch.bfloat16), 12, None)
+            self.assertEqual(prepare.call_args.kwargs['_replica_transfer_row_credit'], 12)
         finally:
             expert.close()
 

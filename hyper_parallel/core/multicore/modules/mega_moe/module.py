@@ -752,7 +752,8 @@ class MegaMoeExperts(MulticoreModule):
         # Credit only half of mandatory FP32 gradient bytes. One routed row
         # costs at most 12*H BF16 payload bytes across forward, replay and
         # backward dispatch/combine; weight copies and residency hits add no credit.
-        gradient_units = (2 * bool(autograd_mask & 4) + bool(autograd_mask & 8)) if autograd_mask & 1 else 0
+        training_gradients = bool(autograd_mask & 1) or get_recompute_state() is not None
+        gradient_units = (2 * bool(autograd_mask & 4) + bool(autograd_mask & 8)) if training_gradients else 0
         transfer_row_credit = self.intermediate_size * gradient_units // 6 if cost_model is None else 0
         return prepare_replica_route(
             topk_ids, self.replica_config, self._ep_group,
