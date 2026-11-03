@@ -37,7 +37,7 @@ Native EP 同样只需 `ExpertParallel(replica_slots_per_rank=6)`。
 | 参数 | 含义 |
 |---|---|
 | `replica_slots_per_rank` | 物理 guest 槽位上限；实际使用量可以更少 |
-| `replica_transport` | MegaMoe 副本权重与梯度的传输协议 |
+| `replica_transport` | MegaMoe replica transport; defaults to `shmem_signal_kernel_gradient_bands` |
 | `replica_min_rows` | 软最小副本行数；容量要求的副本可以保留 |
 | `replica_target_load` | MegaMoe 期望接收行数，不是丢弃阈值或容量硬上限 |
 | `replica_minimum_load_reduction` | 可选的负载削峰要求；显式值覆盖默认策略 |
@@ -58,6 +58,41 @@ forward 重复次数根据框架 checkpoint 上下文确定；非 checkpoint 场
 仅供调试消融的隐藏环境开关是 `HYPER_PARALLEL_REPLICA_COST_MODEL`，默认 `1`。
 设为 `0` 只关闭成本表，负载自适应、容量检查和 checkpoint 计划缓存仍然启用。
 该值在创建执行对象时固定，同一 EP 组必须一致。常规训练无需设置此变量。
+
+### Uncalibrated CPU planning
+
+Unmatched workloads retain the relative receive-peak admission policy. If the
+owner layout fits the current receive allowance and even an ideally balanced
+layout cannot meet the required reduction, the compact count summary selects
+owner-only execution before full CPU planning. Integer rounding, absolute
+saved-row floors, capacity-required copies, and ordered checkpoint replay remain
+the same as in the full planner. An existing native count agreement needs no
+additional histogram readback or collective for this decision.
+
+The final uncalibrated layout also consolidates redundant guest matrices above
+the small-copy threshold. Existing copies of the same owner may take over work;
+no new matrix edge is created and the receive peak cannot increase. Cross-node
+edges and owners with larger fanout are considered first.
+
+For training, MegaMoe derives an internal activation-row credit from its own
+expert shape and gradient flags. With intermediate dimension `I`, it credits
+`floor(I * (2 * grad_gate_up + grad_down) / 6)` extra remote rows per deleted
+matrix edge. The credit is zero when autograd is disabled. A routed row uses
+at most `12 * H` BF16 payload bytes for dispatch and combine across forward,
+one checkpoint replay, and backward. Thus the credit spends at most half the
+deleted projection's mandatory FP32 gradient payload, reserving the rest as
+margin. No weight-copy savings or residency hits are assumed.
+
+The planner checks exact source and node deficits before accepting a deletion.
+Only a deleted cross-node matrix edge can pay for additional cross-node token
+rows. Frozen projections contribute no credit. Shape-free planner callers use
+zero credit and cannot increase either remote-row count. Matched cost models
+keep their existing scoring, and the device planner is unchanged.
+
+This is a conservative payload heuristic, not a latency calibration or an
+end-to-end speed guarantee. Hot-route CPU search costs and device critical paths
+still require matched measurement. No public tuning parameter or native ABI
+change is needed for these rules.
 不支持运行中改变该变量来修改已经创建的执行对象。
 
 有匹配成本时，默认准入按预测收益和不确定性余量决定；没有匹配成本时，

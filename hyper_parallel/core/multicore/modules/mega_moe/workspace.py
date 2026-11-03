@@ -83,7 +83,7 @@ def _workspace_allocation_specs(
 def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
     """Return the replica payload tracked by SHMEM restart transactions."""
     budget = specification.get("replica_slots_per_rank", 0)
-    mode = specification.get("replica_transport", "p2p")
+    mode = specification.get("replica_transport", GRADIENT_BAND_TRANSPORT)
     if not budget or mode == "p2p":
         return 0
     if mode not in KERNEL_GRADIENT_TRANSPORT_MODES:

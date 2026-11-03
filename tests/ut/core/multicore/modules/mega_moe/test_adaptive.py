@@ -224,6 +224,22 @@ class TestAdaptiveExecution(unittest.TestCase):
                 finally:
                     expert.close()
 
+    def test_unmatched_runtime_credits_only_required_expert_gradients(self) -> None:
+        """Frozen projections and inference contribute no unverified matrix-transfer credit."""
+        expert = MegaMoeExperts(hidden_size=16, intermediate_size=24, num_experts=4, top_k=1,
+                               ep_size=2, replica_slots_per_rank=1, create_parameters=False)
+        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=True), home_spec=object(), rank_nodes=(0, 1))
+        try:
+            for mask, credit in ((31, 12), (5, 8), (9, 4), (1, 0), (12, 0)):
+                with self.subTest(mask=mask):
+                    with patch.object(module_api, 'prepare_replica_route') as prepare:
+                        expert._prepare_replica_route(torch.zeros(8, 1, dtype=torch.int32), resources,
+                                                       torch.empty(8, 16, dtype=torch.bfloat16), mask, None)
+                    self.assertEqual(prepare.call_args.kwargs['_replica_transfer_row_credit'], credit)
+                    self.assertIsNone(prepare.call_args.kwargs['_cost_model'])
+        finally:
+            expert.close()
+
     def test_checkpoint_keeps_alternating_placements_owned_by_each_call(self) -> None:
         """Cold and hot calls share a checkpoint without overwriting the earlier decision."""
         config, group = ExpertReplicaConfig(12, 4, 3), object()

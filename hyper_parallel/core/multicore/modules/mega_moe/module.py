@@ -432,7 +432,7 @@ class MegaMoeExperts(MulticoreModule):
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
         replica_slots_per_rank: int = 0,
-        replica_transport: str = "p2p",
+        replica_transport: str = "shmem_signal_kernel_gradient_bands",
         replica_min_rows: int = 1024,
         replica_planner: str = "cpu",
         replica_target_load: int | None = None,
@@ -453,10 +453,11 @@ class MegaMoeExperts(MulticoreModule):
             replica_slots_per_rank: Physical guest slot cap per rank. Positive caps use
                 adaptive quotas by default; zero keeps owner-only routing. Matching
                 costs are selected internally, with load-driven fallback for unmeasured shapes.
-            replica_transport: "p2p" or "shmem_signal_kernel_gradient". The latter uses
-                projection-ready SDMA weights and fused FP32 gradient return.
-                "shmem_signal_kernel_gradient_bands" publishes completed output row bands
-                directly from Cube workers and consumes them in independent AIV groups.
+            replica_transport: Defaults to "shmem_signal_kernel_gradient_bands", which
+                publishes completed output row bands directly from Cube workers and
+                consumes them in independent AIV groups. "shmem_signal_kernel_gradient"
+                uses projection-ready SDMA weights and fused FP32 gradient return.
+                "p2p" uses HCCL weight copies and peer-ordered FP32 gradient return.
             replica_planner: Shared CPU or fused device replica quota policy.
             replica_target_load: Preferred received rows per rank, independent of buffer capacity.
                 All EP ranks must agree. None uses current capacity for push and average load for pull.
@@ -748,10 +749,16 @@ class MegaMoeExperts(MulticoreModule):
         if cost_model is not None and reduction is None:
             reduction = 0.0
         admission, saved_rows = resolve_replica_admission(reduction)
+        # Credit only half of mandatory FP32 gradient bytes. One routed row
+        # costs at most 12*H BF16 payload bytes across forward, replay and
+        # backward dispatch/combine; weight copies and residency hits add no credit.
+        gradient_units = (2 * bool(autograd_mask & 4) + bool(autograd_mask & 8)) if autograd_mask & 1 else 0
+        transfer_row_credit = self.intermediate_size * gradient_units // 6 if cost_model is None else 0
         return prepare_replica_route(
             topk_ids, self.replica_config, self._ep_group,
             target_load=target_load,
             minimum_replica_rows=self.replica_min_rows, _cost_model=cost_model,
+            _replica_transfer_row_credit=transfer_row_credit,
             _rank_nodes=resources.rank_nodes,
             planner_backend=self.replica_planner,
             minimum_load_reduction=admission, minimum_saved_rows=saved_rows,

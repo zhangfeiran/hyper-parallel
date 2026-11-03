@@ -159,7 +159,9 @@ def _recipe(args: argparse.Namespace, work: Path, world: int) -> Any:
         "_target_": compute + "deepseek_v41_ep_compute_fn", "use_grouped_gemm": True,
     }
     replica_slots = getattr(args, "replica_slots_per_rank", 0)
-    replica_transport = getattr(args, "replica_transport", "p2p")
+    replica_transport = getattr(args, "replica_transport", None)
+    if replica_transport is None:
+        replica_transport = "p2p" if args.backend == "owner_ep" else "shmem_signal_kernel_gradient_bands"
     if replica_slots < 0:
         raise ValueError("replica_slots_per_rank must be nonnegative")
     if args.backend == "owner_ep" and replica_slots:
@@ -345,8 +347,9 @@ def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--capacity-factor", type=float)
     parser.add_argument("--replica-slots-per-rank", type=int, default=0,
                         help="Adaptive expert replica cap; zero retains owner-only execution")
-    parser.add_argument("--replica-transport", default="p2p",
-                        choices=("p2p", "shmem_signal_kernel_gradient", "shmem_signal_kernel_gradient_bands"))
+    parser.add_argument("--replica-transport",
+                        choices=("p2p", "shmem_signal_kernel_gradient", "shmem_signal_kernel_gradient_bands"),
+                        help="Defaults to p2p for owner_ep and shmem_signal_kernel_gradient_bands for MegaMoe")
     parser.add_argument("--disable-route-diagnostics", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--modality", choices=("text", "vlm"), default="vlm")
@@ -384,6 +387,8 @@ def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.replica_transport is None:
+        args.replica_transport = "p2p" if args.backend == "owner_ep" else "shmem_signal_kernel_gradient_bands"
     if args.replica_slots_per_rank < 0:
         parser.error("replica-slots-per-rank must be nonnegative")
     if args.backend == "owner_ep" and args.replica_slots_per_rank and args.replica_transport != "p2p":

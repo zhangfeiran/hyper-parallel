@@ -234,6 +234,83 @@ def _prune_small_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, .
             current[rank] += moved
 
 
+def _within_transfer_budget(
+    copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
+    changes: dict[tuple[int, int], int], rank_nodes: tuple[int, ...], node_ranks: dict[int, list[int]],
+    credits: tuple[int, int],
+) -> bool:
+    """Bound changed token traffic by the deleted matrix edge's conservative row credits."""
+    remote_delta = 0
+    for (rank, expert), change in changes.items():
+        deficit = counts[rank][expert] - copies[rank].get(expert, 0)
+        remote_delta += max(deficit - change, 0) - max(deficit, 0)
+    if remote_delta > credits[0]:
+        return False
+    node_changes = {}
+    if node_ranks:
+        for (rank, expert), change in changes.items():
+            key = rank_nodes[rank], expert
+            node_changes[key] = node_changes.get(key, 0) + change
+    cross_delta = 0
+    for (node, expert), change in node_changes.items():
+        if change:
+            deficit = sum(counts[rank][expert] - copies[rank].get(expert, 0) for rank in node_ranks[node])
+            cross_delta += max(deficit - change, 0) - max(deficit, 0)
+    return cross_delta <= credits[1]
+
+
+def _consolidate_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
+                        config: ExpertReplicaConfig, rank_nodes: tuple[int, ...],
+                        transfer_row_credit: int = 0) -> None:
+    """Delete redundant matrices without increasing receive peak or the traffic budget.
+
+    Existing guests of the same owner may take over returned work. No new edge
+    is created, so each owner's fanout and both local and remote matrix payloads
+    are nonincreasing. Source and node deficits match the materializer's minimum
+    remote-row counts without rebuilding a full dispatch table for every trial.
+    Without runtime shape credits, neither remote-row count may increase.
+    """
+    home = config.home_experts
+    loads = [sum(row.values()) for row in copies]
+    ceiling = max(loads)
+    by_owner = [[] for _ in copies]
+    for rank, row in enumerate(copies):
+        for expert, rows in row.items():
+            if rows and expert // home != rank:
+                by_owner[expert // home].append((rank, expert))
+    candidates = sorted(
+        (-int(bool(rank_nodes) and rank_nodes[expert // home] != rank_nodes[rank]),
+         -len(by_owner[expert // home]), copies[rank][expert], rank, expert)
+        for rank, expert in chain.from_iterable(by_owner))
+    node_ranks = {}
+    if 1 < len(set(rank_nodes)) < config.ep_size:
+        for rank, node in enumerate(rank_nodes):
+            node_ranks.setdefault(node, []).append(rank)
+    for negative_remote, _, _, target, expert in candidates:
+        rows = copies[target][expert]
+        replacements = _replacement_rows(copies, loads, home, target, expert, rows, ceiling, by_owner)
+        if replacements is None:
+            continue
+        owner = expert // home
+        changes = {(owner, expert): rows, (target, expert): -rows}
+        for rank, logical, moved in replacements:
+            key = owner, logical
+            changes[key] = changes.get(key, 0) - moved
+            key = rank, logical
+            changes[key] = changes.get(key, 0) + moved
+        cross_credit = -negative_remote * transfer_row_credit
+        if not _within_transfer_budget(copies, counts, changes, rank_nodes, node_ranks,
+                                       (transfer_row_credit, cross_credit)):
+            continue
+        for (rank, logical), change in changes.items():
+            count = copies[rank].get(logical, 0) + change
+            if count or logical // home == rank:
+                copies[rank][logical] = count
+            else:
+                del copies[rank][logical]
+            loads[rank] += change
+
+
 def _rebalance_existing_copies(copies: list[dict[int, int]], config: ExpertReplicaConfig) -> None:
     """Reduce pairwise load peaks using only already retained guest experts.
 
@@ -582,7 +659,8 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
                               minimum_load_reduction: float = 0.0, minimum_saved_rows: int = 0,
                               receive_capacity: int | None = None,
                               adaptive: bool = False,
-                              _rank_nodes: tuple[int, ...] = ()) -> ExpertExecutionPlan:
+                              _rank_nodes: tuple[int, ...] = (),
+                              _replica_transfer_row_credit: int = 0) -> ExpertExecutionPlan:
     """Build a bounded single-execution plan, then reduce residual imbalance.
 
     Args:
@@ -609,12 +687,15 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
             Necessary growth and the independent lossless capacity bound remain enabled.
         adaptive: Select actual guest quotas within the fixed physical slot cap using
             one shared balancing skeleton. Missing costs use load and capacity constraints.
+        _replica_transfer_row_credit: Internal activation-row allowance from mandatory
+            gradient bytes. Zero retains strict remote-row bounds during consolidation.
 
     Returns:
         Immutable physical placement and exact per-source dispatch quotas.
     """
     _integer(minimum_replica_rows, "minimum_replica_rows", 0)
     _integer(minimum_saved_rows, "minimum_saved_rows", 0)
+    _integer(_replica_transfer_row_credit, "Replica transfer row credit", 0)
     admission = reduction_basis_points(minimum_load_reduction)
     if capacity_limit is not None:
         _integer(capacity_limit, "capacity_limit", 0)
@@ -675,6 +756,12 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
             peak = max(sum(row.values()) for row in copies)
             return copies if _optional_peak_is_useful(peak, loads, ceiling, admission, minimum_saved_rows) else baseline
 
+        def materialize(copies: list[dict[int, int]]) -> ExpertExecutionPlan:
+            """Consolidate the final uncalibrated layout before assigning source quotas."""
+            if cost_model is None:
+                _consolidate_copies(copies, counts, config, rank_nodes, _replica_transfer_row_credit)
+            return _materialize(counts, copies, config, capacity_limit, rank_nodes=rank_nodes)
+
         copies, bounds = _adaptive_copies(counts, config, limit, receive_capacity, cost_model, target,
                                           minimum_replica_rows, durations)
         copies = refine(copies, bounds)
@@ -683,12 +770,12 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
         if has_guests and rank_nodes and 1 < len(set(rank_nodes)) < config.ep_size:
             proposal = _locality_copies(copies, config, rank_nodes)
             if proposal is copies:
-                return _materialize(counts, copies, config, capacity_limit, rank_nodes=rank_nodes)
+                return materialize(copies)
             peak = max(sum(row.values()) for row in copies)
             ceiling = min(limit, max(receive_capacity or 0, peak))
             alternative = proposal
             if alternative == copies:
-                return _materialize(counts, copies, config, capacity_limit, rank_nodes=rank_nodes)
+                return materialize(copies)
             alternate_peak = max(sum(row.values()) for row in alternative)
 
             def key(layout: list[dict[int, int]]) -> tuple[float, int]:
@@ -708,7 +795,7 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
                 after, before = key(alternative), key(copies)
                 if after < before:
                     copies = alternative
-        return _materialize(counts, copies, config, capacity_limit, rank_nodes=rank_nodes)
+        return materialize(copies)
     limit = _pruning_capacity(counts, loads, config) if capacity_limit is None else capacity_limit
     if (not replica_slots_per_rank or max(loads) <= target
             or not _optional_peak_is_useful(average, loads, limit, admission, minimum_saved_rows)):
