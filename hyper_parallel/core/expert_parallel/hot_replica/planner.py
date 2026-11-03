@@ -460,7 +460,7 @@ def _home_layout(counts, config):
 
 @dataclass(frozen=True)
 class _UncalibratedCandidate:
-    """Own one invocation's quotas until full source materialization consumes them."""
+    """Own admitted quotas until full source materialization consumes them."""
 
     config: ExpertReplicaConfig
     totals: tuple[int, ...]
@@ -468,12 +468,17 @@ class _UncalibratedCandidate:
     limit: int
     resident: int
     target: int
+    minimum_rows: int = 0
+    admission: int = 0
+    saved_rows: int = 0
 
     def matches(self, totals: list[int], config: ExpertReplicaConfig,
-                limit: int, resident: int, target: int) -> bool:
+                limit: int, resident: int, target: int, minimum_rows: int = 0,
+                admission: int = 0, saved_rows: int = 0) -> bool:
         """Reject reuse if the source totals or agreed allocation policy changed."""
         return (self.config == config and self.totals == tuple(totals)
-                and (self.limit, self.resident, self.target) == (limit, resident, target))
+                and (self.limit, self.resident, self.target, self.minimum_rows, self.admission, self.saved_rows)
+                == (limit, resident, target, minimum_rows, admission, saved_rows))
 
 
 def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
@@ -493,6 +498,12 @@ def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertRepl
         if peak <= limit and (fallback is None or peak < fallback[0]):
             fallback = peak, copies
     if fallback is None:
+        # Thinning can exceed a hard limit before spare guest slots are filled.
+        # Complete the bounded candidate once before declaring it infeasible.
+        copies = _bounded_copies(loads, totals, config, edges=edges)
+        _improve_copies(copies, config, min(target, resident))
+        if max(sum(row.values()) for row in copies) <= limit:
+            return copies
         raise ValueError("Adaptive replica cap cannot satisfy capacity_limit")
     selected = fallback[1]
     if selected is not None:
@@ -500,17 +511,40 @@ def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertRepl
     return selected
 
 
+def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
+                                  limit: int, resident: int, target: int, minimum_rows: int,
+                                  admission: int, saved_rows: int) -> list[dict[int, int]] | None:
+    """Keep accepted quotas, retrying a rejected allocation preference at most once."""
+    average = (sum(loads) + config.ep_size - 1) // config.ep_size
+    for trial in (target, average) if target > average else (target,):
+        copies = _uncalibrated_copies(totals, loads, config, limit, resident, trial)
+        if copies is None:
+            return None
+        peak = max(sum(row.values()) for row in copies)
+        ceiling = min(limit, max(resident, peak))
+        # A validated explicit limit makes fragment pruning source independent.
+        _prune_small_copies(copies, (), loads, config, minimum_rows, ceiling)
+        peak = max(sum(row.values()) for row in copies)
+        if _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows):
+            return copies
+        if not _optional_peak_is_useful(average, loads, ceiling, admission, saved_rows):
+            return None
+    return None
+
+
 def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig,
                      limit: int, receive_capacity: int | None,
                      model: ExpertReplicaCostModel | None, target: int,
                      minimum_replica_rows: int = 0,
                      durations: dict[int, tuple[float, float]] | None = None,
+                     admission: int = 0, minimum_saved_rows: int = 0,
                      ) -> tuple[list[dict[int, int]], tuple[float, float] | None]:
     """Return bounded quotas and their optional (score, optimistic lower bound)."""
     totals, loads, home = _home_layout(counts, config)
     resident = min(limit, receive_capacity) if receive_capacity is not None else limit
     if model is None:
-        selected = _uncalibrated_copies(totals, loads, config, limit, resident, target)
+        selected = _admitted_uncalibrated_copies(totals, loads, config, limit, resident, target,
+                                                minimum_replica_rows, admission, minimum_saved_rows)
         return home if selected is None else selected, None
     measured = min(model.forward_ms[-1][0], model.backward_ms[-1][0])
     durations = {} if durations is None else durations
@@ -794,12 +828,14 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
 
         resident = min(limit, receive_capacity) if receive_capacity is not None else limit
         if (_uncalibrated_candidate is not None and cost_model is None
-                and _uncalibrated_candidate.matches(expert_counts, config, limit, resident, target)):
+                and _uncalibrated_candidate.matches(expert_counts, config, limit, resident, target,
+                                                    minimum_replica_rows, admission, minimum_saved_rows)):
             copies, bounds = _uncalibrated_candidate.copies, None
         else:
             copies, bounds = _adaptive_copies(counts, config, limit, receive_capacity, cost_model, target,
-                                              minimum_replica_rows, durations)
-        copies = refine(copies, bounds)
+                                              minimum_replica_rows, durations, admission, minimum_saved_rows)
+        if cost_model is not None:
+            copies = refine(copies, bounds)
         has_guests = any(expert // config.home_experts != rank and rows
                          for rank, row in enumerate(copies) for expert, rows in row.items())
         if has_guests and rank_nodes and 1 < len(set(rank_nodes)) < config.ep_size:

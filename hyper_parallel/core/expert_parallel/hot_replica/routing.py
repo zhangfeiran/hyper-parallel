@@ -39,9 +39,8 @@ from .plan import ExpertExecutionPlan, ExpertReplicaTransfer
 from .planner import (
     _build_expert_replica_plan as build_expert_replica_plan,
     _optional_peak_is_useful,
-    _prune_small_copies,
     _UncalibratedCandidate,
-    _uncalibrated_copies,
+    _admitted_uncalibrated_copies,
 )
 from .topology import _validate_rank_nodes
 
@@ -435,8 +434,6 @@ def _try_compact_home_route(
         if cost_model is None:
             average = (sum(destination_loads) + config.ep_size - 1) // config.ep_size
             if _optional_peak_is_useful(average, destination_loads, resident, admission, minimum_saved_rows):
-                # A failed quota-level admission cannot be rescued by source
-                # dispatch construction. Keep the full count table on device.
                 if gathered_counts is not None and gathered_counts.host_counts is not None:
                     totals = list(map(sum, zip(*gathered_counts.host_counts)))
                 else:
@@ -450,19 +447,14 @@ def _try_compact_home_route(
                 if not (isinstance(previous, _RejectedReplicaQuotas) and previous.matches(
                         config, totals, destination_loads, target, admission, minimum_saved_rows,
                         minimum_replica_rows)):
-                    candidate = _uncalibrated_copies(totals, list(destination_loads), config, upper, resident, target)
-                    pruned = candidate
-                    if candidate is not None and minimum_replica_rows:
-                        pruned = [dict(row) for row in candidate]
-                        # An explicit limit makes pruning source independent.
-                        # Keep raw quotas for exactly one full-plan refinement.
-                        _prune_small_copies(pruned, (), list(destination_loads), config,
-                                            minimum_replica_rows, resident)
-                    if (pruned is not None and any(expert // config.home_experts != rank and count
-                                                  for rank, row in enumerate(pruned) for expert, count in row.items())
-                            and _optional_peak_is_useful(max(sum(row.values()) for row in pruned), destination_loads,
-                                                        resident, admission, minimum_saved_rows)):
-                        return _UncalibratedCandidate(config, tuple(totals), candidate, upper, resident, target)
+                    candidate = _admitted_uncalibrated_copies(
+                        totals, list(destination_loads), config, upper, resident, target,
+                        minimum_replica_rows, admission, minimum_saved_rows)
+                    if candidate is not None and any(expert // config.home_experts != rank and count
+                                                     for rank, row in enumerate(candidate)
+                                                     for expert, count in row.items()):
+                        return _UncalibratedCandidate(config, tuple(totals), candidate, upper, resident,
+                                                      target, minimum_replica_rows, admission, minimum_saved_rows)
                 if state is not None and not state.is_recomputing:
                     decision = _RejectedReplicaQuotas(config, tuple(totals), destination_loads,
                                                       target, admission, minimum_saved_rows, minimum_replica_rows)

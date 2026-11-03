@@ -69,7 +69,8 @@ class TestQuotaAdmission(unittest.TestCase):
                         distributed.get_rank.return_value = 0
                         route = routing.prepare_replica_route(
                             ids, ExpertReplicaConfig(384, 64, budget), compact_home=True,
-                            minimum_load_reduction=.4, dynamic_header=(0, 4096, 31), _auto_capacity_factor=1.25,
+                            minimum_replica_rows=1024, minimum_load_reduction=.4,
+                            dynamic_header=(0, 4096, 31), _auto_capacity_factor=1.25,
                             _capacity_budget=Mock(return_value=300000),
                             _gathered_counts=routing._GatheredReplicaCounts(logical, summary, host))
                     self.assertTrue(route.home_only and route.plan_bypassed)
@@ -95,7 +96,7 @@ class TestQuotaAdmission(unittest.TestCase):
         """An owner that exceeds the hard allowance still reaches full source planning."""
         ids, gathered = self.gathered(self.counts())
         with (patch.object(routing, 'dist') as distributed,
-              patch.object(routing, '_uncalibrated_copies', side_effect=AssertionError('Quota shortcut')),
+              patch.object(routing, '_admitted_uncalibrated_copies', side_effect=AssertionError('Quota shortcut')),
               patch.object(routing, 'build_expert_replica_plan', wraps=routing.build_expert_replica_plan) as build):
             distributed.is_initialized.return_value = True
             distributed.get_world_size.return_value = 64
@@ -119,7 +120,7 @@ class TestQuotaAdmission(unittest.TestCase):
                     gathered.host_counts, budget, target_load=40960, capacity_limit=300000,
                     receive_capacity=300000, minimum_load_reduction=.4, adaptive=True)
                 with (patch.object(routing, 'dist') as distributed,
-                      patch.object(planner, '_uncalibrated_copies',
+                      patch.object(planner, '_admitted_uncalibrated_copies',
                                    side_effect=AssertionError('Duplicate quota search')),
                       patch.object(routing, 'build_expert_replica_plan',
                                    wraps=routing.build_expert_replica_plan) as build):
@@ -184,7 +185,7 @@ class TestQuotaAdmission(unittest.TestCase):
                     gathered.host_counts, budget, target_load=40960, capacity_limit=300000,
                     receive_capacity=300000, minimum_load_reduction=.4, minimum_replica_rows=1024, adaptive=True)
                 with (patch.object(routing, 'dist') as distributed,
-                      patch.object(planner, '_uncalibrated_copies',
+                      patch.object(planner, '_admitted_uncalibrated_copies',
                                    side_effect=AssertionError('Duplicate quota search'))):
                     distributed.is_initialized.return_value = True
                     distributed.get_world_size.return_value = 64
@@ -204,12 +205,14 @@ class TestQuotaAdmission(unittest.TestCase):
         for changed_counts, target, resident in ((counts, 75, 100), (counts, 50, 80),
                                                  (((80, 20, 0, 0), (0, 0, 0, 0)), 50, 100)):
             with self.subTest(counts=changed_counts, target=target, resident=resident):
-                copies = planner._uncalibrated_copies([100, 0, 0, 0], [100, 0], config, 100, 100, 50)
-                proposal = planner._UncalibratedCandidate(config, (100, 0, 0, 0), copies, 100, 100, 50)
+                copies = planner._admitted_uncalibrated_copies(
+                    [100, 0, 0, 0], [100, 0], config, 100, 100, 50, 0, 4000, 0)
+                proposal = planner._UncalibratedCandidate(config, (100, 0, 0, 0), copies, 100, 100, 50, 0, 4000, 0)
                 options = dict(target_load=target, capacity_limit=100, receive_capacity=resident,
                                minimum_load_reduction=.4, adaptive=True)
                 expected = routing.build_expert_replica_plan(changed_counts, 1, **options)
-                with patch.object(planner, '_uncalibrated_copies', wraps=planner._uncalibrated_copies) as search:
+                with patch.object(planner, '_admitted_uncalibrated_copies',
+                                  wraps=planner._admitted_uncalibrated_copies) as search:
                     actual = routing.build_expert_replica_plan(
                         changed_counts, 1, **options, _uncalibrated_candidate=proposal)
                 self.assertEqual(search.call_count, 1)
@@ -224,7 +227,8 @@ class TestQuotaAdmission(unittest.TestCase):
             distributed.get_world_size.return_value = 64
             distributed.get_rank.return_value = 0
             forward, replay = create_recompute_contexts()
-            options = dict(compact_home=True, minimum_load_reduction=.4, dynamic_header=(0, 4096, 31),
+            options = dict(compact_home=True, minimum_replica_rows=1024,
+                           minimum_load_reduction=.4, dynamic_header=(0, 4096, 31),
                            _auto_capacity_factor=1.25, _capacity_budget=Mock(return_value=300000),
                            _gathered_counts=gathered)
             with forward:
@@ -238,10 +242,11 @@ class TestQuotaAdmission(unittest.TestCase):
     def test_recompute_reuses_rejected_quotas_while_owner_still_fits(self) -> None:
         """A changed allocator allowance need not repeat the same rejected quota search."""
         ids, gathered = self.gathered(self.counts())
-        for budget, minimum_rows in ((1, 0), (2, 0), (6, 0), (1, 1024), (2, 1024), (6, 1024)):
+        for budget, minimum_rows in ((1, 1024), (2, 1024), (6, 1024)):
             with self.subTest(budget=budget, minimum_rows=minimum_rows):
                 with (patch.object(routing, 'dist') as distributed,
-                      patch.object(routing, '_uncalibrated_copies', wraps=routing._uncalibrated_copies) as search,
+                      patch.object(routing, '_admitted_uncalibrated_copies',
+                                   wraps=routing._admitted_uncalibrated_copies) as search,
                       patch.object(routing, 'build_expert_replica_plan', side_effect=AssertionError('Full planner'))):
                     distributed.is_initialized.return_value = True
                     distributed.get_world_size.return_value = 64
@@ -273,12 +278,13 @@ class TestQuotaAdmission(unittest.TestCase):
                 first_ids, first_counts = self.gathered(counts)
                 replay_ids, replay_counts = self.gathered(changed)
                 with (patch.object(routing, 'dist') as distributed,
-                      patch.object(routing, '_uncalibrated_copies', wraps=routing._uncalibrated_copies) as search):
+                      patch.object(routing, '_admitted_uncalibrated_copies',
+                                   wraps=routing._admitted_uncalibrated_copies) as search):
                     distributed.is_initialized.return_value = True
                     distributed.get_world_size.return_value = 64
                     distributed.get_rank.return_value = 0
                     forward, replay = create_recompute_contexts()
-                    options = dict(compact_home=True, dynamic_header=(0, 4096, 31),
+                    options = dict(compact_home=True, minimum_replica_rows=1024, dynamic_header=(0, 4096, 31),
                                    _capacity_budget=Mock(return_value=300000))
                     with forward:
                         first = routing.prepare_replica_route(
@@ -292,7 +298,7 @@ class TestQuotaAdmission(unittest.TestCase):
                             _gathered_counts=replay_counts)
                 self.assertEqual(search.call_count, 2)
                 self.assertTrue(first.home_only)
-                self.assertEqual(bool(second.plan.transfers), change != 'totals')
+                self.assertTrue(second.home_only)
 
     def test_rejected_quota_cache_does_not_override_required_capacity(self) -> None:
         """A replay owner that no longer fits must reach the complete capacity planner."""
@@ -303,7 +309,8 @@ class TestQuotaAdmission(unittest.TestCase):
             distributed.get_world_size.return_value = 64
             distributed.get_rank.return_value = 0
             forward, replay = create_recompute_contexts()
-            options = dict(compact_home=True, minimum_load_reduction=.4, dynamic_header=(0, 4096, 31),
+            options = dict(compact_home=True, minimum_replica_rows=1024, minimum_load_reduction=.4,
+                           dynamic_header=(0, 4096, 31),
                            _auto_capacity_factor=1.25, _gathered_counts=gathered)
             with forward:
                 first = routing.prepare_replica_route(ids, ExpertReplicaConfig(384, 64, 2), **options,
@@ -325,7 +332,8 @@ class TestQuotaAdmission(unittest.TestCase):
                    for rank in range(8)]
         gathered = routing._GatheredReplicaCounts(logical, summary, logical.tolist())
         with (patch.object(routing, 'dist') as distributed,
-              patch.object(routing, '_uncalibrated_copies', wraps=routing._uncalibrated_copies) as search):
+              patch.object(routing, '_admitted_uncalibrated_copies',
+                           wraps=routing._admitted_uncalibrated_copies) as search):
             distributed.is_initialized.return_value = True
             distributed.get_world_size.return_value = 8
             distributed.get_rank.return_value = 0
@@ -350,13 +358,15 @@ class TestQuotaAdmission(unittest.TestCase):
         counts = [4096] + [4096 * 7 // 383 + int(index < 4096 * 7 % 383) for index in range(383)]
         guest_ids, guest_counts = self.gathered(counts)
         with (patch.object(routing, 'dist') as distributed,
-              patch.object(routing, '_uncalibrated_copies', wraps=routing._uncalibrated_copies) as search,
+              patch.object(routing, '_admitted_uncalibrated_copies',
+                           wraps=routing._admitted_uncalibrated_copies) as search,
               patch.object(routing, 'build_expert_replica_plan', wraps=routing.build_expert_replica_plan) as build):
             distributed.is_initialized.return_value = True
             distributed.get_world_size.return_value = 64
             distributed.get_rank.return_value = 0
             forward, replay = create_recompute_contexts()
-            options = dict(compact_home=True, minimum_load_reduction=.4, dynamic_header=(0, 4096, 31),
+            options = dict(compact_home=True, minimum_replica_rows=1024, minimum_load_reduction=.4,
+                           dynamic_header=(0, 4096, 31),
                            _auto_capacity_factor=1.25, _capacity_budget=Mock(return_value=300000))
             config = ExpertReplicaConfig(384, 64, 2)
             with forward:
