@@ -696,7 +696,8 @@ def restore_topk_output(
         # Keep both the expert backward and the empty routing-weight gradient connected.
         return expert_output[:0] + topk_weights.sum().to(expert_output.dtype)
     probabilities = topk_weights.float().contiguous()
-    if getattr(torch_npu, "__version__", "").split("+", 1)[0] == "2.9.0" and torch.is_grad_enabled():
+    npu_version = getattr(torch_npu, "__version__", "").split("+", 1)[0].split(".")[:3]
+    if npu_version == ["2", "9", "0"] and torch.is_grad_enabled():
         return _LegacyTopKRestore.apply(expert_output, unpermute_mapping, probabilities)
     return torch_npu.npu_moe_token_unpermute(
         expert_output,

@@ -95,20 +95,17 @@ def get_install_requires() -> list[str]:
 
 
 def _native_torch_requires() -> list[str]:
-    """Pin a precompiled Torch payload to the framework that built its adapters."""
+    """Keep the Torch minor ABI while leaving customer-managed PTA untouched."""
     payload = os.environ.get("HYPER_PARALLEL_NATIVE_OUTPUT_ROOT", "").strip()
     adapter = os.path.join(payload, "core", "multicore", "lib", "framework", "torch",
                            "libhyper_parallel_mega_moe_torch.so")
     if not payload or not os.path.isfile(adapter):
         return []
-    requirements = []
-    for distribution in ("torch", "torch-npu"):
-        try:
-            version = metadata.version(distribution).split("+", 1)[0]
-        except metadata.PackageNotFoundError as error:
-            raise RuntimeError(f"Build the native wheel in its matching {distribution} environment") from error
-        requirements.append(f"{distribution}=={version}")
-    return requirements
+    try:
+        major, minor = metadata.version("torch").split(".")[:2]
+    except metadata.PackageNotFoundError as error:
+        raise RuntimeError("Build the native wheel in its matching Torch environment") from error
+    return [f"torch>={major}.{minor},<{major}.{int(minor) + 1}"]
 
 
 def get_extra_requires() -> dict[str, list[str]]:
@@ -119,14 +116,15 @@ def get_extra_requires() -> dict[str, list[str]]:
         dict, optional dependency groups keyed by extra name.
     """
     native = _native_torch_requires()
-    default = native or TORCH29_REQUIRES
-    torch29 = native if native and all("==2.9." in item for item in native) else TORCH29_REQUIRES
+    if native:
+        major, minor = metadata.version("torch").split(".")[:2]
+        return {"torch": list(native), f"torch{major}{minor}": list(native), "all": list(native)}
     return {
-        "torch": list(default),
+        "torch": list(TORCH29_REQUIRES),
         "torch26": list(TORCH26_REQUIRES),
         "torch27": list(TORCH27_REQUIRES),
-        "torch29": list(torch29),
-        "all": list(default),
+        "torch29": list(TORCH29_REQUIRES),
+        "all": list(TORCH29_REQUIRES),
     }
 
 
