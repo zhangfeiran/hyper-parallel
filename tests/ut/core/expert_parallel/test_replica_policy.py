@@ -16,7 +16,7 @@ import inspect
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -193,7 +193,8 @@ class TestReplicaScheduleSelection(unittest.TestCase):
         owner = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
                                ep_size=2, replica_slots_per_rank=1)
         self.addCleanup(owner.close)
-        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=True), home_spec=object(), rank_nodes=(0, 1))
+        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=True), home_spec=object(), rank_nodes=(0, 1),
+                                    receive_capacity_limit=Mock())
         with (patch.object(mega_module, '_critical_path_available', return_value=False),
               patch.object(mega_module, '_runtime_cost_model', return_value=None) as resolve,
               patch.object(mega_module, 'prepare_replica_route', return_value=object()) as prepare):

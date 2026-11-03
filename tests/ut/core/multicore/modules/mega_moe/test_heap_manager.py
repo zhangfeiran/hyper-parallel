@@ -36,6 +36,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.heap_manager import (
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
     MegaMoeWorkspace,
+    _replica_inbox_bytes,
     _workspace_allocation_specs,
 )
 from hyper_parallel.core.multicore.shmem import _lifecycle
@@ -48,73 +49,120 @@ class TestMegaMoeHeapManager(unittest.TestCase):
     # These tests deliberately inspect the private manager and lifecycle transaction.
     # pylint: disable=protected-access
 
-    def _automatic_workspace(self, mode: str, hidden_size: int = 16) -> tuple:
+    def _automatic_workspace(self, mode: str, hidden_size: int = 16, replica_slots: int = 0,
+                             automatic: bool = True) -> tuple:
         """Materialize a small symmetric layout using CPU storage for restart validation."""
         specification = {"local_num_tokens": 128, "hidden_size": hidden_size, "intermediate_size": 8,
-                         "num_experts": 4, "top_k": 2, "ep_size": 2, "dispatch_mode": mode,
-                         "initial_capacity_factor": 1.25 if mode == "push" else None, "auto_tokens": True}
+                         "num_experts": 4 + 2 * replica_slots, "logical_num_experts": 4,
+                         "replica_slots_per_rank": replica_slots,
+                         "top_k": 2, "ep_size": 2, "dispatch_mode": mode,
+                         "initial_capacity_factor": 1.25 if mode == "push" else None, "auto_tokens": automatic}
         layout = _workspace_layout(specification, torch.bfloat16)
         manager = self._manager_with_reservation(specification, layout)
-        spec = MegaMoeSpec(128, hidden_size, 8, 4, 2, specification["initial_capacity_factor"],
+        spec = MegaMoeSpec(128, hidden_size, 8, specification['num_experts'], 2,
+                           specification["initial_capacity_factor"],
                            layout.receive_capacity, 2, None, 0, 24, dispatch_mode=mode,
-                           capacity_growth_factor=1.25 if mode == "push" else None, auto_tokens=True)
+                           capacity_growth_factor=1.25 if mode == "push" else None, auto_tokens=automatic,
+                           logical_num_experts=4, replica_slots_per_rank=replica_slots)
         workspace = MegaMoeWorkspace(shared=True)
         workspace.capacity_floor = manager.bind(workspace, spec, specification)
-        for name, allocation in self._allocations(spec, layout.receive_capacity):
+        for name, allocation in self._allocations(spec, layout.receive_capacity,
+                                                  replica_inbox_bytes=_replica_inbox_bytes(specification)):
             setattr(workspace, name, torch.empty(allocation.shape, dtype=allocation.dtype))
         workspace.completion_event = object()
         return manager, workspace, spec
 
-    def test_replica_admission_uses_one_growth_step_without_reserving_memory(self) -> None:
-        """A planning allowance is bounded by the invocation, not accumulated across steps."""
-        manager, workspace, _ = self._automatic_workspace('push')
-        before = manager.entries[0].layout
-        with patch.object(manager, '_restart', side_effect=AssertionError('Planning cannot allocate')):
-            for _ in range(3):
-                self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720), 38400)
-        self.assertIs(manager.entries[0].layout, before)
-        self.assertEqual(workspace.capacity_floor, before.receive_capacity)
+    def test_push_capacity_query_does_not_require_replica_slots(self) -> None:
+        """B0 and B1 expose the same allocation-free policy, independent of geometric growth."""
+        for budget in (0, 1):
+            manager, workspace, _ = self._automatic_workspace('push', replica_slots=budget)
+            entry = manager.entries[0]
+            before = entry.layout
+            with (self.subTest(budget=budget),
+                  patch.object(manager, '_restart', side_effect=AssertionError('Planning cannot allocate'))):
+                for factor in (1.0, 1.25, 2.0):
+                    entry.bound_spec = replace(entry.bound_spec, capacity_growth_factor=factor)
+                    self.assertEqual(manager.receive_capacity_limit(workspace, 4096), 16384)
+            self.assertIs(entry.layout, before)
+            self.assertEqual(workspace.capacity_floor, before.receive_capacity)
 
-    def test_replica_admission_honors_heap_and_other_workspace_reservations(self) -> None:
+    def test_push_capacity_query_honors_heap_and_other_workspace_reservations(self) -> None:
         """Only the bytes left after actual source rows and other entries can admit growth."""
-        manager, workspace, _ = self._automatic_workspace('push', hidden_size=5120)
-        spec = manager.entries[0].specification
-        other = _WorkspaceLayout(2 * 1024 * 1024, (('name', 'other'),), 0)
-        manager.reserve((({'name': 'other'}, other),), allow_resize=True)
-        desired = _workspace_layout(spec, torch.bfloat16, 38400, 4096)
-        minimum = _workspace_layout(spec, torch.bfloat16, 30720, 4096)
-        manager.heap_limit = manager._required_bytes([minimum, other])
-        allowed = manager.replica_receive_capacity(workspace, 4096, 30720)
-        self.assertGreaterEqual(allowed, 30720)
-        self.assertLess(allowed, 38400)
-        actual = _workspace_layout(spec, torch.bfloat16, allowed, 4096)
-        self.assertLessEqual(manager._required_bytes([actual, other]), manager.heap_limit)
-        manager.heap_limit = manager._required_bytes([desired, other])
-        self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720), 38400)
+        for budget in (0, 1):
+            with self.subTest(budget=budget):
+                manager, workspace, _ = self._automatic_workspace('push', hidden_size=5120, replica_slots=budget)
+                spec = manager.entries[0].specification
+                other = _WorkspaceLayout(2 * 1024 * 1024, (('name', 'other'),), 0)
+                manager.reserve((({'name': 'other'}, other),), allow_resize=True)
+                desired = _workspace_layout(spec, torch.bfloat16, 12032, 4096)
+                manager.heap_limit = manager._required_bytes([desired, other])
+                with patch.object(manager, '_restart', side_effect=AssertionError('Planning cannot allocate')):
+                    allowed = manager.receive_capacity_limit(workspace, 4096)
+                self.assertGreaterEqual(allowed, 12032)
+                self.assertLess(allowed, 16384)
+                actual = _workspace_layout(spec, torch.bfloat16, allowed, 4096)
+                overflow = _workspace_layout(spec, torch.bfloat16, allowed + 128, 4096)
+                self.assertLessEqual(manager._required_bytes([actual, other]), manager.heap_limit)
+                self.assertGreater(manager._required_bytes([overflow, other]), manager.heap_limit)
 
-    def test_critical_path_admission_separates_target_from_explicit_heap_limit(self) -> None:
-        """A calibrated candidate may use hard-budget headroom without allocating during planning."""
-        manager, workspace, _ = self._automatic_workspace('push', hidden_size=5120)
-        entry = manager.entries[0]
-        desired = _workspace_layout(entry.specification, torch.bfloat16, 60000, 4096)
-        manager.heap_limit = manager._required_bytes([desired])
-        before = entry.layout
-        with patch.object(manager, '_restart', side_effect=AssertionError('Planning cannot allocate')):
-            allowed = manager.replica_receive_capacity(workspace, 4096, 30720, use_hard_budget=True)
-            self.assertGreaterEqual(allowed, 59904)
-            self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720), 38400)
-        layout = _workspace_layout(entry.specification, torch.bfloat16, allowed, 4096)
-        self.assertLessEqual(manager._required_bytes([layout]), manager.heap_limit)
-        self.assertIs(entry.layout, before)
+    def test_replica_storage_counts_against_the_common_heap_budget(self) -> None:
+        """The policy stays shared while the real guest inbox consumes additional bytes."""
+        capacities = []
+        for budget in (0, 1):
+            manager, workspace, _ = self._automatic_workspace('push', hidden_size=5120, replica_slots=budget)
+            manager.heap_limit = 128 * 1024 * 1024
+            capacities.append(manager.receive_capacity_limit(workspace, 4096))
+        self.assertGreater(capacities[0], capacities[1])
 
-    def test_critical_path_without_explicit_budget_uses_only_committed_capacity(self) -> None:
-        """No instantaneous free-memory guess authorizes unbounded receive growth."""
+    def test_fixed_push_growth_keeps_the_owner_bound_with_every_slot_cap(self) -> None:
+        """Fixed source storage also permits affordable home execution when every guest slot is reserved."""
+        for budget in (0, 1, 2):
+            with self.subTest(budget=budget):
+                manager, workspace, _ = self._automatic_workspace('push', replica_slots=budget, automatic=False)
+                self.assertEqual(manager.receive_capacity_limit(workspace, 128), 512)
+                with patch.object(shmem, '_restart', side_effect=self._cpu_restart):
+                    manager.ensure_capacity(workspace, 500)
+                self.assertEqual(workspace.capacity_floor, 512)
+
+    def test_capacity_query_validates_source_rows_and_push_workspace(self) -> None:
+        """Malformed source counts and non-Push workspaces fail before allocation."""
+        manager, workspace, _ = self._automatic_workspace('push', automatic=False)
+        for tokens in (-1, True, 1.5, 129):
+            with self.subTest(tokens=tokens), self.assertRaises(ValueError):
+                manager.receive_capacity_limit(workspace, tokens)
+        manager, workspace, _ = self._automatic_workspace('pull')
+        with self.assertRaisesRegex(RuntimeError, 'Push workspace'):
+            manager.receive_capacity_limit(workspace, 128)
+
+    def test_capacity_query_rejects_source_growth_that_cannot_keep_committed_receive_rows(self) -> None:
+        """Planning cannot reclaim an existing receive allocation to admit a larger source."""
         manager, workspace, _ = self._automatic_workspace('push')
         entry = manager.entries[0]
-        self.assertIsNone(manager.heap_limit)
-        self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720, use_hard_budget=True), 38400)
-        entry.layout = _WorkspaceLayout(entry.layout.required_bytes, entry.layout.collective_signature, 60000)
-        self.assertEqual(manager.replica_receive_capacity(workspace, 4096, 30720, use_hard_budget=True), 60000)
+        with patch.object(shmem, '_restart', side_effect=self._cpu_restart):
+            manager.ensure_token_capacity(workspace, 128, 65536)
+        smaller = _workspace_layout(entry.specification, torch.bfloat16, 0, 65536)
+        manager.heap_limit = manager._required_bytes([smaller])
+        with (patch.object(manager, '_restart') as restart,
+              self.assertRaisesRegex(RuntimeError, 'explicit Heap budget')):
+            manager.receive_capacity_limit(workspace, 65536)
+        restart.assert_not_called()
+
+    def test_capacity_query_matches_exact_growth_at_the_heap_boundary(self) -> None:
+        """B0 and B1 allocate selected rows even when geometric source growth does not fit."""
+        for budget in (0, 1):
+            with self.subTest(budget=budget):
+                manager, workspace, _ = self._automatic_workspace('push', hidden_size=5120, replica_slots=budget)
+                entry = manager.entries[0]
+                layout = _workspace_layout(entry.specification, torch.bfloat16, 1792, 512)
+                manager.heap_limit = manager._required_bytes([layout])
+                entry.bound_spec = replace(entry.bound_spec, capacity_growth_factor=8.0)
+                allowed = manager.receive_capacity_limit(workspace, 512)
+                self.assertGreaterEqual(allowed, 1792)
+                with patch.object(shmem, '_restart', side_effect=self._cpu_restart):
+                    committed = manager.ensure_token_capacity(workspace, 512, allowed)
+                self.assertEqual(committed.receive_capacity, allowed)
+                self.assertEqual(committed.local_num_tokens, 512)
+                self.assertLessEqual(manager.heap_bytes, manager.heap_limit)
 
     @staticmethod
     def _cpu_restart(**kwargs: Any) -> _lifecycle._RestartResult:
@@ -260,6 +308,8 @@ class TestMegaMoeHeapManager(unittest.TestCase):
     def _allocations(
         specification: Any,
         capacity: int,
+        *,
+        replica_inbox_bytes: int = 0,
     ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
         """Return one workspace's ordered symmetric Allocation specifications."""
         return _workspace_allocation_specs(
@@ -270,6 +320,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             ep_size=specification.ep_size,
             num_experts=specification.num_experts,
             dtype=torch.bfloat16,
+            replica_inbox_bytes=replica_inbox_bytes,
         )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",

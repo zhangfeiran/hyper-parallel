@@ -211,7 +211,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             home = SimpleNamespace(rank_id=0, replica_slots_per_rank=0)
             plans = {False: SimpleNamespace(spec=physical), True: SimpleNamespace(spec=home)}
             resources = SimpleNamespace(spec=physical, home_spec=home, plan=None, home_plan=None,
-                                        rank_nodes=(0,) * experts.ep_size,
+                                        rank_nodes=(0,) * experts.ep_size, receive_capacity_limit=Mock(),
                                         workspace=Mock(capacity_floor=384, in_use=True), ensure_capacity=Mock(),
                                         plan_for_tokens=Mock(side_effect=lambda _tokens, _device, **kw:
                                                              plans[kw.get('home_only', False)]))
@@ -770,7 +770,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                                          replica_slots_per_rank=1, replica_target_load=target).bfloat16()
                 resources = SimpleNamespace(spec=SimpleNamespace(rank_id=0, replica_slots_per_rank=1,
                                                                   auto_tokens=False),
-                                            rank_nodes=(0,) * experts.ep_size,
+                                            rank_nodes=(0,) * experts.ep_size, receive_capacity_limit=Mock(),
                                             plan=SimpleNamespace(spec=object()),
                                             home_plan=None, home_spec=None,
                                             workspace=Mock(capacity_floor=512), ensure_capacity=Mock())
@@ -814,7 +814,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                                          replica_slots_per_rank=budget).bfloat16()
                 spec = SimpleNamespace(rank_id=0, replica_slots_per_rank=budget, auto_tokens=False)
                 resources = SimpleNamespace(spec=spec, plan=SimpleNamespace(spec=spec),
-                                            rank_nodes=(0,) * experts.ep_size,
+                                            rank_nodes=(0,) * experts.ep_size, receive_capacity_limit=Mock(),
                                             home_plan=SimpleNamespace(spec=SimpleNamespace(rank_id=0)),
                                             workspace=Mock(capacity_floor=384, in_use=True), ensure_capacity=Mock())
                 resources.home_spec = resources.home_plan.spec

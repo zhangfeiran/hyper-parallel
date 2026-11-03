@@ -27,7 +27,7 @@ import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -177,26 +177,6 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
             profile = json.loads((root / 'models/push-b1.json').read_text())
             self.assertEqual(profile['fit']['holdout_group_leaders'], [2])
             self.assertTrue(profile['fit']['disjoint_ep_group_holdout'])
-
-
-    def test_group_model_uses_the_agreed_hard_heap_allowance(self) -> None:
-        """Only the calibrated group scorer can compare owner layouts beyond geometric growth."""
-        owner = mega.MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=1,
-                               ep_size=2, replica_slots_per_rank=1)
-        self.addCleanup(owner.close)
-        model = ExpertReplicaCostModel(calibration_version=2, backend='push', hidden_size=16,
-            intermediate_size=8, ep_size=2, transport='shmem_signal_kernel_gradient_bands',
-            forward_ms=((0, 0.), (1000, 1.)), backward_ms=((0, 0.), (1000, 1.)),
-            weight_ms=0., gradient_ms=0., effective_group_ms=(0., 1., 0., 0., 0., 100.))
-        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=True), home_spec=object(), rank_nodes=(0, 1),
-            replica_receive_capacity=Mock(), critical_path_receive_capacity=Mock())
-        with (patch.object(mega, '_critical_path_available', return_value=False),
-              patch.object(mega, '_runtime_cost_model', return_value=model),
-              patch.object(mega, 'prepare_replica_route', return_value=object()) as prepare):
-            owner._prepare_replica_route(torch.zeros(1, 1, dtype=torch.int32), resources,
-                                         torch.zeros(1, 16), 31, None)
-        self.assertIs(prepare.call_args.kwargs['_capacity_budget'], resources.critical_path_receive_capacity)
-        self.assertEqual(prepare.call_args.kwargs['minimum_load_reduction'], 0.)
 
 
     def test_catalog_hash_uses_supported_extension_suffixes(self) -> None:

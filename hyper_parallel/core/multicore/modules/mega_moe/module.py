@@ -296,13 +296,9 @@ class _MegaMoeExecutionResources:
         if self.spec.dispatch_mode == "pull":
             self.workspace.claim()
 
-    def replica_receive_capacity(self, tokens: int, reservation: int) -> int:
-        """Price bounded optional receive growth before committing the selected plan."""
-        return self.heap_manager.replica_receive_capacity(self.workspace, tokens, reservation)
-
-    def critical_path_receive_capacity(self, tokens: int, reservation: int) -> int:
-        """Use committed storage or an explicit hard Heap budget for calibrated candidates."""
-        return self.heap_manager.replica_receive_capacity(self.workspace, tokens, reservation, use_hard_budget=True)
+    def receive_capacity_limit(self, tokens: int) -> int:
+        """Query the allocator's common Push growth limit before selecting a route."""
+        return self.heap_manager.receive_capacity_limit(self.workspace, tokens)
 
     def can_close(self) -> bool:
         """Report whether neither an active call nor a backward graph needs buffers."""
@@ -795,11 +791,8 @@ class MegaMoeExperts(MulticoreModule):
                               if self.dispatch_mode != "pull" and not resources.spec.auto_tokens else None),
             _auto_capacity_factor=(self.initial_capacity_factor
                                    if resources.spec.auto_tokens and self.dispatch_mode != "pull" else None),
-            _capacity_budget=((resources.critical_path_receive_capacity
-                               if cost_model.critical_path is not None or cost_model.effective_group_ms
-                               else resources.replica_receive_capacity)
-                              if resources.spec.auto_tokens and self.dispatch_mode != "pull"
-                              and cost_model is not None else None),
+            _capacity_budget=(resources.receive_capacity_limit
+                              if self.dispatch_mode != "pull" else None),
             _trusted_counts=counts, _gathered_counts=gathered,
         )
 

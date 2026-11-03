@@ -50,7 +50,7 @@ class TestAdaptiveExecution(unittest.TestCase):
         spec = MegaMoeSpec(local_num_tokens=128, top_k=2, ep_size=4, num_experts=24, logical_num_experts=12,
                            replica_slots_per_rank=3, initial_capacity_factor=2, receive_capacity=512,
                            hidden_size=16, intermediate_size=8, ep_group=None, rank_id=0, num_cube_cores=24)
-        self.assertEqual(spec.maximum_receive_capacity, 512)
+        self.assertEqual(spec.maximum_receive_capacity, 1024)
         self.assertEqual(_grow_receive_capacity(spec, 256, 400), (512, 512))
         self.assertEqual(replace(spec, dispatch_mode='pull').maximum_receive_capacity, 1024)
 
@@ -83,7 +83,7 @@ class TestAdaptiveExecution(unittest.TestCase):
                 self.assertEqual(bool(second.plan.transfers), guests)
                 self.assertEqual(first.dynamic_summary, second.dynamic_summary)
                 self.assertLessEqual(max(first.plan.destination_loads), allowed)
-                self.assertTrue(all(call.args == (128, 384) for call in budget.call_args_list))
+                self.assertTrue(all(call.args == (128,) for call in budget.call_args_list))
                 if compact and not guests:
                     self.assertEqual(build.call_count, 0)
                     self.assertTrue(first.plan_bypassed and second.plan_bypassed)
@@ -150,7 +150,83 @@ class TestAdaptiveExecution(unittest.TestCase):
             self.assertTrue(route.home_only and route.plan_bypassed)
             self.assertEqual(route.plan.destination_loads, (432, 80))
             self.assertEqual(route.dynamic_summary, tuple(map(tuple, summary)))
-            budget.assert_called_once_with(128, 384)
+            budget.assert_called_once_with(128)
+
+    def test_capacity_query_is_independent_of_the_cost_model(self) -> None:
+        """The same allocator query applies to heuristic, phase and group cost decisions."""
+        phase_model = self.model(ep_size=2)
+        group_model = replace(phase_model, effective_group_ms=(0., 1., 0., 0., 0., 100.))
+        combinations = ((model, automatic) for model in (None, phase_model, group_model) for automatic in (False, True))
+        for model, automatic in combinations:
+            with self.subTest(model=model, automatic=automatic):
+                owner = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=8, top_k=1,
+                                       ep_size=2, replica_slots_per_rank=1)
+                self.addCleanup(owner.close)
+                resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=automatic), home_spec=object(),
+                                            rank_nodes=(0, 1), receive_capacity_limit=Mock())
+                with (patch.object(module_api, '_critical_path_available', return_value=False),
+                      patch.object(module_api, '_runtime_cost_model', return_value=model),
+                      patch.object(module_api, 'prepare_replica_route', return_value=object()) as prepare):
+                    owner._prepare_replica_route(torch.zeros(1, 1, dtype=torch.int32), resources,
+                                                 torch.zeros(1, 16), 31, None)
+                self.assertIs(prepare.call_args.kwargs['_capacity_budget'], resources.receive_capacity_limit)
+
+    def test_initial_reservation_cannot_raise_the_allocator_limit(self) -> None:
+        """A preferred receive target cannot override a smaller physical Heap allowance."""
+        budget = Mock(return_value=32768)
+        self.assertEqual(routing._automatic_capacity_options(4096, 8, None, None, 1.25, budget),
+                         (40960, 32768))
+        budget.assert_called_once_with(4096)
+        self.assertEqual(routing._automatic_capacity_options(4096, 8, 40960, 40960, None, budget),
+                         (40960, 32768))
+
+    def test_ep64_owner_growth_does_not_force_unprofitable_replicas(self) -> None:
+        """A modest owner peak above the initial reservation can keep the original home execution."""
+        config = ExpertReplicaConfig(384, 64, 1)
+        owner_counts = [700] + [509] * 63
+        owner_counts[1] += 1
+        counts = []
+        for total in owner_counts:
+            counts.extend(total // 6 + int(index < total % 6) for index in range(6))
+        ids = torch.repeat_interleave(torch.arange(384), torch.tensor(counts)).reshape(8, 4096).T.contiguous()
+        matrix = torch.tensor([counts + [0, 0, 4096, 31]] * 64)
+        for compact in (False, True):
+            for allowed, guests in ((None, True), (50048, False)):
+                with self.subTest(compact=compact, allowed=allowed):
+                    with (patch.object(routing, 'dist') as distributed,
+                          patch.object(routing, '_gather_replica_counts', return_value=matrix)):
+                        distributed.is_initialized.return_value = True
+                        distributed.get_rank.return_value = 0
+                        distributed.get_world_size.return_value = 64
+                        route = routing.prepare_replica_route(
+                            ids, config, compact_home=compact, minimum_load_reduction=.4,
+                            dynamic_header=(0, 4096, 31), _auto_capacity_factor=1.25,
+                            _capacity_budget=Mock(return_value=allowed) if allowed is not None else None)
+                    self.assertEqual(bool(route.plan.transfers), guests)
+                    if allowed is not None:
+                        self.assertLessEqual(max(route.plan.destination_loads), allowed)
+                    self.assertEqual(sum(route.plan.destination_loads), 64 * 4096 * 8)
+                    if compact and not guests:
+                        self.assertTrue(route.home_only and route.plan_bypassed)
+                    else:
+                        route.plan.validate()
+
+    def test_push_planner_rejects_an_infeasible_hard_budget(self) -> None:
+        """Neither the initial reservation nor a theoretical replica bound can exceed the Heap limit."""
+        ids = torch.tensor([[0, 1]] * 88 + [[0, 2]] * 40)
+        matrix = torch.tensor([[128, 88, 40, 0, 0, 0, 128, 31]] * 2)
+        for budget in (0, 1):
+            for compact in (False, True):
+                with (self.subTest(budget=budget, compact=compact), patch.object(routing, 'dist') as distributed,
+                      patch.object(routing, '_gather_replica_counts', return_value=matrix)):
+                    distributed.is_initialized.return_value = True
+                    distributed.get_rank.return_value = 0
+                    distributed.get_world_size.return_value = 2
+                    with self.assertRaisesRegex(ValueError, 'capacity'):
+                        routing.prepare_replica_route(
+                            ids, ExpertReplicaConfig(4, 2, budget), compact_home=compact,
+                            dynamic_header=(0, 128, 31), _auto_capacity_factor=1.25,
+                            _capacity_budget=Mock(return_value=128))
 
     def test_public_constructor_needs_only_the_resident_cap(self) -> None:
         """No calibration or adaptive toggle is needed for an unmeasured shape."""
@@ -199,7 +275,7 @@ class TestAdaptiveExecution(unittest.TestCase):
                 home = SimpleNamespace(rank_id=0, replica_slots_per_rank=0)
                 selected = SimpleNamespace(spec=home)
                 resources = SimpleNamespace(spec=physical, home_spec=home, plan=None, home_plan=None,
-                    rank_nodes=(0, 1, 1, 0),
+                    rank_nodes=(0, 1, 1, 0), receive_capacity_limit=Mock(),
                     workspace=Mock(capacity_floor=512, in_use=True), ensure_capacity=Mock(),
                     plan_for_tokens=Mock(return_value=selected))
                 hidden = torch.ones(64, 16, dtype=torch.bfloat16)
@@ -228,7 +304,8 @@ class TestAdaptiveExecution(unittest.TestCase):
         """Frozen projections and inference contribute no unverified matrix-transfer credit."""
         expert = MegaMoeExperts(hidden_size=16, intermediate_size=24, num_experts=4, top_k=1,
                                ep_size=2, replica_slots_per_rank=1, create_parameters=False)
-        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=True), home_spec=object(), rank_nodes=(0, 1))
+        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=True), home_spec=object(), rank_nodes=(0, 1),
+                                    receive_capacity_limit=Mock())
         try:
             for mask, credit in ((31, 12), (5, 8), (9, 4), (1, 0), (12, 0)):
                 with self.subTest(mask=mask):

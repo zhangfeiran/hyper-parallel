@@ -27,6 +27,7 @@ from typing import Any, NoReturn
 
 import torch
 
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.shmem import _lifecycle
 
@@ -326,32 +327,45 @@ class _HeapManager:
                 layouts = [layout if item is entry else item.layout for item in self.entries]
             self._restart(layouts, self._budget(self._required_bytes(layouts)))
 
-    def replica_receive_capacity(self, workspace: MegaMoeWorkspace, tokens: int, reservation: int,
-                                 *, use_hard_budget: bool = False) -> int:
-        """Allow one invocation-sized growth step without reserving symmetric memory.
+    def receive_capacity_limit(self, workspace: MegaMoeWorkspace, tokens: int) -> int:
+        """Query feasible Push receive rows without reserving symmetric memory.
 
         All entries and the explicit Heap limit are agreed across the Root. The
         result depends on those replicated layouts, not rank-local free memory.
-        Actual allocation remains conditional on the selected destination load.
+        Replica slots contribute their actual fixed storage, but do not change
+        the growth policy. Geometric growth is an allocation preference rather
+        than an admission limit. Only the selected destination load is allocated.
+
+        Args:
+            workspace: Bound Push workspace with automatic or fixed source storage.
+            tokens: Group-maximum actual source-token rows for this invocation.
+
+        Returns:
+            Aligned receive-row limit after accounting for other reservations.
+            Without an explicit Heap limit, returns the distinct-TopK owner bound.
         """
+        if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+            raise ValueError('Push capacity query requires a nonnegative integer token count')
         with self.access():
             entry = self._entry_for_workspace(workspace)
             spec = entry.bound_spec
-            if spec is None or not spec.auto_tokens or spec.dispatch_mode != 'push':
-                raise RuntimeError('Replica receive allowance requires an automatic Push workspace')
-            factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
-            ceiling = _align_capacity(math.ceil(reservation * factor))
-            if use_hard_budget:
-                ceiling = max(ceiling, entry.layout.receive_capacity)
+            if spec is None or spec.dispatch_mode != 'push':
+                raise RuntimeError('Receive capacity query requires a bound Push workspace')
+            if not spec.auto_tokens and tokens > spec.local_num_tokens:
+                raise ValueError('Push capacity query exceeds the fixed source-token capacity')
+            ownership = ExpertReplicaConfig(spec.logical_num_experts or spec.num_experts, spec.ep_size, 0)
+            upper = ownership.maximum_receive_rows(tokens, spec.top_k) if tokens else 0
             if self.heap_limit is None:
-                return ceiling
-            token_capacity = max(spec.local_num_tokens, _align_capacity(tokens))
+                return upper
+            token_capacity = max(spec.local_num_tokens, _align_capacity(tokens)) if spec.auto_tokens else None
             fixed = _workspace_layout(entry.specification, self.dtype, 0, token_capacity).required_bytes
             other = sum(item.layout.required_bytes for item in self.entries if item is not entry)
             row_bytes = spec.hidden_size * self.element_size
+            # Source growth cannot reclaim an already committed receive buffer.
+            self._budget(_round_heap_bytes(fixed + other + entry.layout.receive_capacity * row_bytes))
             available = max(0, (self.heap_limit - other - fixed) // row_bytes)
             allowance = available // 128 * 128
-            return allowance if use_hard_budget else min(ceiling, allowance)
+            return min(upper, allowance)
 
     def ensure_token_capacity(self, workspace: MegaMoeWorkspace, tokens: int, received: int) -> MegaMoeSpec:
         """Grow source and destination storage in one transaction after route agreement.

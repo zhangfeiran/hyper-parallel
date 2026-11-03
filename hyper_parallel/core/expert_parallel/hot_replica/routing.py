@@ -268,18 +268,17 @@ def _torch_replica_count_payload(ids: torch.Tensor, num_experts: int) -> torch.T
 
 def _automatic_capacity_options(
     maximum_tokens: int, top_k: int, target_load: int | None, receive_capacity: int | None,
-    factor: float | None, budget: Callable[[int, int], int] | None = None,
+    factor: float | None, budget: Callable[[int], int] | None = None,
 ) -> tuple[int | None, int | None]:
-    """Derive the same invocation reservation before and after checkpoint heap growth."""
-    if factor is None:
-        return target_load, receive_capacity
-    reservation = align_capacity(math.ceil(maximum_tokens * top_k * factor))
+    """Keep the preferred reservation separate from the allocator's hard receive limit."""
+    reservation = (receive_capacity if factor is None else
+                   align_capacity(math.ceil(maximum_tokens * top_k * factor)))
     admission = reservation
     if budget is not None:
-        admission = budget(maximum_tokens, reservation)
-        _integer(admission, 'Replica receive allowance', 0)
-        admission = max(reservation, admission)
-    return reservation if target_load is None else target_load, admission
+        admission = budget(maximum_tokens)
+        _integer(admission, 'Push receive capacity limit', 0)
+    target = reservation if factor is not None and target_load is None else target_load
+    return target, admission
 
 
 def _compact_home_cost_dominates(
@@ -330,7 +329,7 @@ def _try_compact_home_route(
     *, target_load: int | None, receive_capacity: int | None, factor: float | None,
     minimum_load_reduction: float, minimum_saved_rows: int,
     cost_model: ExpertReplicaCostModel | None, rank_nodes: tuple[int, ...],
-    capacity_budget: Callable[[int, int], int] | None = None,
+    capacity_budget: Callable[[int], int] | None = None,
     gathered_counts: _GatheredReplicaCounts | None = None,
 ) -> ReplicaRoute | None:
     """Read bounded statistics before deciding whether a full CPU table is needed."""
@@ -394,6 +393,8 @@ def _try_compact_home_route(
     owner_upper = ExpertReplicaConfig(config.num_experts, config.ep_size, 0).maximum_receive_rows(
         max(1, maximum_tokens), top_k, alignment=1)
     upper = owner_upper if receive_capacity is None else min(owner_upper, max(upper, receive_capacity))
+    if capacity_budget is not None:
+        upper = min(upper, receive_capacity)
     destination_loads = tuple(row[7] for row in rows)
     peak = max(destination_loads)
     resident = min(upper, receive_capacity) if receive_capacity is not None else upper
@@ -428,7 +429,7 @@ def prepare_replica_route(
     max_local_num_tokens: int | None = None,
     receive_capacity: int | None = None,
     _auto_capacity_factor: float | None = None,
-    _capacity_budget: Callable[[int, int], int] | None = None,
+    _capacity_budget: Callable[[int], int] | None = None,
     _rank_nodes: tuple[int, ...] = (),
     _cost_model: ExpertReplicaCostModel | None = None,
     _trusted_counts: torch.Tensor | None = None,
@@ -456,7 +457,7 @@ def prepare_replica_route(
         max_local_num_tokens: Optional source-row reservation, validated again by the dynamic route summary.
         receive_capacity: Globally agreed resident receive rows for capacity-aware CPU cost refinement.
         _auto_capacity_factor: Internal Push reservation factor applied to the gathered actual source size.
-        _capacity_budget: Internal allocation-free allowance within the agreed Heap budget.
+        _capacity_budget: Internal allocator query shared by Push with and without replicas.
         _trusted_counts: Internal exact Router histogram, using the executor's trusted-count contract.
         _gathered_counts: Internal validated native count agreement for CPU planning.
         _replica_transfer_row_credit: Internal conservative activation-row credit per deleted matrix edge.
@@ -516,6 +517,8 @@ def prepare_replica_route(
         target_load, receive_capacity = _automatic_capacity_options(
             maximum_tokens, top_k, target_load, receive_capacity, _auto_capacity_factor, _capacity_budget)
         upper = config.maximum_receive_rows(max(1, maximum_tokens), top_k, alignment=1)
+        if _capacity_budget is not None:
+            upper = min(upper, receive_capacity)
         device_plan = build_device_expert_replica_plan(
             logical_counts, config, capacity_limit=upper,
             target_load=min(upper, target_load) if target_load is not None else None,
@@ -566,6 +569,8 @@ def prepare_replica_route(
             max(1, maximum_tokens), top_k, alignment=1)
         upper = (owner_upper if receive_capacity is None else
                  min(owner_upper, max(upper, receive_capacity)))
+    if _capacity_budget is not None:
+        upper = min(upper, receive_capacity)
     plan, reused = _plan_replica_route(
         logical_host, config, group, rank,
         target_load=min(upper, target_load) if target_load is not None else None,

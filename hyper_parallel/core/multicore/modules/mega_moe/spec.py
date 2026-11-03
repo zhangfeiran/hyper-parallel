@@ -79,13 +79,9 @@ class MegaMoeSpec:
         """Return the bound for dynamic growth without requiring preallocation."""
         if not self.replica_slots_per_rank:
             return _align_capacity(self.ep_size * self.routed_slots)
-        upper = ExpertReplicaConfig(
-            self.logical_num_experts, self.ep_size, self.replica_slots_per_rank,
-        ).maximum_receive_rows(self.local_num_tokens, self.top_k)
-        if self.dispatch_mode == 'pull':
-            return ExpertReplicaConfig(self.logical_num_experts, self.ep_size, 0).maximum_receive_rows(
-                self.local_num_tokens, self.top_k)
-        return max(upper, self.receive_capacity)
+        upper = ExpertReplicaConfig(self.logical_num_experts, self.ep_size, 0).maximum_receive_rows(
+            self.local_num_tokens, self.top_k)
+        return upper if self.dispatch_mode == 'pull' else max(upper, self.receive_capacity)
 
     @property
     def routed_slots(self) -> int:
