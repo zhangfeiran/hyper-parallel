@@ -47,6 +47,32 @@ def apply_prefix(config: RuntimeConfigC, prefix: inactive_tasks.GuestTaskPrefix)
 class TestGuestTaskPrefixes(unittest.TestCase):
     """Remove only unused suffix work and preserve native physical dependencies."""
 
+    def test_ep64_rotated_peer_rounds_remain_symmetric(self) -> None:
+        """EP64 and 24 workers must remove whole rounds of both geometries."""
+        spec = MegaMoeSpec(4096, 128, 128, 768, 6, 1.25, 38400, 64, None, 17, 24,
+                           replica_slots_per_rank=6, logical_num_experts=384)
+        config = _build_runtime_artifacts(spec)[1]
+        prefixes = build_guest_task_prefixes(config, home_experts=6, ep_size=64)
+        mappings = tuple(tuple(range(rank * 6, (rank + 1) * 6)) + (0,) + (-1,) * 5 for rank in range(64))
+        prefix = select_guest_task_prefix(prefixes, mappings[17], all_slot_to_logical=mappings)
+        changed = apply_prefix(config, prefix)
+        retained = set(changed.vector_task_indices[:changed.task_index_num[1]])
+        groups = Counter()
+        original = list(config.vector_task_indices[:config.task_index_num[1]])
+        communication = 0
+        for task_id in original:
+            task = config.all_tasks[task_id]
+            if task_id not in retained and task.task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL:
+                tiles = task.task_split_num // 768
+                groups[task.inputs[3].input_position, task.task_index // tiles] += 1
+                communication += 1
+        self.assertGreater(communication, 0)
+        for (stage, group), count in groups.items():
+            self.assertTrue(all(groups[stage, group % 12 + peer * 12] == count for peer in range(64)))
+        queue = list(changed.vector_task_indices[:changed.task_index_num[1]])
+        positions = {task_id: index for index, task_id in enumerate(original)}
+        self.assertTrue(all(positions[task_id] % 24 == index % 24 for index, task_id in enumerate(queue)))
+
     def test_communication_prefix_changes_restore_with_the_same_local_mapping(self) -> None:
         """A remote mapping change invalidates the body cache even for a fixed local prefix."""
         spec = MegaMoeSpec(1024, 128, 128, 48, 2, 1.25, 8192, 4, None, 0, 24,

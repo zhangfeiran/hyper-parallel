@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import lcm
 import struct
 from typing import Any
 import weakref
@@ -91,7 +92,9 @@ def _communication_prefix(config: RuntimeConfigC, queue: list[int], *, local: in
             return queue, [], Counter()
         experts[task_id] = (int(task.task_index) // tiles) % local
         stages[task_id] = (int(task.inputs[3].input_position), int(task.task_index) // tiles)
-    kept, removed = _whole_round_suffixes(queue, experts, active, workers)
+    # RATR rotates peer order by sender rank. Whole peer rounds preserve equal
+    # incoming signal counts, and whole worker rounds preserve core ownership.
+    kept, removed = _whole_round_suffixes(queue, experts, active, lcm(workers, ep))
     groups = Counter(stages[task_id] for task_id in removed)
     # Every sender must omit the same tiles for each destination. Keep ordinary
     # communication if a future graph does not have that symmetric geometry.
