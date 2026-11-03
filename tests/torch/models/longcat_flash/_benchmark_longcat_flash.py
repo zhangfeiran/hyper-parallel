@@ -26,6 +26,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch_npu
+from torch.nn import functional as F
 from transformers import LongcatFlashConfig
 from transformers.models.longcat_flash.modeling_longcat_flash import LongcatFlashExperts, LongcatFlashTopkRouter
 
@@ -57,6 +58,7 @@ def _build(args: argparse.Namespace, rank: int) -> tuple:
         source = LongcatFlashExperts(config)
         experts = LongcatFlashMegaMoeExperts(module=source,
             backend="native" if args.backend == "native" else "megamoe",
+            swiglu_precision=args.swiglu_precision,
             dispatch_mode="push" if args.backend == "native" else args.backend,
             context={"ep_size": args.ep, "ep": args.ep > 1})
     torch.npu.manual_seed(22000 + rank)
@@ -82,10 +84,12 @@ def _build(args: argparse.Namespace, rank: int) -> tuple:
 def _operator_census(enabled: bool) -> Any:
     """Observe one untimed native call, then restore all public operator functions."""
     names = ("npu_moe_token_permute", "npu_moe_token_unpermute", "npu_grouped_matmul", "npu_swiglu")
-    original, counts = {}, dict.fromkeys(names, 0)
+    owners = {name: torch_npu for name in names}
+    owners["silu"] = F
+    original, counts = {}, dict.fromkeys(owners, 0)
     if enabled:
-        for name in names:
-            original[name] = getattr(torch_npu, name)
+        for name, owner in owners.items():
+            original[name] = getattr(owner, name)
 
             def observed(*args: Any, _name: str = name, **kwargs: Any) -> Any:
                 """Count and execute the selected public NPU primitive.
@@ -98,12 +102,12 @@ def _operator_census(enabled: bool) -> Any:
                 counts[_name] += 1
                 return original[_name](*args, **kwargs)
 
-            setattr(torch_npu, name, observed)
+            setattr(owner, name, observed)
     try:
         yield counts
     finally:
         for name, operator in original.items():
-            setattr(torch_npu, name, operator)
+            setattr(owners[name], name, operator)
 
 
 def _step(experts: torch.nn.Module, hidden: torch.Tensor, ids: torch.Tensor,
@@ -145,6 +149,7 @@ def _phase(args: argparse.Namespace, tensors: tuple, backward: bool) -> dict:
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("native", "push", "pull"), required=True)
+    parser.add_argument("--swiglu-precision", choices=("hf", "fused"), default="hf")
     parser.add_argument("--ep", type=int, default=4)
     parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument("--hidden", type=int, default=6144)
@@ -192,6 +197,7 @@ def main() -> None:
     experts.close_runtime()
     torch.npu.synchronize()
     report = {"rank": rank, "pid": os.getpid(), "backend": args.backend,
+              "swiglu_precision": args.swiglu_precision,
               "shape": {name: getattr(args, name) for name in
                         ("ep", "tokens", "hidden", "intermediate", "real", "zero", "top_k")},
               "scope": "expert component; learned routing precomputed; no optimizer or Router projection",

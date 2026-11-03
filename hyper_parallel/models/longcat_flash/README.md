@@ -16,12 +16,15 @@ experts. Each selected identity contributes its routing probability multiplied b
 Real and identity contributions are accumulated in expert order, retaining the reference's per-contribution
 cast. Identity weights and the input bypass remain differentiable. Storage-sharing identity input views and
 an ordered gather backward preserve HF's per-expert BF16 input-gradient accumulation without expanding
-identity tokens. Native fused SwiGLU and HF's separate SiLU/multiply have different BF16 cast boundaries;
-validation reports must distinguish these arithmetic references.
+identity tokens. `swiglu_precision: hf` is the model default: the optional generic MegaMoE switch
+`swiglu_hf_bf16=True` rounds the SiLU intermediate in forward and the two multiply branches in backward.
+The generic MegaMoE default remains fused. `swiglu_precision: fused` explicitly selects that arithmetic
+for both reference and candidate; validation reports distinguish the two modes.
 
 `LongcatFlashMegaMoeExperts` compacts active real assignments into a K=1 `MegaMoeExperts` executor.
 The `megamoe` backend requires BF16 NPU inputs and supports push and pull. The explicit `native` backend
-uses NPU permute/unpermute, grouped GEMM, fused SwiGLU and differentiable EP collectives on Ascend.
+uses NPU permute/unpermute, grouped GEMM and differentiable EP collectives on Ascend. Its HF mode
+uses separate SiLU and multiply to retain BF16 cast boundaries; fused mode uses `npu_swiglu`.
 On CPU it uses the portable expert reference. The explicit `eager` backend retains the per-expert
 PyTorch reference on every device. Empty sources still participate when
 other ranks have real assignments. A globally identity-only call leaves expert gradients unused.
@@ -46,9 +49,12 @@ router correction biases. Compatible MegaMoE executors share transient resources
 
 ## Model replacements and training
 
-The recipes use the generic RMSNorm and SwiGLU MLP components. The MLA adapter reuses generic fused-latent
-MLA with LongCat's Q/KV LoRA scales and interleaved rotary convention. Dense MLP boundaries are declared
-explicitly because LongCat stores them in a `ModuleList`.
+The recipes use generic RMSNorm and a model-owned dense MLP adapter that keeps the generic packed
+checkpoint layout while preserving HF's separate BF16 Gate/Up and activation boundaries. The MLA adapter
+reuses generic MLA with LongCat's Q/KV LoRA scales and interleaved rotary convention. An explicit eager
+attention request retains HF attention and separate latent projections; other NPU attention modes use
+the fused attention interface. Dense MLP boundaries are declared explicitly because LongCat stores
+them in a `ModuleList`.
 
 - [MegaMoE recipe](recipes/train.yaml)
 - [Same-topology native expert control](recipes/train_native.yaml)

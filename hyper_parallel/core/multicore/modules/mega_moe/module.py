@@ -95,6 +95,7 @@ def _critical_execution_signature(module: Any, resources: Any) -> str:
                 ('dispatch_mode', 'hidden_size', 'intermediate_size', 'ep_size', 'num_experts', 'top_k',
                  'replica_transport', 'replica_slots_per_rank')}
     metadata.update(weight_layout=resources.spec.expert_weight_layout, swiglu_limit=resources.spec.swiglu_limit,
+                    swiglu_hf_bf16=resources.spec.swiglu_hf_bf16,
                     dispatch_split=resources.spec.dispatch_split, combine_split=resources.spec.combine_split,
                     rank_nodes=resources.rank_nodes, checkpointed=get_recompute_state() is not None,
                     native_payload=_critical_native_fingerprint(), policy_abi='dynamic_tokens_v4',
@@ -274,11 +275,21 @@ class _MegaMoeExecutionResources:
             self.workspace.claim()
 
     def replica_receive_capacity(self, tokens: int, reservation: int) -> int:
-        """Price bounded optional receive growth before committing the selected plan."""
+        """Price bounded optional receive growth before committing the selected plan.
+
+        Args:
+            tokens: Proposed source token capacity.
+            reservation: Existing owner receive reservation.
+        """
         return self.heap_manager.replica_receive_capacity(self.workspace, tokens, reservation)
 
     def critical_path_receive_capacity(self, tokens: int, reservation: int) -> int:
-        """Use committed storage or an explicit hard Heap budget for calibrated candidates."""
+        """Use committed storage or an explicit hard Heap budget for calibrated candidates.
+
+        Args:
+            tokens: Proposed source token capacity.
+            reservation: Existing owner receive reservation.
+        """
         return self.heap_manager.replica_receive_capacity(self.workspace, tokens, reservation, use_hard_budget=True)
 
     def can_close(self) -> bool:
@@ -291,7 +302,8 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens",
+                  "dispatch_split", "combine_split", "swiglu_limit", "swiglu_hf_bf16", "expert_weight_layout",
+                  "ep_size", "auto_tokens",
                   "_replica_cost_model_enabled", "_replica_critical_path_identity",
                   "replica_slots_per_rank", "replica_transport")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
@@ -422,6 +434,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         swiglu_limit: float | None = None,
+        swiglu_hf_bf16: bool = False,
         ep_size: int | None = None,
         ep_group: Any | None = None,
         create_parameters: bool = True,
@@ -476,6 +489,8 @@ class MegaMoeExperts(MulticoreModule):
                 Must be a positive multiple of 128.
             combine_split: Combine tile rows in forward and backward, with the same
                 constraints and default as dispatch_split. Sharing requires equal splits.
+            swiglu_hf_bf16: Round BF16 SiLU and multiply intermediates as separate
+                operators; defaults to False and cannot be combined with a clamp.
             swiglu_limit: Optional positive, finite float32-representable clamp
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
@@ -518,6 +533,7 @@ class MegaMoeExperts(MulticoreModule):
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
+            "swiglu_hf_bf16": swiglu_hf_bf16,
             "ep_size": _resolve_ep_size(ep_size, ep_group),
             "ep_group": ep_group,
             "expert_weight_layout": expert_weight_layout,
@@ -562,6 +578,7 @@ class MegaMoeExperts(MulticoreModule):
         self.dispatch_split = specification["dispatch_split"]
         self.combine_split = specification["combine_split"]
         self.swiglu_limit = specification["swiglu_limit"]
+        self.swiglu_hf_bf16 = specification.get("swiglu_hf_bf16", False)
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
         self._ep_group = specification["ep_group"]
@@ -603,6 +620,9 @@ class MegaMoeExperts(MulticoreModule):
             auto_tokens=specification.get("auto_tokens", False),
         )
         swiglu_limit = specification["swiglu_limit"]
+        hf_bf16 = specification.get("swiglu_hf_bf16", False)
+        if not isinstance(hf_bf16, bool) or (hf_bf16 and swiglu_limit is not None):
+            raise ValueError("swiglu_hf_bf16 must be boolean and cannot be combined with swiglu_limit")
         return {
             **specification,
             "initial_capacity_factor": initial_capacity_factor,
@@ -727,6 +747,19 @@ class MegaMoeExperts(MulticoreModule):
         self._validate_tensors(hidden_flat, expert_weights)
         return hidden_flat
 
+    def _replica_capacity_options(self, resources: _MegaMoeExecutionResources, cost_model: Any) -> dict:
+        """Retain the existing fixed/growing capacity policy for replica admission."""
+        return {
+            "receive_capacity": (initial_receive_capacity(self._resource_group.specification)
+                              if self.dispatch_mode != "pull" and not resources.spec.auto_tokens else None),
+            "_auto_capacity_factor": (self.initial_capacity_factor
+                                   if resources.spec.auto_tokens and self.dispatch_mode != "pull" else None),
+            "_capacity_budget": ((resources.critical_path_receive_capacity if cost_model.critical_path is not None
+                               else resources.replica_receive_capacity)
+                              if resources.spec.auto_tokens and self.dispatch_mode != "pull"
+                              and cost_model is not None else None),
+        }
+
     def _prepare_replica_route(
         self, topk_ids: torch.Tensor, resources: _MegaMoeExecutionResources, hidden: torch.Tensor,
         autograd_mask: int, counts: torch.Tensor | None,
@@ -765,16 +798,74 @@ class MegaMoeExperts(MulticoreModule):
             compact_home=resources.home_spec is not None,
             dynamic_header=(int(hidden.shape[0] * max(self.hidden_size, self.top_k) > 2**31 - 1),
                             hidden.shape[0], autograd_mask),
-            receive_capacity=(initial_receive_capacity(self._resource_group.specification)
-                              if self.dispatch_mode != "pull" and not resources.spec.auto_tokens else None),
-            _auto_capacity_factor=(self.initial_capacity_factor
-                                   if resources.spec.auto_tokens and self.dispatch_mode != "pull" else None),
-            _capacity_budget=((resources.critical_path_receive_capacity if cost_model.critical_path is not None
-                               else resources.replica_receive_capacity)
-                              if resources.spec.auto_tokens and self.dispatch_mode != "pull"
-                              and cost_model is not None else None),
+            **self._replica_capacity_options(resources, cost_model),
             _trusted_counts=counts, _gathered_counts=gathered,
         )
+
+    def _prepare_execution_route(
+        self, hidden_flat: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
+        tokens_per_expert: torch.Tensor | None, resources: _MegaMoeExecutionResources, route_options: dict,
+    ) -> tuple:
+        """Select owner/replica placement under the already-acquired workspace lease."""
+        with torch.no_grad():
+            replica_route = None
+            execution_spec = resources.spec
+            integrated = False
+            if self.replica_slots_per_rank:
+                integrated = (resources.spec.auto_tokens and resources.home_spec is not None
+                              and self.replica_planner == "cpu")
+                if integrated:
+                    execution_spec = resources.home_spec
+                    # Capturing the callback's owning dictionary retains the input autograd graph.
+                    route_mask = route_options["autograd_mask"]
+
+                    def select_replica_route(
+                        counts: torch.Tensor, summary: list[list[int]], host_counts: list[list[int]] | None,
+                    ) -> tuple[MegaMoeSpec, ReplicaRoute] | None:
+                        """Keep equal owner loads in the already-prepared home route.
+
+                        Args:
+                            counts: Current source expert counts.
+                            summary: Gathered owner load summaries.
+                            host_counts: Optional host count values from the same exchange.
+                        """
+                        loads = [row[6] for row in summary]
+                        if min(loads) == max(loads):
+                            return None
+                        gathered = _GatheredReplicaCounts(counts, summary, host_counts)
+                        proposal = self._prepare_replica_route(
+                            topk_ids, resources, hidden_flat, route_mask,
+                            tokens_per_expert, gathered)
+                        return (resources.home_spec if proposal.home_only else resources.spec), proposal
+
+                    route_options["_select_replica_route"] = select_replica_route
+                else:
+                    replica_route = self._prepare_replica_route(
+                        topk_ids, resources, hidden_flat, route_options["autograd_mask"], tokens_per_expert)
+                if replica_route is not None and replica_route.home_only:
+                    execution_spec = resources.home_spec
+                    # Allocate using the reserved physical topology, even
+                    # when the first invocation executes only home experts.
+                    if not resources.spec.auto_tokens:
+                        resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
+                if replica_route is not None:
+                    topk_ids = replica_route.physical_ids
+                    tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
+            route = prepare_topk_route(
+                hidden_flat,
+                topk_ids,
+                topk_weights,
+                execution_spec,
+                tokens_per_expert,
+                workspace=resources.workspace,
+                replica_route=replica_route,
+                **route_options,
+            )
+            if integrated:
+                replica_route = route.metadata.replica_route
+                if replica_route is not None:
+                    topk_ids = replica_route.physical_ids
+        return route, topk_ids, replica_route, integrated
 
     def forward(
         self,
@@ -810,11 +901,7 @@ class MegaMoeExperts(MulticoreModule):
         """
         weights = ((self.gate_up_weight, self.down_weight) if expert_weights is None else expert_weights)
         hidden_flat = self._validate_forward_inputs(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            tokens_per_expert,
-            weights,
+            hidden_states, topk_ids, topk_weights, tokens_per_expert, weights,
         )
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
@@ -845,60 +932,9 @@ class MegaMoeExperts(MulticoreModule):
             resources.workspace.claim()
             claimed = True
         try:
-            # Pull source writes and execution must share one workspace lease.
-            with torch.no_grad():
-                replica_route = None
-                execution_plan = resources.plan
-                execution_spec = resources.spec
-                integrated = False
-                if self.replica_slots_per_rank:
-                    integrated = automatic and resources.home_spec is not None and self.replica_planner == "cpu"
-                    if integrated:
-                        execution_spec = resources.home_spec
-                        # Capturing the callback's owning dictionary retains the input autograd graph.
-                        route_mask = route_options["autograd_mask"]
-
-                        def select_replica_route(
-                            counts: torch.Tensor, summary: list[list[int]], host_counts: list[list[int]] | None,
-                        ) -> tuple[MegaMoeSpec, ReplicaRoute] | None:
-                            """Keep equal owner loads in the already-prepared home route."""
-                            loads = [row[6] for row in summary]
-                            if min(loads) == max(loads):
-                                return None
-                            gathered = _GatheredReplicaCounts(counts, summary, host_counts)
-                            proposal = self._prepare_replica_route(
-                                topk_ids, resources, hidden_flat, route_mask,
-                                tokens_per_expert, gathered)
-                            return (resources.home_spec if proposal.home_only else resources.spec), proposal
-
-                        route_options["_select_replica_route"] = select_replica_route
-                    else:
-                        replica_route = self._prepare_replica_route(
-                            topk_ids, resources, hidden_flat, route_options["autograd_mask"], tokens_per_expert)
-                    if replica_route is not None and replica_route.home_only:
-                        execution_plan = resources.home_plan
-                        execution_spec = resources.home_spec
-                        # Allocate using the reserved physical topology, even
-                        # when the first invocation executes only home experts.
-                        if not automatic:
-                            resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
-                    if replica_route is not None:
-                        topk_ids = replica_route.physical_ids
-                        tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
-                route = prepare_topk_route(
-                    hidden_flat,
-                    topk_ids,
-                    topk_weights,
-                    execution_spec,
-                    tokens_per_expert,
-                    workspace=resources.workspace,
-                    replica_route=replica_route,
-                    **route_options,
-                )
-                if integrated:
-                    replica_route = route.metadata.replica_route
-                    if replica_route is not None:
-                        topk_ids = replica_route.physical_ids
+            # Pull source writes and execution share the already-acquired workspace lease.
+            route, topk_ids, replica_route, integrated = self._prepare_execution_route(
+                hidden_flat, topk_ids, topk_weights, tokens_per_expert, resources, route_options)
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
             execution_plan = resources.plan_for_tokens(

@@ -97,7 +97,8 @@ def main() -> None:
     report = {"rank": rank, "pid": os.getpid(), "ep": args.ep,
               "shape": {name: getattr(args, name) for name in
                         ("tokens", "hidden", "intermediate", "real", "zero", "top_k")},
-              "oracle": "native NPU GMM/SwiGLU/permute/AllToAll/unpermute with identical parameters",
+              "oracle": "native NPU GMM/activation/permute/AllToAll/unpermute with identical parameters",
+              "swiglu_precision": args.swiglu_precision,
               "identities": identities, "results": results, "shmem_after_close": shmem.debug_state()}
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / f"rank{rank}.json").write_text(json.dumps(report, indent=2) + "\n")

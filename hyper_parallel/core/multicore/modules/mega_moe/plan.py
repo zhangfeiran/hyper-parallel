@@ -106,7 +106,12 @@ class MegaMoePlan:
 
 
 def record_plan_stream(plan: MegaMoePlan, runtime_config: Any) -> None:
-    """Protect cached tiling and runtime storage from cross-stream eviction."""
+    """Protect cached tiling and runtime storage from cross-stream eviction.
+
+    Args:
+        plan: Cached forward/backward artifacts owning tiling tensors.
+        runtime_config: Current serialized runtime storage.
+    """
     tensors = [value for value in vars(plan).values() if isinstance(value, torch.Tensor)]
     tensors.append(runtime_config)
     for tensor in tensors:
@@ -162,6 +167,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
+        swiglu_hf_bf16=spec.swiglu_hf_bf16,
         expert_weight_layout=spec.expert_weight_layout,
     )
     forward_graph.propagate_splits(task_values)
@@ -181,6 +187,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
+        swiglu_hf_bf16=spec.swiglu_hf_bf16,
         expert_weight_layout=spec.expert_weight_layout,
     )
     if spec.replica_slots_per_rank:

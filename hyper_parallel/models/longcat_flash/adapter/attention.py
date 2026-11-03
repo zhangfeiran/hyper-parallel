@@ -23,6 +23,7 @@ from typing import Any
 # pylint: disable=forbidden-backend-import
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers.models.longcat_flash.modeling_longcat_flash import (
     apply_rotary_pos_emb_interleave,
     eager_attention_forward,
@@ -48,7 +49,7 @@ def longcat_attention_interface(module: nn.Module, query: torch.Tensor, key: tor
         dropout: Attention dropout probability.
         scaling: Source attention score scale.
     """
-    if query.device.type == "npu":
+    if query.device.type == "npu" and module.config._attn_implementation != "eager":
         return npu_fusion_attention_forward(module, query, key, value, attention_mask,
                                            dropout=dropout, scaling=scaling, **kwargs)
     if kwargs.get("actual_seq_len") is not None:
@@ -75,6 +76,25 @@ class LongcatFlashMLAAttention(MLAAttention):
             self.linear_qkv.weight.copy_(torch.cat((module.q_a_proj.weight, module.kv_a_proj_with_mqa.weight)))
             if self.linear_qkv.bias is not None:
                 self.linear_qkv.bias.copy_(torch.cat((module.q_a_proj.bias, module.kv_a_proj_with_mqa.bias)))
+
+    def project_latent_inputs(self, hidden_states: torch.Tensor) -> tuple:
+        """Retain separate BF16 projection gradients when eager attention is requested.
+
+        Args:
+            hidden_states: Original token states before latent normalization.
+        """
+        if self.config._attn_implementation != "eager":
+            return super().project_latent_inputs(hidden_states)
+        weight = self.linear_qkv.weight
+        bias = self.linear_qkv.bias
+        query = F.linear(  # pylint: disable=not-callable
+                         hidden_states, weight[:self.q_lora_rank],
+                         None if bias is None else bias[:self.q_lora_rank])
+        compressed = F.linear(  # pylint: disable=not-callable
+                              hidden_states, weight[self.q_lora_rank:],
+                              None if bias is None else bias[self.q_lora_rank:])
+        kv_nope, key_rope = compressed.split((self.kv_lora_rank, self.qk_rope_head_dim), dim=-1)
+        return self.q_a_layernorm(query), self.kv_a_layernorm(kv_nope), key_rope
 
     def _project_latents(self, hidden_states: torch.Tensor) -> Any:
         """Apply source scales after the projections and before RoPE/cache writes.

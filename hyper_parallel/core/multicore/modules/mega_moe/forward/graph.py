@@ -14,6 +14,9 @@
 # ============================================================================
 """MoE-FFN forward compute graph."""
 
+from __future__ import annotations
+
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from hyper_parallel.core.multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
 )
@@ -94,7 +97,7 @@ def _build_fwd_tensor_specs(
 
 
 def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
-                   down_proj_sv, combine_sv, num_cube_cores, swiglu_limit=None):
+                   down_proj_sv, combine_sv, num_cube_cores, swiglu_limit=None, swiglu_hf_bf16=False):
     """Create all OperatorNode objects for the forward graph."""
     (target, target_offset, src, src_offset, size_d,
      up_proj_weight, up_proj_glist, up_proj_y, swiglu_out,
@@ -138,7 +141,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
             task_num_fn=lambda tsv: (tsv.per_expert_seq // swiglu_sv) * tsv.single_rank_expert_num,
         ),
         tiling_position=_TILING_POS_SWIGLU,
-        fill_config=SwiGLUFillConfig(clamp_limit=swiglu_limit),
+        fill_config=SwiGLUFillConfig(clamp_limit=swiglu_limit, hf_bf16=swiglu_hf_bf16),
     )
     down_proj = OperatorNode(
         name="down_proj", op_type=OpType.GMM,
@@ -168,7 +171,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
     return dispatch, up_proj, swiglu, down_proj, combine
 
 
-def build_forward_graph(tsv, *,
+def build_forward_graph(tsv: TaskSplitValue, *,
                         dispatch_sv:  int = 128,
                         up_proj_sv:   int = 4096,
                         swiglu_sv:    int = 128,
@@ -179,7 +182,8 @@ def build_forward_graph(tsv, *,
                         dtype_size:        int = 2,
                         num_cube_cores:    int = 24,
                         swiglu_limit:      float | None = None,
-                        expert_weight_layout: str = "EIO") -> ComputeGraph:
+                        expert_weight_layout: str = "EIO",
+                        swiglu_hf_bf16: bool = False) -> ComputeGraph:
     """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.
 
     Operator execution order and param_positions (C++ memory slots):
@@ -202,6 +206,7 @@ def build_forward_graph(tsv, *,
         num_cube_cores: number of AIC cube cores on the target device.
         swiglu_limit: optional positive clamp limit for SwiGLU; ``None`` keeps
             the original unclamped operator path.
+        swiglu_hf_bf16: Round SiLU and multiply intermediates to BF16 when enabled.
         expert_weight_layout: Logical expert-weight axis order, either ``"EIO"`` or ``"EOI"``.
 
     Returns:
@@ -217,6 +222,7 @@ def build_forward_graph(tsv, *,
         dispatch_sv=dispatch_sv, up_proj_sv=up_proj_sv, swiglu_sv=swiglu_sv,
         down_proj_sv=down_proj_sv, combine_sv=combine_sv, num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit,
+        swiglu_hf_bf16=swiglu_hf_bf16,
     )
     graph = ComputeGraph()
     (graph.add_op(dispatch).add_op(up_proj).add_op(swiglu).add_op(down_proj).add_op(combine)

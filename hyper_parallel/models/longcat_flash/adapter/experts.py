@@ -63,7 +63,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None, backend: str = "megamoe",
                  dispatch_mode: str = "push", replica_slots_per_rank: int = 0,
-                 expert_weight_layout: str = "EOI") -> None:
+                 expert_weight_layout: str = "EOI", swiglu_precision: str = "hf") -> None:
         """Bind a complete HF expert module before EP and FSDP sharding.
 
         Args:
@@ -74,6 +74,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             dispatch_mode: MegaMoE push or pull transport.
             replica_slots_per_rank: Optional real-expert guest budget.
             expert_weight_layout: EOI avoids copies; EIO enables current hot replicas.
+            swiglu_precision: HF BF16 intermediate casts, or explicit native fused arithmetic.
         """
         super().__init__()
         del module_fqn
@@ -85,6 +86,9 @@ class LongcatFlashMegaMoeExperts(nn.Module):
         self.hidden_size, self.intermediate_size = module.hidden_size, module.intermediate_size
         self.act_fn = module.act_fn
         self.identity_expert = module.identity_expert
+        if swiglu_precision not in ("hf", "fused"):
+            raise ValueError("LongCat swiglu_precision must be hf or fused")
+        self.swiglu_precision = swiglu_precision
         self.backend, self.dispatch_mode = backend, dispatch_mode
         self.replica_slots_per_rank = replica_slots_per_rank
         self.expert_weight_layout = expert_weight_layout
@@ -173,6 +177,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
                 hidden_size=self.hidden_size, intermediate_size=self.intermediate_size,
                 num_experts=self.num_experts, top_k=1, ep_group=ep_group, ep_size=ep_size,
                 create_parameters=False, expert_weight_layout=self.expert_weight_layout,
+                swiglu_hf_bf16=self.swiglu_precision == "hf",
                 dispatch_mode=self.dispatch_mode, replica_slots_per_rank=self.replica_slots_per_rank,
             )
         self._configured = True
@@ -191,7 +196,8 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             from hyper_parallel.models.longcat_flash.adapter.npu import npu_expert_forward  # pylint: disable=C0415
 
             return npu_expert_forward(hidden, ids, expert_weights, self._ep_group,
-                                      self.ep_size, self.num_experts, self.expert_weight_layout)
+                                      self.ep_size, self.num_experts, self.expert_weight_layout,
+                                      activation=self.swiglu_precision)
         from hyper_parallel.models.longcat_flash.adapter.native import native_expert_forward  # pylint: disable=C0415
 
         return native_expert_forward(hidden, ids, expert_weights, self._ep_group,

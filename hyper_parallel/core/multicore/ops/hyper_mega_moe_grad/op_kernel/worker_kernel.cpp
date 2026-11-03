@@ -150,7 +150,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                        input_list[task_desc.outputs[0].input_position] + output_0_offset,
                        input_list[SWIGLU_GRAD_WORKSPACE_IDX],
                        input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
-                       GetSwiGluClampLimit(task_desc));
+                       GetSwiGluClampLimit(task_desc), task_desc.extra_value_1 != 0);
           return;
         } else {
           GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
@@ -168,11 +168,49 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
                        input_list[task_desc.outputs[0].input_position] + output_0_offset,
                        input_list[SWIGLU_GRAD_WORKSPACE_IDX],
-                       tiling_data_addr, GetSwiGluClampLimit(task_desc));
+                       tiling_data_addr, GetSwiGluClampLimit(task_desc), task_desc.extra_value_1 != 0);
         }
       }
       return;
     }
+  }
+
+  struct GroupedMatmulBuffers {
+    GM_ADDR input;
+    GM_ADDR weight;
+    GM_ADDR output;
+  };
+
+  __aicore__ inline GroupedMatmulBuffers ResolveGroupedMatmulBuffers(
+      const TaskDesc &task_desc, int64_t start, uint32_t data_index) {
+    int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
+                               ? start * task_desc.inputs[0].dim[1] * task_desc.inputs[0].data_type
+                               : task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type;
+    int64_t input_1_offset = task_desc.inputs[1].dynamic_shape == 1
+                               ? start * task_desc.inputs[1].dim[1] * task_desc.inputs[1].data_type
+                               : task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type;
+    int64_t output_0_offset = task_desc.outputs[0].dynamic_shape == 1
+                                ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
+                                : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
+
+    GM_ADDR weight_base = input_list[task_desc.inputs[1].input_position];
+    GM_ADDR output_base = input_list[task_desc.outputs[0].input_position];
+    if (this->home_experts_ > 0) {
+      if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+        const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[0].dim[1]) *
+                                     task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
+        const uint32_t position = task_desc.outputs[0].input_position;
+        output_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 18 ? 2 : 3);
+        output_0_offset = 0;
+      } else {
+        const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
+                                     task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+        const uint32_t position = task_desc.inputs[1].input_position;
+        weight_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 11 ? 0 : 1);
+      }
+    }
+    return {input_list[task_desc.inputs[0].input_position] + input_0_offset,
+            weight_base + input_1_offset, output_base + output_0_offset};
   }
 
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
@@ -247,36 +285,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         }
         PipeBarrier<PIPE_ALL>();
 
-        int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
-                                   ? start * task_desc.inputs[0].dim[1] * task_desc.inputs[0].data_type
-                                   : task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type;
-        int64_t input_1_offset = task_desc.inputs[1].dynamic_shape == 1
-                                   ? start * task_desc.inputs[1].dim[1] * task_desc.inputs[1].data_type
-                                   : task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type;
-        int64_t output_0_offset = task_desc.outputs[0].dynamic_shape == 1
-                                    ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
-                                    : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
-
-        GM_ADDR weight_base = input_list[task_desc.inputs[1].input_position];
-        GM_ADDR output_base = input_list[task_desc.outputs[0].input_position];
-        if (this->home_experts_ > 0) {
-          if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
-            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[0].dim[1]) *
-                                         task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
-            const uint32_t position = task_desc.outputs[0].input_position;
-            output_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 18 ? 2 : 3);
-            output_0_offset = 0;
-          } else {
-            const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
-                                         task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
-            const uint32_t position = task_desc.inputs[1].input_position;
-            weight_base = this->GetExpertMatrix(position, data_index, matrix_bytes, position == 11 ? 0 : 1);
-          }
-        }
-        grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       weight_base + input_1_offset, nullptr, nullptr, nullptr,
+        const auto buffers = ResolveGroupedMatmulBuffers(task_desc, start, data_index);
+        grouped_matmul(buffers.input, buffers.weight, nullptr, nullptr, nullptr,
                        nullptr, nullptr, grouped_list_real, nullptr,
-                       output_base + output_0_offset, input_list[WORKSPACE_IDX],
+                       buffers.output, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
                        getTransposeData(task_desc.inputs[1].transpose_flag),
                        task_desc.outputs[0].data_type == sizeof(float), band_flags, band_epoch, band_rows,

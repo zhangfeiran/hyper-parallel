@@ -58,13 +58,14 @@ plan_overrides:
     kind: module
     source_type: transformers.models.longcat_flash.modeling_longcat_flash.LongcatFlashMLP
     implementation:
-      _target_: hyper_parallel.components.modules.swiglu_mlp.SwiGLUMLP
+      _target_: hyper_parallel.models.longcat_flash.adapter.mlp.LongcatFlashSwiGLUMLP
 - match: model.layers.*.mlp.experts
   replace:
     kind: module
     source_type: transformers.models.longcat_flash.modeling_longcat_flash.LongcatFlashExperts
     implementation:
       _target_: hyper_parallel.models.longcat_flash.adapter.experts.LongcatFlashMegaMoeExperts
+      swiglu_precision: hf
       backend: megamoe
       dispatch_mode: push
 - match: model.layers.*.mlps.[01]

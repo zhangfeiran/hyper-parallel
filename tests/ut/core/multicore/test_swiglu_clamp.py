@@ -18,6 +18,7 @@ import math
 import struct
 import unittest
 
+from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
@@ -26,11 +27,14 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
 )
 from hyper_parallel.core.multicore.scheduler.builder import build_runtime_config
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue, TaskType
+from tests.common.mark_utils import arg_mark
 
 
 class TestSwiGLUClamp(unittest.TestCase):
     """Keep the Python clamp option and device task descriptor synchronized."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_serializes_clamp_for_forward_and_backward_tasks(self) -> None:
         """Feature: propagate the clamp limit through both task graphs.
 
@@ -76,6 +80,8 @@ class TestSwiGLUClamp(unittest.TestCase):
                     all(task.extra_value_0 == expected_bits for task in clamp_tasks)
                 )
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_preserves_zero_discriminator_for_legacy_tasks(self) -> None:
         """Feature: preserve the legacy unclamped task discriminator.
 
@@ -116,6 +122,66 @@ class TestSwiGLUClamp(unittest.TestCase):
                 self.assertTrue(legacy_tasks)
                 self.assertTrue(all(task.extra_value_0 == 0 for task in legacy_tasks))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_constructor_validates_hf_bf16_before_allocation(self) -> None:
+        """Feature: expose explicit BF16 intermediate rounding without changing defaults.
+
+        Description: Construct each mode and reject ambiguous values without device allocation.
+        Expectation: Resource signatures retain the flag; clipping remains a separate contract.
+        """
+        for enabled in (False, True):
+            expert = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4,
+                                    top_k=2, ep_size=1, create_parameters=False, swiglu_hf_bf16=enabled)
+            try:
+                self.assertEqual(expert.swiglu_hf_bf16, enabled)
+            finally:
+                expert.close()
+        for flag, clamp in ((1, None), ("hf", None), (True, 10.0)):
+            with self.subTest(flag=flag, clamp=clamp), self.assertRaisesRegex(ValueError, "swiglu_hf_bf16"):
+                MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+                               ep_size=1, create_parameters=False, swiglu_hf_bf16=flag, swiglu_limit=clamp)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_hf_bf16_rounding_is_opt_in_for_both_graphs(self) -> None:
+        """Feature: preserve default math and serialize explicit BF16 cast semantics.
+
+        Description: Build each graph with the compatibility switch off and on.
+        Expectation: Only SwiGLU tasks receive its independent discriminator.
+        """
+        for builder, kind in ((build_forward_graph, TaskType.TASK_SWI_GLU),
+                              (build_backward_graph, TaskType.TASK_SWI_GLU_GRAD)):
+            for enabled in (False, True):
+                with self.subTest(kind=kind, enabled=enabled):
+                    values = TaskSplitValue(tp=1, ep=1, seq_size=128, all_expert_num=4, top_k=2)
+                    graph = builder(values, hidden_size=16, intermediate_size=8,
+                                    num_cube_cores=20, swiglu_hf_bf16=enabled)
+                    graph.propagate_splits(values)
+                    config = build_runtime_config(graph, values, num_cube_cores=20)
+                    tasks = [task for task in config.all_tasks[:config.task_num] if task.task_type == kind]
+                    self.assertTrue(tasks)
+                    self.assertTrue(all(task.extra_value_0 == 0 for task in tasks))
+                    self.assertTrue(all(task.extra_value_1 == int(enabled) for task in tasks))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_rejects_ambiguous_hf_rounding_descriptors(self) -> None:
+        """Feature: reject unsupported combinations before a native launch.
+
+        Description: Request a non-boolean flag or combine HF casts with clipping.
+        Expectation: Task construction rejects each ambiguous arithmetic contract.
+        """
+        for flag, limit in ((1, None), ("hf", None), (True, 10.0)):
+            with self.subTest(flag=flag, limit=limit), self.assertRaisesRegex(ValueError, "hf_bf16"):
+                values = TaskSplitValue(tp=1, ep=1, seq_size=128, all_expert_num=4, top_k=2)
+                graph = build_forward_graph(values, hidden_size=16, intermediate_size=8,
+                                            num_cube_cores=20, swiglu_hf_bf16=flag, swiglu_limit=limit)
+                graph.propagate_splits(values)
+                build_runtime_config(graph, values, num_cube_cores=20)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_rejects_non_positive_or_non_finite_clamp_limit(self) -> None:
         """Feature: reject invalid device clamp descriptors.
 

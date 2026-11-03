@@ -58,6 +58,7 @@ class MegaMoeSpec:
     replica_transport: str = "shmem_signal_kernel_gradient_bands"
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    swiglu_hf_bf16: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -123,7 +124,11 @@ def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tu
 
 
 def initial_receive_capacity(specification: Mapping[str, Any]) -> int:
-    """Resolve the receive reservation independently of the physical guest slot cap."""
+    """Resolve the receive reservation independently of the physical guest slot cap.
+
+    Args:
+        specification: Validated local shape and capacity configuration.
+    """
     capacity = _resolve_receive_capacity(
         specification["initial_capacity_factor"],
         specification["local_num_tokens"] * specification["top_k"], specification["ep_size"],
@@ -237,6 +242,7 @@ def bind_mega_moe_spec(
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit,
+        swiglu_hf_bf16=specification.get("swiglu_hf_bf16", False),
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
