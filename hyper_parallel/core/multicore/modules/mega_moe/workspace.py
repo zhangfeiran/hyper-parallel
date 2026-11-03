@@ -142,7 +142,7 @@ class MegaMoeWorkspace:
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
     replica_runtime_images: dict[int, tuple[Any, bytes, Any]] = field(default_factory=dict, repr=False)
-    replica_task_prefixes: dict[int, tuple[Any, int]] = field(default_factory=dict, repr=False)
+    replica_task_prefixes: dict[int, tuple[Any, tuple[int, int]]] = field(default_factory=dict, repr=False)
     in_use: bool = False
     closing: bool = False
     used: bool = False

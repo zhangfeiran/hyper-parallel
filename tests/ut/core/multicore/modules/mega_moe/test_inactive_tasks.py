@@ -47,6 +47,87 @@ def apply_prefix(config: RuntimeConfigC, prefix: inactive_tasks.GuestTaskPrefix)
 class TestGuestTaskPrefixes(unittest.TestCase):
     """Remove only unused suffix work and preserve native physical dependencies."""
 
+    def test_communication_prefix_changes_restore_with_the_same_local_mapping(self) -> None:
+        """A remote mapping change invalidates the body cache even for a fixed local prefix."""
+        spec = MegaMoeSpec(1024, 128, 128, 48, 2, 1.25, 8192, 4, None, 0, 24,
+                           replica_slots_per_rank=6, logical_num_experts=24)
+        config = _build_runtime_artifacts(spec)[1]
+        prefixes = build_guest_task_prefixes(config, home_experts=6, ep_size=4)
+        local = (0, 1, 2, 3, 4, 5) + (-1,) * 6
+        base = torch.frombuffer(bytearray(serialize_runtime_config(config)), dtype=torch.uint8)
+        image, cache = base.clone(), {}
+        for common in (7, 9, 12, 6, 7):
+            remote = (6, 7, 8, 9, 10, 11) + tuple(0 if slot == common - 1 else -1 for slot in range(6, 12))
+            mappings = (local, remote, local, local)
+            prefix = select_guest_task_prefix(prefixes, local, all_slot_to_logical=mappings)
+            self.assertEqual(prefix.active_experts, 6)
+            self.assertEqual(prefix.communication_experts, common)
+            apply_guest_task_prefix(image, prefix, base=base, cache=cache)
+            self.assertEqual(image.numpy().tobytes(), bytes(apply_prefix(config, prefix)))
+            with patch.object(inactive_tasks, '_copy_device_bytes') as copy:
+                apply_guest_task_prefix(image, prefix, base=base, cache=cache)
+                copy.assert_not_called()
+        with self.assertRaisesRegex(ValueError, 'Global'):
+            select_guest_task_prefix(prefixes, local, all_slot_to_logical=(local,))
+
+
+    def test_global_unmapped_suffix_removes_communication_with_matched_remote_thresholds(self) -> None:
+        """Every retained remote signal matches the destination's completion threshold."""
+        for mode in ('push', 'pull'):
+            for cores in (1, 8, 24):
+                ep, home, local = 4, 6, 12
+                mappings = tuple(tuple(range(rank * home, (rank + 1) * home))
+                                 + ((0, -1, -1, -1, -1, -1) if rank == 1 else (-1,) * 6)
+                                 for rank in range(ep))
+                graphs = []
+                for rank in range(ep):
+                    spec = MegaMoeSpec(1024, 128, 128, ep * local, 2, 1.25, 8192, ep, None, rank, cores,
+                                       dispatch_mode=mode, replica_slots_per_rank=6, logical_num_experts=24)
+                    _, forward, _, backward = _build_runtime_artifacts(spec)
+                    graphs.append((forward, backward))
+                for direction in (0, 1):
+                    changed = []
+                    for rank, pair in enumerate(graphs):
+                        config = pair[direction]
+                        prefixes = build_guest_task_prefixes(config, home_experts=home,
+                                                              ep_size=ep, dispatch_mode=mode)
+                        prefix = select_guest_task_prefix(prefixes, mappings[rank], all_slot_to_logical=mappings)
+                        self.assertEqual(prefix.communication_experts, 7)
+                        self.assertEqual(prefix.active_experts, 7 if rank == 1 else 6)
+                        changed.append(apply_prefix(config, prefix))
+                        original = list(config.vector_task_indices[:config.task_index_num[1]])
+                        retained = list(changed[-1].vector_task_indices[:changed[-1].task_index_num[1]])
+                        positions = {task_id: index for index, task_id in enumerate(original)}
+                        self.assertTrue(all(positions[task_id] % cores == index % cores
+                                            for index, task_id in enumerate(retained)))
+                        removed = [config.all_tasks[task_id] for task_id in set(original) - set(retained)]
+                        communication = [task for task in removed if task.task_type in (
+                            TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM)]
+                        self.assertGreater(len(communication), 0)
+                        for task in communication:
+                            tiles = task.task_split_num // (ep * local)
+                            self.assertGreaterEqual((task.task_index // tiles) % local, 7)
+                    signals = [Counter() for _ in range(ep)]
+                    communication_events = [set() for _ in range(ep)]
+                    for rank, config in enumerate(changed):
+                        for task_id in (*config.cube_task_indices[:config.task_index_num[0]],
+                                        *config.vector_task_indices[:config.task_index_num[1]]):
+                            task = config.all_tasks[task_id]
+                            if task.task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL:
+                                tiles = task.task_split_num // (ep * local)
+                                target = task.task_index // (local * tiles)
+                                signals[target][task.trigger_event] += 1
+                                communication_events[target].add(task.trigger_event)
+                            else:
+                                signals[rank][task.trigger_event] += 1
+                                if task.task_type == TaskType.TASK_SHMEM_GET_MEM:
+                                    communication_events[rank].add(task.trigger_event)
+                    for rank, counts in enumerate(signals):
+                        for event in communication_events[rank]:
+                            total = counts[event]
+                            self.assertEqual(changed[rank].all_event_num_triggers[event], total,
+                                             f'{mode=} {cores=} {direction=} {rank=} {event=} {total=}')
+
     def test_real_graphs_preserve_workers_descriptors_and_event_accounting(self) -> None:
         """Each retained task stays on its original worker with identical operands."""
         for mode in ('push', 'pull'):

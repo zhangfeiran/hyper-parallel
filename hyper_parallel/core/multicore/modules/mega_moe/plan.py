@@ -267,7 +267,8 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         "num_groups": spec.local_experts,
         "num_cube_cores": spec.num_cube_cores,
     }
-    prefix_options = {"home_experts": spec.local_experts - spec.replica_slots_per_rank}
+    prefix_options = {"home_experts": spec.local_experts - spec.replica_slots_per_rank,
+                      "ep_size": spec.ep_size, "dispatch_mode": spec.dispatch_mode}
     return MegaMoePlan(
         spec=spec,
         fwd_task_prefixes=(build_guest_task_prefixes(forward_config, **prefix_options)

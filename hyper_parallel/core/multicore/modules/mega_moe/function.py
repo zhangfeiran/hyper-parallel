@@ -714,7 +714,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             if spec.replica_slots_per_rank and plan.fwd_task_prefixes:
                 slots = None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical[
                     ctx.replica_route.rank]
-                execution = replace(execution, task_prefix=select_guest_task_prefix(plan.fwd_task_prefixes, slots))
+                execution = replace(execution, task_prefix=select_guest_task_prefix(
+                    plan.fwd_task_prefixes, slots,
+                    all_slot_to_logical=None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical))
             _launch_forward_kernel(
                 plan,
                 metadata,
@@ -809,7 +811,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                             else plan.bwd_no_replica_task_prefixes)
                 slots = None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical[
                     ctx.replica_route.rank]
-                execution = replace(execution, task_prefix=select_guest_task_prefix(prefixes, slots))
+                execution = replace(execution, task_prefix=select_guest_task_prefix(
+                    prefixes, slots,
+                    all_slot_to_logical=None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical))
             early_return = prepare_kernel_gradient_return(
                 plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,
                 None if pool is None else pool.gradients[1],

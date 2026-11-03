@@ -139,10 +139,11 @@ class ExpertReplicaCostModel:
         expected_schedule = _default_schedule(self.backend, self.transport)
         schedules = (expected_schedule,)
         if expected_schedule == 'fixed_queue_gradient_bands_v1':
-            schedules += ('fixed_queue_unmapped_guest_suffix_v1',)
+            schedules += ('fixed_queue_unmapped_guest_suffix_v1', 'fixed_queue_global_guest_communication_suffix_v1')
         if self.schedule is not None and self.schedule not in schedules:
             raise ValueError("Replica calibration schedule does not match the execution")
-        if self.schedule == 'fixed_queue_unmapped_guest_suffix_v1' and self.critical_path is not None:
+        if self.schedule in ('fixed_queue_unmapped_guest_suffix_v1',
+                             'fixed_queue_global_guest_communication_suffix_v1') and self.critical_path is not None:
             raise ValueError('Critical-path template does not support the unmapped guest schedule')
         object.__setattr__(self, "schedule", self.schedule or expected_schedule)
         if self.gradient_dtype != "float32":
