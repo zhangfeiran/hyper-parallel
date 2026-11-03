@@ -235,7 +235,9 @@ class OpDispatcher:
                                     "register_hook",
                                     "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim",
                                     "_has_compatible_shallow_copy_type", "is_floating_point", "is_contiguous",
-                                    "get_device"})
+                                    "get_device", "clamp_", "foreach_mul", "_foreach_mul", "_foreach_mul_",
+                                    "_foreach_add_", "_foreach_norm", "fused_adamw", "_fused_adamw_", "is_pinned",
+                                    "new_tensor"})
 
         self._random_ops = {
             "normal_", "uniform_", "bernoulli", "bernoulli_",

@@ -77,7 +77,7 @@ def _build_kda_cp_rewrite(
         """Execute the selected KDA Context Parallel algorithm.
 
         Args:
-            kwargs: Additional model arguments; packed sequences are unsupported.
+            kwargs: Additional model arguments, including global packed sample metadata.
         """
         return executor(*args, **kwargs)
 
@@ -183,8 +183,8 @@ def kimi_delta_attention_cp_wrapper(
         tp_mesh: Simultaneous TP and CP is currently unsupported.
         cp_mesh: Chronological CP mesh, retaining its root for hybrid splitting.
         ep_mesh: Unused expert-parallel context.
-        backend: Local backend; gathers require triton.
-        state_cp_method: State CP method: p2p, allgather, or grouped_allgather_p2p.
+        backend: Local backend; non-P2P state exchange requires triton.
+        state_cp_method: p2p, allgather, grouped_allgather_p2p, or recursive_doubling.
         ulysses_degree: Consecutive ranks exchanging token/head shards.
         allgather_group_size: AG width along state CP, only for grouped_allgather_p2p.
 

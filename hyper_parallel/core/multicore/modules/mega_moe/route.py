@@ -24,11 +24,11 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed as dist
-import torch_npu
 from torch.autograd.function import once_differentiable
 
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, _replica_count_payload
 
+from hyper_parallel.core.multicore._loader import load_torch_npu
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .spec import MegaMoeSpec, _align_capacity
@@ -38,8 +38,12 @@ if TYPE_CHECKING:
 
 
 # Avoid large Host transfers and Python boxing when the gathered count table grows.
-_HOST_ROUTE_MAX_COUNTS = 1024
+_HOST_ROUTE_MAX_COUNTS = 2048
+# Preserve the smaller descriptor budget when counts change on every call.
+_HOST_DESCRIPTOR_MAX_COUNTS = 1024
+_ROUTE_CACHE_REPROBE_STEPS = 8
 _METADATA_ALIGNMENT = 512
+_PULL_STAGING_MAX_BYTES = 64 * 1024 * 1024
 
 ReplicaRouteSelector = Callable[
     [torch.Tensor, list[list[int]], Optional[list[list[int]]]], Optional[tuple[MegaMoeSpec, ReplicaRoute]]]
@@ -72,6 +76,54 @@ class PreparedTopKRoute:
     received_counts: torch.Tensor
     metadata: RouteMetadata
     maximum_received_slots: int = 0
+
+
+@dataclass(frozen=True)
+class _HostRouteCache:
+    """One validated wire table and immutable route descriptors for a workspace."""
+
+    signature: tuple[Any, ...]
+    raw: list[list[int]]
+    summary: tuple[int, int, int]
+    metadata: RouteMetadata | None
+    stream: Any = None
+    ready: Any = None
+
+    def wait(self, device: Any) -> None:
+        """Order a different consumer stream after the descriptor upload.
+
+        Args:
+            device: Device whose current stream consumes the cached descriptors.
+        """
+        if self.ready is not None and self.metadata is not None:
+            current = torch.npu.current_stream(device)
+            if current != self.stream:
+                current.wait_event(self.ready)
+                for tensor in vars(self.metadata).values():
+                    if isinstance(tensor, torch.Tensor):
+                        tensor.record_stream(current)
+
+
+@dataclass(frozen=True)
+class _RouteHeaderCache:
+    """One immutable control header, retained across identical local invocations."""
+
+    key: tuple[Any, ...]
+    tensor: torch.Tensor | None
+    stream: Any = None
+    ready: Any = None
+
+    def wait(self, device: Any) -> None:
+        """Preserve upload ordering and allocation lifetime on another stream.
+
+        Args:
+            device: Device whose current stream consumes the cached header.
+        """
+        if self.ready is not None and self.tensor is not None:
+            current = torch.npu.current_stream(device)
+            if current != self.stream:
+                current.wait_event(self.ready)
+                self.tensor.record_stream(current)
 
 
 def _validate_topk_inputs(
@@ -182,7 +234,7 @@ def _permute_topk_input(
     """Expand hidden rows with the native NPU MoE permutation operator."""
     if hidden_states.shape[0] == 0:
         return hidden_states, torch.empty(0, dtype=torch.int32, device=hidden_states.device)
-    routed_tokens, unpermute_mapping = torch_npu.npu_moe_token_permute(
+    routed_tokens, unpermute_mapping = load_torch_npu().npu_moe_token_permute(
         hidden_states,
         topk_ids,
     )
@@ -481,7 +533,8 @@ def _read_dynamic_route(
     *, defer_receive_limit: bool = False,
 ) -> tuple[tuple[int, int, int], list[list[int]] | None, list[list[int]]]:
     """Reuse the required readback for small descriptors; reduce large tables on device."""
-    if spec.ep_size * spec.num_experts > _HOST_ROUTE_MAX_COUNTS:
+    host_limit = _HOST_DESCRIPTOR_MAX_COUNTS if defer_receive_limit else _HOST_ROUTE_MAX_COUNTS
+    if spec.ep_size * spec.num_experts > host_limit:
         rows = _device_route_rows(payload, spec)
         return _summarize_dynamic_rows(rows, spec, defer_receive_limit=defer_receive_limit), None, rows
     raw = payload.tolist()
@@ -492,6 +545,81 @@ def _read_dynamic_route(
     ]
     rows = [row[:3] + [sum(values), min(values), max(values), load] for row, values, load in zip(raw, counts, loads)]
     return _summarize_dynamic_rows(rows, spec, defer_receive_limit=defer_receive_limit), raw, rows
+
+
+def _summarize_host_route(raw: list[list[int]], spec: MegaMoeSpec) -> tuple[int, int, int]:
+    """Validate a bounded Host table before allocating or publishing source rows."""
+    counts = [row[3:] for row in raw]
+    local = spec.local_experts
+    loads = [
+        sum(sum(values[start : start + local]) for values in counts) for start in range(0, spec.num_experts, local)
+    ]
+    rows = [row[:3] + [sum(values), min(values), max(values), load] for row, values, load in zip(raw, counts, loads)]
+    return _summarize_dynamic_rows(rows, spec)
+
+
+def _route_cache_signature(spec: MegaMoeSpec, device: Any) -> tuple[Any, ...]:
+    """Keep descriptor reuse specific to the route topology and size contract."""
+    return (spec.ep_size, id(spec.ep_group), spec.rank_id, spec.num_experts, spec.top_k, spec.hidden_size,
+            spec.dispatch_mode, spec.auto_tokens, spec.max_local_num_tokens, torch.device(device))
+
+
+def _read_cached_route(
+    payload: torch.Tensor, spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None, device: Any,
+) -> tuple[tuple[int, int, int], list[list[int]] | None, RouteMetadata | None]:
+    """Reuse only an identical, previously validated all-rank wire table."""
+    if workspace is None or not spec.auto_tokens or spec.ep_size * spec.num_experts > _HOST_ROUTE_MAX_COUNTS:
+        summary, raw, _ = _read_dynamic_route(payload, spec)
+        return summary, raw, None
+    cached = getattr(workspace, "route_cache", None)
+    same_topology = isinstance(cached, _HostRouteCache) and cached.signature == _route_cache_signature(spec, device)
+    remaining = getattr(workspace, "route_cache_probe_after", 0)
+    if same_topology and remaining > 0:
+        workspace.route_cache_probe_after = remaining - 1
+        return _dynamic_summary(payload, spec), None, None
+    workspace.route_cache_probe_after = 0
+    raw = payload.tolist()
+    if same_topology and cached.raw == raw:
+        cached.wait(device)
+        return cached.summary, raw, cached.metadata
+    summary = _summarize_host_route(raw, spec)
+    if same_topology and spec.ep_size * spec.num_experts > _HOST_DESCRIPTOR_MAX_COUNTS:
+        workspace.route_cache_probe_after = _ROUTE_CACHE_REPROBE_STEPS
+    return summary, raw, None
+
+
+def _cache_host_route(
+    workspace: MegaMoeWorkspace | None, spec: MegaMoeSpec, raw: list[list[int]],
+    summary: tuple[int, int, int], metadata: RouteMetadata, device: Any,
+) -> None:
+    """Retain descriptors only after confirming a repeated validated wire table."""
+    if workspace is None or not spec.auto_tokens:
+        return
+    signature = _route_cache_signature(spec, device)
+    previous = getattr(workspace, "route_cache", None)
+    repeated = isinstance(previous, _HostRouteCache) and previous.signature == signature and previous.raw == raw
+    retained = metadata if repeated else None
+    stream, ready = None, None
+    if repeated and torch.device(device).type == "npu":
+        stream = torch.npu.current_stream(device)
+        ready = torch.npu.Event()
+        ready.record(stream)
+    workspace.route_cache = _HostRouteCache(signature, raw, summary, retained, stream, ready)
+
+
+def _dynamic_route_metadata(
+    counts: torch.Tensor, gathered: torch.Tensor, host_rows: list[list[int]] | None,
+    spec: MegaMoeSpec, capacity: int,
+) -> RouteMetadata:
+    """Keep wider cache misses on device instead of rebuilding large Host descriptors."""
+    if host_rows is not None and spec.ep_size * spec.num_experts <= _HOST_DESCRIPTOR_MAX_COUNTS:
+        return _host_route_metadata(host_rows, spec, capacity, counts.device)
+    counts_by_source = gathered[:, 3:].contiguous()
+    start = spec.rank_id * spec.local_experts
+    received_counts = counts_by_source[:, start:start + spec.local_experts].contiguous()
+    # Retained dispatch sizes must not alias a caller-owned Router count buffer.
+    local_counts = counts_by_source[spec.rank_id] if spec.auto_tokens else counts
+    return _compute_route_metadata(local_counts, counts_by_source, received_counts, spec, capacity)
 
 
 def _permute_dynamic_pull(
@@ -506,9 +634,61 @@ def _permute_dynamic_pull(
             else (output, topk_ids.reshape(-1)))
 
 
+def _can_stage_pull(hidden_states: torch.Tensor, spec: MegaMoeSpec) -> bool:
+    """Bound ordinary-memory permutation staging while capacity agreement is pending."""
+    return (spec.auto_tokens and spec.dispatch_mode == "pull" and hidden_states.device.type == "npu"
+            and hidden_states.numel() * spec.top_k * hidden_states.element_size() <= _PULL_STAGING_MAX_BYTES)
+
+
+def _stage_dynamic_permutation(
+    hidden_states: torch.Tensor, topk_ids: torch.Tensor, spec: MegaMoeSpec, invalid: bool,
+    workspace: MegaMoeWorkspace | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Stage only valid automatic routes whose ordinary storage survives heap growth."""
+    if invalid or not spec.auto_tokens:
+        return None
+    if (spec.dispatch_mode == "push"
+            or _can_stage_pull(hidden_states, spec) and not getattr(workspace, "route_cache_probe_after", 0)):
+        return _permute_topk_input(hidden_states, topk_ids)
+    return None
+
+
+def _publish_staged_pull(
+    permuted: tuple[torch.Tensor, torch.Tensor], hidden_states: torch.Tensor,
+    spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Publish staged rows only after every rank validated and committed its workspace."""
+    if workspace is None or not workspace.in_use or workspace.source_buffer is None:
+        raise RuntimeError("Pull publication requires an initialized, claimed workspace.")
+    output = workspace.source_buffer[:hidden_states.shape[0] * spec.top_k]
+    output.copy_(permuted[0])
+    return output, permuted[1]
+
+
+def _dynamic_header(
+    values: tuple[int, int, int], dtype: torch.dtype, device: Any, workspace: MegaMoeWorkspace | None,
+) -> torch.Tensor:
+    """Avoid repeated Host allocation and upload of an unchanged control header."""
+    key = (values, dtype, torch.device(device))
+    cached = getattr(workspace, "route_header_cache", None)
+    repeated = isinstance(cached, _RouteHeaderCache) and cached.key == key
+    if repeated and cached.tensor is not None:
+        cached.wait(device)
+        return cached.tensor
+    header = _upload_route_tensor(torch.tensor(values, dtype=dtype), device)
+    if workspace is not None:
+        stream, ready = None, None
+        if repeated and torch.device(device).type == "npu":
+            stream = torch.npu.current_stream(device)
+            ready = torch.npu.Event()
+            ready.record(stream)
+        workspace.route_header_cache = _RouteHeaderCache(key, header if repeated else None, stream, ready)
+    return header
+
+
 def _dynamic_route_payload(
     hidden_states: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
-    supplied_counts: torch.Tensor | None, autograd_mask: int,
+    supplied_counts: torch.Tensor | None, autograd_mask: int, workspace: MegaMoeWorkspace | None = None,
     validate_replica_ids: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, bool]:
     """Pack one group-consistent wire format, including coordinated overflow flags."""
@@ -528,8 +708,8 @@ def _dynamic_route_payload(
     payload_dtype = torch.int32 if flexible else torch.int64
     # An invalid source must still join the same collective before all ranks reject it.
     header_tokens = min(tokens, 2**31 - 1) if flexible else tokens
-    header = _upload_route_tensor(
-        torch.tensor([int(invalid), header_tokens, autograd_mask], dtype=payload_dtype), hidden_states.device)
+    header = _dynamic_header((int(invalid), header_tokens, autograd_mask), payload_dtype,
+                             hidden_states.device, workspace if flexible else None)
     payload = torch.cat((header, counts.to(payload_dtype)))
     return counts, payload, invalid
 
@@ -544,6 +724,54 @@ def _start_dynamic_gather(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[tor
     return gathered, work
 
 
+def _prepare_ordinary_dynamic_route(
+    hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
+    supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
+    prepare_workspace: Callable[[int, int], None] | None = None,
+) -> PreparedTopKRoute:
+    """Exchange variable-length metadata without adding a token-count collective."""
+    tokens = hidden_states.shape[0]
+    counts, payload, invalid = _dynamic_route_payload(
+        hidden_states, flat_ids, spec, supplied_counts, autograd_mask, workspace)
+    if workspace is not None and spec.dispatch_mode != "pull":
+        workspace.wait_for_reuse()
+    gathered, work = _start_dynamic_gather(payload, spec)
+    # Ordinary storage remains valid if count agreement triggers a SHMEM restart.
+    permuted = _stage_dynamic_permutation(hidden_states, topk_ids, spec, invalid, workspace)
+    summary, host_rows, metadata = None, None, None
+    if spec.auto_tokens:
+        if work is not None:
+            work.wait()
+            work = None
+        summary, host_rows, metadata = _read_cached_route(gathered, spec, workspace, hidden_states.device)
+        if prepare_workspace is None:
+            raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
+        prepare_workspace(summary[1], summary[2])
+    if invalid:
+        permuted = None
+    elif spec.dispatch_mode == "pull":
+        permuted = (_permute_dynamic_pull(hidden_states, topk_ids, spec, workspace) if permuted is None else
+                    _publish_staged_pull(permuted, hidden_states, spec, workspace))
+    elif permuted is None:
+        permuted = _permute_topk_input(hidden_states, topk_ids)
+    if work is not None:
+        work.wait()
+    if summary is None:
+        summary, host_rows, _ = _read_dynamic_route(gathered, spec)
+    capacity, plan_tokens, maximum = summary
+    if metadata is None:
+        metadata = _dynamic_route_metadata(counts, gathered, host_rows, spec, capacity)
+        if host_rows is not None:
+            _cache_host_route(workspace, spec, host_rows, summary, metadata, hidden_states.device)
+    received_counts = metadata.combine_size.reshape(spec.ep_size, spec.local_experts)
+    return PreparedTopKRoute(
+        routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
+        received_counts=received_counts,
+        maximum_received_slots=maximum,
+        metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens),
+    )
+
+
 def _prepare_dynamic_route(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
@@ -552,6 +780,11 @@ def _prepare_dynamic_route(
     select_replica_route: ReplicaRouteSelector | None = None,
 ) -> PreparedTopKRoute:
     """Exchange variable-length metadata without adding a token-count collective."""
+    if replica_route is None and select_replica_route is None:
+        return _prepare_ordinary_dynamic_route(
+            hidden_states, topk_ids, flat_ids, spec, supplied_counts, workspace,
+            autograd_mask, prepare_workspace,
+        )
     tokens = hidden_states.shape[0]
     source_summary = None if replica_route is None else replica_route.dynamic_summary
     payload = None
@@ -653,7 +886,7 @@ class _LegacyTopKRestore(torch.autograd.Function):
             probabilities: Contiguous FP32 Router weights.
         """
         ctx.save_for_backward(expert_output, mapping, probabilities)
-        return torch_npu.npu_moe_token_unpermute(expert_output, mapping, probs=probabilities)
+        return load_torch_npu().npu_moe_token_unpermute(expert_output, mapping, probs=probabilities)
 
     @staticmethod
     @once_differentiable
@@ -696,10 +929,10 @@ def restore_topk_output(
         # Keep both the expert backward and the empty routing-weight gradient connected.
         return expert_output[:0] + topk_weights.sum().to(expert_output.dtype)
     probabilities = topk_weights.float().contiguous()
-    npu_version = getattr(torch_npu, "__version__", "").split("+", 1)[0].split(".")[:3]
+    npu_version = getattr(load_torch_npu(), "__version__", "").split("+", 1)[0].split(".")[:3]
     if npu_version == ["2", "9", "0"] and torch.is_grad_enabled():
         return _LegacyTopKRestore.apply(expert_output, unpermute_mapping, probabilities)
-    return torch_npu.npu_moe_token_unpermute(
+    return load_torch_npu().npu_moe_token_unpermute(
         expert_output,
         unpermute_mapping,
         probs=probabilities,

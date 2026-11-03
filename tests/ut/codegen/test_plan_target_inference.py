@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""S3: a missing MoE ``local_compute_fn._target_`` is inferred from structure.
+"""S3: a missing MoE ``replace.implementation`` is inferred from structure.
 
 A plan override whose match resolves to a MoE boundary carries its EP compute
-factory either explicitly (``local_compute_fn._target_`` — the escape hatch) or
+factory either explicitly (``replace.implementation`` — the escape hatch) or
 implicitly via structure detection. These two write paths must be equivalent:
 the inferred ``_target_`` written into meta must equal the explicit one, and
 the generated artifact bytes must be identical. Recognition never guesses — an
@@ -31,6 +31,7 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
 
 from hyper_parallel.codegen import manager
+from hyper_parallel.distributed import forward_replacement
 from hyper_parallel.distributed.expert_parallel.structure import (
     UnsupportedModuleStructure,
 )
@@ -39,9 +40,10 @@ QWEN_ROOT = "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel
 EP_PATH = QWEN_ROOT + "qwen3moe_ep_compute_fn"
 
 
-def _stub_factory(**kwargs):
+@forward_replacement
+def _stub_factory(*, mesh, tp_mesh, cp_mesh, ep_mesh):
     """An inert callable — ``Target.to_dict`` only serializes the path."""
-    return None
+    del mesh, tp_mesh, cp_mesh, ep_mesh
 
 
 def _holder_with(block: nn.Module) -> nn.Module:
@@ -81,6 +83,7 @@ class TestPlanTargetInference(unittest.TestCase):
         """An implicit (no ``_target_``) override writes the same meta target."""
         from hyper_parallel.trainer.config import (  # pylint: disable=C0415,import-outside-toplevel
             PlanOverride,
+            ReplaceAction,
             Target,
             entries_to_plan_overrides,
         )
@@ -88,10 +91,12 @@ class TestPlanTargetInference(unittest.TestCase):
         explicit = entries_to_plan_overrides(
             [
                 PlanOverride(
-                    match="layers.mlp",
+                    match="layers.mlp.forward",
                     when="ep",
                     region_dispatch=False,
-                    local_compute_fn=Target(_stub_factory, target_path=EP_PATH),
+                    replace=ReplaceAction(
+                        kind="method", implementation=Target(_stub_factory, target_path=EP_PATH),
+                    ),
                 )
             ],
             ep_size=2,

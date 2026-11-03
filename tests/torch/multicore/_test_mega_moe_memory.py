@@ -179,14 +179,18 @@ def test_mega_moe_local_capacity_lifetime() -> None:
         start_shmem_lifetime()
         mega, common = baseline.new_layers(shape, initial_capacity_factor=factor)
         resources = mega._get_execution_resources(baseline.make_data(shape)[0])  # pylint: disable=protected-access
-        assert resources.plan.reuse_backward_dispatch
+        select_plan = resources.plan_for_tokens
         original = ops.mega_moe_grad_with_diagnostic_buffer
         pairs = [("balanced", "tail"), ("tail", "balanced")]
         if factor is None:
             pairs.extend([("destination0", "destination1"), ("destination1", "tail")])
         try:
             for reuse in (False, True):
-                resources.plan = replace(resources.plan, reuse_backward_dispatch=reuse)
+                def _select_plan(tokens, device, expected_reuse=reuse, original_plan=select_plan):
+                    """Exercise both reuse policies with the actual cached automatic plan."""
+                    plan = original_plan(tokens, device)
+                    assert plan.reuse_backward_dispatch
+                    return replace(plan, reuse_backward_dispatch=expected_reuse)
 
                 def _backward(*args, expected_reuse=reuse, kernel=original):
                     """Check receive-buffer ownership at the native boundary."""
@@ -194,7 +198,9 @@ def test_mega_moe_local_capacity_lifetime() -> None:
                     assert args[17].data_ptr() != args[0].data_ptr()
                     return kernel(*args)
 
-                with patch.object(ops, "mega_moe_grad_with_diagnostic_buffer", side_effect=_backward), patch.object(
+                with patch.object(resources, "plan_for_tokens", side_effect=_select_plan), patch.object(
+                    ops, "mega_moe_grad_with_diagnostic_buffer", side_effect=_backward,
+                ), patch.object(
                     ops, "mega_moe_grad", side_effect=partial(_backward, kernel=ops.mega_moe_grad),
                 ):
                     for patterns in pairs:
@@ -234,9 +240,10 @@ def test_mega_moe_local_capacity_lifetime() -> None:
 def _check_unknown_owner(mega: MegaMoeExperts, shape: baseline.MoeShape) -> None:
     """Converge one rank's unmanaged reference and preserve every old buffer."""
     # Force the private lazy bind so the failure probe has live transport buffers.
+    hidden = baseline.make_data(shape)[0]
     # pylint: disable-next=protected-access
-    resources = mega._get_execution_resources(baseline.make_data(shape)[0])
-    resources.workspace.ensure(resources.spec, torch.bfloat16, baseline.DEVICE)
+    resources = mega._get_execution_resources(hidden)
+    resources.prepare_auto_workspace(shape.local_num_tokens, shape.local_num_tokens * shape.top_k, hidden)
     before = resources.workspace.expert_buffer
     if baseline.RANK == 0:
         shmem.acquire()
@@ -298,7 +305,9 @@ def test_mega_moe_heap_growth() -> None:
             for index, (reference, observed) in enumerate(zip(expected, actual)):
                 baseline.assert_close(f"grow patterns={patterns} tensor={index}", observed, reference)
         epochs = [item[0] for item in observations]
-        assert epochs[:2] == [0, 1] and all(epoch == 1 for epoch in epochs[2:]), observations
+        initial_epoch = epochs[0]
+        assert epochs[:2] == [initial_epoch, initial_epoch + 1], observations
+        assert all(epoch == initial_epoch + 1 for epoch in epochs[2:]), observations
         assert observations[1][2] > observations[0][2], observations
         assert old_buffers[0].untyped_storage().nbytes() == 0
         # The process Heap Manager owns the sole SHMEM Runtime reference.

@@ -93,7 +93,7 @@ class TestFsdpDegreeResolution(unittest.TestCase):
         mock_dist.get_rank.return_value = 0  # local rank in FSDP group
         mock_resolve_pg.return_value = MagicMock()
 
-        config = PassConfig(fsdp_degree=2, tp_size=2)
+        config = PassConfig(fsdp_degree=2)
         plan = GraphParallelPlan()
         plan.fsdp_mark_pattern("*")
 
@@ -139,7 +139,7 @@ class TestShardLiveModelParamsRank(unittest.TestCase):
         mock_dist.get_rank.return_value = 1  # local rank in FSDP group
         mock_resolve_pg.return_value = MagicMock()
 
-        config = PassConfig(fsdp_degree=2, tp_size=2)
+        config = PassConfig(fsdp_degree=2)
         plan = GraphParallelPlan()
         plan.fsdp_mark_pattern("*")
 

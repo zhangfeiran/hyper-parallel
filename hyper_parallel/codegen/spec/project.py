@@ -164,30 +164,10 @@ def _project_dp_size(accelerator: Any) -> int:
 def _canonicalize_override(entry: Any) -> dict[str, Any]:
     """Stable dict form of one PlanOverride entry.
 
-    Resolves Target values instead of stashing raw ``repr()``.
-    ``replace_module`` is projected so changes invalidate the signature.
+    Include the public replacement action so implementation changes invalidate
+    the generated artifact signature.
     """
-    result: dict[str, Any] = {"match": entry.match}
-    for attr in (
-        "when",
-        "module_type",
-        "exact_type",
-        "inner_target",
-        "region_dispatch",
-        "tp_divide_attrs",
-    ):
-        value = getattr(entry, attr, None)
-        if value is not None:
-            result[attr] = value
-    for attr in ("inner_wrapper", "replace_module", "local_compute_fn"):
-        value = getattr(entry, attr, None)
-        if value is not None:
-            result[attr] = _canonicalize_value(value)
-    for attr in ("params", "in_src", "in_dst", "out_src", "out_dst"):
-        value = getattr(entry, attr, None)
-        if value is not None:
-            result[attr] = _canonicalize_value(value)
-    return result
+    return _canonicalize_value(entry.to_dict())
 
 
 def _canonicalize_value(value: Any) -> Any:

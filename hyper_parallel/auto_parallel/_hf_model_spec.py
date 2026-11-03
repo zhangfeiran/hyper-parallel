@@ -557,7 +557,9 @@ def _census(text_config: Any, layers: Any, seq_length: int, replacements: Tuple[
         tuple((group["kind"], int(group["count"]), bool(group.get("mtp"))) for group in layers),
         int(seq_length),
         tuple((f"{spec.factory.__module__}.{spec.factory.__qualname__}",
-               f"{spec.module_type.__module__}.{spec.module_type.__qualname__}",
+               getattr(spec.factory, "_hp_config", None),
+               (f"{spec.module_type.__module__}.{spec.module_type.__qualname__}"
+                if spec.module_type is not None else None),
                tuple(spec.match), bool(spec.exact_type)) for spec in replacements),
     )
     if key not in _CENSUSES:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Contract tests for generated-model ``replace_module`` handling.
+"""Contract tests for generated-model module replacement handling.
 
 ``meta.module_overrides`` FQN records must agree with a generation-time
 ``compile_module_replacements`` hit (same FQN set).
@@ -31,6 +31,7 @@ from hyper_parallel.codegen.emit.replacement import compile_overrides_for_meta
 from hyper_parallel.codegen.meta import CodegenMeta
 from hyper_parallel.trainer.config import (
     PlanOverride,
+    ReplaceAction,
     Target,
     entries_to_module_replacements,
 )
@@ -94,15 +95,16 @@ def _meta_model() -> helpers.MetaModel:
 
 
 def _spec_entries():
-    """A real YAML-shaped ``replace_module`` entry (module_type separate)."""
+    """A real YAML-shaped module replacement entry."""
     return [
         PlanOverride(
             match="model.0",
-            module_type="tests.ut.codegen.helpers.SourceMLP",
-            exact_type=False,
-            replace_module=Target(
-                helpers._replace_mlp,
-                target_path="tests.ut.codegen.helpers._replace_mlp",
+            replace=ReplaceAction(
+                kind="module", source_type="tests.ut.codegen.helpers.SourceMLP",
+                implementation=Target(
+                    helpers._replace_mlp,
+                    target_path="tests.ut.codegen.helpers._replace_mlp",
+                ),
             ),
         )
     ]
@@ -133,7 +135,7 @@ def test_g7_meta_records_match_via_desugar_path(source_path):
 
 
 def test_g7_nomatch_pattern_fails_fast(source_path):
-    """A replace_module rule matching no module is a config error, not a skip.
+    """A module replacement rule matching no module is a config error, not a skip.
 
     Mirrors the native ``compile_module_replacements`` behavior: an unmatched
     pattern raises a fail-fast :class:`ValueError` at generation time instead
@@ -142,11 +144,12 @@ def test_g7_nomatch_pattern_fails_fast(source_path):
     """
     spec = PlanOverride(
         match="model.99",
-        module_type="tests.ut.codegen.helpers.SourceMLP",
-        exact_type=False,
-        replace_module=Target(
-            helpers._replace_mlp,
-            target_path="tests.ut.codegen.helpers._replace_mlp",
+        replace=ReplaceAction(
+            kind="module", source_type="tests.ut.codegen.helpers.SourceMLP",
+            implementation=Target(
+                helpers._replace_mlp,
+                target_path="tests.ut.codegen.helpers._replace_mlp",
+            ),
         ),
     )
     specs = entries_to_module_replacements([spec])

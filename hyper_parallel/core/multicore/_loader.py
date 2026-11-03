@@ -17,15 +17,28 @@
 from __future__ import annotations
 
 import ctypes
+from functools import lru_cache
+import importlib
 import os
 from pathlib import Path
 import sys
+from types import ModuleType
 
 _VENDOR_NAME = "hyper_parallel_multicore_nn"
 
 
 class NativeComponentUnavailableError(RuntimeError):
     """Report an unavailable or incorrectly activated multicore component."""
+
+
+@lru_cache(maxsize=1)
+def load_torch_npu() -> ModuleType:
+    """Register the optional NPU backend only when an operation needs it.
+
+    Import errors propagate so an unusable backend cannot masquerade as successful
+    native initialization. Failed imports are not cached and may be retried.
+    """
+    return importlib.import_module("torch_npu")
 
 
 def require_multicore_environment() -> Path:

@@ -78,6 +78,7 @@ class HSDPSchedulerContext:
         # parameter state only on the first real forward.
         self.lazy_init_done: bool = False
         self.root_bp_state = False
+        self.post_backward_final_callback_queued = False
         # all_hsdp_schedulers (for one module tree structure), deduplicated at
         # registration time because ``fully_shard`` may be given a module list
         # whose modules share one scheduler.
@@ -219,6 +220,7 @@ class HSDPSchedulerV2:
     def reset_iter_state(self) -> None:
         """Reset scheduler bookkeeping after a completed iteration."""
         self.scheduler_ctx.root_bp_state = False
+        self.scheduler_ctx.post_backward_final_callback_queued = False
         self.scheduler_ctx.pre_reduce_scatter_params.clear()
         self.scheduler_ctx.pre_all_reduce_params.clear()
         self.scheduler_ctx.pre_direct_all_reduce_grads.clear()
@@ -522,8 +524,10 @@ class HSDPSchedulerV2:
         """Execute backward pre hook."""
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return grad
-        if self._is_root:
-            Variable._execution_engine.queue_callback(self._root_backward_hook)
+        if not self.scheduler_ctx.post_backward_final_callback_queued:
+            self.scheduler_ctx.post_backward_final_callback_queued = True
+            root_scheduler = self.scheduler_ctx.root_module.hsdp_scheduler
+            Variable._execution_engine.queue_callback(root_scheduler._root_backward_hook)
         self.scheduler_ctx.root_bp_state = True
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
@@ -532,10 +536,12 @@ class HSDPSchedulerV2:
     def _root_backward_hook(self):
         """Drain all DP pipelines, then run final TP reduction and apply gradients."""
         logger.debug("hook=root_backward_hook enter module=%s", self.hsdp_state)
-        self.check_state_prefetch_handles_consumed()
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             # let modules which are not triggered backward_hook launch backward communication.
             hsdp_scheduler._backward_hook()
+        # Keep pending gradient reductions in flight while unused parameter
+        # prefetches finish, rather than delaying their launch on those waits.
+        self._finalize_unused_prefetches()
         self.scheduler_ctx.root_bp_state = False
         with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
             logger.debug(
@@ -545,6 +551,46 @@ class HSDPSchedulerV2:
             self._finalize_comm_fusion_reductions()
             self._finalize_per_param_reductions()
             self.launch_tp_replicate_reduce_and_apply()
+        # BACKWARD only deduplicates hooks within one autograd execution;
+        # accumulated no-sync gradients must outlive this state reset.
+        for scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+            scheduler.scheduler_state = None
+        self.scheduler_ctx.post_backward_final_callback_queued = False
+
+    def _finalize_unused_prefetches(self) -> None:
+        """Wait and release unused all-gathers after autograd has finished.
+
+        A module used in forward need not participate in this backward. Its
+        speculative prefetch may therefore have no pre-backward consumer.
+        """
+        for scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+            state = scheduler.hsdp_state
+            if state is None:
+                continue
+            for param in state.hsdp_params:
+                context = param.allgather_comm_ctx
+                if context.allgather_handle is None and context.allgather_output is None:
+                    continue
+                with profiler_record(f"finalize_unused_prefetch param:{param}"):
+                    if context.allgather_handle is not None:
+                        context.allgather_handle.wait()
+                        context.allgather_handle = None
+                    context.allgather_output = None
+                    if state.is_shard and param.shard_world_size > 1:
+                        param.free_unsharded_param()
+            if state.param_group is not None:
+                for bucket in state.param_group.all_gather_buckets:
+                    result = bucket.all_gather_result
+                    if result is None:
+                        continue
+                    param_fqns = ", ".join(str(param) for param in bucket.hsdp_params)
+                    with profiler_record(f"finalize_unused_prefetch bucket:{state.module_name}:{param_fqns}"):
+                        if result.handle is not None:
+                            result.handle.wait()
+                            result.handle = None
+                        result.all_gather_input = None
+                        result.all_gather_output = None
+                        bucket.all_gather_result = None
 
     def check_state_prefetch_handles_consumed(self) -> None:
         """Check that all parameters in the module tree consumed their prefetch work.

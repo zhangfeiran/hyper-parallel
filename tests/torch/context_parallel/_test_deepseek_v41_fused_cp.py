@@ -168,7 +168,7 @@ def test_native_geometry_cp8_gloo():
                       for model in (reference, candidate)]
         for step in range(2):
             torch.manual_seed(100+step)
-            boundaries = torch.tensor([0, 30 if step % 2 else 34, 78, length])
+            boundaries = torch.tensor([*range(17), 31, 79, length] if step % 2 else [0, 34, 78, length])
             source = torch.randn(1, length, 32)
             full = source.clone().requires_grad_()
             shard = source[:, rank*local:(rank+1)*local].clone().requires_grad_()

@@ -23,6 +23,8 @@ from typing import Any, Callable, Optional, Sequence, Set, Tuple, Union
 import numpy as np
 import torch
 from torch import Tensor
+from torch.optim.optimizer import _foreach_supported_types as _optimizer_foreach_supported_types
+from torch.utils._foreach_utils import _foreach_supported_types as _torch_foreach_supported_types
 
 from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor._collective_utils import mesh_broadcast, mesh_scatter
@@ -967,6 +969,16 @@ class DTensor(DTensorBase):
         from hyper_parallel.core.dtensor.tensor_redistribution import _tensor_redistribution
         out = _tensor_redistribution.redistribution(self, replicated_layout)
         return out.to_local()
+
+
+def _register_optimizer_tensor_type() -> None:
+    """Enable PyTorch optimizer and foreach selection for DTensor."""
+    for supported_types in (_optimizer_foreach_supported_types, _torch_foreach_supported_types):
+        if DTensor not in supported_types:
+            supported_types.append(DTensor)
+
+
+_register_optimizer_tensor_type()
 
 
 def _normalize_shard_dim(dim: int, ndim: int) -> int:

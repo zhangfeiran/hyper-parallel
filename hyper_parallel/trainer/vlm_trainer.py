@@ -19,11 +19,13 @@ __all__ = ["VLMTrainer"]
 from collections import defaultdict
 from typing import Any, Dict
 
+import torch  # pylint: disable=forbidden-backend-import
+
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch
 from hyper_parallel.data.omni import OmniDataTransform
 from hyper_parallel.distributed.encoder_parallel import build_encoder_parallel_runtime
-from hyper_parallel.distributed.encoder_parallel.batch_input import EncoderParallelInputAdapter
+from hyper_parallel.distributed.encoder_parallel.transport import EncoderParallelBatchTransport
 from hyper_parallel.models.registry import resolve_model_adapter
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
@@ -106,13 +108,20 @@ class VLMTrainer:
         dataset_config = self.base.config.dataset
         if dataset_config is None:
             raise ValueError("dataset must define a build target")
+
         if dataset_config.data_transform is None:
             raise ValueError("dataset.data_transform must define an Omni transform build target")
+
+        if dataset_config.training_mode is None:
+            raise ValueError("dataset.training_mode must be explicitly set to 'sft' or 'pretrain' for VLM training")
+
         data_transform = dataset_config.data_transform.build(
             processor=self.base.processor,
+            training_mode=dataset_config.training_mode,
         )
         if not isinstance(data_transform, OmniDataTransform):
             raise TypeError("dataset.data_transform must build an OmniDataTransform")
+
         self.base.data_transform = data_transform
 
     def _build_collate_fn(self) -> None:
@@ -157,10 +166,7 @@ class VLMTrainer:
         if encoder_runtime is not None:
             if not isinstance(get_batch, OmniParallelBatch):
                 raise ValueError("encoder parallel requires OmniParallelBatch")
-            get_batch.runtime_input_adapter = EncoderParallelInputAdapter(
-                runtime=encoder_runtime,
-                inner=get_batch.runtime_input_adapter,
-            )
+            get_batch.batch_transport = EncoderParallelBatchTransport(runtime=encoder_runtime)
         self.base.get_batch = get_batch
 
     @property
@@ -194,13 +200,17 @@ class VLMTrainer:
         """Dispatch the epoch-end lifecycle hook."""
         self.base.on_epoch_end()
 
-    def on_step_begin(self, micro_batches: Any = None) -> None:
-        """Dispatch the step-begin lifecycle hook.
+    def on_step_begin(self) -> None:
+        """Dispatch the step-begin lifecycle hook."""
+        self.base.on_step_begin()
+
+    def on_micro_step_begin(self, micro_batch: dict[str, Any]) -> None:
+        """Dispatch the micro-step-begin lifecycle hook.
 
         Args:
-            micro_batches: Prepared model inputs for this optimizer step.
+            micro_batch: Prepared inputs and lightweight metric metadata.
         """
-        self.base.on_step_begin(micro_batches=micro_batches)
+        self.base.on_micro_step_begin(micro_batch)
 
     def on_step_end(
             self,
@@ -221,39 +231,30 @@ class VLMTrainer:
             grad_norm=grad_norm,
         )
 
-    def _forward_backward_micro_batches(
+    def forward_backward_step(
             self,
-            training_batches: list[Any],
+            data_iterator: Any,
             num_micro_steps: int,
-    ) -> tuple[float, Dict[str, float]]:
-        """Run and aggregate the VLM forward-backward micro-steps."""
-        total_loss = 0.0
-        total_loss_dict = defaultdict(int)
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Fetch and execute one forward-backward micro-step.
 
-        for micro_step, batch in enumerate(training_batches):
-            model_inputs, loss_inputs = batch
-            self.base.model_reshard(micro_step, num_micro_steps)
-            self.base.configure_fsdp_gradient_sync(
-                micro_step,
-                num_micro_steps,
-            )
-            self.base.begin_fsdp_runtime_diagnostics(micro_step)
-            self.base.current_token_counts = count_loss_token(loss_inputs)
-            self.base.step_token_counts = {
-                name: token_count * num_micro_steps
-                for name, token_count in self.base.current_token_counts.items()
-            }
-            loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
+        Args:
+            data_iterator: Iterator providing one multimodal batch per call.
+            num_micro_steps: Number of FB steps in the current optimizer step.
 
-            # Release each device batch as soon as its backward pass completes;
-            # prefetching all micro-batches must not pin them until step end.
-            training_batches[micro_step] = None
+        Returns:
+            Loss tensor and named loss tensors for this FB step.
+        """
+        model_inputs, loss_inputs = self.base.get_batch(data_iterator)
+        self.base.current_token_counts = count_loss_token(loss_inputs)
+        self.base.step_token_counts = {
+            name: token_count * num_micro_steps
+            for name, token_count in self.base.current_token_counts.items()
+        }
+        self.on_micro_step_begin(model_inputs)
+        loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
 
-            total_loss += loss.item()
-            for loss_name, loss_value in loss_dict.items():
-                total_loss_dict[loss_name] += loss_value.item()
-
-        return total_loss, total_loss_dict
+        return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         """Execute one VLM training step.
@@ -265,22 +266,30 @@ class VLMTrainer:
             Aggregated loss and gradient norm.
         """
         memory_profiler.step()
-        first_training_batch = self.base.get_batch(data_iterator)
         num_micro_steps = self.base.num_micro_batches
-        training_batches = [first_training_batch]
-        for _ in range(1, num_micro_steps):
-            training_batches.append(self.base.get_batch(data_iterator))
 
-        self.on_step_begin(
-            micro_batches=[model_inputs for model_inputs, _ in training_batches]
-        )
+        self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
-        total_loss, total_loss_dict = self._forward_backward_micro_batches(
-            training_batches,
-            num_micro_steps,
-        )
+        total_loss = 0.0
+        total_loss_dict = defaultdict(int)
+
+        for micro_step in range(num_micro_steps):
+            self.base.model_reshard(micro_step, num_micro_steps)
+            self.base.configure_fsdp_gradient_sync(
+                micro_step,
+                num_micro_steps,
+            )
+            self.base.begin_fsdp_runtime_diagnostics(micro_step)
+            loss, loss_dict = self.forward_backward_step(
+                data_iterator,
+                num_micro_steps,
+            )
+
+            total_loss += loss.item()
+            for loss_name, loss_value in loss_dict.items():
+                total_loss_dict[loss_name] += loss_value.item()
 
         grad_norm = self.base.prepare_optimizer_step()
         self.base.step_optimizers_and_schedulers()

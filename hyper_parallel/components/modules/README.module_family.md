@@ -6,7 +6,7 @@ Module Family 在构建阶段为同一种模块选择具体实现。用户通过
 
 ## 使用 GroupedExperts Family
 
-将以下片段加入完整训练配置。`match` 使用模型中实际的模块路径，`module_type` 使用源模块的类型。
+将以下片段加入完整训练配置。`match` 使用模型中实际的模块路径。需要限定源类型时，在 `replace.source_type` 中填写可导入的模块类。
 
 ```yaml
 accelerator:
@@ -17,12 +17,12 @@ accelerator:
 
 plan_overrides:
   - match: "model.layers.*.mlp.experts"
-    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
-    exact_type: true
-    replace_module:
-      _target_: hyper_parallel.components.modules.GroupedExperts
-      use_mxfp8: true
-      use_fused_mxfp8: true
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedExperts
+        use_mxfp8: true
+        use_fused_mxfp8: true
 ```
 
 两个开关均为严格的布尔类型，默认值均为 `false`：
@@ -36,8 +36,8 @@ plan_overrides:
 
 省略两个开关等价于选择默认实现。`true` 与字符串 `"true"`、整数 `1` 是不同类型，后两者不能替代布尔值。
 
-- `match` 和 `module_type` 确定替换模型中的哪些实例；`exact_type: true` 排除源类型的子类。
-- `replace_module._target_` 指定已注册的 baseline；选择参数确定本次使用的具体实现。
+- `match` 确定要替换的实例；可选的 `replace.source_type` 校验源类型，`replace.exact_type: true` 排除子类。
+- `replace.implementation._target_` 指定已注册的 baseline；选择参数确定本次使用的具体实现。
 - MXFP8 变体支持三维 packed、无 bias、标准 SwiGLU，并要求路由权重在第二次 GMM 后由外层应用。隐藏维度和专家中间维度须为 32 的倍数。
 - 当前 MXFP8 变体要求 `TP=CP=EP=PP=1`。Family 选择本身不增加并行支持；其他模块原有的并行能力保持各自契约。
 - 运行环境需提供 MXFP8 GMM；融合另需 `npu_swiglu_mx_quant_with_dual_axis` 和 `_npu_swiglu_backward_mx_quant_with_dual_axis`。缺少能力时会报错。
@@ -50,7 +50,7 @@ plan_overrides:
 
 ```mermaid
 flowchart TD
-    A[解析 replace_module] --> B[导入 baseline 并查询 Family]
+    A[解析 replace.implementation] --> B[导入 baseline 并查询 Family]
     B --> C[补齐 selector 默认值并检查类型]
     C --> D{匹配完整参数组合}
     D -->|完整默认组合| E[选择 baseline]
@@ -175,11 +175,11 @@ register_module_family(ModuleFamily(
 ```yaml
 plan_overrides:
   - match: "model.projection"
-    module_type: torch.nn.Linear
-    exact_type: true
-    replace_module:
-      _target_: my_project.linear_family.ExampleLinear
-      implementation: matmul
+    replace:
+      kind: module
+      implementation:
+        _target_: my_project.linear_family.ExampleLinear
+        implementation: matmul
 ```
 
 省略 `implementation` 或填写 `reference` 选择 baseline；填写 `matmul` 选择另一实现；其他值报错。新增这个 Family 无需修改通用 resolver。

@@ -26,6 +26,7 @@ from hyper_parallel.components.quantization.config import (
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.trainer.config.parallelism import (
     PlanOverride,
+    ReplaceAction,
     entries_to_module_replacements,
 )
 from hyper_parallel.trainer.config.target import Target
@@ -177,8 +178,9 @@ class TestLowPrecisionConfig(unittest.TestCase):
             match="expert",
             when="low_precision",
             low_precision_dtype_scheme="fake",
-            module_type=f"{__name__}._SourceModule",
-            replace_module=target,
+            replace=ReplaceAction(
+                kind="module", source_type=f"{__name__}._SourceModule", implementation=target,
+            ),
         )
         fake = LowPrecisionDtypeScheme(
             is_fake_quantize=True,
@@ -218,8 +220,10 @@ class TestLowPrecisionConfig(unittest.TestCase):
             match="expert",
             when="low_precision",
             low_precision_dtype_scheme="native",
-            module_type=f"{__name__}._SourceModule",
-            replace_module=Target(identity, target_path=f"{__name__}.identity"),
+            replace=ReplaceAction(
+                kind="module", source_type=f"{__name__}._SourceModule",
+                implementation=Target(identity, target_path=f"{__name__}.identity"),
+            ),
         )
         native = LowPrecisionDtypeScheme()
         configs = (
@@ -253,8 +257,10 @@ class TestLowPrecisionConfig(unittest.TestCase):
         entry = PlanOverride(
             match="expert",
             low_precision_dtype_scheme="native",
-            module_type=f"{__name__}._SourceModule",
-            replace_module=Target(identity, target_path=f"{__name__}.identity"),
+            replace=ReplaceAction(
+                kind="module", source_type=f"{__name__}._SourceModule",
+                implementation=Target(identity, target_path=f"{__name__}.identity"),
+            ),
         )
         with self.assertRaisesRegex(ValueError, "is not a low-precision entry"):
             entries_to_module_replacements(

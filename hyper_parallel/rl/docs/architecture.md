@@ -1,16 +1,11 @@
 # Hyper-RL 架构
 
-Hyper-RL 当前运行时的核心是一个同步训练状态机：每一步只消费一个已发布策略生成的数据，并且只有完成训练、权重传输、worker 校验和 cache reset 后，下一策略版本才对 rollout 可见。
+Hyper-RL 的同步路径由 `SyncTrainer` 编排：先消费已发布策略生成的数据，完成更新、传输和worker确认后提交下一策略版本。
+独立的 rayless 异步路径复用角色与发布组件，见文末[异步合同](#rayless-asynchronous-grpo)。
+本文维护状态所有权与失败语义；配置及运行命令见 [vLLM](vllm_rollout.md)、
+[一致性](qwen3_training_inference_consistency.md)和[运行镜像](../docker/README.md)。
 
-可以用三个句子概括当前架构：
-
-- 一个 `SyncTrainer` 决定全局执行顺序。
-- 一组 token-first 数据合同连接数据、Agent、rollout 和训练。
-- 一个 policy publication transaction 连接可训练 Actor 与 vLLM workers。
-
-本文首先描述**当前同步实现**的组件边界、状态所有权和失败语义；文末单独说明规划中的演进边界。具体配置、已验证拓扑和运行命令分别由 [vLLM Rollout](vllm_rollout.md)、[训练-推理一致性](qwen3_training_inference_consistency.md) 和 [运行镜像](../docker/README.md) 维护。
-
-当前端到端算法包括 GRPO 和部分组合已验收的 PPO；模型、Native/Hyper rollout、学习、发布及拓扑范围见 [README](../README.md#支持范围)。
+内置算法包括 GRPO/PPO/GSPO，接入状态与实际验收范围分开；模型、Native/Hyper rollout、学习、发布及拓扑范围见 [README](../README.md#支持范围)。
 Agentic 的内部 runner 保留环境循环；Codex 与 DeepSeek Harness 使用真实逐调用轨迹和 episode GRPO，见 [Agentic RL](agentic_rl.md)。
 
 ## 系统视图
@@ -40,7 +35,23 @@ mesh、layout、FSDP、P2P 和 redistribution 缓存。P2P 缓存使用 native-c
 销毁失败时仍清理缓存；底层函数抛出的 RuntimeError/ValueError 由总清理入口记录为告警。
 初始化及模型构建继续复用共享 runtime；共享 DeviceMesh 负责清理其内部注册表。
 
-`SyncTrainer` 是唯一顶层编排者。Algorithm 不启动进程、不管理设备，也不执行 checkpoint；它只声明：
+初始化或训练失败时，Trainer 在进入清理前记录原始异常。设置 `HYPER_RL_FAILURE_DIR` 后，
+`rl/utils/failure_reporting.py` 将首个 rank 异常原子写入独立 attempt 目录；不调用设备或 collective。
+宿主实验监督器读取 `failure-rank-*.json`，并兼容阶段日志中的 `status=failed`，在正常完成标记之前判定失败。
+监督器只停止该 attempt 记录的容器 ID，限时停止、必要时强制终止并确认退出；训练错误不自动重试。
+这是宿主监督与训练错误上报合同，不表示损坏的通信组总能自行正常清理，也不以低利用率判定失败。
+没有宿主监督器的普通启动仍依赖启动器处理进程退出；仅设置报告目录不会自动终止其他 rank。
+
+RL概率模式由 `train.token_log_probs_mode` 控制：`auto` 保持既有家族行为（Qwen3 dense、Qwen3.5分块），
+`dense` 保留普通完整logits路径，`selected_chunked` 显式启用RL统一的动作位置分块概率。
+`train.token_log_probs_chunk_size` 默认为512，范围1–512；只限制输出层投影位置数，不改变完整decoder上下文。
+Actor/old/reference共用 `roles/policy/token_log_probs_adapter.py` 和 `token_log_probs.py`，
+训练时按块重计算，参考前向不建反向图；未选择位置返回零且必须从loss中排除。
+显式新模式限Qwen3/Qwen3.5 text、TP1 GRPO、consistency关闭且无蒸馏；当前GSM8K配方关闭该模式，
+采用状态与结果边界见[GSM8K 配方](../examples/gsm8k/README.md)。
+普通模型实例不自动启用该RL适配。Qwen3.5原有root不reshard限制继续保留。
+
+同步路径由 `SyncTrainer` 编排。Algorithm 不启动进程、不管理设备，也不执行 checkpoint；它只声明：
 
 - 需要哪些角色，例如 Reference 或 Critic；
 - 需要哪些数据，例如 rollout logprobs、reference logprobs、values 和 returns；
@@ -65,7 +76,36 @@ Checkpoint 绑定蒸馏目标与教师元数据身份。完整合同、配方和
 
 当前代码文件清单、隔离适配边界、回退范围和验证状态见 [模块导航](../../../docs/rl-navigation.md)。
 
-`rl/config.py` 将既有 YAML 转换为 master 的 `TrainerConfig`、`OptimizerConfig` 和 FSDP 配置。
+`rl/config.py` 将YAML转换为共享Trainer、Optimizer和FSDP配置。Actor/优化器由
+`train.accelerator.cpu_offload`控制，Reference可通过`reference_cpu_offload`独立覆盖；省略时继承Actor设置。
+共卡设备驻留要求GRPO、consistency off；独立Reference卸载另限Qwen3 dense TP1；Reward Model仍要求CPU offload。
+发布前等待HSDP流并重新分片，检查参数和优化器矩状态的设备，允许CPU标量计步器。
+
+`offload_during_rollout`独立控制阶段卸载，默认false；仅支持共卡Qwen3 dense TP1 GRPO、consistency off，不含蒸馏或Reward Model。
+它复用HSDP模型转换，将参数、缓冲、FP32主参数及优化器状态移至CPU，保持对象身份；
+训练前睡眠vLLM并恢复各张量原设备。更新后先发布权重、再卸载训练状态、最后唤醒KV；
+验证期间保持卸载，checkpoint前释放推理显存并恢复训练状态。操作要求梯度已清空，使用阻塞拷贝。
+`residency/{offload,restore}_{seconds,bytes,allocated_before,allocated_after}`记录搬运开销；
+卸载已计入`timing_s/weight_sync`，恢复单列为`timing_s/restore_training_state`。
+共享转换清理失效flat buffer；权重接收确认后再释放闲置缓存，失败时不唤醒rollout或提交新版本。
+
+`gradient_sync_each_micro_batch=true`逐微批归约，默认false时常驻模式延迟到mini-batch末尾；
+CPU offload始终逐微批归约。两者保持每个mini-batch一次更新，延迟归约需要更多梯度显存。
+`comm_fusion_zero_copy`直接传递共享FSDP选项，省略/null沿用底层默认。
+
+Actor、old log-prob、Reference分别使用`max_tokens_per_micro_batch`、
+`old_log_prob_max_tokens_per_micro_batch`、`reference_log_prob_max_tokens_per_micro_batch`；省略/null使用固定条数。
+当前支持Qwen3 dense TP1 GRPO、consistency off、无蒸馏，要求完整轨迹和连续右padding。
+预算包含prompt、response和padding；超预算序列独立成批且不截断，单样本容量仍需实机验收。
+Actor在原optimizer mini-batch内排序并复用`FirstFitPackingSelector`，保持成员、更新次数及有效action-token归一化。
+各DP rank拆分分组以对齐FSDP调用次数，无法无空批对齐时失败；概率前向恢复原行序与输出形状。
+这不是跨样本packed attention；`train/micro_batches_per_rank`、`input_tokens`、`padded_input_tokens`、
+`padding_fraction`记录分批工作量，其中token统计跨DP并计入所有policy epochs。
+
+实验性`balance_dp_tokens`默认关闭，仅在同一全局optimizer mini-batch内跨DP交换完整行，要求各rank条数相同。
+顺序为完整组优势→重分配→old/reference→更新，避免在残组上重算GRPO；保留身份、掩码和全部目标字段。
+`timing_s/balance`须计入总时间；该开关不改变三个阶段的独立预算，也未纳入默认精度配方。
+
 `rl/roles/model_setup.py` 只调用模型及优化器构建入口、冻结 Reference，不实现 Qwen3 的 forward 或并行切分。
 纯 TP 场景继续启用 size-one FSDP，以保留 checkpoint 布局和 TP-replicated 参数的梯度归约。
 
@@ -120,7 +160,7 @@ returns / values     [batch, tokens - 1] when required
 
 默认 internal 路径的 `RolloutManager` 将运行配置收敛为 `AgentRunner + GenerationSettings`。AgentRunner 负责：
 
-- 为每个 prompt/sample 建立稳定 row seed；
+- 配置 rollout seed 时，为每个 prompt/sample 建立稳定 row seed；
 - 驱动 single-turn 或 multi-turn `AgentSession`；
 - 调用环境、工具与 reward；
 - 将 observation/action 映射为 token-aligned turns；
@@ -176,6 +216,22 @@ sequenceDiagram
 4. 只有 publication transaction 成功，`SyncTrainer` 才把 step 提交为 V+1，并允许记录指标或 checkpoint。
 
 因此，训练进度代表“已经发布给 rollout 的策略”，而不是“Actor 曾经执行过一次 optimizer step”。
+
+普通 RL 默认使用 `train.old_log_prob_source=rollout`。显式设置为 `actor` 时，
+Trainer 在更新前重算并冻结训练侧概率，作为重要性比率的分母；原始采样概率继续保存在
+`rollout_log_probs` 中，便于诊断。仅开启日志诊断不会改变分母；OPD 仍保留其既有重算行为。
+内部 runner 使用 actor anchor 且关闭 consistency/OPD 时，可设置 `rollout.collect_log_probs=false`
+省去推理侧概率计算和传输；此时不报告 Actor 与 rollout 概率差异，不能把重算值冒充采样概率。
+该选项默认为 true。`rollout.seed` 控制逐轨迹稳定 seed；设为 null 时不向请求传入 seed，
+可用 `rollout.vllm.seed` 设置引擎随机状态。引擎级 seed 不保证改变请求调度后仍逐条复现回答。
+`rollout.vllm.disable_log_stats=true` 将统计开关传给 vLLM，默认 false；关闭后不能依赖其服务端性能统计。
+`rollout.vllm.task_queue_enable=1/2` 可单独设置推理子进程的 Ascend 算子下发队列等级；
+未配置时继承环境，设置此项不修改 Trainer 进程的队列模式。
+`evaluation.at_end=true` 可在最后一次策略发布后评估，而无需保存 checkpoint；默认值为 false。
+`evaluation.before_train=true` 在训练循环前评估当前策略（恢复时为恢复后的版本）；
+`evaluation.every_n_steps` 为正整数时独立于保存间隔触发验证，0 关闭周期验证，省略或 null 沿用保存边界。
+周期验证与末步验证重合时只执行一次。
+AdamW 的 `train.optimizer.no_decay_params` 默认为 `[bias, norm, ln_]`，显式空列表表示所有参数参与 decay。
 
 ## 状态所有权
 
@@ -277,57 +333,31 @@ Resume 后，如果 Trainer step 高于 rollout 初始版本，Trainer 会在第
 
 ## 演进边界（规划）
 
-长期能力目标见[设计原则](design.md)，当前模型与验证边界见 [支持范围](../README.md#支持范围)。本文维护演进所需的合同边界，不重复维护任务状态或验收数字。同步、异步与多模态应复用任务接口、算法组件和模型基础设施；不同执行模式可以采用独立的显式编排，不要求全部逻辑进入 SyncTrainer。
-
-| 方向 | 复用内容 | 必须新增或重新定义的合同 |
-| --- | --- | --- |
-| 程序化 Agent 扩展 | 已接入的内置 Harness、Trajectory、batch builder、学习与发布 | 新增 runner 的适配边界及验收；按需求补齐取消、资源释放与非法轨迹检查 |
-| Ray 异步 | 任务、算法、模型及权重传输基础 | 明确训练/采样的设备与显存归属、在途请求的发布边界；分别记录采样、更新与发布进度，定义 policy lag、丢弃/校正、队列背压及恢复 |
-| 多模态训练 | 轨迹、奖励、算法与训练编排 | 视觉模块及投影层的模型接入、可训练/冻结范围、权重发布与恢复；媒体/处理元数据和 token/动作位置对齐，两侧预处理一致 |
-| 多模态 Agent | 多模态训练与既有任务接口 | 环境反馈、工具输出及多轮媒体拼接；明确截断、取消、奖励归属与资源释放 |
-| 更大规模 / 多节点 | HyperParallel 并行与流式同步 | 完整目标模型适配、容量测算、必要的并行/offload；MoE 训练/采样资源部署、跨节点发布、失败传播与恢复 |
-| PPO 扩展组合 | 已接入独立 Critic 与双角色 checkpoint | 具体并行、恢复和学习证据见 [PPO 配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml)，未验收组合不能外推 |
-
-### 学习与样本合同（规划）
-
-当前已有 group ID、rollout logprobs、奖励分量和轨迹 metadata；下表补充它们在新执行模式下需要明确的语义，不表示这些能力已实现，也不要求新增一套公共框架。
-
-| 边界 | 必须明确的语义 |
-| --- | --- |
-| 生成上下文 | 每段动作对应生成时实际可见的上下文与媒体；追加式多轮可沿用现有序列合同。压缩、历史改写或分支须单独定义，不能由最终 messages 重建训练条件。 |
-| 概率与策略 | 区分生成策略、训练侧重算概率和当前更新策略；若算法另设近端参考策略，明确其来源。记录采样变换及 logprob 口径；版本校验、Bit-Exact 与 off-policy 校正分别承担职责。 |
-| GRPO 分组与消费 | 明确 group 的预期成员、完整条件、超时补采/丢弃、零方差处置与消费次数；按完成速度或奖励筛选时记录选择规则及任务分布变化。 |
-| 奖励与环境 | 记录评分规则、judge/工具/环境配置版本及证据引用；区分任务失败、环境故障和评分缺失。故障不默认转换为负奖励，处置由任务合同定义。 |
-| 异步恢复 | 明确已完成未消费、已消费未提交、已提交及仍在生成的数据所有权；选择持久化恢复或显式丢弃/重采，训练状态与消费记录使用一致的恢复边界。 |
-
-模型版本相同并不保证两个引擎的概率相同。先诊断训推 logprob 差异、校正权重与有效样本比例；MoE 另诊断路由差异和专家负载，再按证据选择校正或 Router Replay，不将特定方法作为所有模型的强制前提。
-
-### 执行与恢复边界（规划）
-
-请求并发、采样/学习重叠、partial rollout 是不同能力。最小异步版本先采用一种有限滞后与分组消费策略；Ray 负责调度，样本是否可训练由算法和数据合同决定。当前同步模式的单 batch 策略身份与 `global_step` 对应发布版本的假设，不能直接推广到异步模式。
-
-通用异步可先使用单轮任务验证；Agent 异步另验收多轮在途状态。多模态训练可独立推进，多模态 Agent 再组合任务交互，两者均不要求先接入程序化 Agent。
-
-Partial rollout、请求中途换权重和 retry 分别设计、验证后再引入。重放已完成样本保留原 token 与身份；重新生成须记录新的尝试与实际策略，不能承诺相同 seed 必然生成相同 token。重复提交约束作用于持久化训练提交边界；有副作用的外部工具通过幂等标识或明确失败语义处理，不承诺调用恰好一次。
-
-CP/PP、更多 TP/EP 组合及动态专家重分配按实际任务需求推进；基础库存在某项并行能力不等于 RL 端到端已支持。当前 RL 模型与已验证 TP/EP/EDP 组合见[支持范围](../README.md#支持范围)。
+单节点异步已有独立实现，遵守下节的分组、滞后、发布与恢复合同，不再以 Ray 调度作为前置假设。
+多节点、更多并行组合、多模态与世界模型仍按[支持范围](../README.md#支持范围)和
+[规划方向](../README.md#规划方向)分别推进，不能由主项目能力推导为 RL 已支持。
+新场景仍需保留真实生成上下文、策略身份、奖励证据与明确的副作用语义；外部工具不承诺 exactly-once。
 
 ## 阅读代码
 
 需要定位具体实现时，参阅 [模块导航](../../../docs/rl-navigation.md)、[PPO 配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml)
 和 [测试入口](../README.md#系统测试)。架构文档不重复维护函数级路径。
 
+公共 token 计数和优势/价值统计不依赖采样 log-prob 返回。
+缺少独立采样概率或未执行诊断前向时，只报告 `training/rollout_probs_diff_valid=0`，不构造概率差值；
+`training/total_tokens` 和对应吞吐继续按有效样本统计，排除 DP 补齐样本。
+
 ## Rayless asynchronous GRPO
 
-`examples/async_training/launch.py` composes the existing roles with an independent asynchronous loop. `SyncTrainer`
+`examples/fully_async/launch.py` composes the existing roles with an independent asynchronous loop. `SyncTrainer`
 retains its synchronous loop and strict version defaults. The supported scope is single-node Qwen3 dense GRPO with
 disjoint vLLM devices, using internal single-turn tasks or Codex Search/Code/SWE-Smith programs. PPO, MoE, Qwen3.5,
 internal multi-turn, model rewards, distillation and synchronous consistency gates are rejected. Codex inline evaluation
 must be disabled.
 
 ```bash
-bash hyper_parallel/rl/examples/async_training/scripts/run_async_training.sh \
-  hyper_parallel/rl/examples/async_training/configs/qwen3_4b_gsm8k_grpo.yaml \
+bash hyper_parallel/rl/examples/fully_async/scripts/run_fully_async.sh \
+  hyper_parallel/rl/examples/fully_async/configs/qwen3_4b_gsm8k_grpo.yaml \
   --model.weights_path=/models/Qwen3-4B --model.tokenizer_path=/models/Qwen3-4B \
   --data.train_path=/data/gsm8k/train.parquet --data.test_path=/data/gsm8k/test.parquet
 ```
@@ -355,3 +385,157 @@ diagnostics live under `rollouts/` beside the audit or checkpoint output.
 
 UT covers protocol, publication, recovery and sync isolation. `tests/st/test_async_training.py` checks two/four-rank
 CPU/Gloo updates and recovery, independently of NPU/task-quality acceptance.
+
+## 共卡异步 GRPO
+
+`examples/colocate_async/launch.py` 提供独立共卡入口，生产代码位于 `rl/colocate_async/`。
+Trainer 控制训练和设备阶段，Rollouter 在 rank 0 协调已有 `AsyncRuntime`、CPU producer 与
+`ExperienceBuffer`。后者不持有模型、不执行训练 collective。同步和分离全异步主循环不变。
+
+| 文件 | 负责的状态与操作 |
+| --- | --- |
+| `rl/colocate_async/colocate_async_trainer.py` | 所有训练 rank 的模型阶段、更新计数、发布、评估和保存顺序 |
+| `rl/colocate_async/colocate_async_rollouter.py` | rank 0 的组配额、完整组租约、过期淘汰与采样控制 |
+| `rl/config.py::ColocateAsyncConfig` | 新模式的独立配置、支持范围及容量推导 |
+| 原有 `rl/fully_async/` | 不修改地复用 CPU producer、IPC、经验合同和 partial 服务 |
+
+Package renaming preserves existing sample/checkpoint payloads and the `async_training` configuration key.
+
+阶段顺序参考 [verl 共卡异步 Trainer](https://github.com/verl-project/verl/tree/main/verl/trainer/ppo/v1/trainer_colocate_async.py)：
+取到完整样本后 abort/sleep，更新结束后发布/resume。本实现沿用本仓库的有界 IPC 经验池，
+没有引入 TransferQueue 或另写一套采样服务。
+
+共卡路径为单节点、至少两卡 Ascend、Qwen3 dense GRPO，复用 internal 单轮或现有 Codex 多轮采样。
+训练使用 FSDP TP=1，
+推理 DP=1、TP=训练 world size，必须 CPU offload、reshard-after-forward、eager、sleep level 1、
+raw logprobs、temperature=1/top-p=1/top-k=0，以及 full-gather IPC。沿用 partial 服务固定的
+vLLM 0.23.0 / Ascend 0.23.0.post1。拒绝 internal 多轮、DeepSeek、PPO/GSPO、MoE、Qwen3.5、模型奖励、
+蒸馏、router replay、一致性门禁及 batch-invariant。八卡两步流程已验证，学习质量与长稳仍待验收。
+
+在现有 RL 运行环境中，从仓库根启动；修改示例中的模型、数据和输出目录后执行：
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  hyper_parallel/rl/examples/colocate_async/launch.py \
+  hyper_parallel/rl/examples/colocate_async/configs/qwen3_4b_gsm8k.yaml
+```
+
+启动脚本不覆盖训练决策。`colocate_async` 与 `async_training` 不能同时配置。
+Trainer 保留 batch 构造与阶段编排，更新结果显式携带本轮校正指标和拒绝组；
+`utils/monitoring/colocate_async_metrics.py` 负责统计和上报，采样计数仍在 rollout 统计 collective 后读取。
+共卡角色适配管理评估网关，Rollouter 管理 producer，Trainer 协调排空、交接、保存及重建顺序。
+全局组数为训练 DP 大小乘 `groups_per_dp_rank`；预取容量为组数乘 `(warmup_batches + 1)`。
+warmup 仅支持非负整数，最坏容量须满足 `max_buffer_bytes >= capacity * max_group_bytes`。
+这些限制约束序列化经验，不代表整个进程 RSS 上限。
+
+```text
+完整组就绪 → partial pause/abort 并清理请求 → native sleep
+    → 搬运训练 batch、计算优势、Actor 更新 → 成功后 commit 消费
+    → IPC 发布权重/恢复推理内存 → 实际 Worker 版本核验 → partial resume
+```
+
+暂停生成后，Client 保留原 token 与概率；更新权重后以已有前缀重新 prefill 并继续生成。
+每段动作保留实际策略版本和原始行为概率。过期按最老真实动作的更新年龄整组淘汰，
+释放配额后补发，版本年龄控制目前只有 drop。
+服务的原生调度恢复不代表 partial 入口已开放：显式版本核验之后才允许续跑请求进入引擎。
+
+Codex 复用 `AsyncRuntime.pause(drain=True)`：已进入引擎的一次模型调用完整结束，再暂停引擎。
+同一 episode 的后续调用可以使用新版本；不会主动在单次 Codex 模型调用内部切换权重。
+变长调用 batch 继续使用现有 episode 分组和 DP padding，不要求调用数等于采样次数。
+八卡 Search 配置见 `examples/colocate_async/configs/qwen3_4b_search_r1.yaml`；执行 Search 还需
+主机 broker 调用原有 `examples.search_r1.container_runtime.execute_episode`，保持每个候选容器的隔离检查。
+单独运行 `torchrun` 不提供此 broker。
+`raw_prefix_mismatches` 比较相邻调用是否沿用逐 token 连续前缀；它不等于训练输入错配。
+每一调用均使用实际采样的 prompt/action token 与原始概率构建训练行，
+`training_context_mismatches` 必须为 0；未对齐时直接报错。
+
+### 共卡 off-policy 校正
+
+共卡 GRPO 的 `colocate_async.off_policy` 默认关闭。`metrics_only` 额外计算诊断，
+继续使用原来的采样概率作为 PPO old probability；`decoupled` 在每个完整训练 batch 开始时，
+复用 `Actor.compute_log_probs()` 无梯度重算固定 Actor 锚点。它与 Reference 模型不同。
+锚点和权重在本 batch 的全部 mini/micro-batch、优化器步骤和 epoch 中保持固定。
+
+```yaml
+colocate_async:
+  off_policy:
+    mode: "off"  # off / metrics_only / decoupled; quote off for YAML 1.1 readers.
+    importance_sampling: token
+    max_importance_weight: 2.0
+    rejection: disabled  # group requires decoupled and max_abs_log_ratio.
+    max_abs_log_ratio: null
+    max_refill_rounds: 3
+```
+
+启用时可向独立共卡入口添加 `--colocate_async.off_policy.mode=decoupled`。
+原有版本滞后上限仍先执行，概率校正不替代经验池的滞后控制。
+
+记实际采样概率为 `mu`、固定锚点为 `pi_0`、当前优化策略为 `pi_theta`。
+校正权重为 `min(exp(log(pi_0)-log(mu)), cap)`，PPO ratio 使用 `pi_theta/pi_0`。
+`rollout_log_probs` 永久保存原始 `mu`，`old_log_probs` 在 decoupled 模式下保存固定 `pi_0`，
+`rollout_is_weights` 为冻结的 FP32、next-token 对齐权重。prompt、观察和 padding 的权重为零。
+权重在 log space 截断后再 exp；cap 必须在 `[1, exp(20)]` 内。
+权重只乘逐 token 策略梯度项；参考 KL 的原定义和全局有效 action-token 归一化保持不变，
+不会再用 `pi_theta/mu` 乘同一份校正权重。
+
+internal partial 的每段 token 使用生成时保存的行为概率；Codex 每次调用在自己的实际 prompt 上
+计算锚点，继续保留 episode 分组奖励。该方案校正已记录上下文下的动作分布，包含截断偏差，
+不声称无偏地校正多轮状态访问分布或 GRPO 组归一化。
+
+可选 `rejection: group` 根据有效 action 的最大绝对 `log(pi_0/mu)` 判断异常。
+任何候选/调用超出阈值便拒绝整个 prompt group。各 DP rank 汇总组 ID，由 rank 0 释放被拒绝组，
+其余完整组返回 ready 池；恢复同版本推理并有界补样。拒绝期间不执行 optimizer/scheduler，
+不提交消费、不增加 global step、不发布新权重。达到 `max_refill_rounds` 后同步失败。
+概率缺失、非有限或坐标错误直接报错，不作为普通拒绝样本处理。
+
+`off_policy/*` 记录权重均值/最大值、截断比例、token ESS/N、log-ratio 和补样轮数。
+P50/P95/P99 使用全 DP 128-bin histogram 的近似上界，不汇集 token 或上下文；
+`k3_clamped_mean` 是 log-ratio 截断至 ±20 后的诊断，`diagnostic_clamp_fraction` 显示截断比例。
+token ESS 不代表独立 episode 样本数，也不等同于任务质量。
+
+关闭时不额外执行 Actor 概率前向，损失可选字段为空，沿用旧同步/全异步调用方式。
+默认关闭的校正字段不进入共卡 checkpoint 指纹，兼容旧快照；启用配置进入指纹。
+checkpoint 仍只保存原始经验和训练状态，恢复后重新计算锚点与权重。
+新增数值/上下文校验在进入诊断 collective 前同步，启用模式下前向非有限值在 backward 前
+向所有 DP rank 传播；已经发生优化器更新后的失败应从完整 checkpoint 恢复。
+
+数学/控制流 UT 位于 `tests/ut/rl/colocate_async/test_rollout_correction.py`；
+真实 CPU/DDP 梯度等价、空本地 rank、非有限前向和补样测试位于
+`tests/st/test_rollout_correction.py`。核心行数检查同时覆盖校正模块与共享损失衔接。
+
+### 共卡发布与恢复
+
+每次更新后发布，初始版本为 1，完成 u 次更新后的发布版本为 u+1。
+`audit_dir` 记录阶段和生成事件；指标包括 `colocate/*` 和 `timing_s/*`。审计 IO 会影响性能。
+
+保存与验证沿用模型 checkpoint 配置的触发边界：先恢复生成、停止补发、等待所有在途组结束，
+然后验证；再关闭入口并休眠，保存模型/优化器/scheduler/RNG 与完整 buffer/source/版本快照。
+非最终保存以 level 1 唤醒同版本。不能在 sleep 后等待 partial 请求完成。
+启用 Codex 评估时，在排空并冻结 source/buffer 后关闭 CPU producer，释放它持有的网关；
+由训练 rank 的原有 Codex runtime 执行评估，结束后关闭评估网关。非最终保存后从冻结快照重建
+CPU producer，保留 ready 组、数据游标和计数，再恢复同版本采样。两个网关不会同时占用同一端口。
+自动选择最新完整快照；显式 load_path 优先。损坏、配置/数据身份、模式或 step 不符时拒绝恢复。
+恢复保留 ready 经验和数据游标，再完整发布恢复 Actor；不保存活跃协程或外部工具现场。
+最后一步若命中周期保存，即使 save_final=false 仍实际保存，最终 HF 导出单独处理。
+
+核心物理行数包含许可证、注释与空行，以及新配置安全控制，限制为 1000 行；检查入口为
+`tests/st/test_colocate_core_budget.py`。CPU UT 在 `tests/ut/rl/colocate_async/`，
+`tests/st/test_colocate_async.py` 使用真实 CPU/DDP Actor 和有界进程 IPC，推理与设备驻留为替身，
+不能据此宣称 NPU 共卡或性能验收通过。
+
+验证覆盖 Qwen3-4B 与固定 `hyper-rl:v0.23.0.post1-code-agent-arm64` 运行时：两卡短流程及
+全新进程恢复；八卡真实 GSM8K/internal 和 HotpotQA Search/Codex 各两步，包含每步评估、
+checkpoint、最终八 rank 重载与 HF 导出。GSM8K 覆盖同次生成中断后跨版本续跑，
+Search 覆盖同一 episode 在不同模型调用间跨版本，单次调用内部保持同一策略。
+这些短流程不能替代长稳、任务质量或性能验收。
+
+off-policy 与职责重构复验覆盖 343 项 CPU 回归及 5 项真实 CPU/DDP 流程；默认关闭、metrics-only、
+decoupled 的更新与恢复均有覆盖。八卡 GSM8K/internal 和 Search/Codex 另各运行两步 decoupled 更新，
+包含评估、checkpoint、八 rank 重载与 HF 导出；Search 的训练上下文审计无错位。
+八卡配方的整组拒绝保持关闭，该分支由真实 CPU/DDP、producer IPC 与异常概率注入验证。
+
+CPU 合同与真实 Gloo 流程覆盖默认模式、校正模式及保存恢复。共享回归另有两项 Qwen3.5 HF 导出失败在
+原始代码上同样复现，原因是测试镜像中的 `Qwen3_5Config` 缺少 `vocab_size`。
+新增代码没有 pylint/lizard 问题；共享配置原有的静态告警仍保留。
+共用 vLLM 服务在最终保存后关闭时可能输出 `EngineDeadError` 与 resource-tracker 清理告警；
+已验证主进程退出及设备进程释放，未为此修改共享服务。

@@ -5,7 +5,8 @@
 
 The user YAML is not extended.  Codegen reads the already frozen
 ``module_overrides`` and ``injections`` metadata, whose fields originate from
-``plan_overrides.replace_module`` / ``inner_wrapper`` / ``local_compute_fn``.
+``plan_overrides.replace`` actions. Frozen execution records retain private
+module and injection fields for the code generator.
 """
 
 from __future__ import annotations

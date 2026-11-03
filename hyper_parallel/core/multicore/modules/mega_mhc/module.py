@@ -41,6 +41,8 @@ class MegaMhc(torch.nn.Module):
         Forward-only callers can use ``hyper_mega_mhc(..., need_backward=False)``.
     """
 
+    fp32_parameter_names: tuple[str, ...] = ("phi", "alpha", "bias")
+
     def __init__(
         self,
         hidden_size: int,
@@ -80,7 +82,7 @@ class MegaMhc(torch.nn.Module):
 
     def _apply(self, fn: Callable, recurse: bool = True) -> MegaMhc:
         """Keep mapping predictors FP32 when the enclosing model changes dtype or device."""
-        return super()._apply(preserve_fp32_parameters(self, fn, ("phi", "alpha", "bias")), recurse=recurse)
+        return super()._apply(preserve_fp32_parameters(self, fn, self.fp32_parameter_names), recurse=recurse)
 
     @classmethod
     def from_module(cls, module: torch.nn.Module) -> MegaMhc:

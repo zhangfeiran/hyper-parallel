@@ -22,6 +22,7 @@ __all__ = [
     "PipelineScheduleBase",
     "ScheduleGPipe",
     "Schedule1F1B",
+    "ScheduleInterleaved1F1B",
     "SCHEDULE_REGISTRY",
     "get_schedule_class",
 ]
@@ -33,5 +34,6 @@ from .pp_schedule import (
     PipelineScheduleBase,
     Schedule1F1B,
     ScheduleGPipe,
+    ScheduleInterleaved1F1B,
     get_schedule_class,
 )

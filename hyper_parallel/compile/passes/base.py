@@ -17,8 +17,8 @@ Graph Pass Base - Base Class for Graph Transformation Passes
 
 All parallel partitioning passes and optimization passes inherit from this
 class. The config a pass receives is typed as ``PassConfig`` so passes
-can rely on ``enable_overlap`` / ``fsdp_enabled`` / ``fsdp_degree``
-/ ``tp_size`` being present without each pass re-declaring the contract.
+can rely on ``enable_overlap`` / ``fsdp_enabled`` / ``fsdp_degree`` being
+present without each pass re-declaring the contract.
 """
 
 __all__ = ["GraphPass"]

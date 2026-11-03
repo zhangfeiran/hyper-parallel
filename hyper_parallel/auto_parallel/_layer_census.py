@@ -48,7 +48,7 @@ before the backward as the trainer does; half the vocabulary tells the
 bytes a vocabulary-parallel loss splits.
 
 Where a train.yaml replaces Transformers' modules with HyperParallel's
-fused ones (``plan_overrides`` with ``replace_module``: its RMSNorm, its
+fused ones (``plan_overrides`` with ``replace.kind: module``: its RMSNorm, its
 grouped-query attention, its grouped experts), the census runs those
 instead, so what it measures is what the trainer saves
 (:func:`replacement_specs`).  Their kernels are ``torch_npu``'s, which a
@@ -652,33 +652,62 @@ def replacement_specs(plan_overrides: Any) -> Tuple[Any, ...]:
 
     Returns:
         One :class:`~hyper_parallel.models.replacement.ModuleReplacementSpec`
-        per entry that states ``replace_module``, in the order stated; the
+        per entry that states ``replace.kind: module``, in the order stated; the
         entries that state a sharding action alone, or a replacement
         conditioned on a run the census does not price (``when``), are left
         out.
 
     Raises:
-        ValueError: If an entry states ``replace_module`` without
-            ``module_type``, or names a module or factory that cannot be
-            imported.
+        ValueError: If a replacement names a module or factory that cannot be
+            imported, or uses a removed replacement field.
     """
-    from hyper_parallel.models.replacement import ModuleReplacementSpec  # pylint: disable=C0415
+    from hyper_parallel.components.modules.family import resolve_module_family_target  # pylint: disable=C0415
+    from hyper_parallel.models.replacement import ModuleReplacementSpec, module_replacement  # pylint: disable=C0415
 
     specs = []
     for index, entry in enumerate(plan_overrides or ()):
         where = f"plan_overrides[{index}]"
-        if not isinstance(entry, Mapping) or entry.get("replace_module") is None or entry.get("when") is not None:
+        if not isinstance(entry, Mapping):
             continue
-        if entry.get("module_type") is None:
-            raise ValueError(f"{where} states replace_module without module_type")
+        removed = {
+            "replace_module", "module_type", "exact_type", "local_compute_fn",
+            "inner_wrapper", "inner_target", "inner_out_src",
+        }
+        if removed.intersection(entry):
+            raise ValueError(f"{where}: old replacement fields are no longer supported")
+        action = entry.get("replace")
+        if not isinstance(action, Mapping) or action.get("kind") != "module" or entry.get("when") is not None:
+            continue
+        if "implementation" not in action:
+            raise ValueError(f"{where}.replace requires implementation")
         match = entry.get("match")
         patterns = (match,) if isinstance(match, str) else tuple(match or ())
-        factory = entry["replace_module"]
+        implementation = action["implementation"]
+        target_path = implementation.get("_target_") if isinstance(implementation, Mapping) else implementation
+        requested = _import(target_path, where)
+        args = {key: value for key, value in implementation.items() if key != "_target_"} if isinstance(
+            implementation, Mapping) else {}
+        selected, args = resolve_module_family_target(requested, args)
+        if args:
+            @module_replacement
+            def factory(
+                *, module: torch.nn.Module, module_fqn: str, context: Mapping[str, Any],
+                _selected: Any = selected, _args: tuple[tuple[str, Any], ...] = tuple(args.items()),
+            ) -> torch.nn.Module:
+                """Construct the selected family variant with ordinary YAML arguments."""
+                return _selected(module=module, module_fqn=module_fqn, context=context, **dict(_args))
+            factory.__name__ = selected.__name__
+            factory.__qualname__ = selected.__qualname__
+            factory.__module__ = selected.__module__
+            setattr(factory, "_hp_config", repr(sorted(args.items())))
+        else:
+            factory = selected
+        source_type = action.get("source_type")
         specs.append(ModuleReplacementSpec(
             match=patterns,
-            factory=_import(factory.get("_target_") if isinstance(factory, Mapping) else factory, where),
-            module_type=_import(entry["module_type"], where),
-            exact_type=bool(entry.get("exact_type", False)),
+            factory=factory,
+            module_type=_import(source_type, where) if source_type is not None else None,
+            exact_type=bool(action.get("exact_type", False)),
         ))
     return tuple(specs)
 

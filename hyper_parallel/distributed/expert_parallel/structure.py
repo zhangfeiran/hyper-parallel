@@ -40,7 +40,7 @@ class MoeStructure:
 def _unsupported(module: Any, detail: str) -> UnsupportedModuleStructure:
     return UnsupportedModuleStructure(
         f"{type(module).__name__}: {detail}. Declare an explicit "
-        "local_compute_fn._target_ to opt out of structure detection."
+        "replace.implementation to opt out of structure detection."
     )
 
 

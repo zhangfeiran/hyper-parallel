@@ -27,6 +27,10 @@ from typing import Optional
 import torch
 from torch.nn import functional as F
 
+from hyper_parallel.components.functional.linear_attention_packed import (
+    packed_reference,
+)
+
 _GDN_BACKENDS = frozenset({"eager", "triton"})
 _MIN_TRITON_ASCEND_VERSION = (3, 2, 1)
 _TRITON_GDN_HEAD_DIM = 128
@@ -50,6 +54,7 @@ def torch_chunk_gated_delta_rule(
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: Optional[torch.Tensor] = None,
 ):
     """Chunked gated delta-rule linear attention (pure torch reference).
 
@@ -62,6 +67,12 @@ def torch_chunk_gated_delta_rule(
     g:            ``(B, S, num_v_heads)``
     beta:         ``(B, S, num_v_heads)``
     """
+    if cu_seqlens is not None:
+        return packed_reference(
+            torch_chunk_gated_delta_rule, (query, key, value, g, beta), cu_seqlens,
+            initial_state=initial_state, output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, chunk_size=chunk_size,
+        )
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
         query = _l2norm(query, dim=-1, eps=1e-6)
@@ -167,7 +178,6 @@ def _is_triton_gdn_input_supported(
         and query.shape == key.shape
         and query.shape[:3] == value.shape[:3] == g.shape == beta.shape
         and query.shape[-1] == value.shape[-1] == _TRITON_GDN_HEAD_DIM
-        and query.shape[1] % _TRITON_GDN_CHUNK_SIZE == 0
     ):
         return False
     return all(
@@ -188,7 +198,7 @@ def is_triton_gdn_available(
     if chunk_size != _TRITON_GDN_CHUNK_SIZE:
         return False
     if query is not None and not _is_triton_gdn_input_supported(
-        query, key, value, g, beta
+        query, key, value, g, beta,
     ):
         return False
     try:
@@ -216,8 +226,16 @@ def chunk_gated_delta_rule(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     backend: str = "eager",
+    cu_seqlens: Optional[torch.Tensor] = None,
 ):
     """Dispatch GDN to an explicitly selected eager or Triton backend."""
+    if query.ndim == 3:
+        output, final = chunk_gated_delta_rule(
+            *(tensor.unsqueeze(0) for tensor in (query, key, value, g, beta)),
+            initial_state=initial_state, output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, chunk_size=chunk_size,
+            backend=backend, cu_seqlens=cu_seqlens)
+        return output.squeeze(0), final
     backend = backend.lower()
     if backend not in _GDN_BACKENDS:
         raise ValueError(
@@ -235,15 +253,16 @@ def chunk_gated_delta_rule(
             initial_state=initial_state,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
         )
     if not is_triton_gdn_available(
-        query, key, value, g, beta, chunk_size=chunk_size
+        query, key, value, g, beta, chunk_size=chunk_size,
     ):
         raise RuntimeError(
             "GDN backend='triton' requires triton-ascend >= 3.2.1 "
             "installation with the Ascend backend and NPU inputs "
             "q/k/v/beta=bf16, g=fp32, head_k_dim=head_v_dim=128, "
-            "chunk_size=64, and sequence length divisible by 64."
+            "and chunk_size=64."
         )
 
     from hyper_parallel.components.functional.gated_delta_net import (  # pylint: disable=import-outside-toplevel
@@ -260,4 +279,5 @@ def chunk_gated_delta_rule(
         output_final_state=output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )

@@ -20,7 +20,7 @@ import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from unittest.mock import Mock, patch
 
 import torch
@@ -28,10 +28,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from rl.algorithm.loss import build_algorithm
-from rl.async_training.protocol import AsyncTrainingConfig
-from rl.async_training.fully_async_trainer import FullyAsyncTrainer
-from rl.async_training.protocol import SampleGroup
-from rl.async_training.fully_async_rollouter import AsyncRuntime
+from rl.fully_async.protocol import AsyncTrainingConfig
+from rl.fully_async.fully_async_trainer import FullyAsyncTrainer
+from rl.fully_async.protocol import SampleGroup
+from rl.fully_async.fully_async_rollouter import AsyncRuntime
 from rl.roles.rollout.base import GenerationSettings
 from rl.dataset.batch_builder import ExperiencePreparer, pad_agent_call_batch_for_dp
 from rl.dataset.contracts import Trajectory, Turn
@@ -41,7 +41,8 @@ from rl.roles.policy.actor import Actor
 class TinyPolicy(torch.nn.Module):
     """A real trainable categorical policy; no model server is implied by this test."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Create a small trainable categorical policy."""
         super().__init__()
         self.table = torch.nn.Parameter(torch.zeros(8, 8))
 
@@ -52,7 +53,7 @@ class TinyPolicy(torch.nn.Module):
         return {"logits": self.table[input_ids]}
 
 
-def producer(config: dict, connection: Any, results: Any, source: dict | None) -> None:
+def producer(config: dict, connection: Any, results: Any, source: Optional[dict]) -> None:
     """Maintain the real CPU producer protocol with deterministic complete trajectories."""
     connection.send(("ready", 1))
     cursor = 0 if source is None else source["cursor"]
@@ -105,12 +106,13 @@ def producer(config: dict, connection: Any, results: Any, source: dict | None) -
 class Checkpoints:
     """Small persistent model contract, exercising the production async commit layer."""
 
-    def __init__(self, runtime, config):
+    def __init__(self, runtime: Any, config: dict) -> None:
+        """Bind persistent test state to the actual distributed runtime."""
         self.runtime, self.config = runtime, config
         self.root = Path(config["output_dir"])
 
     @property
-    def load_path(self) -> str | None:
+    def load_path(self) -> Optional[str]:
         """Return the selected checkpoint source."""
         return self.config.get("load_path")
 
@@ -155,7 +157,8 @@ class Checkpoints:
 class TinyRuntime:
     """Use actual GRPO, Actor and DDP, replacing only the expensive model/server boundary."""
 
-    def __init__(self, config):
+    def __init__(self, config: dict) -> None:
+        """Construct real CPU Actor, optimizer and checkpoint roles."""
         self.state = SimpleNamespace(global_step=0, max_steps=config["train"]["max_steps"],
                                      consumed_samples=0, consumed_tokens=0)
         self.parallel_dims = SimpleNamespace(dp_rank=dist.get_rank(), dp_size=dist.get_world_size(), tp_rank=0)
@@ -166,7 +169,7 @@ class TinyRuntime:
         group_info = SimpleNamespace(group=dist.group.WORLD, rank_size=dist.get_world_size())
         self.actor = Actor(
             self.model, self.algorithm, micro_batch_size=1,
-            optimizer=torch.optim.SGD(self.model.parameters(), lr=0.05),
+            optimizer=torch.optim.SGD(self.model.parameters(), lr=0.05, foreach=False),
             device=self.device, dp_group_info=group_info, dp_size=dist.get_world_size(),
             response_mini_batch_size=2, update_epochs=1,
         )
@@ -241,8 +244,8 @@ def run(output: str) -> None:
         """Keep production IPC while substituting a deterministic producer."""
         return AsyncRuntime(*args, target=producer, control_client=Mock())
 
-    with patch("rl.async_training.fully_async_trainer.RLRoleRuntime", TinyRuntime), patch(
-        "rl.async_training.fully_async_trainer.AsyncRuntime", sampler_factory,
+    with patch("rl.fully_async.fully_async_trainer.RLRoleRuntime", TinyRuntime), patch(
+        "rl.fully_async.fully_async_trainer.AsyncRuntime", sampler_factory,
     ):
         trainer = FullyAsyncTrainer(config)
         trainer.train()

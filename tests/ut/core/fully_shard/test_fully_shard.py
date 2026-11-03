@@ -62,6 +62,7 @@ from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.distributed._builder.source_shard import _source_infos_for_fully_shard
+from tests.common.mark_utils import arg_mark
 
 
 Tensor = torch.Tensor
@@ -386,14 +387,14 @@ class TestHSDPParamV2(unittest.TestCase):
             self.assertEqual(param_v2.all_reduce_comm_ctx.all_reduce_output.dtype, grad_dtype)
             self.assertIs(param_v2.all_reduce_comm_ctx.all_reduce_handle, mock_handle)
 
-    @patch.object(DTensor, "from_local")
+    @patch.object(DTensor, "from_local_with_layout")
     @patch.object(HSDPParamV2, "_update_shardedparam_storage_forcely")
     @patch('hyper_parallel.core.dtensor.layout.Layout')
     def test_reset_sharded_param(
         self,
         mock_layout,
         mock_update_storage,
-        mock_dtensor_from_local,
+        mock_dtensor_from_layout,
     ):
         """Test resetting sharded parameters.
 
@@ -403,10 +404,10 @@ class TestHSDPParamV2(unittest.TestCase):
 
         Args:
             mock_layout: Mock for Layout class
-            mock_dtensor_from_local: Mock for DTensor class
+            mock_dtensor_from_layout: Mock for DTensor layout constructor
         """
         sharded_param_data = self.sharded_param_data
-        mock_dtensor_instance = self._create_mock_dtensor(mock_dtensor_from_local, sharded_param_data)
+        self._create_mock_dtensor(mock_dtensor_from_layout, sharded_param_data)
 
         # Create parameter
         param_v2 = self._create_param_v2()
@@ -702,6 +703,13 @@ class TestHSDPParamV2(unittest.TestCase):
     def test_to_accumulated_grad_if_needed_preserves_grad_without_reduce_dtype(self):
         """Verify no-sync paths still move local grad into accumulated buffer even without dtype conversion."""
         param_v2 = object.__new__(HSDPParamV2)
+        previous_grad = torch.full((2, 2), 2.0)
+        param_v2.unsharded_accumulated_grad = previous_grad
+
+        HSDPParamV2.accumulate_unsharded_grad_if_needed(param_v2)
+        HSDPParamV2.to_accumulated_grad_if_needed(param_v2)
+        self.assertIs(param_v2.unsharded_accumulated_grad, previous_grad)
+
         grad = torch.ones(2, 2, dtype=torch.float32)
         param_v2._unsharded_param = MagicMock()
         param_v2._unsharded_param.grad = grad
@@ -712,6 +720,13 @@ class TestHSDPParamV2(unittest.TestCase):
 
         self.assertIsNone(param_v2._unsharded_param.grad)
         self.assertTrue(torch.equal(param_v2.unsharded_accumulated_grad, grad))
+
+        next_grad = torch.full((2, 2), 3.0)
+        param_v2._unsharded_param.grad = next_grad
+        HSDPParamV2.accumulate_unsharded_grad_if_needed(param_v2)
+
+        self.assertIsNone(param_v2._unsharded_param.grad)
+        torch.testing.assert_close(param_v2.unsharded_accumulated_grad, torch.full((2, 2), 4.0))
 
 
 class TestFullyShardMeshUtils(unittest.TestCase):
@@ -1172,8 +1187,13 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         )
         self.assertIs(result, mock_ddp_mesh_info.return_value)
 
-    def test_state_init_mp_dtypes_initializes_replicate_params_independently(self):
-        """Verify _init_mp_dtypes leaves dtype ownership with each managed parameter."""
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_state_init_mp_dtypes_initializes_replicate_params_independently(self) -> None:
+        """Feature: Replicated parameter precision refresh.
+        Description: Initialize a replicated parameter from the shared state precision policy.
+        Expectation: The parameter receives the state policy to resolve its own dtype overrides.
+        """
         state = object.__new__(HSDPStateV2)
         state.hsdp_params = []
         state.replicate_params = []

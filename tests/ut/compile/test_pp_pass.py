@@ -53,10 +53,14 @@ Schedule driver (mocked subgraphs + mocked dist):
     class; the registry stays consistent with ``PP_SCHEDULES`` and rejects
     unknown names.
 16. 1F1B frees each microbatch's saved activations as soon as its backward
-    consumed them (the last stage keeps only the per-microbatch loss) and
-    drains its boundary send buffers one turn later (only the final
-    microbatch's sends wait for step end); ``num_microbatches ==
-    pp_degree`` stays correct.
+   consumed them (the last stage keeps only the per-microbatch loss) and
+   drains its boundary send buffers one turn later (only the final
+   microbatch's sends wait for step end); ``num_microbatches ==
+   pp_degree`` stays correct.
+17. VPP (`pp_chunks > 1`): rank `r` owns virtual stages `r, r + pp_degree,
+   ...`; interleaved-1F1B warmup/steady/cooldown grads match the non-PP
+   full-batch mean, including the last-stage -> rank-0 wrap edge and the
+   short-microbatch regime.
 
 Review follow-ups:
 10. Skip-stage dataflow (values crossing 2+ cuts) is rejected up front
@@ -69,6 +73,12 @@ Review follow-ups:
     them (kwargs-general); multi-stage consumption is rejected and
     unconsumed inputs ride the last stage with a warning.
 """
+
+# Fixture modules below model only a parameter/module tree (the joint graph
+# is hand-built and drives PpPass directly), so they intentionally omit a
+# callable ``forward``. The tests also spy on the schedule's private
+# per-microbatch helpers to assert activation lifetimes.
+# pylint: disable=abstract-method,protected-access
 
 import logging
 import queue
@@ -85,8 +95,14 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch import fx, nn
 
+from tests.ut.compile.inductor_stub import install_regional_inductor_stub
+
+# Older supported torch builds (2.6/2.7/2.9) have no regional_inductor; install
+# the executable test double so the numeric Inductor check still runs.
+install_regional_inductor_stub()
 
 from hyper_parallel.compile.pass_config import PP_SCHEDULES, PassConfig  # pylint: disable=C0413
+from hyper_parallel.compile.passes.inductor_pass import InductorPass  # pylint: disable=C0413
 from hyper_parallel.compile.passes.parallel.pp_pass import (  # pylint: disable=C0413
     PpPass,
     _auto_stage_split,
@@ -95,6 +111,7 @@ from hyper_parallel.compile.passes.parallel.pp_schedule import (  # pylint: disa
     SCHEDULE_REGISTRY,
     Schedule1F1B,
     ScheduleGPipe,
+    ScheduleInterleaved1F1B,
     get_schedule_class,
 )
 from hyper_parallel.compile.graph_parallel_plan import GraphParallelPlan  # pylint: disable=C0413
@@ -365,6 +382,10 @@ def _build_pp_stages(
         model = model_factory()
         with _patch_dist(world_size=pp_degree, rank=rank):
             PpPass(parallel_plan=plan).run(jg.graph_module, cfg, model=model)
+        # Terminal backend compilation runs AFTER PpPass and compiles the
+        # schedule's per-stage subgraphs (cfg.inductor_mode == "off" is a
+        # no-op). Keep it inside the loop so each rank's schedule is compiled.
+        InductorPass().run(jg.graph_module, cfg)
         models[rank] = model
         scheds[rank] = jg.graph_module.pp_schedule
     return models, scheds
@@ -1102,6 +1123,53 @@ class TestScheduleGradEquivalence(unittest.TestCase):
         }
         _assert_grads_match(self, pp_by_fqn, ref_by_fqn)
 
+    def test_pp_grads_match_full_batch_mean_with_inductor(self):
+        """Test PP stage subgraphs compiled by Inductor keep the same grads."""
+        for inductor_mode in ("regional", "full"):
+            with self.subTest(inductor_mode=inductor_mode):
+                plan = GraphParallelPlan()
+                plan.pp_stage(0, ["embed", "lin0"])
+                plan.pp_stage(1, ["lin1", "head"])
+                cfg = PassConfig(
+                    fsdp_enabled=False,
+                    pp_enabled=True,
+                    pp_degree=2,
+                    pp_microbatch_size=2,
+                    inductor_mode=inductor_mode,
+                )
+
+                ref_jg, ref_model, x, y = _tiny_lm_joint_graph(batch=4)
+                ref_by_fqn = _reference_grads_by_fqn(
+                    ref_jg, ref_model, {"x": x, "y": y}
+                )
+
+                models, scheds = _build_pp_stages(
+                    lambda: _tiny_lm_joint_graph(batch=2)[0],
+                    _tiny_lm_stage_model,
+                    plan,
+                    cfg,
+                )
+                for sched in scheds.values():
+                    self.assertEqual(
+                        sched.fwd_gm.meta.get("inductor_compiled"), inductor_mode
+                    )
+                    self.assertEqual(
+                        sched.bwd_gm.meta.get("inductor_compiled"), inductor_mode
+                    )
+                grads = self._sweeps(
+                    models,
+                    scheds,
+                    [x],
+                    [y],
+                    x.shape[0] // scheds[0].microbatch_size,
+                )
+
+                pp_by_fqn = {
+                    **_stage_grads_by_fqn(models[0], grads[0]),
+                    **_stage_grads_by_fqn(models[1], grads[1]),
+                }
+                _assert_grads_match(self, pp_by_fqn, ref_by_fqn)
+
     def test_pp_grads_match_full_batch_mean_multi_input(self):
         """Test 3-input routing (two -> stage 0, one -> last) keeps grads.
 
@@ -1196,18 +1264,19 @@ class TestUserInputRouting(unittest.TestCase):
         self.assertEqual(phs1.count("pp_input_2"), 1)
         self.assertEqual(phs1.count("pp_input_0"), 0)
 
-    def test_input_consumed_on_two_stages_rejected(self):
-        """Test an input feeding two stages fails with an actionable error.
+    def test_input_consumed_on_two_stages_is_replicated(self):
+        """Test an input feeding two stages is broadcast to both.
 
         Feature: PP kwargs-general user-input routing
         Description: Trace a graph whose ``x`` feeds the stage-0
             embedding AND the last-stage loss, then run PpPass.
-        Expectation: ValueError mentioning the consuming stages.
+        Expectation: Both stages own the input (no P2P replication of user
+            inputs); every rank already receives the full input list.
         """
         cfg = PassConfig(
             fsdp_enabled=False, pp_enabled=True, pp_degree=2, pp_microbatch_size=1
         )
-        jg, model, x, y = _tiny_lm_joint_graph(batch=2)
+        _, model, x, y = _tiny_lm_joint_graph(batch=2)
 
         def train_fn(m: nn.Module, *, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             """Consume ``x`` on both stages: embedding AND the loss."""
@@ -1223,11 +1292,9 @@ class TestUserInputRouting(unittest.TestCase):
             warnings.simplefilter("ignore", RuntimeWarning)
             jg2 = trace_model_graph(m, train_fn, {"x": x, "y": y})
         with _patch_dist(world_size=2, rank=0):
-            with self.assertRaises(ValueError) as ctx:
-                PpPass(parallel_plan=_manual_plan()).run(
-                    jg2.graph_module, cfg, model=model
-                )
-        self.assertIn("consumed on stages", str(ctx.exception))
+            PpPass(parallel_plan=_manual_plan()).run(jg2.graph_module, cfg, model=model)
+        self.assertEqual(jg2.graph_module.pp_schedule.user_input_stage_sets[0], [0, 1])
+        self.assertEqual(jg2.graph_module.pp_schedule.user_input_stage_sets[1], [1])
 
     def test_unconsumed_input_warns_and_rides_last_stage(self):
         """Test an ignored kwarg warns and routes to the last stage.
@@ -1241,7 +1308,7 @@ class TestUserInputRouting(unittest.TestCase):
         cfg = PassConfig(
             fsdp_enabled=False, pp_enabled=True, pp_degree=2, pp_microbatch_size=1
         )
-        jg, _, x, y = _tiny_lm_joint_graph(batch=2)
+        _, _, x, y = _tiny_lm_joint_graph(batch=2)
         # The traced graph already carries the (x, y) leaves; piggyback an
         # unconsumed scalar by re-tracing with an extra ignored kwarg.
         torch.manual_seed(0)
@@ -1614,11 +1681,12 @@ def _assert_threaded_grads_match(
     scheds: Dict[int, Any],
     results: Dict[int, Any],
     ref_by_fqn: Dict[str, torch.Tensor],
+    schedule_cls: type = Schedule1F1B,
 ) -> None:
     """Assert every stage's returned grads (slot 1:) cover and match the reference."""
     pp_by_fqn: Dict[str, torch.Tensor] = {}
     for rank in models:
-        case.assertIsInstance(scheds[rank], Schedule1F1B)
+        case.assertIsInstance(scheds[rank], schedule_cls)
         pp_by_fqn.update(_stage_grads_by_fqn(models[rank], results[rank][1:]))
     _assert_grads_match(case, pp_by_fqn, ref_by_fqn)
 
@@ -1711,7 +1779,7 @@ class TestSchedule1F1BGradEquivalence(unittest.TestCase):
 
         last._apply_backward = spy_backward
         last._finalize_loss = spy_finalize
-        results, errors, alive = _run_threaded_1f1b(models, scheds, x, y)
+        _, errors, alive = _run_threaded_1f1b(models, scheds, x, y)
         self.assertFalse(alive, "1F1B schedule deadlocked across stages")
         self.assertFalse(errors, f"stage raised: {errors}")
         self.assertEqual(len(checks), 4)
@@ -1784,6 +1852,64 @@ class TestSchedule1F1BGradEquivalence(unittest.TestCase):
         self.assertEqual(len(fwd_refs), 4)
         self.assertFalse(stale, f"buffers still held: {stale}")
         self.assertIsInstance(results[1][0], torch.Tensor)
+
+
+def _two_by_two_vpp(
+    microbatch_size: int,
+) -> Tuple[Dict[int, nn.Module], Dict[int, Any]]:
+    """Build two physical ranks x two virtual stages each (VPP degree 4)."""
+    plan = GraphParallelPlan()
+    for stage, fqn in enumerate(("embed", "lin0", "lin1", "head")):
+        plan.pp_stage(stage, [fqn])
+    cfg = PassConfig(
+        fsdp_enabled=False,
+        pp_enabled=True,
+        pp_degree=2,
+        pp_chunks=2,
+        pp_microbatch_size=microbatch_size,
+        pp_schedule="vpp",
+    )
+    return _build_pp_stages(
+        lambda: _tiny_lm_joint_graph(batch=microbatch_size)[0],
+        _tiny_lm_stage_model,
+        plan,
+        cfg,
+        pp_degree=2,
+    )
+
+
+class TestVppSchedule(unittest.TestCase):
+    """VPP installs interleaved schedules and matches non-PP gradients."""
+
+    def test_installs_interleaved_with_loop_stage_mapping(self):
+        """Test rank r owns virtual stages r, r + pp_degree, ..."""
+        models, scheds = _two_by_two_vpp(microbatch_size=2)
+        self.assertEqual(set(models), {0, 1})
+        self.assertIsInstance(scheds[0], ScheduleInterleaved1F1B)
+        self.assertIsInstance(scheds[1], ScheduleInterleaved1F1B)
+        self.assertEqual(scheds[0].stage_indices, [0, 2])
+        self.assertEqual(scheds[1].stage_indices, [1, 3])
+
+    def test_vpp_grads_match_full_batch_mean(self):
+        """Test the four- and one-microbatch regimes against reference grads."""
+        for batch in (8, 2):
+            with self.subTest(batch=batch):
+                ref_jg, ref_model, x, y = _tiny_lm_joint_graph(batch=batch)
+                ref_by_fqn = _reference_grads_by_fqn(
+                    ref_jg, ref_model, {"x": x, "y": y}
+                )
+                models, scheds = _two_by_two_vpp(microbatch_size=2)
+                results, errors, alive = _run_threaded_1f1b(models, scheds, x, y)
+                self.assertFalse(alive, "VPP schedule deadlocked across ranks")
+                self.assertFalse(errors, f"stage raised: {errors}")
+                _assert_threaded_grads_match(
+                    self,
+                    models,
+                    scheds,
+                    results,
+                    ref_by_fqn,
+                    schedule_cls=ScheduleInterleaved1F1B,
+                )
 
 
 if __name__ == "__main__":

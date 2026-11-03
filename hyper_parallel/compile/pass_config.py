@@ -23,19 +23,42 @@ distributed guard inside ``FSDPPass`` (which still early-returns on
 distributed was initialized, leaving no way to run pure-TP / pure-PP graph
 mode. The explicit field fixes that. Pipeline-parallel (``pp_enabled``)
 follows the same contract: intent here, runtime guard in ``PpPass``.
+
+Note:
+    TP / SP / LP are deliberately NOT configurable here: their collectives
+    are baked into module boundary forwards by the automodel flow (shared
+    with eager mode), and no graph pass consumes them. ``PassConfig`` only
+    drives what the graph passes actually execute.
 """
 
-__all__ = ["PassConfig", "PP_SCHEDULES", "DP_MODES", "normalize_dp_mode"]
+__all__ = [
+    "PassConfig",
+    "PP_SCHEDULES",
+    "INDUCTOR_MODES",
+    "DP_MODES",
+    "normalize_dp_mode",
+    "build_pass_config_from_trainer_config",
+]
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 
 # Pipeline schedule names accepted by ``pp_schedule``. Kept torch-free here so
 # the config dataclass stays importable anywhere; ``pp_schedule``'s registry
 # (which does import torch) must expose exactly these keys.
-PP_SCHEDULES = ("gpipe", "1f1b")
+PP_SCHEDULES = ("gpipe", "1f1b", "interleaved_1f1b", "vpp")
+
+# Backend compilation modes for the terminal ``InductorPass``:
+#   "off"      - no Inductor compilation (graph runs as plain FX nodes)
+#   "regional" - compile tagged compute regions; collectives and
+#                side-effectful nodes stay eager (see InductorPass)
+#   "full"     - compile the whole joint graph as one Inductor region
+INDUCTOR_MODES = ("off", "regional", "full")
+
+# Schedule names that can drive multiple virtual stages per physical rank.
+_INTERLEAVED_SCHEDULES = ("interleaved_1f1b", "vpp")
 
 # Data-parallel modes, mirroring simplefsdp's ``data_parallel`` modes:
 #   "fsdp" -> fully_shard        (Shard(0) on the fsdp axis)
@@ -70,6 +93,12 @@ class PassConfig:
     Attributes:
         enable_overlap: Drive ``AutoOverlapPass`` to move ``wait_tensor`` for
             communication/compute overlap.
+        fsdp_bucketing: Fuse compatible FSDP all-gathers and reduce-scatters before
+            overlap. Python-only, disabled by default; configure before compilation.
+        fsdp_bucket_modules: Optional module FQN groups, produced by
+            ``build_module_bucket_plans`` or supplied as a list of paths/groups.
+            None groups by immediate parameter parents; an empty list selects nothing.
+            All ranks in each FSDP group must use the same configuration.
         fsdp_allgather_prefetch: Prefetch forward/backward FSDP all-gathers
             and delay their wait/view nodes independently of enable_overlap.
         fsdp_overlap_grad_reduce: Advance backward reduce-scatter launches and
@@ -113,28 +142,29 @@ class PassConfig:
             or ``world_size // fsdp_degree`` for HSDP / ``world_size`` for
             DDP). Kept separate from ``fsdp_degree`` (the shard axis) so an
             HSDP mesh is unambiguous.
-        tp_size: Tensor-parallel degree. Informational today (TP collectives
-            live inside boundary forwards baked by automodel, not in the
-            graph-mode passes); kept so a future TP-aware pass can read it
-            without API churn.
-        sequence_parallel: Enable sequence parallel (SP) on the TP axis.
-        loss_parallel: Enable loss parallel (LP) on the TP axis.
         pp_enabled: Drive ``PpPass`` (pipeline-parallel graph split). When
             ``True`` the joint fwd+bwd graph is sliced to this rank's stage
             along module-FQN boundaries declared in ``GraphParallelPlan``, cross-stage
             activations are exchanged via P2P ``isend``/``irecv``, and a
-            self-contained GPipe schedule is installed as a ``call_module``
+            self-contained pipeline schedule is installed as a ``call_module``
             stub inside the rewritten graph, so the trainer needs no PP
             wiring. ``PpPass`` early-returns when distributed is not
             initialized or ``world_size == 1``.
-        pp_degree: Number of pipeline-parallel ranks (== number of stages
-            for the single-virtual-stage schedule shipped here). ``None``
-            means "resolve at runtime": pure-PP resolves it from
+        pp_degree: Number of pipeline-parallel ranks (physical stages).
+            ``None`` means "resolve at runtime": pure-PP resolves it from
             ``world_size``; the PP+DP hybrid resolves it from the 2-D
             ``(pp, DP)`` mesh built by ``GraphCompiler._init_pp_dp_mesh``
             (which also back-fills ``fsdp_degree`` /
             ``dp_replicate_degree``), subject to
             ``pp_degree * dp_degree == world_size``.
+        pp_chunks: Number of virtual pipeline stages per physical rank.
+            ``1`` (default) is the classic single-stage-per-rank layout used
+            by ``"gpipe"`` / ``"1f1b"``. Values ``> 1`` enable VPP
+            (interleaved 1F1B): the model is split into
+            ``pp_degree * pp_chunks`` virtual stages, rank ``r`` owns virtual
+            stages ``r, r + pp_degree, ...``, and the ``"interleaved_1f1b"``
+            schedule pipelines the virtual stages. Requires
+            ``pp_schedule`` to be an interleaved schedule.
         pp_microbatch_size: Number of samples per microbatch for the
             pipeline schedule. The per-step batch size (the leading dim of
             the trainer's input tensor) must be divisible by this. ``1`` means
@@ -148,8 +178,29 @@ class PassConfig:
             bubble and freeing each microbatch's activations as soon as its
             backward runs (GPipe retains all of them until the sweep ends);
             it requires ``num_microbatches >= pp_degree``.
+            ``"interleaved_1f1b"`` (alias ``"vpp"``) is the VPP schedule: it
+            supports ``pp_chunks > 1`` virtual stages per rank and uses the
+            classic interleaved-1F1B warmup / steady / cooldown order.
             ``PpPass`` resolves the name to a schedule class via
             ``pp_schedule.get_schedule_class``.
+        inductor_mode: Terminal backend compilation for the joint graph, one
+            of ``INDUCTOR_MODES``. ``"off"`` (default) runs the graph as
+            plain FX nodes; ``"regional"`` compiles tagged compute regions
+            with TorchInductor while keeping communication collectives and
+            side-effectful nodes (e.g. the FSDP reshard storage free) eager;
+            ``"full"`` compiles the whole joint graph as one region. Both
+            compiling modes force ``eager_numerics.division_rounding`` on
+            torch builds that provide it (2.11+) so compiled code stays
+            bitwise-equal to eager, and restore the positional calling
+            convention afterwards. Requires a torch with Inductor. With
+            pipeline parallel enabled, ``PpPass`` runs first and this pass
+            compiles each stage's forward/backward subgraph
+            independently (both modes); cross-stage fusion is inherently
+            impossible because the schedule's P2P sits between the stages.
+        inductor_configs: Optional Inductor config overrides passed to the
+            compiled regions (keys validated by ``torch._inductor.config``),
+            e.g. ``{"reorder_for_peak_memory": True}``. ``"full"`` mode
+            always sets ``reorder_for_peak_memory=True`` unless overridden.
 
     Note:
         ``fsdp_enabled`` / ``pp_enabled`` no longer probe
@@ -164,16 +215,18 @@ class PassConfig:
     fsdp_degree: Optional[int] = None
     dp_mode: str = "fsdp"
     dp_replicate_degree: Optional[int] = None
-    tp_size: int = 1
-    sequence_parallel: bool = False
-    loss_parallel: bool = False
     pp_enabled: bool = False
     pp_degree: Optional[int] = None
+    pp_chunks: int = 1
     pp_microbatch_size: int = 1
     pp_schedule: str = "gpipe"
+    fsdp_bucketing: bool = False
+    fsdp_bucket_modules: Optional[list[str | list[str]] | tuple[tuple[str, ...], ...]] = None
     fsdp_allgather_prefetch: bool = True
     fsdp_overlap_grad_reduce: bool = True
     max_in_flight_gb: float = 0.25
+    inductor_mode: str = "off"
+    inductor_configs: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         self.dp_mode = normalize_dp_mode(self.dp_mode)
@@ -183,10 +236,11 @@ class PassConfig:
         """Sanity-check invariants; also re-run after manual field mutation.
 
         Raises:
-            ValueError: On a negative ``tp_size``, a non-positive explicit
-                ``fsdp_degree`` / ``pp_degree``, a non-positive
-                ``pp_microbatch_size``, an unknown ``pp_schedule`` /
-                ``dp_mode``, or a non-positive ``dp_replicate_degree``.
+            ValueError: On a non-positive explicit ``fsdp_degree`` /
+                ``pp_degree``, a non-positive ``pp_microbatch_size``, an
+                unknown ``pp_schedule`` / ``dp_mode``, or a non-positive
+                ``dp_replicate_degree``, or ``pp_chunks > 1`` with a
+                non-interleaved schedule.
         """
         self._validate_flags()
         self._validate_dp()
@@ -194,10 +248,12 @@ class PassConfig:
 
     def _validate_flags(self) -> None:
         """Validate boolean flags and the overlap memory budget."""
-        for name in ("fsdp_allgather_prefetch", "fsdp_overlap_grad_reduce"):
+        for name in ("fsdp_bucketing", "fsdp_allgather_prefetch", "fsdp_overlap_grad_reduce"):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a bool")
+        if self.fsdp_bucket_modules is not None and not isinstance(self.fsdp_bucket_modules, (list, tuple)):
+            raise ValueError("fsdp_bucket_modules must be None or a list/tuple of module groups")
         value = self.max_in_flight_gb
         if (
             isinstance(value, bool)
@@ -206,11 +262,31 @@ class PassConfig:
             or value < 0
         ):
             raise ValueError("max_in_flight_gb must be a finite non-negative number")
+        self._validate_inductor()
+
+    def _validate_inductor(self) -> None:
+        """Validate the Inductor compilation mode and config overrides."""
+        if not isinstance(self.inductor_mode, str) or (
+            self.inductor_mode.lower() not in INDUCTOR_MODES
+        ):
+            raise ValueError(
+                f"inductor_mode must be one of {INDUCTOR_MODES}, "
+                f"got {self.inductor_mode!r}"
+            )
+        # Canonicalize to one spelling so the pass's mode dispatch cannot be
+        # defeated by an accepted-but-unnormalized value like "FULL".
+        self.inductor_mode = self.inductor_mode.lower()
+        if self.inductor_configs is not None and (
+            not isinstance(self.inductor_configs, dict)
+            or not all(isinstance(key, str) for key in self.inductor_configs)
+        ):
+            raise ValueError(
+                "inductor_configs must be None or a dict of "
+                "torch._inductor.config option names (str) to values"
+            )
 
     def _validate_dp(self) -> None:
         """Validate the tensor-parallel and data-parallel degrees."""
-        if self.tp_size < 1:
-            raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
         if self.fsdp_degree is not None and self.fsdp_degree < 1:
             raise ValueError(
                 f"fsdp_degree must be None or a positive int, got {self.fsdp_degree}"
@@ -232,6 +308,8 @@ class PassConfig:
             raise ValueError(
                 f"pp_degree must be None or a positive int, got {self.pp_degree}"
             )
+        if self.pp_chunks < 1:
+            raise ValueError(f"pp_chunks must be >= 1, got {self.pp_chunks}")
         if self.pp_microbatch_size < 1:
             raise ValueError(
                 f"pp_microbatch_size must be >= 1, got {self.pp_microbatch_size}"
@@ -241,6 +319,14 @@ class PassConfig:
         ):
             raise ValueError(
                 f"pp_schedule must be one of {PP_SCHEDULES}, got {self.pp_schedule!r}"
+            )
+        if (
+            self.pp_chunks > 1
+            and self.pp_schedule.lower() not in _INTERLEAVED_SCHEDULES
+        ):
+            raise ValueError(
+                f"pp_chunks={self.pp_chunks} requires an interleaved schedule "
+                f"(one of {_INTERLEAVED_SCHEDULES}), got {self.pp_schedule!r}"
             )
 
 
@@ -255,9 +341,11 @@ def build_pass_config_from_trainer_config(
     This helper stays in the pass-config module because it computes the
     graph-pass surface from the trainer topology without altering runtime
     objects. Accepting ``Any`` keeps this module importable without the
-    trainer package.
+    trainer package. Only fields the graph passes actually consume are
+    projected: TP / SP / LP topology (``accelerator.tp_size`` /
+    ``sequence_parallel`` / ``loss_parallel``) is owned by the automodel
+    flow and deliberately not copied.
     """
-    accelerator = config.accelerator
     compile_config = getattr(config, "compile", None)
     if fsdp_enabled is None:
         fsdp_enabled = (
@@ -269,9 +357,6 @@ def build_pass_config_from_trainer_config(
         enable_overlap=enable_overlap,
         fsdp_enabled=fsdp_enabled,
         fsdp_degree=fsdp_degree,
-        tp_size=accelerator.tp_size,
-        sequence_parallel=accelerator.sequence_parallel,
-        loss_parallel=accelerator.loss_parallel,
         fsdp_reshard_after_forward=getattr(
             config.fsdp_config, "reshard_after_forward", True
         ),
@@ -283,6 +368,3 @@ def build_pass_config_from_trainer_config(
         ),
         max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
     )
-
-
-__all__ = ["PassConfig", "build_pass_config_from_trainer_config"]

@@ -518,7 +518,7 @@ class MegaMoeExperts(MulticoreModule):
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
-            "ep_size": ep_size,
+            "ep_size": _resolve_ep_size(ep_size, ep_group),
             "ep_group": ep_group,
             "expert_weight_layout": expert_weight_layout,
             "dispatch_mode": dispatch_mode,
@@ -659,7 +659,7 @@ class MegaMoeExperts(MulticoreModule):
 
     def _validate_tensors(self, hidden_states: torch.Tensor, expert_weights: tuple) -> None:
         """Validate activation and parameter metadata before acquiring resources."""
-        if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_npu:
+        if hidden_states.dtype != torch.bfloat16 or not getattr(hidden_states, "is_npu", False):
             raise TypeError("MegaMoeExperts requires BF16 NPU hidden states.")
         weight1, weight2 = expert_weights
         if weight1 is None or weight2 is None:

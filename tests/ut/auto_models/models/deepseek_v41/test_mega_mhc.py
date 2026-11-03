@@ -147,11 +147,14 @@ class TestDeepseekV41HyperMegaMhc(unittest.TestCase):
             "optimizer": {"_target_": f"{__name__}._optimizer_target"},
             "plan_overrides": [{
                 "match": ["model.layers.*.attn_hc", "model.layers.*.ffn_hc"],
-                "module_type": (
-                    "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41."
-                    "DeepseekV41PipelinedHyperConnection"
-                ),
-                "replace_module": {"_target_": target},
+                "replace": {
+                    "kind": "module",
+                    "source_type": (
+                        "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41."
+                        "DeepseekV41PipelinedHyperConnection"
+                    ),
+                    "implementation": {"_target_": target},
+                },
             }],
         })
         rules = entries_to_module_replacements(recipe.plan_overrides)

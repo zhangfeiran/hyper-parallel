@@ -200,7 +200,7 @@ def _factory_arguments(
 def archetype_for_factory(factory_path: str | None) -> Any | None:
     """Reverse-lookup a MoE archetype by its compute-factory ``_target_``.
 
-    A YAML ``local_compute_fn._target_`` that names a known archetype factory
+    A YAML ``replace.implementation`` that names a known archetype factory
     resolves to that archetype: the strategy kind / target class / boundary
     sub-patterns / EP body keys are then structural, not declared per family.
     """

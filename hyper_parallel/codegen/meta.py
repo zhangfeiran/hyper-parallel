@@ -96,7 +96,7 @@ class CodegenMeta:
 #: the artifact carries the parallel logic and the runtime shards from
 #: ``codegen_meta.json``.  When True, the trainer short-circuits the
 #: planner+applier and runs the artifact's own parallelize step.
-#: ``module_overrides`` turns True once generation sunk ``replace_module``, so
+#: ``module_overrides`` turns True once generation sunk module replacements, so
 #: the trainer's HF replacement step is skipped.
 COVERED_DEFAULTS = {
     "sharding_plan": False,

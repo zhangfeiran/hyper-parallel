@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
 from hyper_parallel.core.multicore.torch import ops
+from tests.common.mark_utils import arg_mark
 
 
 # Registration-cache and alias-ABI checks require Torch's private operator schema and loader.
@@ -30,6 +31,12 @@ class TestTorchOps(unittest.TestCase):
     """Native initialization is cached, but Torch itself is imported normally."""
 
     # pylint: disable=protected-access
+
+    def setUp(self) -> None:
+        """Isolate backend registration from the native adapter schema checks."""
+        patcher = patch.object(ops, "load_torch_npu")
+        self.backend = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self) -> None:
         """Never retain a mocked native-registration cache between tests."""
@@ -44,8 +51,13 @@ class TestTorchOps(unittest.TestCase):
         )
         return SimpleNamespace(default=SimpleNamespace(_schema=schema))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_adapter_failure_reports_original_cause(self):
-        """Preserve the failed library and ABI error in the native diagnostic."""
+        """Feature: Native adapter load diagnostics.
+        Description: Register the backend and fail the actual adapter library load.
+        Expectation: Preserve the failed library and original ABI error.
+        """
         with (
             patch.object(ops, "get_multicore_paths", return_value=(Path("vendor"), Path("bad.so"))),
             patch.object(ops, "preload_vendor_library"),
@@ -54,8 +66,13 @@ class TestTorchOps(unittest.TestCase):
         ):
             ops._load_native()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_successful_registration_is_cached(self):
-        """Load the adapter only once across repeated operation calls."""
+        """Feature: Cached native registration.
+        Description: Load the backend and adapter twice, then reject mismatched native schemas.
+        Expectation: Register once per cache lifetime and retain transport and alias validation.
+        """
         with (
             patch.object(ops, "get_multicore_paths", return_value=(Path("vendor"), Path("good.so"))),
             patch.object(ops, "preload_vendor_library") as preload,
@@ -66,6 +83,7 @@ class TestTorchOps(unittest.TestCase):
         ):
             ops._load_native()
             ops._load_native()
+            self.backend.assert_called_once_with()
             preload.assert_called_once_with(Path("vendor"))
             load.assert_called_once_with("good.so")
             for protocol, alias, message in ((0, "a", "transport ABI"), (1, "e", "storage reuse")):

@@ -59,7 +59,8 @@ def test_moe_runtime_uses_public_recipe_and_native_rollout(moe_config: dict) -> 
     assert runtime.accelerator.ep_size == 2
     assert runtime.fsdp_config.edp_shard_size == 2
     assert any(entry.when == "ep" for entry in runtime.plan_overrides)
-    assert any(entry.replace_module is not None for entry in runtime.plan_overrides)
+    assert any(entry.replace is not None and entry.replace.kind == "module"
+               for entry in runtime.plan_overrides)
     resolved = resolve_vllm_automatic_limits(moe_config)
     assert resolved["rollout"]["vllm"]["max_num_seqs"] > 0
 
@@ -142,7 +143,7 @@ def test_r3_supports_internal_and_codex_multiturn(
     moe_config["agentic"].update(max_turns=3, interaction_mode="multi_turn")
     validate_config(resolve_vllm_automatic_limits(moe_config), build_algorithm(moe_config["algorithm"]))
 
-    recipe = Path(rl.__file__).resolve().parent.parent / "examples/gsm8k/configs/codex_multi_turn.yaml"
+    recipe = Path(rl.__file__).resolve().parent.parent / "examples/gsm8k/configs/qwen3_30b_a3b_codex_multi_turn.yaml"
     moe_config["agentic"] = yaml.safe_load(recipe.read_text(encoding="utf-8"))["agentic"]
     moe_config["rollout"]["vllm"].update(enable_auto_tool_choice=True, tool_call_parser="hermes")
     resolved = resolve_vllm_automatic_limits(resolve_router_replay_config(moe_config))

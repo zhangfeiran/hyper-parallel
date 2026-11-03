@@ -17,6 +17,7 @@
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 import weakref
 
 import pytest
@@ -381,6 +382,48 @@ def test_resume_failure_propagates_without_compensation(deployment):
         controller.prepare_for_rollout()
     assert controller.policy_version == 0
     assert client.events[-1] == "resume"
+
+
+@pytest.mark.parametrize("failure", ["request", "residency"])
+def test_failed_sleep_prevents_publication_and_resume(failure: str) -> None:
+    """A failed sleep request or false residency check stops the switching sequence."""
+    publisher, _, client, controller, state = _publication("colocated", "full_gather")
+    client.sleep = Mock(side_effect=RuntimeError("sleep failed") if failure == "request" else None)
+    with pytest.raises(RuntimeError, match="sleep"):
+        controller.prepare_for_training()
+        controller.update_weights(PolicySnapshot(1, "qwen", state))
+        controller.prepare_for_rollout()
+    assert not client.events, f"Unexpected operations after sleep failure: actual={client.events}, expected=[]"
+    assert controller.policy_version == 0, f"Published version: actual={controller.policy_version}, expected=0"
+    assert publisher.last_strategy is None, f"Publication succeeded: actual={publisher.last_strategy}, expected=None"
+
+
+@pytest.mark.parametrize("failure", ["finish", "wrong_version", "disagreeing_workers"])
+def test_failed_commit_or_version_check_prevents_resume(failure: str) -> None:
+    """Transferred weights stay inaccessible when commit or worker agreement fails."""
+    publisher, _, client, controller, state = _publication("colocated", "full_gather")
+    finish = client.finish_weight_update
+
+    def finish_update() -> None:
+        """Inject failure at the commit boundary after real CPU weight transfer."""
+        if failure == "finish":
+            raise RuntimeError("finish failed")
+        finish()
+        for worker in client.workers:
+            worker._rl_loaded_policy_version = 0
+        if failure == "disagreeing_workers":
+            client.workers[0]._rl_loaded_policy_version = 1
+
+    client.finish_weight_update = finish_update
+    controller.prepare_for_training()
+    with pytest.raises(RuntimeError):
+        controller.update_weights(PolicySnapshot(1, "qwen", state))
+        controller.prepare_for_rollout()
+    _assert_parameters(client, state)
+    assert client.paused, f"Admission state: actual={client.paused}, expected=True"
+    assert "resume" not in client.events, f"Unexpected resume after {failure}: actual={client.events}"
+    assert controller.policy_version == 0, f"Published version: actual={controller.policy_version}, expected=0"
+    assert publisher.last_strategy is None, f"Publication succeeded: actual={publisher.last_strategy}, expected=None"
 
 
 def test_graph_refresh_failure_during_kv_wake_cannot_expose_transferred_policy():

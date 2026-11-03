@@ -76,6 +76,8 @@ class MegaGate(torch.nn.Module):
     non-NPU tensors use the equivalent Torch implementation.
     """
 
+    fp32_parameter_names: tuple[str, ...] = ("bias", "bias_vl")
+
     def __init__(
         self,
         *,
@@ -180,7 +182,7 @@ class MegaGate(torch.nn.Module):
 
     def _apply(self, fn: Callable, recurse: bool = True) -> MegaGate:
         """Keep correction biases FP32 under enclosing model dtype conversion."""
-        return super()._apply(preserve_fp32_parameters(self, fn, ("bias", "bias_vl")), recurse=recurse)
+        return super()._apply(preserve_fp32_parameters(self, fn, self.fp32_parameter_names), recurse=recurse)
 
     def _plan(self, hidden_states: torch.Tensor) -> MegaGatePlan:
         """Return the process-level plan for an NPU tensor."""

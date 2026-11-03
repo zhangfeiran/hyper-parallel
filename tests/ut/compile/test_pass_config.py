@@ -18,8 +18,7 @@ Covers the rules the dataclass asserts and that have regressed before:
 
 1. Defaults match the documented intent (FSDP on, overlap on, degrees
    unresolved until runtime).
-2. ``__post_init__`` rejects negative ``tp_size`` and non-positive explicit
-   ``fsdp_degree``.
+2. ``__post_init__`` rejects non-positive explicit ``fsdp_degree``.
 3. ``validate()`` re-runs the same checks after a caller mutates a field
    (the compiler back-fills ``fsdp_degree`` from the mesh in
    ``GraphCompiler._init_device_mesh``).
@@ -65,9 +64,6 @@ class TestPassConfigDefaults(unittest.TestCase):
                 f"got {cfg.dp_replicate_degree}"
             ),
         )
-        self.assertEqual(
-            cfg.tp_size, 1, (f"tp_size default should be 1, got {cfg.tp_size}")
-        )
         # PP defaults: off by default (opt-in), degrees unresolved, safe
         # microbatch of 1.
         self.assertFalse(
@@ -90,6 +86,11 @@ class TestPassConfigDefaults(unittest.TestCase):
             "gpipe",
             (f"pp_schedule default should be 'gpipe', got {cfg.pp_schedule!r}"),
         )
+        self.assertEqual(
+            cfg.pp_chunks,
+            1,
+            (f"pp_chunks default should be 1, got {cfg.pp_chunks}"),
+        )
 
     def test_explicit_construction(self):
         """Test explicit construction forwards every kwarg."""
@@ -99,7 +100,6 @@ class TestPassConfigDefaults(unittest.TestCase):
             fsdp_degree=8,
             dp_mode="hsdp",
             dp_replicate_degree=4,
-            tp_size=2,
             pp_enabled=True,
             pp_degree=4,
             pp_microbatch_size=2,
@@ -110,7 +110,6 @@ class TestPassConfigDefaults(unittest.TestCase):
         self.assertEqual(cfg.fsdp_degree, 8)
         self.assertEqual(cfg.dp_mode, "hsdp")
         self.assertEqual(cfg.dp_replicate_degree, 4)
-        self.assertEqual(cfg.tp_size, 2)
         self.assertTrue(cfg.pp_enabled)
         self.assertEqual(cfg.pp_degree, 4)
         self.assertEqual(cfg.pp_microbatch_size, 2)
@@ -148,20 +147,6 @@ class TestPassConfigDpMode(unittest.TestCase):
 class TestPassConfigValidation(unittest.TestCase):
     """``__post_init__`` catches misconfigurations early."""
 
-    def test_rejects_non_positive_tp_size(self):
-        """Test ``tp_size < 1`` raises ValueError at construction."""
-        for bad in (0, -1, -4):
-            with self.assertRaises(ValueError) as ctx:
-                PassConfig(tp_size=bad)
-            self.assertIn(
-                "tp_size",
-                str(ctx.exception),
-                (
-                    f"error for tp_size={bad} should mention tp_size, "
-                    f"got: {ctx.exception}"
-                ),
-            )
-
     def test_rejects_non_positive_fsdp_degree(self):
         """Test explicit ``fsdp_degree < 1`` raises ValueError."""
         for bad in (0, -1, -8):
@@ -191,6 +176,21 @@ class TestPassConfigValidation(unittest.TestCase):
                 str(ctx.exception),
                 f"error for pp_schedule={bad!r} should mention pp_schedule",
             )
+
+    def test_pp_chunks_validation(self):
+        """Test ``pp_chunks`` bounds and its interleaved-schedule requirement."""
+        for bad in (0, -1):
+            with self.assertRaises(ValueError) as ctx:
+                PassConfig(pp_chunks=bad)
+            self.assertIn("pp_chunks", str(ctx.exception))
+        for bad_schedule in ("gpipe", "1f1b"):
+            with self.assertRaises(ValueError) as ctx:
+                PassConfig(pp_chunks=2, pp_schedule=bad_schedule)
+            self.assertIn("pp_chunks", str(ctx.exception))
+        for good in ("vpp", "interleaved_1f1b"):
+            cfg = PassConfig(pp_chunks=2, pp_schedule=good)
+            self.assertEqual(cfg.pp_chunks, 2)
+            self.assertEqual(cfg.pp_schedule, good)
 
     def test_validate_after_mutation(self):
         """Test ``validate()`` re-runs checks after a caller mutates a field.

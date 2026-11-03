@@ -20,6 +20,7 @@ import logging
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import torch
@@ -779,7 +780,7 @@ def _validate_activation_checkpoint_config(
         )
 
 
-def _adapter_recompute_spec(model: nn.Module):
+def _adapter_recompute_spec(model: nn.Module, *, required: bool = True):
     """Resolve a model-owned recompute declaration without family branches."""
     config = getattr(model, "config", None)
     identities = [getattr(config, "model_type", None)]
@@ -793,6 +794,8 @@ def _adapter_recompute_spec(model: nn.Module):
             break
     provider = getattr(adapter_spec, "recompute", None)
     if provider is None or not callable(provider):
+        if not required:
+            return None
         raise ValueError(
             "activation_checkpoint.selection.source=model_adapter_safe_regions "
             "requires ModelAdapterSpec.recompute"
@@ -980,6 +983,7 @@ def _apply_model_adapter_regions_checkpointing(
     *,
     enable_compile: bool,
     swap_inputs: bool,
+    recompute_spec: Optional[RecomputePolicy] = None,
 ) -> nn.Module:
     """Wrap the adapter-declared recompute regions of the selected layers.
 
@@ -989,7 +993,8 @@ def _apply_model_adapter_regions_checkpointing(
     lets a cross-layer state producer or consumer live inside a checkpointed
     layer.
     """
-    recompute_spec = _adapter_recompute_spec(model)
+    if recompute_spec is None:
+        recompute_spec = _adapter_recompute_spec(model)
     if not recompute_spec.region_patterns:
         raise ValueError(
             "activation_checkpoint.selection.source=model_adapter_safe_regions "
@@ -1029,10 +1034,8 @@ def _apply_model_adapter_regions_checkpointing(
 def _wrap_declared_exclusions(module_by_fqn: dict, roots: list, recompute_spec: Any) -> int:
     """Validate the declared exclusions of the selected regions and wrap them."""
     exclude_targets = _select_excluded_targets(module_by_fqn, roots, recompute_spec)
-    declared_exclusions = bool(
-        recompute_spec.exclude_patterns or recompute_spec.exclude_predicate is not None
-    )
-    if declared_exclusions and not exclude_targets:
+    # A predicate may select decoder-only exclusions while the chosen regions are visual blocks.
+    if recompute_spec.exclude_patterns and not exclude_targets:
         raise ValueError(
             "model adapter recompute exclusions matched no module "
             "inside the selected regions"
@@ -1234,6 +1237,13 @@ def _apply_activation_checkpointing(
     has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)
 
     selection_source = getattr(selection, "source", "default")
+    recompute_spec = None
+    if selection_source == "default" and activation_checkpoint == "full" and not enable_compile:
+        recompute_spec = _adapter_recompute_spec(model, required=False)
+        if recompute_spec is not None:
+            # Model-owned regions also cover non-decoder towers and their replay state.
+            selection = SimpleNamespace(layer_count=len(ac_layers), layer_indices=None)
+            selection_source = "model_adapter_safe_regions"
     if selection_source == "model_adapter_safe_regions":
         return _apply_model_adapter_regions_checkpointing(
             model,
@@ -1242,6 +1252,7 @@ def _apply_activation_checkpointing(
             selection,
             enable_compile=enable_compile,
             swap_inputs=swap_inputs,
+            recompute_spec=recompute_spec,
         )
 
     if hasattr(model, "gradient_checkpointing_disable"):

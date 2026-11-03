@@ -67,7 +67,8 @@ def test_mega_moe_large_runtime() -> None:
         actual = baseline.run_layer(mega, hidden, ids, weights, counts, upstream)
         baseline.assert_results_close(expected, actual)
         # Inspect private plan ownership only to prove which uploaded queues ran.
-        plan = mega._resource_group.resources.plan  # pylint: disable=protected-access
+        resources = mega._resource_group.resources  # pylint: disable=protected-access
+        plan = resources.plan_for_tokens(shape.local_num_tokens, baseline.DEVICE)
         result = {"forward": _runtime_metadata(plan.fwd_runtime_config),
                   "backward": _runtime_metadata(plan.bwd_runtime_config),
                   "all_outputs_gradients_updates_match": True, "memory": memory_sample()}

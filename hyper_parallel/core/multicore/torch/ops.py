@@ -47,10 +47,10 @@ __all__ = [
 from functools import lru_cache
 
 import torch
-import torch_npu  # noqa: F401  # pylint: disable=unused-import  # Registers native NPU operators.
 
 from hyper_parallel.core.multicore._loader import (
     NativeComponentUnavailableError,
+    load_torch_npu,
     get_multicore_paths,
     preload_vendor_library,
 )
@@ -71,6 +71,7 @@ def _launch_diagnostic_out(
 @lru_cache(maxsize=1)
 def _load_native() -> None:
     """Register the ABI-specific native adapter once on first operation."""
+    load_torch_npu()
     vendor_root, adapter_path = get_multicore_paths()
     preload_vendor_library(vendor_root)
     try:

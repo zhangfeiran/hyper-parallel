@@ -472,21 +472,6 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         self.assertEqual(comp.pass_config.dp_replicate_degree, 2)
         self.assertEqual(comp.pass_config.fsdp_degree, 2)
 
-    def test_init_device_mesh_fallback_rejects_tp(self):
-        """Test the fallback refuses a TP topology (needs a MeshContext)."""
-        comp = GraphCompiler(
-            model=_make_model(),
-            train_fn=_mse_train_fn,
-            pass_config=PassConfig(fsdp_enabled=True, tp_size=2),
-            device=torch.device("cpu"),
-        )
-        mock_dist = MagicMock()
-        mock_dist.get_world_size.return_value = 4
-        with patch("hyper_parallel.compile.compiler.dist", mock_dist):
-            with self.assertRaises(ValueError) as ctx:
-                comp._init_device_mesh(None)
-        self.assertIn("tp_size", str(ctx.exception))
-
     def test_init_device_mesh_pp_fsdp_builds_2d(self):
         """Test the PP+FSDP hybrid builds a 2-D ``(pp, fsdp_shard)`` mesh."""
         comp = GraphCompiler(

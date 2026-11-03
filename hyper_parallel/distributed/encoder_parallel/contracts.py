@@ -59,11 +59,19 @@ EncoderFeature = tuple[EncoderWorkItem, torch.Tensor]
 
 
 @dataclass(frozen=True)
+class EncoderLocalInputs:
+    """Device patches packed in the order of one plan's local segments."""
+
+    patches: torch.Tensor
+
+
+@dataclass(frozen=True)
 class EncoderParallelAdapterSpec:
     """Model-owned visual boundaries and a runtime bridge factory.
 
     ``bind(model)`` returns an object with ``input_fields``, ``head_counts``,
-    ``validate_training``, ``parse_images``, ``encode_local`` and ``project``.
+    ``validate_training``, ``parse_images``, ``pack_payload``, ``payload_field``,
+    ``empty_payload_shape``, ``encode_local`` and ``project``.
     The runtime uses these operations without inspecting model-specific state.
     Module replacement is selected separately by recipe ``replace_module``.
     """

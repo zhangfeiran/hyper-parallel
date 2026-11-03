@@ -17,11 +17,14 @@
 from functools import partial
 from typing import Any
 
+from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
+from hyper_parallel.distributed.encoder_parallel.attention import encoder_attention_checkpoint_contexts
 from hyper_parallel.models.adapter_spec import RecomputePolicy
 from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
     attention_role,
     configure_shared_state,
 )
+from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionTower
 
 #: The CSA2 attention roles, producers first.
 _ATTENTION_ROLES = ("full", "reindex", "reuse")
@@ -47,11 +50,25 @@ def _attention_stays_resident(module_fqn: str, module: Any, *, resident: tuple[s
     return attention_role(module) in resident
 
 
+def _configure_recompute(model: Any, *, roles: tuple[str, ...]) -> None:
+    """Configure decoder shared state and complete visual-block replay."""
+    configure_shared_state(model, roles)
+    for module in model.modules():
+        if isinstance(module, DeepseekV41VisionTower):
+            for block in module.blocks:
+                if isinstance(block, CheckpointWrapper):
+                    block.checkpoint_kwargs.update(
+                        context_fn=encoder_attention_checkpoint_contexts,
+                        # All ranks must replay every Ulysses/FSDP collective.
+                        early_stop=False,
+                    )
+
+
 def build_recompute_policy() -> RecomputePolicy:
     """Return the V4.1 recompute regions used by normal training.
 
-    Every decoder layer is one region. The attention roles listed for
-    :data:`ATTENTION_RECOMPUTE_TIER` recompute with their layer; the remaining
+    Every decoder layer and every visual block is one region. The attention
+    roles listed for :data:`ATTENTION_RECOMPUTE_TIER` recompute with their layer; the remaining
     roles stay outside the region, which is what the tiers differ in. The
     model-owned hook then pins the discrete selection of the recomputed index
     sources, so recomputing one neither chooses a different key set nor
@@ -61,11 +78,11 @@ def build_recompute_policy() -> RecomputePolicy:
     recomputed = _RECOMPUTED_ROLES[ATTENTION_RECOMPUTE_TIER]
     resident = tuple(role for role in _ATTENTION_ROLES if role not in recomputed)
     return RecomputePolicy(
-        region_patterns=("model.layers.*",),
+        region_patterns=("model.layers.*", "model.vision.blocks.*"),
         exclude_predicate=(
             partial(_attention_stays_resident, resident=resident) if resident else None
         ),
-        on_applied=partial(configure_shared_state, roles=recomputed),
+        on_applied=partial(_configure_recompute, roles=recomputed),
     )
 
 

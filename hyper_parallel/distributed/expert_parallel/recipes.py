@@ -22,10 +22,11 @@ injected automatically — a factory must be referenced explicitly from YAML:
 .. code-block:: yaml
 
     plan_overrides:
-      - match: "*.mlp"
+      - match: "*.mlp.forward"
         when: ep
-        local_compute_fn:
-          _target_: hyper_parallel.distributed.expert_parallel.recipes.qwen2moe_ep_compute_fn
+        replace:
+          kind: method
+          implementation: hyper_parallel.distributed.expert_parallel.recipes.qwen2moe_ep_compute_fn
 
 Archetype table (each factory is a COMPLETE semantic implementation —
 router / dispatch / experts / combine / shared expert / gate / merge are

@@ -319,7 +319,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         )
 
         with (
-            patch.object(torch_profiler.torch, "npu", fake_npu),
+            patch.object(torch_profiler.torch, "npu", fake_npu, create=True),
             patch.object(torch_profiler.torch, "empty", return_value=profile_buffer),
         ):
             with profiler:
@@ -401,7 +401,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         parse_error = ValueError("invalid profile header")
 
         with (
-            patch.object(torch_profiler.torch, "npu", _FakeNpu()),
+            patch.object(torch_profiler.torch, "npu", _FakeNpu(), create=True),
             patch.object(torch_profiler.torch, "empty", return_value=profile_buffer),
             patch.object(runtime, "parse", side_effect=parse_error),
         ):
@@ -448,7 +448,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         )
 
         with (
-            patch.object(torch_profiler.torch, "npu", _FakeNpu()),
+            patch.object(torch_profiler.torch, "npu", _FakeNpu(), create=True),
             patch.object(torch_profiler.torch, "empty", return_value=profile_buffer),
             patch.object(runtime, "parse", side_effect=ValueError("invalid profile header")) as parse,
         ):
@@ -483,7 +483,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         profiler = torch_profiler.mega_kernel_profile(max_pending_calls=1)
 
         with (
-            patch.object(torch_profiler.torch, "npu", _FakeNpu()),
+            patch.object(torch_profiler.torch, "npu", _FakeNpu(), create=True),
             patch.object(torch_profiler.torch, "empty", return_value=profile_buffer),
         ):
             with self.assertRaisesRegex(RuntimeError, "before launches complete"):
@@ -533,7 +533,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         )
 
         with (
-            patch.object(torch_profiler.torch, "npu", fake_npu),
+            patch.object(torch_profiler.torch, "npu", fake_npu, create=True),
             patch.object(
                 torch_profiler.torch,
                 "empty",

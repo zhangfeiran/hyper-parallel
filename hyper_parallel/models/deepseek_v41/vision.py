@@ -29,14 +29,17 @@ def _vision_cos_sin(
         rope_dim: int,
         rope_theta: float,
         device: torch.device,
+        *,
+        patch_start: int = 0,
+        patch_count: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build DeepSeek's flattened 2D RoPE coefficients for one image grid."""
     inverse_frequency = 1.0 / (
         rope_theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
     )
-    height_positions = torch.arange(grid_height, device=device).unsqueeze(1).expand(grid_height, grid_width)
-    width_positions = torch.arange(grid_width, device=device).unsqueeze(0).expand(grid_height, grid_width)
-    frequencies = torch.stack((height_positions, width_positions), dim=-1).reshape(-1, 2, 1).float()
+    count = grid_height * grid_width if patch_count is None else patch_count
+    positions = torch.arange(patch_start, patch_start + count, device=device)
+    frequencies = torch.stack((positions // grid_width, positions % grid_width), dim=-1).unsqueeze(-1).float()
     frequencies = (frequencies * inverse_frequency).flatten(1)
     return frequencies.cos().unsqueeze(1), frequencies.sin().unsqueeze(1)
 
@@ -52,6 +55,62 @@ def _apply_vision_rotary(
     return torch.cat((first_half * cosine - second_half * sine, second_half * cosine + first_half * sine), dim=-1).to(
         data_type
     )
+
+
+def _npu_vision_attention(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+) -> torch.Tensor:
+    """Run bidirectional fused attention on canonical BNSD tensors."""
+    # The NPU extension is optional for CPU/GPU vision and checkpoint tests.
+    from hyper_parallel.components.functional.npu_fusion_attention import (  # pylint: disable=C0415
+        npu_fusion_attention_forward,
+    )
+
+    output, _ = npu_fusion_attention_forward(
+        module, query, key, value, attention_mask=None,
+        dropout=0.0, scaling=query.shape[-1] ** -0.5,
+        is_causal=False, sparse_mode=0,
+        pre_tokens=2147483647, next_tokens=2147483647,
+    )
+    return output
+
+
+def _vision_attention(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_length: int | None = None,
+) -> torch.Tensor:
+    """Attend one image without materializing its padding mask.
+
+    Args:
+        module: Owning vision attention module.
+        query: Query rows in sequence/head/dimension order, including padding.
+        key: Key rows in the same order.
+        value: Value rows in the same order.
+        key_length: Valid key/value prefix length, or None for a complete image.
+
+    Returns:
+        Attended rows in sequence/head/dimension order.
+    """
+    if key_length is not None:
+        key = key[:key_length]
+        value = value[:key_length]
+    heads, head_dim = query.shape[1:]
+    # Canonical singleton strides are required by native attention entry points.
+    query = query.transpose(0, 1).contiguous().view(1, heads, query.shape[0], head_dim)
+    key = key.transpose(0, 1).contiguous().view(1, heads, key.shape[0], head_dim)
+    value = value.transpose(0, 1).contiguous().view(1, heads, value.shape[0], head_dim)
+    if query.device.type == "npu":
+        return _npu_vision_attention(module, query, key, value).squeeze(0)
+    output = functional.scaled_dot_product_attention(  # pylint: disable=not-callable
+        query, key, value, is_causal=False,
+    )
+    return output.squeeze(0).transpose(0, 1)
 
 
 class DeepseekV41VisionRMSNorm(nn.Module):
@@ -125,13 +184,8 @@ class DeepseekV41VisionAttention(nn.Module):
         )
         query = _apply_vision_rotary(query, cosine, sine)
         key = _apply_vision_rotary(key, cosine, sine)
-        attention_output = functional.scaled_dot_product_attention(  # pylint: disable=not-callable
-            query.transpose(0, 1).unsqueeze(0),
-            key.transpose(0, 1).unsqueeze(0),
-            value.transpose(0, 1).unsqueeze(0),
-            is_causal=False,
-        )
-        return self.wo(attention_output.squeeze(0).transpose(0, 1).reshape(token_count, -1))
+        attention_output = _vision_attention(self, query, key, value)
+        return self.wo(attention_output.reshape(token_count, -1))
 
 
 class DeepseekV41VisionMLP(nn.Module):
@@ -179,6 +233,8 @@ class DeepseekV41VisionTower(nn.Module):
     def __init__(self, config: Any) -> None:
         """Create the configured vision tower from V4.1 extension fields."""
         super().__init__()
+        # Let the model-owned checkpoint policy discover every vision block.
+        self.gradient_checkpointing = False
         self.hidden_size = int(config.v41_vision_hidden_size)
         self.patch_size = int(config.v41_vision_patch_size)
         self.num_attention_heads = int(config.v41_vision_num_attention_heads)

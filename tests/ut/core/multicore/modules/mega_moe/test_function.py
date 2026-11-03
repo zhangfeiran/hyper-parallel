@@ -104,8 +104,8 @@ class TestMegaMoeFunction(unittest.TestCase):
                         else:
                             self.assertTrue(torch.isnan(value[expert]).all())
 
-    def test_eoi_weight_operands_and_gradients_are_zero_copy_views(self) -> None:
-        """Native EOI operands retain storage and gradients restore caller orientation."""
+    def test_eoi_weight_operands_and_gradients_keep_contiguous_layout(self) -> None:
+        """Native EOI operands and gradients already match the parameter storage layout."""
         spec = SimpleNamespace(
             expert_weight_layout="EOI",
             replica_slots_per_rank=0,
@@ -126,18 +126,13 @@ class TestMegaMoeFunction(unittest.TestCase):
             gate_up,
             down,
         )
-        restored_gate_up = function_module._restore_weight_gradient_layout(
-            spec, gradients.grad_weight1
-        )
-        restored_down = function_module._restore_weight_gradient_layout(
-            spec, gradients.grad_weight2
-        )
-        self.assertEqual(tuple(restored_gate_up.shape), tuple(gate_up.shape))
-        self.assertEqual(tuple(restored_down.shape), tuple(down.shape))
-        self.assertEqual(
-            restored_gate_up.data_ptr(), gradients.grad_weight1.data_ptr()
-        )
-        self.assertEqual(restored_down.data_ptr(), gradients.grad_weight2.data_ptr())
+        for weight, gradient in ((gate_up, gradients.grad_weight1), (down, gradients.grad_weight2)):
+            self.assertEqual(gradient.shape, weight.shape,
+                             msg=f"Gradient shape: expected={weight.shape}, actual={gradient.shape}")
+            self.assertEqual(gradient.stride(), weight.stride(),
+                             msg=f"Gradient stride: expected={weight.stride()}, actual={gradient.stride()}")
+            self.assertEqual(torch.count_nonzero(gradient).item(), 0,
+                             msg=f"Empty-expert gradients: expected=0, actual={gradient}")
 
     def test_checkpoint_backward_reuses_replayed_replica_weights(self) -> None:
         """Replay refreshes the original context without a third weight transfer."""

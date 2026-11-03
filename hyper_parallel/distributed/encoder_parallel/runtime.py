@@ -33,6 +33,7 @@ from hyper_parallel.distributed.encoder_parallel.attention import (
 from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelConfig
 from hyper_parallel.distributed.encoder_parallel.contracts import (
     EncoderFeature,
+    EncoderLocalInputs,
     EncoderParallelAdapterSpec,
     EncoderSegment,
     EncoderWorkItem,
@@ -142,7 +143,7 @@ class EncoderParallelPlan:
             gathered.append(full if segment.is_dummy else full[:segment.item.sequence_length])
         return tuple(gathered)
 
-    def _execute_local(self, image_inputs: Mapping[str, Any]
+    def _execute_local(self, image_inputs: Mapping[str, Any] | EncoderLocalInputs
                        ) -> tuple[tuple[EncoderFeature, ...], torch.Tensor, torch.Tensor]:
         """Run the local ViT pass and build routed feature records."""
         bridge = self.runtime.bridge
@@ -180,12 +181,12 @@ class EncoderParallelPlan:
         anchor = torch.stack(anchors).sum() if anchors else prototype.sum() * 0.0
         return tuple(records), prototype, anchor
 
-    def encode_and_route(self, image_inputs: Mapping[str, Any]
+    def encode_and_route(self, image_inputs: Mapping[str, Any] | EncoderLocalInputs
                          ) -> tuple[list[EncoderFeature], torch.Tensor | None]:
         """Run packed ViT and route aligned features to this decoder owner.
 
         Args:
-            image_inputs: Original image tensors shared across the parent ranks.
+            image_inputs: Prepared local patches, or a native image bundle for direct callers.
 
         Returns:
             Routed image records and a zero-valued gradient anchor, or no work.

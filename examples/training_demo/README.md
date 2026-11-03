@@ -116,12 +116,17 @@ overrides may be appended to either command.
 ## DeepSeek-V4.1 Engram and shared compressed attention
 
 `deepseek_v41/train_deepseek_v41_online.yaml` is a four-layer, randomly initialized
-DeepSeek-V4.1 text crop. Four layers are the minimum that execute all requested
-paths: layer 1 owns Engram, layer 2 publishes compressed KV and Lightning
-Indexer selections plus compact hierarchical candidate blocks, and layer 3
-performs a fresh Reindex over that candidate pool. The crop also enables the
-PanGu-style selected-TopK Indexer KL training path. Vision, DSpark, the second
-Engram layer, later compressed-attention source groups, PP-stage shadow
+DeepSeek-V4.1 text crop. Hierarchical candidates are disabled by default,
+preserving the released Full/Reindex/Reuse roles of the retained layers.
+With zero-based layer indices, layer 1 owns Engram, layer 2 is a Full layer
+that publishes compressed KV, Index K, and TopK selections, and layer 3 is a
+Reuse layer that consumes those shared results. This prefix has no Reindex layer.
+The crop also enables the PanGu-style selected-TopK Indexer KL training path.
+
+For non-fused candidate testing, set `enable_candidate_pool: true`. Only then
+does `exercise_post_training_indexer: true` (the default) bound the candidate
+pool and remap layer 3 to Reindex for this shallow crop. Vision, DSpark, the
+second Engram layer, later compressed-attention source groups, PP-stage shadow
 indexers, runtime KV-cache decode, and FP4 QAT remain outside this validation
 crop. Raw KV, shared compressed KV, and compressed index K use PanGu-style
 asynchronous KV-all-gather CP.

@@ -23,7 +23,7 @@ from hyper_parallel.codegen.inline.ir import ImportPatch, ModuleSnippetPatch
 
 @dataclass(frozen=True)
 class ReplacementSpec:
-    """Source-level form of one ``replace_module`` target."""
+    """Source-level form of one module replacement implementation."""
 
     old_ctor: str
     new_ctor: str

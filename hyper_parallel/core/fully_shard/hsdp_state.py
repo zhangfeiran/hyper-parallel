@@ -229,7 +229,7 @@ class HSDPStateV2:
         )
 
     def _init_mp_dtypes(self):
-        """Initialize mixed-precision dtypes for all managed parameters."""
+        """Initialize dtype attributes for each parameter from the mixed-precision policy."""
         for hsdp_param in self.hsdp_params:
             hsdp_param.init_dtype_attrs(self.mp_policy)
 
@@ -344,7 +344,8 @@ class HSDPStateV2:
         params_to_reduce = []
         for hsdp_param in self.hsdp_params:
             skip_param = (
-                not hsdp_param.unsharded_param_buffers
+                not hasattr(hsdp_param, "_unsharded_param")
+                or not hsdp_param.unsharded_param_buffers
                 or not hsdp_param.sharded_param.requires_grad
                 or (
                     hsdp_param.unsharded_param.grad is None

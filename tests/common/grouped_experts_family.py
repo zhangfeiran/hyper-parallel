@@ -139,8 +139,12 @@ def family_config(**selectors: Any) -> TrainerConfig:
         "model": {"_target_": "tests.common.grouped_experts_family.TinyMoE"},
         "optimizer": {"_target_": "torch.optim.SGD", "lr": 0.01},
         "plan_overrides": [{
-            "match": "mlp.experts", "module_type": "tests.common.grouped_experts_family.PackedExperts",
-            "replace_module": {"_target_": "hyper_parallel.components.modules.GroupedExperts", **selectors},
+            "match": "mlp.experts",
+            "replace": {
+                "kind": "module",
+                "source_type": "tests.common.grouped_experts_family.PackedExperts",
+                "implementation": {"_target_": "hyper_parallel.components.modules.GroupedExperts", **selectors},
+            },
         }],
     })
 

@@ -279,6 +279,8 @@ def main():  # pylint: disable=too-many-locals
 
     # 5. GraphTrainer reuses the automodel mesh (tp group already created);
     #    it registers the dp sub-mesh as "fsdp" and back-fills fsdp_degree.
+    #    TP/SP/LP are NOT PassConfig knobs: they live in the automodel plan
+    #    applied above, and the graph passes never read them.
     tcfg = cfg["train"]
     trainer = GraphTrainer(
         model=model,
@@ -286,9 +288,6 @@ def main():  # pylint: disable=too-many-locals
         pass_config=PassConfig(
             enable_overlap=cfg["parallel"].get("enable_overlap", True),
             fsdp_degree=cfg["parallel"]["dp_size"],
-            tp_size=tp_size,
-            sequence_parallel=sequence_parallel,
-            loss_parallel=loss_parallel,
         ),
         parallel_plan=fsdp_plan,
         optimizer_config={

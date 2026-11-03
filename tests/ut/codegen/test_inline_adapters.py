@@ -30,7 +30,7 @@ from hyper_parallel.codegen import manager
 from hyper_parallel.codegen.inline.ir import (
     ForwardExtractPatch, InlinePatchSet, InlineRule, ModuleSnippetPatch,
 )
-from hyper_parallel.codegen.inline.framework_spec import interface_component_class
+from hyper_parallel.codegen.inline.framework_spec import declaration_summary, interface_component_class
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.codegen.inline.pipeline import render_inline_modeling
@@ -191,7 +191,7 @@ class TestInlineAdapters(unittest.TestCase):
               card_mark="onecard", essential_mark="unessential")
     def test_legacy_and_explicit_qwen_identity(self):
         """The adapter path infers the family; every alias selects the same spec.
-        ``module_type`` is the rule's own declared source type, so it travels
+        ``module_type`` is the compiled rule's source type, so it travels
         with the lookup rather than being reconstructed from the family name.
 
         Feature: structure-driven inline source generation.
@@ -205,8 +205,8 @@ class TestInlineAdapters(unittest.TestCase):
             legacy, replacement_spec(ATTENTION, "Qwen3MoeForCausalLM", module_type=ATTENTION_TYPE)
         )
         self.assertEqual(strategy_spec(EP).target_class, "Qwen3MoeSparseMoeBlock")
-        # A CP wrapper is a strategy *because of its position* in the override
-        # (``inner_wrapper``); the same target as a local compute fn is not one.
+        # A CP wrapper is a strategy when its forward implementation uses the
+        # inner-wrapper executor; the same path is not an EP compute factory.
         self.assertIsNone(strategy_spec(CP))
         self.assertIsNone(strategy_spec(CP, inner_wrapper=True).body_template)
 
@@ -578,8 +578,8 @@ class Model:
                 "overrides": [
                     {
                         "match": "blocks.0.proj",
-                        "module_type": TOY_NORM_TYPE,
-                        "replace_module": {"_target_": TOY_NORM},
+                        "replace": {"kind": "module", "source_type": TOY_NORM_TYPE,
+                                    "implementation": {"_target_": TOY_NORM}},
                     }
                 ],
                 "target": {},
@@ -604,6 +604,26 @@ class Model:
         self.assertNotEqual(
             _signature(_toy_rms_norm_factory), _signature(_toy_grouped_experts_factory)
         )
+
+    def test_declaration_summary_reads_public_replace_actions(self):
+        """Module and forward actions both contribute resolved codegen declarations."""
+        overrides = [
+            {"match": "blocks.0.proj", "replace": {
+                "kind": "module", "source_type": TOY_NORM_TYPE, "implementation": TOY_NORM,
+            }},
+            {"match": "blocks.0.mlp.forward", "replace": {
+                "kind": "method", "implementation": EP,
+            }},
+            {"match": "blocks.0.self_attn.forward", "replace": {
+                "kind": "method", "implementation": CP,
+            }},
+        ]
+        with patch.dict(registry.MODEL_ADAPTER_REGISTRY), patch.dict(registry._FAMILY_ALIASES):
+            registry.register_model_adapter(_toy_adapter(factory=_toy_rms_norm_factory))
+            summary = declaration_summary("toy", overrides)
+        self.assertIn(TOY_NORM, summary["replacement_specs"])
+        self.assertIn(EP, summary["strategy_specs"])
+        self.assertIn(CP, summary["strategy_specs"])
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="onecard", essential_mark="unessential")

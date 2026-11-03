@@ -5,16 +5,24 @@
 # Host table plus SparseAdam moments require approximately 1.1 TiB of CPU memory across eight ranks.
 # Run with run_deepseek_v41_vlm_online_load_hf.sh; baseline saves checkpoints, without resume.
 model:
-  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_hf_layer_cropped_deepseek_v41
-  pretrained_model_name_or_path: /path/to/DeepSeek-V4.1-Flash-BF16
-  text_layers: 2
-  vision_layers: 2
+  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+  config_path: /path/to/DeepSeek-V4.1-Flash-BF16
+  num_hidden_layers: 2
+  text_parameter_divisor: 1
+  enable_vision: true
+  vision_num_hidden_layers: 2
+  vision_parameter_divisor: 1
+  num_routed_experts: 384
+  exercise_post_training_indexer: false
+  enable_candidate_pool: true
+  router_aux_loss_coeff: 0.001
   engram_assets_path: /path/to/generated/engram_assets.json
   engram_storage_backend: host
   load_base_model: true
+  # Verify all loaded shards, including CPU Host Engram, before the first forward.
+  verify_hf_weights: ./output/training_demo/deepseek_v41/hf_weight_check
   torch_dtype: bfloat16
   validate_placement: false
-  local_files_only: true
 model_init_dtype: float32
 training:
   train_iters: 10
@@ -53,42 +61,49 @@ fsdp_config:
   comm_fusion: false
 plan_overrides:
 - match: model.vision.blocks.*.attn
-  module_type: hyper_parallel.models.deepseek_v41.vision.DeepseekV41VisionAttention
-  replace_module:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
 - match:
   - model.layers.*.attn_hc
   - model.layers.*.ffn_hc
-  module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
-  replace_module:
-    _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
 - match: model.layers.*.self_attn
-  module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
-  replace_module:
-    _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
 - match: model.layers.*.engram
-  module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
-  replace_module:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
 - match: model.layers.*.engram
   params:
     q_weight: {tp: replicate}
     k_weight: {tp: replicate}
     embed.weight: {ep: 'shard(0)'}
     wkv.weight: {tp: replicate}
-- match: model.layers.*.engram
+- match: model.layers.*.engram.forward
   when: ep
   region_dispatch: false
-  local_compute_fn:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
 - match: '*.self_attn'
   tp_divide_attrs:
   - num_groups
-- match: '*.self_attn'
+- match: '*.self_attn.forward'
   region_dispatch: false
-  inner_target: self
-  inner_wrapper:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
 - match: model
   params:
     image_start:
@@ -180,12 +195,14 @@ plan_overrides:
       tp: shard(1)
       cp: shard(1)
       ep: replicate
-- match: model.layers.*.mlp
+- match: model.layers.*.mlp.forward
   when: ep
   region_dispatch: false
-  local_compute_fn:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
-    use_grouped_gemm: true
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+      use_grouped_gemm: true
 mixed_precision:
   enabled: false
 activation_checkpoint:
@@ -200,13 +217,15 @@ compile:
   options: {}
   dynamo_cache_size_limit: 256
 dataset:
+  training_mode: sft
   model_assets:
     _target_: hyper_parallel.models.deepseek_v41.adapter.data.processor.build_deepseek_v41_processor
     config_path: /path/to/DeepSeek-V4.1-Flash-BF16
   data_transform:
     _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
     max_seq_len: 4096
-    sequence_alignment: 4
+    sample_format: messages
+    sample_alignment_size: 4
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   data_path: /path/to/train.jsonl
   data_config: {}

@@ -204,15 +204,15 @@ optimizer:
   _target_: torch.optim.AdamW
   lr: 1.0e-3
 plan_overrides:
-  - match: "*.self_attn"
+  - match: "*.self_attn.forward"
     when: cp
-    region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
-      backend: triton
-      state_cp_method: grouped_allgather_p2p
-      allgather_group_size: 2
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        backend: triton
+        state_cp_method: grouped_allgather_p2p
+        allgather_group_size: 2
 """
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "kda_cp.yaml"
@@ -221,17 +221,18 @@ plan_overrides:
 
         self.assertEqual(len(config.plan_overrides), 1)
         entry = config.plan_overrides[0]
+        self.assertNotIn("region_dispatch", entry.to_dict())
         self.assertEqual(entry.when, "cp")
-        self.assertEqual(entry.inner_target, "self")
+        self.assertEqual(entry.to_override()[1].inner_target, "self")
         self.assertFalse(entry.region_dispatch)
-        self.assertEqual(entry.inner_wrapper.backend, "triton")
-        self.assertEqual(entry.inner_wrapper.state_cp_method, "grouped_allgather_p2p")
-        self.assertEqual(entry.inner_wrapper.allgather_group_size, 2)
-        self.assertFalse(hasattr(entry.inner_wrapper, "chunk_size"))
+        self.assertEqual(entry.replace.implementation.backend, "triton")
+        self.assertEqual(entry.replace.implementation.state_cp_method, "grouped_allgather_p2p")
+        self.assertEqual(entry.replace.implementation.allgather_group_size, 2)
+        self.assertFalse(hasattr(entry.replace.implementation, "chunk_size"))
         self.assertEqual(entries_to_plan_overrides([entry], cp_size=1), {})
         active = entries_to_plan_overrides([entry], cp_size=4)
         self.assertEqual(set(active), {"*.self_attn"})
-        self.assertIs(active["*.self_attn"].inner_wrapper, entry.inner_wrapper)
+        self.assertIs(active["*.self_attn"].inner_wrapper, entry.replace.implementation)
 
 
 class TestKimiK3CpWrapperContracts(unittest.TestCase):
@@ -321,13 +322,14 @@ class TestKDACombinedAdapter(unittest.TestCase):
     def test_all_combinations_record_effective_options(self):
         """Feature: Unified KDA CP recipe adapter.
 
-        Description: Construct AG and every two/three-way recipe using metadata-only executors.
+        Description: Construct AG, RD and mixed recipes using metadata-only executors.
         Expectation: The forward rewrite preserves protocol, Ulysses and group-width choices.
         """
         parameters = inspect.signature(adapter_context_parallel.kimi_delta_attention_cp_wrapper).parameters
         self.assertNotIn("chunk_size", parameters)
         cases = [("allgather", 1, 1), ("p2p", 2, 1), ("allgather", 2, 1),
-                 ("grouped_allgather_p2p", 1, 2), ("grouped_allgather_p2p", 2, 2)]
+                 ("grouped_allgather_p2p", 1, 2), ("grouped_allgather_p2p", 2, 2),
+                 ("recursive_doubling", 1, 1), ("recursive_doubling", 2, 1)]
         for protocol, ulysses, width in cases:
             with self.subTest(protocol=protocol, ulysses=ulysses):
                 name = "KimiDeltaAttentionLayerCP"
@@ -402,7 +404,7 @@ class TestKDACombinedAdapter(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     protocol.forward(state, state.double())
                 with self.assertRaises(ValueError):
-                    protocol.backward(state, state[..., :64])
+                    protocol.backward(state, (state[..., :64],))
                 for invalid in (state[:0], torch.empty_like(state, device="meta")):
                     with self.assertRaises(ValueError):
                         protocol.forward(invalid, invalid)

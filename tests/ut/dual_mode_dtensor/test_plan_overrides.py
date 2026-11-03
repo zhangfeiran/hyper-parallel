@@ -31,6 +31,7 @@ from hyper_parallel.distributed.recipe_spec import (
 try:
     from hyper_parallel.trainer.config import (
         PlanOverride,
+        ReplaceAction,
         entries_to_plan_overrides,
     )
     _HAS_TRAINER_CONFIG = True
@@ -943,16 +944,18 @@ def test_yaml_dsl_merge(tiny_llama, make_mesh, caplog):
     case = "desugared_entry_equivalent_to_handwritten"
     plan = ShardingPlanner(
         plan_overrides=entries_to_plan_overrides([
-            PlanOverride(match="*.self_attn", inner_target="self",
-                 inner_wrapper="sdpa_hf"),
+            PlanOverride(match="*.self_attn.forward", replace=ReplaceAction(
+                kind="method", implementation=
+                "hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper")),
         ])).plan(tiny_llama, mesh, tp_size=2)
     spec = plan.modules["model.layers.0.self_attn"]
-    assert spec.inner_wrapper == "sdpa_hf", f"case: {case}"
+    assert spec.inner_wrapper.callable.__name__ == "sdpa_hf_cp_wrapper", f"case: {case}"
     # planner-derived param sharding/contracts untouched (merge inheritance)
     assert spec.params["q_proj.weight"], f"case: {case}"
     assert "hidden_states" in spec.in_dst, f"case: {case}"
     # both layers hit; unhit boundaries unaffected
-    assert plan.modules["model.layers.1.self_attn"].inner_wrapper == "sdpa_hf", f"case: {case}"
+    assert (plan.modules["model.layers.1.self_attn"].inner_wrapper.callable.__name__
+            == "sdpa_hf_cp_wrapper"), f"case: {case}"
     assert plan.modules["lm_head"].inner_wrapper is None, f"case: {case}"
 
     # ── case: desugared_composes_with_handwritten_overrides ──────────────
@@ -974,18 +977,19 @@ def test_yaml_dsl_merge(tiny_llama, make_mesh, caplog):
     planner = ShardingPlanner(plan_overrides={
         "model.layers.0.self_attn": override,
         **entries_to_plan_overrides([
-            PlanOverride(match="*.self_attn", inner_target="self",
-                 inner_wrapper="sdpa_hf"),
+            PlanOverride(match="*.self_attn.forward", replace=ReplaceAction(
+                kind="method", implementation=
+                "hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper")),
         ]),
     })
     plan = planner.plan(tiny_llama, mesh, tp_size=2)
     spec = plan.modules["model.layers.0.self_attn"]
     # user contract takes effect (field-granularity merge replacement) + injection takes effect
     assert spec.in_dst["hidden_states"][TP] == Replicate(), f"case: {case}"
-    assert spec.inner_wrapper == "sdpa_hf", f"case: {case}"
+    assert spec.inner_wrapper.callable.__name__ == "sdpa_hf_cp_wrapper", f"case: {case}"
     # the other layer is a derived spec + glob merge injection
-    assert plan.modules["model.layers.1.self_attn"].inner_wrapper \
-        == "sdpa_hf", f"case: {case}"
+    assert plan.modules["model.layers.1.self_attn"].inner_wrapper.callable.__name__ \
+        == "sdpa_hf_cp_wrapper", f"case: {case}"
 
     # ── case: desugared_glob_miss_warns ──────────────────────────────────
     case = "desugared_glob_miss_warns"
@@ -993,7 +997,9 @@ def test_yaml_dsl_merge(tiny_llama, make_mesh, caplog):
     with caplog.at_level(logging.WARNING):
         ShardingPlanner(
             plan_overrides=entries_to_plan_overrides([
-                PlanOverride(match="*.self_atn", inner_wrapper="sdpa_hf"),
+                PlanOverride(match="*.self_atn.forward", replace=ReplaceAction(
+                    kind="method", implementation=
+                    "hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper")),
             ])).plan(tiny_llama, mesh, tp_size=2)
     assert "hit no boundary spec" in caplog.text, f"case: {case}"
 
@@ -1010,15 +1016,23 @@ def test_plan_override_desugar():
 
     # ── case: to_override_basic ──────────────────────────────────────────
     case = "to_override_basic"
-    entry = PlanOverride(match="*.self_attn", inner_wrapper="sdpa_hf")
+    entry = PlanOverride(match="*.self_attn.forward", replace=ReplaceAction(
+        kind="method", implementation=
+        "hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper"))
     match, spec = entry.to_override()
     assert match == "*.self_attn", f"case: {case}"
-    assert spec.inner_wrapper == "sdpa_hf", f"case: {case}"
+    assert spec.inner_wrapper.callable.__name__ == "sdpa_hf_cp_wrapper", f"case: {case}"
     # unset fields keep spec defaults (treated as "unset" under merge semantics, inheriting derived values)
     assert spec.local_compute_fn is None, f"case: {case}"
-    assert spec.inner_target is None, f"case: {case}"
-    assert spec.region_dispatch is None, f"case: {case}"
+    assert spec.inner_target == "self", f"case: {case}"
+    assert spec.region_dispatch is False, f"case: {case}"
     assert spec.tp_divide_attrs is None, f"case: {case}"
+    assert "region_dispatch" not in entry.to_dict(), f"case: {case}"
+
+    # Sharding-only rules must retain an explicit false during codegen projection.
+    assert PlanOverride(match="*.mlp", region_dispatch=False).to_dict() == {
+        "match": "*.mlp", "region_dispatch": False,
+    }, f"case: {case}"
 
     # ── case: tp_divide_attrs_desugar ────────────────────────────────────
     case = "tp_divide_attrs_desugar"
@@ -1036,29 +1050,8 @@ def test_plan_override_desugar():
                 match="*.self_attn", tp_divide_attrs=attrs,
             ).to_override()
 
-    # ── case: inner_out_src_desugar ──────────────────────────────────────
-    # inner_out_src desugaring: sentinel / single-output DSL / multi-output DSL / illegal value.
-    case = "inner_out_src_desugar"
-    _, spec = PlanOverride(
-        match="*.self_attn", inner_out_src="first_input").to_override()
-    assert spec.inner_out_src == "first_input", f"case: {case}"
-
-    _, spec = PlanOverride(
-        match="m", inner_out_src={"cp": "shard(2)"}).to_override()
-    assert spec.inner_out_src["cp"] == Shard(2), f"case: {case}"
-
-    _, spec = PlanOverride(match="m", inner_out_src={
-        "hidden": {"cp": "shard(2)"},
-        "aux": {"tp": "partial"},
-    }).to_override()
-    assert spec.inner_out_src["hidden"]["cp"] == Shard(2), f"case: {case}"
-    assert spec.inner_out_src["aux"]["tp"] == Partial(), f"case: {case}"
-
-    with pytest.raises(ValueError, match="first_input"):
-        PlanOverride(match="m", inner_out_src="bogus").to_override()
-
     # ── case: to_override_missing_match_raises ───────────────────────────
-    entry = PlanOverride(match="", inner_wrapper="sdpa_hf")
+    entry = PlanOverride(match="")
     with pytest.raises(ValueError, match="match"):
         entry.to_override()
 
@@ -1067,7 +1060,9 @@ def test_plan_override_desugar():
     case = "to_plan_overrides_merges_same_match"
     overrides = entries_to_plan_overrides([
         PlanOverride(match="*.mlp", region_dispatch=False),
-        PlanOverride(match="*.mlp", inner_target="self"),
+        PlanOverride(match="*.mlp.forward", replace=ReplaceAction(
+            kind="method", implementation=
+            "hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper")),
     ])
     assert set(overrides) == {"*.mlp"}, f"case: {case}"
     spec = overrides["*.mlp"]
@@ -1081,7 +1076,7 @@ def test_plan_override_desugar():
         when="sequence_parallel",
         params={"weight": {"tp": "replicate"}},
     )
-    assert entries_to_plan_overrides([entry]) == {}, f"case: {case}"
+    assert not entries_to_plan_overrides([entry]), f"case: {case}"
     overrides = entries_to_plan_overrides(
         [entry], sequence_parallel=True
     )
@@ -1248,7 +1243,7 @@ def test_preflight_fail_fast(tiny_llama, tiny_hf_native_moe, tiny_moe,
     # cp>1 + attention boundary without inner_wrapper -> fail-fast before apply.
     mesh_cp = _meta_mesh((2,), ("cp",))
     plan = ShardingPlanner().plan(tiny_llama, mesh_cp, cp_size=2)
-    with pytest.raises(ValueError, match="inner_wrapper"):
+    with pytest.raises(ValueError, match="kind: method"):
         apply_sharding_plan(tiny_llama, plan, mesh_cp)
 
     # ── case: cp_with_injection_passes_preflight ─────────────────────────
@@ -1295,7 +1290,7 @@ def test_preflight_fail_fast(tiny_llama, tiny_hf_native_moe, tiny_moe,
     mesh_ep = _meta_mesh((4, 2), ("dp", "tp"))
     plan = ShardingPlanner().plan(
         tiny_hf_native_moe, mesh_ep, tp_size=2, ep_size=2)
-    with pytest.raises(ValueError, match="local_compute_fn"):
+    with pytest.raises(ValueError, match="kind: method"):
         apply_sharding_plan(tiny_hf_native_moe, plan, mesh_ep)
 
     # ── case: ep_with_injection_passes_preflight ─────────────────────────
@@ -1320,5 +1315,5 @@ def test_preflight_fail_fast(tiny_llama, tiny_hf_native_moe, tiny_moe,
     with pytest.raises(ValueError) as exc:
         apply_sharding_plan(tiny_hf_native_moe, plan, mesh_ep)
     msg = str(exc.value)
-    assert "recipes.qwen2moe_ep_compute_fn" in msg, f"case: {case}"
+    assert "kind: method" in msg, f"case: {case}"
     assert "region_dispatch" in msg, f"case: {case}"

@@ -126,6 +126,109 @@ class TestMegaMoeRoute(unittest.TestCase):
         callback.assert_not_called()
         permute.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_staged_pull_publishes_only_after_capacity_agreement(self) -> None:
+        """Feature: Automatic MegaMoe route workspace reuse.
+
+        Description: Ordinary permutation may overlap agreement while SHMEM writes use the committed allocation.
+        Expectation: The old source stays untouched and publication uses the newly committed allocation.
+        """
+        spec = replace(self._spec(ep_size=2), auto_tokens=True, dispatch_mode="pull")
+        hidden = torch.randn(257, 4)
+        ids = torch.tensor([[0, 1]] * 257, dtype=torch.int32)
+        wire = torch.tensor([[0, 257, 15, 257, 257, 0, 0], [0, 0, 15, 0, 0, 0, 0]])
+        old_buffer = torch.zeros(1, 4)
+        workspace = SimpleNamespace(in_use=False, source_buffer=old_buffer, route_cache=None,
+                                    route_header_cache=None)
+        order = []
+        staged = hidden.repeat_interleave(2, dim=0)
+        original_publish = route_module._publish_staged_pull
+
+        def gather(output: torch.Tensor, value: torch.Tensor, **_kwargs: object) -> Mock:
+            """Complete agreement after ordinary-memory permutation was submitted."""
+            output.copy_(wire.flatten())
+            return Mock(wait=lambda: order.append("wait"))
+
+        def stage(*_args: object) -> tuple:
+            """Keep the old SHMEM allocation untouched before agreement."""
+            self.assertEqual(order, [])
+            self.assertFalse(workspace.in_use)
+            order.append("stage")
+            return staged, torch.arange(514, dtype=torch.int32)
+
+        def grow(tokens: int, received: int) -> None:
+            """Replace the undersized allocation after collective validation."""
+            self.assertEqual(order, ["stage", "wait"])
+            self.assertEqual((tokens, received), (384, 514))
+            workspace.source_buffer = torch.empty(tokens * 2, 4)
+            workspace.in_use = True
+            order.append("grow")
+
+        def publish(*args: object) -> tuple:
+            """Copy into the newly committed source buffer with its lease held."""
+            self.assertEqual(order, ["stage", "wait", "grow"])
+            order.append("publish")
+            return original_publish(*args)
+
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather),
+              patch.object(route_module, "_can_stage_pull", return_value=True),
+              patch.object(route_module, "_permute_topk_input", side_effect=stage),
+              patch.object(route_module, "_permute_topk_input_out") as direct,
+              patch.object(route_module, "_publish_staged_pull", side_effect=publish)):
+            prepared = prepare_topk_route(hidden, ids, torch.ones(257, 2), spec, None, workspace,
+                                          autograd_mask=15, prepare_workspace=grow)
+        self.assertEqual(order, ["stage", "wait", "grow", "publish"])
+        direct.assert_not_called()
+        self.assertEqual(prepared.routed_tokens.data_ptr(), workspace.source_buffer.data_ptr())
+        torch.testing.assert_close(prepared.routed_tokens, staged, rtol=0, atol=0)
+        torch.testing.assert_close(old_buffer, torch.zeros_like(old_buffer), rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_small_pull_staging_keeps_collective_rejection_ahead_of_publication(self) -> None:
+        """Feature: Automatic MegaMoe route workspace reuse.
+
+        Description: A failing peer may discard ordinary staging but must never publish to SHMEM.
+        Expectation: A bad peer prevents capacity changes and every SHMEM publication.
+        """
+        spec = replace(self._spec(ep_size=2), auto_tokens=True, dispatch_mode="pull")
+        hidden, ids = torch.ones(1, 4), torch.tensor([[0, 1]], dtype=torch.int32)
+        wire = torch.tensor([[0, 1, 15, 1, 1, 0, 0], [0, 1, 0, 1, 1, 0, 0]])
+
+        def gather(output: torch.Tensor, value: torch.Tensor, **_kwargs: object) -> Mock:
+            """Inject an incompatible peer mask through the real wire-validation path."""
+            output.copy_(wire.flatten())
+            return Mock()
+
+        grow = Mock()
+        workspace = SimpleNamespace(in_use=False, source_buffer=None, route_header_cache=None)
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather),
+              patch.object(route_module, "_can_stage_pull", return_value=True),
+              patch.object(route_module, "_permute_topk_input", return_value=(hidden, ids.flatten())) as stage,
+              patch.object(route_module, "_publish_staged_pull") as publish,
+              self.assertRaisesRegex(RuntimeError, "autograd participation")):
+            prepare_topk_route(hidden, ids, torch.ones(1, 2), spec, None, workspace,
+                               autograd_mask=15, prepare_workspace=grow)
+        stage.assert_called_once()
+        grow.assert_not_called()
+        publish.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_pull_staging_is_limited_by_actual_tensor_bytes(self) -> None:
+        """Feature: Automatic MegaMoe route workspace reuse.
+
+        Description: Limit temporary Top-K expansion by bytes across hidden sizes and token counts.
+        Expectation: Only automatic NPU Pull inputs within the byte budget use staging.
+        """
+        spec = replace(self._spec(ep_size=2), auto_tokens=True, dispatch_mode="pull", top_k=8)
+        for tokens, expected in ((256, True), (512, True), (1024, False), (4096, False)):
+            tensor = SimpleNamespace(device=SimpleNamespace(type="npu"), numel=lambda tokens=tokens: tokens * 5120,
+                                     element_size=lambda: 2)
+            with self.subTest(tokens=tokens):
+                self.assertEqual(route_module._can_stage_pull(tensor, spec), expected)
+
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -181,9 +284,9 @@ class TestMegaMoeRoute(unittest.TestCase):
         hidden = torch.empty(0, 4, requires_grad=True)
         ids = torch.empty(0, 2, dtype=torch.int32)
         weights = torch.empty(0, 2, requires_grad=True)
-        with patch.object(route_module.torch_npu, "npu_moe_token_permute") as permute:
+        with patch.object(route_module, "load_torch_npu") as backend:
             route = prepare_topk_route(hidden, ids, weights, spec, None, autograd_mask=15)
-        permute.assert_not_called()
+        backend.assert_not_called()
         self.assertEqual(route.routed_tokens.shape[0], 0)
         self.assertEqual(route.metadata.expert_capacity, 1)
         self.assertEqual(route.metadata.plan_tokens, 128)
@@ -726,7 +829,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         Description: Cross table sizes, integer widths, transports and empty-source ranks.
         Expectation: Every policy preserves exact destination loads and aligned schedules.
         """
-        for experts in (24, 256, 260, 1024):
+        for experts in (24, 256, 260, 512, 1024, 2048):
             for dtype in (torch.int32, torch.int64):
                 payload = self._payload(experts, dtype)
                 for rank in range(4):
@@ -745,8 +848,8 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         Description: Prohibit raw readback for a count matrix above the Host policy limit.
         Expectation: Device reduction reads back a compact summary with the same results.
         """
-        payload = self._payload(1024, torch.int64)
-        spec = self._spec(1024)
+        payload = self._payload(2048, torch.int64)
+        spec = self._spec(2048)
         expected = self._reference(payload, spec)
         original = torch.Tensor.tolist
 
@@ -768,7 +871,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         Description: Inject native overflow, mixed gradients and invalid histogram values.
         Expectation: Small and large tables reject invalid metadata on every rank.
         """
-        for experts in (24, 1024):
+        for experts in (24, 2048):
             valid = self._payload(experts, torch.int64)
             for column, value, message in ((0, 1, "INT32"), (2, 0, "autograd participation"), (3, -1, "counts")):
                 invalid = valid.clone()
@@ -793,7 +896,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         Description: Compare every field across empty sources, uneven counts and both transports.
         Expectation: INT64 offsets, INT32 sizes and cumulative expert loads match tensor scans exactly.
         """
-        for ep in (1, 2, 4, 8):
+        for ep in (1, 2, 4, 8, 16):
             for dtype in (torch.int32, torch.int64):
                 for local in (2, 6, 64):
                     experts = ep * local
@@ -811,13 +914,305 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                                 for field, value in vars(expected).items():
                                     observed = getattr(actual, field)
                                     if isinstance(value, torch.Tensor):
-                                        self.assertEqual(value.dtype, torch.int32 if field.endswith("size") else torch.int64)
+                                        expected_dtype = torch.int32 if field.endswith("size") else torch.int64
+                                        self.assertEqual(value.dtype, expected_dtype)
                                         torch.testing.assert_close(observed, value, rtol=0, atol=0)
                                         self.assertTrue(observed.is_contiguous())
                                         offset = observed.data_ptr() - observed.untyped_storage().data_ptr()
                                         self.assertEqual(offset % 512, 0)
                                     else:
                                         self.assertEqual(observed, value)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_cached_routes_reuse_descriptors_but_permute_current_ids(self) -> None:
+        """Feature: Automatic MegaMoe route workspace reuse.
+
+        Description: Reuse metadata for unchanged histograms while consuming each call's token assignments.
+        Expectation: Identical tables reuse descriptors, changed tables replace them, and token mappings stay
+        current.
+        """
+        for mode in ("push", "pull"):
+            for experts in (24, 384):
+                with self.subTest(mode=mode, experts=experts):
+                    self._check_cached_route_permutations(mode, experts)
+
+    def _check_cached_route_permutations(self, mode: str, experts: int) -> None:
+        """Exercise descriptor hits and replacement with an independent tensor-prefix oracle."""
+        spec = replace(self._spec(experts, rank=1), dispatch_mode=mode)
+        hidden = torch.ones(1, 16)
+        ids = torch.tensor([[3, 4]], dtype=torch.int32)
+        probabilities = torch.ones(1, 2)
+        payload = self._payload(experts, torch.int32)
+        workspace = SimpleNamespace(route_cache=None, in_use=True, source_buffer=torch.empty(1024, 16),
+                                    wait_for_reuse=lambda: None)
+        observed_ids = []
+
+        def gather(output: torch.Tensor, value: torch.Tensor, **_kwargs: object) -> Mock:
+            """Return all peers' current counts without a real process group."""
+            output.copy_(payload.flatten())
+            return Mock()
+
+        def permute(hidden_states: torch.Tensor, current_ids: torch.Tensor, *_args: object) -> tuple:
+            """Retain evidence that token order is never replaced by a cached permutation."""
+            observed_ids.append(current_ids.clone())
+            return hidden_states.repeat_interleave(2, dim=0), torch.arange(2, dtype=torch.int32)
+
+        grow = Mock()
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
+              patch.object(route_module, "_permute_topk_input", side_effect=permute),
+              patch.object(route_module, "_permute_topk_input_out", side_effect=permute),
+              patch.object(route_module, "_dynamic_route_metadata", wraps=route_module._dynamic_route_metadata) as build,
+              patch.object(route_module, "_host_route_metadata", wraps=route_module._host_route_metadata) as host_build,
+              patch.object(route_module, "_compute_route_metadata", wraps=route_module._compute_route_metadata)
+              as device_build):
+            first = prepare_topk_route(hidden, ids, probabilities, spec, None, workspace,
+                                       autograd_mask=31, prepare_workspace=grow)
+            first_fields = {key: value.clone() for key, value in vars(first.metadata).items()
+                            if isinstance(value, torch.Tensor)}
+            second = prepare_topk_route(hidden, ids.flip(1), probabilities, spec, None, workspace,
+                                        autograd_mask=31, prepare_workspace=grow)
+            self.assertEqual(build.call_count, 2)
+            self.assertNotEqual(first.metadata.dispatch_src_off.data_ptr(),
+                                second.metadata.dispatch_src_off.data_ptr())
+            again = prepare_topk_route(hidden, ids, probabilities, spec, None, workspace,
+                                       autograd_mask=31, prepare_workspace=grow)
+            self.assertEqual(build.call_count, 2)
+            self.assertEqual(second.metadata.dispatch_src_off.data_ptr(),
+                             again.metadata.dispatch_src_off.data_ptr())
+            changed_ids = torch.tensor([[4, 5]], dtype=torch.int32)
+            payload[1, 3:] = torch.bincount(changed_ids.flatten().long(), minlength=experts).to(torch.int32)
+            third = prepare_topk_route(hidden, changed_ids, probabilities, spec, None, workspace,
+                                       autograd_mask=31, prepare_workspace=grow)
+            self.assertEqual(build.call_count, 3)
+            self.assertEqual(exchange.call_count, 4)
+            self.assertEqual(grow.call_count, 4)
+            host_policy = spec.ep_size * experts <= route_module._HOST_DESCRIPTOR_MAX_COUNTS
+            self.assertEqual(host_build.call_count, 3 if host_policy else 0)
+            self.assertEqual(device_build.call_count, 0 if host_policy else 3)
+        for observed, expected in zip(observed_ids, (ids, ids.flip(1), ids, changed_ids)):
+            torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+        counts = payload[:, 3:]
+        start = spec.rank_id * spec.local_experts
+        received = counts[:, start:start + spec.local_experts].contiguous()
+        expected = route_module._compute_route_metadata(counts[1], counts, received, spec,
+                                                        third.metadata.expert_capacity)
+        for key, value in vars(expected).items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(getattr(third.metadata, key), value, rtol=0, atol=0)
+                torch.testing.assert_close(getattr(first.metadata, key), first_fields[key], rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_cached_pull_still_rejects_changed_peer_before_workspace_write(self) -> None:
+        """Feature: Automatic MegaMoe route workspace reuse.
+
+        Description: A previous valid descriptor must not hide new peer participation failures.
+        Expectation: A previously cached route cannot bypass fresh peer validation.
+        """
+        spec = replace(self._spec(24, rank=1), dispatch_mode="pull")
+        payload = self._payload(24, torch.int32)
+        hidden, ids = torch.ones(1, 16), torch.tensor([[3, 4]], dtype=torch.int32)
+        workspace = SimpleNamespace(route_cache=None, in_use=True, source_buffer=torch.empty(1024, 16))
+        grow, permute = Mock(), Mock(return_value=(hidden.repeat_interleave(2, dim=0), torch.arange(2)))
+
+        def gather(output: torch.Tensor, value: torch.Tensor, **_kwargs: object) -> Mock:
+            """Supply valid and invalid wire tables in consecutive calls."""
+            output.copy_(payload.flatten())
+            return Mock()
+
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather),
+              patch.object(route_module, "_permute_topk_input_out", permute)):
+            prepare_topk_route(hidden, ids, torch.ones(1, 2), spec, None, workspace,
+                               autograd_mask=31, prepare_workspace=grow)
+            previous = workspace.route_cache
+            payload[2, 2] = 0
+            grow.reset_mock()
+            permute.reset_mock()
+            with self.assertRaisesRegex(RuntimeError, "autograd participation"):
+                prepare_topk_route(hidden, ids, torch.ones(1, 2), spec, None, workspace,
+                                   autograd_mask=31, prepare_workspace=grow)
+            grow.assert_not_called()
+            permute.assert_not_called()
+            self.assertIs(workspace.route_cache, previous)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_cached_descriptors_wait_and_retain_storage_on_another_stream(self) -> None:
+        """Feature: Automatic MegaMoe route workspace reuse.
+
+        Description: A consumer stream must wait for upload and retain the shared descriptor allocation.
+        Expectation: A different consumer waits for upload and retains both cached allocations.
+        """
+        order = []
+        producer, consumer, ready = Mock(), Mock(), Mock()
+        consumer.wait_event.side_effect = lambda _event: order.append("wait")
+        tensors = [Mock(spec=torch.Tensor, record_stream=Mock(side_effect=lambda _stream: order.append("record")))
+                   for _ in range(7)]
+        metadata = SimpleNamespace(**{f"field{index}": tensor for index, tensor in enumerate(tensors)}, capacity=1)
+        cached = route_module._HostRouteCache((), [], (1, 128, 1), metadata, producer, ready)
+        with patch.object(torch, "npu", create=True) as mock_npu:
+            mock_npu.current_stream.return_value = consumer
+            cached.wait("npu:0")
+        expected_order = ["wait"] + ["record"] * len(tensors)
+        self.assertEqual(order, expected_order)
+        consumer.wait_event.assert_called_once_with(ready)
+        for tensor in tensors:
+            tensor.record_stream.assert_called_once_with(consumer)
+        with patch.object(torch, "npu", create=True) as mock_npu:
+            mock_npu.current_stream.return_value = producer
+            cached.wait("npu:0")
+        self.assertEqual(order, expected_order)
+        tensor = tensors[0]
+        header = route_module._RouteHeaderCache((), tensor, producer, ready)
+        order.clear()
+        with patch.object(torch, "npu", create=True) as mock_npu:
+            mock_npu.current_stream.return_value = consumer
+            header.wait("npu:0")
+        self.assertEqual(order, ["wait", "record"])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_dynamic_headers_reuse_immutable_storage_and_track_mask_changes(self) -> None:
+        """Feature: Automatic MegaMoe route workspace reuse.
+
+        Description: Control headers must update on shape or gradient-policy changes without mutating an in-flight
+        header.
+        Expectation: Identical keys reuse storage while token and mask changes allocate a new immutable header.
+        """
+        workspace = SimpleNamespace(route_header_cache=None)
+        with patch.object(route_module, "_upload_route_tensor", wraps=route_module._upload_route_tensor) as upload:
+            first = route_module._dynamic_header((0, 129, 31), torch.int32, "cpu", workspace)
+            again = route_module._dynamic_header((0, 129, 31), torch.int32, "cpu", workspace)
+            self.assertIsNot(again, first)
+            confirmed = route_module._dynamic_header((0, 129, 31), torch.int32, "cpu", workspace)
+            self.assertIs(confirmed, again)
+            self.assertEqual(upload.call_count, 2)
+            changed = route_module._dynamic_header((0, 129, 15), torch.int32, "cpu", workspace)
+            resized = route_module._dynamic_header((0, 257, 15), torch.int32, "cpu", workspace)
+            self.assertEqual(upload.call_count, 4)
+        torch.testing.assert_close(first, torch.tensor([0, 129, 31], dtype=torch.int32), rtol=0, atol=0)
+        torch.testing.assert_close(changed, torch.tensor([0, 129, 15], dtype=torch.int32), rtol=0, atol=0)
+        torch.testing.assert_close(resized, torch.tensor([0, 257, 15], dtype=torch.int32), rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_changed_tables_do_not_create_descriptor_cache_events(self) -> None:
+        """Feature: Automatic MegaMoe descriptor cache admission.
+
+        Description: Continuously changed tables must not pay for unused device cache readiness events.
+        Expectation: Only the first repeated table retains descriptors and records one readiness event.
+        """
+        spec = self._spec()
+        raw = self._payload(24, torch.int32).tolist()
+        changed = [row.copy() for row in raw]
+        changed[1][3 + 3] -= 1
+        changed[1][3 + 5] += 1
+        metadata = route_module._host_route_metadata(raw, spec, 128, torch.device("cpu"))
+        changed_metadata = route_module._host_route_metadata(changed, spec, 128, torch.device("cpu"))
+        workspace = SimpleNamespace(route_cache=None)
+        producer, ready = Mock(), Mock()
+        with (patch.object(torch, "npu", create=True) as mock_npu,
+              patch.object(torch, "device", return_value=SimpleNamespace(type="npu", index=0))):
+            current, event = mock_npu.current_stream, mock_npu.Event
+            current.return_value, event.return_value = producer, ready
+            route_module._cache_host_route(workspace, spec, raw, (1, 128, 1), metadata, "npu:0")
+            self.assertIsNone(workspace.route_cache.metadata)
+            route_module._cache_host_route(workspace, spec, changed, (1, 128, 1), changed_metadata, "npu:0")
+            self.assertIsNone(workspace.route_cache.metadata)
+            current.assert_not_called()
+            event.assert_not_called()
+            route_module._cache_host_route(workspace, spec, changed, (1, 128, 1), changed_metadata, "npu:0")
+            self.assertIs(workspace.route_cache.metadata, changed_metadata)
+            current.assert_called_once()
+            event.assert_called_once()
+            ready.record.assert_called_once_with(producer)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_changed_headers_do_not_create_unused_readiness_events(self) -> None:
+        """Feature: Automatic MegaMoe control header cache admission.
+
+        Description: New token lengths upload headers without recording events for unconfirmed reuse.
+        Expectation: A repeated header records one event and subsequent identical headers reuse its tensor.
+        """
+        workspace = SimpleNamespace(route_header_cache=None)
+        producer, ready = Mock(), Mock()
+        with (patch.object(route_module, "_upload_route_tensor", side_effect=lambda value, _device: value) as upload,
+              patch.object(torch, "npu", create=True) as mock_npu,
+              patch.object(torch, "device", return_value=SimpleNamespace(type="npu", index=0))):
+            current, event = mock_npu.current_stream, mock_npu.Event
+            current.return_value, event.return_value = producer, ready
+            route_module._dynamic_header((0, 129, 31), torch.int32, "npu:0", workspace)
+            self.assertIsNone(workspace.route_header_cache.tensor)
+            route_module._dynamic_header((0, 257, 31), torch.int32, "npu:0", workspace)
+            self.assertIsNone(workspace.route_header_cache.tensor)
+            current.assert_not_called()
+            event.assert_not_called()
+            confirmed = route_module._dynamic_header((0, 257, 31), torch.int32, "npu:0", workspace)
+            again = route_module._dynamic_header((0, 257, 31), torch.int32, "npu:0", workspace)
+            self.assertIs(confirmed, again)
+            self.assertEqual(upload.call_count, 3)
+            self.assertEqual(current.call_count, 2)
+            event.assert_called_once()
+            ready.record.assert_called_once_with(producer)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_cached_device_dispatch_sizes_own_their_count_snapshot(self) -> None:
+        """Feature: Automatic MegaMoe cached descriptor ownership.
+
+        Description: A Router may reuse its count buffer after earlier invocations have completed.
+        Expectation: Cached dispatch sizes remain equal to the gathered snapshot after caller mutation.
+        """
+        spec = self._spec(384, rank=1)
+        payload = self._payload(384, torch.int32)
+        summary, raw, _ = route_module._read_dynamic_route(payload, spec)
+        supplied = payload[spec.rank_id, 3:].clone()
+        workspace = SimpleNamespace(route_cache=None)
+        for _ in range(2):
+            metadata = route_module._dynamic_route_metadata(supplied, payload, raw, spec, summary[0])
+            route_module._cache_host_route(workspace, spec, raw, summary, metadata, "cpu")
+        self.assertIsNotNone(workspace.route_cache.metadata)
+        supplied.zero_()
+        _, _, cached = route_module._read_cached_route(payload, spec, workspace, "cpu")
+        self.assertIsNotNone(cached)
+        torch.testing.assert_close(cached.dispatch_size, payload[spec.rank_id, 3:], rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_changing_wide_tables_back_off_and_recover_on_repeated_counts(self) -> None:
+        """Feature: Automatic MegaMoe route cache reprobing.
+
+        Description: Changing wide tables temporarily use device summaries without reading the full Host table.
+        Expectation: Eight fallback calls preserve validation, then repeated counts recover immutable descriptors.
+        """
+        spec = self._spec(384, rank=1)
+        payload = self._payload(384, torch.int32)
+        workspace = SimpleNamespace(route_cache=None, route_cache_probe_after=0)
+        summary, raw, _ = route_module._read_cached_route(payload, spec, workspace, "cpu")
+        metadata = route_module._dynamic_route_metadata(payload[1, 3:], payload, raw, spec, summary[0])
+        route_module._cache_host_route(workspace, spec, raw, summary, metadata, "cpu")
+        payload[1, 3 + 3] -= 1
+        payload[1, 3 + 5] += 1
+        changed, raw, _ = route_module._read_cached_route(payload, spec, workspace, "cpu")
+        metadata = route_module._dynamic_route_metadata(payload[1, 3:], payload, raw, spec, changed[0])
+        route_module._cache_host_route(workspace, spec, raw, changed, metadata, "cpu")
+        self.assertEqual(workspace.route_cache_probe_after, route_module._ROUTE_CACHE_REPROBE_STEPS)
+        with (patch.object(payload, "tolist", side_effect=AssertionError("unexpected full Host table read")),
+              patch.object(route_module, "_dynamic_summary", wraps=route_module._dynamic_summary) as device_summary):
+            for remaining in range(route_module._ROUTE_CACHE_REPROBE_STEPS - 1, -1, -1):
+                observed, host, cached = route_module._read_cached_route(payload, spec, workspace, "cpu")
+                self.assertEqual(observed, changed)
+                self.assertIsNone(host)
+                self.assertIsNone(cached)
+                self.assertEqual(workspace.route_cache_probe_after, remaining)
+            self.assertEqual(device_summary.call_count, route_module._ROUTE_CACHE_REPROBE_STEPS)
+        _, raw, cached = route_module._read_cached_route(payload, spec, workspace, "cpu")
+        self.assertIsNone(cached)
+        route_module._cache_host_route(workspace, spec, raw, changed, metadata, "cpu")
+        _, _, cached = route_module._read_cached_route(payload, spec, workspace, "cpu")
+        self.assertIs(cached, metadata)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

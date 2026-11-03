@@ -74,9 +74,19 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         self.assertEqual(base.untyped_storage().nbytes(), 16)
         self.assertEqual(workspace.expert_capacity, 512)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_pending_backward_prevents_close_without_changing_buffers(self) -> None:
-        """An outstanding graph must release its claim before symmetric memory teardown."""
+        """Feature: Automatic MegaMoe route workspace reuse.
+
+        Description: An outstanding graph must release its claim before symmetric memory teardown.
+        Expectation: Pending ownership preserves caches and a successful close releases them.
+        """
         workspace = workspace_module.MegaMoeWorkspace(shared=False)
+        cached_route, cached_header = object(), object()
+        workspace.route_cache = cached_route
+        workspace.route_header_cache = cached_header
+        workspace.route_cache_probe_after = 7
         context = Mock()
         workspace.track_graph(context)
         self.assertFalse(workspace.can_close())
@@ -89,6 +99,9 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             workspace.close()
         exchange.assert_not_called()
         self.assertFalse(workspace.closing)
+        self.assertIs(workspace.route_cache, cached_route)
+        self.assertIs(workspace.route_header_cache, cached_header)
+        self.assertEqual(workspace.route_cache_probe_after, 7)
         workspace.heap_manager = SimpleNamespace(root_group=None, access=nullcontext)
         with (
             patch.object(workspace_module._collective.dist, "is_initialized", return_value=False),
@@ -97,6 +110,9 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             workspace.close()
         gather.assert_not_called()
         self.assertTrue(workspace.closing)
+        self.assertIsNone(workspace.route_cache)
+        self.assertIsNone(workspace.route_header_cache)
+        self.assertEqual(workspace.route_cache_probe_after, 0)
 
     def test_partial_replica_teardown_rejects_mismatched_ranks_before_free(self) -> None:
         """An inbox surviving only on one rank cannot enter a collective free."""
@@ -259,8 +275,13 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             self.assertIsNone(workspace.replica_provider)
             self.assertIsNone(workspace.replica_inbox)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
-        """Retain expanded event storage when allocating through the SHMEM API."""
+        """Feature: Dynamic event allocation.
+        Description: Allocate and reuse event storage through the SHMEM API.
+        Expectation: Preserve dynamic counters and ready tails without reallocating.
+        """
         spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
                                ep_size=64, num_experts=1024, dispatch_mode="push", replica_slots_per_rank=0)
         workspace = MegaMoeWorkspace(shared=True)
@@ -268,7 +289,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
                 shape, dtype=kw["dtype"],
             )) as allocate,
-            patch.object(workspace_module.torch.npu, "Event"),
+            patch.object(workspace_module.torch, "npu", create=True),
         ):
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
@@ -281,28 +302,27 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         self.assertEqual(workspace.gmm_workspace.numel(), 512)
         self.assertEqual(workspace.swiglu_grad_workspace.numel(), 512)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_reuse_waits_with_event_without_host_synchronize(self) -> None:
-        """Order serial reuse across streams without blocking the CPU."""
+        """Feature: Cross-stream workspace reuse.
+        Description: Claim and release a workspace with a pending completion event.
+        Expectation: Wait and record on the current stream without synchronizing the host.
+        """
         workspace = MegaMoeWorkspace(shared=True)
         completion_event = Mock()
         current_stream = Mock()
         workspace.completion_event = completion_event
         workspace.used = True
 
-        with (
-            patch.object(
-                workspace_module.torch.npu,
-                "current_stream",
-                return_value=current_stream,
-            ),
-            patch.object(workspace_module.torch.npu, "synchronize") as mock_synchronize,
-        ):
+        with patch.object(workspace_module.torch, "npu", create=True) as mock_npu:
+            mock_npu.current_stream.return_value = current_stream
             workspace.claim()
             workspace.release()
 
         current_stream.wait_event.assert_called_once_with(completion_event)
         completion_event.record.assert_called_once_with(current_stream)
-        mock_synchronize.assert_not_called()
+        mock_npu.synchronize.assert_not_called()
 
 
 class TestReadyEventWorkspace(unittest.TestCase):
@@ -339,12 +359,18 @@ class TestReadyEventWorkspace(unittest.TestCase):
         self.assertEqual(torch.count_nonzero(workspace.forward_event_counters).item(), 0)
         mock_barrier.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_reuse_wait_precedes_claim_without_consuming_lease(self) -> None:
-        """A pre-collective wait keeps the release marker valid for claim."""
+        """Feature: Workspace lease ordering.
+        Description: Wait before claiming a previously used workspace.
+        Expectation: Preserve the release marker and wait again when claiming.
+        """
         workspace = MegaMoeWorkspace(shared=True)
         workspace.completion_event = Mock()
         stream = Mock()
-        with patch.object(workspace_module.torch.npu, "current_stream", return_value=stream):
+        with patch.object(workspace_module.torch, "npu", create=True) as mock_npu:
+            mock_npu.current_stream.return_value = stream
             workspace.wait_for_reuse()
             stream.wait_event.assert_not_called()
             workspace.used = True

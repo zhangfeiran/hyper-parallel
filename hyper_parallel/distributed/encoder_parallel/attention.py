@@ -16,9 +16,9 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterator, Mapping
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
@@ -83,3 +83,16 @@ def activate_encoder_attention(context: EncoderAttentionContext) -> Iterator[Enc
         yield context
     finally:
         _ACTIVE_CONTEXT.reset(token)
+
+
+def encoder_attention_checkpoint_contexts() -> tuple[AbstractContextManager, AbstractContextManager]:
+    """Retain one forward's Encoder-CP metadata for checkpoint replay.
+
+    Each checkpoint invocation owns its replay audit. Recomputing an earlier
+    microbatch must neither use a later batch's segments nor change its audit.
+    """
+    context = current_encoder_attention_context()
+    if context is None:
+        return nullcontext(), nullcontext()
+    replay = replace(context, seen={})
+    return nullcontext(), activate_encoder_attention(replay)

@@ -189,6 +189,9 @@ class GraphCompiler:
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
         pass_kwargs = self._build_pass_kwargs()
+        # Terminal backend compilation (InductorPass) sizes its regions from
+        # the tracer's fake example inputs; every other pass ignores them.
+        pass_kwargs["example_inputs"] = joint_graph.example_inputs
 
         # Passes mutate ``graph_module`` in place and return it, so the
         # transformed graph lives on ``joint_graph`` for ``forward_backward``.
@@ -269,7 +272,6 @@ class GraphCompiler:
             self._init_expert_dp(mesh_context)
             return
 
-        self._require_pure_dp_fallback()
         device_type = self._mesh_device_type()
         world_size = dist.get_world_size()
         rank_list = tuple(range(world_size))
@@ -465,25 +467,6 @@ class GraphCompiler:
         if hasattr(torch, "npu") and torch.npu.is_available():
             return "npu"
         return "cpu"
-
-    def _require_pure_dp_fallback(self) -> None:
-        """Reject TP topologies for the self-built DP mesh.
-
-        The fallback mesh spans the whole world; with a TP axis it would
-        shard/reduce across the wrong ranks. TP topologies must supply an
-        automodel ``MeshContext`` (which carries the proper DP sub-mesh). PP
-        is handled by ``_init_pp_dp_mesh`` before this guard is reached.
-
-        Raises:
-            ValueError: When ``tp_size != 1``.
-        """
-        cfg = self.pass_config
-        if cfg.tp_size != 1:
-            raise ValueError(
-                "Graph-mode DP without a MeshContext only supports pure data "
-                f"parallelism (tp_size=1); got tp_size={cfg.tp_size}. Pass a "
-                "MeshContext carrying the DP sub-mesh for TP hybrids."
-            )
 
     def _init_mesh_from_context(self, mesh_context: Any, dp_mode: str) -> None:
         """Resolve and register the DP group(s) from an automodel ``MeshContext``.

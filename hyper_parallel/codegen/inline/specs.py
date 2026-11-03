@@ -35,9 +35,9 @@ def replacement_spec(
     *,
     module_type: str | None = None,
 ) -> ReplacementSpec | None:
-    """Resolve a YAML ``replace_module`` target to its component replacement.
+    """Resolve a module implementation to its component replacement.
 
-    ``module_type`` is the rule's matched source type from the YAML; it names
+    ``module_type`` is the compiled rule's matched source type; it names
     the source class the generated artifact must model, so it is passed rather
     than reconstructed.
     """
@@ -52,9 +52,9 @@ def strategy_spec(
 ) -> StrategySpec | None:
     """Resolve a YAML strategy target to its parallel strategy.
 
-    ``inner_wrapper`` marks the target as a ``plan_overrides.inner_wrapper``
-    declaration: only that position makes a CP attention wrapper a strategy
-    (a ``local_compute_fn`` in the same slot is not one).
+    ``inner_wrapper`` marks a forward replacement backed by the private
+    inner-wrapper executor: only that execution mode makes a CP attention
+    wrapper a strategy.
     """
     return strategy_spec_for(target, model_type, inner_wrapper=inner_wrapper)
 

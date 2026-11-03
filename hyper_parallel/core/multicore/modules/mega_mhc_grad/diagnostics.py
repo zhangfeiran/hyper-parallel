@@ -19,7 +19,7 @@ from typing import Any
 
 from hyper_parallel.core.multicore.diagnostics.common.graph import bind_graph_tensor_ports
 from hyper_parallel.core.multicore.diagnostics.dump.l1 import L1TensorView, L1TensorViewContext
-from hyper_parallel.core.multicore.modules.mega_mhc.diagnostics import tensor_port
+from hyper_parallel.core.multicore.scheduler.graph import TensorSpec
 
 
 def resolve_backward_view(context: L1TensorViewContext) -> L1TensorView:
@@ -72,7 +72,10 @@ def bind_backward_graph(graph: Any, config: Any) -> Any:
         Args:
             indices: ABI positions selected from the backward operand table.
         """
-        return [tensor_port(names[index], index, 2 if index in bf16 else 4) for index in indices]
+        return [
+            TensorSpec(names[index], [], index, dtype_size=2 if index in bf16 else 4, is_dynamic=True)
+            for index in indices
+        ]
 
     bindings = {
         "grad_output_init": ([], []),

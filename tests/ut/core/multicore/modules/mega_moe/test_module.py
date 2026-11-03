@@ -15,6 +15,7 @@
 """Unit tests for the model-facing MegaMoe module."""
 
 import gc
+import struct
 import unittest
 import weakref
 from collections import OrderedDict
@@ -29,6 +30,11 @@ import torch
 from hyper_parallel.core.multicore import _automatic, _collective
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import build_config_for_rank
+from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
+from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
+    get_w1_grad_tiling_bytes, get_w2_grad_tiling_bytes,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -123,24 +129,208 @@ class TestMegaMoeExperts(unittest.TestCase):
                                     auto_tokens=True, replica_slots_per_rank=1, logical_num_experts=4)
         resources._token_capacity = 4096
         resources._plans = {}
+    @staticmethod
+    def _cache_resources(capacity: int, *, automatic: bool = False, mode: str = "push") -> Any:
+        """Create a lazy resource with an explicit committed source reservation."""
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources.spec = MegaMoeSpec(capacity, 16, 8, 4, 2, None, capacity * 2, 1, None, 0, 24,
+                                    max_local_num_tokens=None if automatic else capacity,
+                                    auto_tokens=automatic, dispatch_mode=mode)
+        resources._token_capacity = capacity
+        resources._plans = {}
+        return resources
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_automatic_constructor_accepts_shapes_without_token_arguments(self) -> None:
+        """Feature: Automatic token API.
+        Description: Construct both transports without predicting token counts and reject removed keywords.
+        Expectation: Start lazily at 128 rows and accept empty, aligned and arbitrary real input shapes.
+        """
+        for mode in ("push", "pull"):
+            with self.subTest(mode=mode):
+                layer = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+                                       dispatch_mode=mode)
+                self.addCleanup(layer.close)
+                self.assertFalse(hasattr(layer, "local_num_tokens"))
+                self.assertFalse(hasattr(layer, "max_local_num_tokens"))
+                self.assertTrue(layer._resource_group.specification["auto_tokens"])
+                self.assertEqual(layer._resource_group.specification["local_num_tokens"], 128)
+                self.assertIsNone(layer._resource_group.resources)
+                parameters = (layer.gate_up_weight.bfloat16(), layer.down_weight.bfloat16())
+                with patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True, create=True):
+                    for rows in (0, 1, 127, 128, 129, 257, 4097):
+                        result = layer._validate_forward_inputs(
+                            torch.empty(1, rows, 16, dtype=torch.bfloat16),
+                            torch.zeros(rows, 2, dtype=torch.int32), torch.ones(rows, 2), None, parameters)
+                        self.assertEqual(tuple(result.shape), (rows, 16))
+        for keyword in ("local_num_tokens", "max_local_num_tokens"):
+            with self.subTest(keyword=keyword), self.assertRaisesRegex(TypeError, keyword):
+                MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **{keyword: 128})
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_dynamic_cycles_retain_bucket_plans_and_reserved_specification(self) -> None:
+        """Feature: Geometric token plan retention.
+        Description: Replay seven buckets plus nearby and wide length sequences after warmup.
+        Expectation: Each covering plan is built once and retained plans keep the committed reservation.
+        """
+        for lengths, expected in (
+            ((128, 256, 512, 1024, 2048, 4096, 8192), 7),
+            ((3200, 3712, 3328, 3968, 3456, 4096, 3584, 3840), 1),
+            ((8192, 8064, 7936, 7808, 7680), 1), ((128, 1152, 2176, 3200, 4224), 4),
+        ):
+            with self.subTest(lengths=lengths):
+                resources = self._cache_resources(8192)
+                with patch.object(mega_moe_module, "build_mega_moe_plan",
+                                  side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
+                    first = [resources.plan_for_tokens(tokens, "cpu") for tokens in lengths]
+                    for _ in range(3):
+                        for tokens, retained in zip(lengths, first):
+                            self.assertIs(resources.plan_for_tokens(tokens, "cpu"), retained)
+                    self.assertEqual((build.call_count, len(resources._plans)), (expected, expected))
+                for plan in first:
+                    self.assertEqual((plan.spec.routed_slots, plan.spec.receive_capacity), (16384, 16384))
+                    self.assertEqual(resources.spec, replace(plan.spec, schedule_tokens=None))
+
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_partial_and_small_buckets_cover_inputs_without_expanding_storage(self) -> None:
+        """Feature: bounded token schedule coverage.
+
+        Description: Exercise zero, tiny inputs and non-power-of-two public token limits.
+        Expectation: Every plan covers its input within the original reservation and tiny inputs use 128 rows.
+        """
+        for public_bound, reserved in ((1, 128), (129, 256), (257, 384), (8000, 8064), (8193, 8320)):
+            with self.subTest(public_bound=public_bound):
+                resources = self._cache_resources(reserved)
+                resources.spec = replace(resources.spec, max_local_num_tokens=public_bound)
+                with patch.object(mega_moe_module, "build_mega_moe_plan",
+                                  side_effect=lambda spec, device: SimpleNamespace(spec=spec)):
+                    for requested in (0, 128, reserved):
+                        plan = resources.plan_for_tokens(requested, "cpu")
+                        self.assertGreaterEqual(plan.spec.plan_tokens, max(128, requested))
+                        self.assertLessEqual(plan.spec.plan_tokens, reserved)
+                        self.assertEqual(plan.spec.plan_tokens % 128, 0)
+                        self.assertEqual(plan.spec.routed_slots, reserved * 2)
+                    self.assertEqual(resources.plan_for_tokens(1, "cpu").spec.plan_tokens, 128)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_automatic_plan_uses_committed_capacity_in_both_transports(self) -> None:
+        """Feature: automatic token schedule coverage.
+
+        Description: Grow a 128-row reservation in both transports and native weight layouts.
+        Expectation: Plans retain the layout and cover 4096 rows without changing the original specification.
+        """
+        for mode, layout in product(("push", "pull"), ("EIO", "EOI")):
+            with self.subTest(mode=mode, layout=layout):
+                resources = self._cache_resources(128, automatic=True, mode=mode)
+                resources.spec = replace(resources.spec, expert_weight_layout=layout)
+                resources.workspace = Mock()
+                resources.heap_manager = Mock()
+                physical = replace(resources.spec, local_num_tokens=4096, receive_capacity=32768)
+                resources.heap_manager.ensure_token_capacity.return_value = physical
+                tensor = torch.empty(1, 16, dtype=torch.bfloat16)
+                resources.prepare_auto_workspace(4096, 32768, tensor)
+                with patch.object(mega_moe_module, "build_mega_moe_plan",
+                                  side_effect=lambda spec, device: SimpleNamespace(spec=spec)):
+                    plan = resources.plan_for_tokens(4096, "cpu")
+                    self.assertEqual(plan.spec.plan_tokens, 4096)
+                    self.assertEqual(plan.spec.expert_weight_layout, layout)
+                resources.workspace.ensure.assert_called_once_with(physical, tensor.dtype, tensor.device)
+                self.assertEqual(resources.workspace.claim.call_count, int(mode == "pull"))
+                self.assertEqual(resources.spec.local_num_tokens, 128)
+                self.assertEqual(resources._token_capacity, 4096)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_partial_bucket_upgrade_is_retryable_and_keeps_retained_plans(self) -> None:
+        """Feature: Immutable partial bucket replacement.
+        Description: Fail a larger plan build, then retry it while backward retains the old plan.
+        Expectation: Failure preserves the cache; successful retry replaces only the cached reference.
+        """
+        resources = self._cache_resources(128, automatic=True)
+        resources._token_capacity = 384
+        with patch.object(mega_moe_module, "build_mega_moe_plan",
+                          side_effect=lambda spec, device: SimpleNamespace(spec=spec)):
+            retained = resources.plan_for_tokens(384, "cpu")
+            resources._token_capacity = 512
+            with (patch.object(mega_moe_module, "build_mega_moe_plan", side_effect=RuntimeError("build failed")),
+                  self.assertRaisesRegex(RuntimeError, "build failed")):
+                resources.plan_for_tokens(512, "cpu")
+            self.assertIs(resources._plans[512], retained)
+            self.assertEqual(retained.spec.plan_tokens, 384)
+            expanded = resources.plan_for_tokens(512, "cpu")
+            self.assertIsNot(expanded, retained)
+            self.assertEqual((retained.spec.plan_tokens, expanded.spec.plan_tokens), (384, 512))
+            self.assertIs(resources.plan_for_tokens(384, "cpu"), expanded)
+            self.assertEqual(len(resources._plans), 1)
+            self.assertEqual(resources.spec.local_num_tokens, 128)
+
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_unprepared_capacity_is_rejected_before_building(self) -> None:
+        """Feature: committed token capacity enforcement.
+
+        Description: Fail workspace preparation before requesting a larger token schedule.
+        Expectation: The previous capacity is retained and no undersized plan is constructed.
+        """
+        resources = self._cache_resources(128, automatic=True)
+        resources.workspace = Mock()
+        resources.workspace.ensure.side_effect = RuntimeError("workspace failed")
+        resources.heap_manager = Mock()
+        resources.heap_manager.ensure_token_capacity.return_value = replace(resources.spec, local_num_tokens=4096)
+        with self.assertRaisesRegex(RuntimeError, "workspace failed"):
+            resources.prepare_auto_workspace(4096, 8192, torch.empty(1, 16))
+        self.assertEqual(resources._token_capacity, 128)
+        with (patch.object(mega_moe_module, "build_mega_moe_plan") as build,
+              self.assertRaisesRegex(RuntimeError, "requested=4096, capacity=128")):
+            resources.plan_for_tokens(4096, "cpu")
+        build.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_int32_limit_bounds_the_number_of_cached_plans(self) -> None:
+        """Feature: bounded geometric plan cache.
+
+        Description: Replay every geometric level within the native INT32 source row limit.
+        Expectation: Each level is constructed once and no cached plan exceeds the reservation.
+        """
+        capacity = ((2**31 - 1) // 16 // 128) * 128
+        resources = self._cache_resources(capacity)
+        lengths = [2**power for power in range(7, 27)] + [capacity]
         with patch.object(mega_moe_module, "build_mega_moe_plan",
                           side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
-            retained = resources.plan_for_tokens(128, "cpu")
-            self.assertIs(retained, resources.plan_for_tokens(128, "cpu"))
-            for tokens in (256, 384, 512, 4096):
+            for tokens in lengths * 3:
                 resources.plan_for_tokens(tokens, "cpu")
-            self.assertEqual(len(resources._plans), 4)
-            self.assertIs(resources._plans[128], retained)
-            self.assertEqual(retained.spec.plan_tokens, 128)
-            self.assertEqual(retained.spec.routed_slots, 8192)
-            self.assertEqual(retained.spec.receive_capacity, 8192)
-            self.assertEqual(resources.spec, replace(retained.spec, schedule_tokens=None))
-            self.assertEqual(build.call_count, 4)
+            self.assertEqual(build.call_count, 21)
+            self.assertEqual(len(resources._plans), 21)
+            self.assertLessEqual(max(plan.spec.plan_tokens for plan in resources._plans.values()), capacity)
 
-    def test_resource_manifest_rejects_rank_configuration_mismatch(self) -> None:
-        """Static and dynamic ranks enter the same check before symmetric allocation."""
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_resource_consensus_rejects_configuration_and_wire_mismatches(self) -> None:
+        """Feature: Distributed resource and automatic count agreement.
+        Description: Inject a different manifest, legacy wire version or incompatible expert-weight layout.
+        Expectation: Every mismatch fails before symmetric allocation or count exchange.
+        """
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
         resources.spec = SimpleNamespace(ep_size=2, ep_group=object())
+        for mismatch in ("configuration", "wire", "layout"):
+            def gather(output: list, value: Any, kind: str = mismatch, **kwargs: Any) -> None:
+                """Change one peer agreement field while preserving all unrelated metadata."""
+                self.assertIs(kwargs["group"], resources.spec.ep_group)
+                if kind == "layout":
+                    peer_specification = list(value[2][0])
+                    self.assertEqual(peer_specification[-3], "EOI")
+                    peer_specification[-3] = "EIO"
+                    peer = (value[0], value[1], (tuple(peer_specification),))
+                else:
+                    peer = ("dynamic_tokens_v1", *value[1:]) if kind == "wire" else ("different",)
+                output[:] = [value, peer]
 
         def gather(output: list, value: Any, **kwargs: Any) -> None:
             """Simulate a peer using another resource mode or capacity."""
@@ -518,6 +708,33 @@ class TestMegaMoeExperts(unittest.TestCase):
         self.assertFalse(backward.get_op("act_grad").inputs[1].transpose)
         self.assertFalse(backward.get_op("gate_grad").inputs[1].transpose)
 
+        backward.propagate_splits(topology)
+        runtime = build_config_for_rank(backward, topology, 0)
+        for name, positions, shape, tiling_builder in (
+            ("w1_grad", [10, 17], [2, 16, 12], get_w1_grad_tiling_bytes),
+            ("w2_grad", [0, 5], [2, 12, 8], get_w2_grad_tiling_bytes),
+        ):
+            op = backward.get_op(name)
+            self.assertEqual(op.task_num, 48, msg=f"{name} tasks: expected=48, actual={op.task_num}")
+            self.assertEqual(op.outputs[0].shape, shape,
+                             msg=f"{name} output: expected={shape}, actual={op.outputs[0].shape}")
+            task = next(task for task in runtime.all_tasks[:runtime.task_num]
+                        if task.outputs[0].input_position == op.outputs[0].param_position)
+            actual_positions = [task.inputs[i].input_position for i in range(2)]
+            actual_transpose = [task.inputs[i].transpose_flag for i in range(2)]
+            self.assertEqual(actual_positions, positions,
+                             msg=f"{name} operands: expected={positions}, actual={actual_positions}")
+            self.assertEqual(actual_transpose, [1, 0],
+                             msg=f"{name} transpose: expected=[1, 0], actual={actual_transpose}")
+            tiling = tiling_builder(op.split_value, hidden_size=12, intermediate_size=8,
+                                   num_groups=2, expert_weight_layout="EOI")
+            words = struct.unpack(f"<{len(tiling) // 4}I", tiling)
+            matmul_start = words.index(393216) - 19
+            axes = list(words[matmul_start + 1:matmul_start + 3])
+            self.assertEqual(axes, shape[1:], msg=f"{name} tiling M/N: expected={shape[1:]}, actual={axes}")
+        self.assertTrue(can_reuse_backward_dispatch(runtime, 2, 24),
+                        msg=f"Expected safe dispatch reuse, actual={can_reuse_backward_dispatch(runtime, 2, 24)}")
+
         hidden_states = SimpleNamespace(dtype=torch.bfloat16, is_npu=True, device=torch.device("cpu"))
         noncontiguous_gate_up = torch.empty(2, 12, 16, dtype=torch.bfloat16).transpose(1, 2)
         noncontiguous_down = torch.empty(2, 8, 12, dtype=torch.bfloat16).transpose(1, 2)
@@ -698,9 +915,9 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         with (
             patch.object(
-                torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True
+                torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True, create=True
             ),
-            patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
+            patch.object(torch, "npu", Mock(is_current_stream_capturing=Mock(return_value=False)), create=True),
             patch.object(experts, "_get_execution_resources", return_value=resources),
             patch.object(
                 mega_moe_module, "prepare_topk_route", return_value=route
@@ -892,7 +1109,7 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         with (
             patch.object(
-                torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True
+                torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True, create=True
             ),
             patch.object(
                 experts, "_create_execution_resources"
@@ -905,7 +1122,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 torch.full((128, 2), 0.5),
             )
         experts.gate_up_weight = experts.down_weight = None
-        with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+        with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True, create=True),
               patch.object(experts, "_create_execution_resources", mock_create_resources)):
             for weights, error in ((None, ValueError),
                                    ((torch.zeros(2, 16, 16), torch.zeros(2, 8, 16)), TypeError)):

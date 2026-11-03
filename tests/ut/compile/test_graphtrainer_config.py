@@ -261,8 +261,6 @@ class TestGraphModeIntegration(unittest.TestCase):
 
         self.assertTrue(compiler.pass_config.fsdp_enabled)
         self.assertEqual(compiler.pass_config.fsdp_degree, 4)
-        self.assertEqual(compiler.pass_config.tp_size, 2)
-        self.assertTrue(compiler.pass_config.sequence_parallel)
 
     def test_graphcompiler_prefers_explicit_pass_config(self):
         """An explicit pass config should override trainer topology inference."""
@@ -274,7 +272,7 @@ class TestGraphModeIntegration(unittest.TestCase):
             ),
             fsdp_config=SimpleNamespace(dp_shard_size=4, edp_shard_size=1),
         )
-        pass_config = PassConfig(fsdp_enabled=False, tp_size=1)
+        pass_config = PassConfig(fsdp_enabled=False)
 
         compiler = GraphCompiler(
             model=torch.nn.Linear(2, 2),
@@ -306,8 +304,6 @@ class TestGraphModeIntegration(unittest.TestCase):
 
         self.assertTrue(trainer.pass_config.fsdp_enabled)
         self.assertEqual(trainer.pass_config.fsdp_degree, 4)
-        self.assertEqual(trainer.pass_config.tp_size, 2)
-        self.assertTrue(trainer.pass_config.sequence_parallel)
 
     def test_use_joint_graph_skips_eager_fsdp2_instantiation(self):
         """Graph-mode selection should keep mesh planning but skip eager FSDP2."""
@@ -419,17 +415,6 @@ class TestGraphModeIntegration(unittest.TestCase):
             pass_config.fsdp_degree,
             4,
             f"FSDP degree mismatch: expected=4, got={pass_config.fsdp_degree}",
-        )
-        self.assertEqual(
-            pass_config.tp_size, 2, f"TP size mismatch: expected=2, got={pass_config.tp_size}"
-        )
-        self.assertTrue(
-            pass_config.sequence_parallel,
-            f"sequence parallel flag mismatch: expected=True, got={pass_config.sequence_parallel}",
-        )
-        self.assertTrue(
-            pass_config.loss_parallel,
-            f"loss parallel flag mismatch: expected=True, got={pass_config.loss_parallel}",
         )
         self.assertTrue(
             pass_config.enable_overlap,

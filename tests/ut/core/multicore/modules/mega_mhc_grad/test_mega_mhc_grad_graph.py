@@ -47,14 +47,14 @@ class TestMegaMhcGradGraph(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    @patch("hyper_parallel.core.multicore.modules.mega_mhc_grad.function.torch.npu.get_device_limit")
-    def test_resolve_core_counts_uses_device_vector_count(self, mock_get_device_limit) -> None:
+    @patch("hyper_parallel.core.multicore.modules.mega_mhc_grad.function.torch.npu", create=True)
+    def test_resolve_core_counts_uses_device_vector_count(self, mock_npu) -> None:
         """Feature: HyperMegaMhcGrad device core discovery.
 
         Description: Read distinct AIC and AIV limits reported for a 910B3.
         Expectation: The execution plan receives the physical 20/40 core counts.
         """
-        mock_get_device_limit.return_value = {
+        mock_npu.get_device_limit.return_value = {
             "cube_core_num": NUM_CUBE_CORES,
             "vector_core_num": NUM_VECTOR_CORES,
         }
@@ -66,14 +66,14 @@ class TestMegaMhcGradGraph(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    @patch("hyper_parallel.core.multicore.modules.mega_mhc_grad.function.torch.npu.get_device_limit")
-    def test_resolve_core_counts_rejects_incompatible_mixed_ratio(self, mock_get_device_limit) -> None:
+    @patch("hyper_parallel.core.multicore.modules.mega_mhc_grad.function.torch.npu", create=True)
+    def test_resolve_core_counts_rejects_incompatible_mixed_ratio(self, mock_npu) -> None:
         """Feature: HyperMegaMhcGrad mixed-kernel core ratio.
 
         Description: Report an AIV limit that is not twice the AIC limit.
         Expectation: Planning fails before launching the fixed 1:2 mixed kernel.
         """
-        mock_get_device_limit.return_value = {
+        mock_npu.get_device_limit.return_value = {
             "cube_core_num": NUM_CUBE_CORES,
             "vector_core_num": 32,
         }

@@ -2,7 +2,7 @@
 
 codegen 把并行规划与高性能模块替换显示的写入模型文件。codegen读取训练 YAML配置，离线推导 TP/CP/EP 等并行契约，将参数布局、边界重分发、前向边界改写和模块替换冻结进 artifact（`codegen_meta.json` + 生成版 modeling 文件）。训练时各 rank 加载同一份 artifact，由 runtime 读取其中冻结的 sharding plan 并执行分片。
 
-codegen 同时承载两类能力：一类是将 sharding plan 固化为生成模型中的参数分片和边界通信逻辑；另一类是将 `replace_module` 等模型改写下沉到生成文件。当 YAML 用 `replace_module` 把标准注意力或 MoE 替换成融合实现（flash attention、grouped GEMM 专家、CP wrapper）时，codegen 会把替换入口写入模型类的 `__init__`，保证替换在模型构造阶段生效。
+codegen 同时承载两类能力：一类是将 sharding plan 固化为生成模型中的参数分片和边界通信逻辑；另一类是将 `replace.kind: module` 等模型改写下沉到生成文件。当 YAML 用 `replace.kind: module` 把标准注意力或 MoE 替换成融合实现（flash attention、grouped GEMM 专家、CP wrapper）时，codegen 会把替换入口写入模型类的 `__init__`，保证替换在模型构造阶段生效。
 
 ## 核心概念
 
@@ -149,7 +149,7 @@ model:
 
 `codegen_meta.json` 是 bundle 的索引和校验文件。它记录本次生成对应的 signature、YAML 摘要、原始 modeling source 摘要、并行维度、入口点、冻结后的 sharding plan、module override 记录、输出文件哈希和 covered 声明。训练前的 preflight 会读取它判断 artifact 是否属于当前配置；训练时 runtime 也会消费其中的 frozen plan。
 
-`modeling_Qwen3_Moe_gen_npu.py` 是真正被训练导入的生成模型文件。它以原始 Transformers modeling 源码为基础，追加生成来源 banner，把可静态下沉的边界 forward 改写为显式的边界通信代码（原始主体保留为 `_forward_impl`，公开 `forward` 变成"入口算子 → 原始计算 → 出口算子"的静态下沉形态，见下节），并把 `replace_module` 下沉到模块的构造点。生成文件不再写入冻结计划常量或 `hp_parallelize()` 入口——冻结计划保存在 `codegen_meta.json`，由 runtime 读取后执行分片；模型构建时，`replace_module` 相关 patch 直接由这个文件里的 `__init__` 构造逻辑生效。
+`modeling_Qwen3_Moe_gen_npu.py` 是真正被训练导入的生成模型文件。它以原始 Transformers modeling 源码为基础，追加生成来源 banner，把可静态下沉的边界 forward 改写为显式的边界通信代码（原始主体保留为 `_forward_impl`，公开 `forward` 变成"入口算子 → 原始计算 → 出口算子"的静态下沉形态，见下节），并把 `replace.kind: module` 下沉到模块的构造点。生成文件不再写入冻结计划常量或 `hp_parallelize()` 入口——冻结计划保存在 `codegen_meta.json`，由 runtime 读取后执行分片；模型构建时，`replace.kind: module` 相关 patch 直接由这个文件里的 `__init__` 构造逻辑生效。
 
 `modeling_Qwen3_Moe_gen_npu.py.diff` 是审计文件。它展示原始 modeling 源码和 generated modeling 的统一 diff，用于检查 codegen 到底改了哪些位置：新增了哪些 import、哪些类的 forward 被改写为边界通信形态（`_forward_impl` 提取 + 入口/出口算子），以及哪些模块构造点被替换成融合实现。
 
@@ -235,9 +235,9 @@ class Qwen3MoeAttention(nn.Module):
 
 这段改写的核心含义是：原始计算逻辑仍在 `_forward_impl()` 中，codegen 只把并行边界通信显式插到它的前后。`# hidden_states: ...` / `# output: ...` 注释由 codegen 生成，标注每一步的布局迁移——如 `P(sum) -> R ==> all_reduce(sum)` 表示出口把 TP 上的部分和规约成完整张量。`self._hp_tp` 由 runtime 在 install 时绑定：安装前会先对照真实 mesh 重新校验该形态与冻结计划一致，不一致就用通用引擎整个替换这个 `forward`，烤进文件的调用永远不会在校验通过前运行。
 
-### replace_module 的下沉
+### 模块替换的源码下沉
 
-对于 `replace_module`，原生路径是在 trainer 的动态 applier 中匹配模块并替换；codegen 在生成阶段就把替换下沉到源码里的模块构造点，因此生成的 `__init__` 直接构造的就是高性能实现，模型构建时不再需要跑一遍替换：
+对于 `replace.kind: module`，原生路径是在 trainer 的动态 applier 中匹配模块并替换；codegen 在生成阶段就把替换下沉到源码里的模块构造点，因此生成的 `__init__` 直接构造的就是高性能实现，模型构建时不再需要跑一遍替换：
 
 ```python
 # 原始 modeling 源码
@@ -260,9 +260,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 命中的 FQN 仍会记录进 `codegen_meta.json` 的 `module_overrides`（并置 `covered.module_overrides=true`），供 preflight 核对，同时告诉 trainer 不必再对同一批规则执行自己的替换步骤。
 
-YAML 里 `replace_module` 的 `_target_` 有两种写法：指向返回包装器的工厂函数（如本例的 `replace_qwen3_moe_flash_attention`），或直接指向 `hyper_parallel.components.*` 下的组件类。两种写法 codegen 都支持，生成结果与原生路径的模块替换一致。
+YAML 里 `replace.implementation` 的 `_target_` 有两种写法：指向返回包装器的工厂函数（如本例的 `replace_qwen3_moe_flash_attention`），或直接指向 `hyper_parallel.components.*` 下的组件类。两种写法 codegen 都支持，生成结果与原生路径的模块替换一致。
 
-在本文 demo 使用的 Qwen3-MoE 配置中，RMSNorm、attention fusion、CP wrapper、MoE local compute 等 patch 都由 generated artifact 承载。训练启动后只需要 import generated modeling，runtime 会读取 artifact 中冻结的 sharding plan 并执行分片，不需要再把同一批 `replace_module` 规则交给 native applier 重复处理。其他模型是否包含同类 patch，取决于对应 YAML 中的 `plan_overrides` 和 codegen 当前支持的静态下沉能力。
+在本文 demo 使用的 Qwen3-MoE 配置中，RMSNorm、attention fusion、CP wrapper、MoE local compute 等 patch 都由 generated artifact 承载。训练启动后只需要 import generated modeling，runtime 会读取 artifact 中冻结的 sharding plan 并执行分片，不需要再把同一批 `replace.kind: module` 规则交给 native applier 重复处理。其他模型是否包含同类 patch，取决于对应 YAML 中的 `plan_overrides` 和 codegen 当前支持的静态下沉能力。
 
 ---
 
@@ -300,7 +300,7 @@ did not load <N> owned model tensors
 
 先区分两类情况。
 
-如果 checkpoint 路径、模型类型、Transformers 版本或 YAML 中的 `replace_module` 配置写错，属于用户配置问题。典型表现是模型文件和权重本来就不匹配，native 路径也无法稳定加载同一份 checkpoint。
+如果 checkpoint 路径、模型类型、Transformers 版本或 YAML 中的 `replace.kind: module` 配置写错，属于用户配置问题。典型表现是模型文件和权重本来就不匹配，native 路径也无法稳定加载同一份 checkpoint。
 
 如果同一份 YAML 的 native 路径可以正常加载，而 codegen 路径出现该日志，通常属于 HyperParallel codegen 对当前模型结构或权重转换规则的支持不足。常见原因是生成模型中已经应用了结构融合或模块替换，但 codegen 尚未为这种生成后的结构注册对应的 checkpoint 转换规则，导致原始 checkpoint 中的参数名无法映射到生成模型中的目标参数名。
 
@@ -336,7 +336,7 @@ codegen: reuse artifact ...
 通常有三种情况：
 
 1. 修改的是训练步数、日志、优化器等运行参数。这类配置不会改变 generated model，复用旧产物是正常行为。
-2. 修改的是模型来源、并行规模、`plan_overrides` 或 `replace_module`。这类配置应该触发重新生成；如果没有重新生成，说明当前 artifact 与预期不一致。
+2. 修改的是模型来源、并行规模、`plan_overrides` 或 `replace.kind: module`。这类配置应该触发重新生成；如果没有重新生成，说明当前 artifact 与预期不一致。
 3. 直接编辑了 `generated/` 下的文件。generated 文件是产物，不是源码入口，手工修改不会成为稳定配置，后续检查或重新生成会覆盖这些改动。
 
 **解决方案**
@@ -373,10 +373,10 @@ codegen: imported generated modeling file ...
 
 **问题根因**
 
-codegen 对当前不支持的模型结构不做静默回退：无法把 YAML 声明的并行策略或 `replace_module` 忠实下沉到生成文件时，生成会立即失败，而不是产出一份语义不完整的产物。这是设计行为，报错说明该配置超出了 codegen 已验证的结构范围。
+codegen 对当前不支持的模型结构不做静默回退：无法把 YAML 声明的并行策略或 `replace.kind: module` 忠实下沉到生成文件时，生成会立即失败，而不是产出一份语义不完整的产物。这是设计行为，报错说明该配置超出了 codegen 已验证的结构范围。
 
 **解决方案**
 
-1. 核对 YAML 中 `plan_overrides` / `replace_module` 的目标是否属于 codegen 已支持的结构（可对照本文示例使用的配置范围）；
+1. 核对 YAML 中 `plan_overrides` / `replace.kind: module` 的目标是否属于 codegen 已支持的结构（可对照本文示例使用的配置范围）；
 2. 暂不需要 codegen 时，去掉 `codegen: true` 即回到原生 trainer 路径，训练不受影响；
 3. 若确认配置无误仍失败，请在 HyperParallel 仓库提交 issue，附上模型名称、训练 YAML 与完整报错信息。

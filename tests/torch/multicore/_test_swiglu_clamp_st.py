@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 from unittest.mock import patch
 
@@ -263,12 +264,14 @@ def _run_routed_mega(
     layer.zero_grad(set_to_none=True)
     routed = routed_tokens.detach().clone().requires_grad_(True)
     resources = layer._get_execution_resources(routed)  # pylint: disable=protected-access
+    tokens = route.metadata.plan_tokens
+    plan = resources.plan_for_tokens(resources.spec.plan_tokens if tokens is None else tokens, routed.device)
     output = execute_mega_moe(
         routed,
         layer.gate_up_weight,
         layer.down_weight,
         route.metadata,
-        resources.plan,
+        plan,
         resources.workspace,
     )
     input_grad = torch.autograd.grad(output, routed, grad_output)[0]
@@ -361,6 +364,7 @@ def test_swiglu_clamp_input_gradient() -> None:
                 resources.spec,
                 tokens_per_expert,
                 workspace=resources.workspace,
+                prepare_workspace=partial(resources.prepare_auto_workspace, tensor=hidden),
             )
             routed_grad = torch.ones_like(route.routed_tokens)
             expected = _run_routed_reference(

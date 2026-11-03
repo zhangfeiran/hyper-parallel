@@ -316,19 +316,35 @@ def run_layer(
     topk_weights: torch.Tensor,
     tokens_per_expert: torch.Tensor | None,
     grad_output: torch.Tensor,
+    *,
+    accumulation_steps: int = 1,
 ) -> _RunResult:
-    """Run one layer F+B plus SGD and detach all compared tensors."""
+    """Accumulate F+B microbatches, take one SGD step, and detach compared tensors."""
     layer.zero_grad(set_to_none=True)
     hidden = hidden_states.detach().clone().requires_grad_(True)
     route_weights = topk_weights.detach().clone().requires_grad_(True)
-    output = forward_layer(
-        layer,
-        hidden,
-        topk_ids,
-        route_weights,
-        tokens_per_expert=tokens_per_expert,
-    )
-    output.backward(grad_output)
+    first_weight_gradients = ()
+    for microbatch in range(accumulation_steps):
+        output = forward_layer(
+            layer,
+            hidden,
+            topk_ids,
+            route_weights,
+            tokens_per_expert=tokens_per_expert,
+        )
+        output.backward(grad_output)
+        if accumulation_steps > 1:
+            gradients = expert_weight_gradients(layer)
+            if microbatch == 0:
+                first_weight_gradients = tuple(gradient.detach().clone() for gradient in gradients)
+            else:
+                for name, gradient, first in zip(("gate/up", "down"), gradients, first_weight_gradients):
+                    assert_close(f"{name} accumulated gradient", gradient, first * (microbatch + 1))
+    if isinstance(layer, MegaMoeExperts):
+        for weight in (layer.gate_up_weight, layer.down_weight):
+            assert weight.grad.stride() == weight.stride(), (
+                f"rank={RANK}: expected gradient stride={weight.stride()}, actual={weight.grad.stride()}."
+            )
     optimizer = torch.optim.SGD(layer.parameters(), lr=1e-3)
     optimizer.step()
     torch.npu.synchronize(DEVICE)
@@ -527,33 +543,24 @@ def test_mega_moe_level0_balanced() -> None:
     # Reuse the bounded-capacity scenario to cover TorchTitan-native EOI storage
     # in the same process group as the default EIO routing cases.
     bounded, bounded_common = new_layers(shape, initial_capacity_factor=1.5, expert_weight_layout="EOI")
-    topk_ids, topk_weights, tokens_per_expert = make_balanced_route(shape)
     try:
-        bounded_common_result = run_layer(
-            bounded_common,
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            tokens_per_expert,
-            grad_output,
-        )
-        bounded_result = run_layer(
-            bounded,
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            tokens_per_expert,
-            grad_output,
-        )
-        assert_results_close(bounded_common_result, bounded_result)
-        overflow_ids, overflow_weights, overflow_counts = _make_fixed_route(
-            shape,
-            "single_destination",
-        )
-        reference = run_layer(bounded_common, hidden_states, overflow_ids, overflow_weights,
-                              overflow_counts, grad_output)
-        actual = run_layer(bounded, hidden_states, overflow_ids, overflow_weights, overflow_counts, grad_output)
-        assert_results_close(reference, actual)
+        for pattern in ("balanced", "zero_token_experts", "skew", "single_destination"):
+            ids, probabilities, counts = _make_fixed_route(shape, pattern)
+            if pattern == "balanced":
+                weights = (bounded.gate_up_weight, bounded.down_weight)
+                output = forward_layer(bounded, hidden_states, ids, probabilities, tokens_per_expert=counts)
+                gradients = torch.autograd.grad(output, weights, grad_output)
+                for weight, gradient in zip(weights, gradients):
+                    assert gradient.stride() == weight.stride(), (
+                        f"rank={RANK}: native gradient stride expected={weight.stride()}, "
+                        f"actual={gradient.stride()}."
+                    )
+            accumulation_steps = 2 if pattern == "balanced" else 1
+            reference = run_layer(bounded_common, hidden_states, ids, probabilities, counts, grad_output,
+                                  accumulation_steps=accumulation_steps)
+            actual = run_layer(bounded, hidden_states, ids, probabilities, counts, grad_output,
+                               accumulation_steps=accumulation_steps)
+            assert_results_close(reference, actual)
     finally:
         bounded.close()
 

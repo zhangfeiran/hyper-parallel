@@ -733,17 +733,18 @@ class TestModuleReplacements(unittest.TestCase):
     def test_an_entry_is_checked(self):
         """
         Feature: replacement_specs' checks.
-        Description: An entry that replaces a module without stating its
-            type, one naming a module that cannot be imported, and one
-            naming no factory of that name.
+        Description: Removed fields fail, as do source types and factories
+            that cannot be imported.
         Expectation: Each raises, naming the entry and what is wrong.
         """
-        entry = {"match": "*.self_attn", "module_type": "torch.nn.Linear",
-                 "replace_module": {"_target_": "hyper_parallel.models.replacement.module_replacement"}}
+        entry = {"match": "*.self_attn", "replace": {
+            "kind": "module", "source_type": "torch.nn.Linear",
+            "implementation": {"_target_": "hyper_parallel.models.replacement.module_replacement"}}}
         cases = (
-            ({**entry, "module_type": None}, "without module_type"),
-            ({**entry, "module_type": "no.such.module.Type"}, "cannot import"),
-            ({**entry, "replace_module": {"_target_": "torch.nn.no_such_factory"}}, "cannot import"),
+            ({**entry, "module_type": "torch.nn.Linear"}, "no longer supported"),
+            ({**entry, "replace": {**entry["replace"], "source_type": "no.such.module.Type"}}, "cannot import"),
+            ({**entry, "replace": {**entry["replace"], "implementation": {
+                "_target_": "torch.nn.no_such_factory"}}}, "cannot import"),
         )
         for raw, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
@@ -825,9 +826,10 @@ class TestModuleReplacements(unittest.TestCase):
         Expectation: The run is priced without a census, as a run that asks
             for none, and a warning says why.
         """
-        plan = [{"match": "*.input_layernorm",
-                 "module_type": "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm",
-                 "replace_module": {"_target_": f"{__name__}._needs_a_library"}}]
+        plan = [{"match": "*.input_layernorm", "replace": {
+            "kind": "module",
+            "source_type": "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm",
+            "implementation": {"_target_": f"{__name__}._needs_a_library"}}}]
         with self.assertLogs("hyper_parallel.auto_parallel._hf_model_spec", "WARNING") as logs:
             priced = _evaluator(_qwen35_text(), census=True, plan_overrides=plan)
         self.assertIsNone(priced.ccfg.census)

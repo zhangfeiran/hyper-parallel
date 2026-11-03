@@ -125,12 +125,14 @@ class TestDeepseekV41FixedRouter(unittest.TestCase):
         for fixed in (False, True):
             with self.subTest(fixed=fixed):
                 entry = resolve_component(yaml.safe_load(f"""
-match: '*.mlp'
+match: '*.mlp.forward'
 when: ep
 region_dispatch: false
-local_compute_fn:
-  _target_: {ep_adapter.__name__}.deepseek_v41_megamoe_compute_fn
-  fix_router: {str(fixed).lower()}
+replace:
+  kind: method
+  implementation:
+    _target_: {ep_adapter.__name__}.deepseek_v41_megamoe_compute_fn
+    fix_router: {str(fixed).lower()}
 """), annotation=PlanOverride, path="$.plan_overrides[0]")
                 spec = entries_to_plan_overrides([entry], ep_size=4)["*.mlp"]
                 module = _make_module("sqrtsoftplus", torch.float32, True)
@@ -314,13 +316,15 @@ local_compute_fn:
         for grouped, multimodal, fixed in product((False, True), (False, True), (False, True)):
             with self.subTest(grouped=grouped, multimodal=multimodal, fixed=fixed):
                 raw = yaml.safe_load(f"""
-match: '*.mlp'
+match: '*.mlp.forward'
 when: ep
 region_dispatch: false
-local_compute_fn:
-  _target_: {ep_adapter.__name__}.deepseek_v41_ep_compute_fn
-  use_grouped_gemm: {str(grouped).lower()}
-  fix_router: {str(fixed).lower()}
+replace:
+  kind: method
+  implementation:
+    _target_: {ep_adapter.__name__}.deepseek_v41_ep_compute_fn
+    use_grouped_gemm: {str(grouped).lower()}
+    fix_router: {str(fixed).lower()}
 """)
                 entry = resolve_component(raw, annotation=PlanOverride, path="$.plan_overrides[0]")
                 spec = entries_to_plan_overrides([entry], ep_size=4)["*.mlp"]

@@ -20,21 +20,23 @@ from typing import Any, Mapping, Sequence
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.nn import functional  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
 from hyper_parallel.distributed.context_parallel import ulysses_head_to_seq, ulysses_seq_to_head
 from hyper_parallel.distributed.encoder_parallel.attention import (
     current_encoder_attention_context,
+    encoder_attention_checkpoint_contexts,
 )
 from hyper_parallel.distributed.encoder_parallel.contracts import (
     EncoderParallelAdapterSpec,
+    EncoderLocalInputs,
     EncoderSegment,
     EncoderWorkItem,
 )
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAttention,
     _apply_vision_rotary,
+    _vision_attention,
     _vision_cos_sin,
 )
 from hyper_parallel.models.replacement import module_replacement
@@ -141,6 +143,7 @@ class DeepseekV41VisionBridge:
     """Bind native DeepSeek image operators to one constructed model."""
 
     input_fields = _IMAGE_FIELDS
+    payload_field = "pixel_values"
 
     def __init__(self, model: nn.Module) -> None:
         """Keep direct references to the existing ViT and aligner modules."""
@@ -149,6 +152,11 @@ class DeepseekV41VisionBridge:
             raise ValueError("DeepSeek vision and aligner must be enabled")
         self.vision = backbone.vision
         self.aligner = backbone.aligner
+
+    @property
+    def empty_payload_shape(self) -> tuple[int, int, int]:
+        """Describe a dummy patch without allocating model-device storage."""
+        return (3, self.vision.patch_size, self.vision.patch_size)
 
     @property
     def head_counts(self) -> dict[str, int]:
@@ -171,68 +179,96 @@ class DeepseekV41VisionBridge:
             raise NotImplementedError(
                 "unsupported encoder loss layout; config_path=accelerator.loss_parallel"
             )
+        supported = {id(block) for block in self.vision.blocks
+                     if isinstance(block, CheckpointWrapper)
+                     and block.checkpoint_kwargs.get("context_fn") is encoder_attention_checkpoint_contexts
+                     and block.checkpoint_kwargs.get("early_stop") is False}
         forbidden = [name for name, module in self.vision.named_modules()
-                     if isinstance(module, CheckpointWrapper)]
+                     if isinstance(module, CheckpointWrapper) and id(module) not in supported]
         forbidden.extend(name for name, module in self.aligner.named_modules()
                          if isinstance(module, CheckpointWrapper))
         if forbidden:
-            raise RuntimeError(f"vision activation checkpoint is unsupported: {forbidden}")
+            raise RuntimeError(f"encoder requires context-preserving full vision-block checkpoints: {forbidden}")
 
     def parse_images(self, batch: Mapping[str, Any]) -> tuple[EncoderWorkItem, ...]:
         """Validate native image metadata and expose complete image jobs.
 
         Args:
-            batch: Device batch containing native DeepSeek image fields.
+            batch: Native DeepSeek image fields, normally on the CPU before transport.
 
         Returns:
             Validated image jobs in their original order.
         """
-        return build_deepseek_v41_work_items(batch)
+        items = build_deepseek_v41_work_items(batch)
+        if items and tuple(batch["pixel_values"].shape[1:]) != self.empty_payload_shape:
+            raise ValueError(f"pixel_values patches must have shape {self.empty_payload_shape}")
+        return items
 
-    def _pack_local_inputs(self, batch: Mapping[str, Any], segments: Sequence[EncoderSegment]
+    def pack_payload(self, batch: Mapping[str, Any], segments: Sequence[EncoderSegment],
+                     *, device: torch.device | str = "cpu") -> torch.Tensor:
+        """Copy only the selected patch intervals and zero padding into one buffer.
+
+        Args:
+            batch: Native image bundle retained on its source device.
+            segments: Ordered image intervals assigned to the destination rank.
+            device: Device of the packed output; CPU for training input transport.
+
+        Returns:
+            Packed patches with explicit zero padding and dummy rows.
+        """
+        pixels = batch.get("pixel_values")
+        dtype = pixels.dtype if pixels is not None else torch.float32
+        count = sum(segment.local_padded_length for segment in segments)
+        packed = torch.zeros((count, *self.empty_payload_shape), dtype=dtype, device=device)
+        for segment in segments:
+            if segment.is_dummy or not segment.local_valid_length:
+                continue
+            if pixels is None:
+                raise ValueError("real image segment requires pixel_values")
+            start = segment.item.payload_start + segment.local_start
+            length = segment.local_valid_length
+            packed[segment.packed_offset:segment.packed_offset + length].copy_(pixels[start:start + length])
+        return packed
+
+    def _pack_local_inputs(self, batch: Mapping[str, Any] | EncoderLocalInputs, segments: Sequence[EncoderSegment]
                            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pack image shards and identity RoPE for padded positions."""
         vision = self.vision
-        pixels = batch.get("pixel_values")
-        prototype = pixels if pixels is not None else vision.patch_embed.proj.weight
-        patch_parts = []
+        if isinstance(batch, EncoderLocalInputs):
+            patches = batch.patches
+        else:
+            pixels = batch.get("pixel_values")
+            device = pixels.device if pixels is not None else vision.patch_embed.proj.weight.device
+            patches = self.pack_payload(batch, segments, device=device)
         cosine_parts = []
         sine_parts = []
         for segment in segments:
             if segment.is_dummy:
-                local = prototype.new_zeros((segment.local_padded_length, 3,
-                                             vision.patch_size, vision.patch_size))
                 cosine = torch.ones((segment.local_padded_length, 1, vision.rope_dim),
-                                    dtype=torch.float32, device=local.device)
+                                    dtype=torch.float32, device=patches.device)
                 sine = torch.zeros_like(cosine)
             else:
-                if pixels is None:
-                    raise ValueError("real image segment requires pixel_values")
                 item = segment.item
-                full = pixels[item.payload_start:item.payload_stop]
-                local = full[segment.local_start:segment.local_start + segment.local_valid_length]
                 pad_count = segment.local_padded_length - segment.local_valid_length
-                if pad_count:
-                    local = torch.cat((local, full.new_zeros((pad_count, *full.shape[1:]))), dim=0)
-                full_cosine, full_sine = _vision_cos_sin(*item.metadata["vit_hw"], vision.rope_dim,
-                                                         vision.rope_theta, pixels.device)
-                cosine = full_cosine[segment.local_start:segment.local_start + segment.local_valid_length]
-                sine = full_sine[segment.local_start:segment.local_start + segment.local_valid_length]
+                cosine, sine = _vision_cos_sin(
+                    *item.metadata["vit_hw"], vision.rope_dim, vision.rope_theta, patches.device,
+                    patch_start=segment.local_start, patch_count=segment.local_valid_length,
+                )
                 if pad_count:
                     cosine = torch.cat((cosine, torch.ones((pad_count, 1, vision.rope_dim),
                                                            device=cosine.device, dtype=cosine.dtype)))
                     sine = torch.cat((sine, torch.zeros((pad_count, 1, vision.rope_dim),
                                                         device=sine.device, dtype=sine.dtype)))
-            patch_parts.append(local)
             cosine_parts.append(cosine)
             sine_parts.append(sine)
-        return torch.cat(patch_parts), torch.cat(cosine_parts), torch.cat(sine_parts)
+        return patches, torch.cat(cosine_parts), torch.cat(sine_parts)
 
-    def encode_local(self, batch: Mapping[str, Any], segments: Sequence[EncoderSegment]) -> torch.Tensor:
+    def encode_local(self, batch: Mapping[str, Any] | EncoderLocalInputs,
+                     segments: Sequence[EncoderSegment]) -> torch.Tensor:
         """Run native patch embedding, ViT blocks and final norm on packed shards.
 
         Args:
-            batch: Device batch containing complete image patch tensors.
+            batch: Prepared local device patches, or a native bundle for direct callers.
             segments: This Encoder-CP rank's padded image shards.
 
         Returns:
@@ -314,14 +350,8 @@ class DeepseekV41EncoderParallelAttention(DeepseekV41VisionAttention):
             k = ulysses_seq_to_head(key[start:stop], seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh)
             v = ulysses_seq_to_head(value[start:stop], seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh)
             global_length = segment.local_padded_length * context.cp_mesh.size()
-            mask = None
-            if not segment.is_dummy and segment.item.sequence_length < global_length:
-                indices = torch.arange(global_length, device=q.device)
-                mask = (indices < segment.item.sequence_length).view(1, 1, -1)
-            attended = functional.scaled_dot_product_attention(  # pylint: disable=not-callable
-                q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), attn_mask=mask,
-                is_causal=False,
-            ).transpose(0, 1)
+            key_length = global_length if segment.is_dummy else segment.item.sequence_length
+            attended = _vision_attention(self, q, k, v, key_length=key_length)
             outputs.append(ulysses_head_to_seq(attended, seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh))
         return self.wo(torch.cat(outputs, dim=0).reshape(count, -1))
 

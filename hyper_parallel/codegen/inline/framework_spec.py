@@ -18,23 +18,23 @@ This module replaces per-family ``render_spec.py`` files. Every fact a
 generated artifact needs is derived from the family's *existing runtime
 providers* plus the frozen plan, never from a family-name dispatch table:
 
-* a YAML ``replace_module._target_`` names the family's own
+* a YAML ``replace.implementation._target_`` names the family's own
   ``@module_replacement`` factory; inspecting that factory's source reveals
   which generic component it constructs (``RMSNorm`` / ``GroupedExperts`` /
   ``GQAAttention``) and, for fused attention, the kernel entry it hands over;
-* a YAML ``replace_module._target_`` that names a generic component class
+* a YAML ``replace.implementation._target_`` that names a generic component class
   directly (under ``hyper_parallel.components.``) resolves through that
   component's own wrap-style constructor -- the same declaration the native
   ``_target_replacement_factory`` builds, so no family factory is required;
-* a YAML ``local_compute_fn._target_`` that names a known MoE archetype
+* a forward replacement implementation that names a known MoE archetype
   factory resolves to that archetype's strategy kind / target class / boundary
   sub-patterns / EP body keys;
-* a CP ``inner_wrapper`` target under the ``models/<family>/adapter``
+* a CP forward replacement under the ``models/<family>/adapter``
   convention resolves to the framework CP attention strategy (imports only).
 
 The source class name an artifact must model (``Qwen3MoeRMSNorm``) is not
-duplicated here either: it is read from the rule's own ``module_type``, which
-the YAML already carries for its type check. No model-family codegen
+duplicated here either: it comes from the matched module's actual type in the
+compiled replacement record. No model-family codegen
 declaration remains.
 
 Heavy resolution (importing the real generic component to render a fused
@@ -134,7 +134,7 @@ def _factory_function(target: str, model_type: str | None):
     return getattr(module, name, None)
 
 
-#: YAML ``replace_module`` targets under this prefix name a generic component
+#: Module replacement implementations under this prefix name a generic component
 #: class directly (``hyper_parallel.components.modules.engram.EngramModule``)
 #: -- the declaration the native path builds through
 #: ``_target_replacement_factory`` as ``Cls(module=..., module_fqn=...,
@@ -305,10 +305,10 @@ def replacement_spec_for(
     *,
     module_type: str | None = None,
 ) -> ReplacementSpec | None:
-    """Resolve a ``replace_module`` target to its structural component spec.
+    """Resolve a module replacement target to its structural component spec.
 
     ``module_type`` is the matched source module's dotted type path from the
-    YAML rule; the source class name (``old_ctor``) is its class name — a
+    compiled rule; the source class name (``old_ctor``) is its class name — a
     property of the matched source module, never a hand-written literal.
     """
     if target is None:
@@ -338,13 +338,12 @@ def _resolve_replacement_spec(
     Whatever component a family's factory constructs, the spec is derived from
     that factory's own source, so a new family (or a new component inside one)
     needs no codegen declaration.  A factory with no constructor call to sink --
-    or a rule with no ``module_type`` naming the source class it replaces -- has
+    or a record with no matched ``module_type`` naming the source class -- has
     no spec, and the rule is left to the native path.
     """
     del model_type, target
-    # The source class the constructor call replaces: without the rule's
-    # ``module_type`` there is no call site to rewrite, and guessing one would
-    # silently target the wrong class.
+    # The source class comes from the matched meta-model module. Without that
+    # recorded type there is no safe constructor call site to rewrite.
     old_ctor = class_name_of(module_type)
     if not old_ctor:
         return None
@@ -504,20 +503,20 @@ def declaration_summary(
     replacement_specs: dict[str, Any] = {}
     strategy_specs: dict[str, Any] = {}
     for entry in overrides or ():
-        replace_target = _target_path(entry.get("replace_module"))
-        if replace_target is not None:
+        action = entry.get("replace") or {}
+        target = _target_path(action.get("implementation"))
+        if target is None:
+            continue
+        if action.get("kind") == "module":
             spec = replacement_spec_for(
-                replace_target, model_type, module_type=entry.get("module_type")
+                target, model_type, module_type=action.get("source_type")
             )
-            replacement_specs[replace_target] = asdict(spec) if spec is not None else None
-        local_target = _target_path(entry.get("local_compute_fn"))
-        if local_target is not None:
-            spec = strategy_spec_for(local_target, model_type)
-            strategy_specs[local_target] = asdict(spec) if spec is not None else None
-        inner_target = _target_path(entry.get("inner_wrapper"))
-        if inner_target is not None:
-            spec = strategy_spec_for(inner_target, model_type, inner_wrapper=True)
-            strategy_specs[inner_target] = asdict(spec) if spec is not None else None
+            replacement_specs[target] = asdict(spec) if spec is not None else None
+        elif action.get("kind") == "method" and entry.get("match", "").endswith(".forward"):
+            spec = strategy_spec_for(target, model_type)
+            if spec is None:
+                spec = strategy_spec_for(target, model_type, inner_wrapper=True)
+            strategy_specs[target] = asdict(spec) if spec is not None else None
     return {"replacement_specs": replacement_specs, "strategy_specs": strategy_specs}
 
 

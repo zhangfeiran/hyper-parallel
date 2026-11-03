@@ -14,6 +14,9 @@
 # ============================================================================
 """MoE-FFN backward compute graph."""
 
+from typing import Optional
+
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from hyper_parallel.core.multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
 )
@@ -53,9 +56,10 @@ def _build_bwd_tensor_specs(
     w2_grad_x1 = TensorSpec(
         "w2_grad_x1", [tsv.per_rank_seq, intermediate_size],
         param_position=5, dtype_size=dtype_size,
-        tensor_type=1, is_dynamic=True, transpose=True)
+        tensor_type=1, is_dynamic=True, transpose=not weight_is_eoi)
     w2_grad_y = TensorSpec(
-        "w2_grad_y", [sre, intermediate_size, hidden_size],
+        "w2_grad_y", ([sre, hidden_size, intermediate_size]
+                      if weight_is_eoi else [sre, intermediate_size, hidden_size]),
         param_position=6, dtype_size=dtype_size, tensor_type=1)
     act_grad_weight = TensorSpec(
         "act_grad_weight",
@@ -96,9 +100,10 @@ def _build_bwd_tensor_specs(
     w1_grad_x1 = TensorSpec(
         "w1_grad_x1", [tsv.per_rank_seq, hidden_size],
         param_position=17, dtype_size=dtype_size,
-        tensor_type=1, is_dynamic=True, transpose=True)
+        tensor_type=1, is_dynamic=True, transpose=not weight_is_eoi)
     w1_grad_y = TensorSpec(
-        "w1_grad_y", [sre, hidden_size, intermediate_size * 2],
+        "w1_grad_y", ([sre, intermediate_size * 2, hidden_size]
+                      if weight_is_eoi else [sre, hidden_size, intermediate_size * 2]),
         param_position=18, dtype_size=dtype_size, tensor_type=1)
     glist = TensorSpec(
         "glist", [sre],
@@ -111,7 +116,7 @@ def _build_bwd_tensor_specs(
 
 
 def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
-                         swiglu_sv, num_cube_cores, swiglu_limit=None):
+                         swiglu_sv, num_cube_cores, swiglu_limit=None, expert_weight_layout="EIO"):
     """Create dispatch, act_grad, w2_grad, swiglu_grad operator nodes."""
     (target, target_offset, src, src_offset, size_d,
      w2_grad_x1, w2_grad_y, act_grad_weight, act_grad_y,
@@ -143,17 +148,20 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
         fill_config=GmmFillConfig(offset_inputs={0}, rank_in_event=True, global_trigger=False,
                                   out_offset=True, advance="cube_only", num_cube_cores=num_cube_cores),
     )
+    weight_is_eoi = expert_weight_layout == "EOI"
+    w2_inputs = [target, w2_grad_x1, glist] if weight_is_eoi else [w2_grad_x1, target, glist]
     w2_grad = OperatorNode(
         name="w2_grad", op_type=OpType.GMM,
         diagnostic_name="W2Grad",
-        inputs=[w2_grad_x1, target, glist], outputs=[w2_grad_y],
-        param_positions=[5, 0, 19, 6], split_value=w2_grad_sv,
+        inputs=w2_inputs, outputs=[w2_grad_y],
+        param_positions=[tensor.param_position for tensor in w2_inputs] + [6], split_value=w2_grad_sv,
         split_spec=SplitSpec(
-            split_inputs=[(1, 0)], split_output_dims=[0],
+            split_inputs=[(0 if weight_is_eoi else 1, 0)], split_output_dims=[0],
             task_num_fn=lambda tsv, _ncc=num_cube_cores: _ncc * tsv.single_rank_expert_num,
         ),
         tiling_position=_TILING_POS_W2_GRAD,
-        fill_config=GmmFillConfig(offset_inputs={0, 1}, rank_in_event=True, global_trigger=True,
+        fill_config=GmmFillConfig(offset_inputs={0, 1}, transpose_inputs={0} if weight_is_eoi else set(),
+                                  rank_in_event=True, global_trigger=True,
                                   out_offset=False, advance="cube_custom",
                                   event_delta=tsv.single_rank_expert_num, num_cube_cores=num_cube_cores),
     )
@@ -172,7 +180,8 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
     return dispatch, act_grad, w2_grad, swiglu_grad
 
 
-def _build_bwd_ops_second(specs, *, gate_grad_sv, w1_grad_sv, combine_sv, num_cube_cores):
+def _build_bwd_ops_second(specs, *, gate_grad_sv, w1_grad_sv, combine_sv, num_cube_cores,
+                          expert_weight_layout="EIO"):
     """Create gate_grad, combine, w1_grad operator nodes."""
     (*_, swiglu_out, gate_grad_weight, gate_grad_y,
      combine_out, target_offset_c, src_offset_c, size_c,
@@ -202,24 +211,27 @@ def _build_bwd_ops_second(specs, *, gate_grad_sv, w1_grad_sv, combine_sv, num_cu
         tiling_position=-1,
         fill_config=AllToAllFillConfig(moe_type=AllToAllType.COMBINE, advance="vector_only", event_group=1),
     )
+    weight_is_eoi = expert_weight_layout == "EOI"
+    w1_inputs = [swiglu_out, w1_grad_x1, glist] if weight_is_eoi else [w1_grad_x1, swiglu_out, glist]
     w1_grad = OperatorNode(
         name="w1_grad", op_type=OpType.GMM,
         diagnostic_name="W1Grad",
-        inputs=[w1_grad_x1, swiglu_out, glist], outputs=[w1_grad_y],
-        param_positions=[17, 10, 19, 18], split_value=w1_grad_sv,
+        inputs=w1_inputs, outputs=[w1_grad_y],
+        param_positions=[tensor.param_position for tensor in w1_inputs] + [18], split_value=w1_grad_sv,
         split_spec=SplitSpec(
-            split_inputs=[(1, 0)], split_output_dims=[0],
+            split_inputs=[(0 if weight_is_eoi else 1, 0)], split_output_dims=[0],
             task_num_fn=lambda tsv, _ncc=num_cube_cores: _ncc * tsv.single_rank_expert_num,
         ),
         tiling_position=_TILING_POS_W1_GRAD,
-        fill_config=GmmFillConfig(offset_inputs={0, 1}, rank_in_event=False, global_trigger=True,
+        fill_config=GmmFillConfig(offset_inputs={0, 1}, transpose_inputs={0} if weight_is_eoi else set(),
+                                  rank_in_event=False, global_trigger=True,
                                   out_offset=False, advance="cube_custom",
                                   event_delta=1, num_cube_cores=num_cube_cores),
     )
     return gate_grad, combine, w1_grad
 
 
-def build_backward_graph(tsv, *,
+def build_backward_graph(tsv: TaskSplitValue, *,
                          dispatch_sv:   int = 128,
                          act_grad_sv:   int = 4096,
                          w2_grad_sv:    int = 4096,
@@ -231,7 +243,7 @@ def build_backward_graph(tsv, *,
                          intermediate_size: int = 2048,
                          dtype_size:        int = 2,
                          num_cube_cores:    int = 24,
-                         swiglu_limit:      float | None = None,
+                         swiglu_limit:      Optional[float] = None,
                          expert_weight_layout: str = "EIO") -> ComputeGraph:
     """Build the MoE-FFN backward DAG.
 
@@ -243,11 +255,17 @@ def build_backward_graph(tsv, *,
     Param positions (C++ memory slots):
       dispatch:     [target_offset=1, src=2, src_offset=3, size=4 | target=0]
       act_grad:     [x=0, weight=7, glist=19 | y=8]
-      w2_grad:      [x1=5, x2=0, glist=19 | y=6]
+      w2_grad EIO:  [x1=5, x2=0, glist=19 | y=6]
+      w2_grad EOI:  [x1=0, x2=5, glist=19 | y=6]
       swiglu_grad:  [x=8, dy=9 | out=10]
       gate_grad:    [x=10, weight=11, glist=19 | y=12]
       combine:      [target_offset=14, src=12, src_offset=15, size=16 | target=13]
-      w1_grad:      [x1=17, x2=10, glist=19 | y=18]
+      w1_grad EIO:  [x1=17, x2=10, glist=19 | y=18]
+      w1_grad EOI:  [x1=10, x2=17, glist=19 | y=18]
+
+    EOI writes gradients directly in parameter layout. A transpose view itself
+    does not copy data; returning it can require a later layout copy during
+    gradient accumulation.
 
     Args:
         tsv: TaskSplitValue carrying TP/EP/seq partition metadata.
@@ -274,11 +292,13 @@ def build_backward_graph(tsv, *,
         dispatch_sv=dispatch_sv, act_grad_sv=act_grad_sv,
         w2_grad_sv=w2_grad_sv, swiglu_sv=swiglu_sv, num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit,
+        expert_weight_layout=expert_weight_layout,
     )
     gate_grad, combine, w1_grad = _build_bwd_ops_second(
         specs,
         gate_grad_sv=gate_grad_sv, w1_grad_sv=w1_grad_sv,
         combine_sv=combine_sv, num_cube_cores=num_cube_cores,
+        expert_weight_layout=expert_weight_layout,
     )
     graph = ComputeGraph()
     (graph.add_op(dispatch).add_op(act_grad).add_op(w2_grad)

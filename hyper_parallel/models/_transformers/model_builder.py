@@ -72,7 +72,7 @@ from hyper_parallel.models.external_state import (
     ExternalLoadContext,
     get_model_external_state,
 )
-from hyper_parallel.models.replacement import _apply_module_replacement_actions
+from hyper_parallel.models.replacement import _apply_module_replacement_actions, apply_method_replacements
 
 logger = logging.getLogger(__name__)
 
@@ -690,6 +690,32 @@ def _maybe_apply_module_replacements(
     )
 
 
+def _tie_model_weights_before_parallelism(model: nn.Module) -> None:
+    """Establish declared parameter aliases before distributed wrapping.
+
+    Args:
+        model: Constructed model whose static tied-weight mapping is available.
+
+    Raises:
+        ValueError: If the model cannot establish its declared parameter aliases.
+    """
+    tied_mapping = getattr(model, "all_tied_weights_keys", None) or {}
+    if not tied_mapping:
+        return
+    tie_weights = getattr(model, "tie_weights", None)
+    if not callable(tie_weights):
+        raise ValueError("Model declares tied weights but has no callable tie_weights()")
+    tie_weights(recompute_mapping=False)
+    for target_name, source_name in tied_mapping.items():
+        target = model.get_parameter_or_buffer(target_name)
+        source = model.get_parameter_or_buffer(source_name)
+        if target is not source:
+            raise ValueError(
+                "Model tie_weights() did not establish parameter identity for "
+                f"{target_name} and {source_name}"
+            )
+
+
 def _apply_fsdp2_with_external(
     model: nn.Module,
     fsdp2_manager: Optional[FSDP2Manager],
@@ -761,8 +787,18 @@ def apply_model_infrastructure(
     if is_meta_device:
         _apply_materialization_adapter(model)
 
+    _tie_model_weights_before_parallelism(model)
+
     if freeze_config is not None:
         _apply_parameter_freezing(model, freeze_config)
+
+    method_context = _build_replacement_context(distributed_setup, low_precision_config)
+    method_context["mesh_context"] = getattr(distributed_setup, "mesh_context", None)
+    apply_method_replacements(
+        model,
+        getattr(distributed_setup, "method_replacements", None) or (),
+        context=method_context,
+    )
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     handled, source_shard_info = _parallelize_from_generated(
@@ -876,6 +912,16 @@ def _refresh_hsdp_precision_state(model: nn.Module) -> None:
             hsdp_param.init_dtype_attrs(hsdp_state.mp_policy)
 
 
+def _model_fp32_parameter_ids(model: nn.Module) -> set[int]:
+    """Collect parameters declared by modules through local ``fp32_parameter_names``."""
+    return {
+        id(parameter)
+        for module in model.modules()
+        for name, parameter in module.named_parameters(recurse=False, remove_duplicate=False)
+        if name in getattr(module, "fp32_parameter_names", ())
+    }
+
+
 def _validate_model_state_dtype(
         model: nn.Module,
         target_dtype: torch.dtype,
@@ -883,10 +929,12 @@ def _validate_model_state_dtype(
     """Validate floating model parameters and buffers against a resolved dtype."""
     external = get_model_external_state(model)
     external_ids = {id(parameter) for parameter in external.parameters.values()} if external is not None else set()
+    fp32_ids = _model_fp32_parameter_ids(model)
     mismatched = [
         name
         for name, tensor in model.named_parameters(remove_duplicate=False)
-        if id(tensor) not in external_ids and tensor.is_floating_point() and tensor.dtype != target_dtype
+        if id(tensor) not in external_ids and (tensor.is_floating_point() or id(tensor) in fp32_ids)
+        and tensor.dtype != (torch.float32 if id(tensor) in fp32_ids else target_dtype)
     ]
     mismatched.extend(
         name for name, tensor in model.named_buffers(remove_duplicate=False)

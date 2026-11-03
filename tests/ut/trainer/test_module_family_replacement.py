@@ -16,6 +16,7 @@
 
 import copy
 import unittest
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional
 from unittest.mock import patch
 
@@ -24,9 +25,11 @@ import yaml
 from torch import nn
 
 from hyper_parallel.components.modules import family as registry
+from hyper_parallel.auto_parallel._layer_census import replacement_specs
+from hyper_parallel.codegen.manager import _apply_generation_replacements
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements, module_replacement
-from hyper_parallel.trainer.config.parallelism import entries_to_module_replacements
+from hyper_parallel.trainer.config.parallelism import ReplaceAction, entries_to_module_replacements
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, replace_override_path, resolve_config
 from hyper_parallel.trainer.config.target import Target
 from tests.common.mark_utils import arg_mark
@@ -102,9 +105,9 @@ def _raw_config(**selectors):
         "plan_overrides": [
             {
                 "match": "0",
-                "module_type": "torch.nn.Linear",
-                "exact_type": True,
-                "replace_module": {"_target_": f"{__name__}.ReferenceLinear", **selectors},
+                "replace": {"kind": "module", "source_type": "torch.nn.Linear",
+                            "exact_type": True,
+                            "implementation": {"_target_": f"{__name__}.ReferenceLinear", **selectors}},
             }
         ],
     }
@@ -191,6 +194,58 @@ class TestFamilyReplacement(unittest.TestCase):
         card_mark="onecard",
         essential_mark="essential",
     )
+    def test_public_replace_action_preserves_family_selection(self) -> None:
+        """
+        Feature: Module Family selection through the public replacement action.
+        Description: Resolve a variant through replace.implementation and retain its baseline on round trips.
+        Expectation: The selected implementation replaces the source and explicit selectors survive serialization.
+        """
+        raw = _raw_config(algorithm="matmul", fused=True)
+        config = resolve_config(raw)
+        implementation = config.plan_overrides[0].replace.implementation
+        self.assertIs(implementation.callable, AddmmLinear)
+        serialized = implementation.to_dict()
+        self.assertEqual(serialized["_target_"], f"{__name__}.ReferenceLinear")
+        self.assertEqual(serialized["algorithm"], "matmul")
+        self.assertTrue(serialized["fused"])
+
+        raw["plan_overrides"] = [entry.to_dict() for entry in config.plan_overrides]
+        roundtrip = resolve_config(yaml.safe_load(yaml.safe_dump(raw)))
+        self.assertIs(roundtrip.plan_overrides[0].replace.implementation.callable, AddmmLinear)
+        model = _install(nn.Sequential(nn.Linear(4, 3)), roundtrip)
+        self.assertIsInstance(model[0], AddmmLinear)
+
+    def test_codegen_records_selected_family_variant(self) -> None:
+        """The generated constructor targets the selected variant, not the baseline."""
+        raw = _raw_config(algorithm="matmul")
+        raw["plan_overrides"][0]["replace"].pop("source_type")
+        raw["plan_overrides"][0]["replace"].pop("exact_type")
+        config = resolve_config(raw)
+        model = nn.Sequential(nn.Linear(4, 3))
+        dims = SimpleNamespace(tp_size=1, cp_size=1, ep_size=1, pp_size=1, sequence_parallel=False)
+        records = _apply_generation_replacements(
+            SimpleNamespace(), config, model, SimpleNamespace(parallel_dims=dims),
+        )
+        self.assertEqual(records[0]["factory"], f"{__name__}.MatmulLinear")
+        self.assertEqual(records[0]["module_type"], "torch.nn.modules.linear.Linear")
+        self.assertIsInstance(model[0], MatmulLinear)
+
+    def test_census_uses_selected_family_variant(self) -> None:
+        """The cost-model replacement uses the same family selector as training."""
+        raw = _raw_config(algorithm="matmul")
+        raw["plan_overrides"][0]["replace"].pop("source_type")
+        raw["plan_overrides"][0]["replace"].pop("exact_type")
+        model = nn.Sequential(nn.Linear(4, 3))
+        rules = replacement_specs(raw["plan_overrides"])
+        apply_module_replacements(model, compile_module_replacements(model, rules))
+        self.assertIsInstance(model[0], MatmulLinear)
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
     def test_aliases_use_one_selected_instance(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -220,7 +275,7 @@ class TestFamilyReplacement(unittest.TestCase):
         Description: Selection changes copy configuration without mutating the original or changing its baseline path.
         Expectation: Copies reselect independently and YAML round trips retain explicit fields.
         """
-        original = resolve_config(_raw_config()).plan_overrides[0].replace_module
+        original = resolve_config(_raw_config()).plan_overrides[0].replace.implementation
         alternate = original.replace(algorithm="matmul")
         fused = alternate.replace(fused=True)
         restored = fused.replace(algorithm="reference", fused=False)
@@ -228,8 +283,8 @@ class TestFamilyReplacement(unittest.TestCase):
         self.assertEqual(original.selectors, {})
         for target in (original, alternate, fused, restored):
             raw = _raw_config()
-            raw["plan_overrides"][0]["replace_module"] = target.to_dict()
-            roundtrip = resolve_config(yaml.safe_load(yaml.safe_dump(raw))).plan_overrides[0].replace_module
+            raw["plan_overrides"][0]["replace"]["implementation"] = target.to_dict()
+            roundtrip = resolve_config(yaml.safe_load(yaml.safe_dump(raw))).plan_overrides[0].replace.implementation
             self.assertEqual(roundtrip.to_dict(), target.to_dict())
             self.assertIs(roundtrip.callable, target.callable)
         self.assertEqual(restored.selectors, {"algorithm": "reference", "fused": False})
@@ -267,13 +322,13 @@ class TestFamilyReplacement(unittest.TestCase):
         Description: Scalar selectors are terminal path elements; suffixes are not silently discarded.
         Expectation: Overrides reselect correctly and reject child paths on scalar selectors.
         """
-        original = resolve_config(_raw_config()).plan_overrides[0].replace_module
-        alternate = replace_override_path(original, ["algorithm"], "matmul", path="replace_module")
+        original = resolve_config(_raw_config()).plan_overrides[0].replace.implementation
+        alternate = replace_override_path(original, ["algorithm"], "matmul", path="replace.implementation")
         self.assertIs(alternate.callable, MatmulLinear)
         with self.assertRaises(ConfigResolutionError):
-            replace_override_path(original, ["algorithm", "extra"], "matmul", path="replace_module")
+            replace_override_path(original, ["algorithm", "extra"], "matmul", path="replace.implementation")
         with self.assertRaises(ConfigResolutionError):
-            replace_override_path(original, ["fused"], True, path="replace_module")
+            replace_override_path(original, ["fused"], True, path="replace.implementation")
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
@@ -288,13 +343,13 @@ class TestFamilyReplacement(unittest.TestCase):
         Expectation: Non-Family factories retain the existing Target and factory behavior.
         """
         raw = _raw_config()
-        raw["plan_overrides"][0]["replace_module"] = {
+        raw["plan_overrides"][0]["replace"]["implementation"] = {
             "_target_": f"{__name__}.ordinary_factory",
             "algorithm": "not-a-selector",
             "custom_option": 42,
         }
         config = resolve_config(raw)
-        self.assertIs(type(config.plan_overrides[0].replace_module), Target)
+        self.assertIs(type(config.plan_overrides[0].replace.implementation), Target)
         model = _install(nn.Sequential(nn.Linear(4, 3)), config)
         self.assertEqual(model[0].algorithm, "not-a-selector")
         self.assertEqual(model[0].options, {"custom_option": 42, "callback": None})
@@ -312,10 +367,13 @@ class TestFamilyReplacement(unittest.TestCase):
         Expectation: Python Targets select the same class while ordinary callbacks preserve identity.
         """
         config = resolve_config(_raw_config())
-        config.plan_overrides[0].replace_module = Target(
-            ReferenceLinear,
-            target_path=f"{__name__}.ReferenceLinear",
-            algorithm="matmul",
+        config.plan_overrides[0].replace = ReplaceAction(
+            kind="module", source_type="torch.nn.Linear", exact_type=True,
+            implementation=Target(
+                ReferenceLinear,
+                target_path=f"{__name__}.ReferenceLinear",
+                algorithm="matmul",
+            ),
         )
         model = _install(nn.Sequential(nn.Linear(4, 3)), config)
         self.assertIsInstance(model[0], MatmulLinear)
@@ -324,10 +382,13 @@ class TestFamilyReplacement(unittest.TestCase):
             """Keep object identity through Python Target construction."""
             return value
 
-        config.plan_overrides[0].replace_module = Target(
-            ordinary_factory,
-            target_path=f"{__name__}.ordinary_factory",
-            callback=callback,
+        config.plan_overrides[0].replace = ReplaceAction(
+            kind="module", source_type="torch.nn.Linear", exact_type=True,
+            implementation=Target(
+                ordinary_factory,
+                target_path=f"{__name__}.ordinary_factory",
+                callback=callback,
+            ),
         )
         model = _install(nn.Sequential(nn.Linear(4, 3)), config)
         self.assertIs(model[0].options["callback"], callback)

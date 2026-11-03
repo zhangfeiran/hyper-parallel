@@ -41,10 +41,12 @@ from tests.common.mark_utils import arg_mark
 
 _VISUAL_RECIPE_RULE = """
 match: "model.vision.blocks.*.attn"
-module_type: hyper_parallel.models.deepseek_v41.vision.DeepseekV41VisionAttention
-replace_module:
-  _target_: >-
-    hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
+replace:
+  kind: module
+  source_type: hyper_parallel.models.deepseek_v41.vision.DeepseekV41VisionAttention
+  implementation:
+    _target_: >-
+      hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
 """
 
 

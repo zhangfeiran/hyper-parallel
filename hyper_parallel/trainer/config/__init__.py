@@ -42,6 +42,7 @@ __all__ = [
     "StressDetectConfig",
     "OpStressDetectConfig",
     "ModelStressDetectConfig",
+    "ReplaceAction",
     "Target",
     "TrainerConfig",
     "TrainingConfig",
@@ -68,8 +69,10 @@ from hyper_parallel.trainer.config.parallelism import (
     ActivationCheckpointConfig,
     ActivationCheckpointSelection,
     PlanOverride,
+    ReplaceAction,
     _import_module_type,
     entries_to_module_replacements,
+    entries_to_method_replacements,
     entries_to_plan_overrides,
     normalize_distributed_setup_overrides,
 )

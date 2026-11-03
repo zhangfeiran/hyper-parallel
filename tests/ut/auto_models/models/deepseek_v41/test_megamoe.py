@@ -67,37 +67,51 @@ fsdp_config:
     cast_forward_inputs: false
 plan_overrides:
   - match: model.layers.*.mlp.experts
-    module_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts
-    replace_module:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
-      dispatch_mode: push
+    replace:
+      kind: module
+      source_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
+        dispatch_mode: push
   - match: [model.layers.*.attn_hc, model.layers.*.ffn_hc]
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
-    replace_module:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
+    replace:
+      kind: module
+      source_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
   - match: model.layers.*.mlp.gate
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41TopKRouter
-    replace_module:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate.DeepseekV41MegaGate
+    replace:
+      kind: module
+      source_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41TopKRouter
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate.DeepseekV41MegaGate
   - match: model.layers.*.engram
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
-    replace_module:
-      _target_: hyper_parallel.components.modules.engram.EngramModule
+    replace:
+      kind: module
+      source_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
+      implementation:
+        _target_: hyper_parallel.components.modules.engram.EngramModule
   - match: model.layers.*.self_attn
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
-    replace_module:
-      _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
-  - match: model.layers.*.mlp
+    replace:
+      kind: module
+      source_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
+      implementation:
+        _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+  - match: model.layers.*.mlp.forward
     region_dispatch: false
-    local_compute_fn:
-      _target_: >-
-        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
+    replace:
+      kind: method
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
 """
 _VISION_OVERRIDE_YAML = """
   - match: model.vision.blocks.*.attn
-    module_type: hyper_parallel.models.deepseek_v41.vision.DeepseekV41VisionAttention
-    replace_module:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
+    replace:
+      kind: module
+      source_type: hyper_parallel.models.deepseek_v41.vision.DeepseekV41VisionAttention
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
 """
 
 
@@ -202,14 +216,16 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 if multimodal:
                     expected.add('model.vision.blocks.*.attn')
                 self.assertEqual(matches, expected)
-                experts = [entry for entry in mega.plan_overrides if entry.replace_module is not None
-                           and entry.replace_module.callable is DeepseekV41MegaMoeExperts]
+                experts = [entry for entry in mega.plan_overrides
+                           if entry.replace is not None and entry.replace.kind == "module"
+                           and entry.replace.implementation.callable is DeepseekV41MegaMoeExperts]
                 self.assertEqual(len(experts), 1)
-                self.assertEqual(experts[0].replace_module.dispatch_mode, 'push')
-                compute = [entry for entry in mega.plan_overrides if entry.local_compute_fn is not None
-                           and entry.local_compute_fn.callable is deepseek_v41_megamoe_compute_fn]
+                self.assertEqual(experts[0].replace.implementation.dispatch_mode, 'push')
+                compute = [entry for entry in mega.plan_overrides
+                           if entry.replace is not None and entry.replace.kind == "method"
+                           and entry.replace.implementation.callable is deepseek_v41_megamoe_compute_fn]
                 self.assertEqual(len(compute), 1)
-                self.assertEqual(compute[0].match, 'model.layers.*.mlp')
+                self.assertEqual(compute[0].match, 'model.layers.*.mlp.forward')
                 self.assertIsNone(compute[0].when)
                 self.assertEqual(mega.model_init_dtype, 'float32')
                 self.assertEqual(mega.fsdp_config.mix_precision.param_dtype, 'bfloat16')
@@ -360,7 +376,8 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_multimodal_router_and_shared_expert_gradients(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
-        Description: Use real image/text router biases and propagate image-token gradients through variable-length experts.
+        Description: Use real image/text router biases and propagate
+        image-token gradients through variable-length experts.
         Expectation: Preserve text/image outputs and input, router and shared-expert gradients.
         """
         torch.manual_seed(81)
@@ -481,8 +498,8 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 config = _parse_recipe(multimodal)
                 self.assertNotIn('megamoe', config.to_dict())
                 entry = next(entry for entry in config.plan_overrides
-                             if entry.replace_module is not None
-                             and entry.replace_module.callable is DeepseekV41MegaMoeExperts)
+                             if entry.replace is not None and entry.replace.kind == "module"
+                             and entry.replace.implementation.callable is DeepseekV41MegaMoeExperts)
                 rules = entries_to_module_replacements([entry])
                 model = nn.Module()
                 model.config = DeepseekV4Config.from_dict({

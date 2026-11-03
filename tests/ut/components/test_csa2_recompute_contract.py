@@ -66,10 +66,10 @@ class _CountingState(SharedCompressedAttentionState):
         self.topk_count = 0
         self.index_key_count = 0
 
-    def publish_compressed_kv(self, source_layer: int, value: torch.Tensor) -> None:
+    def publish_compressed_kv(self, source_layer: int, value: torch.Tensor, key_offset: int = 0) -> None:
         """Count one compressed K=V publication."""
         self.publish_count += 1
-        super().publish_compressed_kv(source_layer, value)
+        super().publish_compressed_kv(source_layer, value, key_offset)
 
     def publish_topk_indices(self, source_layer: int, value: torch.Tensor) -> None:
         """Count one Top-K publication."""

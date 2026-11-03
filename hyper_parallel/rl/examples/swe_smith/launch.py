@@ -209,7 +209,7 @@ def _script(args: argparse.Namespace, repository: Path, temporary: Path, *,
     resolved_config = args.output_dir / "resolved_config.yaml"
     command = ["torchrun", "--standalone", f"--nproc_per_node={len(args.devices)}"]
     if args.mode == "train":
-        entry = "examples/async_training/launch.py" if getattr(args, "fully_async", False) else "train_rl.py"
+        entry = "examples/fully_async/launch.py" if getattr(args, "fully_async", False) else "train_rl.py"
         command.extend([str(source_root / entry), str(resolved_config)])
     else:
         command.extend(["-m", "examples.swe_smith.infer", str(resolved_config),

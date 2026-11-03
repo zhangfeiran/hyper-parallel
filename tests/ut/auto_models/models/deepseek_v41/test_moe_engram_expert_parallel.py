@@ -46,13 +46,15 @@ from tests.common.mark_utils import arg_mark
 # This fixture exercises the installed package's configuration contract, not the
 # contents of repository-only training examples.
 _EP_OVERRIDE_YAML = """
-match: "*.mlp"
+match: "*.mlp.forward"
 when: ep
 region_dispatch: false
-local_compute_fn:
-  _target_: >-
-    hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
-  use_grouped_gemm: {use_grouped_gemm}
+replace:
+  kind: method
+  implementation:
+    _target_: >-
+      hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+    use_grouped_gemm: {use_grouped_gemm}
 """
 
 

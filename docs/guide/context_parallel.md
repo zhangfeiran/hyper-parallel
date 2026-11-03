@@ -7,6 +7,9 @@ CP 不负责切分数据集、token ids 或整层 Transformer 输入。启用 CP
 Kimi Delta Attention 的状态递推使用专用入口，P2P、AllGather、Ulysses 及其混合配置见
 [KDA 上下文并行使用指南](./kda_context_parallel.md)。
 
+DeepSeek V4.1 的共享压缩 attention 使用专用 CP 包装；均衡策略与通信配置见
+[DeepSeek V4.1 Indexer 负载均衡与 CP 通信](./deepseek_v41_indexer_cp.md)。
+
 ## 适用边界
 
 | 接口 | 真实作用 |

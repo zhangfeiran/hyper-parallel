@@ -125,6 +125,8 @@ class DeepseekV41Engram(nn.Module):
         padded_sizes = assets.get("padded_num_embeddings")
         if padded_sizes is None:
             pad_multiple = int(getattr(config, "v41_engram_table_pad_multiple", 1))
+            if pad_multiple < 1:
+                raise ValueError("Engram table padding multiple must be positive")
             logical_size = int(assets["num_embeddings"][layer_index])
             self.padded_num_embeddings = (
                 (logical_size + pad_multiple - 1) // pad_multiple * pad_multiple
@@ -139,6 +141,10 @@ class DeepseekV41Engram(nn.Module):
         self.wkv = nn.Linear(hash_columns * head_dim, self.hidden_size * (self.hc_mult + 1), bias=False)
         self.q_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size))
         self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size))
+
+    def checkpoint_logical_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Declare Engram embedding logical dimensions for padded HF loading."""
+        return {"embed.weight": (int(self.logical_num_embeddings), self.embed.embedding_dim)}
 
     def forward(
             self,
@@ -439,12 +445,16 @@ class DeepseekV41Compressor(nn.Module):
             self,
             hidden_states: torch.Tensor,
             compress_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+            block_plan: Any = None,
+            cp_context: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return unrotated and RoPE-rotated compressed KV tensors.
 
         Args:
             hidden_states: Decoder hidden rows to compress.
             compress_position_embeddings: Rotary coefficients for compressed keys.
+            block_plan: Optional document-local grouping and cross-rank boundary plan.
+            cp_context: Communication context used to complete boundary groups.
         """
         batch_size, sequence_length, _ = hidden_states.shape
         if self.compress_ratio == 1:
@@ -452,6 +462,13 @@ class DeepseekV41Compressor(nn.Module):
             cos, sin = compress_position_embeddings
             rotated = _apply_v41_rope(latent.unsqueeze(1), cos, sin).squeeze(1)
             return latent, rotated
+
+        if block_plan is not None:
+            latent = self.norm(block_plan.pool(self.wkv(hidden_states), self.wgate(hidden_states), cp_context))
+            cos, sin = compress_position_embeddings
+            return latent, _apply_v41_rope(
+                latent.unsqueeze(1), cos, sin,
+            ).squeeze(1)
 
         usable = sequence_length - sequence_length % self.compress_ratio
         key_value = self.wkv(hidden_states[:, :usable])
@@ -1019,6 +1036,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             self, *, input_ids: torch.LongTensor, inputs_embeds: torch.FloatTensor | None,
             token_types: torch.LongTensor | None, image_inputs: dict[str, Any],
             image_sequence_start: int, encoder_parallel_plan: Any | None,
+            encoder_parallel_inputs: Any | None = None,
     ) -> torch.Tensor:
         """Encode images and merge only records owned by this decoder rank."""
         if encoder_parallel_plan is None:
@@ -1029,7 +1047,9 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             )
             vision_grad_anchor = None
         else:
-            routed_records, vision_grad_anchor = encoder_parallel_plan.encode_and_route(image_inputs)
+            routed_records, vision_grad_anchor = encoder_parallel_plan.encode_and_route(
+                image_inputs if encoder_parallel_inputs is None else encoder_parallel_inputs,
+            )
             image_records = [
                 (item.batch_index, item.decoder_token_start, *item.metadata["llm_hw"], feature)
                 for item, feature in routed_records
@@ -1169,6 +1189,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             image_token_starts: torch.LongTensor | None = None,
             image_sequence_start: int = 0,
             encoder_parallel_plan: Any | None = None,
+            encoder_parallel_inputs: Any | None = None,
             **kwargs: Any,
     ) -> MoeModelOutputWithPast:
         """Execute image injection, Engram, shared attention, and pipelined mHC.
@@ -1189,6 +1210,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             image_token_starts: Global token start for each image span.
             image_sequence_start: Global start of this decoder hidden shard.
             encoder_parallel_plan: Derived visual work and feature route for this batch.
+            encoder_parallel_inputs: Device patches already packed for this encoder rank.
             **kwargs: Additional decoder-layer keyword arguments.
 
         Returns:
@@ -1212,6 +1234,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                 "image_token_starts": image_token_starts,
             },
             image_sequence_start=image_sequence_start, encoder_parallel_plan=encoder_parallel_plan,
+            encoder_parallel_inputs=encoder_parallel_inputs,
         )
         image_mask = None if token_types is None else token_types >= 0
         engram_token_mask = None if image_mask is None else ~image_mask

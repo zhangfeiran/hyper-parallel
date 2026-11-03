@@ -19,10 +19,10 @@ from __future__ import annotations
 from functools import lru_cache
 
 import torch
-import torch_npu  # pylint: disable=unused-import  # Registers NPU dispatch.
 
 from hyper_parallel.core.multicore._loader import (
     NativeComponentUnavailableError,
+    load_torch_npu,
     get_multicore_adapter_path,
     preload_vendor_library,
 )
@@ -32,6 +32,7 @@ from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics
 @lru_cache(maxsize=1)
 def _load_native() -> None:
     """Load the MegaGate ABI adapter on the first native call."""
+    load_torch_npu()
     vendor_root, adapter_path = get_multicore_adapter_path("hyper_parallel_mega_gate_torch")
     preload_vendor_library(vendor_root)
     try:

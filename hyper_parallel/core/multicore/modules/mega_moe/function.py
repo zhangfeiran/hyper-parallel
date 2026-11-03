@@ -22,7 +22,6 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-import torch_npu
 
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 from hyper_parallel.core.expert_parallel.hot_replica._metadata import (
@@ -33,6 +32,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.transport import (
     prefetch_weights,
     return_gradients,
 )
+from hyper_parallel.core.multicore._loader import load_torch_npu
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .inactive_tasks import GuestTaskPrefix, apply_guest_task_prefix, select_guest_task_prefix
@@ -221,24 +221,16 @@ def _allocate_backward_intermediates(
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
     gradient_dtype = torch.float32 if spec.replica_slots_per_rank else weight2.dtype
-    if spec.expert_weight_layout == "EOI":
-        grad_weight1 = weight1.new_zeros(
-            (spec.local_experts, spec.hidden_size, spec.intermediate_size * 2), dtype=gradient_dtype,
-        )
-        grad_weight2 = weight2.new_zeros(
-            (spec.local_experts, spec.intermediate_size, spec.hidden_size), dtype=gradient_dtype,
-        )
-    else:
-        clear_all = empty_experts is None or len(empty_experts) == weight1.shape[0]
-        allocate = torch.zeros_like if clear_all else torch.empty_like
-        grad_weight1 = allocate(weight1, dtype=gradient_dtype)
-        grad_weight2 = allocate(weight2, dtype=gradient_dtype)
-        if not clear_all:
-            # Complete-K GMM stores overwrite every nonempty home matrix. Only
-            # skipped experts need zero initialization before remote additions.
-            for expert in empty_experts:
-                grad_weight1[expert].zero_()
-                grad_weight2[expert].zero_()
+    clear_all = empty_experts is None or len(empty_experts) == weight1.shape[0]
+    allocate = torch.zeros_like if clear_all else torch.empty_like
+    grad_weight1 = allocate(weight1, dtype=gradient_dtype)
+    grad_weight2 = allocate(weight2, dtype=gradient_dtype)
+    if not clear_all:
+        # Complete-K GMM stores overwrite every nonempty home matrix. Only
+        # skipped experts need zero initialization before remote additions.
+        for expert in empty_experts:
+            grad_weight1[expert].zero_()
+            grad_weight2[expert].zero_()
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -256,13 +248,6 @@ def _allocate_backward_intermediates(
     )
     # Empty experts must retain exact zero gradients on the baseline kernel.
     return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
-
-
-def _restore_weight_gradient_layout(spec: Any, gradient: torch.Tensor) -> torch.Tensor:
-    """Return native weight gradients in the caller-selected physical layout."""
-    if spec.expert_weight_layout == "EOI":
-        return gradient.transpose(-2, -1)
-    return gradient
 
 
 def _native_weight_operand(weight: torch.Tensor, plan: MegaMoePlan) -> torch.Tensor:
@@ -735,7 +720,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 probs = topk_weights.float().contiguous()
                 ctx.topk_dtype = topk_weights.dtype
                 permutation_inputs += (output, probs)
-                output = (torch_npu.npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
+                output = (load_torch_npu().npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
                           if ctx.source_rows else output[:0])
             _save_forward_state(
                 ctx,
@@ -838,17 +823,11 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None, None, None,
             ))
             grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
-            grad_weight1 = _restore_weight_gradient_layout(
-                plan.spec, execution.intermediates.grad_weight1
-            )
-            grad_weight2 = _restore_weight_gradient_layout(
-                plan.spec, execution.intermediates.grad_weight2
-            )
             _release_completed_graph(ctx, workspace)
             return (
                 grad_input,
-                grad_weight1,
-                grad_weight2,
+                execution.intermediates.grad_weight1,
+                execution.intermediates.grad_weight2,
                 None,
                 None,
                 None,

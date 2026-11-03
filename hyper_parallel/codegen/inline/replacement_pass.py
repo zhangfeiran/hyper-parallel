@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | None = None) -> InlinePatchSet:
-    """Build constructor replacement patches from ``replace_module`` targets.
+    """Build constructor replacement patches from module actions.
 
     The rule's settled FQNs (``rule.match``, recorded from the same plan the
     native path applies) define the *scope* of each rewrite: only the
@@ -42,7 +42,7 @@ def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | N
     decided would make the artifact diverge from the trained model.
 
     The plan records one entry per matched FQN, so the entries sharing a
-    ``replace_module`` target must be merged: taking only the first would scope
+    module implementation must be merged: taking only the first would scope
     the rewrite to a single matched attribute (``input_layernorm``) and silently
     leave its siblings (``post_attention_layernorm``, ``model.norm``) on the
     original class.
@@ -71,7 +71,7 @@ def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | N
         scope_attrs = tuple(sorted(scopes_by_target[target]))
         if not scope_attrs:
             logger.warning(
-                "codegen: replace_module %r matched no module and is not expanded",
+                "codegen: module replacement %r matched no module and is not expanded",
                 target,
             )
             continue

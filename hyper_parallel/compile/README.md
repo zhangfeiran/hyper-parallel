@@ -41,11 +41,16 @@ pass_config = PassConfig(enable_overlap=True)
 
 ```text
 DeadCodeElimination → CanonicalizeGraph → FSDPPass
-    → AutoOverlapPass → FsdpOverlapPass → [PP: PpPass]
+    → AutoOverlapPass → FsdpOverlapPass → [PP: PpPass] → [Inductor: InductorPass]
 ```
 
-`PpPass` runs last so every graph-level pass still sees the joint graph;
-it then replaces it with the schedule stub.
+`PpPass` runs last among the graph-level passes so every pass still sees the
+joint graph; it then replaces it with the schedule stub. `InductorPass`
+(when `inductor_mode` is enabled) is TERMINAL: it lowers the graph to
+TorchInductor kernels, after which the FX graph wraps the compiled callable
+and no further graph-level pass may run. With PP enabled it compiles the
+schedule's per-stage forward/backward subgraphs instead of the stub (see
+below).
 
 **FSDPPass** (data-parallel, `PassConfig.dp_mode`):
 
@@ -69,10 +74,15 @@ Disable reshard with `PassConfig(fsdp_reshard_after_forward=False)`.
 
 **PpPass** (pipeline-parallel, `PassConfig.pp_enabled`):
 
-- Splits the (post-FSDP) joint graph to this rank's stage at module-FQN
+- Splits the (post-FSDP) joint graph to this rank's stage(s) at module-FQN
   boundaries, exchanging boundary activations/gradients via P2P
-- Installs a self-contained GPipe / 1F1B schedule (`pp_schedule`) as a
-  `call_module` stub, so the trainer needs no PP wiring
+- Installs a self-contained GPipe / 1F1B / Interleaved-1F1B (VPP) schedule
+  (`pp_schedule`) as a `call_module` stub, so the trainer needs no PP wiring
+- `pp_chunks > 1` enables VPP: the model is split into
+  `pp_degree * pp_chunks` virtual stages, rank `r` owns
+  `r, r + pp_degree, ...`, and `pp_schedule: vpp` (alias
+  `interleaved_1f1b`) pipelines them with the classic interleaved-1F1B
+  warmup / steady / cooldown order
 - Pure PP: `fsdp_enabled=False`, `pp_degree == world_size`; the PP+FSDP /
   PP+DDP hybrid uses the 2-D `(pp, DP)` mesh built by the compiler, which
   registers the intra-stage DP group (`"fsdp"` / `"dp_replicate"`) and the
@@ -87,6 +97,50 @@ Disable reshard with `PassConfig(fsdp_reshard_after_forward=False)`.
 - **Placeholder no-op today**: `enable_overlap` is accepted, but the pass
   does not yet reorder `wait_tensor` nodes. Sinking waits past independent
   compute is planned.
+
+**InductorPass** (terminal backend compilation, `PassConfig.inductor_mode`):
+
+- `"regional"` compiles tagged compute regions with TorchInductor (kernel
+  fusion, Inductor caching) while keeping `_c10d_functional` collectives,
+  their waits, and side-effectful nodes (the FSDP reshard storage free) as
+  eager FX nodes — the comm scheduling surface the overlap passes built stays
+  observable at runtime.
+- `"full"` compiles the whole joint graph as one region (c10d functional
+  collectives included, functionalized by Inductor). It always sets
+  `reorder_for_peak_memory=True` so AOTAutograd keeps the fwd/bwd
+  interleaving.
+- Both modes force `torch._inductor.config.eager_numerics.division_rounding`
+  on torch builds that provide it (2.11+), so compiled code is bitwise-equal
+  to eager (unit-tested loss/gradient parity), and restore the positional
+  calling convention that
+  `run_traced_graph` relies on (`regional_inductor` otherwise switches the
+  graph to boxed codegen).
+- Nodes inserted by earlier passes carry no fake metadata; the pass
+  re-propagates shapes with `FakeTensorProp` on the graph's own
+  `FakeTensorMode` before compiling.
+- Requires `example_inputs` (the tracer's fake inputs) for the non-PP joint
+  graph. With active PP, `PpPass` first replaces the joint graph with the
+  schedule stub; the pass then compiles every virtual stage's forward and
+  backward subgraph independently (both `regional` and `full`), deriving each
+  subgraph's fake inputs from its own placeholders. The stub stays the outer
+  entry point and the schedule's P2P remains outside the compiled regions —
+  cross-stage fusion is impossible by construction. Stage forward subgraphs
+  can export multi-result ops (e.g. `nll_loss_forward`) as saved values; their
+  nested output is flattened to `getitem` leaves before compilation and
+  rebuilt by a wrapper, since AOTAutograd's regional path requires flat
+  outputs.
+  `inductor_configs` (a `PassConfig` field) forwards
+  `torch._inductor.config` overrides to the compiled regions.
+
+Inductor settings live on `PassConfig` (like the PP settings), not in the
+YAML-facing `compile:` section:
+
+```python
+pass_config = PassConfig(
+    inductor_mode="regional",                  # or "full"
+    inductor_configs={"reorder_for_peak_memory": True},  # optional overrides
+)
+```
 
 **FsdpOverlapPass** (independent FSDP graph controls):
 
@@ -266,7 +320,7 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 | Axis | Status | Notes |
 |------|--------|-------|
 | FSDP / DDP / HSDP | Implemented | `FSDPPass`; `PassConfig.dp_mode` selects the mode |
-| PP | Implemented | `PpPass` + `pp_schedule` (`gpipe` / `1f1b`); pure PP and the PP+FSDP / PP+DDP hybrid (2-D `(pp, DP)` mesh) |
+| PP | Implemented | `PpPass` + `pp_schedule` (`gpipe` / `1f1b` / `interleaved_1f1b` / `vpp`), including VPP via `pp_chunks > 1`; pure PP and the PP+FSDP / PP+DDP hybrid (2-D `(pp, DP)` mesh) |
 | TP (+ SP / LP) | Via `mesh_context` | TP collectives are baked into automodel boundary forwards; graph mode reuses the mesh |
 | PP + HSDP / PP + TP | Planned | HSDP needs a 3-D mesh; TP-in-stage needs per-stage TP collectives in the graph |
 | EP | Planned | — |
@@ -294,7 +348,26 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
   intra-stage DP group and the cross-stage `"pp"` group. PP+HSDP (3-D mesh)
   and PP composed with an external `MeshContext` are not supported yet.
   Without a pp group (direct `PpPass` use), `fsdp_enabled=True` is rejected.
+- **VPP stage plan**: with `pp_chunks > 1`, a manual `GraphParallelPlan`
+  must declare `pp_degree * pp_chunks` exact module FQNs (one list per
+  virtual stage); auto split distributes layers evenly across the virtual
+  stages. The interleaved schedule ships boundary values between adjacent
+  virtual stages, including the last-stage -> rank-0 wrap edge.
 - **`AutoOverlapPass` is a placeholder no-op** — see the pass note above.
+- **`InductorPass` composes with PP (and everything else)**: `regional` /
+  `full` backend compilation runs after `PpPass` and compiles each virtual
+  stage's forward/backward subgraph through the schedule's
+  `map_stage_graphs` hook; the schedule stub itself is never compiled and its
+  P2P stays eager. Both modes require a torch build that ships
+  `torch.fx.passes.regional_inductor` (newer than 2.9; the supported 2.6 /
+  2.7 / 2.9 builds do not). On older builds the pass logs a warning, leaves
+  the graph untouched and records `inductor_compiled="unavailable"` instead of
+  raising. Compiled regions are keyed to the traced static input shapes —
+  exactly like stock
+  `torch.compile` static tracing; dynamic-shape graphs keep working (Inductor
+  compiles the symbolic graph with its own guards), but the combination is
+  validated on CPU only, and `dynamic` plus PP remains rejected by
+  `GraphCompiler` (independent of Inductor).
 - **Compilation is not idempotent**: the partitioning passes mutate the live
   model in place, so `GraphCompiler.compile` may only be called once — a
   second call silently re-traces the already-partitioned model and yields an

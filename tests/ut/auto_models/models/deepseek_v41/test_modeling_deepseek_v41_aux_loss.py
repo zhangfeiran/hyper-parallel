@@ -58,13 +58,15 @@ from tests.common.mark_utils import arg_mark
 # Match the text/VLM recipe contract without requiring repository-only examples.
 _ROUTER_OVERRIDE_YAML = """
 plan_overrides:
-  - match: "{match}"
+  - match: "{match}.forward"
     when: ep
     region_dispatch: false
-    local_compute_fn:
-      _target_: >-
-        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
-      use_grouped_gemm: true
+    replace:
+      kind: method
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+        use_grouped_gemm: true
 """
 
 
@@ -417,7 +419,7 @@ class TestV41NativeAuxLoss(unittest.TestCase):
             entries = [
                 resolve_component(entry, annotation=PlanOverride, path="plan_overrides")
                 for entry in raw["plan_overrides"]
-                if isinstance(entry["match"], str) and entry["match"].endswith(".mlp")
+                if isinstance(entry["match"], str) and entry["match"].endswith(".mlp.forward")
             ]
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries_to_plan_overrides(entries, ep_size=1), {})

@@ -16,16 +16,17 @@
 
 Since the explicit-injection rework the framework NEVER picks a CP wrapper
 automatically: the built-ins below are referenced explicitly — by
-registry name (``spec.inner_wrapper="sdpa_hf"``), by callable, or by a YAML
-Target pointing at one of these functions:
+registry name in an internal plan, by callable, or by a public forward
+replacement pointing at one of these functions:
 
 .. code-block:: yaml
 
     plan_overrides:
-      - match: "*.self_attn"
+      - match: "*.self_attn.forward"
         when: cp
-        inner_wrapper:
-          _target_: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper
+        replace:
+          kind: method
+          implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper
 
 Wrapper contract (also the Target factory contract — at apply time the
 Target is built with its declared context, filled by name)::

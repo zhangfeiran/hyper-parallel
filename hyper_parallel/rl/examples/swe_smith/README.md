@@ -134,7 +134,7 @@ swe_common+=(--docker-host ssh://USER@HOST:PORT)
 
 ## Asynchronous training
 
-Pass `--config hyper_parallel/rl/examples/async_training/configs/qwen3_4b_swe_smith.yaml`
+Pass `--config hyper_parallel/rl/examples/fully_async/configs/qwen3_4b_swe_smith.yaml`
 to the existing launcher, with disjoint `--devices 0,1 --rollout-devices 2,3`.
 Qwen3.5/3.8 colocated recipes remain synchronous; see the
 [publication and recovery contract](../../docs/architecture.md#rayless-asynchronous-grpo).
