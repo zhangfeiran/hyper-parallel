@@ -76,22 +76,20 @@ class TestQuotaAdmission(unittest.TestCase):
                     self.assertEqual(route.plan.destination_loads[0], 60800)
                     self.assertFalse(route.plan.transfers)
 
-    def test_minimum_fragment_pruning_keeps_the_full_planner(self) -> None:
-        """Source-sensitive pruning cannot use the quota-only rejection shortcut."""
+    def test_fragment_pruning_rejection_skips_source_materialization(self) -> None:
+        """An explicit capacity makes the default fragment rejection source independent."""
         ids, gathered = self.gathered(self.counts())
         with (patch.object(routing, 'dist') as distributed,
-              patch.object(routing, '_uncalibrated_copies', side_effect=AssertionError('Quota shortcut')),
-              patch.object(routing, 'build_expert_replica_plan', wraps=routing.build_expert_replica_plan) as build):
+              patch.object(routing, 'build_expert_replica_plan', side_effect=AssertionError('Full source planner'))):
             distributed.is_initialized.return_value = True
             distributed.get_world_size.return_value = 64
             distributed.get_rank.return_value = 0
             route = routing.prepare_replica_route(
-                ids, ExpertReplicaConfig(384, 64, 2), compact_home=True, minimum_replica_rows=1,
+                ids, ExpertReplicaConfig(384, 64, 2), compact_home=True, minimum_replica_rows=1024,
                 minimum_load_reduction=.4, dynamic_header=(0, 4096, 31), _auto_capacity_factor=1.25,
                 _capacity_budget=Mock(return_value=300000), _gathered_counts=gathered)
-        self.assertEqual(build.call_count, 1)
         self.assertTrue(route.home_only)
-        self.assertFalse(route.plan_bypassed)
+        self.assertTrue(route.plan_bypassed)
 
     def test_required_capacity_copies_are_not_rejected(self) -> None:
         """An owner that exceeds the hard allowance still reaches full source planning."""
@@ -176,6 +174,29 @@ class TestQuotaAdmission(unittest.TestCase):
         self.assertEqual(tuple(map(tuple, gathered.host_counts)), original)
         self.assertTrue(route.plan.transfers)
 
+    def test_fragment_pruning_reuses_raw_quotas_before_full_refinement(self) -> None:
+        """Profitable default-fragment plans reuse raw quotas and preserve exact dispatch."""
+        counts = [4096] + [4096 * 7 // 383 + int(index < 4096 * 7 % 383) for index in range(383)]
+        ids, gathered = self.gathered(counts)
+        for budget in (1, 2, 6):
+            with self.subTest(budget=budget):
+                expected = routing.build_expert_replica_plan(
+                    gathered.host_counts, budget, target_load=40960, capacity_limit=300000,
+                    receive_capacity=300000, minimum_load_reduction=.4, minimum_replica_rows=1024, adaptive=True)
+                with (patch.object(routing, 'dist') as distributed,
+                      patch.object(planner, '_uncalibrated_copies',
+                                   side_effect=AssertionError('Duplicate quota search'))):
+                    distributed.is_initialized.return_value = True
+                    distributed.get_world_size.return_value = 64
+                    distributed.get_rank.return_value = 0
+                    route = routing.prepare_replica_route(
+                        ids, ExpertReplicaConfig(384, 64, budget), compact_home=True,
+                        minimum_replica_rows=1024, minimum_load_reduction=.4,
+                        dynamic_header=(0, 4096, 31), _auto_capacity_factor=1.25,
+                        _capacity_budget=Mock(return_value=300000), _gathered_counts=gathered)
+                self.assertEqual(route.plan, expected)
+                self.assertTrue(route.plan.transfers)
+
     def test_changed_policy_or_totals_recompute_prepared_quotas(self) -> None:
         """A previously affordable proposal cannot override a changed target or source histogram."""
         counts = ((100, 0, 0, 0), (0, 0, 0, 0))
@@ -217,8 +238,8 @@ class TestQuotaAdmission(unittest.TestCase):
     def test_recompute_reuses_rejected_quotas_while_owner_still_fits(self) -> None:
         """A changed allocator allowance need not repeat the same rejected quota search."""
         ids, gathered = self.gathered(self.counts())
-        for budget in (1, 2, 6):
-            with self.subTest(budget=budget):
+        for budget, minimum_rows in ((1, 0), (2, 0), (6, 0), (1, 1024), (2, 1024), (6, 1024)):
+            with self.subTest(budget=budget, minimum_rows=minimum_rows):
                 with (patch.object(routing, 'dist') as distributed,
                       patch.object(routing, '_uncalibrated_copies', wraps=routing._uncalibrated_copies) as search,
                       patch.object(routing, 'build_expert_replica_plan', side_effect=AssertionError('Full planner'))):
@@ -226,7 +247,8 @@ class TestQuotaAdmission(unittest.TestCase):
                     distributed.get_world_size.return_value = 64
                     distributed.get_rank.return_value = 0
                     forward, replay = create_recompute_contexts()
-                    options = dict(compact_home=True, minimum_load_reduction=.4, dynamic_header=(0, 4096, 31),
+                    options = dict(compact_home=True, minimum_load_reduction=.4, minimum_replica_rows=minimum_rows,
+                                   dynamic_header=(0, 4096, 31),
                                    _auto_capacity_factor=1.25, _gathered_counts=gathered)
                     with forward:
                         first = routing.prepare_replica_route(
@@ -294,6 +316,34 @@ class TestQuotaAdmission(unittest.TestCase):
         self.assertTrue(second.plan.transfers)
         self.assertLessEqual(max(second.plan.destination_loads), 60000)
 
+    def test_rejected_quota_cache_invalidates_fragment_threshold(self) -> None:
+        """A relaxed fragment threshold can admit copies rejected by the original forward."""
+        counts = [128] + [896 // 47 + int(index < 896 % 47) for index in range(47)]
+        logical = torch.tensor([counts] * 8, dtype=torch.int32)
+        ids = torch.repeat_interleave(torch.arange(48), torch.tensor(counts)).reshape(8, 128).T.contiguous()
+        summary = [[0, 128, 31, 1024, min(counts), max(counts), 8 * sum(counts[rank * 6:(rank + 1) * 6])]
+                   for rank in range(8)]
+        gathered = routing._GatheredReplicaCounts(logical, summary, logical.tolist())
+        with (patch.object(routing, 'dist') as distributed,
+              patch.object(routing, '_uncalibrated_copies', wraps=routing._uncalibrated_copies) as search):
+            distributed.is_initialized.return_value = True
+            distributed.get_world_size.return_value = 8
+            distributed.get_rank.return_value = 0
+            forward, replay = create_recompute_contexts()
+            options = dict(compact_home=True, minimum_load_reduction=.4,
+                           dynamic_header=(0, 128, 31),
+                           _auto_capacity_factor=1., _capacity_budget=Mock(return_value=6000),
+                           _gathered_counts=gathered)
+            with forward:
+                first = routing.prepare_replica_route(ids, ExpertReplicaConfig(48, 8, 2), **options,
+                                                       minimum_replica_rows=1024)
+            with replay:
+                second = routing.prepare_replica_route(ids, ExpertReplicaConfig(48, 8, 2), **options,
+                                                        minimum_replica_rows=0)
+        self.assertTrue(first.home_only)
+        self.assertEqual(search.call_count, 2)
+        self.assertTrue(second.plan.transfers)
+
     def test_rejected_quotas_preserve_mixed_checkpoint_call_order(self) -> None:
         """A rejected call must consume exactly its own cache entry before a profitable call."""
         home_ids, home_counts = self.gathered(self.counts())
@@ -314,7 +364,8 @@ class TestQuotaAdmission(unittest.TestCase):
                 guest = routing.prepare_replica_route(guest_ids, config, **options, _gathered_counts=guest_counts)
             with replay:
                 home_replay = routing.prepare_replica_route(home_ids, config, **options, _gathered_counts=home_counts)
-                guest_replay = routing.prepare_replica_route(guest_ids, config, **options, _gathered_counts=guest_counts)
+                guest_replay = routing.prepare_replica_route(
+                    guest_ids, config, **options, _gathered_counts=guest_counts)
         self.assertEqual(search.call_count, 2)
         self.assertEqual(build.call_count, 1)
         self.assertTrue(home.home_only and home_replay.home_only)

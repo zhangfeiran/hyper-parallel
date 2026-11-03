@@ -793,7 +793,7 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
             return _materialize(counts, copies, config, capacity_limit, rank_nodes=rank_nodes)
 
         resident = min(limit, receive_capacity) if receive_capacity is not None else limit
-        if (_uncalibrated_candidate is not None and cost_model is None and not minimum_replica_rows
+        if (_uncalibrated_candidate is not None and cost_model is None
                 and _uncalibrated_candidate.matches(expert_counts, config, limit, resident, target)):
             copies, bounds = _uncalibrated_candidate.copies, None
         else:

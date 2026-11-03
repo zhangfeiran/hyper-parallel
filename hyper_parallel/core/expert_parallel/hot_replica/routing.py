@@ -39,6 +39,7 @@ from .plan import ExpertExecutionPlan, ExpertReplicaTransfer
 from .planner import (
     _build_expert_replica_plan as build_expert_replica_plan,
     _optional_peak_is_useful,
+    _prune_small_copies,
     _UncalibratedCandidate,
     _uncalibrated_copies,
 )
@@ -116,12 +117,14 @@ class _RejectedReplicaQuotas:
     target: int
     admission: int
     saved_rows: int
+    minimum_rows: int
 
     def matches(self, config: ExpertReplicaConfig, totals: list[int], loads: tuple[int, ...],
-                target: int, admission: int, saved_rows: int) -> bool:
+                target: int, admission: int, saved_rows: int, minimum_rows: int) -> bool:
         """Require the same quota inputs and benefit policy after fresh count agreement."""
         return (self.config == config and self.totals == tuple(totals) and self.loads == loads
-                and (self.target, self.admission, self.saved_rows) == (target, admission, saved_rows))
+                and (self.target, self.admission, self.saved_rows, self.minimum_rows)
+                == (target, admission, saved_rows, minimum_rows))
 
 
 class _RecomputedReplicaPlans:
@@ -432,8 +435,6 @@ def _try_compact_home_route(
         if cost_model is None:
             average = (sum(destination_loads) + config.ep_size - 1) // config.ep_size
             if _optional_peak_is_useful(average, destination_loads, resident, admission, minimum_saved_rows):
-                if minimum_replica_rows:
-                    return None
                 # A failed quota-level admission cannot be rescued by source
                 # dispatch construction. Keep the full count table on device.
                 if gathered_counts is not None and gathered_counts.host_counts is not None:
@@ -445,17 +446,26 @@ def _try_compact_home_route(
                 if cache is not None and cache.cursor < len(cache.entries):
                     previous = cache.entries[cache.cursor][0]
                 # Allocator limits above the owner peak cannot change the
-                # target-driven quota search or its optional-benefit rejection.
+                # quota search or fragment pruning, whose bound is owner peak.
                 if not (isinstance(previous, _RejectedReplicaQuotas) and previous.matches(
-                        config, totals, destination_loads, target, admission, minimum_saved_rows)):
+                        config, totals, destination_loads, target, admission, minimum_saved_rows,
+                        minimum_replica_rows)):
                     candidate = _uncalibrated_copies(totals, list(destination_loads), config, upper, resident, target)
-                    if candidate is not None and _optional_peak_is_useful(
-                            max(sum(row.values()) for row in candidate), destination_loads,
-                            resident, admission, minimum_saved_rows):
+                    pruned = candidate
+                    if candidate is not None and minimum_replica_rows:
+                        pruned = [dict(row) for row in candidate]
+                        # An explicit limit makes pruning source independent.
+                        # Keep raw quotas for exactly one full-plan refinement.
+                        _prune_small_copies(pruned, (), list(destination_loads), config,
+                                            minimum_replica_rows, resident)
+                    if (pruned is not None and any(expert // config.home_experts != rank and count
+                                                  for rank, row in enumerate(pruned) for expert, count in row.items())
+                            and _optional_peak_is_useful(max(sum(row.values()) for row in pruned), destination_loads,
+                                                        resident, admission, minimum_saved_rows)):
                         return _UncalibratedCandidate(config, tuple(totals), candidate, upper, resident, target)
                 if state is not None and not state.is_recomputing:
                     decision = _RejectedReplicaQuotas(config, tuple(totals), destination_loads,
-                                                      target, admission, minimum_saved_rows)
+                                                      target, admission, minimum_saved_rows, minimum_replica_rows)
         elif not _compact_home_cost_dominates(totals, rows, config, cost_model):
             return None
     counts = logical.to(torch.int32).contiguous()
