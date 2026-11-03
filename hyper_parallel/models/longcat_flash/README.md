@@ -14,11 +14,16 @@ softmax, selection-only correction bias, and the original scaled probabilities w
 IDs below `n_routed_experts` select parameterized SwiGLU experts. The remaining IDs select identity
 experts. Each selected identity contributes its routing probability multiplied by the input token.
 Real and identity contributions are accumulated in expert order, retaining the reference's per-contribution
-cast. Identity weights and the input bypass remain differentiable.
+cast. Identity weights and the input bypass remain differentiable. Storage-sharing identity input views and
+an ordered gather backward preserve HF's per-expert BF16 input-gradient accumulation without expanding
+identity tokens. Native fused SwiGLU and HF's separate SiLU/multiply have different BF16 cast boundaries;
+validation reports must distinguish these arithmetic references.
 
 `LongcatFlashMegaMoeExperts` compacts active real assignments into a K=1 `MegaMoeExperts` executor.
 The `megamoe` backend requires BF16 NPU inputs and supports push and pull. The explicit `native` backend
-uses portable expert mathematics and differentiable EP collectives. Empty sources still participate when
+uses NPU permute/unpermute, grouped GEMM, fused SwiGLU and differentiable EP collectives on Ascend.
+On CPU it uses the portable expert reference. The explicit `eager` backend retains the per-expert
+PyTorch reference on every device. Empty sources still participate when
 other ranks have real assignments. A globally identity-only call leaves expert gradients unused.
 
 Compaction materializes ordinary `[R, H]` scratch for the real assignments. It avoids identity traffic and

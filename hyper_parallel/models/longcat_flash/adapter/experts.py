@@ -29,11 +29,13 @@ from hyper_parallel.components.checkpoint.weight_conversion import WeightConvert
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.multicore.modules.mega_moe.assignments import masked_expert_forward
 from hyper_parallel.models.longcat_flash.adapter.layout import ExpertOwnershipPacking
+from hyper_parallel.models.longcat_flash.adapter.routing import OrderedInputGather
 from hyper_parallel.models.replacement import module_replacement
 
 
 def identity_contribution(hidden: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor,
-                          real_experts: int, initial: torch.Tensor | None = None) -> torch.Tensor:
+                          real_experts: int, initial: torch.Tensor | None = None,
+                          inputs: tuple[torch.Tensor, ...] | None = None) -> torch.Tensor:
     """Accumulate identity slots in expert order with HF's per-contribution cast.
 
     Args:
@@ -41,13 +43,16 @@ def identity_contribution(hidden: torch.Tensor, ids: torch.Tensor, weights: torc
         ids: Selected global expert IDs.
         weights: Current differentiable routing or expert weights.
         real_experts: Number of parameterized experts.
+        initial: Already accumulated real-expert output.
+        inputs: Optional storage-sharing identity views with an ordered source backward.
     """
     order = ids.argsort(dim=-1)
     ordered_ids, ordered_weights = ids.gather(1, order), weights.gather(1, order)
     output = torch.zeros_like(hidden) if initial is None else initial
     for slot in range(ids.shape[1]):
         probability = ordered_weights[:, slot] * (ordered_ids[:, slot] >= real_experts)
-        output = output + (hidden * probability[:, None]).to(hidden.dtype)
+        source = hidden if inputs is None else inputs[slot]
+        output = output + (source * probability[:, None]).to(hidden.dtype)
     return output
 
 
@@ -65,7 +70,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             module: Executable HF LongcatFlashExperts with packed SwiGLU weights.
             module_fqn: Framework replacement scope.
             context: Resolved parallel sizes and sequence-parallel setting.
-            backend: Explicit megamoe NPU backend or portable native reference.
+            backend: MegaMoE, native NPU big operators, or explicit eager reference.
             dispatch_mode: MegaMoE push or pull transport.
             replica_slots_per_rank: Optional real-expert guest budget.
             expert_weight_layout: EOI avoids copies; EIO enables current hot replicas.
@@ -116,13 +121,13 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             replica_slots_per_rank: Declared replica slots per rank value.
             expert_weight_layout: Declared expert weight layout value.
         """
-        if backend not in ("megamoe", "native"):
-            raise ValueError("LongCat expert backend must be megamoe or native")
+        if backend not in ("megamoe", "native", "eager"):
+            raise ValueError("LongCat expert backend must be megamoe, native or eager")
         if context.get("pp") or context.get("cp"):
             raise ValueError("LongCat Flash integration currently requires CP=PP=1")
         if context.get("tp"):
             raise ValueError("LongCat expert integration currently requires TP=1")
-        if backend == "native" and replica_slots_per_rank:
+        if backend != "megamoe" and replica_slots_per_rank:
             raise ValueError("native LongCat reference does not support expert replicas")
         if expert_weight_layout not in ("EOI", "EIO"):
             raise ValueError("expert_weight_layout must be EOI or EIO")
@@ -181,9 +186,14 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             ids: Selected global expert IDs.
             probabilities: K=1 placeholder weights consumed by the native executor.
         """
+        del probabilities
+        if self.backend == "native" and hidden.device.type == "npu":
+            from hyper_parallel.models.longcat_flash.adapter.npu import npu_expert_forward  # pylint: disable=C0415
+
+            return npu_expert_forward(hidden, ids, expert_weights, self._ep_group,
+                                      self.ep_size, self.num_experts, self.expert_weight_layout)
         from hyper_parallel.models.longcat_flash.adapter.native import native_expert_forward  # pylint: disable=C0415
 
-        del probabilities
         return native_expert_forward(hidden, ids, expert_weights, self._ep_group,
                                      self.ep_size, self.num_experts, self.expert_weight_layout)
 
@@ -209,10 +219,14 @@ class LongcatFlashMegaMoeExperts(nn.Module):
         order = top_k_index.argsort(dim=-1)
         top_k_index = top_k_index.gather(1, order)
         top_k_weights = top_k_weights.gather(1, order)
+        gather = OrderedInputGather(top_k_index.shape[1])
         if not self.num_experts:
+            empty = top_k_index.new_empty((0,))
+            gather(hidden, empty, empty)
             if bool(route_error):
                 raise ValueError("LongCat route contains an invalid expert ID")
-            return identity_contribution(hidden, top_k_index, top_k_weights, 0).reshape(original_shape)
+            return identity_contribution(hidden, top_k_index, top_k_weights, 0,
+                                         inputs=gather.identity_inputs).reshape(original_shape)
         if not self._configured:
             if self.ep_size != 1:
                 raise RuntimeError("Configure LongCat EP experts before execution")
@@ -226,9 +240,10 @@ class LongcatFlashMegaMoeExperts(nn.Module):
         executor = self._executor if self.backend == "megamoe" else _NativeExecutor(self)
         real = masked_expert_forward(executor, hidden, top_k_index, top_k_weights,
                                      top_k_index < self.num_experts, expert_weights=weights,
-                                     ep_group=self._ep_group, route_error=route_error)
+                                     ep_group=self._ep_group, route_error=route_error, input_gather=gather)
         return identity_contribution(hidden, top_k_index, top_k_weights,
-                                     self.num_experts, initial=real).reshape(original_shape)
+                                     self.num_experts, initial=real,
+                                     inputs=gather.identity_inputs).reshape(original_shape)
 
     def close_runtime(self) -> None:
         """Release native resources after the final backward."""

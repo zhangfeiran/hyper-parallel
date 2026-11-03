@@ -25,6 +25,7 @@ from transformers.models.longcat_flash.modeling_longcat_flash import LongcatFlas
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
 from hyper_parallel.models.longcat_flash.adapter.experts import LongcatFlashMegaMoeExperts
 from hyper_parallel.models.longcat_flash.adapter.layout import ExpertOwnershipPacking
+from hyper_parallel.models.longcat_flash.adapter.routing import OrderedInputGather
 from hyper_parallel.models.longcat_flash.modeling_longcat_flash import build_longcat_flash
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.models._transformers.model_builder import _initialize_model_weights
@@ -312,3 +313,21 @@ class TestLongcatIntegration(unittest.TestCase):
         model(tokens, labels=tokens, use_cache=False).loss.backward()
         optimizer.step()
         self.assertTrue(all(parameter.main_param.dtype == torch.float32 for parameter in model.parameters()))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_identity_aliases_and_ordered_bf16_source_gradient(self) -> None:
+        """Feature: Expert-ordered BF16 input gradients.
+
+        Description: Combine cancelling real and identity derivatives through storage-sharing aliases.
+        Expectation: Descending expert accumulation preserves the HF result without identity expansion.
+        """
+        hidden = torch.ones(1, 1, dtype=torch.bfloat16, requires_grad=True)
+        gather = OrderedInputGather(3)
+        real = gather(hidden, torch.tensor([0, 0]), torch.tensor([0, 1]))
+        self.assertTrue(all(value.data_ptr() == hidden.data_ptr() for value in gather.identity_inputs))
+        torch.autograd.backward((real, *gather.identity_inputs),
+                                (torch.tensor([[256.], [1.]], dtype=torch.bfloat16),
+                                 torch.zeros_like(hidden), torch.zeros_like(hidden),
+                                 torch.full_like(hidden, -256.)))
+        torch.testing.assert_close(hidden.grad, torch.ones_like(hidden), rtol=0, atol=0)

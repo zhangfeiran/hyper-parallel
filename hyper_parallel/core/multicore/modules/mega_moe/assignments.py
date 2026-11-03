@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -46,6 +46,7 @@ def masked_expert_forward(
     expert_weights: tuple[torch.Tensor, torch.Tensor],
     ep_group: Any = None,
     route_error: torch.Tensor | None = None,
+    input_gather: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Compact active slots, execute real experts, and restore original tokens.
 
@@ -58,6 +59,7 @@ def masked_expert_forward(
         expert_weights: Current local unsharded Gate/Up and Down weights.
         ep_group: Explicit expert group; None selects standalone execution.
         route_error: Optional caller-detected route error, agreed across the EP group.
+        input_gather: Optional source gather with a custom backward; called even for an empty route.
 
     Returns:
         Weighted real-expert contribution in the original token order.
@@ -78,10 +80,12 @@ def masked_expert_forward(
     total, invalid_count = agreement.tolist()
     if invalid_count:
         raise ValueError("an active route contains an invalid real expert ID")
+    states = input_gather(hidden_states, token, slot) if input_gather is not None else None
     if total == 0:
         # Preserve unused expert parameters as grad=None, including AdamW decay.
         return hidden_states * 0 + routing_weights.sum().to(hidden_states.dtype) * 0
-    states = hidden_states.index_select(0, token)
+    if states is None:
+        states = hidden_states.index_select(0, token)
     unweighted = executor(
         states, ids, routing_weights.new_ones((ids.shape[0], 1)), expert_weights=expert_weights,
     )

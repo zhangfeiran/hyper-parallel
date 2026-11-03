@@ -72,13 +72,17 @@ def _build_case(backend: str, device_type: str, mode: str, world: int,
     reference = copy.deepcopy(model)
     entries = _resolve_entries(backend, mode, device_type)
     reference_mode = os.getenv("HP_LONGCAT_REFERENCE", "hf")
-    if reference_mode == "same_dense":
-        dense_entries = [entry for entry in entries if not (
+    if reference_mode in ("same_dense", "native"):
+        reference_entries = _resolve_entries("native", mode, device_type) if reference_mode == "native" else entries
+        dense_entries = [entry for entry in reference_entries if reference_mode == "native" or not (
             entry.replace is not None and entry.replace.kind == "module"
             and entry.replace.implementation.callable is LongcatFlashMegaMoeExperts)]
         dense_rules = entries_to_module_replacements(dense_entries)
+        reference_context = {"ep_size": world, "ep": world > 1} if reference_mode == "native" else {}
         apply_module_replacements(reference, compile_module_replacements(reference, dense_rules),
-                                  weights_mapping=[])
+                                  context=reference_context, weights_mapping=[])
+        if reference_mode == "native":
+            register_materialization(reference)
     replacements = entries_to_module_replacements(entries)
     conversions = []
     apply_module_replacements(model, compile_module_replacements(model, replacements),
@@ -92,6 +96,9 @@ def _build_case(backend: str, device_type: str, mode: str, world: int,
     overrides = entries_to_plan_overrides(entries, ep_size=world)
     plan = ShardingPlanner(plan_overrides=overrides).plan(model, mesh.device_mesh, ep_size=world)
     apply_sharding_plan(model, plan, mesh)
+    if reference_mode == "native":
+        reference_plan = ShardingPlanner(plan_overrides=overrides).plan(reference, mesh.device_mesh, ep_size=world)
+        apply_sharding_plan(reference, reference_plan, mesh)
     return model, reference, config, dtype
 
 
@@ -161,24 +168,35 @@ def _expert_reference_gradient(name: str, parameters: dict, gradient: Any) -> An
     return gradient
 
 
+def _expected_gradient(name: str, parameters: dict, config: dict, world: int, rank: int) -> Any:
+    """Resolve physical owner gradients or reduce and pack the unsharded HF oracle."""
+    gradient = _reference_gradient(name, parameters)
+    sharded_reference = ".experts." in name and os.getenv("HP_LONGCAT_REFERENCE", "hf") == "native"
+    if ".experts." in name and not sharded_reference:
+        gradient = _expert_reference_gradient(name, parameters, gradient)
+    if isinstance(gradient, DTensor):
+        gradient = gradient.to_local()
+    if gradient is None:
+        return None
+    if ".experts." in name and not sharded_reference:
+        if name.endswith("gate_up_proj"):
+            gradient = ExpertOwnershipPacking(config["n_routed_experts"],
+                                               config["zero_expert_num"], world).apply(gradient)
+        gradient = gradient.chunk(world)[rank]
+    return gradient
+
+
 def _gradient_metrics(model: Any, reference: Any, config: dict, world: int,
                       rank: int, dtype: torch.dtype, rtol: float) -> tuple:
     """Collect all failures so every rank executes the same collective sequence."""
     observed, relative_errors, failures = {}, {}, {}
     parameters = dict(reference.named_parameters())
     for name, parameter in model.named_parameters():
-        gradient = _reference_gradient(name, parameters)
-        if ".experts." in name:
-            gradient = _expert_reference_gradient(name, parameters, gradient)
+        gradient = _expected_gradient(name, parameters, config, world, rank)
         if gradient is None:
             if parameter.grad is not None:
                 failures[name] = "unexpected gradient for an unused parameter"
             continue
-        if ".experts." in name:
-            if name.endswith("gate_up_proj"):
-                gradient = ExpertOwnershipPacking(config["n_routed_experts"],
-                                                   config["zero_expert_num"], world).apply(gradient)
-            gradient = gradient.chunk(world)[rank]
         actual = parameter.grad.to_local() if isinstance(parameter.grad, DTensor) else parameter.grad
         if actual is None:
             failures[name] = "missing gradient for a globally active parameter"
