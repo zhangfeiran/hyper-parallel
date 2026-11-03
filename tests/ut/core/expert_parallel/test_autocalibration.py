@@ -20,6 +20,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
+import socket
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -312,3 +314,44 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
                         self.assertEqual(payload['stage_environment'][phase]
                             ['HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT'], f'tcp://127.0.0.1:{port}')
             self.assertFalse((root / 'run').exists())
+
+    def test_cluster_dry_run_bounds_long_scheduler_hostname_without_dns(self) -> None:
+        """A long allocation identity must not become an overlong native SHMEM endpoint."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.manifest(root)
+            repository = Path(__file__).resolve().parents[4]
+            address = 'worker-0.' + 'a' * 60 + '.allocation.invalid'
+            environment = os.environ | {'NNODES': '8', 'NODE_RANK': '0', 'NUM_CARDS': '16',
+                                         'MASTER_ADDR': address, 'MASTER_PORT_BASE': '29300'}
+            result = subprocess.run([sys.executable, str(repository / 'scripts/replica_autocalibration.py'),
+                '--manifest', str(root / 'model.json'), '--output', str(root / 'run'), '--dry-run'],
+                check=True, capture_output=True, text=True, env=environment)
+            payload = json.loads(result.stdout)
+            for phase in ('collect', 'verify'):
+                endpoint = payload['stage_environment'][phase]['HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT']
+                self.assertLessEqual(len(endpoint.encode()), 63)
+                self.assertIn(f'--master-addr={address}', payload['commands'][phase])
+            self.assertFalse((root / 'run').exists())
+
+    def test_cluster_endpoint_resolves_only_the_shmem_host_and_checks_native_limit(self) -> None:
+        """Both phase endpoints use the resolved IPv4 without changing the allocation hostname."""
+        repository = Path(__file__).resolve().parents[4]
+        coordinator = runpy.run_path(str(repository / 'scripts/replica_autocalibration.py'))
+        address = 'worker-0.' + 'a' * 60 + '.allocation.invalid'
+        with patch('socket.gethostbyname', return_value='192.0.2.100') as resolve:
+            host = coordinator['_shmem_host'](address, dry_run=False)
+            resolve.assert_called_once_with(address)
+        for port in (29301, 29303):
+            endpoint = coordinator['_shmem_endpoint'](host, port)
+            self.assertEqual(endpoint, f'tcp://192.0.2.100:{port}')
+        with patch('socket.gethostbyname', side_effect=AssertionError('Dry run must not perform DNS')):
+            self.assertEqual(coordinator['_shmem_host'](address, dry_run=True), 'resolved-ipv4-at-launch')
+            self.assertEqual(coordinator['_shmem_host']('192.0.2.100', dry_run=False), '192.0.2.100')
+        with patch('socket.gethostbyname', side_effect=socket.gaierror('Unknown host')):
+            with self.assertRaisesRegex(ValueError, 'Cannot resolve SHMEM bootstrap host to IPv4'):
+                coordinator['_shmem_host'](address, dry_run=False)
+        with self.assertRaisesRegex(ValueError, 'at most 63 bytes'):
+            coordinator['_shmem_endpoint'](address, 29301)
+        with self.assertRaisesRegex(ValueError, 'valid port'):
+            coordinator['_shmem_endpoint'](host, 65536)

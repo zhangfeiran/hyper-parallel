@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -81,6 +82,30 @@ def _terminate(signum: int, _frame: Any) -> None:
     raise SystemExit(128 + signum)
 
 
+def _shmem_host(address: str, *, dry_run: bool) -> str:
+    """Keep the allocation identity intact while shortening the native bootstrap host."""
+    try:
+        socket.inet_pton(socket.AF_INET, address)
+        return address
+    except OSError:
+        if dry_run:
+            return 'resolved-ipv4-at-launch'
+    try:
+        resolved = socket.gethostbyname(address)
+        socket.inet_pton(socket.AF_INET, resolved)
+    except OSError as error:
+        raise ValueError(f'Cannot resolve SHMEM bootstrap host to IPv4: {address}') from error
+    return resolved
+
+
+def _shmem_endpoint(host: str, port: int) -> str:
+    """Fail before starting workers if the native bootstrap ABI cannot hold the endpoint."""
+    endpoint = f'tcp://{host}:{port}'
+    if not 1 <= port <= 65535 or len(endpoint.encode()) > 63:
+        raise ValueError(f'SHMEM bootstrap endpoint must use a valid port and at most 63 bytes: {endpoint}')
+    return endpoint
+
+
 def main() -> None:
     """Run on every node; publish only after all ranks and both untouched holdouts pass."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -121,8 +146,9 @@ def main() -> None:
                                                                  '--candidate-directory', str(args.output / 'models')],
                 'publish': fitter + ['--input', str(args.output / 'verify'), '--verify']}
     commands['verify'] += ['--placement-output', str(args.output / 'verify' / 'placement')]
+    shmem_host = _shmem_host(address, dry_run=args.dry_run)
     stage_environment = {
-        phase: {'HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT': f'tcp://{address}:{endpoint_port}'}
+        phase: {'HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT': _shmem_endpoint(shmem_host, endpoint_port)}
         for phase, endpoint_port in (('collect', port + 1), ('verify', port + 3))
     }
     if args.dry_run:
