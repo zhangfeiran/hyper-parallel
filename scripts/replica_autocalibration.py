@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Scheduler-neutral collection, fitting and model-in-loop calibration coordinator."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+def _write(path: Path, value: Any) -> None:
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(value, indent=2) + '\n')
+    temporary.replace(path)
+
+
+def _run(command: list[str], log: Path, timeout: int, peers: list[Path] | None = None) -> int:
+    """Own the full child process group through normal completion or interruption."""
+    with log.open('w') as stream:
+        process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                status = process.poll()
+                if status is not None:
+                    return status
+                if peers and any(json.loads(path.read_text())['exit_status'] for path in peers if path.exists()):
+                    raise RuntimeError('A peer calibration node failed')
+                time.sleep(.5)
+            raise subprocess.TimeoutExpired(command, timeout)
+        except BaseException:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            raise
+
+
+def _wait(paths: list[Path], timeout: int) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        present = [json.loads(path.read_text()) for path in paths if path.exists()]
+        if any(record['exit_status'] for record in present):
+            raise RuntimeError(f'Calibration stage failed: {present}')
+        if len(present) == len(paths):
+            return present
+        time.sleep(1)
+    raise TimeoutError(f'Calibration stage completion missing: {[str(path) for path in paths if not path.exists()]}')
+
+
+def _terminate(signum: int, _frame: Any) -> None:
+    """Propagate scheduler termination through owned child groups and terminal evidence."""
+    raise SystemExit(128 + signum)
+
+
+def main() -> None:
+    """Run on every node; publish only after all ranks and both untouched holdouts pass."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--manifest', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--dry-run', action='store_true')
+    args = parser.parse_args()
+    signal.signal(signal.SIGTERM, _terminate)
+    hosts = os.environ.get('VC_WORKER_HOSTS', '').split(',')
+    nodes = int(os.environ.get('NNODES', os.environ.get('MA_NUM_HOSTS', str(len(hosts)))))
+    node = int(os.environ.get('NODE_RANK', os.environ.get('RANK_AFTER_ACC', os.environ.get('VC_TASK_INDEX', '-1'))))
+    cards = int(os.environ.get('NUM_CARDS', '16'))
+    address = os.environ.get('MASTER_ADDR', hosts[0].split(':')[0])
+    port = int(os.environ.get('MASTER_PORT_BASE', '29300'))
+    timeout = int(os.environ.get('CALIBRATION_PHASE_TIMEOUT_SECONDS', '3600'))
+    if nodes < 1 or not 0 <= node < nodes or cards < 1 or not address or not 1024 <= port < 65532:
+        raise ValueError('Require valid scheduler NNODES/NODE_RANK/MASTER_ADDR and a free rendezvous port')
+    manifest = json.loads(args.manifest.read_text())
+    if nodes * cards % manifest['ep_size']:
+        raise ValueError('Cluster world size must be divisible by the model manifest EP size')
+    os.environ['HYPER_PARALLEL_REPLICA_WEIGHT_RESIDENCY'] = '0'
+    os.environ['HYPER_PARALLEL_REPLICA_METADATA_REUSE'] = '0'
+    os.environ.update(MASTER_ADDR=address, NNODES=str(nodes), NUM_CARDS=str(cards))
+    os.environ.pop('HYPER_PARALLEL_REPLICA_CALIBRATION_DIR', None)
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    base = [sys.executable, '-m', 'torch.distributed.run', f'--nnodes={nodes}', f'--node-rank={node}',
+            f'--nproc-per-node={cards}', f'--master-addr={address}']
+    worker = ['-m', 'tests.torch.expert_parallel._replica_capture_launcher',
+              '--worker-module', 'tests.torch.expert_parallel._replica_autocalibration_worker',
+              '--manifest', str(args.manifest.resolve())]
+    fitter = [sys.executable, '-m', 'hyper_parallel.core.expert_parallel.hot_replica.autocalibration',
+              '--manifest', str(args.manifest.resolve()), '--output', str(args.output / 'models')]
+    commands = {'collect': base + [f'--master-port={port}'] + worker + ['--output', str(args.output / 'collect'),
+                            '--placement-output', str(args.output / 'collect' / 'placement')],
+                'fit': fitter + ['--input', str(args.output / 'collect')],
+                'verify': base + [f'--master-port={port+2}'] + worker + ['--output', str(args.output / 'verify'),
+                                                                 '--candidate-directory', str(args.output / 'models')],
+                'publish': fitter + ['--input', str(args.output / 'verify'), '--verify']}
+    commands['verify'] += ['--placement-output', str(args.output / 'verify' / 'placement')]
+    if args.dry_run:
+        print(json.dumps({'commands': commands, 'model': manifest, 'nodes': nodes, 'node_rank': node,
+                          'cards_per_node': cards, 'runtime_bootstrap': 'caller-owned CANN/native/Python activation'},
+                         indent=2))
+        return
+    node_root = args.output / 'nodes' / f'node_{node}'
+    node_root.mkdir(parents=True, exist_ok=True)
+    (node_root / 'started').mkdir()
+    terminal = 1
+    try:
+        for phase in ('collect', 'fit', 'verify', 'publish'):
+            if phase in ('collect', 'verify'):
+                peers = [args.output / f'{phase}-node{index}.json' for index in range(nodes)]
+                try:
+                    status = _run(commands[phase], node_root / f'{phase}.log', timeout, peers)
+                except BaseException:
+                    _write(args.output / f'{phase}-node{node}.json', {'exit_status': 1, 'node': node})
+                    raise
+                _write(args.output / f'{phase}-node{node}.json', {'exit_status': status, 'node': node})
+                _wait([args.output / f'{phase}-node{index}.json' for index in range(nodes)], timeout)
+                missing = [rank for rank in range(nodes * cards)
+                           if not (args.output / phase / f'status-rank{rank}.json').exists()]
+                if missing:
+                    raise RuntimeError(f'Missing completed rank evidence: {phase}: {missing}')
+            else:
+                if node == 0:
+                    status = _run(commands[phase], node_root / f'{phase}.log', timeout)
+                    _write(args.output / f'{phase}-done.json', {'exit_status': status, 'node': node})
+                _wait([args.output / f'{phase}-done.json'], timeout)
+        terminal = 0
+    finally:
+        _write(node_root / 'terminal.json', {'exit_status': terminal, 'node': node})
+    print(json.dumps({'status': 'validated', 'calibration_directory': str(args.output / 'models'),
+                      'runtime_environment': {'HYPER_PARALLEL_REPLICA_CALIBRATION_DIR': str(args.output / 'models')}}))
+
+
+if __name__ == '__main__':
+    main()

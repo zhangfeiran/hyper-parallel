@@ -30,6 +30,7 @@ from hyper_parallel.core.activation_memory.recompute_state import get_recompute_
 
 from .cost import ExpertReplicaCostModel, _default_schedule
 from .critical_path import execution_fingerprint
+from .calibration_catalog import external_profiles
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,14 +49,23 @@ def _cost_model_enabled() -> bool:
 def _calibrations() -> dict[tuple, ExpertReplicaCostModel]:
     """Own immutable package calibrations with exact hardware and workload selectors."""
     models = {}
-    for path in sorted(Path(__file__).with_name('calibrations').glob('*.json')):
-        payload = json.loads(path.read_text(encoding='utf-8'))
+    payloads = [json.loads(path.read_text(encoding='utf-8'))
+                for path in sorted(Path(__file__).with_name('calibrations').glob('*.json'))]
+    directory = os.environ.get('HYPER_PARALLEL_REPLICA_CALIBRATION_DIR')
+    if directory:
+        payloads.extend(external_profiles(Path(directory)))
+    for payload in payloads:
         model = ExpertReplicaCostModel(**payload['model'])
         selector = payload['selector']
         key = (model.backend, model.hidden_size, model.intermediate_size, model.ep_size, model.transport,
                selector['num_experts'], selector['top_k'], selector['soc_name'])
+        signature = payload['selector'].get('execution_signature')
         if model.critical_path is not None:
-            key += (model.critical_path.execution_signature,)
+            if signature is not None and signature != model.critical_path.execution_signature:
+                raise ValueError('Replica selector and critical-path signatures differ')
+            signature = model.critical_path.execution_signature
+        if signature is not None:
+            key += (signature,)
         if key in models:
             raise ValueError(f'Duplicate replica calibration: {key}')
         models[key] = model
@@ -73,9 +83,9 @@ def _calibration_available(backend: str, hidden: int, intermediate: int, ep_size
 @lru_cache(maxsize=128)
 def _critical_path_available(backend: str, hidden: int, intermediate: int, ep_size: int, transport: str,
                              num_experts: int, top_k: int) -> bool:
-    """Avoid payload hashing on executions with no critical-path profile."""
+    """Avoid payload hashing on executions with no execution-bound profile."""
     prefix = backend, hidden, intermediate, ep_size, transport, num_experts, top_k
-    return any(key[:7] == prefix and model.critical_path is not None
+    return any(key[:7] == prefix and (model.critical_path is not None or len(key) == 9)
                for key, model in _calibrations().items())
 
 

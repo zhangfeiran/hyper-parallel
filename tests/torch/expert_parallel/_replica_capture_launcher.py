@@ -29,6 +29,7 @@ def main() -> None:
     """Apply the existing placement policy and retain each rank's affinity."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--worker-module', required=True, choices=(
+        'tests.torch.expert_parallel._replica_autocalibration_worker',
         'tests.torch.expert_parallel._benchmark_replica_links',
         'tests.torch.expert_parallel._benchmark_replica_contention',
         'tests.torch.expert_parallel._benchmark_replica_critical_path',

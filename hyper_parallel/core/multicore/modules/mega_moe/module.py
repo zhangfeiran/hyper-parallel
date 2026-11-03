@@ -20,6 +20,7 @@ __all__ = ["MegaMoeExperts"]
 
 import hashlib
 import math
+import os
 import struct
 from collections.abc import Mapping
 from dataclasses import replace
@@ -43,6 +44,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.policy import (
 )
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 from hyper_parallel.core.expert_parallel.hot_replica.critical_path import execution_fingerprint
+from hyper_parallel.core.expert_parallel.hot_replica.calibration_catalog import ENVIRONMENT_DEFAULTS
 from hyper_parallel.core.multicore._loader import get_multicore_paths
 from hyper_parallel.core.expert_parallel.hot_replica.topology import _local_node_identity, _node_ids
 from hyper_parallel.core.expert_parallel.hot_replica.device import (
@@ -89,7 +91,7 @@ def _critical_native_fingerprint() -> str:
     return digest.hexdigest()
 
 
-def _critical_execution_signature(module: Any, resources: Any) -> str:
+def _critical_execution_signature(module: Any, resources: Any, *, execution_tokens: int | None = None) -> str:
     """Bind calibration to the actual static execution and normalized EP topology."""
     metadata = {name: getattr(module, name) for name in
                 ('dispatch_mode', 'hidden_size', 'intermediate_size', 'ep_size', 'num_experts', 'top_k',
@@ -98,9 +100,16 @@ def _critical_execution_signature(module: Any, resources: Any) -> str:
                     dispatch_split=resources.spec.dispatch_split, combine_split=resources.spec.combine_split,
                     rank_nodes=resources.rank_nodes, checkpointed=get_recompute_state() is not None,
                     native_payload=_critical_native_fingerprint(), policy_abi='dynamic_tokens_v4',
+                    cube_cores=getattr(resources.spec, 'num_cube_cores', None),
+                    global_world_size=dist.get_world_size() if dist.is_initialized() else module.ep_size,
                     template='replica_ready_ack_v1', weight_dtype='bfloat16', partial_dtype='float32')
     if module.replica_slots_per_rank:
         metadata['runtime_schedule'] = UNMAPPED_GUEST_SUFFIX_SCHEDULE
+    metadata['runtime_environment'] = {name: os.environ.get(name, default)
+                                       for name, default in ENVIRONMENT_DEFAULTS.items()}
+    if execution_tokens is not None:
+        _integer(execution_tokens, 'Execution token domain', 0)
+        metadata['maximum_source_tokens'] = execution_tokens
     return execution_fingerprint(metadata)
 
 
@@ -738,7 +747,9 @@ class MegaMoeExperts(MulticoreModule):
         if self._cost_model_enabled and _critical_path_available(
                 self.dispatch_mode, self.hidden_size, self.intermediate_size, self.ep_size,
                 self.replica_transport, self.num_experts, self.top_k):
-            selection['execution_signature'] = _critical_execution_signature(self, resources)
+            maximum_tokens = max(row[1] for row in gathered.source_summary) if gathered is not None else None
+            selection['execution_signature'] = _critical_execution_signature(
+                self, resources, execution_tokens=maximum_tokens)
         cost_model = _runtime_cost_model(self._cost_model_enabled, self.dispatch_mode,
             self.hidden_size, self.intermediate_size, self.ep_size, self.replica_transport,
             self.num_experts, self.top_k, hidden.device, **selection)
