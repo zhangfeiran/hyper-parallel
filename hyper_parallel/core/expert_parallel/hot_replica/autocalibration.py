@@ -284,7 +284,7 @@ def validate_profile(payload: dict[str, Any], samples: list[dict[str, Any]], bas
         observed_gain = owner['component_rank_max_ms'] - row['component_rank_max_ms']
         if predicted_gain > model.minimum_gain_ms and observed_gain < -model.minimum_gain_ms:
             harmful.append({'frame': row['frame'], 'predicted_gain_ms': predicted_gain,
-                            'observed_wall_gain_ms': observed_gain})
+                            'observed_component_gain_ms': observed_gain})
         home = row['plan'].config.home_experts
         loads = [sum(sum(source[start:start + home]) for source in row['plan'].logical_counts)
                  for start in range(0, row['plan'].config.num_experts, home)]
