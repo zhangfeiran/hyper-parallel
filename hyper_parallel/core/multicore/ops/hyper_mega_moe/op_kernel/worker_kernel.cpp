@@ -25,7 +25,9 @@
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
 #include "runtime/bf16_clamp.h"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
 #include "runtime/indexed_pull.h"
+#endif
 
 using namespace AscendC;
 
@@ -52,6 +54,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
 
   __aicore__ inline void PrepareIngressThresholds() {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
     TaskDesc first;
     getTaskDesc(this->runtimeConfigPtr, &first, 0);
     if (first.task_type == TaskType::TASK_MOE_TOKEN_GET && first.extra_value_1 == 6) { return; }
@@ -65,6 +68,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         this->all_event_num_triggers[first.trigger_event + expert]);
     }
     PipeBarrier<PIPE_ALL>();
+#endif
   }
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
@@ -118,15 +122,24 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteShmemPutMem(task_desc);
         break;
       case TaskType::TASK_MOE_TOKEN_GET:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
         ExecuteTokenPull<DTYPE_DISPATCH_TARGET>(task_desc, input_list, TILING_IDX);
+#else
+        AscendC::Trap();
+#endif
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
       case TaskType::TASK_MOE_OWNER_GET:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
         if (task_desc.extra_value_0 == 16 && task_desc.inputs[1].dim[3] != 0) {
           ExecuteIndexedPull<DTYPE_DISPATCH_TARGET>(task_desc, input_list, TILING_IDX);
         } else {
           ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
         }
+#else
+        if (task_desc.task_type == TaskType::TASK_MOE_OWNER_GET) { AscendC::Trap(); }
+        ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
+#endif
         break;
       default:
         break;
