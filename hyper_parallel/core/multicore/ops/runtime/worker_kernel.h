@@ -65,6 +65,8 @@ template <typename Derived, VectorWorkerPolicy WorkerPolicy = VectorWorkerPolicy
           RuntimeStorageBoundsPolicy StorageBoundsPolicy = RuntimeStorageBoundsPolicy::NATIVE_TILING>
 class KernelWorkerBase {
  public:
+  static constexpr uint32_t SHARED_PTRS_IDX = 0xFFFFFFFF;
+
   __aicore__ inline KernelWorkerBase() {}
 
   static constexpr uint32_t PROFILE_DESC_WAIT_DEPENDENCY = 0x10000;
@@ -120,6 +122,12 @@ class KernelWorkerBase {
     this->vector_num = getNumWorkers(this->runtimeConfigPtr);
     this->core_num = this->vector_num / 2;
     this->active_vector_num = WorkerPolicy == VectorWorkerPolicy::ALL ? this->vector_num : this->vector_num / 2;
+    if constexpr (Derived::SHARED_PTRS_IDX != 0xFFFFFFFF) {
+      if (input_list[Derived::SHARED_PTRS_IDX] != input_list[Derived::EVENT_IDX] &&
+          reinterpret_cast<__gm__ uint64_t *>(input_list[Derived::SHARED_PTRS_IDX])[0] == 1) {
+        shared_vector_count_ = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 4) / 128;
+      }
+    }
   }
 
   __aicore__ inline void Process() {
@@ -145,6 +153,14 @@ class KernelWorkerBase {
   }
 
  protected:
+  __aicore__ inline GM_ADDR SharedTensorAddress(const TensorDesc &desc) {
+    GM_ADDR address = input_list[desc.input_position];
+    if (desc.tensor_type == 2) {
+      address = reinterpret_cast<GM_ADDR>(reinterpret_cast<__gm__ uint64_t *>(address)[desc.dynamic_dim + 1]);
+    }
+    return address + desc.base_ptr_offset * desc.data_type;
+  }
+
   __aicore__ inline void ProcessFast() {
 #ifdef __DAV_CUBE__
     uint32_t block_idx = this->worker_id_;
@@ -162,13 +178,22 @@ class KernelWorkerBase {
       return;
     }
     do {
-      if (block_idx >= this->vector_task_num) {
-        return;
+      uint32_t end = this->vector_task_num;
+      if (shared_vector_count_ != 0) {
+        end = this->worker_id_ % 2 == 0 ? this->vector_task_num - 1
+                                      : this->vector_task_num - shared_vector_count_ - 1;
+      }
+      if (block_idx >= end) {
+        break;
       }
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskFast(task_index);
       block_idx = block_idx + this->active_vector_num;
     } while (1);
+    if (shared_vector_count_ != 0 && this->worker_id_ % 2 == 1 &&
+        this->worker_id_ / 2 == (this->vector_task_num - 1) % this->core_num) {
+      ExecuteTaskFast(GetTaskIndex(this->vector_task_num - 1));
+    }
 #endif
   }
 
@@ -189,13 +214,22 @@ class KernelWorkerBase {
       return;
     }
     do {
-      if (block_idx >= this->vector_task_num) {
-        return;
+      uint32_t end = this->vector_task_num;
+      if (shared_vector_count_ != 0) {
+        end = this->worker_id_ % 2 == 0 ? this->vector_task_num - 1
+                                      : this->vector_task_num - shared_vector_count_ - 1;
+      }
+      if (block_idx >= end) {
+        break;
       }
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskL1Dump(task_index);
       block_idx = block_idx + this->active_vector_num;
     } while (1);
+    if (shared_vector_count_ != 0 && this->worker_id_ % 2 == 1 &&
+        this->worker_id_ / 2 == (this->vector_task_num - 1) % this->core_num) {
+      ExecuteTaskL1Dump(GetTaskIndex(this->vector_task_num - 1));
+    }
 #endif
   }
 
@@ -221,13 +255,22 @@ class KernelWorkerBase {
       return;
     }
     do {
-      if (block_idx >= this->vector_task_num) {
-        return;
+      uint32_t end = this->vector_task_num;
+      if (shared_vector_count_ != 0) {
+        end = this->worker_id_ % 2 == 0 ? this->vector_task_num - 1
+                                      : this->vector_task_num - shared_vector_count_ - 1;
+      }
+      if (block_idx >= end) {
+        break;
       }
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskProfiled(task_index, cycle_trace_recorder);
       block_idx = block_idx + this->active_vector_num;
     } while (1);
+    if (shared_vector_count_ != 0 && this->worker_id_ % 2 == 1 &&
+        this->worker_id_ / 2 == (this->vector_task_num - 1) % this->core_num) {
+      ExecuteTaskProfiled(GetTaskIndex(this->vector_task_num - 1), cycle_trace_recorder);
+    }
 #endif
   }
 
@@ -340,6 +383,9 @@ class KernelWorkerBase {
   __aicore__ inline uint32_t GetVectorScheduleIndex() {
     if constexpr (WorkerPolicy == VectorWorkerPolicy::ALL) {
       return this->worker_id_ < this->active_vector_num ? this->worker_id_ : INVALID_VECTOR_SCHEDULE_INDEX;
+    }
+    if (shared_vector_count_ != 0 && this->worker_id_ % 2 == 0) {
+      return this->vector_task_num - shared_vector_count_ - 1 + this->worker_id_ / 2;
     }
     return this->worker_id_ % 2 == 0 ? INVALID_VECTOR_SCHEDULE_INDEX : this->worker_id_ / 2;
   }
@@ -502,6 +548,7 @@ class KernelWorkerBase {
 
   __aicore__ inline void TriggerEvent(uint32_t event_index) { AtomicAddForAllEventCounters(event_index); }
 
+  uint32_t shared_vector_count_ = 0;
   bool pull_protocol_ = false;
   uint32_t worker_id_ = 0;
   uint32_t grouped_matmul_group_list_offset_ = 0;

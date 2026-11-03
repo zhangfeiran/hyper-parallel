@@ -14,6 +14,8 @@
 # ============================================================================
 """MoE-FFN forward compute graph."""
 
+from hyper_parallel.core.multicore.modules.mega_moe.shared_schedule import add_shared_graph
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from hyper_parallel.core.multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
 )
@@ -159,7 +161,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
     return dispatch, up_proj, swiglu, down_proj, combine
 
 
-def build_forward_graph(tsv, *,
+def build_forward_graph(tsv: TaskSplitValue, *,
                         dispatch_sv:  int = 128,
                         up_proj_sv:   int = 4096,
                         swiglu_sv:    int = 128,
@@ -169,7 +171,8 @@ def build_forward_graph(tsv, *,
                         intermediate_size: int = 2048,
                         dtype_size:        int = 2,
                         num_cube_cores:    int = 24,
-                        swiglu_limit:      float | None = None) -> ComputeGraph:
+                        swiglu_limit:      float | None = None,
+                        shared_intermediate_size: int = 0) -> ComputeGraph:
     """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.
 
     Operator execution order and param_positions (C++ memory slots):
@@ -209,4 +212,7 @@ def build_forward_graph(tsv, *,
           .add_edge(up_proj,   swiglu)
           .add_edge(swiglu,    down_proj)
           .add_edge(down_proj, combine))
+    if shared_intermediate_size:
+        add_shared_graph(graph, tsv, hidden_size, shared_intermediate_size, num_cube_cores,
+                         backward=False)
     return graph

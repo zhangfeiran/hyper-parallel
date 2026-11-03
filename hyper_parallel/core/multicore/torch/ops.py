@@ -75,8 +75,10 @@ def _load_native() -> None:
     preload_vendor_library(vendor_root)
     try:
         torch.ops.load_library(str(adapter_path))
-        if torch.ops.hyper_parallel.mega_moe_transport_version() != 6:
+        if torch.ops.hyper_parallel.mega_moe_transport_version() != 7:
             raise RuntimeError("adapter transport ABI mismatch; rebuild the Torch adapter")
+        if torch.ops.hyper_parallel.mega_moe_shared_version() != 4:
+            raise RuntimeError("adapter shared-expert ABI mismatch; rebuild the Torch adapter")
         # Torch exposes operator alias metadata through this private schema attribute.
         schema = torch.ops.hyper_parallel.mega_moe_grad.default._schema  # pylint: disable=protected-access
         dispatch_alias = schema.arguments[0].alias_info.before_set
@@ -554,6 +556,8 @@ def mega_moe(
     expert_num: int,
     hidden_size: int,
     seq_size: int,
+    shared_ptrs: torch.Tensor | None = None,
+    shared_runtime: torch.Tensor | None = None,
 ) -> None:
     """
     MoE-FFN forward operator.
@@ -616,11 +620,14 @@ def mega_moe(
         runtime_config,
         all_event_counters,
         all_event_counters,
+        all_event_counters,
+        all_event_counters,
         rank_id,
         ep,
         expert_num,
         hidden_size,
         seq_size,
+        shared_ptrs=shared_ptrs, shared_runtime=shared_runtime,
     )
 
 
@@ -659,6 +666,8 @@ def mega_moe_grad(
     expert_num: int,
     hidden_size: int,
     seq_size: int,
+    shared_ptrs: torch.Tensor | None = None,
+    shared_runtime: torch.Tensor | None = None,
 ) -> None:
     """Launch the public MoE-FFN backward operator.
 
@@ -704,11 +713,14 @@ def mega_moe_grad(
         runtime_config,
         all_event_counters,
         all_event_counters,
+        all_event_counters,
+        all_event_counters,
         rank_id,
         ep,
         expert_num,
         hidden_size,
         seq_size,
+        shared_ptrs=shared_ptrs, shared_runtime=shared_runtime,
     )
 
 
@@ -741,6 +753,8 @@ def mega_moe_with_diagnostic_buffer(
     expert_num: int,
     hidden_size: int,
     seq_size: int,
+    shared_ptrs: torch.Tensor | None = None,
+    shared_runtime: torch.Tensor | None = None,
 ) -> None:
     """
     Launch the internal forward ABI with a shared diagnostic-buffer argument.
@@ -806,6 +820,8 @@ def mega_moe_with_diagnostic_buffer(
         runtime_config,
         all_event_counters,
         diagnostic_buffer,
+        shared_ptrs if shared_ptrs is not None else all_event_counters,
+        shared_runtime if shared_runtime is not None else all_event_counters,
         rank_id,
         ep,
         expert_num,
@@ -850,6 +866,8 @@ def mega_moe_grad_with_diagnostic_buffer(
     expert_num: int,
     hidden_size: int,
     seq_size: int,
+    shared_ptrs: torch.Tensor | None = None,
+    shared_runtime: torch.Tensor | None = None,
 ) -> None:
     """Launch the diagnostic MoE-FFN backward ABI.
 
@@ -895,6 +913,8 @@ def mega_moe_grad_with_diagnostic_buffer(
         runtime_config,
         all_event_counters,
         diagnostic_buffer,
+        shared_ptrs if shared_ptrs is not None else all_event_counters,
+        shared_runtime if shared_runtime is not None else all_event_counters,
         rank_id,
         ep,
         expert_num,

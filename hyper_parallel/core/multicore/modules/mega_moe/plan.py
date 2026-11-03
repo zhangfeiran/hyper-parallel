@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from copy import copy
+import struct
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -58,6 +59,8 @@ from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_coun
 
 from .diagnostics import _mega_moe_owner_options
 from .spec import MegaMoeSpec, _route_metadata_rows
+from .shared import shared_tiling_bytes
+from .shared_schedule import bind_shared_diagnostic_graph
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
 from .udma_order import validate_udma_qp_owners
 
@@ -80,6 +83,8 @@ class MegaMoePlan:
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
+    shared_forward_runtime: Any = None
+    shared_backward_runtime: Any = None
     ingress_diagnostics: MegaKernelDiagnostics | None = None
     row_credit_element_offset: int | None = None
 
@@ -149,6 +154,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
+        shared_intermediate_size=spec.shared_intermediate_size,
     )
     forward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(forward_graph)
@@ -157,6 +163,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         task_values,
         spec.rank_id,
         spec.num_cube_cores,
+        shared_placement=spec.shared_placement,
     )
     if spec.forward_ingress_mode != "legacy":
         if spec.num_cube_cores != 32 or spec.dispatch_mode != "pull" or spec.max_local_num_tokens is not None:
@@ -166,7 +173,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
                 task.extra_value_0 = 16
                 task.extra_value_1 = 3 if spec.forward_ingress_mode == "peer_dedup" else 1
                 task.inputs[1].dim[3] = spec.top_k
-            elif task.task_type == TaskType.TASK_GROUPED_MATMUL:
+            elif task.task_type == TaskType.TASK_GROUPED_MATMUL and task.inputs[0].tensor_type != 2:
                 # Blaze does not use the legacy GMM workspace tensor at port 16.
                 task.extra_value_1 = 2
     if spec.forward_ingress_mode == "peer_overlap":
@@ -191,6 +198,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
+        shared_intermediate_size=spec.shared_intermediate_size,
     )
     backward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(backward_graph)
@@ -199,7 +207,15 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         task_values,
         spec.rank_id,
         spec.num_cube_cores,
+        shared_placement=spec.shared_placement,
     )
+    if spec.shared_intermediate_size:
+        clamp = struct.unpack("<I", struct.pack("<f", spec.swiglu_limit or 0.0))[0]
+        for config in (forward_data, backward_data):
+            for task in config.all_tasks[:config.task_num]:
+                if task.inputs[0].tensor_type == 2 and task.task_type in (TaskType.TASK_SWI_GLU,
+                                                                       TaskType.TASK_SWI_GLU_GRAD):
+                    task.extra_value_0 = clamp
     qp_count = configured_udma_qp_count()
     if qp_count != 32:
         for config in (forward_data, backward_data):
@@ -224,12 +240,15 @@ def _prepare_diagnostics(
         "device": device,
         "rank": dist.get_rank() if dist.is_initialized() else spec.rank_id,
         **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
+        "graph_adapter": bind_shared_diagnostic_graph if spec.shared_intermediate_size else None,
     }
     return (
         prepare_mega_kernel_diagnostics(
-            forward_graph, forward_config, parameter_count=17 if spec.forward_ingress_mode != "legacy" else 16,
+            forward_graph, forward_config,
+            parameter_count=28 if spec.shared_intermediate_size else (17 if spec.forward_ingress_mode != "legacy" else 16),
             **options),
-        prepare_mega_kernel_diagnostics(backward_graph, backward_config, parameter_count=20, **options),
+        prepare_mega_kernel_diagnostics(
+            backward_graph, backward_config, parameter_count=35 if spec.shared_intermediate_size else 20, **options),
     )
 
 
@@ -257,7 +276,11 @@ def _attach_route_metadata_input(graph: ComputeGraph, spec: MegaMoeSpec) -> None
         split_spec=SplitSpec(split_inputs=None, task_num_fn=lambda _: 0),
         tiling_position=-1, fill_config=None,
     )
-    graph.add_op(node).add_edge(node, graph.get_op("dispatch"))
+    graph.add_op(node)
+    if not spec.shared_intermediate_size:
+        graph.add_edge(node, graph.get_op("dispatch"))
+    # A new predecessor would reorder the independent shared branch after task
+    # IDs have been assigned. This zero-task node only describes a Host binding.
     source = graph.get_op("dispatch").inputs[1]
     source.shape = [spec.local_num_tokens, spec.hidden_size]
 
@@ -384,6 +407,10 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     return MegaMoePlan(
         spec=spec,
         ingress_diagnostics=ingress_diagnostics,
+        shared_forward_runtime=(_tensor_from_bytes(shared_tiling_bytes(spec, backward=False), device)
+                                if spec.shared_intermediate_size else None),
+        shared_backward_runtime=(_tensor_from_bytes(shared_tiling_bytes(spec, backward=True), device)
+                                 if spec.shared_intermediate_size else None),
         row_credit_element_offset=_row_credit_element_offset(forward_config, spec),
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,

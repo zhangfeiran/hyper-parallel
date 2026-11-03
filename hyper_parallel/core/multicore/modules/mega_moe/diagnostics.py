@@ -52,6 +52,8 @@ def _resolve_expert_owner(
     raw_context: Any,
 ) -> int | None:
     """Resolve the global expert ID from a graph operator and its concrete task."""
+    if operator.name.startswith("shared_"):
+        return None
     context = _require_diagnostic_context(raw_context)
     topology = context.topology
     rank_owner_base = topology.rank_id * topology.single_rank_expert_num

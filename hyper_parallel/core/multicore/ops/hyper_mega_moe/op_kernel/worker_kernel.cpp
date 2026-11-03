@@ -35,6 +35,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
   // input_list layout for hyper_mega_moe (forward):
   //   [23] = tiling params  [24] = all_event_counters  [25] = diagnostic_buffer  [16] = gmm_workspace
+  static constexpr uint32_t SHARED_PTRS_IDX = 26;
   static constexpr uint32_t TILING_IDX   = 23;
   static constexpr uint32_t EVENT_IDX    = 24;
   static constexpr uint32_t DIAGNOSTIC_IDX = 25;
@@ -166,6 +167,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
   __aicore__ inline void ExecuteSwiglu(const TaskDesc &task_desc) {
+    if (task_desc.inputs[0].tensor_type == 2) {
+      swi_glu(SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.outputs[0]), nullptr,
+              input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+              GetSwiGluClampLimit(task_desc));
+      return;
+    }
+
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.outputs[0].dynamic_shape == 1) {
       DynamicData dynamic_data;
       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
@@ -229,6 +237,18 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
   __aicore__ inline void ExecuteGroupedMatmul(TaskDesc task_desc) {
+    if (task_desc.inputs[0].tensor_type == 2) {
+      GM_ADDR tiling_address = input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset +
+                               2016 * AscendC::GetBlockIdx();
+      grouped_matmul(SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.inputs[1]),
+                     nullptr, nullptr, nullptr, nullptr, nullptr, SharedTensorAddress(task_desc.inputs[2]),
+                     nullptr, SharedTensorAddress(task_desc.outputs[0]),
+                     reinterpret_cast<GM_ADDR>(reinterpret_cast<__gm__ uint64_t *>(input_list[SHARED_PTRS_IDX])[7]),
+                     tiling_address,
+                     task_desc.inputs[0].transpose_flag == 1, task_desc.inputs[1].transpose_flag == 1);
+      return;
+    }
+
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
       DynamicData dynamic_data;
       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));

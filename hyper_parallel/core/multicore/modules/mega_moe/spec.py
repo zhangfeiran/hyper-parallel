@@ -62,6 +62,8 @@ class MegaMoeSpec:
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
     forward_ingress_mode: str = "legacy"
+    shared_intermediate_size: int = 0
+    shared_placement: str = "idle"
 
     @property
     def plan_tokens(self) -> int:
@@ -222,4 +224,6 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         forward_ingress_mode=forward_ingress_mode,
+        shared_intermediate_size=specification.get("shared_intermediate_size", 0),
+        shared_placement=specification.get("shared_placement", "idle"),
     )
