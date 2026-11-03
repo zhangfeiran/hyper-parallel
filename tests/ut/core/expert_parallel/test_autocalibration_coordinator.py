@@ -62,6 +62,48 @@ def test_quality_rejection_keeps_collection_and_never_reports_validated(rejected
         assert marker['worker_exit_status'] == 20
         assert marker['quality_rejected'] is True
         assert phases[-1] == rejected_phase
+        assert json.loads((output / 'nodes/node_0/terminal.json').read_text())['exit_status'] == 20
+
+
+@pytest.mark.parametrize('publish_catalog', [True, False])
+def test_validated_result_requires_actual_catalog_publication(publish_catalog: bool) -> None:
+    """Successful process exits cannot stand in for an atomically published cost catalog."""
+    coordinator = load_coordinator()
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        manifest = root / 'shape.json'
+        manifest.write_text(json.dumps(dict(ep_size=4)))
+        output = root / 'output'
+        phases = []
+
+        def run(command: list[str], log: Path, timeout: int, peers: list[Path] | None = None) -> int:
+            phase = log.stem
+            phases.append(phase)
+            if phase in ('collect', 'verify'):
+                (output / phase).mkdir()
+                for rank in range(4):
+                    (output / phase / f'status-rank{rank}.json').write_text('{}')
+            if phase == 'publish' and publish_catalog:
+                (output / 'models').mkdir()
+                (output / 'models/catalog.json').write_text('{}')
+            return 0
+
+        environment = dict(NNODES='1', NODE_RANK='0', NUM_CARDS='4', MASTER_ADDR='127.0.0.1')
+        with patch.dict(os.environ, environment), patch.object(coordinator, '_run', side_effect=run), \
+                patch.object(signal, 'signal'), patch.object(sys, 'argv', ['coordinator', '--manifest',
+                                                                          str(manifest), '--output', str(output)]):
+            if not publish_catalog:
+                with pytest.raises(RuntimeError, match='without a validated catalog'):
+                    coordinator.main()
+            else:
+                coordinator.main()
+        assert phases == ['collect', 'fit', 'verify', 'publish']
+        if publish_catalog:
+            outcome = json.loads((output / 'outcome.json').read_text())
+            assert outcome['status'] == 'validated'
+            assert outcome['catalog_published'] is True
+        else:
+            assert not (output / 'outcome.json').exists()
 
 
 def test_runtime_failure_is_not_converted_to_quality_rejection() -> None:

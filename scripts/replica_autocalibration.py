@@ -207,6 +207,8 @@ def main() -> None:
                     break
         if outcome is None:
             if node == 0:
+                if not (args.output / 'models/catalog.json').is_file():
+                    raise RuntimeError('Calibration publication completed without a validated catalog')
                 _write(args.output / 'outcome.json', {
                     'exit_status': 0, 'status': 'validated', 'collection_complete': True,
                     'catalog_published': True, 'calibration_directory': str(args.output / 'models'),
