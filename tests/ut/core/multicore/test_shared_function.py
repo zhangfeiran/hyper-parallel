@@ -184,6 +184,11 @@ class TestSharedFunction(unittest.TestCase):
                 dw2.copy_(torch.mm(activation.t(), dy))
             execution.grad_x.zero_()
 
+        def backward_pointers(tensors: tuple[torch.Tensor, ...], *, idle_vectors: bool = False) -> tuple:
+            """Reserve vector workers only when the kernel still produces shared SwiGLU gradients."""
+            self.assertEqual(idle_vectors, cube_cores != 32)
+            return tensors
+
         def activation_backward(gradient: torch.Tensor, up: torch.Tensor, _dim: int) -> torch.Tensor:
             """Emulate only the native activation derivative on CPU."""
             with torch.enable_grad():
@@ -200,7 +205,7 @@ class TestSharedFunction(unittest.TestCase):
 
         with (
             patch.object(moe_function, "pointer_table", side_effect=lambda tensors, **_: tensors),
-            patch.object(moe_shared, "pointer_table", side_effect=lambda tensors, **_: tensors),
+            patch.object(moe_shared, "pointer_table", side_effect=backward_pointers),
             patch.object(moe_function.torch.ops.npu, "npu_swiglu_backward", side_effect=activation_backward),
             patch.object(moe_function.torch_npu, "npu_swiglu", side_effect=activation_forward) as native_forward,
             patch.object(moe_function, "_launch_forward_kernel", side_effect=forward_kernel),

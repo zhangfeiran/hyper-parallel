@@ -710,7 +710,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 if grad_shared_output is None:
                     grad_shared_output = torch.zeros_like(shared_saved[0])
                 shared_tensors, pointers = shared_backward_buffers(
-                    grad_shared_output, shared_saved, idle_vectors=True,
+                    grad_shared_output, shared_saved, idle_vectors=plan.spec.num_cube_cores != 32,
                     native_activation_grad=plan.spec.num_cube_cores == 32, swiglu_limit=plan.spec.swiglu_limit,
                 )
                 execution = replace(execution, shared_ptrs=pointers)
