@@ -749,10 +749,16 @@ class MegaMoeExperts(MulticoreModule):
         if cost_model is not None and reduction is None:
             reduction = 0.0
         admission, saved_rows = resolve_replica_admission(reduction)
+        # Credit only half of mandatory FP32 gradient bytes. One routed row
+        # costs at most 12*H BF16 payload bytes across forward, replay and
+        # backward dispatch/combine; weight copies and residency hits add no credit.
+        gradient_units = (2 * bool(autograd_mask & 4) + bool(autograd_mask & 8)) if autograd_mask & 1 else 0
+        transfer_row_credit = self.intermediate_size * gradient_units // 6 if cost_model is None else 0
         return prepare_replica_route(
             topk_ids, self.replica_config, self._ep_group,
             target_load=target_load,
             minimum_replica_rows=self.replica_min_rows, _cost_model=cost_model,
+            _replica_transfer_row_credit=transfer_row_credit,
             _rank_nodes=resources.rank_nodes,
             planner_backend=self.replica_planner,
             minimum_load_reduction=admission, minimum_saved_rows=saved_rows,

@@ -36,7 +36,10 @@ from .count_kernel import try_count_payload
 from .device import DeviceExpertExecutionPlan, ReplicaPlanSummary, build_device_expert_replica_plan
 from .device import validate_planner_backend
 from .plan import ExpertExecutionPlan, ExpertReplicaTransfer
-from .planner import _build_expert_replica_plan as build_expert_replica_plan
+from .planner import (
+    _build_expert_replica_plan as build_expert_replica_plan,
+    _optional_peak_is_useful,
+)
 from .topology import _validate_rank_nodes
 
 
@@ -143,10 +146,10 @@ def _plan_replica_route(counts: Any, config: ExpertReplicaConfig, group: object,
     if state is None:
         return build_expert_replica_plan(counts, config.replica_slots_per_rank, **options), False
     frozen = tuple(tuple(row) for row in counts)
-    # Heap migration may increase the reservation between phases. Replaying the
-    # original decision preserves checkpoint metadata while growth remains legal.
+    # Heap allowance and gradient-dependent credits can change between phases.
+    # Replaying the original decision preserves the checkpoint's physical graph.
     policy = tuple((key, type(value), value) for key, value in sorted(options.items())
-                   if key not in ('receive_capacity', 'capacity_limit'))
+                   if key not in ('receive_capacity', 'capacity_limit', '_replica_transfer_row_credit'))
     signature = (config, id(group), rank, policy)
     cache = state.get_resource(_RecomputedReplicaPlans, _RecomputedReplicaPlans)
     if state.is_recomputing:
@@ -329,7 +332,7 @@ def _try_compact_home_route(
         if cache.cursor < len(cache.entries) and cache.entries[cache.cursor][1] is not None:
             return None
     _integer(minimum_saved_rows, "minimum_saved_rows", 0)
-    reduction_basis_points(minimum_load_reduction)
+    admission = reduction_basis_points(minimum_load_reduction)
     if target_load is not None:
         _integer(target_load, "target_load", 0)
     nodes = _validate_rank_nodes(rank_nodes, config.ep_size)
@@ -349,13 +352,17 @@ def _try_compact_home_route(
         summary = torch.cat((matrix[:, config.num_experts:], logical.sum(1, keepdim=True),
                              logical.amin(1, keepdim=True), logical.amax(1, keepdim=True),
                              loads[:, None], grouped.diagonal()[:, None]), dim=1)
-        compact = torch.cat((summary.flatten(), logical.sum(0))).cpu().tolist()
+        payload = summary.flatten() if cost_model is None else torch.cat((summary.flatten(), logical.sum(0)))
+        compact = payload.cpu().tolist()
         width = summary.shape[1]
         rows = [compact[start:start + width] for start in range(0, config.ep_size * width, width)]
         totals = compact[config.ep_size * width:]
     else:
         logical = gathered_counts.counts
-        if gathered_counts.host_counts is None:
+        if cost_model is None:
+            rows = [[0] + list(row) for row in gathered_counts.source_summary]
+            totals = []
+        elif gathered_counts.host_counts is None:
             grouped = logical.reshape(config.ep_size, config.ep_size, config.home_experts).sum(2, dtype=torch.int64)
             compact = torch.cat((grouped.diagonal(), logical.sum(0, dtype=torch.int64))).cpu().tolist()
             diagonal, totals = compact[:config.ep_size], compact[config.ep_size:]
@@ -364,8 +371,9 @@ def _try_compact_home_route(
             diagonal = [sum(row[owner * config.home_experts:(owner + 1) * config.home_experts])
                         for owner, row in enumerate(host)]
             totals = list(map(sum, zip(*host)))
-        # Native agreement already validated the source controls and owner loads.
-        rows = [[0] + list(row) + [local] for row, local in zip(gathered_counts.source_summary, diagonal)]
+        if cost_model is not None:
+            # Native agreement already validated the source controls and owner loads.
+            rows = [[0] + list(row) + [local] for row, local in zip(gathered_counts.source_summary, diagonal)]
     if any(row[0] for row in rows):
         raise ValueError("hot replication requires in-range, distinct expert IDs per token")
     maximum_tokens = max(row[2] for row in rows)
@@ -382,9 +390,15 @@ def _try_compact_home_route(
     if peak > upper:
         return None
     balanced = min(destination_loads) == peak
-    if not balanced and (cost_model is None or peak > resident
-                         or not _compact_home_cost_dominates(totals, rows, config, cost_model)):
-        return None
+    if not balanced:
+        if peak > resident:
+            return None
+        if cost_model is None:
+            average = (sum(destination_loads) + config.ep_size - 1) // config.ep_size
+            if _optional_peak_is_useful(average, destination_loads, resident, admission, minimum_saved_rows):
+                return None
+        elif not _compact_home_cost_dominates(totals, rows, config, cost_model):
+            return None
     counts = logical.to(torch.int32).contiguous()
     plan = _HomeOnlyPlan(config, counts, destination_loads)
     _record_home_decision()
@@ -409,6 +423,7 @@ def prepare_replica_route(
     _cost_model: ExpertReplicaCostModel | None = None,
     _trusted_counts: torch.Tensor | None = None,
     _gathered_counts: _GatheredReplicaCounts | None = None,
+    _replica_transfer_row_credit: int = 0,
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
@@ -434,6 +449,7 @@ def prepare_replica_route(
         _capacity_budget: Internal allocation-free allowance within the agreed Heap budget.
         _trusted_counts: Internal exact Router histogram, using the executor's trusted-count contract.
         _gathered_counts: Internal validated native count agreement for CPU planning.
+        _replica_transfer_row_credit: Internal conservative activation-row credit per deleted matrix edge.
 
     Returns:
         Invocation-owned placement, physical IDs and dispatch counts.
@@ -452,6 +468,7 @@ def prepare_replica_route(
     if topk_ids.ndim != 2 or topk_ids.dtype not in (torch.int32, torch.int64):
         raise ValueError("topk_ids must be a two-dimensional integer tensor")
     rank = dist.get_rank(group) if dist.is_initialized() else 0
+    _integer(_replica_transfer_row_credit, "Replica transfer row credit", 0)
     size = dist.get_world_size(group) if dist.is_initialized() else 1
     if size != config.ep_size:
         raise ValueError("replica configuration must match the EP group size")
@@ -506,7 +523,8 @@ def prepare_replica_route(
         return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_plan.dispatch_counts.to(torch.int32),
                             rank, group, device_plan=device_plan, dynamic_summary=dynamic_summary)
     if (compact_home and dynamic_header is not None and config.replica_slots_per_rank
-            and (_gathered_counts is None or _cost_model is not None)):
+            and (_gathered_counts is None or _cost_model is not None
+                 or minimum_load_reduction or minimum_saved_rows)):
         ordinary = _try_compact_home_route(
             matrix if _gathered_counts is None else None, topk_ids, config, group, rank,
             target_load=target_load, receive_capacity=receive_capacity,
@@ -546,6 +564,7 @@ def prepare_replica_route(
         minimum_saved_rows=minimum_saved_rows,
         receive_capacity=receive_capacity, adaptive=bool(config.replica_slots_per_rank),
         _rank_nodes=_rank_nodes,
+        _replica_transfer_row_credit=_replica_transfer_row_credit,
     )
     if max(plan.destination_loads) > upper:
         raise RuntimeError("replica planner exceeded the theoretical receive bound")
