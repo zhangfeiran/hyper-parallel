@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 import torch.distributed as dist
 import torch_npu
+from torch.autograd.function import once_differentiable
 
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, _replica_count_payload
 
@@ -636,6 +637,46 @@ def _prepare_dynamic_route(
     )
 
 
+class _LegacyTopKRestore(torch.autograd.Function):
+    """Keep Torch-NPU 2.9.0 unpermute gradients on the explicit ACLNN adapter."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, expert_output: torch.Tensor, mapping: torch.Tensor, probabilities: torch.Tensor,
+    ) -> torch.Tensor:
+        """Retain owned forward inputs for the precompiled backward entry.
+
+        Args:
+            ctx: Autograd context for this output restoration.
+            expert_output: Owned expert-major forward output rows.
+            mapping: INT32 inverse permutation mapping.
+            probabilities: Contiguous FP32 Router weights.
+        """
+        ctx.save_for_backward(expert_output, mapping, probabilities)
+        return torch_npu.npu_moe_token_unpermute(expert_output, mapping, probs=probabilities)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor | None, None, torch.Tensor | None]:
+        """Return correctly ordered expert and routing gradients in owned tensors.
+
+        Args:
+            ctx: Context retaining the expert outputs and Router metadata.
+            gradient: Token-major output gradient.
+        """
+        expert_output, mapping, probabilities = ctx.saved_tensors
+        grad_experts = torch.empty_like(expert_output)
+        grad_probabilities = torch.empty_like(probabilities)
+        multicore_ops.mega_moe_unpermute_grad_out(
+            expert_output, gradient, mapping, probabilities, grad_experts, grad_probabilities,
+        )
+        return (
+            grad_experts if ctx.needs_input_grad[0] else None,
+            None,
+            grad_probabilities if ctx.needs_input_grad[2] else None,
+        )
+
+
 def restore_topk_output(
     expert_output: torch.Tensor,
     unpermute_mapping: torch.Tensor,
@@ -654,8 +695,11 @@ def restore_topk_output(
     if topk_weights.shape[0] == 0:
         # Keep both the expert backward and the empty routing-weight gradient connected.
         return expert_output[:0] + topk_weights.sum().to(expert_output.dtype)
+    probabilities = topk_weights.float().contiguous()
+    if getattr(torch_npu, "__version__", "").split("+", 1)[0] == "2.9.0" and torch.is_grad_enabled():
+        return _LegacyTopKRestore.apply(expert_output, unpermute_mapping, probabilities)
     return torch_npu.npu_moe_token_unpermute(
         expert_output,
         unpermute_mapping,
-        probs=topk_weights.float().contiguous(),
+        probs=probabilities,
     )

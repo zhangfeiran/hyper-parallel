@@ -22,6 +22,11 @@ HyperParallel 提供两种安装方式：
 
 zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释为通配符。
 
+包含预编译 Torch Multicore adapter 的 wheel 会把构建时的 `torch` 和 `torch-npu`
+版本写入必需依赖，普通 `pip install /path/to/package.whl` 即可安装匹配版本。
+这类 wheel 的 `torch`、`all` 和对应的 `torch29` extra 也使用匹配的构建版本。
+不包含 Torch native payload 的通用 wheel 保持上表中的依赖行为。
+
 ## 2. 从源码编译 whl 包
 
 统一入口调用所选组件的构建脚本，再将成功组件的产物组装为一个 wheel。indexed Dataset C++ helper
@@ -84,4 +89,23 @@ import hyper_parallel as hp
 import importlib.metadata as metadata
 
 print(metadata.version("hyper_parallel"))
+```
+
+包含 Multicore 的 wheel 还提供 B=1 安装态验证程序。以下示例需要已安装匹配的
+CANN toolkit/ops 和 NPU 驱动；wheel 不包含驱动或 CANN 本身。Python ABI、CPU 架构和
+SoC 必须与 wheel 的构建目标一致。验证程序使用默认 bands 传输，要求发生实际复制，
+并将前向、输入/路由/权重梯度及 AdamW 更新与独立 Torch 参考比较。参考保留 BF16
+前向中间结果的舍入边界，使用 FP32 专家参数累计参考权重梯度；每步先对齐当前权重。
+
+```bash
+python3.11 -m venv /path/to/new-venv
+source /path/to/new-venv/bin/activate
+python -m pip install /absolute/path/to/the-built-wheel.whl
+source /path/to/cann/set_env.sh
+source "$(command -v hyper_parallel_multicore_set_env.bash)"
+cd /tmp
+torchrun --standalone --nproc-per-node=4 -m \
+  hyper_parallel.core.multicore.examples.moe.b1_smoke --dispatch-mode push
+torchrun --standalone --nproc-per-node=4 -m \
+  hyper_parallel.core.multicore.examples.moe.b1_smoke --dispatch-mode pull
 ```

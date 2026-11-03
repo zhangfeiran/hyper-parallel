@@ -20,7 +20,7 @@ import shutil
 import stat
 import platform
 import subprocess
-from importlib import import_module
+from importlib import import_module, metadata
 from setuptools import setup, find_packages, find_namespace_packages, Distribution, Extension
 from setuptools.command.egg_info import egg_info
 from setuptools.command.build_py import build_py
@@ -91,7 +91,24 @@ def get_install_requires() -> list[str]:
     Returns:
         list, list of dependent packages.
     """
-    return _read_requirements('requirements.txt')
+    return _read_requirements('requirements.txt') + _native_torch_requires()
+
+
+def _native_torch_requires() -> list[str]:
+    """Pin a precompiled Torch payload to the framework that built its adapters."""
+    payload = os.environ.get("HYPER_PARALLEL_NATIVE_OUTPUT_ROOT", "").strip()
+    adapter = os.path.join(payload, "core", "multicore", "lib", "framework", "torch",
+                           "libhyper_parallel_mega_moe_torch.so")
+    if not payload or not os.path.isfile(adapter):
+        return []
+    requirements = []
+    for distribution in ("torch", "torch-npu"):
+        try:
+            version = metadata.version(distribution).split("+", 1)[0]
+        except metadata.PackageNotFoundError as error:
+            raise RuntimeError(f"Build the native wheel in its matching {distribution} environment") from error
+        requirements.append(f"{distribution}=={version}")
+    return requirements
 
 
 def get_extra_requires() -> dict[str, list[str]]:
@@ -101,12 +118,15 @@ def get_extra_requires() -> dict[str, list[str]]:
     Returns:
         dict, optional dependency groups keyed by extra name.
     """
+    native = _native_torch_requires()
+    default = native or TORCH29_REQUIRES
+    torch29 = native if native and all("==2.9." in item for item in native) else TORCH29_REQUIRES
     return {
-        "torch": list(TORCH29_REQUIRES),
+        "torch": list(default),
         "torch26": list(TORCH26_REQUIRES),
         "torch27": list(TORCH27_REQUIRES),
-        "torch29": list(TORCH29_REQUIRES),
-        "all": list(TORCH29_REQUIRES),
+        "torch29": list(torch29),
+        "all": list(default),
     }
 
 
@@ -188,6 +208,13 @@ class BuildPy(build_py):
                 logger.info("Copied optional native payload from %s", native_payload)
         else:
             logger.info("No native payload selected; assembling a core-only wheel.")
+        for directory, subdirectories, filenames in os.walk(target_lib_dir):
+            if "__pycache__" in subdirectories:
+                shutil.rmtree(os.path.join(directory, "__pycache__"))
+                subdirectories.remove("__pycache__")
+            for filename in filenames:
+                if filename.endswith((".pyc", ".pyo")):
+                    os.remove(os.path.join(directory, filename))
         write_commit_id(target_lib_dir)
         update_permissions(target_lib_dir)
 

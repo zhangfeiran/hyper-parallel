@@ -91,11 +91,14 @@ from hyper_parallel.core.multicore import MegaMoeExperts
 ```
 
 HyperParallel 根包不导出 Multicore 的业务接口。
+
 ## Torch-NPU 2.9.0 wheels
 
 Use matching `torch==2.9.0` and `torch_npu==2.9.0` in one isolated virtual environment.
 The original 2.9.0 wheel does not package `npu_cpp_extension.h` or its newer extension API.
 The adapter selects its public OpCommand/ACLNN bridge when that header is absent.
+Push training on Torch-NPU 2.9.0 also uses the packaged ACLNN unpermute backward
+entry with owned gradient outputs, avoiding that wheel's differing autograd path.
 This path retains input tensors and optional shape storage through queued submission,
 records their consuming stream, and allocates workspace on that stream. It resolves
 symbols only from the activated custom vendor and CANN SDK. Deterministic-algorithm
