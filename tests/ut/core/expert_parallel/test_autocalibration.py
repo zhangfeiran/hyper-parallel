@@ -248,10 +248,24 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
             self.manifest(root)
             repository = Path(__file__).resolve().parents[4]
             environment = os.environ | {'NNODES': '8', 'NODE_RANK': '0', 'NUM_CARDS': '16', 'MASTER_ADDR': '127.0.0.1'}
-            result = subprocess.run([sys.executable, str(repository / 'scripts/replica_autocalibration.py'),
-                '--manifest', str(root / 'model.json'), '--output', str(root / 'run'), '--dry-run'],
-                check=True, capture_output=True, text=True, env=environment)
-            commands = json.loads(result.stdout)['commands']
-            self.assertIn('tests.torch.expert_parallel._replica_capture_launcher', commands['collect'])
-            self.assertIn('--placement-output', commands['verify'])
+            fallback = environment | {'NNODES': '', 'NODE_RANK': '', 'MASTER_ADDR': '', 'MA_NUM_HOSTS': '',
+                'RANK_AFTER_ACC': '', 'VC_TASK_INDEX': '0', 'MASTER_PORT_BASE': '', 'NUM_CARDS': '',
+                'CALIBRATION_PHASE_TIMEOUT_SECONDS': '',
+                'VC_WORKER_HOSTS': ','.join(f'127.0.0.{index}:8000' for index in range(1, 9)),
+                'HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT': 'tcp://stale-host:1'}
+            for active in (environment, fallback):
+                with self.subTest(empty_scheduler_fields=not bool(active['NNODES'])):
+                    result = subprocess.run([sys.executable, str(repository / 'scripts/replica_autocalibration.py'),
+                        '--manifest', str(root / 'model.json'), '--output', str(root / 'run'), '--dry-run'],
+                        check=True, capture_output=True, text=True, env=active)
+                    payload = json.loads(result.stdout)
+                    commands = payload['commands']
+                    self.assertIn('tests.torch.expert_parallel._replica_capture_launcher', commands['collect'])
+                    self.assertIn('--placement-output', commands['verify'])
+                    self.assertEqual(payload['nodes'], 8)
+                    self.assertEqual(payload['node_rank'], 0)
+                    self.assertEqual(payload['cards_per_node'], 16)
+                    for phase, port in (('collect', 29301), ('verify', 29303)):
+                        self.assertEqual(payload['stage_environment'][phase]
+                            ['HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT'], f'tcp://127.0.0.1:{port}')
             self.assertFalse((root / 'run').exists())

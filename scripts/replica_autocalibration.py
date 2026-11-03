@@ -49,11 +49,17 @@ def _run(command: list[str], log: Path, timeout: int, peers: list[Path] | None =
                 time.sleep(.5)
             raise subprocess.TimeoutExpired(command, timeout)
         except BaseException:
-            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 process.wait(timeout=20)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait()
             raise
 
@@ -83,14 +89,15 @@ def main() -> None:
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, _terminate)
-    hosts = os.environ.get('VC_WORKER_HOSTS', '').split(',')
-    nodes = int(os.environ.get('NNODES', os.environ.get('MA_NUM_HOSTS', str(len(hosts)))))
-    node = int(os.environ.get('NODE_RANK', os.environ.get('RANK_AFTER_ACC', os.environ.get('VC_TASK_INDEX', '-1'))))
-    cards = int(os.environ.get('NUM_CARDS', '16'))
-    address = os.environ.get('MASTER_ADDR', hosts[0].split(':')[0])
-    port = int(os.environ.get('MASTER_PORT_BASE', '29300'))
-    timeout = int(os.environ.get('CALIBRATION_PHASE_TIMEOUT_SECONDS', '3600'))
-    if nodes < 1 or not 0 <= node < nodes or cards < 1 or not address or not 1024 <= port < 65532:
+    hosts = [host.strip() for host in os.environ.get('VC_WORKER_HOSTS', '').split(',') if host.strip()]
+    nodes = int(os.environ.get('NNODES') or os.environ.get('MA_NUM_HOSTS') or len(hosts) or 1)
+    node = int(os.environ.get('NODE_RANK') or os.environ.get('RANK_AFTER_ACC')
+               or os.environ.get('VC_TASK_INDEX') or '-1')
+    cards = int(os.environ.get('NUM_CARDS') or '16')
+    address = os.environ.get('MASTER_ADDR') or (hosts[0].split(':')[0] if hosts else '')
+    port = int(os.environ.get('MASTER_PORT_BASE') or '29300')
+    timeout = int(os.environ.get('CALIBRATION_PHASE_TIMEOUT_SECONDS') or '3600')
+    if nodes < 1 or not 0 <= node < nodes or cards < 1 or not address or not 1024 <= port < 65532 or timeout < 1:
         raise ValueError('Require valid scheduler NNODES/NODE_RANK/MASTER_ADDR and a free rendezvous port')
     manifest = json.loads(args.manifest.read_text())
     if nodes * cards % manifest['ep_size']:
@@ -114,9 +121,14 @@ def main() -> None:
                                                                  '--candidate-directory', str(args.output / 'models')],
                 'publish': fitter + ['--input', str(args.output / 'verify'), '--verify']}
     commands['verify'] += ['--placement-output', str(args.output / 'verify' / 'placement')]
+    stage_environment = {
+        phase: {'HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT': f'tcp://{address}:{endpoint_port}'}
+        for phase, endpoint_port in (('collect', port + 1), ('verify', port + 3))
+    }
     if args.dry_run:
         print(json.dumps({'commands': commands, 'model': manifest, 'nodes': nodes, 'node_rank': node,
-                          'cards_per_node': cards, 'runtime_bootstrap': 'caller-owned CANN/native/Python activation'},
+                          'cards_per_node': cards, 'stage_environment': stage_environment,
+                          'runtime_bootstrap': 'caller-owned CANN/native/Python activation'},
                          indent=2))
         return
     node_root = args.output / 'nodes' / f'node_{node}'
@@ -126,6 +138,7 @@ def main() -> None:
     try:
         for phase in ('collect', 'fit', 'verify', 'publish'):
             if phase in ('collect', 'verify'):
+                os.environ.update(stage_environment[phase])
                 peers = [args.output / f'{phase}-node{index}.json' for index in range(nodes)]
                 try:
                     status = _run(commands[phase], node_root / f'{phase}.log', timeout, peers)
@@ -140,7 +153,11 @@ def main() -> None:
                     raise RuntimeError(f'Missing completed rank evidence: {phase}: {missing}')
             else:
                 if node == 0:
-                    status = _run(commands[phase], node_root / f'{phase}.log', timeout)
+                    try:
+                        status = _run(commands[phase], node_root / f'{phase}.log', timeout)
+                    except BaseException:
+                        _write(args.output / f'{phase}-done.json', {'exit_status': 1, 'node': node})
+                        raise
                     _write(args.output / f'{phase}-done.json', {'exit_status': status, 'node': node})
                 _wait([args.output / f'{phase}-done.json'], timeout)
         terminal = 0
