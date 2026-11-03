@@ -33,6 +33,11 @@ from .cost import ExpertReplicaCostModel
 from .plan import ExpertExecutionPlan
 
 MEASUREMENT_CONTRACT = 'rank_cumulative_f_r_b_v2'
+CAPTURE_POLICY = 'runtime_default_admission_v1'
+
+
+class CalibrationDesignRejected(ValueError):
+    """Report valid captures that cannot identify a stable TRAIN-only service model."""
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -48,13 +53,15 @@ def load_manifest(path: Path) -> dict[str, Any]:
     defaults = {'dispatch_modes': ['push', 'pull'], 'replica_caps': [1, 2, 6], 'dtype': 'bfloat16',
                 'gradient_dtype': 'float32', 'expert_weight_layout': 'EIO', 'swiglu_limit': None,
                 'residency_mode': 'force_normal_miss', 'checkpoint_contract': 'nonreentrant',
-                'measurement_contract': MEASUREMENT_CONTRACT,
+                'measurement_contract': MEASUREMENT_CONTRACT, 'capture_policy': CAPTURE_POLICY,
                 'frames': 12, 'samples': 3, 'warmup': 1}
     result = defaults | value
     if result['checkpoint_contract'] not in ('reentrant', 'nonreentrant'):
         raise ValueError('checkpoint_contract must be reentrant or nonreentrant')
     if result['measurement_contract'] != MEASUREMENT_CONTRACT:
         raise ValueError('Automatic calibration requires fresh rank-cumulative F/R/B component timing')
+    if result['capture_policy'] != CAPTURE_POLICY:
+        raise ValueError('Automatic calibration requires the runtime default admission policy')
     if (result['dtype'], result['gradient_dtype'], result['expert_weight_layout'], result['residency_mode']) != (
             'bfloat16', 'float32', 'EIO', 'force_normal_miss'):
         raise ValueError('Automatic calibration requires BF16/EIO, FP32 partials and force_normal_miss')
@@ -74,12 +81,34 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise ValueError(f'{name} must be at least {minimum}')
     if result.get('replica_transport', 'shmem_signal_kernel_gradient_bands') != 'shmem_signal_kernel_gradient_bands':
         raise ValueError('Automatic calibration requires gradient-band transport')
+    templates = result.get('route_templates', [])
+    if templates:
+        if not isinstance(templates, list) or result['frames'] != 12 + len(templates):
+            raise ValueError('Route templates must follow the twelve bounded calibration frames')
+        names = set()
+        for template in templates:
+            counts = template.get('source_expert_counts', [])
+            name, family = template.get('name'), template.get('family')
+            if (not isinstance(name, str) or not name or name in names
+                    or not isinstance(family, str) or not family
+                    or len(counts) != result['num_experts']
+                    or any(type(count) is not int or not 0 <= count <= result['local_num_tokens'] for count in counts)
+                    or sum(counts) != result['local_num_tokens'] * result['top_k']):
+                raise ValueError('Route templates require unique names, families and conserved distinct-TopK counts')
+            names.add(name)
     return result
 
 
 def calibration_ids(tokens: int, manifest: dict[str, Any], frame: int, nodes: tuple[int, ...]) -> torch.Tensor:
     """Build bounded expert histograms with distinct logical experts in each token row."""
     experts, top_k, size = manifest['num_experts'], manifest['top_k'], manifest['ep_size']
+    templates = manifest.get('route_templates', [])
+    if templates and frame >= 12:
+        if tokens != manifest['local_num_tokens'] or frame - 12 >= len(templates):
+            raise ValueError('A frozen route template requires its exact declared source-token shape')
+        counts = templates[frame - 12]['source_expert_counts']
+        flat = torch.repeat_interleave(torch.arange(experts), torch.tensor(counts))
+        return flat.reshape(top_k, tokens).T.contiguous().int()
     counts = [tokens * top_k // experts] * experts
     for expert in range(tokens * top_k % experts):
         counts[expert] += 1
@@ -174,6 +203,8 @@ def _samples(reports: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]
         for row in report['records']:
             if row.get('measurement_contract') != MEASUREMENT_CONTRACT:
                 raise ValueError('Capture requires fresh rank-cumulative F/R/B component timing')
+            if row.get('capture_policy') != CAPTURE_POLICY:
+                raise ValueError('Capture requires the runtime default admission policy')
             if row.get('execution_signature', report['execution_signature']) != report['execution_signature']:
                 raise ValueError('Observation changed its live execution or token domain')
             if row.get('profile_on') is not False or not row.get('finite'):
@@ -229,7 +260,8 @@ def _fit_services(train: list[dict[str, Any]]) -> tuple[np.ndarray, dict[str, An
         raise ValueError('Service fitting accepts TRAIN frames only')
     features = np.stack([row['features'][0][:, [0, 1, 4, 5, 8, 9]].max(axis=0) for row in train])
     target = np.array([row['observed_ms'] for row in train])
-    folds = np.array([row['frame'] % 4 + 4 * int(4 <= row['frame'] % 12 < 8) for row in train])
+    folds = np.array([row.get('cv_group', str(row['frame'] % 4 + 4 * int(4 <= row['frame'] % 12 < 8)))
+                      for row in train])
     nodes = train[0]['rank_nodes']
     possible = {2: len(set(nodes)) < len(nodes), 3: len(set(nodes)) > 1}
     candidates, errors = [], []
@@ -250,7 +282,7 @@ def _fit_services(train: list[dict[str, Any]]) -> tuple[np.ndarray, dict[str, An
         except ValueError as error:
             errors.append(str(error))
     if not candidates:
-        raise ValueError(f'No identifiable TRAIN cross-validation basis: {errors}')
+        raise CalibrationDesignRejected(f'No identifiable TRAIN cross-validation basis: {errors}')
     _, _, columns, cv = min(candidates, key=lambda row: (row[0], row[1], row[2]))
     values, fit = fit_nonnegative_services(features[:, columns], target)
     beta = np.zeros(6)
@@ -342,7 +374,10 @@ def fit_directory(manifest: dict[str, Any], source: Path, output: Path, *, verif
                                            for row in selected):
                 raise ValueError('Incomplete observations or incompatible execution signatures')
             rows = _samples(selected, budget)
-            holdout = [row for row in rows if row['frame'] % 3 == 2]
+            leaders = sorted({row['group_leader'] for row in rows})
+            train_leader = leaders[0]
+            holdout = [row for row in rows if row['frame'] % 3 == 2
+                       and (len(leaders) == 1 or row['group_leader'] != train_leader)]
             filename = f'{backend}-b{budget}.json'
             if verify:
                 payload = json.loads((output / filename).read_text())
@@ -353,7 +388,8 @@ def fit_directory(manifest: dict[str, Any], source: Path, output: Path, *, verif
                     validation['status'] = 'failed'
                     validation['reason'] = 'Candidate did not reach every runtime holdout'
             else:
-                train = [row for row in rows + baseline if row['frame'] % 3 != 2]
+                train = [row for row in rows + baseline if row['frame'] % 3 != 2
+                         and row['group_leader'] == train_leader]
                 beta, fit = _fit_services(train)
                 host = max(row.get('planner_cpu_ms', 0.) for row in train)
                 margin = max(.05, 2 * max(fit['train_absolute_error_p95_ms'],
@@ -362,6 +398,9 @@ def fit_directory(manifest: dict[str, Any], source: Path, output: Path, *, verif
                 coverage = max(max(max(rank) for rank in row['plan'].destination_counts) for row in train)
                 payload = _candidate(manifest, selected[0], budget, beta, margin, coverage)
                 payload['fit'] = fit
+                payload['fit']['train_group_leader'] = train_leader
+                payload['fit']['holdout_group_leaders'] = sorted({row['group_leader'] for row in holdout})
+                payload['fit']['disjoint_ep_group_holdout'] = len(leaders) > 1
                 validation = validate_profile(payload, holdout, baseline)
                 validation['status'] = 'candidate' if validation['status'] == 'passed' else 'failed'
             payload['validation'] = validation
@@ -393,6 +432,13 @@ def main() -> None:
     args = parser.parse_args()
     try:
         report = fit_directory(load_manifest(args.manifest), args.input, args.output, verify=args.verify)
+    except CalibrationDesignRejected as error:
+        args.output.mkdir(parents=True, exist_ok=True)
+        report = {'status': 'failed', 'calibration_status': 'rejected', 'collection_complete': True,
+                  'reason': str(error), 'catalog_published': False}
+        (args.output / 'fit-report.json').write_text(json.dumps(report, indent=2) + '\n')
+        print(json.dumps(report, indent=2))
+        raise SystemExit(20) from error
     except (ValueError, KeyError, FileNotFoundError) as error:
         args.output.mkdir(parents=True, exist_ok=True)
         report = {'status': 'failed', 'reason': str(error), 'catalog_published': False}

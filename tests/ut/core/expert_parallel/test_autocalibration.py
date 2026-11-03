@@ -27,12 +27,13 @@ import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
 from hyper_parallel.core.expert_parallel.hot_replica import policy, autocalibration
+from hyper_parallel.core.expert_parallel.hot_replica import calibration_catalog
 from hyper_parallel.core.expert_parallel.hot_replica.autocalibration import (
     MEASUREMENT_CONTRACT, calibration_ids, fit_directory, fit_nonnegative_services, load_manifest, plan_features,
 )
@@ -46,6 +47,7 @@ from hyper_parallel.core.activation_memory.recompute_state import get_recompute_
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega
 from hyper_parallel.core.multicore.modules.mega_moe.inactive_tasks import UNMAPPED_GUEST_SUFFIX_SCHEDULE
 from tests.torch.expert_parallel._replica_autocalibration_worker import _checkpoint_operation
+from tests.torch.expert_parallel import _replica_autocalibration_worker as capture_worker
 
 
 class TestAutomaticReplicaCalibration(unittest.TestCase):
@@ -67,12 +69,147 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
             manifest = self.manifest(root)
             for key, value in (('ep_size', 3), ('top_k', 5), ('hidden_size', 0), ('checkpointed', False),
                                ('dtype', 'float32'), ('replica_caps', [True]), ('frames', 3),
-                               ('checkpoint_contract', 'unknown'), ('measurement_contract', 'legacy')):
+                               ('checkpoint_contract', 'unknown'), ('measurement_contract', 'legacy'),
+                               ('capture_policy', 'forced_full_planning')):
                 with self.subTest(key=key):
                     payload = manifest | {key: value}
                     (root / 'model.json').write_text(json.dumps(payload))
                     with self.assertRaises(ValueError):
                         load_manifest(root / 'model.json')
+
+    def test_capture_keeps_the_production_admission_default(self) -> None:
+        """Cost-off and cost-on capture must not force a different admission threshold from training."""
+        original = capture_worker.MegaMoeExperts
+        observed = []
+
+        def capture_settings(**options: object) -> None:
+            module = original(**options)
+            self.addCleanup(module.close)
+            observed.append(module.replica_minimum_load_reduction)
+            raise RuntimeError('Captured admission settings')
+
+        with TemporaryDirectory() as temp:
+            manifest = self.manifest(Path(temp))
+            for enabled in ('0', '1'):
+                with (self.subTest(cost_model=enabled),
+                      patch.dict(os.environ, {'HYPER_PARALLEL_REPLICA_COST_MODEL': enabled}),
+                      patch.object(capture_worker.dist, 'get_rank', return_value=0),
+                      patch.object(capture_worker.dist, 'get_world_size', return_value=2),
+                      patch.object(capture_worker, 'MegaMoeExperts', side_effect=capture_settings)):
+                    with self.assertRaisesRegex(RuntimeError, 'Captured admission settings'):
+                        capture_worker._capture(manifest, 'push', 1, None, torch.device('cpu'), Path(temp))
+            self.assertEqual(observed, [None, None])
+
+    def test_forced_policy_samples_cannot_be_relabelled_as_runtime_defaults(self) -> None:
+        """Old forced-planning captures must not be admitted by changing only their manifest."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = self.manifest(root)
+            self.observations(root / 'collect', manifest)
+            report = json.loads((root / 'collect/push-b1-group0.json').read_text())
+            for policy_name in (None, 'forced_full_planning'):
+                with self.subTest(capture_policy=policy_name):
+                    invalid = deepcopy(report)
+                    invalid['records'][0]['capture_policy'] = policy_name
+                    with self.assertRaisesRegex(ValueError, 'runtime default admission'):
+                        autocalibration._samples([invalid], 1)
+
+    def test_unidentifiable_valid_capture_is_a_quality_rejection(self) -> None:
+        """A stable-model design failure must preserve exit 20 without accepting malformed input."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.manifest(root)
+            command = ['autocalibration', '--manifest', str(root / 'model.json'),
+                       '--input', str(root / 'collect'), '--output', str(root / 'models')]
+            with (patch.object(sys, 'argv', command),
+                  patch.object(autocalibration, 'fit_directory',
+                               side_effect=autocalibration.CalibrationDesignRejected('No stable TRAIN basis'))):
+                with self.assertRaises(SystemExit) as result:
+                    autocalibration.main()
+            self.assertEqual(result.exception.code, 20)
+            report = json.loads((root / 'models/fit-report.json').read_text())
+            self.assertTrue(report['collection_complete'])
+            self.assertEqual(report['calibration_status'], 'rejected')
+            self.assertFalse(report['catalog_published'])
+
+    def test_frozen_route_templates_retain_exact_counts_and_distinct_topk(self) -> None:
+        """A calibration can include model-owned route frames without changing their source shape."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = self.manifest(root)
+            template = dict(name='medium-layer0', family='medium', source_expert_counts=[96, 0, 32, 0])
+            (root / 'model.json').write_text(json.dumps(manifest | {'route_templates': [template], 'frames': 13}))
+            selected = load_manifest(root / 'model.json')
+            ids = calibration_ids(128, selected, 12, (0, 1))
+            self.assertEqual(torch.bincount(ids.flatten().long(), minlength=4).tolist(),
+                             template['source_expert_counts'])
+            with self.assertRaisesRegex(ValueError, 'exact declared'):
+                calibration_ids(64, selected, 12, (0, 1))
+            for changes in ({'frames': 12}, {'route_templates': [template | {'source_expert_counts': [129, 0, 0, 0]}]}):
+                (root / 'model.json').write_text(json.dumps(selected | changes))
+                with self.assertRaises(ValueError):
+                    load_manifest(root / 'model.json')
+
+
+    def test_another_ep_group_is_held_out_from_all_coefficient_fitting(self) -> None:
+        """A second EP group never influences fitted coefficients or TRAIN-only basis selection."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = self.manifest(root)
+            self.observations(root / 'collect', manifest)
+            for rank in (2, 3):
+                (root / 'collect' / f'status-rank{rank}.json').write_text(
+                    json.dumps(dict(rank=rank, completed=True)))
+            for budget in (0, 1):
+                path = root / 'collect' / f'push-b{budget}-group0.json'
+                first = json.loads(path.read_text()) | {'world_size': 4}
+                path.write_text(json.dumps(first))
+                second = deepcopy(first) | {'ep_members': [2, 3]}
+                second['records'] = [row | {'group_leader': 2} for row in first['records']]
+                (root / 'collect' / f'push-b{budget}-group2.json').write_text(json.dumps(second))
+            beta = np.array([0., 3., 0., 0., 0., 0.])
+            with patch.object(autocalibration, '_fit_services', return_value=(beta, {
+                    'train_absolute_error_p95_ms': 0., 'train_group_absolute_error_p95_ms': 0.})) as fit:
+                result = fit_directory(manifest, root / 'collect', root / 'models')
+            self.assertEqual(result['status'], 'candidate')
+            self.assertEqual({row['group_leader'] for row in fit.call_args.args[0]}, {0})
+            self.assertTrue(all(row['frame'] % 3 != 2 for row in fit.call_args.args[0]))
+            profile = json.loads((root / 'models/push-b1.json').read_text())
+            self.assertEqual(profile['fit']['holdout_group_leaders'], [2])
+            self.assertTrue(profile['fit']['disjoint_ep_group_holdout'])
+
+
+    def test_group_model_uses_the_agreed_hard_heap_allowance(self) -> None:
+        """Only the calibrated group scorer can compare owner layouts beyond geometric growth."""
+        owner = mega.MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=1,
+                               ep_size=2, replica_slots_per_rank=1)
+        self.addCleanup(owner.close)
+        model = ExpertReplicaCostModel(calibration_version=2, backend='push', hidden_size=16,
+            intermediate_size=8, ep_size=2, transport='shmem_signal_kernel_gradient_bands',
+            forward_ms=((0, 0.), (1000, 1.)), backward_ms=((0, 0.), (1000, 1.)),
+            weight_ms=0., gradient_ms=0., effective_group_ms=(0., 1., 0., 0., 0., 100.))
+        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=True), home_spec=object(), rank_nodes=(0, 1),
+            replica_receive_capacity=Mock(), critical_path_receive_capacity=Mock())
+        with (patch.object(mega, '_critical_path_available', return_value=False),
+              patch.object(mega, '_runtime_cost_model', return_value=model),
+              patch.object(mega, 'prepare_replica_route', return_value=object()) as prepare):
+            owner._prepare_replica_route(torch.zeros(1, 1, dtype=torch.int32), resources,
+                                         torch.zeros(1, 16), 31, None)
+        self.assertIs(prepare.call_args.kwargs['_capacity_budget'], resources.critical_path_receive_capacity)
+        self.assertEqual(prepare.call_args.kwargs['minimum_load_reduction'], 0.)
+
+
+    def test_catalog_hash_uses_supported_extension_suffixes(self) -> None:
+        """Fingerprint compatible host extensions without initializing devices."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            abi3 = root / '_replica_host.abi3.so'
+            abi3.write_bytes(b'cluster host extension')
+            self.assertEqual(calibration_catalog._host_extension(root), abi3)
+            specific = root / ('_replica_host' + calibration_catalog.EXTENSION_SUFFIXES[0])
+            specific.write_bytes(b'interpreter specific extension')
+            self.assertEqual(calibration_catalog._host_extension(root), specific)
+
 
     def test_checkpoint_contract_matches_grad_modes_rng_and_execution_signature(self) -> None:
         """Reentrant PanGu and nonreentrant Hyper replay retain distinct stable F/R signatures."""
@@ -185,6 +322,7 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
                 for sample in range(manifest['samples']):
                     records.append({'group_leader': 0, 'frame': frame, 'sample': sample,
                         'measurement_contract': MEASUREMENT_CONTRACT,
+                        'capture_policy': autocalibration.CAPTURE_POLICY,
                         'config': asdict(plan.config), 'source_counts': plan.logical_counts,
                         'slots': plan.slot_to_logical, 'dispatch': plan.dispatch_counts, 'rank_nodes': [0, 1],
                         'rank_phase_ms': [dict(forward=peak, recompute=peak, backward=peak)] * 2,

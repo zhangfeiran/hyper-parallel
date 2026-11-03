@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import hashlib
 from importlib import metadata
+from importlib.machinery import EXTENSION_SUFFIXES
 import json
 import os
 from pathlib import Path
-import sysconfig
 from typing import Any
 
 
@@ -38,6 +38,12 @@ ENVIRONMENT_DEFAULTS = {'HYPER_PARALLEL_REPLICA_WEIGHT_RESIDENCY': '1',
                         'HYPER_PARALLEL_REPLICA_HOST_NATIVE': '1'}
 
 
+def _host_extension(directory: Path) -> Path | None:
+    """Follow the interpreter's extension suffix order, including packaged ABI3 builds."""
+    return next((directory / ('_replica_host' + suffix) for suffix in EXTENSION_SUFFIXES
+                 if (directory / ('_replica_host' + suffix)).is_file()), None)
+
+
 def runtime_contract() -> dict[str, Any]:
     """Fingerprint execution sources and policy switches without querying a device."""
     root = Path(__file__).resolve().parents[4]
@@ -51,11 +57,12 @@ def runtime_contract() -> dict[str, Any]:
         except metadata.PackageNotFoundError:
             versions[package] = None
     cann = Path(os.environ.get('ASCEND_HOME_PATH', '/nonexistent')) / 'share/info/runtime/version.info'
-    host = Path(__file__).with_name('_host_kernel') / f"_replica_host{sysconfig.get_config_var('EXT_SUFFIX')}"
+    host = _host_extension(Path(__file__).with_name('_host_kernel'))
     return {'source_sha256': {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                              for name in EXECUTION_FILES}, 'environment': flags,
             'framework_versions': versions, 'cann_version_info': cann.read_text() if cann.is_file() else None,
-            'host_native_sha256': hashlib.sha256(host.read_bytes()).hexdigest() if host.is_file() else None,
+            'host_native_sha256': hashlib.sha256(host.read_bytes()).hexdigest() if host is not None else None,
+            'heap_budget': os.environ.get('HYPER_PARALLEL_SHMEM_HEAP_SIZE'),
             'allocation_scope': {name: os.environ.get(name) for name in
                                  ('MASTER_ADDR', 'VC_WORKER_HOSTS', 'NNODES', 'NUM_CARDS')}}
 

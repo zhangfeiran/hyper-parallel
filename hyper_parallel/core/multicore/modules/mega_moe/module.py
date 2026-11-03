@@ -795,7 +795,8 @@ class MegaMoeExperts(MulticoreModule):
                               if self.dispatch_mode != "pull" and not resources.spec.auto_tokens else None),
             _auto_capacity_factor=(self.initial_capacity_factor
                                    if resources.spec.auto_tokens and self.dispatch_mode != "pull" else None),
-            _capacity_budget=((resources.critical_path_receive_capacity if cost_model.critical_path is not None
+            _capacity_budget=((resources.critical_path_receive_capacity
+                               if cost_model.critical_path is not None or cost_model.effective_group_ms
                                else resources.replica_receive_capacity)
                               if resources.spec.auto_tokens and self.dispatch_mode != "pull"
                               and cost_model is not None else None),

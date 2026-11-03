@@ -80,10 +80,10 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
              device: torch.device, output: Path) -> None:
     rank, size = dist.get_rank(group), dist.get_world_size(group)
     global_rank = dist.get_rank()
+    # Equal quota layouts must retain the same admission defaults and host paths as training.
     module = MegaMoeExperts(hidden_size=manifest['hidden_size'], intermediate_size=manifest['intermediate_size'],
         num_experts=manifest['num_experts'], top_k=manifest['top_k'], ep_group=group, dispatch_mode=mode,
         replica_slots_per_rank=budget, swiglu_limit=manifest['swiglu_limit'],
-        replica_minimum_load_reduction=None if os.environ['HYPER_PARALLEL_REPLICA_COST_MODEL'] == '1' else 0.,
         replica_transport='shmem_signal_kernel_gradient_bands').to(device).bfloat16()
     torch.manual_seed(42 + rank)
     with torch.no_grad():
@@ -103,6 +103,7 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
         begin = time.perf_counter()
         result = original_plan(*arguments, **options)
         active['planner_cpu_ms'] = active.get('planner_cpu_ms', 0.) + (time.perf_counter() - begin) * 1000
+        active['planner_entry_calls'] = active.get('planner_entry_calls', 0) + 1
         active['plan'] = result[0]
         return result
 
@@ -111,6 +112,9 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
         expected = options.get('execution_signature')
         key = (*arguments[1:8], policy._soc_name(device), expected)
         candidate = policy._calibrations().get(key)
+        if candidate is None:
+            shared_soc = policy._SHARED_SOC_CALIBRATIONS.get(key[-2], key[-2])
+            candidate = policy._calibrations().get(key[:-2] + (shared_soc, expected))
         active['cost_model_matched'] = model is not None and model == candidate
         return model
 
@@ -118,8 +122,10 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
         with (patch.object(routing, '_plan_replica_route', plan_hook),
               patch.object(mega, '_runtime_cost_model', cost_hook)):
             for frame in range(manifest['frames']):
-                tokens = manifest['local_num_tokens'] // (2 if 4 <= frame % 12 < 8 and rank % 2 == 0 else 1)
-                if frame % 4 == 3 and rank % 4 == 0:
+                frozen = bool(manifest.get('route_templates')) and frame >= 12
+                tokens = manifest['local_num_tokens'] // (2 if not frozen and 4 <= frame % 12 < 8
+                                                         and rank % 2 == 0 else 1)
+                if not frozen and frame % 4 == 3 and rank % 4 == 0:
                     tokens = 0
                 frame_tokens = [None] * size
                 dist.all_gather_object(frame_tokens, tokens, group=group)
@@ -178,6 +184,7 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
                                  (result, values.grad, probabilities.grad, *[p.grad for p in module.parameters()]))
                     local = {'phase_ms': phases, 'wall_ms': wall_ms, 'counts': local_counts, 'finite': finite,
                              'component_ms': component_ms,
+                             'execution_replica_slots': resources.last_execution_plan.spec.replica_slots_per_rank,
                              'signature': active['signature'], 'matched': active.get('cost_model_matched', False),
                              'planner_cpu_ms': active.get('planner_cpu_ms', 0.)}
                     gathered = [None] * size
@@ -195,6 +202,9 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
                             plan = _materialize(counts, copies, config, rank_nodes=nodes)
                         plan.validate()
                         records.append({'group_leader': global_rank, 'frame': frame, 'sample': sample,
+                            'capture_policy': manifest['capture_policy'],
+                            'cv_group': ('template:' + manifest['route_templates'][frame - 12]['family'] if frozen
+                                         else 'bounded:' + str(frame % 4 + 4 * int(4 <= frame % 12 < 8))),
                             'measurement_contract': MEASUREMENT_CONTRACT,
                             'execution_signature': active['signature'], 'maximum_source_tokens': maximum_tokens,
                             'config': asdict(plan.config), 'source_counts': plan.logical_counts,
@@ -207,6 +217,9 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
                                                         for phase in ('forward', 'recompute', 'backward')),
                             'wall_rank_max_ms': max(row['wall_ms'] for row in gathered),
                             'planner_cpu_ms': max(row['planner_cpu_ms'] for row in gathered),
+                            'planner_entry_calls': active.get('planner_entry_calls', 0),
+                            'plan_bypassed': active.get('plan') is None,
+                            'execution_replica_slots': [row['execution_replica_slots'] for row in gathered],
                             'finite': True, 'profile_on': False,
                             'cost_model_matched': all(row['matched'] for row in gathered),
                             'balanced_owner_bypass': len(set(sum(sum(source[start:start + config.home_experts])
@@ -218,7 +231,9 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
         payload = {'manifest': manifest, 'backend': mode, 'budget': budget, 'rank_nodes': nodes,
             'world_size': dist.get_world_size(),
             'native_payload_sha256': mega._critical_native_fingerprint(),
-            'ep_members': dist.get_process_group_ranks(group), 'soc_name': torch.npu.get_device_name(device),
+            'ep_members': dist.get_process_group_ranks(group),
+            'soc_name': policy._SHARED_SOC_CALIBRATIONS.get(torch.npu.get_device_name(device),
+                                                            torch.npu.get_device_name(device)),
             'schedule': UNMAPPED_GUEST_SUFFIX_SCHEDULE, 'execution_signature': active['signature'],
             'runtime_contract': runtime_contract(), 'records': records, 'completed': True}
         (output / f'{mode}-b{budget}-group{global_rank}.json').write_text(json.dumps(payload) + '\n')
