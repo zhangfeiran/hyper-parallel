@@ -92,10 +92,20 @@ class TestSharedFunction(unittest.TestCase):
                     self._check_deferred(True, None, forward_shared=forward, backward_shared=True,
                                          outputs=outputs)
 
+    def test_a5_native_activation_producers_keep_recompute_and_clamp_gradients(self) -> None:
+        """Consume native activation gradients without rerunning them in the fused CPU kernel."""
+        for forward in (False, True):
+            for limit in (None, 1.25):
+                for recompute in (None, False, True):
+                    with self.subTest(forward=forward, limit=limit, recompute=recompute):
+                        self._check_deferred(True, limit, forward_shared=forward, backward_shared=True,
+                                             recompute=recompute, cube_cores=32)
+
     def _check_deferred(
         self, input_grad: bool, limit: float | None, *, strided: bool = False,
         forward_shared: bool = True, backward_shared: bool = False,
         recompute: bool | None = None, freeze: int | None = None, outputs: str = "both",
+        cube_cores: int = 24,
     ) -> None:
         """Compare deferred shared gradients with an independent dense reference.
 
@@ -108,12 +118,14 @@ class TestSharedFunction(unittest.TestCase):
             recompute: Checkpoint mode; None executes without checkpoint.
             freeze: Optional first or second shared weight to freeze.
             outputs: Select the consumed branch; single branches also repeat backward with graph retention.
+            cube_cores: Select full A3 fusion or the A5 native activation producer contract.
         """
         torch.manual_seed(73)
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0, ep_size=2,
                                num_experts=4, top_k=2, dispatch_mode="push", shared_intermediate_size=2,
                                forward_ingress_mode="legacy", swiglu_limit=limit,
-                               forward_shared_expert=forward_shared, backward_shared_expert=backward_shared)
+                               forward_shared_expert=forward_shared, backward_shared_expert=backward_shared,
+                               num_cube_cores=cube_cores)
         plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, ingress_diagnostics=None)
         workspace = Mock(expert_buffer=torch.zeros(8, 4), routed_buffer=torch.zeros(4, 4),
                          gmm_workspace=torch.zeros(512, dtype=torch.uint8), swiglu_grad_workspace=torch.zeros(1))
@@ -153,17 +165,20 @@ class TestSharedFunction(unittest.TestCase):
             self.assertEqual(execution.shared_ptrs is not None, backward_shared)
             if execution.shared_ptrs is not None:
                 dy, activation, dw2, second, dactivation, up, dup, first, dx, source, dw1 = execution.shared_ptrs
-                dactivation.copy_(torch.mm(dy, second))
-                activation_input = up
-                if limit is not None:
-                    gate, branch = up.chunk(2, dim=-1)
-                    activation_input = torch.cat((gate.clamp(max=limit), branch.clamp(-limit, limit)), dim=-1)
-                derivative = activation_backward(dactivation, activation_input, -1)
-                if limit is not None:
-                    gate_grad, branch_grad = derivative.chunk(2, dim=-1)
-                    derivative = torch.cat((torch.where(gate <= limit, gate_grad, 0),
-                                            torch.where((branch >= -limit) & (branch <= limit), branch_grad, 0)), -1)
-                dup.copy_(derivative)
+                if cube_cores != 32:
+                    dactivation.copy_(torch.mm(dy, second))
+                    activation_input = up
+                    if limit is not None:
+                        gate, branch = up.chunk(2, dim=-1)
+                        activation_input = torch.cat((gate.clamp(max=limit), branch.clamp(-limit, limit)), dim=-1)
+                    derivative = activation_backward(dactivation, activation_input, -1)
+                    if limit is not None:
+                        gate_grad, branch_grad = derivative.chunk(2, dim=-1)
+                        derivative = torch.cat(
+                            (torch.where(gate <= limit, gate_grad, 0),
+                             torch.where((branch >= -limit) & (branch <= limit), branch_grad, 0)), -1,
+                        )
+                    dup.copy_(derivative)
                 dx.copy_(torch.mm(dup, first))
                 dw1.copy_(torch.mm(source.t(), dup))
                 dw2.copy_(torch.mm(activation.t(), dy))

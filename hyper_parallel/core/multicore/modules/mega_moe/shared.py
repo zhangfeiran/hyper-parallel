@@ -81,12 +81,39 @@ def shared_forward_buffers(x: torch.Tensor, intermediate: int) -> tuple[torch.Te
 
 def shared_backward_buffers(
     dy: torch.Tensor, saved: tuple[torch.Tensor, ...], *, idle_vectors: bool = False,
+    native_activation_grad: bool = False, swiglu_limit: float | None = None,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-    """Allocate gradients and keep indirect targets alive through kernel completion."""
+    """Allocate gradients and keep indirect targets alive through kernel completion.
+
+    Args:
+        dy: Token-major shared output gradient.
+        saved: Owned input, weights, preactivation and activation.
+        idle_vectors: Keep the independent shared vector queue enabled.
+        native_activation_grad: Produce A5 activation gradients before launching shared GEMMs.
+        swiglu_limit: Optional clamp matching the shared forward activation.
+
+    Returns:
+        Owned targets and their unchanged native pointer-table representation.
+    """
     x, w1, w2, up, activation = saved
     intermediate = w2.shape[1]
     dw2 = w2.new_empty((intermediate, w2.shape[0]))
-    dactivation, dup, dx = torch.empty_like(activation), torch.empty_like(up), torch.empty_like(x)
+    dy = dy.contiguous()
+    if native_activation_grad:
+        dactivation = torch.mm(dy, w2)
+        activation_input = up
+        if swiglu_limit is not None and swiglu_limit > 0:
+            gate, branch = up.chunk(2, dim=-1)
+            activation_input = torch.cat((gate.clamp(max=swiglu_limit),
+                                          branch.clamp(-swiglu_limit, swiglu_limit)), dim=-1)
+        dup = torch.ops.npu.npu_swiglu_backward(dactivation, activation_input, -1)
+        if swiglu_limit is not None and swiglu_limit > 0:
+            grad_gate, grad_branch = dup.chunk(2, dim=-1)
+            dup = torch.cat((torch.where(gate <= swiglu_limit, grad_gate, 0),
+                             torch.where((branch >= -swiglu_limit) & (branch <= swiglu_limit), grad_branch, 0)), dim=-1)
+    else:
+        dactivation, dup = torch.empty_like(activation), torch.empty_like(up)
+    dx = torch.empty_like(x)
     dw1 = w1.new_empty((w1.shape[1], w1.shape[0]))
-    tensors = (dy.contiguous(), activation, dw2, w2, dactivation, up, dup, w1, dx, x, dw1)
+    tensors = (dy, activation, dw2, w2, dactivation, up, dup, w1, dx, x, dw1)
     return tensors, pointer_table(tensors, idle_vectors=idle_vectors)

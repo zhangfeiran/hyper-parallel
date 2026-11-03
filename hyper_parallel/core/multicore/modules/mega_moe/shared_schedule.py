@@ -154,17 +154,24 @@ def add_shared_graph(
     dx = tensor("shared_dx", [tokens, hidden], 8)
     x = tensor("shared_x", [tokens, hidden], 9, True)
     dw1 = tensor("shared_dw1", [1, hidden, 2 * intermediate], 10)
-    first = add("shared_act_grad", OpType.GMM, [dy, w2], dact, GROUP_LIST_BYTES,
-                EVENT_INVALID_ID, event_base)
+    first = None
+    if cores != 32:
+        first = add("shared_act_grad", OpType.GMM, [dy, w2], dact, GROUP_LIST_BYTES,
+                    EVENT_INVALID_ID, event_base)
     add("shared_w2_grad", OpType.GMM, [act, dy], dw2, GROUP_LIST_BYTES + 3 * stride,
         EVENT_INVALID_ID, event_base + 1)
-    middle = add("shared_swiglu_grad", OpType.SWIGLU_GRAD, [dact, up], dup, GROUP_LIST_BYTES + 4 * stride,
-                 event_base, event_base + 2)
+    middle = None
+    if first is not None:
+        middle = add("shared_swiglu_grad", OpType.SWIGLU_GRAD, [dact, up], dup, GROUP_LIST_BYTES + 4 * stride,
+                     event_base, event_base + 2)
+    # A5 native producers preserve BF16 activation rounding before shared weight reductions.
+    dependency = event_base + 2 if middle is not None else EVENT_INVALID_ID
     gate = add("shared_gate_grad", OpType.GMM, [dup, w1], dx, GROUP_LIST_BYTES + stride,
-               event_base + 2, event_base + 3)
+               dependency, event_base + 3)
     weight = add("shared_w1_grad", OpType.GMM, [x, dup], dw1, GROUP_LIST_BYTES + 2 * stride,
-                 event_base + 2, event_base + 4)
-    graph.add_edge(first, middle).add_edge(middle, gate).add_edge(middle, weight)
+                 dependency, event_base + 4)
+    if first is not None and middle is not None:
+        graph.add_edge(first, middle).add_edge(middle, gate).add_edge(middle, weight)
 
 
 def reorder_shared_tasks(
@@ -200,9 +207,9 @@ def reorder_shared_tasks(
     cube = list(cfg.cube_task_indices[:len(cube)])
     vector = list(cfg.vector_task_indices[:len(vector)])
     if backward:
-        first = stages["shared_act_grad"] + stages["shared_w2_grad"]
+        first = stages.get("shared_act_grad", []) + stages["shared_w2_grad"]
         last = stages["shared_gate_grad"] + stages["shared_w1_grad"]
-        activation = stages["shared_swiglu_grad"]
+        activation = stages.get("shared_swiglu_grad", [])
     else:
         first, last, activation = (stages[name] for name in ("shared_up_proj", "shared_down_proj", "shared_swiglu"))
     if placement == "front":
@@ -213,7 +220,7 @@ def reorder_shared_tasks(
             # Hide shared dActivation in the initial dispatch wait. Finish its
             # vector work before inserting dependent Cube rounds at the phase boundary.
             phase_end = 2 * tsv.single_rank_expert_num * cores
-            cube = (stages["shared_act_grad"] + cube[:phase_end] + stages["shared_w2_grad"]
+            cube = (stages.get("shared_act_grad", []) + cube[:phase_end] + stages["shared_w2_grad"]
                     + last + cube[phase_end:])
             activation_start = len(stages["dispatch"])
         else:

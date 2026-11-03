@@ -25,17 +25,58 @@ import torch
 from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts
 from hyper_parallel.core.multicore.modules.mega_moe.plan import build_mega_moe_plan
 from hyper_parallel.core.multicore.modules.mega_moe import function as moe_function
+from hyper_parallel.core.multicore.modules.mega_moe import shared as moe_shared
 from hyper_parallel.core.multicore.diagnostics import api as diagnostic_api
 from hyper_parallel.core.multicore.diagnostics.common.call import DiagnosticCall
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
 from hyper_parallel.core.multicore.modules.mega_moe.shared_schedule import bind_shared_diagnostic_graph
 from hyper_parallel.core.multicore.diagnostics.common.graph import validate_mega_kernel_diagnostic_contract
-from hyper_parallel.core.multicore.scheduler.config import TaskType
+from hyper_parallel.core.multicore.scheduler.config import EVENT_INVALID_ID, TaskType
 
 
 class TestA5SharedFusion(unittest.TestCase):
     """Keep routed scheduling and local shared ownership independently verifiable."""
+
+    def test_a5_shared_backward_consumes_native_activation_gradients(self) -> None:
+        """Keep A5 activation rounding outside the three fused shared gradient GEMMs."""
+        for cores in (24, 32):
+            with self.subTest(cores=cores):
+                spec = MegaMoeSpec(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
+                                   num_experts=32, top_k=8, initial_capacity_factor=None,
+                                   receive_capacity=32768, ep_size=4, ep_group=None, rank_id=0,
+                                   num_cube_cores=cores, dispatch_mode="pull", shared_intermediate_size=2048,
+                                   backward_shared_expert=True)
+                graph, config = _build_runtime_artifacts(spec)[2:]
+                names = {op.name for op in graph.topological_sort() if op.name.startswith("shared_")}
+                expected = {"shared_w2_grad", "shared_gate_grad", "shared_w1_grad"}
+                if cores == 24:
+                    expected |= {"shared_act_grad", "shared_swiglu_grad"}
+                self.assertEqual(names, expected)
+                if cores == 32:
+                    shared = [task for task in config.all_tasks[:config.task_num]
+                              if task.inputs[0].tensor_type == 2]
+                    self.assertEqual(len(shared), 3 * cores)
+                    self.assertTrue(all(task.dependent_event == EVENT_INVALID_ID for task in shared))
+
+    def test_native_shared_activation_buffers_keep_owned_results(self) -> None:
+        """Pass native producer storage directly to the unchanged indirect pointer ABI."""
+        dy = torch.randn(8, 4)
+        source, first, second = torch.randn(8, 4), torch.randn(6, 4), torch.randn(4, 3)
+        up, activation = torch.randn(8, 6), torch.randn(8, 3)
+        derivative = torch.randn_like(up)
+        with (
+            patch.object(moe_shared, "pointer_table", side_effect=lambda tensors, **_: tensors),
+            patch.object(torch.ops.npu, "npu_swiglu_backward", return_value=derivative) as native,
+        ):
+            tensors, pointers = moe_shared.shared_backward_buffers(
+                dy, (source, first, second, up, activation), native_activation_grad=True,
+            )
+        native.assert_called_once()
+        torch.testing.assert_close(tensors[4], dy @ second)
+        self.assertIs(tensors[6], derivative)
+        self.assertIs(pointers, tensors)
+        self.assertEqual(tuple(tensors[10].shape), (4, 6))
 
     def test_independent_shared_switches_keep_abi_and_routed_storage(self) -> None:
         """Feature: Independent shared kernel directions.
