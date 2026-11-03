@@ -64,6 +64,8 @@ class MegaMoeSpec:
     forward_ingress_mode: str = "legacy"
     shared_intermediate_size: int = 0
     shared_placement: str = "idle"
+    forward_shared_expert: bool = True
+    backward_shared_expert: bool = False
 
     @property
     def plan_tokens(self) -> int:
@@ -226,4 +228,6 @@ def bind_mega_moe_spec(
         forward_ingress_mode=forward_ingress_mode,
         shared_intermediate_size=specification.get("shared_intermediate_size", 0),
         shared_placement=specification.get("shared_placement", "idle"),
+        forward_shared_expert=specification.get("forward_shared_expert", True),
+        backward_shared_expert=specification.get("backward_shared_expert", False),
     )

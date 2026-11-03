@@ -34,6 +34,22 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     # pylint: disable=protected-access
 
+    def test_shared_switch_defaults_and_constructor_validation(self) -> None:
+        """Feature: Independent shared kernel directions.
+        Description: Construct experts with defaults and invalid direction flags.
+        Expectation: Preserve forward-only defaults and reject nonbooleans before resource allocation.
+        """
+        options = {"local_num_tokens": 128, "hidden_size": 16, "intermediate_size": 8,
+                   "num_experts": 4, "top_k": 2, "create_parameters": False, "shared_intermediate_size": 8}
+        experts = MegaMoeExperts(**options)
+        self.addCleanup(experts.close)
+        specification = experts._resource_group.specification
+        self.assertIs(specification["forward_shared_expert"], True)
+        self.assertIs(specification["backward_shared_expert"], False)
+        for overrides in ({"forward_shared_expert": 0}, {"backward_shared_expert": "true"}):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, "must be booleans"):
+                MegaMoeExperts(**options, **overrides)
+
     def test_dynamic_constructor_retains_capacity_and_accepts_real_shapes(self) -> None:
         """Arbitrary including empty inputs do not change the reserved resource specification."""
         experts = MegaMoeExperts(max_local_num_tokens=257, hidden_size=16, intermediate_size=8,

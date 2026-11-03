@@ -154,7 +154,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
-        shared_intermediate_size=spec.shared_intermediate_size,
+        shared_intermediate_size=spec.shared_intermediate_size if spec.forward_shared_expert else 0,
     )
     forward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(forward_graph)
@@ -199,7 +199,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
-        shared_intermediate_size=0,
+        shared_intermediate_size=spec.shared_intermediate_size if spec.backward_shared_expert else 0,
     )
     backward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(backward_graph)
@@ -246,10 +246,12 @@ def _prepare_diagnostics(
     return (
         prepare_mega_kernel_diagnostics(
             forward_graph, forward_config,
-            parameter_count=28 if spec.shared_intermediate_size else (17 if spec.forward_ingress_mode != "legacy" else 16),
+            parameter_count=(28 if spec.shared_intermediate_size and spec.forward_shared_expert
+                             else (17 if spec.forward_ingress_mode != "legacy" else 16)),
             **options),
         prepare_mega_kernel_diagnostics(
-            backward_graph, backward_config, parameter_count=20, **options),
+            backward_graph, backward_config,
+            parameter_count=35 if spec.shared_intermediate_size and spec.backward_shared_expert else 20, **options),
     )
 
 
@@ -278,7 +280,7 @@ def _attach_route_metadata_input(graph: ComputeGraph, spec: MegaMoeSpec) -> None
         tiling_position=-1, fill_config=None,
     )
     graph.add_op(node)
-    if not spec.shared_intermediate_size:
+    if not (spec.shared_intermediate_size and spec.forward_shared_expert):
         graph.add_edge(node, graph.get_op("dispatch"))
     # A new predecessor would reorder the independent shared branch after task
     # IDs have been assigned. This zero-task node only describes a Host binding.
@@ -409,8 +411,9 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         spec=spec,
         ingress_diagnostics=ingress_diagnostics,
         shared_forward_runtime=(_tensor_from_bytes(shared_tiling_bytes(spec, backward=False), device)
-                                if spec.shared_intermediate_size else None),
-        shared_backward_runtime=None,
+                                if spec.shared_intermediate_size and spec.forward_shared_expert else None),
+        shared_backward_runtime=(_tensor_from_bytes(shared_tiling_bytes(spec, backward=True), device)
+                                 if spec.shared_intermediate_size and spec.backward_shared_expert else None),
         row_credit_element_offset=_row_credit_element_offset(forward_config, spec),
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,

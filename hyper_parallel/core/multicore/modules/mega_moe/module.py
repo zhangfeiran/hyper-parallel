@@ -170,6 +170,7 @@ class _MegaMoeExecutionResources:
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens,
             self.spec.forward_ingress_mode, self.spec.shared_intermediate_size, self.spec.shared_placement,
+            self.spec.forward_shared_expert, self.spec.backward_shared_expert,
             self.workspace.udma_qp_count,
         )
 
@@ -184,7 +185,7 @@ class _MegaMoeExecutionResources:
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
                   "dispatch_split", "combine_split", "swiglu_limit", "ep_size", "forward_ingress_mode",
-                  "shared_intermediate_size", "shared_placement")
+                  "shared_intermediate_size", "shared_placement", "forward_shared_expert", "backward_shared_expert")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v1", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications),
@@ -257,6 +258,8 @@ class MegaMoeExperts(MulticoreModule):
         forward_ingress_mode: str = "legacy",
         shared_intermediate_size: int = 0,
         shared_placement: str = "idle",
+        forward_shared_expert: bool = True,
+        backward_shared_expert: bool = False,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -291,6 +294,10 @@ class MegaMoeExperts(MulticoreModule):
                 preserves the legacy unclamped path.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
+            shared_intermediate_size: Width of caller-owned local shared weights; zero disables the branch.
+            shared_placement: Place shared kernel tasks in idle slots or at the front of the queues.
+            forward_shared_expert: Fuse shared forward. Defaults to the existing forward-only behavior.
+            backward_shared_expert: Fuse shared backward independently; experimental and disabled by default.
             ep_group: Torch expert-parallel process group, possibly a subgroup of
                 WORLD. Expert ownership follows group-local rank order. Disjoint
                 PP/DP groups bootstrap independently; one process can have only
@@ -301,6 +308,8 @@ class MegaMoeExperts(MulticoreModule):
             raise ValueError("shared_intermediate_size must be a nonnegative integer")
         if shared_placement not in ("idle", "front"):
             raise ValueError("shared_placement must be idle or front")
+        if not isinstance(forward_shared_expert, bool) or not isinstance(backward_shared_expert, bool):
+            raise ValueError("forward_shared_expert and backward_shared_expert must be booleans")
         if shared_intermediate_size and max_local_num_tokens is not None:
             raise ValueError("Shared expert fusion requires static token rows")
         reserved_tokens = _resolve_token_capacity(local_num_tokens, max_local_num_tokens, hidden_size, top_k)
@@ -333,6 +342,8 @@ class MegaMoeExperts(MulticoreModule):
             "forward_ingress_mode": forward_ingress_mode,
             "shared_intermediate_size": shared_intermediate_size,
             "shared_placement": shared_placement,
+            "forward_shared_expert": forward_shared_expert,
+            "backward_shared_expert": backward_shared_expert,
         }
         if max_local_num_tokens is not None:
             specification["max_local_num_tokens"] = max_local_num_tokens
