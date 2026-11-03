@@ -257,7 +257,8 @@ def _fit_services(train: list[dict[str, Any]]) -> tuple[np.ndarray, dict[str, An
     beta[columns] = values
     fit.update(basis=columns, parameterization='group_component_max_nnls_v1',
                measurement_contract=MEASUREMENT_CONTRACT, cross_validation=cv,
-               cross_validation_rankings=[dict(basis=row[2], **row[3]) for row in sorted(candidates)],
+               cross_validation_rankings=[dict(basis=row[2], **row[3])
+                                           for row in sorted(candidates, key=lambda row: (row[0], row[1], row[2]))],
                separate_phase_services_identified=False, rejected_training_bases=errors)
     fit['train_group_absolute_error_p95_ms'] = fit['train_absolute_error_p95_ms']
     return beta, fit
