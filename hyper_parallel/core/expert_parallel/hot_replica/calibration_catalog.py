@@ -27,6 +27,7 @@ from typing import Any
 
 EXECUTION_FILES = tuple('hyper_parallel/' + name for name in (
     'core/multicore/modules/mega_moe/module.py', 'core/multicore/modules/mega_moe/function.py',
+    'core/multicore/modules/mega_moe/heap_manager.py', 'core/multicore/modules/mega_moe/spec.py',
     'core/multicore/modules/mega_moe/plan.py', 'core/multicore/modules/mega_moe/inactive_tasks.py',
     'core/multicore/modules/mega_moe/workspace.py', 'core/expert_parallel/hot_replica/residency.py',
     'core/expert_parallel/hot_replica/host.py', 'core/expert_parallel/hot_replica/policy.py',

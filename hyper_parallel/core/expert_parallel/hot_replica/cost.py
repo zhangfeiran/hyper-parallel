@@ -43,7 +43,8 @@ def _default_schedule(backend: str, transport: str) -> str:
 
 def _effective_group_features(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
                               home: int, nodes: tuple[int, ...],
-                              source_totals: list[int] | None = None) -> tuple[float, ...]:
+                              source_totals: list[int] | None = None,
+                              source_row_floor: float = 0.) -> tuple[float, ...]:
     """Summarize group component maxima without treating synchronized rank waits as local work."""
     if len(nodes) != len(copies):
         raise ValueError('Effective group scoring requires the measured EP topology')
@@ -63,7 +64,8 @@ def _effective_group_features(copies: list[dict[int, int]], counts: tuple[tuple[
         received.append(sum(experts.values()))
         hits = sum(min(counts[rank][expert], rows) for expert, rows in experts.items())
         tokens.append((source_totals[rank] + received[-1] - 2 * hits) / 2)
-    return max(tasks), max(received), max(local), max(remote), max(tokens), int(any(local) or any(remote))
+    received_max = max(max(received), source_row_floor * max(source_totals))
+    return max(tasks), received_max, max(local), max(remote), max(tokens), int(any(local) or any(remote))
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,7 @@ class ExpertReplicaCostModel:
     _rank_nodes: tuple[int, ...] = field(default=(), repr=False)
     critical_path: DeviceCriticalPathCalibration | None = None
     effective_group_ms: tuple[float, ...] = ()
+    effective_source_row_floor: float = 0.
 
     def __post_init__(self) -> None:
         """Freeze measured inputs and reject inconsistent calibration contracts."""
@@ -158,6 +161,9 @@ class ExpertReplicaCostModel:
             for value in coefficients:
                 _nonnegative(value, 'Effective group milliseconds')
         object.__setattr__(self, 'effective_group_ms', coefficients)
+        _nonnegative(self.effective_source_row_floor, 'Effective source-row floor')
+        if self.effective_source_row_floor > 1 or self.effective_source_row_floor and not coefficients:
+            raise ValueError('Source-row floor requires group calibration and a value between zero and one')
         if isinstance(self.critical_path, dict):
             object.__setattr__(self, 'critical_path', DeviceCriticalPathCalibration(**self.critical_path))
         if self.critical_path is not None:
@@ -377,7 +383,7 @@ class _QuotaCostState:
             if removed:
                 raise ValueError('Effective group scoring requires final explicit quotas')
             features = _effective_group_features(self.copies, self.counts, self.home, self.model._rank_nodes,
-                                                 self.source_totals)
+                                                 self.source_totals, self.model.effective_source_row_floor)
             return sum(value * coefficient for value, coefficient in zip(features, self.model.effective_group_ms))
         if self.model.critical_path is not None:
             if removed:

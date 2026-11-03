@@ -34,6 +34,7 @@ from .plan import ExpertExecutionPlan
 
 MEASUREMENT_CONTRACT = 'rank_cumulative_f_r_b_v2'
 CAPTURE_POLICY = 'runtime_default_admission_v1'
+HOT_OWNER_EXCESS = 2.5
 
 
 class CalibrationDesignRejected(ValueError):
@@ -117,7 +118,8 @@ def calibration_ids(tokens: int, manifest: dict[str, Any], frame: int, nodes: tu
         owner = (frame // 4) % size
         owners = [owner] if kind == 1 else [rank for rank, node in enumerate(nodes) if node == nodes[owner]]
         recipients = [rank * home for rank in owners]
-        desired = int(tokens * top_k / size * .75)
+        # Strong probes must reach runtime admission without forcing a different policy.
+        desired = int(tokens * top_k / size * HOT_OWNER_EXCESS)
         donors = [expert for expert in range(experts) if expert // home not in owners]
         pending = min(desired * len(owners), sum(counts[expert] for expert in donors))
         for expert in recipients:
@@ -165,10 +167,17 @@ def plan_features(record: dict[str, Any]) -> tuple[np.ndarray, ExpertExecutionPl
 
 def fit_nonnegative_services(features: np.ndarray, observed: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
     """Fit identifiable rank-local effective services by convex nonnegative least squares."""
+    if np.any(observed < 0):
+        raise ValueError('Calibration samples require nonnegative device durations')
+    return _fit_nonnegative_services(features, observed)
+
+
+def _fit_nonnegative_services(features: np.ndarray, observed: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    """Allow signed paired residuals while retaining nonnegative service coefficients."""
     if features.ndim != 2 or observed.shape != (features.shape[0],):
         raise ValueError('Expected observation x coefficient features and one rank-local target per observation')
-    if not np.isfinite(features).all() or not np.isfinite(observed).all() or np.any(observed < 0):
-        raise ValueError('Calibration samples must be finite with nonnegative device durations')
+    if not np.isfinite(features).all() or not np.isfinite(observed).all():
+        raise ValueError('Calibration samples must be finite')
     scales = np.maximum(np.linalg.norm(features, axis=0), 1.)
     x = features / scales
     rank = int(np.linalg.matrix_rank(x, tol=1e-7))
@@ -229,7 +238,7 @@ def _samples(reports: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]
 
 
 def _candidate(manifest: dict[str, Any], report: dict[str, Any], budget: int,
-               beta: np.ndarray, margin: float, coverage: int) -> dict[str, Any]:
+               beta: np.ndarray, margin: float, coverage: int, source_floor: float = 0.) -> dict[str, Any]:
     def curve(fixed: float, slope: float) -> tuple:
         return ((0, 0.), (1, float(fixed + slope)), (max(2, coverage), float(fixed + slope * max(2, coverage))))
     model = ExpertReplicaCostModel(
@@ -243,6 +252,7 @@ def _candidate(manifest: dict[str, Any], report: dict[str, Any], budget: int,
         intra_node_gradient_ms=float(beta[2] / 3), inter_node_gradient_ms=float(beta[3] / 3),
         intra_node_backward_weight_ms=0., inter_node_backward_weight_ms=0.,
         effective_group_ms=tuple(float(value) for value in beta), _rank_nodes=tuple(report['rank_nodes']),
+        effective_source_row_floor=source_floor,
         schedule=report['schedule'], minimum_gain_ms=margin, minimum_replica_gain_ms=margin)
     return {'selector': {'soc_name': report['soc_name'], 'num_experts': manifest['num_experts'],
                          'top_k': manifest['top_k'], 'execution_signature': report['execution_signature']},
@@ -254,45 +264,146 @@ def _candidate(manifest: dict[str, Any], report: dict[str, Any], budget: int,
                                     'not identified physical compute/band/ACK services'}}
 
 
-def _fit_services(train: list[dict[str, Any]]) -> tuple[np.ndarray, dict[str, Any]]:
-    """Select identifiable group-service components by grouped TRAIN-only cross-validation."""
+def _paired_training(train: list[dict[str, Any]]) -> tuple[np.ndarray, ...]:
+    """Keep each B0/Bn pair and all repeated route-family samples in the same TRAIN fold."""
     if any(row['frame'] % 3 == 2 for row in train):
         raise ValueError('Service fitting accepts TRAIN frames only')
-    features = np.stack([row['features'][0][:, [0, 1, 4, 5, 8, 9]].max(axis=0) for row in train])
-    target = np.array([row['observed_ms'] for row in train])
-    folds = np.array([row.get('cv_group', str(row['frame'] % 4 + 4 * int(4 <= row['frame'] % 12 < 8)))
-                      for row in train])
-    nodes = train[0]['rank_nodes']
-    possible = {2: len(set(nodes)) < len(nodes), 3: len(set(nodes)) > 1}
+    if not train or len({row['group_leader'] for row in train}) != 1:
+        raise ValueError('Service fitting requires one TRAIN EP group')
+    indexed = {}
+    for row in train:
+        key = row['group_leader'], row['frame'], row['sample']
+        budget = row['plan'].config.replica_slots_per_rank
+        role = int(budget > 0)
+        if (key, role) in indexed:
+            raise ValueError('Duplicate B0 or replica training observation')
+        indexed[key, role] = row
+    features, target, gains, folds, source_rows = [], [], [], [], []
+    for key in sorted({key for key, _ in indexed}):
+        if (key, 0) not in indexed or (key, 1) not in indexed:
+            raise ValueError('Replica fitting requires a matched B0 for every training observation')
+        owner, replica = indexed[key, 0], indexed[key, 1]
+        if (owner['plan'].logical_counts != replica['plan'].logical_counts
+                or tuple(owner['rank_nodes']) != tuple(replica['rank_nodes'])):
+            raise ValueError('Matched training pairs require the same source histogram and topology')
+        family = lambda row: row.get('cv_group', str(row['frame'] % 4 + 4 * int(4 <= row['frame'] % 12 < 8)))
+        if family(owner) != family(replica):
+            raise ValueError('Matched observations cannot cross route-family folds')
+        features.append([row['features'][0][:, [0, 1, 4, 5, 8, 9]].max(axis=0) for row in (owner, replica)])
+        target.append([owner['observed_ms'], replica['observed_ms']])
+        gains.append(owner['component_rank_max_ms'] - replica['component_rank_max_ms'])
+        folds.append(family(owner))
+        source_rows.append(max(map(sum, owner['plan'].logical_counts)))
+    if len(set(folds)) < 2:
+        raise CalibrationDesignRejected('Paired calibration requires multiple TRAIN route families')
+    return np.array(features), np.array(target), np.array(gains), np.array(folds), np.array(source_rows)
+
+
+def _owner_services(features: np.ndarray, target: np.ndarray,
+                    folds: np.ndarray, source_rows: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Anchor fixed, receive-row and token services exclusively to owner-only observations."""
     candidates, errors = [], []
-    bases = ((0, 1, 2, 3, 4, 5), (1, 2, 3, 5), (0, 1, 4, 5), (1, 4, 5),
-             (0, 1, 5), (1, 3, 4, 5), (0, 3, 4, 5))
-    for basis in bases:
-        columns = [column for column in basis if possible.get(column, True)]
+    bases = ((0, 1, 4), (0, 1), (1, 4), (0, 4), (0,), (1,), (4,))
+    for floor, basis in ((floor, basis) for floor in (0., .5, .75, 1.) for basis in bases):
+        design = features.copy()
+        design[:, 1] = np.maximum(design[:, 1], source_rows * floor)
+        columns = list(basis)
         try:
             predicted = np.zeros_like(target)
+            coefficients = np.zeros((len(target), 6))
             for fold in sorted(set(folds)):
                 fit_rows, valid_rows = folds != fold, folds == fold
-                values, _ = fit_nonnegative_services(features[fit_rows][:, columns], target[fit_rows])
-                predicted[valid_rows] = features[valid_rows][:, columns] @ values
+                values, _ = fit_nonnegative_services(design[fit_rows][:, columns], target[fit_rows])
+                predicted[valid_rows] = design[valid_rows][:, columns] @ values
+                coefficients[np.ix_(valid_rows, columns)] = values
             relative = np.abs(predicted - target) / np.maximum(target, 1e-6)
             cv = dict(relative_error_p95=float(np.quantile(relative, .95)),
                       worst_underprediction_ms=float(max(target - predicted)))
-            candidates.append((cv['relative_error_p95'], len(columns), columns, cv))
+            candidates.append((cv['relative_error_p95'], len(columns), floor, columns, cv, coefficients))
         except ValueError as error:
             errors.append(str(error))
     if not candidates:
-        raise CalibrationDesignRejected(f'No identifiable TRAIN cross-validation basis: {errors}')
-    _, _, columns, cv = min(candidates, key=lambda row: (row[0], row[1], row[2]))
-    values, fit = fit_nonnegative_services(features[:, columns], target)
+        raise CalibrationDesignRejected(f'No identifiable B0 TRAIN basis: {errors}')
+    _, _, floor, columns, cv, coefficients = min(candidates, key=lambda row: (row[0], row[1], row[2], row[3]))
+    design = features.copy()
+    design[:, 1] = np.maximum(design[:, 1], source_rows * floor)
+    values, fit = fit_nonnegative_services(design[:, columns], target)
     beta = np.zeros(6)
     beta[columns] = values
-    fit.update(basis=columns, parameterization='group_component_max_nnls_v1',
-               measurement_contract=MEASUREMENT_CONTRACT, cross_validation=cv,
-               cross_validation_rankings=[dict(basis=row[2], **row[3])
-                                           for row in sorted(candidates, key=lambda row: (row[0], row[1], row[2]))],
-               separate_phase_services_identified=False, rejected_training_bases=errors)
-    fit['train_group_absolute_error_p95_ms'] = fit['train_absolute_error_p95_ms']
+    fit.update(basis=columns, source_row_floor=floor, cross_validation=cv, rejected_training_bases=errors)
+    return beta, coefficients, fit
+
+
+def _replica_services(features: np.ndarray, target: np.ndarray, gains: np.ndarray, folds: np.ndarray,
+                      owner: np.ndarray, owner_cv: np.ndarray,
+                      nodes: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Fit only paired incremental costs; tied links are a fallback when topology is not identifiable."""
+    possible = {2: len(set(nodes)) < len(nodes), 3: len(set(nodes)) > 1}
+    bases = (((2,), (3,), (5,)), ((2,), (3,)), ((2, 3), (5,)), ((2, 3),))
+    delta = features[:, 1] - features[:, 0]
+    candidates, errors = [], []
+    for basis in bases:
+        groups = tuple(tuple(column for column in group if possible.get(column, True)) for group in basis)
+        groups = tuple(group for group in groups if group)
+        design = np.stack([features[:, 1, list(group)].sum(axis=1) for group in groups], axis=1)
+        try:
+            predicted = np.zeros_like(gains)
+            candidate_cv = np.zeros_like(gains)
+            for fold in sorted(set(folds)):
+                fit_rows, valid_rows = folds != fold, folds == fold
+                base = owner_cv[valid_rows][0]
+                residual = target[fit_rows, 1] - target[fit_rows, 0] - delta[fit_rows] @ base
+                values, _ = _fit_nonnegative_services(design[fit_rows], residual)
+                predicted[valid_rows] = -(delta[valid_rows] @ base + design[valid_rows] @ values)
+                candidate_cv[valid_rows] = features[valid_rows, 1] @ base + design[valid_rows] @ values
+            cv = dict(gain_absolute_error_p95_ms=float(np.quantile(np.abs(predicted - gains), .95)),
+                      worst_gain_overprediction_ms=float(max(predicted - gains)))
+            candidates.append((cv['gain_absolute_error_p95_ms'], len(groups), groups, cv, candidate_cv))
+        except ValueError as error:
+            errors.append(str(error))
+    if not candidates:
+        raise CalibrationDesignRejected(f'No identifiable paired replica TRAIN basis: {errors}')
+    _, _, groups, cv, predicted = min(candidates, key=lambda row: (row[0], row[1], row[2]))
+    design = np.stack([features[:, 1, list(group)].sum(axis=1) for group in groups], axis=1)
+    residual = target[:, 1] - target[:, 0] - delta @ owner
+    values, fit = _fit_nonnegative_services(design, residual)
+    beta = np.zeros(6)
+    for group, value in zip(groups, values):
+        beta[list(group)] = value
+    fit.update(link_groups=groups, cross_validation=cv, rejected_training_bases=errors)
+    return beta, predicted, fit
+
+
+def _fit_services(train: list[dict[str, Any]]) -> tuple[np.ndarray, dict[str, Any]]:
+    """Fit owner-only absolute services, then matched replica increments using TRAIN-only folds."""
+    features, target, gains, folds, source_rows = _paired_training(train)
+    owner, owner_cv, owner_fit = _owner_services(features[:, 0], target[:, 0], folds, source_rows)
+    features[:, :, 1] = np.maximum(features[:, :, 1], source_rows[:, None] * owner_fit['source_row_floor'])
+    replica, replica_cv, replica_fit = _replica_services(
+        features, target, gains, folds, owner, owner_cv, tuple(train[0]['rank_nodes']))
+    beta = owner + replica
+    predicted = features @ beta
+    cv_predicted = np.stack(((features[:, 0] * owner_cv).sum(axis=1), replica_cv), axis=1)
+    cv_error = cv_predicted - target
+    gain_error = predicted[:, 0] - predicted[:, 1] - gains
+    cv_gain_error = cv_predicted[:, 0] - cv_predicted[:, 1] - gains
+    absolute_p95 = float(np.quantile(np.abs(predicted - target), .95))
+    fit = dict(parameterization='b0_anchored_paired_group_nnls_v2', measurement_contract=MEASUREMENT_CONTRACT,
+        basis=sorted(set(owner_fit['basis']) | {column for group in replica_fit['link_groups'] for column in group}),
+        owner_fit=owner_fit, replica_fit=replica_fit, paired_train_samples=len(gains),
+        source_row_floor=owner_fit['source_row_floor'],
+        train_absolute_error_p95_ms=absolute_p95, train_group_absolute_error_p95_ms=absolute_p95,
+        train_worst_underprediction_ms=float(np.max(target - predicted)),
+        train_gain_absolute_error_p95_ms=float(np.quantile(np.abs(gain_error), .95)),
+        cross_validation=dict(relative_error_p95=float(np.quantile(np.abs(cv_error) / np.maximum(target, 1e-6), .95)),
+            worst_underprediction_ms=float(np.max(-cv_error)),
+            gain_absolute_error_p95_ms=float(np.quantile(np.abs(cv_gain_error), .95)),
+            worst_gain_overprediction_ms=float(np.max(cv_gain_error))),
+        absolute_error_bound_ms=max(.05, 2 * absolute_p95, float(np.max(-cv_error))),
+        decision_margin_ms=max(.05, 2 * float(np.quantile(np.abs(gain_error), .95)), float(np.max(cv_gain_error))),
+        planner_cpu_max_ms=max(row.get('planner_cpu_ms', 0.) for row in train),
+        uncertainty_contract='Paired whole-component gains already include host enqueue gaps; no CPU-wall subtraction',
+        separate_phase_services_identified=False)
     return beta, fit
 
 
@@ -300,8 +411,11 @@ def validate_profile(payload: dict[str, Any], samples: list[dict[str, Any]], bas
                      *, maximum_relative_error: float = .2) -> dict[str, Any]:
     """Gate untouched holdouts and harmful false admissions using the actual planner score."""
     model = ExpertReplicaCostModel(**payload['model'])
+    absolute_bound = payload.get('fit', {}).get('absolute_error_bound_ms', model.minimum_gain_ms)
+    if not isinstance(absolute_bound, (int, float)) or not math.isfinite(absolute_bound) or absolute_bound < 0:
+        raise ValueError('Absolute prediction uncertainty must be finite and nonnegative')
     reference = {(row['group_leader'], row['frame'], row['sample']): row for row in baseline}
-    errors, under, harmful, matched, required = [], [], [], 0, 0
+    errors, under, harmful, gain_errors, matched, required = [], [], [], [], 0, 0
     for row in samples:
         effective = ExpertReplicaCostModel(**(payload['model'] | {'_rank_nodes': tuple(row['rank_nodes'])}))
         predicted = effective.estimate_ms(row['plan'])
@@ -314,6 +428,7 @@ def validate_profile(payload: dict[str, Any], samples: list[dict[str, Any]], bas
         owner = reference[key]
         predicted_gain = effective.estimate_ms(owner['plan']) - predicted
         observed_gain = owner['component_rank_max_ms'] - row['component_rank_max_ms']
+        gain_errors.append(predicted_gain - observed_gain)
         if predicted_gain > model.minimum_gain_ms and observed_gain < -model.minimum_gain_ms:
             harmful.append({'frame': row['frame'], 'predicted_gain_ms': predicted_gain,
                             'observed_component_gain_ms': observed_gain})
@@ -327,13 +442,16 @@ def validate_profile(payload: dict[str, Any], samples: list[dict[str, Any]], bas
         raise ValueError('Need at least four disjoint holdout observations')
     p95 = float(np.quantile(errors, .95))
     worst = max(under)
-    return {'status': 'passed' if p95 <= maximum_relative_error and worst <= model.minimum_gain_ms
-            and not harmful else 'failed',
+    gain_gate = payload.get('fit', {}).get('parameterization') == 'b0_anchored_paired_group_nnls_v2'
+    return {'status': 'passed' if p95 <= maximum_relative_error and worst <= absolute_bound
+            and (not gain_gate or max(gain_errors) <= model.minimum_gain_ms) and not harmful else 'failed',
             'holdout_samples': len(errors), 'relative_error_p95': p95,
             'worst_underprediction_ms': worst, 'maximum_relative_error': maximum_relative_error,
             'harmful_false_admissions': harmful, 'runtime_matched_samples': matched,
             'runtime_lookup_required_samples': required,
-            'absolute_error_gate_ms': model.minimum_gain_ms,
+            'absolute_error_gate_ms': absolute_bound, 'admission_error_gate_ms': model.minimum_gain_ms,
+            'gain_absolute_error_p95_ms': float(np.quantile(np.abs(gain_errors), .95)),
+            'worst_gain_overprediction_ms': max(gain_errors),
             'note': 'No holdout coefficient refitting or slow-sample exclusion'}
 
 
@@ -391,12 +509,10 @@ def fit_directory(manifest: dict[str, Any], source: Path, output: Path, *, verif
                 train = [row for row in rows + baseline if row['frame'] % 3 != 2
                          and row['group_leader'] == train_leader]
                 beta, fit = _fit_services(train)
-                host = max(row.get('planner_cpu_ms', 0.) for row in train)
-                margin = max(.05, 2 * max(fit['train_absolute_error_p95_ms'],
-                                         fit['train_group_absolute_error_p95_ms']) + host,
-                             max(0., fit.get('cross_validation', {}).get('worst_underprediction_ms', 0.)) + host)
+                margin = fit['decision_margin_ms']
                 coverage = max(max(max(rank) for rank in row['plan'].destination_counts) for row in train)
-                payload = _candidate(manifest, selected[0], budget, beta, margin, coverage)
+                payload = _candidate(manifest, selected[0], budget, beta, margin, coverage,
+                                     fit.get('source_row_floor', 0.))
                 payload['fit'] = fit
                 payload['fit']['train_group_leader'] = train_leader
                 payload['fit']['holdout_group_leaders'] = sorted({row['group_leader'] for row in holdout})

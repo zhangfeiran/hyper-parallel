@@ -31,6 +31,7 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+from torch.utils.checkpoint import DefaultDeviceType
 
 from hyper_parallel.core.expert_parallel.hot_replica import policy, autocalibration
 from hyper_parallel.core.expert_parallel.hot_replica import calibration_catalog
@@ -169,7 +170,8 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
                 (root / 'collect' / f'push-b{budget}-group2.json').write_text(json.dumps(second))
             beta = np.array([0., 3., 0., 0., 0., 0.])
             with patch.object(autocalibration, '_fit_services', return_value=(beta, {
-                    'train_absolute_error_p95_ms': 0., 'train_group_absolute_error_p95_ms': 0.})) as fit:
+                    'train_absolute_error_p95_ms': 0., 'train_group_absolute_error_p95_ms': 0.,
+                    'decision_margin_ms': .05, 'absolute_error_bound_ms': .05})) as fit:
                 result = fit_directory(manifest, root / 'collect', root / 'models')
             self.assertEqual(result['status'], 'candidate')
             self.assertEqual({row['group_leader'] for row in fit.call_args.args[0]}, {0})
@@ -193,6 +195,9 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
 
     def test_checkpoint_contract_matches_grad_modes_rng_and_execution_signature(self) -> None:
         """Reentrant PanGu and nonreentrant Hyper replay retain distinct stable F/R signatures."""
+        previous_device_type = DefaultDeviceType.get_device_type()
+        DefaultDeviceType.set_device_type('cpu')
+        self.addCleanup(DefaultDeviceType.set_device_type, previous_device_type)
         module = SimpleNamespace(dispatch_mode='push', hidden_size=16, intermediate_size=8, ep_size=2,
             num_experts=4, top_k=1, replica_transport='shmem_signal_kernel_gradient_bands', replica_slots_per_rank=1)
         resources = SimpleNamespace(rank_nodes=(0, 0), spec=SimpleNamespace(expert_weight_layout='EIO',
@@ -326,7 +331,8 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
             beta = np.array([0., 3., 0., 0., 0., 0.])
             with patch('hyper_parallel.core.expert_parallel.hot_replica.autocalibration._fit_services',
                        return_value=(beta, {'train_absolute_error_p95_ms': 0.,
-                                            'train_group_absolute_error_p95_ms': 0.})):
+                                            'train_group_absolute_error_p95_ms': 0.,
+                                            'decision_margin_ms': .05, 'absolute_error_bound_ms': .05})):
                 candidate = fit_directory(manifest, root / 'collect', root / 'models')
             self.assertEqual(candidate['status'], 'candidate')
             self.assertFalse((root / 'models/catalog.json').exists())
@@ -348,7 +354,8 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
             beta = np.array([0., 3., 0., 0., 0., 0.])
             with patch('hyper_parallel.core.expert_parallel.hot_replica.autocalibration._fit_services',
                        return_value=(beta, {'train_absolute_error_p95_ms': 0.,
-                                            'train_group_absolute_error_p95_ms': 0.})):
+                                            'train_group_absolute_error_p95_ms': 0.,
+                                            'decision_margin_ms': .05, 'absolute_error_bound_ms': .05})):
                 fit_directory(manifest, root / 'collect', root / 'models')
             report = fit_directory(manifest, root / 'verify', root / 'models', verify=True)
             self.assertEqual(report['status'], 'failed')
@@ -429,17 +436,24 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
                 autocalibration._samples([report], 1)
 
     def test_group_training_cv_identifies_services_without_holdout(self) -> None:
-        """Complete route families, including all repeat samples, stay in one TRAIN-only fold."""
+        """Matched owner and replica samples remain in the same TRAIN-only family fold."""
         rng = np.random.default_rng(17)
         beta = np.array([.3, .8, .6, 1.2, .1, .5])
         rows = []
-        for frame in range(12):
+        for frame in range(36):
             if frame % 3 == 2:
                 continue
-            for _ in range(3):
+            for budget in (0, 1):
                 features = rng.uniform(.1, 4., (2, 4, 10))
+                if not budget:
+                    features[0][:, [4, 5, 9]] = 0.
                 observed = float(features[0][:, [0, 1, 4, 5, 8, 9]].max(axis=0) @ beta)
-                rows.append(dict(frame=frame, features=features, observed_ms=observed, rank_nodes=(0, 0, 1, 1)))
+                for sample in range(3):
+                    rows.append(dict(group_leader=0, frame=frame, sample=sample,
+                        cv_group=f'family:{frame % 4}', features=features, observed_ms=observed,
+                        component_rank_max_ms=observed, rank_nodes=(0, 0, 1, 1),
+                        plan=SimpleNamespace(config=autocalibration.ExpertReplicaConfig(8, 4, budget),
+                                             logical_counts=((1, 0, 0, 0, 0, 0, 0, 0),) * 4)))
         actual, report = autocalibration._fit_services(rows)
         self.assertLess(float(np.linalg.norm(actual - beta)), .001)
         self.assertLess(report['cross_validation']['relative_error_p95'], .001)
@@ -485,6 +499,31 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
                 for function in (policy._calibrations, policy._calibration_available, policy._critical_path_available,
                                  policy._critical_path_identity, policy._resolve_cost_model):
                     function.cache_clear()
+
+    def test_catalog_rejects_changed_push_growth_or_specification_sources(self) -> None:
+        """Allocator-only policy changes invalidate tables even when the main module is unchanged."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in calibration_catalog.EXECUTION_FILES:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(name)
+            module_path = root / 'hyper_parallel/core/expert_parallel/hot_replica/calibration_catalog.py'
+            with patch.object(calibration_catalog, '__file__', str(module_path)):
+                payload = {'selector': {'execution_signature': 'a' * 64}, 'validation': {'status': 'passed'}}
+                raw = json.dumps(payload).encode()
+                (root / 'profile.json').write_bytes(raw)
+                catalog = dict(schema_version=1, status='validated', runtime_contract=runtime_contract(),
+                               profiles=[dict(file='profile.json', sha256=hashlib.sha256(raw).hexdigest())])
+                (root / 'catalog.json').write_text(json.dumps(catalog))
+                self.assertEqual(external_profiles(root), [payload])
+                for filename in ('heap_manager.py', 'spec.py'):
+                    path = root / 'hyper_parallel/core/multicore/modules/mega_moe' / filename
+                    original = path.read_bytes()
+                    path.write_text('Changed Push allocation policy')
+                    with self.subTest(source=filename), self.assertRaisesRegex(ValueError, 'runtime contract mismatch'):
+                        external_profiles(root)
+                    path.write_bytes(original)
 
     def test_residency_switch_preserves_default_and_forces_normal_misses(self) -> None:
         """Disabling the optional cross-forward cache does not remove its public lifetime contract."""

@@ -294,11 +294,12 @@ def _compact_home_cost_dominates(
         home = config.home_experts
         tasks = max(sum(count > 0 for count in totals[start:start + home])
                     for start in range(0, config.num_experts, home))
-        received = max(row[7] for row in rows)
+        source_floor = model.effective_source_row_floor * max(row[4] for row in rows)
+        received = max(max(row[7] for row in rows), source_floor)
         tokens = max((row[4] + row[7] - 2 * row[8]) / 2 for row in rows)
         fixed, row_ms, _, _, token_ms, active_ms = model.effective_group_ms
         owner = fixed * tasks + row_ms * received + token_ms * tokens
-        optimistic = row_ms * sum(row[7] for row in rows) / config.ep_size + active_ms
+        optimistic = row_ms * max(sum(row[7] for row in rows) / config.ep_size, source_floor) + active_ms
         return owner <= optimistic + max(model.minimum_gain_ms, model.minimum_replica_gain_ms or 0)
     durations: dict[int, tuple[float, float]] = {}
     costs = []
