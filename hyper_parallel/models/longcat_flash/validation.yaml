@@ -1,0 +1,25 @@
+schema_version: 2
+model:
+  adapter: longcat_flash
+  builder:
+    _target_: hyper_parallel.models.longcat_flash.adapter.validation.build_validation_model
+    optimized: true
+reference:
+  builder:
+    _target_: hyper_parallel.models.longcat_flash.adapter.validation.build_validation_model
+    optimized: false
+output_dir: ../../../output/longcat_flash/integration
+matrix:
+  devices: 1
+  steps: 3
+  baseline:
+    tp: 1
+    cp: 1
+    ep: 1
+    fsdp: 1
+    recompute: 'off'
+acceptance:
+  parameters:
+    module_parity:
+      atol: 2.0e-05
+      rtol: 0.0002

@@ -60,11 +60,13 @@ class MLAAttention(nn.Module):
         attention_interface: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] = (
             npu_fusion_attention_forward
         ),
+        rotary_interface: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> None:
         """Build the high-performance module from a Transformers MLA module."""
         super().__init__()
         del module_fqn, context
         self.attention_interface = attention_interface
+        self.rotary_interface = rotary_interface
         required = (
             "q_a_proj",
             "q_a_layernorm",
@@ -257,7 +259,9 @@ class MLAAttention(nn.Module):
             )
 
             cos, sin = position_embeddings
-            rope_fn = apply_rotary_pos_emb_interleave if self.rotary_interleaved else apply_rotary_pos_emb
+            rope_fn = self.rotary_interface
+            if rope_fn is None:
+                rope_fn = apply_rotary_pos_emb_interleave if self.rotary_interleaved else apply_rotary_pos_emb
             query_rope, key_rope = rope_fn(query_rope, key_rope, cos, sin)
         kv_nope = latents.kv_nope
         if past_key_values is not None:

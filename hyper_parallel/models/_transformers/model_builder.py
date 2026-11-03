@@ -437,6 +437,10 @@ def _build_replacement_context(
         "cp": getattr(mesh_context, "cp_size", 1) > 1,
         "ep": getattr(mesh_context, "ep_size", 1) > 1,
         "pp": getattr(mesh_context, "pp_size", 1) > 1,
+        "ep_size": getattr(mesh_context, "ep_size", 1),
+        "tp_size": getattr(mesh_context, "tp_size", 1),
+        "cp_size": getattr(mesh_context, "cp_size", 1),
+        "pp_size": getattr(mesh_context, "pp_size", 1),
         "sequence_parallel": bool(getattr(mesh_context, "sequence_parallel", False)),
     }
 
@@ -769,6 +773,32 @@ def apply_model_infrastructure(
     materialization/loading -> model_init_dtype conversion -> per-layer compile.
     Placement validation keeps the DTensor placement path and skips compile;
     FSDP2 consumes DTensor parameter layouts in both modes.
+
+    Args:
+        model: Complete executable model before infrastructure is applied.
+        mesh: Resolved parallel mesh context.
+        sharding_planner: Parameter and activation layout planner.
+        fsdp2_manager: FSDP lifecycle manager.
+        peft_config: Optional parameter-efficient training configuration.
+        qat_config: Optional quantization-aware training configuration.
+        fp8_config: Optional low-precision configuration.
+        freeze_config: Parameter freezing declarations.
+        compile_config: Optional compilation configuration.
+        activation_checkpoint: Activation checkpoint mode.
+        activation_checkpoint_selection: Selected checkpoint regions.
+        activation_swap: Activation swap policy.
+        swap_inputs: Whether swap regions include their inputs.
+        allow_cache_entry_mutation: Whether checkpoint replay may mutate cache entries.
+        is_meta_device: Whether model storage still needs materialization.
+        is_hf_model: Whether pretrained loading follows the HF contract.
+        device: Final local device.
+        load_base_model: Whether pretrained base tensors must be loaded.
+        pretrained_path: Local pretrained source path.
+        validate_placement: Enable strict layout validation.
+        low_precision_config: Resolved low-precision policy.
+        model_init_dtype: Parameter dtype applied after initialization.
+        codegen_artifact_dir: Optional generated source output directory.
+        **kwargs: Distributed setup and additional infrastructure options.
     """
 
     distributed_setup = kwargs.get("distributed_setup")
