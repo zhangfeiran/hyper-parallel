@@ -55,7 +55,7 @@ class MegaMoeSpec:
     schedule_tokens: int | None = None
     replica_slots_per_rank: int = 0
     logical_num_experts: int = 0
-    replica_transport: str = "p2p"
+    replica_transport: str = "shmem_signal_kernel_gradient_bands"
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
 
@@ -228,7 +228,7 @@ def bind_mega_moe_spec(
         num_experts=specification["num_experts"],
         logical_num_experts=specification.get("logical_num_experts", specification["num_experts"]),
         replica_slots_per_rank=specification.get("replica_slots_per_rank", 0),
-        replica_transport=specification.get("replica_transport", "p2p"),
+        replica_transport=specification.get("replica_transport", "shmem_signal_kernel_gradient_bands"),
         top_k=top_k,
         initial_capacity_factor=initial_capacity_factor,
         receive_capacity=receive_capacity,

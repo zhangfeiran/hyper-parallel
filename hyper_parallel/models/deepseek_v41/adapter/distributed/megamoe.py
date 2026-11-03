@@ -47,7 +47,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
                  context: Mapping[str, Any] | None = None,
                  dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
                  capacity_growth_factor: float | None = None, initializer_range: float = 0.02,
-                 replica_slots_per_rank: int = 0, replica_transport: str = "p2p") -> None:
+                 replica_slots_per_rank: int = 0,
+                 replica_transport: str = "shmem_signal_kernel_gradient_bands") -> None:
         """Convert a full HF holder before EP partitioning and FSDP construction.
 
         Args:
@@ -59,7 +60,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             capacity_growth_factor: Push capacity growth multiplier; omit for pull.
             initializer_range: Standard deviation used for meta-model random initialization.
             replica_slots_per_rank: Adaptive guest-slot cap; zero preserves owner-only execution.
-            replica_transport: Weight-copy and gradient-return transport for guest experts.
+            replica_transport: Guest weight-copy and gradient-return transport; defaults to gradient bands.
         """
         super().__init__()
         del module_fqn

@@ -37,7 +37,7 @@ Native EP 同样只需 `ExpertParallel(replica_slots_per_rank=6)`。
 | 参数 | 含义 |
 |---|---|
 | `replica_slots_per_rank` | 物理 guest 槽位上限；实际使用量可以更少 |
-| `replica_transport` | MegaMoe 副本权重与梯度的传输协议 |
+| `replica_transport` | MegaMoe replica transport; defaults to `shmem_signal_kernel_gradient_bands` |
 | `replica_min_rows` | 软最小副本行数；容量要求的副本可以保留 |
 | `replica_target_load` | MegaMoe 期望接收行数，不是丢弃阈值或容量硬上限 |
 | `replica_minimum_load_reduction` | 可选的负载削峰要求；显式值覆盖默认策略 |

@@ -432,7 +432,7 @@ class MegaMoeExperts(MulticoreModule):
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
         replica_slots_per_rank: int = 0,
-        replica_transport: str = "p2p",
+        replica_transport: str = "shmem_signal_kernel_gradient_bands",
         replica_min_rows: int = 1024,
         replica_planner: str = "cpu",
         replica_target_load: int | None = None,
@@ -453,10 +453,11 @@ class MegaMoeExperts(MulticoreModule):
             replica_slots_per_rank: Physical guest slot cap per rank. Positive caps use
                 adaptive quotas by default; zero keeps owner-only routing. Matching
                 costs are selected internally, with load-driven fallback for unmeasured shapes.
-            replica_transport: "p2p" or "shmem_signal_kernel_gradient". The latter uses
-                projection-ready SDMA weights and fused FP32 gradient return.
-                "shmem_signal_kernel_gradient_bands" publishes completed output row bands
-                directly from Cube workers and consumes them in independent AIV groups.
+            replica_transport: Defaults to "shmem_signal_kernel_gradient_bands", which
+                publishes completed output row bands directly from Cube workers and
+                consumes them in independent AIV groups. "shmem_signal_kernel_gradient"
+                uses projection-ready SDMA weights and fused FP32 gradient return.
+                "p2p" uses HCCL weight copies and peer-ordered FP32 gradient return.
             replica_planner: Shared CPU or fused device replica quota policy.
             replica_target_load: Preferred received rows per rank, independent of buffer capacity.
                 All EP ranks must agree. None uses current capacity for push and average load for pull.

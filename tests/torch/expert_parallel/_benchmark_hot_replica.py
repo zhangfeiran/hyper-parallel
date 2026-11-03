@@ -141,7 +141,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("push", "pull"), default="push")
     parser.add_argument("--replica-transport", choices=("p2p", "shmem_signal_kernel_gradient",
-                                                     "shmem_signal_kernel_gradient_bands"), default="p2p")
+                                                     "shmem_signal_kernel_gradient_bands"),
+                        default="shmem_signal_kernel_gradient_bands")
     parser.add_argument("--replica-planner", choices=("cpu", "device"), default="cpu")
     parser.add_argument("--route", choices=("balanced", "hot", "rotating_hot"), default="hot")
     parser.add_argument("--budget", type=int, default=1)

@@ -211,7 +211,8 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         """Heap replacement drops the old provider's address views and epoch."""
         specification = {"local_num_tokens": 128, "top_k": 2, "hidden_size": 5120,
                          "intermediate_size": 1792, "num_experts": 28, "ep_size": 4,
-                         "logical_num_experts": 24, "replica_slots_per_rank": 1, "initial_capacity_factor": 1.0}
+                         "logical_num_experts": 24, "replica_slots_per_rank": 1, "initial_capacity_factor": 1.0,
+                         "replica_transport": "p2p"}
         before = workspace_module._spec_workspace_bytes(specification, torch.bfloat16)
         specification["replica_transport"] = "shmem_signal_kernel_gradient"
         after = workspace_module._spec_workspace_bytes(specification, torch.bfloat16)

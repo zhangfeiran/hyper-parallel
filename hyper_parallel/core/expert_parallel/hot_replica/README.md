@@ -15,12 +15,13 @@ style = ExpertParallel(replica_slots_per_rank=1, replica_planner="cpu")
 style.apply(experts, ep_mesh)
 ```
 
-MegaMoe 的 push/pull 共享规划器，支持两种副本传输：
+MegaMoe push/pull share one planner and support three replica transports:
 
 | `replica_transport` | 权重与梯度执行 |
 | --- | --- |
-| `p2p`（默认） | HCCL P2P 权重复制，按 peer 顺序归还 FP32 梯度 |
+| `p2p` | HCCL P2P 权重复制，按 peer 顺序归还 FP32 梯度 |
 | `shmem_signal_kernel_gradient` | 按 peer 并行 SDMA 预取，分投影 ready，反向内核归还 FP32 梯度 |
+| `shmem_signal_kernel_gradient_bands` (default) | Cube publishes completed gradient bands for independent AIV return |
 
 ```python
 from hyper_parallel.core.multicore import MegaMoeExperts
@@ -29,7 +30,7 @@ module = MegaMoeExperts(
     hidden_size=5120, intermediate_size=1792,
     num_experts=24, top_k=8, ep_size=4, ep_group=ep_group,
     dispatch_mode="push", replica_slots_per_rank=1,
-    replica_transport="shmem_signal_kernel_gradient",
+    replica_transport="shmem_signal_kernel_gradient_bands",
     replica_planner="cpu",
 )
 output = module(values, topk_ids, topk_weights)
