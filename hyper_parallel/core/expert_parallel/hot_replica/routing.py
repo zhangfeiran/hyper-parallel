@@ -39,6 +39,8 @@ from .plan import ExpertExecutionPlan, ExpertReplicaTransfer
 from .planner import (
     _build_expert_replica_plan as build_expert_replica_plan,
     _optional_peak_is_useful,
+    _UncalibratedCandidate,
+    _uncalibrated_copies,
 )
 from .topology import _validate_rank_nodes
 
@@ -149,7 +151,8 @@ def _plan_replica_route(counts: Any, config: ExpertReplicaConfig, group: object,
     # Heap allowance and gradient-dependent credits can change between phases.
     # Replaying the original decision preserves the checkpoint's physical graph.
     policy = tuple((key, type(value), value) for key, value in sorted(options.items())
-                   if key not in ('receive_capacity', 'capacity_limit', '_replica_transfer_row_credit'))
+                   if key not in ('receive_capacity', 'capacity_limit', '_replica_transfer_row_credit',
+                                  '_uncalibrated_candidate'))
     signature = (config, id(group), rank, policy)
     cache = state.get_resource(_RecomputedReplicaPlans, _RecomputedReplicaPlans)
     if state.is_recomputing:
@@ -330,9 +333,10 @@ def _try_compact_home_route(
     *, target_load: int | None, receive_capacity: int | None, factor: float | None,
     minimum_load_reduction: float, minimum_saved_rows: int,
     cost_model: ExpertReplicaCostModel | None, rank_nodes: tuple[int, ...],
+    minimum_replica_rows: int = 0,
     capacity_budget: Callable[[int], int] | None = None,
     gathered_counts: _GatheredReplicaCounts | None = None,
-) -> ReplicaRoute | None:
+) -> ReplicaRoute | _UncalibratedCandidate | None:
     """Read bounded statistics before deciding whether a full CPU table is needed."""
     # A larger allowance must not replace the original checkpoint graph with
     # a newly affordable home-only shortcut during recomputation.
@@ -388,7 +392,7 @@ def _try_compact_home_route(
         raise ValueError("hot replication requires in-range, distinct expert IDs per token")
     maximum_tokens = max(row[2] for row in rows)
     top_k = topk_ids.shape[1]
-    _, receive_capacity = _automatic_capacity_options(
+    target_load, receive_capacity = _automatic_capacity_options(
         maximum_tokens, top_k, target_load, receive_capacity, factor, capacity_budget)
     upper = config.maximum_receive_rows(max(1, maximum_tokens), top_k, alignment=1)
     owner_upper = ExpertReplicaConfig(config.num_experts, config.ep_size, 0).maximum_receive_rows(
@@ -408,7 +412,21 @@ def _try_compact_home_route(
         if cost_model is None:
             average = (sum(destination_loads) + config.ep_size - 1) // config.ep_size
             if _optional_peak_is_useful(average, destination_loads, resident, admission, minimum_saved_rows):
-                return None
+                if minimum_replica_rows:
+                    return None
+                # A failed quota-level admission cannot be rescued by source
+                # dispatch construction. Keep the full count table on device.
+                if gathered_counts is not None and gathered_counts.host_counts is not None:
+                    totals = list(map(sum, zip(*gathered_counts.host_counts)))
+                else:
+                    totals = logical.sum(0, dtype=torch.int64).cpu().tolist()
+                candidate = _uncalibrated_copies(
+                    totals, list(destination_loads), config, upper, resident, max(average, target_load or 0))
+                if candidate is not None and _optional_peak_is_useful(
+                        max(sum(row.values()) for row in candidate), destination_loads,
+                        resident, admission, minimum_saved_rows):
+                    return _UncalibratedCandidate(config, tuple(totals), candidate, upper, resident,
+                                                  max(average, target_load or 0))
         elif not _compact_home_cost_dominates(totals, rows, config, cost_model):
             return None
     counts = logical.to(torch.int32).contiguous()
@@ -536,6 +554,7 @@ def prepare_replica_route(
         remapped = _remap_replica_ids(ids.to(torch.int64), plan, slots, lengths)
         return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_plan.dispatch_counts.to(torch.int32),
                             rank, group, device_plan=device_plan, dynamic_summary=dynamic_summary)
+    prepared_candidate = None
     if (compact_home and dynamic_header is not None and config.replica_slots_per_rank
             and (_gathered_counts is None or _cost_model is not None
                  or minimum_load_reduction or minimum_saved_rows)):
@@ -544,10 +563,12 @@ def prepare_replica_route(
             target_load=target_load, receive_capacity=receive_capacity,
             factor=_auto_capacity_factor, minimum_load_reduction=minimum_load_reduction,
             minimum_saved_rows=minimum_saved_rows,
+            minimum_replica_rows=minimum_replica_rows,
             cost_model=_cost_model, rank_nodes=_rank_nodes, capacity_budget=_capacity_budget,
             gathered_counts=_gathered_counts)
-        if ordinary is not None:
+        if isinstance(ordinary, ReplicaRoute):
             return ordinary
+        prepared_candidate = ordinary
     # The deterministic host planner shares the route-count synchronization with
     # split sizing; no per-expert device-to-host reads occur below.
     if _gathered_counts is None:
@@ -581,6 +602,7 @@ def prepare_replica_route(
         receive_capacity=receive_capacity, adaptive=bool(config.replica_slots_per_rank),
         _rank_nodes=_rank_nodes,
         _replica_transfer_row_credit=_replica_transfer_row_credit,
+        _uncalibrated_candidate=prepared_candidate,
     )
     if max(plan.destination_loads) > upper:
         raise RuntimeError("replica planner exceeded the theoretical receive bound")

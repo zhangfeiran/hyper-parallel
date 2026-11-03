@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from heapq import heapify, heappop, heappush
 from itertools import chain
 
@@ -458,6 +458,48 @@ def _home_layout(counts, config):
     return totals, [sum(row.values()) for row in copies], copies
 
 
+@dataclass(frozen=True)
+class _UncalibratedCandidate:
+    """Own one invocation's quotas until full source materialization consumes them."""
+
+    config: ExpertReplicaConfig
+    totals: tuple[int, ...]
+    copies: list[dict[int, int]]
+    limit: int
+    resident: int
+    target: int
+
+    def matches(self, totals: list[int], config: ExpertReplicaConfig,
+                limit: int, resident: int, target: int) -> bool:
+        """Reject reuse if the source totals or agreed allocation policy changed."""
+        return (self.config == config and self.totals == tuple(totals)
+                and (self.limit, self.resident, self.target) == (limit, resident, target))
+
+
+def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
+                         limit: int, resident: int, target: int) -> list[dict[int, int]] | None:
+    """Select source-independent quotas, using None for unchanged owner placement."""
+    owner_peak = max(loads)
+    if owner_peak <= min(target, resident):
+        return None
+    fallback = (owner_peak, None) if owner_peak <= limit else None
+    edges = _balanced_edges(loads, totals, config.home_experts)
+    for budget in range(1, min(config.replica_slots_per_rank, config.home_experts) + 1):
+        candidate = ExpertReplicaConfig(config.num_experts, config.ep_size, budget)
+        copies = _bounded_copies(loads, totals, candidate, edges=edges)
+        peak = max(sum(row.values()) for row in copies)
+        if peak <= min(target, resident):
+            return copies
+        if peak <= limit and (fallback is None or peak < fallback[0]):
+            fallback = peak, copies
+    if fallback is None:
+        raise ValueError("Adaptive replica cap cannot satisfy capacity_limit")
+    selected = fallback[1]
+    if selected is not None:
+        _improve_copies(selected, config, min(target, resident))
+    return selected
+
+
 def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig,
                      limit: int, receive_capacity: int | None,
                      model: ExpertReplicaCostModel | None, target: int,
@@ -468,23 +510,8 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
     totals, loads, home = _home_layout(counts, config)
     resident = min(limit, receive_capacity) if receive_capacity is not None else limit
     if model is None:
-        if max(loads) <= min(target, resident):
-            return home, None
-        fallback = (max(loads), home) if max(loads) <= limit else None
-        edges = _balanced_edges(loads, totals, config.home_experts)
-        for budget in range(1, min(config.replica_slots_per_rank, config.home_experts) + 1):
-            candidate = ExpertReplicaConfig(config.num_experts, config.ep_size, budget)
-            copies = _bounded_copies(loads, totals, candidate, edges=edges)
-            peak = max(sum(row.values()) for row in copies)
-            if peak <= min(target, resident):
-                return copies, None
-            if peak <= limit and (fallback is None or peak < fallback[0]):
-                fallback = peak, copies
-        if fallback is None:
-            raise ValueError("Adaptive replica cap cannot satisfy capacity_limit")
-        if fallback[1] is not home:
-            _improve_copies(fallback[1], config, min(target, resident))
-        return fallback[1], None
+        selected = _uncalibrated_copies(totals, loads, config, limit, resident, target)
+        return home if selected is None else selected, None
     measured = min(model.forward_ms[-1][0], model.backward_ms[-1][0])
     durations = {} if durations is None else durations
 
@@ -660,7 +687,8 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
                               receive_capacity: int | None = None,
                               adaptive: bool = False,
                               _rank_nodes: tuple[int, ...] = (),
-                              _replica_transfer_row_credit: int = 0) -> ExpertExecutionPlan:
+                              _replica_transfer_row_credit: int = 0,
+                              _uncalibrated_candidate: _UncalibratedCandidate | None = None) -> ExpertExecutionPlan:
     """Build a bounded single-execution plan, then reduce residual imbalance.
 
     Args:
@@ -689,6 +717,8 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
             one shared balancing skeleton. Missing costs use load and capacity constraints.
         _replica_transfer_row_credit: Internal activation-row allowance from mandatory
             gradient bytes. Zero retains strict remote-row bounds during consolidation.
+        _uncalibrated_candidate: Invocation-local quotas admitted using compact counts.
+            Reuse requires the same histogram, configuration, and capacity policy.
 
     Returns:
         Immutable physical placement and exact per-source dispatch quotas.
@@ -762,8 +792,13 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
                 _consolidate_copies(copies, counts, config, rank_nodes, _replica_transfer_row_credit)
             return _materialize(counts, copies, config, capacity_limit, rank_nodes=rank_nodes)
 
-        copies, bounds = _adaptive_copies(counts, config, limit, receive_capacity, cost_model, target,
-                                          minimum_replica_rows, durations)
+        resident = min(limit, receive_capacity) if receive_capacity is not None else limit
+        if (_uncalibrated_candidate is not None and cost_model is None and not minimum_replica_rows
+                and _uncalibrated_candidate.matches(expert_counts, config, limit, resident, target)):
+            copies, bounds = _uncalibrated_candidate.copies, None
+        else:
+            copies, bounds = _adaptive_copies(counts, config, limit, receive_capacity, cost_model, target,
+                                              minimum_replica_rows, durations)
         copies = refine(copies, bounds)
         has_guests = any(expert // config.home_experts != rank and rows
                          for rank, row in enumerate(copies) for expert, rows in row.items())
