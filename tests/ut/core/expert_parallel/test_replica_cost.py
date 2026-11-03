@@ -17,6 +17,7 @@
 import random
 import unittest
 from dataclasses import replace
+from typing import Tuple, Union
 from unittest.mock import PropertyMock, patch
 
 from hyper_parallel.core.expert_parallel.hot_replica import (
@@ -31,6 +32,26 @@ from hyper_parallel.core.expert_parallel.hot_replica.planner import (
 
 class TestReplicaCost(unittest.TestCase):
     """Keep measured costs advisory and preserve every routing invariant."""
+
+    def test_zero_token_coefficient_skips_unused_source_expert_reads(self) -> None:
+        """A zero token term retains the score without walking per-expert source hits."""
+        class NoHits(tuple):
+            """Allow aggregate iteration while rejecting unused expert-index reads."""
+
+            def __getitem__(self, _index: Union[int, slice]) -> Union[int, Tuple[int, ...]]:
+                raise AssertionError('Source expert hit was read')
+
+        counts = ((10, 4, 0, 0), (6, 0, 0, 0))
+        guarded = tuple(NoHits(row) for row in counts)
+        copies = [{0: 10, 1: 4}, {2: 0, 3: 0, 0: 6}]
+        config = ExpertReplicaConfig(4, 2, 1)
+        model = self._model(effective_group_ms=(.5, .1, .2, .3, 0., .4), _rank_nodes=(0, 1))
+        expected = cost._QuotaCostState(model, copies, counts, config).score()
+        actual = cost._QuotaCostState(model, copies, guarded, config).score()
+        self.assertEqual(actual, expected)
+        positive = replace(model, effective_group_ms=(.5, .1, .2, .3, .25, .4))
+        with self.assertRaisesRegex(AssertionError, 'Source expert hit'):
+            cost._QuotaCostState(positive, copies, guarded, config).score()
 
     def test_resident_backward_weights_keep_forward_copy_cost(self) -> None:
         """Residency removes one backward copy without discounting forward or replay."""

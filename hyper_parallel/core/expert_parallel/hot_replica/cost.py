@@ -44,7 +44,7 @@ def _default_schedule(backend: str, transport: str) -> str:
 def _effective_group_features(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
                               home: int, nodes: tuple[int, ...],
                               source_totals: list[int] | None = None,
-                              source_row_floor: float = 0.) -> tuple[float, ...]:
+                              source_row_floor: float = 0., token_work: bool = True) -> tuple[float, ...]:
     """Summarize group component maxima without treating synchronized rank waits as local work."""
     if len(nodes) != len(copies):
         raise ValueError('Effective group scoring requires the measured EP topology')
@@ -62,10 +62,11 @@ def _effective_group_features(copies: list[dict[int, int]], counts: tuple[tuple[
     for rank, experts in enumerate(copies):
         tasks.append(sum(rows > 0 for rows in experts.values()))
         received.append(sum(experts.values()))
-        hits = sum(min(counts[rank][expert], rows) for expert, rows in experts.items())
-        tokens.append((source_totals[rank] + received[-1] - 2 * hits) / 2)
+        if token_work:
+            hits = sum(min(counts[rank][expert], rows) for expert, rows in experts.items())
+            tokens.append((source_totals[rank] + received[-1] - 2 * hits) / 2)
     received_max = max(max(received), source_row_floor * max(source_totals))
-    return max(tasks), received_max, max(local), max(remote), max(tokens), int(any(local) or any(remote))
+    return max(tasks), received_max, max(local), max(remote), max(tokens, default=0.), int(any(local) or any(remote))
 
 
 @dataclass(frozen=True)
@@ -383,7 +384,8 @@ class _QuotaCostState:
             if removed:
                 raise ValueError('Effective group scoring requires final explicit quotas')
             features = _effective_group_features(self.copies, self.counts, self.home, self.model._rank_nodes,
-                                                 self.source_totals, self.model.effective_source_row_floor)
+                                                 self.source_totals, self.model.effective_source_row_floor,
+                                                 token_work=bool(self.model.effective_group_ms[4]))
             return sum(value * coefficient for value, coefficient in zip(features, self.model.effective_group_ms))
         if self.model.critical_path is not None:
             if removed:
