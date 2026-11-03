@@ -46,8 +46,18 @@ class TestSharedFunction(unittest.TestCase):
             with self.subTest(input_grad=input_grad, limit=limit):
                 self._check_deferred(input_grad, limit)
 
-    def _check_deferred(self, input_grad: bool, limit: float | None) -> None:
-        """Emulate routed zeros and compare the integrated shared gradients to Torch."""
+    def test_strided_shared_input_keeps_values_and_gradients(self) -> None:
+        """Honor row strides at the public boundary before the raw device pointer is consumed."""
+        self._check_deferred(True, None, strided=True)
+
+    def _check_deferred(self, input_grad: bool, limit: float | None, *, strided: bool = False) -> None:
+        """Compare deferred shared gradients with an independent dense reference.
+
+        Args:
+            input_grad: Whether the caller requires input gradients.
+            limit: Optional activation clamp.
+            strided: Use a token view with a gap between its physical rows.
+        """
         torch.manual_seed(73)
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0, ep_size=2,
                                num_experts=4, top_k=2, dispatch_mode="push", shared_intermediate_size=2,
@@ -68,6 +78,8 @@ class TestSharedFunction(unittest.TestCase):
         def forward_kernel(_plan, _route, _source, _first, _second, execution) -> None:
             """Fill independent outputs through the actual indirect tensor table."""
             source, first, second, up, activation, output, _scratch = execution.shared_ptrs
+            # Device shared_x descriptors carry dense dimensions and no stride metadata.
+            source = torch.as_strided(source, source.shape, (source.shape[1], 1), source.storage_offset())
             up.copy_(functional.linear(source, first))
             gate, branch = up.chunk(2, dim=-1)
             if limit is not None:
@@ -100,6 +112,10 @@ class TestSharedFunction(unittest.TestCase):
         ):
             for _ in range(2):
                 source = (torch.randn(2, 4) if limit is None else torch.eye(4)[:2]).requires_grad_(input_grad)
+                if strided:
+                    storage = torch.randn(4, 4, requires_grad=input_grad)
+                    source = storage[::2]
+                    source.retain_grad()
                 reference = source.detach().clone().requires_grad_(input_grad)
                 route = SimpleNamespace(expert_capacity=3, group_list=torch.tensor([0, 3]))
                 for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",

@@ -837,6 +837,9 @@ def execute_mega_moe_with_permutation(
         Owned expert-major rows, or token-major rows when topk_weights is provided,
         differentiable with respect to input tokens, expert weights and Router probabilities.
     """
+    # Shared descriptors bind dense rows; keep the layout copy in the caller's autograd graph.
+    if shared_weight1 is not None:
+        hidden_states = hidden_states.contiguous()
     result = _MegaMoeFunction.apply(
         hidden_states,
         weight1.contiguous(),
