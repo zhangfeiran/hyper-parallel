@@ -21,7 +21,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.models.longcat_flash.adapter.route_kernels import OrderedCombine, OrderedGather
 
 
@@ -72,11 +71,7 @@ def fused_expert_forward(module: Any, hidden: torch.Tensor, ids: torch.Tensor,
             if module.ep_size != 1:
                 raise RuntimeError("Configure LongCat EP experts before execution")
             module.configure()
-        gate, down = (value.to_local() if isinstance(value, DTensor) else value
-                      for value in (module.gate_up_proj, module.down_proj))
-        weights = (gate[:module.num_experts // module.ep_size], down)
-        if module.expert_weight_layout == "EIO":
-            weights = tuple(value.transpose(1, 2).contiguous() for value in weights)
+        weights = module._real_weights()  # pylint: disable=protected-access
         inputs = (states, ids[token, slot].reshape(-1, 1).contiguous(),
                   probabilities.new_ones((token.numel(), 1)))
         if module.backend == "megamoe":

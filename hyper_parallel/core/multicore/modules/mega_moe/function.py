@@ -227,7 +227,7 @@ def _allocate_backward_intermediates(
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
     gradient_dtype = torch.float32 if spec.replica_slots_per_rank else weight2.dtype
-    clear_all = empty_experts is None or len(empty_experts) == weight1.shape[0]
+    clear_all = empty_experts is None or len(empty_experts) == weight2.shape[0]
     allocate = torch.zeros_like if clear_all else torch.empty_like
     grad_weight1 = allocate(weight1, dtype=gradient_dtype)
     grad_weight2 = allocate(weight2, dtype=gradient_dtype)
@@ -237,6 +237,8 @@ def _allocate_backward_intermediates(
         for expert in empty_experts:
             grad_weight1[expert].zero_()
             grad_weight2[expert].zero_()
+        if weight1.shape[0] > weight2.shape[0]:
+            grad_weight1[weight2.shape[0]:].zero_()
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -495,7 +497,7 @@ def _launch_forward_kernel(
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            _split_runtime(plan.fwd_runtime_config, pool, weight1.shape[0],
+            _split_runtime(plan.fwd_runtime_config, pool, weight2.shape[0],
                            home_only=_single_expert_addresses(spec, pool),
                            cache=execution.runtime_cache,
                            task_prefix=execution.task_prefix, prefix_cache=execution.prefix_cache),
@@ -520,7 +522,7 @@ def _launch_forward_kernel(
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            _split_runtime(diagnostic_call.runtime_config, pool, weight1.shape[0],
+            _split_runtime(diagnostic_call.runtime_config, pool, weight2.shape[0],
                            home_only=_single_expert_addresses(spec, pool),
                            task_prefix=None if diagnostic_call.preserves_task_queues else execution.task_prefix),
             diagnostic_call.event_counters,
@@ -578,7 +580,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            _split_runtime(diagnostics.runtime_config, pool, saved.weight1.shape[0], backward=True,
+            _split_runtime(diagnostics.runtime_config, pool, saved.weight2.shape[0], backward=True,
                            gradient_return=gradient_return,
                            home_only=_single_expert_addresses(spec, pool),
                            cache=execution.runtime_cache, task_prefix=execution.task_prefix,
@@ -607,7 +609,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            _split_runtime(diagnostic_call.runtime_config, pool, saved.weight1.shape[0], backward=True,
+            _split_runtime(diagnostic_call.runtime_config, pool, saved.weight2.shape[0], backward=True,
                            gradient_return=gradient_return,
                            home_only=_single_expert_addresses(spec, pool),
                            task_prefix=None if diagnostic_call.preserves_task_queues else execution.task_prefix),

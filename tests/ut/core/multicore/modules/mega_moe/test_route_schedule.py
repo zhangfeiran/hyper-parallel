@@ -24,6 +24,8 @@ import torch
 from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.core.multicore.modules.mega_moe import module as module_impl
+from hyper_parallel.core.multicore.modules.mega_moe import function as function_impl
+from hyper_parallel.models.longcat_flash.adapter.parameter_grad import real_gate_prefix
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 from hyper_parallel.core.multicore.modules.mega_moe.route import RouteSchedule, _route_schedule
@@ -184,3 +186,73 @@ class TestRouteSchedule(unittest.TestCase):
         self.assertTrue(single.single_expert_tasks)
         with self.assertRaises(ValueError):
             MegaMoeExperts.share_execution_resources([ordinary, single])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_padded_gate_storage_requires_external_nonreplica_weights(self) -> None:
+        """Feature: Inactive Gate/Up storage rows.
+
+        Description: Validate configuration and independent Gate/Up versus Down storage shapes.
+        Expectation: Only external, EP-divisible non-replica Gate/Up padding is accepted.
+        """
+        common = {"hidden_size": 4, "intermediate_size": 3, "num_experts": 4, "top_k": 1,
+                  "ep_size": 2, "create_parameters": False, "expert_weight_layout": "EOI"}
+        for invalid in (True, -1, 1.5, 1):
+            with self.subTest(padding=invalid), self.assertRaises(ValueError):
+                MegaMoeExperts(**common, gate_up_expert_padding=invalid)
+        for extra in ({"create_parameters": True}, {"replica_slots_per_rank": 1},
+                      {"expert_weight_layout": "EIO"}):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                MegaMoeExperts(**(common | extra), gate_up_expert_padding=2)
+        experts = MegaMoeExperts(**common, gate_up_expert_padding=2)
+        self.addCleanup(experts.close)
+        hidden = SimpleNamespace(dtype=torch.bfloat16, is_npu=True, device=torch.device("cpu"))
+        gate, down = torch.empty(3, 6, 4, dtype=torch.bfloat16), torch.empty(2, 4, 3, dtype=torch.bfloat16)
+        experts._validate_tensors(hidden, (gate, down))
+        with self.assertRaisesRegex(ValueError, "gate_up_weight"):
+            experts._validate_tensors(hidden, (gate[:2], down))
+        with self.assertRaisesRegex(ValueError, "down_weight"):
+            experts._validate_tensors(hidden, (gate, torch.empty(3, 4, 3, dtype=torch.bfloat16)))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_padded_gradient_initialization_clears_empty_and_unused_rows(self) -> None:
+        """Feature: Direct full-shape expert gradients.
+
+        Description: Poison allocations and vary the real expert emptiness set.
+        Expectation: Empty real matrices and unused Gate/Up rows are zero; active matrices await complete stores.
+        """
+        spec = SimpleNamespace(replica_slots_per_rank=0, intermediate_size=3, hidden_size=4)
+        gate, down = torch.ones(3, 6, 4), torch.ones(2, 4, 3)
+        for empty in (None, (), (1,), (0, 1)):
+            with self.subTest(empty=empty):
+                with patch.object(function_impl.torch, "empty_like",
+                                  side_effect=lambda value, **kwargs: torch.full_like(value, float("nan"), **kwargs)):
+                    result = function_impl._allocate_backward_intermediates(
+                        spec, 4, torch.ones(4, 4), gate, down, empty_experts=empty)
+                torch.testing.assert_close(result.grad_weight1[2], torch.zeros_like(gate[2]))
+                for expert in range(2):
+                    for value in (result.grad_weight1, result.grad_weight2):
+                        if empty is None or expert in empty:
+                            torch.testing.assert_close(value[expert], torch.zeros_like(value[expert]))
+                        else:
+                            self.assertTrue(torch.isnan(value[expert]).all())
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_native_gate_prefix_preserves_values_alias_and_full_derivative(self) -> None:
+        """Feature: Native control with selective padded-gradient initialization.
+
+        Description: Compare empty, partial and complete prefixes in FP32 and BF16.
+        Expectation: Forward storage aliases the parameter and the complete derivative equals slicing exactly.
+        """
+        for dtype in (torch.float32, torch.bfloat16):
+            for rows in (0, 2, 3):
+                with self.subTest(dtype=dtype, rows=rows):
+                    reference = torch.randn(3, 6, 4, dtype=dtype).requires_grad_()
+                    candidate = reference.detach().clone().requires_grad_()
+                    expected, actual = reference[:rows], real_gate_prefix(candidate, rows)
+                    gradient = torch.randn_like(expected)
+                    expected.backward(gradient)
+                    actual.backward(gradient)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(candidate.grad, reference.grad, rtol=0, atol=0)
+                    if rows:
+                        self.assertEqual(actual.data_ptr(), candidate.data_ptr())

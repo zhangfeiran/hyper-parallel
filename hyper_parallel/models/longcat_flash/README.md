@@ -42,6 +42,15 @@ after updating the source; the runtime must accept an all-home execution with no
 Bounded plans apply to non-replica execution; enabled guest configurations retain the original route planner.
 Set `optimize_tasks: false` to retain the earlier task paths.
 
+For non-replica EOI storage, `direct_weight_gradients: true` also retains the full HF Gate/Up parameter
+as the MegaMoE autograd input. The generic `gate_up_expert_padding` option declares trailing storage
+rows that are never routed. The kernel writes active matrices directly into the full gradient allocation;
+only empty real matrices and unused trailing rows are initialized. The native GMM control uses an exact
+prefix-view backward that copies active gradients and clears only the unused tail. Both paths preserve
+all unused parameter rows, full gradient shapes and ordinary optimizer/weight-decay behavior.
+`direct_weight_gradients: false` restores the ordinary slice backward. This optimization is disabled for
+EIO layout and guest replicas.
+
 The optional `routing_backend: triton` fuses local combine and ordered input-gradient accumulation.
 It retains every per-slot BF16 rounding boundary and the original FP32 probability reductions. Expert IDs
 are sorted through exactly representable FP32 values to avoid the Ascend int64 AICPU fallback. Launches

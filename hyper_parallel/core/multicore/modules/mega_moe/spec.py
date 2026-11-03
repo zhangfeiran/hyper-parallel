@@ -60,6 +60,7 @@ class MegaMoeSpec:
     auto_tokens: bool = False
     swiglu_hf_bf16: bool = False
     single_expert_tasks: bool = False
+    gate_up_expert_padding: int = 0
     route_task_bounds: bool = False
     schedule_expert_rows: int | None = None
     schedule_source_expert_rows: int | None = None
@@ -248,6 +249,7 @@ def bind_mega_moe_spec(
         swiglu_limit=swiglu_limit,
         swiglu_hf_bf16=specification.get("swiglu_hf_bf16", False),
         single_expert_tasks=specification.get("single_expert_tasks", False),
+        gate_up_expert_padding=specification.get("gate_up_expert_padding", 0),
         route_task_bounds=specification.get("route_task_bounds", False),
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),

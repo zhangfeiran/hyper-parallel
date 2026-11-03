@@ -29,6 +29,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import WeightConvert
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.multicore.modules.mega_moe.assignments import masked_expert_forward
 from hyper_parallel.models.longcat_flash.adapter.layout import ExpertOwnershipPacking
+from hyper_parallel.models.longcat_flash.adapter.parameter_grad import real_gate_prefix
 from hyper_parallel.models.longcat_flash.adapter.routing import OrderedInputGather
 from hyper_parallel.models.replacement import module_replacement
 
@@ -64,7 +65,8 @@ class LongcatFlashMegaMoeExperts(nn.Module):
                  context: Mapping[str, Any] | None = None, backend: str = "megamoe",
                  dispatch_mode: str = "push", replica_slots_per_rank: int = 0,
                  expert_weight_layout: str = "EOI", swiglu_precision: str = "hf",
-                 optimize_tasks: bool = True, routing_backend: str = "torch") -> None:
+                 optimize_tasks: bool = True, routing_backend: str = "torch",
+                 direct_weight_gradients: bool = True) -> None:
         """Bind a complete HF expert module before EP and FSDP sharding.
 
         Args:
@@ -75,6 +77,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             dispatch_mode: MegaMoE push or pull transport.
             replica_slots_per_rank: Optional real-expert guest budget.
             expert_weight_layout: EOI avoids copies; EIO enables current hot replicas.
+            direct_weight_gradients: Retain full Gate/Up gradients without clearing the active prefix.
             routing_backend: Ordered Torch routing, or explicit optional Ascend Triton fusion.
             optimize_tasks: Use exact route bounds and one-expert MegaMoE task addressing.
             swiglu_precision: HF BF16 intermediate casts, or explicit native fused arithmetic.
@@ -95,6 +98,10 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             raise ValueError("LongCat optimize_tasks must be boolean")
         if routing_backend not in ("torch", "triton"):
             raise ValueError("LongCat routing_backend must be torch or triton")
+        if not isinstance(direct_weight_gradients, bool):
+            raise ValueError("LongCat direct_weight_gradients must be boolean")
+        self.direct_weight_gradients = all((direct_weight_gradients, optimize_tasks,
+                                            expert_weight_layout == "EOI", replica_slots_per_rank == 0))
         self.routing_backend = routing_backend
         self.optimize_tasks = optimize_tasks
         self.swiglu_precision = swiglu_precision
@@ -188,6 +195,8 @@ class LongcatFlashMegaMoeExperts(nn.Module):
                 create_parameters=False, expert_weight_layout=self.expert_weight_layout,
                 swiglu_hf_bf16=self.swiglu_precision == "hf",
                 route_task_bounds=self.optimize_tasks, single_expert_tasks=self.optimize_tasks,
+                gate_up_expert_padding=(self.zero_expert_num
+                                        if self.direct_weight_gradients and not self.replica_slots_per_rank else 0),
                 dispatch_mode=self.dispatch_mode, replica_slots_per_rank=self.replica_slots_per_rank,
             )
         self._configured = True
@@ -212,6 +221,20 @@ class LongcatFlashMegaMoeExperts(nn.Module):
 
         return native_expert_forward(hidden, ids, expert_weights, self._ep_group,
                                      self.ep_size, self.num_experts, self.expert_weight_layout)
+
+    def _real_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select backend storage while retaining the same full HF parameter derivative."""
+        gate, down = (value.to_local() if isinstance(value, DTensor) else value
+                      for value in (self.gate_up_proj, self.down_proj))
+        local = self.num_experts // self.ep_size
+        if self.direct_weight_gradients and not self.replica_slots_per_rank:
+            gate = gate if self.backend == "megamoe" else real_gate_prefix(gate, local)
+        else:
+            gate = gate[:local]
+        weights = (gate, down)
+        if self.expert_weight_layout == "EIO":
+            weights = tuple(value.transpose(1, 2).contiguous() for value in weights)
+        return weights
 
     def _validate_checkpoint_packing(self) -> None:
         """Check a newly loaded packing marker once before executing expert matrices."""
@@ -260,12 +283,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             if self.ep_size != 1:
                 raise RuntimeError("Configure LongCat EP experts before execution")
             self.configure()
-        gate, down = (value.to_local() if isinstance(value, DTensor) else value
-                      for value in (self.gate_up_proj, self.down_proj))
-        local = self.num_experts // self.ep_size
-        weights = (gate[:local], down)
-        if self.expert_weight_layout == "EIO":
-            weights = tuple(value.transpose(1, 2).contiguous() for value in weights)
+        weights = self._real_weights()
         executor = self._executor if self.backend == "megamoe" else _NativeExecutor(self)
         real = masked_expert_forward(executor, hidden, top_k_index, top_k_weights,
                                      top_k_index < self.num_experts, expert_weights=weights,

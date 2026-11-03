@@ -97,6 +97,7 @@ def _critical_execution_signature(module: Any, resources: Any) -> str:
     metadata.update(weight_layout=resources.spec.expert_weight_layout, swiglu_limit=resources.spec.swiglu_limit,
                     swiglu_hf_bf16=resources.spec.swiglu_hf_bf16,
                     single_expert_tasks=resources.spec.single_expert_tasks,
+                    gate_up_expert_padding=resources.spec.gate_up_expert_padding,
                     route_task_bounds=resources.spec.route_task_bounds,
                     dispatch_split=resources.spec.dispatch_split, combine_split=resources.spec.combine_split,
                     rank_nodes=resources.rank_nodes, checkpointed=get_recompute_state() is not None,
@@ -133,6 +134,14 @@ def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
             "swiglu_limit must be None or a finite positive float32-representable number, "
             f"got {swiglu_limit!r}."
         )
+
+
+def _validate_gate_storage_padding(padding: int, ep_size: int, owned: bool, replicas: int,
+                                   layout: str) -> None:
+    """Restrict inactive Gate/Up rows to external contiguous EOI storage."""
+    _integer(padding, "gate_up_expert_padding", 0)
+    if padding and (owned or replicas or padding % ep_size or layout != "EOI"):
+        raise ValueError("gate_up_expert_padding requires external non-replica EOI weights and divisibility by EP")
 
 
 def _create_mega_moe_parameters(
@@ -306,7 +315,7 @@ class _MegaMoeExecutionResources:
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
                   "dispatch_split", "combine_split", "swiglu_limit", "swiglu_hf_bf16", "single_expert_tasks",
-                  "route_task_bounds", "expert_weight_layout",
+                  "route_task_bounds", "gate_up_expert_padding", "expert_weight_layout",
                   "ep_size", "auto_tokens",
                   "_replica_cost_model_enabled", "_replica_critical_path_identity",
                   "replica_slots_per_rank", "replica_transport")
@@ -455,6 +464,7 @@ class MegaMoeExperts(MulticoreModule):
         swiglu_limit: float | None = None,
         swiglu_hf_bf16: bool = False,
         single_expert_tasks: bool = False,
+        gate_up_expert_padding: int = 0,
         route_task_bounds: bool = False,
         ep_size: int | None = None,
         ep_group: Any | None = None,
@@ -512,6 +522,9 @@ class MegaMoeExperts(MulticoreModule):
                 constraints and default as dispatch_split. Sharing requires equal splits.
             swiglu_hf_bf16: Round BF16 SiLU and multiply intermediates as separate
                 operators; defaults to False and cannot be combined with a clamp.
+            gate_up_expert_padding: Global trailing Gate/Up storage rows that are never routed.
+                Requires externally supplied EOI weights and no guest replicas. Gradients retain
+                the full storage shape with an explicitly zeroed trailing region.
             route_task_bounds: Bound automatic task plans by exact current route counts.
                 Defaults to False; allocation capacity and receive strides remain unchanged.
             single_expert_tasks: Address each task's matrix as a one-expert GMM group.
@@ -533,6 +546,8 @@ class MegaMoeExperts(MulticoreModule):
         if replica_transport not in ("p2p", *KERNEL_GRADIENT_TRANSPORT_MODES):
             raise ValueError("Unsupported replica_transport; expected p2p or a kernel-gradient transport")
         ep_size = _resolve_ep_size(ep_size, ep_group)
+        _validate_gate_storage_padding(gate_up_expert_padding, ep_size, create_parameters,
+                                       replica_slots_per_rank, expert_weight_layout)
         replica_config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         _integer(replica_min_rows, "replica_min_rows", 0)
         if replica_target_load is not None:
@@ -560,6 +575,7 @@ class MegaMoeExperts(MulticoreModule):
             "swiglu_limit": swiglu_limit,
             "swiglu_hf_bf16": swiglu_hf_bf16,
             "single_expert_tasks": single_expert_tasks,
+            "gate_up_expert_padding": gate_up_expert_padding,
             "route_task_bounds": route_task_bounds,
             "ep_size": _resolve_ep_size(ep_size, ep_group),
             "ep_group": ep_group,
@@ -607,6 +623,7 @@ class MegaMoeExperts(MulticoreModule):
         self.swiglu_limit = specification["swiglu_limit"]
         self.swiglu_hf_bf16 = specification.get("swiglu_hf_bf16", False)
         self.single_expert_tasks = specification.get("single_expert_tasks", False)
+        self.gate_up_expert_padding = specification.get("gate_up_expert_padding", 0)
         self.route_task_bounds = specification.get("route_task_bounds", False)
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
@@ -717,11 +734,12 @@ class MegaMoeExperts(MulticoreModule):
         weight1, weight2 = expert_weights
         if weight1 is None or weight2 is None:
             raise ValueError("Parameterless MegaMoe requires explicit expert_weights")
+        storage_experts = self.local_experts + self.gate_up_expert_padding // self.ep_size
         if self.expert_weight_layout == "EOI":
-            expected_weight1 = (self.local_experts, self.intermediate_size * 2, self.hidden_size)
+            expected_weight1 = (storage_experts, self.intermediate_size * 2, self.hidden_size)
             expected_weight2 = (self.local_experts, self.hidden_size, self.intermediate_size)
         else:
-            expected_weight1 = (self.local_experts, self.hidden_size, self.intermediate_size * 2)
+            expected_weight1 = (storage_experts, self.hidden_size, self.intermediate_size * 2)
             expected_weight2 = (self.local_experts, self.intermediate_size, self.hidden_size)
         if tuple(weight1.shape) != expected_weight1:
             raise ValueError(
