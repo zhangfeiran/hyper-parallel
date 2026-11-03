@@ -15,7 +15,11 @@
 
 """Unit tests for native Torch adapter registration diagnostics."""
 
+import ast
+from collections.abc import Callable
+import inspect
 from pathlib import Path
+import re
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -76,3 +80,47 @@ class TestTorchOps(unittest.TestCase):
                 backward.default._schema = self._backward_op(alias).default._schema
                 with self.assertRaisesRegex(NativeComponentUnavailableError, message):
                     ops._load_native()
+
+    def test_shared_wrappers_match_registered_native_schemas(self) -> None:
+        """Exercise normal and diagnostic calls through Torch's actual schema dispatcher."""
+        registration = Path(ops.__file__).parent / "csrc/registration.cpp"
+        source = registration.read_text()
+        library = ops.torch.library.Library("hp_shared_abi_test", "DEF")
+        captures = {}
+        for name, indices in (("mega_moe", (0, 7, 8, 11, 12)),
+                              ("mega_moe_grad", (0, 6, 8, 10, 12, 13, 17, 18))):
+            start = source.index(f'"{name}("')
+            declaration = source[start:source.index('");', start) + 1]
+            schema = "".join(ast.literal_eval(token) for token in re.findall(r'"(?:[^"\\]|\\.)*"', declaration))
+            library.define(schema)
+            library.impl(name, self._capture_native(captures, name, indices), "CPU")
+        proxy = SimpleNamespace(mega_moe=ops.torch.ops.hp_shared_abi_test.mega_moe,
+                                mega_moe_grad=ops.torch.ops.hp_shared_abi_test.mega_moe_grad)
+        attributes = {"rank_id", "ep", "expert_num", "hidden_size", "seq_size"}
+        with patch.object(ops, "_load_native"), patch.object(ops.torch.ops, "hyper_parallel", proxy):
+            for name in ("mega_moe", "mega_moe_grad", "mega_moe_with_diagnostic_buffer",
+                         "mega_moe_grad_with_diagnostic_buffer"):
+                for shared in (False, True):
+                    with self.subTest(wrapper=name, shared=shared):
+                        function = getattr(ops, name)
+                        arguments = {key: 1 if key in attributes else ops.torch.empty((2, 2))
+                                     for key in inspect.signature(function).parameters}
+                        if not shared:
+                            arguments.update(shared_ptrs=None, shared_runtime=None)
+                        function(**arguments)
+                        actual = captures["mega_moe_grad" if "grad" in name else "mega_moe"]
+                        for index, key in ((-7, "shared_ptrs"), (-6, "shared_runtime"),
+                                           (-8, "diagnostic_buffer")):
+                            expected = arguments.get(key)
+                            if expected is None:
+                                expected = arguments["all_event_counters"]
+                            self.assertEqual(actual[index].data_ptr(), expected.data_ptr())
+
+    @staticmethod
+    def _capture_native(captures: dict, name: str, indices: tuple[int, ...]) -> Callable[..., tuple]:
+        """Return a CPU implementation behind the independently parsed native schema."""
+        def capture(*arguments: object) -> tuple:
+            """Capture dispatcher-validated arguments and return declared output aliases."""
+            captures[name] = arguments
+            return tuple(arguments[index] for index in indices)
+        return capture

@@ -620,14 +620,13 @@ def mega_moe(
         runtime_config,
         all_event_counters,
         all_event_counters,
-        all_event_counters,
-        all_event_counters,
+        shared_ptrs if shared_ptrs is not None else all_event_counters,
+        shared_runtime if shared_runtime is not None else all_event_counters,
         rank_id,
         ep,
         expert_num,
         hidden_size,
         seq_size,
-        shared_ptrs=shared_ptrs, shared_runtime=shared_runtime,
     )
 
 
@@ -713,14 +712,13 @@ def mega_moe_grad(
         runtime_config,
         all_event_counters,
         all_event_counters,
-        all_event_counters,
-        all_event_counters,
+        shared_ptrs if shared_ptrs is not None else all_event_counters,
+        shared_runtime if shared_runtime is not None else all_event_counters,
         rank_id,
         ep,
         expert_num,
         hidden_size,
         seq_size,
-        shared_ptrs=shared_ptrs, shared_runtime=shared_runtime,
     )
 
 
