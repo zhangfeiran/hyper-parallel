@@ -29,7 +29,7 @@ foreach(required_path IN ITEMS
     "${TORCH_INCLUDE_ROOT}"
     "${TORCH_INCLUDE_ROOT}/torch/csrc/api/include"
     "${TORCH_NPU_INCLUDE_ROOT}"
-    "${OP_PLUGIN_ROOT}/op_plugin/include/npu_cpp_extension.h"
+    "${TORCH_NPU_INCLUDE_ROOT}/torch_npu/csrc/framework/OpCommand.h"
     ${TORCH_LINK_LIBRARIES})
     if(NOT EXISTS "${required_path}")
         message(FATAL_ERROR

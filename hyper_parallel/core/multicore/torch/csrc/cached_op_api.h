@@ -15,6 +15,8 @@
 #ifndef HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
 #define HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
 
+#if __has_include("op_plugin/include/npu_cpp_extension.h")
+
 #include <mutex>
 
 #include "op_plugin/include/npu_cpp_extension.h"
@@ -73,5 +75,11 @@ class CachedOpApiResolver final {
       EXEC_NPU_CMD_V1_EXT(aclnn_api, __VA_ARGS__);                                   \
     }                                                                                \
   } while (false)
+
+#else
+
+#include "csrc/legacy_op_api.h"
+
+#endif
 
 #endif  // HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
