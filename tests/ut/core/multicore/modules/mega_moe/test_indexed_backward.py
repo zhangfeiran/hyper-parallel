@@ -105,7 +105,7 @@ class TestIndexedBackward(unittest.TestCase):
 
     def test_unsupported_backward_modes_fail_before_parameter_allocation(self) -> None:
         """Reject incomplete ingress pairs and unsupported mode strings before device work."""
-        for forward, backward in (('legacy', 'indexed'), ('indexed', 'unknown'), ('peer_tile', 'indexed')):
+        for forward, backward in (('legacy', 'indexed'), ('indexed', 'unknown'), ('peer_dedup', 'indexed')):
             with self.subTest(forward=forward, backward=backward), self.assertRaises(ValueError):
                 MegaMoeExperts(hidden_size=5120, intermediate_size=1792,
                                num_experts=32, top_k=8, dispatch_mode='pull',

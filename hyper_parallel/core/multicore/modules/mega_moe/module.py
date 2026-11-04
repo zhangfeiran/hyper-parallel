@@ -70,6 +70,7 @@ from .spec import (
     MegaMoeSpec,
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
+    _supports_indexed_backward_pair,
     bind_mega_moe_spec,
     initial_receive_capacity,
 )
@@ -515,10 +516,10 @@ class MegaMoeExperts(MulticoreModule):
                 Peer token uses original-token jobs and packed fanout metadata.
                 Peer tile publishes input-tile credits to the unchanged Blaze F2 arithmetic.
                 Peer dedup uses a dispatch prepass followed by the original compute graph.
-                It preserves the legacy backward source capacity and receive layout.
+                Legacy backward retains its expanded source capacity and receive layout.
             backward_ingress_mode: Experimental "indexed" backward publishes original dY rows and
-                computes route-weight gradients in the backward graph. Requires indexed forward,
-                static pull on Ascend 950, and hidden size divisible by 32 and at most 8192.
+                computes route-weight gradients in the backward graph. Requires static pull on Ascend 950
+                with indexed forward or B0 peer token/tile forward, and hidden size divisible by 32 and at most 8192.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
                 Must be a positive multiple of 128.
             combine_split: Combine tile rows in forward and backward, with the same
@@ -570,8 +571,8 @@ class MegaMoeExperts(MulticoreModule):
         if backward_ingress_mode not in ("legacy", "indexed"):
             raise ValueError("backward_ingress_mode must be legacy or indexed")
         if backward_ingress_mode == "indexed":
-            if forward_ingress_mode != "indexed" or dispatch_mode != "pull":
-                raise ValueError("Indexed backward ingress requires indexed forward and static pull dispatch")
+            if not _supports_indexed_backward_pair(forward_ingress_mode, dispatch_mode, replica_slots_per_rank):
+                raise ValueError("Indexed backward requires indexed or B0 peer token/tile forward with static pull")
             if hidden_size > 8192 or hidden_size % 32:
                 raise ValueError("Indexed backward ingress requires hidden_size divisible by 32 and at most 8192")
             if top_k > 32:

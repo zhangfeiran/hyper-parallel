@@ -41,7 +41,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
 from hyper_parallel.core.multicore.shmem import _lifecycle
 from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 
-from .spec import MegaMoeSpec, initial_receive_capacity, _route_metadata_rows
+from .spec import MegaMoeSpec, initial_receive_capacity, _route_metadata_rows, _supports_indexed_backward_pair
 from .indexed_backward import BACKWARD_METADATA_PREFIX_ROWS
 from .udma_order import SUBMISSION_ORDER, validate_transport
 
@@ -76,8 +76,8 @@ def _workspace_allocation_specs(
     data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
     data_rows = routed_slots if dispatch_mode == "pull" else receive_capacity
     if backward_ingress_mode == "indexed":
-        if dispatch_mode != "pull" or forward_ingress_mode != "indexed" or top_k <= 0:
-            raise ValueError("Compact backward allocations require paired indexed pull ingress")
+        if not _supports_indexed_backward_pair(forward_ingress_mode, dispatch_mode) or top_k <= 0:
+            raise ValueError("Compact backward allocations require original-row indexed or peer pull ingress")
         data_rows = routed_slots // top_k
     event_bytes = event_workspace_bytes(ep_size, num_experts, shared_expert=shared_expert)
     allocation_spec = _lifecycle._AllocationSpec  # pylint: disable=protected-access

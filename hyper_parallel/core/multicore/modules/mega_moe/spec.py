@@ -40,6 +40,13 @@ _DEFAULT_CAPACITY_FACTOR = 1.25
 _A5_SHARED_FORWARD_MIN_ROWS = 512
 
 
+def _supports_indexed_backward_pair(forward: str, dispatch: str, replica_slots: int = 0) -> bool:
+    """Match original-row sources while keeping peer replica pairings disabled."""
+    return dispatch == "pull" and (
+        forward == "indexed" or (forward in ("peer_token", "peer_tile") and replica_slots == 0)
+    )
+
+
 @dataclass(frozen=True)
 class MegaMoeSpec:
     """Shape, capacity, topology, and hardware values bound on first use."""

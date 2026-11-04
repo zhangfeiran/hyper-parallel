@@ -69,7 +69,7 @@ from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_coun
 from .bf16_gmm_tiling import retile_a5_bf16
 from .diagnostics import _mega_moe_owner_options
 from .inactive_tasks import GuestTaskPrefix, build_guest_task_prefixes
-from .spec import MegaMoeSpec, _route_metadata_rows
+from .spec import MegaMoeSpec, _route_metadata_rows, _supports_indexed_backward_pair
 from .shared import shared_tiling_bytes
 from .shared_schedule import bind_shared_diagnostic_graph
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
@@ -258,8 +258,9 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
         prepare_w13_overlap_schedule(backward_data, spec.local_experts, spec.num_cube_cores,
                                     replica_slots=spec.replica_slots_per_rank)
     if spec.backward_ingress_mode == "indexed":
-        if spec.num_cube_cores != 32 or spec.dispatch_mode != "pull" or spec.forward_ingress_mode != "indexed":
-            raise ValueError("Indexed backward requires the static Ascend 950 indexed pull plan")
+        if spec.num_cube_cores != 32 or not _supports_indexed_backward_pair(
+                spec.forward_ingress_mode, spec.dispatch_mode, spec.replica_slots_per_rank):
+            raise ValueError("Indexed backward requires an Ascend 950 indexed or B0 peer pull plan")
         for task in backward_data.all_tasks[:backward_data.task_num]:
             if task.task_type == TaskType.TASK_SHMEM_GET_MEM:
                 task.extra_value_0, task.extra_value_1 = 25, 8
