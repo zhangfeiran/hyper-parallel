@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from heapq import heapify, heappop, heappush
 from itertools import chain
 from math import isfinite
+import os
 
 from .admission import reduction_basis_points
 from .capacity import ExpertReplicaConfig, _integer
@@ -28,6 +29,8 @@ from .plan import ExpertExecutionPlan
 from .cost import ExpertReplicaCostModel, _QuotaCostState, refine_replica_quotas
 from .topology import _validate_rank_nodes
 from .host import _validate_counts
+
+_COMPLETE_GUEST_HOTSPOT_FACTOR = 3
 
 
 def _counts_matrix(counts: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:
@@ -520,7 +523,8 @@ def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertRepl
 
 def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
                                   limit: int, resident: int, target: int, minimum_rows: int,
-                                  admission: int, saved_rows: int) -> list[dict[int, int]] | None:
+                                  admission: int, saved_rows: int, *,
+                                  allow_complete_search: bool = False) -> list[dict[int, int]] | None:
     """Admit the first quota target without an unpriced optional retry."""
     copies = _uncalibrated_copies(totals, loads, config, limit, resident, target)
     if copies is None:
@@ -530,7 +534,40 @@ def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: E
     # A validated explicit limit makes fragment pruning source independent.
     _prune_small_copies(copies, (), loads, config, minimum_rows, ceiling)
     peak = max(sum(row.values()) for row in copies)
-    return copies if _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows) else None
+    if not _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows):
+        return None
+    if (allow_complete_search and config.replica_slots_per_rank == 2
+            and config.home_experts > 2 and peak > target):
+        average = (sum(loads) + config.ep_size - 1) // config.ep_size
+        if max(loads) >= _COMPLETE_GUEST_HOTSPOT_FACTOR * average and target > average:
+            complete = _complete_bounded_copies(totals, loads, config, copies, ceiling, minimum_rows, peak)
+            if complete is not None:
+                return complete
+    return copies
+
+
+def _complete_guest_search_enabled() -> bool:
+    """Enable the isolated no-table candidate without changing default decisions."""
+    return os.environ.get("HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH") == "1"
+
+
+def _complete_bounded_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
+                             current: list[dict[int, int]], ceiling: int, minimum_rows: int,
+                             peak: int) -> list[dict[int, int]] | None:
+    """Keep a complete quota only when every receiver already fits the physical cap."""
+    home = config.home_experts
+    edges = _balanced_edges(loads, totals, home)
+    # The balancing skeleton emits at most one edge per receiver. There is no
+    # need to shrink its rows when the full edge fits the reserved guest slots.
+    if any(len(segments) > config.replica_slots_per_rank for _, _, segments in edges):
+        return None
+    candidate = _bounded_copies(loads, totals, replace(config, replica_slots_per_rank=home), edges=edges)
+    _prune_small_copies(candidate, (), loads, config, minimum_rows, ceiling)
+    if max(sum(row.values()) for row in candidate) + max(1, minimum_rows) > peak:
+        return None
+    if max(max(row.values()) for row in candidate) > max(max(row.values()) for row in current):
+        return None
+    return candidate
 
 
 def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig,
@@ -545,7 +582,8 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
     resident = min(limit, receive_capacity) if receive_capacity is not None else limit
     if model is None:
         selected = _admitted_uncalibrated_copies(totals, loads, config, limit, resident, target,
-                                                minimum_replica_rows, admission, minimum_saved_rows)
+                                                minimum_replica_rows, admission, minimum_saved_rows,
+                                                allow_complete_search=_complete_guest_search_enabled())
         return home if selected is None else selected, None
     measured = min(model.forward_ms[-1][0], model.backward_ms[-1][0])
     durations = {} if durations is None else durations

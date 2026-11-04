@@ -14,6 +14,7 @@
 # ============================================================================
 """Retry otherwise rejected preference targets without changing accepted placements."""
 
+import os
 import unittest
 from dataclasses import replace
 from unittest.mock import patch
@@ -107,3 +108,22 @@ class TestReplicaAdmissionRetry(unittest.TestCase):
         self.assertTrue(actual.transfers)
         self.assertLessEqual(max(actual.destination_loads), 49152)
         self.assertEqual(select.call_count, 1)
+
+    def test_complete_candidate_fits_two_physical_guests_and_keeps_all_routes(self) -> None:
+        """A full redistribution that fits every receiver should not be quota-thinned."""
+        source = [4096, 0, 9, 97, 0, 0, 4096, 0, 4096, 4096, 0, 0,
+                  0, 0, 1200, 0, 0, 0, 0, 3354, 0, 11, 0, 82,
+                  0, 0, 1, 0, 0, 0, 224, 0, 7, 2993, 0, 0,
+                  0, 0, 0, 0, 0, 208, 0, 0, 1, 5, 0, 0]
+        counts = [source] * 8
+        options = dict(adaptive=True, target_load=30720, minimum_replica_rows=1024,
+                       minimum_load_reduction=.4, capacity_limit=196608, receive_capacity=196608)
+        with patch.dict(os.environ, {"HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH": "0"}):
+            baseline = planner._build_expert_replica_plan(counts, 2, **options)
+        with patch.dict(os.environ, {"HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH": "1"}):
+            candidate = planner._build_expert_replica_plan(counts, 2, **options)
+        candidate.validate()
+        self.assertEqual(candidate.config.replica_slots_per_rank, 2)
+        self.assertLessEqual(max(candidate.replica_slots_used), 2)
+        self.assertEqual(max(candidate.destination_loads), 24576)
+        self.assertGreater(max(baseline.destination_loads), 30720)
