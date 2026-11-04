@@ -127,3 +127,50 @@ class TestReplicaAdmissionRetry(unittest.TestCase):
         self.assertLessEqual(max(candidate.replica_slots_used), 2)
         self.assertEqual(max(candidate.destination_loads), 24576)
         self.assertGreater(max(baseline.destination_loads), 30720)
+
+    def test_projected_quota_keeps_two_slots_and_exact_dispatch(self) -> None:
+        """An affordable wider quota can reproduce the B6 plan with two slots."""
+        source = [123, 332, 981, 924, 1371, 1361, 1320, 243, 777, 911, 116, 568,
+                  262, 829, 148, 223, 267, 22, 678, 28, 1312, 240, 386, 8,
+                  666, 35, 18, 694, 33, 582, 1982, 3907, 735, 1240, 2737, 678,
+                  1067, 186, 225, 1432, 2, 78, 1588, 547, 106, 58, 391, 351]
+        baseline, projected, wider = self._projected_plans(source)
+        projected.validate()
+        self.assertEqual(projected.config.replica_slots_per_rank, 2)
+        self.assertEqual(max(projected.destination_loads), 33240)
+        self.assertLess(max(projected.destination_loads), max(baseline.destination_loads))
+        self.assertEqual(projected.destination_loads, wider.destination_loads)
+        self.assertEqual(projected.transfers, wider.transfers)
+        for left, right in zip(projected.dispatch_counts, wider.dispatch_counts, strict=True):
+            self.assertEqual(left, tuple(row for index, row in enumerate(right)
+                                         if index % wider.config.slots_per_rank < projected.config.slots_per_rank))
+
+    def test_projection_rejects_unpaid_or_infeasible_wider_quotas(self) -> None:
+        """Retain the first B2 route if wider fanout is unpriced or exceeds two slots."""
+        pressure = [423, 31, 1181, 56, 311, 1067, 665, 110, 3694, 265, 558, 3556,
+                    205, 1409, 188, 205, 66, 191, 1145, 336, 45, 170, 78, 964,
+                    1978, 163, 830, 127, 178, 675, 763, 473, 62, 903, 1534, 288,
+                    808, 903, 900, 768, 146, 289, 881, 1311, 209, 3, 1384, 273]
+        occupancy = [15, 214, 86, 130, 4096, 456, 1, 101, 367, 30, 55, 116,
+                     136, 1996, 1201, 93, 904, 63, 1926, 389, 1446, 264, 1836, 3548,
+                     411, 0, 105, 82, 32, 857, 0, 812, 491, 556, 104, 1254,
+                     2883, 4, 165, 765, 634, 772, 1195, 2, 1433, 233, 125, 384]
+        for source, fits in ((pressure, True), (occupancy, False)):
+            with self.subTest(wider_fits=fits):
+                baseline, projected, wider = self._projected_plans(source)
+                self.assertEqual(max(wider.replica_slots_used) <= 2, fits)
+                self.assertLess(max(wider.destination_loads), max(projected.destination_loads))
+                self.assertEqual(projected, baseline)
+
+    @staticmethod
+    def _projected_plans(source: list[int]) -> tuple[planner.ExpertExecutionPlan, ...]:
+        """Use the same two-node histogram for old B2, projected B2, and B6."""
+        options = dict(adaptive=True, target_load=40960, minimum_replica_rows=1024,
+                       minimum_load_reduction=.4, capacity_limit=196608, receive_capacity=196608,
+                       _rank_nodes=(0,) * 4 + (1,) * 4)
+        plans = []
+        for budget, enabled in ((2, '0'), (2, '1'), (6, '0')):
+            with patch.dict(os.environ, {"HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH": "1",
+                                         "HYPER_PARALLEL_REPLICA_PROJECTED_GUEST_SEARCH": enabled}):
+                plans.append(planner._build_expert_replica_plan([source] * 8, budget, **options))
+        return tuple(plans)

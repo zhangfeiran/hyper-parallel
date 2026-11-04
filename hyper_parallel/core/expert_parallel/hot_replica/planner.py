@@ -524,26 +524,81 @@ def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertRepl
 def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
                                   limit: int, resident: int, target: int, minimum_rows: int,
                                   admission: int, saved_rows: int, *,
-                                  allow_complete_search: bool = False) -> list[dict[int, int]] | None:
-    """Admit the first quota target without an unpriced optional retry."""
+                                  allow_complete_search: bool = False,
+                                  projected_rank_nodes: tuple[int, ...] = ()) -> list[dict[int, int]] | None:
+    """Admit feasible quotas using the selected uncalibrated placement policy."""
     copies = _uncalibrated_copies(totals, loads, config, limit, resident, target)
-    if copies is None:
-        return None
-    peak = max(sum(row.values()) for row in copies)
-    ceiling = min(limit, max(resident, peak))
-    # A validated explicit limit makes fragment pruning source independent.
-    _prune_small_copies(copies, (), loads, config, minimum_rows, ceiling)
-    peak = max(sum(row.values()) for row in copies)
-    if not _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows):
-        return None
-    if (allow_complete_search and config.replica_slots_per_rank == 2
-            and config.home_experts > 2 and peak > target):
-        average = (sum(loads) + config.ep_size - 1) // config.ep_size
-        if max(loads) >= _COMPLETE_GUEST_HOTSPOT_FACTOR * average and target > average:
+    wider_cap = config.replica_slots_per_rank == 2 and config.home_experts > 2
+    search_wider = wider_cap and (allow_complete_search or projected_rank_nodes)
+    average = (sum(loads) + config.ep_size - 1) // config.ep_size if search_wider else target
+    if copies is not None:
+        peak = max(sum(row.values()) for row in copies)
+        ceiling = min(limit, max(resident, peak))
+        # A validated explicit limit makes fragment pruning source independent.
+        _prune_small_copies(copies, (), loads, config, minimum_rows, ceiling)
+        peak = max(sum(row.values()) for row in copies)
+        if not _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows):
+            copies = None
+        elif (allow_complete_search and wider_cap and peak > target > average
+              and max(loads) >= _COMPLETE_GUEST_HOTSPOT_FACTOR * average):
             complete = _complete_bounded_copies(totals, loads, config, copies, ceiling, minimum_rows, peak)
             if complete is not None:
-                return complete
+                copies = complete
+    if projected_rank_nodes and wider_cap and target > average and min(loads) < max(loads) <= limit:
+        projected = _project_wider_quota(totals, loads, config, copies, limit, resident, target,
+                                        minimum_rows, admission, saved_rows, projected_rank_nodes)
+        if projected is not None:
+            return projected
     return copies
+
+
+def _copy_pressure(copies: list[dict[int, int]], home: int, nodes: tuple[int, ...]) -> tuple[int, int]:
+    """Bound concurrent matrix fanout and count cross-node copies per source node."""
+    weighted_outgoing = [0] * len(copies)
+    remote_by_node: dict[int, int] = {}
+    for target, row in enumerate(copies):
+        for expert, count in row.items():
+            owner = expert // home
+            if count and owner != target:
+                remote = nodes[owner] != nodes[target]
+                weighted_outgoing[owner] += 1 + int(remote)
+                if remote:
+                    remote_by_node[nodes[owner]] = remote_by_node.get(nodes[owner], 0) + 1
+    return max(weighted_outgoing), max(remote_by_node.values(), default=0)
+
+
+def _project_wider_quota(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
+                         current: list[dict[int, int]] | None, limit: int, resident: int, target: int,
+                         minimum_rows: int, admission: int, saved_rows: int,
+                         nodes: tuple[int, ...]) -> list[dict[int, int]] | None:
+    """Try wider quota selection without consuming more physical guest slots."""
+    grain = max(1, minimum_rows)
+    home = config.home_experts
+    current_peak = max(sum(row.values()) for row in current) if current is not None else max(loads)
+    average = (sum(loads) + config.ep_size - 1) // config.ep_size
+    if current_peak - average < grain:
+        return None
+    virtual = replace(config, replica_slots_per_rank=home)
+    proposal = _admitted_uncalibrated_copies(totals, loads, virtual, limit, resident, target, minimum_rows,
+                                            admission, saved_rows)
+    if proposal is None or any(sum(bool(count) and expert // home != rank for expert, count in row.items())
+                               > config.replica_slots_per_rank for rank, row in enumerate(proposal)):
+        return None
+    saved = current_peak - max(sum(row.values()) for row in proposal)
+    current_expert_peak = max(max(row.values()) for row in current) if current is not None else max(totals)
+    if saved < grain or max(max(row.values()) for row in proposal) > current_expert_peak:
+        return None
+    old_rank, old_node = _copy_pressure(current, home, nodes) if current is not None else (0, 0)
+    new_rank, new_node = _copy_pressure(proposal, home, nodes)
+    # A fixed matrix copy must earn extra peak-row savings. Cross-node fanout
+    # costs twice the rank credit; take the larger rank or node increment.
+    penalty = max(0, new_rank - old_rank, new_node - old_node)
+    return proposal if saved >= grain + penalty * ((grain + 1) // 2) else None
+
+
+def _projected_rank_nodes(nodes: tuple[int, ...]) -> tuple[int, ...]:
+    """Expose the topology only to the isolated no-table projection experiment."""
+    return nodes if os.environ.get("HYPER_PARALLEL_REPLICA_PROJECTED_GUEST_SEARCH") == "1" else ()
 
 
 def _complete_guest_search_enabled() -> bool:
@@ -576,6 +631,7 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
                      minimum_replica_rows: int = 0,
                      durations: dict[int, tuple[float, float]] | None = None,
                      admission: int = 0, minimum_saved_rows: int = 0,
+                     rank_nodes: tuple[int, ...] = (),
                      ) -> tuple[list[dict[int, int]], tuple[float, float] | None]:
     """Return bounded quotas and their optional (score, optimistic lower bound)."""
     totals, loads, home = _home_layout(counts, config)
@@ -583,7 +639,8 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
     if model is None:
         selected = _admitted_uncalibrated_copies(totals, loads, config, limit, resident, target,
                                                 minimum_replica_rows, admission, minimum_saved_rows,
-                                                allow_complete_search=_complete_guest_search_enabled())
+                                                allow_complete_search=_complete_guest_search_enabled(),
+                                                projected_rank_nodes=_projected_rank_nodes(rank_nodes))
         return home if selected is None else selected, None
     measured = min(model.forward_ms[-1][0], model.backward_ms[-1][0])
     durations = {} if durations is None else durations
@@ -888,7 +945,8 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
             copies, bounds = _uncalibrated_candidate.copies, None
         else:
             copies, bounds = _adaptive_copies(counts, config, limit, receive_capacity, cost_model, target,
-                                              minimum_replica_rows, durations, admission, minimum_saved_rows)
+                                              minimum_replica_rows, durations, admission, minimum_saved_rows,
+                                              rank_nodes)
         if cost_model is not None:
             copies = refine(copies, bounds)
         has_guests = any(expert // config.home_experts != rank and rows

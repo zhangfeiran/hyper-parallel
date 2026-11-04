@@ -42,6 +42,7 @@ from .planner import (
     _UncalibratedCandidate,
     _admitted_uncalibrated_copies,
     _complete_guest_search_enabled,
+    _projected_rank_nodes,
 )
 from .topology import _validate_rank_nodes
 
@@ -451,7 +452,8 @@ def _try_compact_home_route(
                     candidate = _admitted_uncalibrated_copies(
                         totals, list(destination_loads), config, upper, resident, target,
                         minimum_replica_rows, admission, minimum_saved_rows,
-                        allow_complete_search=_complete_guest_search_enabled())
+                        allow_complete_search=_complete_guest_search_enabled(),
+                        projected_rank_nodes=_projected_rank_nodes(nodes))
                     if candidate is not None and any(expert // config.home_experts != rank and count
                                                      for rank, row in enumerate(candidate)
                                                      for expert, count in row.items()):
