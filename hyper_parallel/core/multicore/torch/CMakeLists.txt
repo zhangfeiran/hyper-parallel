@@ -18,6 +18,18 @@ hp_detect_torch_build_contract("${Python3_EXECUTABLE}" TORCH)
 set(TORCH_INCLUDE_ROOT "${TORCH_PACKAGE_ROOT}/include")
 set(TORCH_NPU_INCLUDE_ROOT "${TORCH_NPU_PACKAGE_ROOT}/include")
 set(OP_PLUGIN_ROOT "${TORCH_NPU_INCLUDE_ROOT}/third_party/op-plugin")
+execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env TORCH_DEVICE_BACKEND_AUTOLOAD=0
+            ${Python3_EXECUTABLE} -c
+            "import torch; major, minor = torch.__version__.split('.')[:2]; print(f'V{major}R{minor}')"
+    RESULT_VARIABLE op_plugin_version_status
+    OUTPUT_VARIABLE TORCH_OP_PLUGIN_VERSION
+    ERROR_VARIABLE op_plugin_version_error
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT op_plugin_version_status EQUAL 0 OR
+   NOT TORCH_OP_PLUGIN_VERSION MATCHES "^V2R[1-9][0-9]*$")
+    message(FATAL_ERROR "Cannot select the active Torch op-plugin compatibility API: ${op_plugin_version_error}")
+endif()
 set(TORCH_LINK_LIBRARIES
     "${TORCH_PACKAGE_ROOT}/lib/libc10.so"
     "${TORCH_PACKAGE_ROOT}/lib/libtorch.so"
@@ -50,10 +62,10 @@ add_library(hyper_parallel_mega_moe_torch SHARED
 hp_apply_torch_cxx_standard(
     hyper_parallel_mega_moe_torch "${TORCH_CXX_STANDARD}")
 # The bundled op-plugin compatibility headers (including NamedTensorCompat.h)
-# consume CURRENT_VERSION; select their newest API without probing Torch versions.
+# consume CURRENT_VERSION; match the active Torch rather than a future plugin API.
 target_compile_definitions(hyper_parallel_mega_moe_torch PRIVATE
     _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI}
-    CURRENT_VERSION=VERSION_NEWEST)
+    CURRENT_VERSION=${TORCH_OP_PLUGIN_VERSION})
 target_include_directories(hyper_parallel_mega_moe_torch PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${Python3_INCLUDE_DIRS}
@@ -75,7 +87,7 @@ hp_apply_torch_cxx_standard(
     hyper_parallel_mega_gate_torch "${TORCH_CXX_STANDARD}")
 target_compile_definitions(hyper_parallel_mega_gate_torch PRIVATE
     _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI}
-    CURRENT_VERSION=VERSION_NEWEST)
+    CURRENT_VERSION=${TORCH_OP_PLUGIN_VERSION})
 target_include_directories(hyper_parallel_mega_gate_torch PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${Python3_INCLUDE_DIRS}

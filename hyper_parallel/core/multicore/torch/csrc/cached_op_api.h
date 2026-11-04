@@ -16,6 +16,7 @@
 #define HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
 
 #include <mutex>
+#include <torch/version.h>
 
 #include "op_plugin/include/npu_cpp_extension.h"
 
