@@ -15,9 +15,11 @@
 """Retry otherwise rejected preference targets without changing accepted placements."""
 
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from hyper_parallel.core.expert_parallel.hot_replica import planner
+from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
 
 
 class TestReplicaAdmissionRetry(unittest.TestCase):
@@ -32,8 +34,8 @@ class TestReplicaAdmissionRetry(unittest.TestCase):
         counts = [rows // 6 + int(expert < rows % 6) for rows in totals for expert in range(6)]
         return [list(counts) for _ in range(8)]
 
-    def test_rejected_preference_retries_average_with_same_capacity(self) -> None:
-        """A reservation target must not hide a feasible admitted quota candidate."""
+    def test_uncalibrated_preference_keeps_owner_without_retry(self) -> None:
+        """A smaller receive peak alone does not justify the optional retry."""
         counts = self.diffuse_counts()
         for budget in (2, 6):
             with self.subTest(budget=budget):
@@ -43,9 +45,33 @@ class TestReplicaAdmissionRetry(unittest.TestCase):
                 with patch.object(planner, '_uncalibrated_copies', wraps=planner._uncalibrated_copies) as select:
                     actual = planner._build_expert_replica_plan(counts, budget, target_load=30720, **options)
                 actual.validate()
-                self.assertTrue(actual.transfers)
-                self.assertEqual(actual, expected)
-                self.assertEqual([call.args[5] for call in select.call_args_list], [30720, 24576])
+                self.assertTrue(expected.transfers)
+                self.assertFalse(actual.transfers)
+                self.assertEqual([call.args[5] for call in select.call_args_list], [30720])
+
+    def test_calibrated_retry_must_cover_search_and_uncertainty(self) -> None:
+        """A paired group estimate must cover both fixed replica and extra search costs."""
+        counts = self.diffuse_counts()
+        model = ExpertReplicaCostModel(
+            calibration_version=2, backend='push', hidden_size=128, intermediate_size=256,
+            ep_size=8, transport='p2p', forward_ms=((0, 0.), (50000, .05)),
+            backward_ms=((0, 0.), (50000, .05)), weight_ms=0., gradient_ms=0.,
+            effective_group_ms=(0., .001, 0., 0., 0., 16.), _rank_nodes=(0, 0, 0, 0, 1, 1, 1, 1),
+            minimum_gain_ms=1., quota_search_budget_ms=2.,
+        )
+        options = dict(adaptive=True, target_load=30720, minimum_replica_rows=1024, minimum_load_reduction=.4,
+                       capacity_limit=196608, receive_capacity=196608)
+
+        admitted = planner._build_expert_replica_plan(counts, 2, cost_model=model, **options)
+        admitted.validate()
+        self.assertTrue(admitted.transfers)
+        self.assertEqual(max(admitted.destination_loads), 24576)
+        for budget in (0., 3.):
+            with self.subTest(search_budget_ms=budget):
+                rejected = planner._build_expert_replica_plan(
+                    counts, 2, cost_model=replace(model, quota_search_budget_ms=budget), **options)
+                rejected.validate()
+                self.assertFalse(rejected.transfers)
 
     def test_profitable_preference_keeps_first_candidate(self) -> None:
         """Existing concentrated-hot choices must not pay for a second search."""

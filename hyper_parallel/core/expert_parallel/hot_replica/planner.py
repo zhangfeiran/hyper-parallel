@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from heapq import heapify, heappop, heappush
 from itertools import chain
+from math import isfinite
 
 from .admission import reduction_basis_points
 from .capacity import ExpertReplicaConfig, _integer
@@ -514,22 +515,16 @@ def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertRepl
 def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
                                   limit: int, resident: int, target: int, minimum_rows: int,
                                   admission: int, saved_rows: int) -> list[dict[int, int]] | None:
-    """Keep accepted quotas, retrying a rejected allocation preference at most once."""
-    average = (sum(loads) + config.ep_size - 1) // config.ep_size
-    for trial in (target, average) if target > average else (target,):
-        copies = _uncalibrated_copies(totals, loads, config, limit, resident, trial)
-        if copies is None:
-            return None
-        peak = max(sum(row.values()) for row in copies)
-        ceiling = min(limit, max(resident, peak))
-        # A validated explicit limit makes fragment pruning source independent.
-        _prune_small_copies(copies, (), loads, config, minimum_rows, ceiling)
-        peak = max(sum(row.values()) for row in copies)
-        if _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows):
-            return copies
-        if not _optional_peak_is_useful(average, loads, ceiling, admission, saved_rows):
-            return None
-    return None
+    """Admit the first quota target without an unpriced optional retry."""
+    copies = _uncalibrated_copies(totals, loads, config, limit, resident, target)
+    if copies is None:
+        return None
+    peak = max(sum(row.values()) for row in copies)
+    ceiling = min(limit, max(resident, peak))
+    # A validated explicit limit makes fragment pruning source independent.
+    _prune_small_copies(copies, (), loads, config, minimum_rows, ceiling)
+    peak = max(sum(row.values()) for row in copies)
+    return copies if _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows) else None
 
 
 def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig,
@@ -638,6 +633,22 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
     for completed, candidate_score in deferred:
         if improves(candidate_score):
             best, best_score = completed, candidate_score
+    if (best is home and best_score is not None and isfinite(best_score)
+            and baseline_score is not None and isfinite(baseline_score)
+            and (model.effective_group_ms or model.critical_path is not None)
+            and model.quota_search_budget_ms > 0):
+        retry_target = (sum(loads) + config.ep_size - 1) // config.ep_size
+        if (retry_target < target
+                and _optional_peak_is_useful(retry_target, loads, resident, admission, minimum_saved_rows)):
+            # Charge extra search on top of the uncertainty margin, against the
+            # feasible owner route that would otherwise execute.
+            retry = _admitted_uncalibrated_copies(totals, loads, config, limit, resident, retry_target,
+                                                  minimum_replica_rows, admission, minimum_saved_rows)
+            if retry is not None and max(sum(row.values()) for row in retry) <= resident:
+                retry_score = score(retry)
+                if (retry_score is not None and isfinite(retry_score)
+                        and improves(retry_score + model.quota_search_budget_ms)):
+                    best, best_score = retry, retry_score
     if best_score is not None:
         return best, None if model.critical_path is not None else (best_score, optimistic)
     if fallback is None:
