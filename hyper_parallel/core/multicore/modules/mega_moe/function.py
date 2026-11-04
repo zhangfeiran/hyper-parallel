@@ -274,6 +274,21 @@ def _restore_weight_gradient_layout(spec: Any, gradient: torch.Tensor) -> torch.
     return gradient
 
 
+def _empty_backward_experts(ctx: Any, weight: torch.Tensor) -> tuple[int, ...] | None:
+    """Reuse exact host counts for A5 BF16 complete-K gradient overwrites."""
+    route = ctx.replica_route
+    if route is not None and route.plan.transfers:
+        return tuple(expert for expert, rows in enumerate(
+            route.plan.destination_counts[route.rank][:weight.shape[0]]) if not rows)
+    spec = ctx.plan.spec
+    if (getattr(spec, "num_cube_cores", 0) != 32 or spec.replica_slots_per_rank
+            or spec.expert_weight_layout != "EIO" or weight.dtype != torch.bfloat16):
+        return None
+    # Small dynamic routes already own these CPU counts. Unknown or device-only
+    # routes keep full initialization instead of adding another readback.
+    return getattr(ctx, "empty_experts", None)
+
+
 def _native_weight_operand(weight: torch.Tensor, plan: MegaMoePlan) -> torch.Tensor:
     """Prepare one expert operand without copying native EOI storage."""
     if plan.spec.expert_weight_layout == "EOI":
@@ -780,6 +795,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         shared_input = routed_tokens
         metadata = route
         ctx.replica_route = route.replica_route
+        ctx.empty_experts = getattr(metadata, "empty_experts", None)
         home_weights = (weight1, weight2)
         permutation_inputs = ()
         indexed_ingress = getattr(spec, "forward_ingress_mode", "legacy") != "legacy"
@@ -964,9 +980,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 grad_output,
                 has_replica_transfers=has_replica_transfers,
                 overlap_w13=kernel_w13,
-                empty_experts=(tuple(expert for expert, rows in enumerate(
-                    ctx.replica_route.plan.destination_counts[ctx.replica_route.rank][:saved.weight1.shape[0]])
-                                     if not rows) if has_replica_transfers else None),
+                empty_experts=_empty_backward_experts(ctx, saved.weight1),
             )
             if plan.spec.replica_slots_per_rank and plan.bwd_task_prefixes:
                 prefixes = (plan.bwd_task_prefixes if execution.diagnostics is plan.bwd_diagnostics

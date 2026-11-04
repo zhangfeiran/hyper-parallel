@@ -60,6 +60,7 @@ class RouteMetadata:
     plan_tokens: int | None = None
     replica_route: ReplicaRoute | None = None
     expert_row_counts: torch.Tensor | None = None
+    empty_experts: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -296,7 +297,8 @@ def _host_route_metadata(
         for expert in range(local)
     ]
     wide = (dispatch_source, dispatch_target, target_offsets, source_offsets, groups)
-    return _pack_host_route(wide, (dispatch_sizes, received), capacity, device)
+    empty = tuple(expert for expert, (begin, end) in enumerate(zip([0] + groups[:-1], groups)) if begin == end)
+    return replace(_pack_host_route(wide, (dispatch_sizes, received), capacity, device), empty_experts=empty)
 
 
 def _host_route_prefixes(
