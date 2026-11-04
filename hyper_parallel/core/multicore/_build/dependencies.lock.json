@@ -137,6 +137,11 @@
             "path": "hyper_parallel/core/multicore/shmem/_build/patches/diagnostic_explicit_mesh_fabric.patch",
             "sha256": "367a5e17e2af6ad4095274b95f5fa39699a43fff862f70aa7a20bbce1df2421b",
             "purpose": "Honor explicit Mesh network type before inferred topology classification on Ascend950"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/shmem/_build/patches/udma_queue_state_flush_v170.patch",
+            "sha256": "b7e8c920158020442363a50021f80de663000256eb76e42ad7ec7f911712d40b",
+            "purpose": "Backport release/v1.7.0 d942c05 device queue publication and CQ tail flushing without changing the host ABI"
           }
         ],
         "packaging_policy": {
