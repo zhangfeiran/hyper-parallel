@@ -169,6 +169,51 @@ class TestReplicaHost(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(self.native.abi_version(), 3)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Address-space validation requires Linux procfs")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_materializer_validates_declared_width_before_allocating(self) -> None:
+        """Feature: Native input-shape admission.
+        Description: Present an empty row with a declared width beyond a bounded child address space.
+        Expectation: The native function returns the reference fallback without attempting the large allocation.
+        """
+        script = """
+import importlib.util
+import os
+from pathlib import Path
+import resource
+import sys
+
+spec = importlib.util.spec_from_file_location('_replica_host', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+virtual = int(Path('/proc/self/statm').read_text().split()[0]) * os.sysconf('SC_PAGE_SIZE')
+limit = virtual + 4 * 1024**2
+resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+assert module.materialize_dispatch(((),), [{}], 2**23, 0, ()) is None
+"""
+        result = subprocess.run([sys.executable, "-S", "-c", script, self.native.__file__],
+                                check=False, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, f"returncode={result.returncode} stderr={result.stderr}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_materialization_retains_interleaved_nodes_and_fully_migrated_owner(self) -> None:
+        """Feature: Interleaved physical-node placement.
+        Description: Replay full owner migration and node-local residual filling across noncontiguous ranks.
+        Expectation: Native slots and all source dispatch counts exactly match the Python reference.
+        """
+        counts = tuple((rows,) + (0,) * 7 for rows in (1, 4, 5, 2))
+        nodes = (101, 108, 101, 108)
+        config = ExpertReplicaConfig(8, 4, 1)
+        for owner, first, last in ((0, 0, 12), (6, 3, 3)):
+            copies = [{0: owner, 1: 0}, {2: 0, 3: 0}, {4: 0, 5: 0}, {6: 0, 7: 0, 0: last}]
+            if first:
+                copies[1][0] = first
+            with patch.object(host, "_native_backend", return_value=None):
+                expected = planner._materialize(counts, copies, config, rank_nodes=nodes)
+            slots, dispatch = self.native.materialize_dispatch(counts, copies, 2, 1, nodes)
+            self.assertEqual((slots, dispatch), (expected.slot_to_logical, expected.dispatch_counts))
+
     def test_ordered_costs_match_double_bits_and_cache(self) -> None:
         """Feature: Ordered calibrated costs.
         Description: Compare 120 layouts with interpolation and shuffled expert order.

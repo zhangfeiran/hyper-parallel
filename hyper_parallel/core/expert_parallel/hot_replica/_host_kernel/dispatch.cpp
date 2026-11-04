@@ -79,11 +79,15 @@ bool AddCount(int64_t value, int64_t *total) {
 }
 
 bool ReadCounts(PyObject *counts, const Geometry &shape, Matrix *input, std::vector<int64_t> *totals) {
+  // Reject an impossible declared width before creating the native matrices.
+  for (size_t source = 0; source < shape.peers; ++source) {
+    PyObject *row = PyTuple_GET_ITEM(counts, source);
+    if (!PyTuple_CheckExact(row) || PyTuple_GET_SIZE(row) != static_cast<Py_ssize_t>(shape.experts)) return false;
+  }
   input->assign(shape.peers, std::vector<int64_t>(shape.experts));
   totals->assign(shape.experts, 0);
   for (size_t source = 0; source < shape.peers; ++source) {
     PyObject *row = PyTuple_GET_ITEM(counts, source);
-    if (!PyTuple_CheckExact(row) || PyTuple_GET_SIZE(row) != static_cast<Py_ssize_t>(shape.experts)) return false;
     for (size_t expert = 0; expert < shape.experts; ++expert) {
       int64_t value = 0;
       if (!Count(PyTuple_GET_ITEM(row, expert), &value) || !AddCount(value, &(*totals)[expert])) return false;
