@@ -36,6 +36,7 @@ def _route_metadata_rows(routed_slots: int, num_experts: int, ep_size: int, mode
 
 _COMMUNICATION_SPLIT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
+_A5_SHARED_FORWARD_MIN_ROWS = 512
 
 
 @dataclass(frozen=True)
@@ -206,6 +207,12 @@ def bind_mega_moe_spec(
         raise ValueError("Indexed backward ingress requires the Ascend 950 32-Cube BF16 kernel.")
     initial_capacity_factor = specification["initial_capacity_factor"]
     swiglu_limit = specification["swiglu_limit"]
+    shared_intermediate_size = specification.get("shared_intermediate_size", 0)
+    forward_shared_expert = specification.get("forward_shared_expert", True)
+    if num_cube_cores == 32 and shared_intermediate_size and local_num_tokens < _A5_SHARED_FORWARD_MIN_ROWS:
+        # Smaller integrated shared forwards have not met the strict gradient
+        # agreement gate. The native path retains that contract for these rows.
+        forward_shared_expert = False
     receive_capacity = _resolve_receive_capacity(
         initial_capacity_factor,
         local_num_tokens * top_k,
@@ -231,8 +238,8 @@ def bind_mega_moe_spec(
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         forward_ingress_mode=forward_ingress_mode,
         backward_ingress_mode=backward_ingress_mode,
-        shared_intermediate_size=specification.get("shared_intermediate_size", 0),
+        shared_intermediate_size=shared_intermediate_size,
         shared_placement=specification.get("shared_placement", "idle"),
-        forward_shared_expert=specification.get("forward_shared_expert", True),
+        forward_shared_expert=forward_shared_expert,
         backward_shared_expert=specification.get("backward_shared_expert", False),
     )

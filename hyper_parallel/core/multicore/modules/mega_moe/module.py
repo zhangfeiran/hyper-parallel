@@ -302,7 +302,8 @@ class MegaMoeExperts(MulticoreModule):
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             shared_intermediate_size: Width of caller-owned local shared weights; zero disables the branch.
             shared_placement: Place shared kernel tasks in idle slots or at the front of the queues.
-            forward_shared_expert: Fuse shared forward. Defaults to the existing forward-only behavior.
+            forward_shared_expert: Fuse shared forward. A5 uses native shared forward below 512 token rows
+                to retain strict shared-gradient agreement. Defaults to the existing forward-only behavior.
             backward_shared_expert: Fuse shared backward independently; experimental and disabled by default.
             ep_group: Torch expert-parallel process group, possibly a subgroup of
                 WORLD. Expert ownership follows group-local rank order. Disjoint
