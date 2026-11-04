@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import unittest
 from dataclasses import replace
@@ -603,6 +604,31 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             manager.ensure_capacity(workspace, 2)
         self.assertEqual(manager.entries[0].layout.receive_capacity, 2)
         self.assertEqual(workspace.capacity_floor, 2)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fixed_heap_repack_opt_in_does_not_change_automatic_heap_policy(self) -> None:
+        """Feature: Fixed heap repacking.
+        Description: Cross the opt-in switch with automatic and explicit heap budgets.
+        Expectation: Only an explicit fixed budget can request the unchanged-runtime transaction.
+        """
+        for enabled in ("0", "1"):
+            for fixed in (False, True):
+                with self.subTest(enabled=enabled, fixed=fixed):
+                    layout = self._layout(512, 1)
+                    manager = self._manager_with_reservation({"shape": "dynamic"}, layout)
+                    manager.heap_limit = manager.heap_bytes if fixed else None
+                    with (
+                        patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_FIXED_HEAP_REPACK": enabled}),
+                        patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart,
+                    ):
+                        manager._restart([layout], manager.heap_bytes)
+                    actual = restart.call_args.kwargs
+                    if enabled == "1":
+                        self.assertEqual(actual["allow_existing_runtime"], fixed)
+                    else:
+                        self.assertNotIn("allow_existing_runtime", actual)
+                    self.assertEqual(manager.epoch, 1)
 
     def test_resize_lock_rejects_concurrent_access(self) -> None:
         """Reject another submission while one capacity change owns the manager lock."""

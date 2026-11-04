@@ -450,6 +450,7 @@ def _restart(
     heap_size_bytes: int,
     replacements: tuple[_AllocationReplacement, ...],
     preflight_hook: Callable[[], object],
+    allow_existing_runtime: bool = False,
 ) -> _RestartResult:
     """Collectively rebuild the sole user's symmetric Allocations.
 
@@ -457,6 +458,7 @@ def _restart(
         heap_size_bytes: Positive byte capacity of the restarted symmetric Heap.
         replacements: Complete active Allocations and their target physical specifications.
         preflight_hook: Read-only business-state snapshot executed once while the lifecycle lock is held.
+        allow_existing_runtime: Reuse the active symmetric Heap if its physical size is unchanged.
 
     Returns:
         Replacement Tensors in request order and generic restart stage timings.
@@ -476,6 +478,7 @@ def _restart(
         torch, dist = _torch_modules()
         destructive_started = False
         current_stage = "Preflight"
+        reuse_runtime = False
 
         def run_stage(stage: str, operation: Callable[[], Any]) -> float:
             """Run one converged restart stage under a stable diagnostic label."""
@@ -492,7 +495,7 @@ def _restart(
 
         def preflight() -> tuple[Any, ...]:
             """Capture and validate the complete local pre-destructive state."""
-            nonlocal preflight_state
+            nonlocal preflight_state, reuse_runtime
             if _runtime_invalidated:
                 raise _RuntimeUnavailableError(_INVALIDATED_RUNTIME_MESSAGE)
             if _users != 1:
@@ -529,44 +532,17 @@ def _restart(
                 native_state,
                 heap_size_bytes,
             )
+            reuse_runtime = (allow_existing_runtime
+                             and native_state["config"]["heap_size_bytes"] == heap_size_bytes)
             preflight_state = (heap_size_bytes, business_state, current_manifest, target_manifest,
-                               native_state["config"]["data_engine"], configured_udma_qp_count())
+                               native_state["config"]["data_engine"], configured_udma_qp_count(), reuse_runtime)
             return preflight_state
 
-        try:
-            stages_ms = {
-                "preflight_ms": run_stage("Preflight", preflight),
-            }
-            device = torch.device("npu", _device_index)
-            stages_ms["quiesce_ms"] = run_stage("Quiesce", lambda: _synchronize_device(device))
-
-            # _api imports lifecycle guards, so the local import avoids a cycle while reusing Allocation validation
-            # and diagnostics.
-            from . import _api  # pylint: disable=import-outside-toplevel
-
-            replacement_tensors = []
-
-            def release_allocations() -> None:
-                """Release every declared Allocation and verify an empty registry."""
-                for replacement in replacements:
-                    _api.free(replacement.current)
-                if native._debug_state()["active_allocations"]:  # pylint: disable=protected-access
-                    raise RuntimeError("SHMEM restart release left active Allocations")
-
-            destructive_started = True
-            stages_ms["release_ms"] = run_stage(
-                "ReleaseAllocations",
-                release_allocations,
-            )
-            validate_ms = run_stage(
-                "ValidateShutdown",
-                native._validate_shutdown,  # pylint: disable=protected-access
-            )
-            shutdown_ms = run_stage(
-                "Shutdown",
-                native._shutdown,  # pylint: disable=protected-access
-            )
-            stages_ms["finalize_ms"] = validate_ms + shutdown_ms
+        def reinitialize_runtime() -> dict[str, float]:
+            """Replace the runtime only when the allocation transaction requires it."""
+            nonlocal current_stage
+            validate_ms = run_stage("ValidateShutdown", native._validate_shutdown)  # pylint: disable=protected-access
+            shutdown_ms = run_stage("Shutdown", native._shutdown)  # pylint: disable=protected-access
             current_stage = "Bootstrap"
             started = time.perf_counter()
             rank = int(dist.get_rank(_root_group)) if _root_uses_distributed else 0
@@ -579,7 +555,7 @@ def _restart(
                 failure_prefix="SHMEM restart failed during Bootstrap",
             )
                          if _root_uses_distributed else b"")
-            stages_ms["bootstrap_ms"] = (time.perf_counter() - started) * 1000
+            bootstrap_ms = (time.perf_counter() - started) * 1000
 
             def initialize() -> None:
                 """Initialize the target Heap and verify the frozen device."""
@@ -595,10 +571,32 @@ def _restart(
                 if int(native_state["device_index"]) != _device_index:
                     raise RuntimeError("SHMEM Runtime restarted on a different NPU device")
 
-            stages_ms["initialize_ms"] = run_stage(
-                "Initialize",
-                initialize,
-            )
+            return {"finalize_ms": validate_ms + shutdown_ms, "bootstrap_ms": bootstrap_ms,
+                    "initialize_ms": run_stage("Initialize", initialize)}
+
+        try:
+            stages_ms = {"preflight_ms": run_stage("Preflight", preflight)}
+            device = torch.device("npu", _device_index)
+            stages_ms["quiesce_ms"] = run_stage("Quiesce", lambda: _synchronize_device(device))
+
+            # _api imports lifecycle guards, so the local import avoids a cycle while reusing Allocation validation.
+            from . import _api  # pylint: disable=import-outside-toplevel
+
+            replacement_tensors = []
+
+            def release_allocations() -> None:
+                """Release every declared Allocation and verify an empty registry."""
+                for replacement in replacements:
+                    _api.free(replacement.current)
+                if native._debug_state()["active_allocations"]:  # pylint: disable=protected-access
+                    raise RuntimeError("SHMEM restart release left active Allocations")
+
+            destructive_started = True
+            stages_ms["release_ms"] = run_stage("ReleaseAllocations", release_allocations)
+            if reuse_runtime:
+                stages_ms.update(finalize_ms=0.0, bootstrap_ms=0.0, initialize_ms=0.0)
+            else:
+                stages_ms.update(reinitialize_runtime())
 
             def restore_allocations() -> None:
                 """Create replacement Tensors in their declared order."""

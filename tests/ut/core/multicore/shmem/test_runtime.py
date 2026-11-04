@@ -620,12 +620,144 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertEqual(self.dist.all_gather_object.call_count, 7)
         payloads = [call.args[1] for call in self.dist.all_gather_object.call_args_list]
         self.assertEqual(payloads[0], (
-            (256, ("layout", 1), (((4,), "torch.float32", 16),), (((8,), "torch.float32", 16, 32),), "mte", 32),
+            (256, ("layout", 1), (((4,), "torch.float32", 16),), (((8,), "torch.float32", 16, 32),), "mte", 32, False),
             None,
             False,
         ))
         self.assertEqual(payloads[1:], [(None, None, False)] * 6)
         self.assertFalse(_lifecycle._runtime_invalidated)  # pylint: disable=protected-access
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fixed_heap_repack_replaces_allocations_without_reinitialization(self) -> None:
+        """Feature: Fixed heap repacking.
+        Description: Retire all old allocations before reusing the unchanged physical heap.
+        Expectation: Quiescence and allocation replacement preserve runtime identity and configuration.
+        """
+        _lifecycle.acquire()
+        self.native._initialize.reset_mock()
+        self.native._get_unique_id.reset_mock()
+        registry = self.native._debug_state.return_value["active_allocations"]
+        registry.append({"allocation_base": 100, "allocation_bytes": 16})
+        current = Mock(shape=(4,), dtype=torch.float32, _base=None)
+        current.data_ptr.return_value = 100
+        current.numel.return_value = 4
+        current.element_size.return_value = 4
+        current.is_contiguous.return_value = True
+        replacement = _lifecycle._AllocationReplacement(
+            current, _lifecycle._AllocationSpec((8,), torch.float32, 16))
+        new = torch.empty(8, dtype=torch.float32)
+        with (
+            patch("hyper_parallel.core.multicore.shmem._api.free", side_effect=lambda _: registry.clear()) as free,
+            patch("hyper_parallel.core.multicore.shmem._api.empty", return_value=new) as empty,
+        ):
+            result = _lifecycle._restart(
+                heap_size_bytes=128, replacements=(replacement,), preflight_hook=lambda: "layout",
+                allow_existing_runtime=True,
+            )
+        self.torch.npu.synchronize.assert_called_once_with("npu:0")
+        free.assert_called_once_with(current)
+        empty.assert_called_once_with((8,), dtype=torch.float32, alignment=16)
+        self.native._validate_shutdown.assert_not_called()
+        self.native._shutdown.assert_not_called()
+        self.native._initialize.assert_not_called()
+        self.native._get_unique_id.assert_not_called()
+        self.assertEqual(result.tensors, (new,))
+        self.assertEqual([result.stages_ms[name] for name in ("finalize_ms", "bootstrap_ms", "initialize_ms")],
+                         [0.0, 0.0, 0.0])
+        payload = self.dist.all_gather_object.call_args_list[0].args[1][0]
+        self.assertEqual(payload[-3:], ("mte", 32, True))
+        self.assertTrue(_lifecycle._runtime_is_healthy())
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fixed_heap_repack_requires_root_agreement_before_quiescence(self) -> None:
+        """Feature: Fixed heap repacking.
+        Description: Compare reuse decisions before selecting a collective transaction path.
+        Expectation: Rank disagreement fails before device quiescence or destructive work.
+        """
+        _lifecycle.acquire()
+
+        def disagree(output: list, payload: tuple, **_kwargs: object) -> None:
+            """Inject a peer that requires a full runtime reinitialization."""
+            value, error, unavailable = payload
+            output[:] = [payload, (value[:-1] + (False,), error, unavailable)]
+
+        self.dist.all_gather_object.side_effect = disagree
+        with self.assertRaisesRegex(RuntimeError, "Preflight: values differ across Root ranks"):
+            _lifecycle._restart(
+                heap_size_bytes=128, replacements=(), preflight_hook=lambda: "layout",
+                allow_existing_runtime=True,
+            )
+        self.torch.npu.synchronize.assert_not_called()
+        self.native._shutdown.assert_not_called()
+        self.assertTrue(_lifecycle._runtime_is_healthy())
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fixed_heap_repack_retains_engine_and_qp_when_physical_heap_grows(self) -> None:
+        """Feature: Fixed heap repacking.
+        Description: Request a larger physical heap while enabling the reuse option.
+        Expectation: A real growth retains the A5 engine and non-default QP configuration.
+        """
+        self.native._debug_state.return_value["config"].update(data_engine="mte_udma", udma_qp_num=16)
+        with patch.dict(os.environ, {
+            "HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma",
+            "HYPER_PARALLEL_SHMEM_UDMA_QP_NUM": "16",
+        }):
+            _lifecycle.acquire()
+            self.native._initialize.reset_mock()
+            _lifecycle._restart(
+                heap_size_bytes=256, replacements=(), preflight_hook=lambda: "layout",
+                allow_existing_runtime=True,
+            )
+        self.native._shutdown.assert_called_once()
+        self.native._initialize.assert_called_once_with(
+            0, 2, b"group-bootstrap", 256, data_engine="mte_udma", udma_qp_num=16,
+        )
+        self.assertTrue(_lifecycle._runtime_is_healthy())
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fixed_heap_repack_failures_preserve_invalidation_boundary(self) -> None:
+        """Feature: Fixed heap repacking.
+        Description: Inject failures during synchronization, release, and allocation restoration.
+        Expectation: Synchronization and destructive transaction failures invalidate the runtime.
+        """
+        for stage in ("quiesce", "release", "restore"):
+            with self.subTest(stage=stage):
+                self._reset_runtime()
+                self.native._debug_state.return_value["active_allocations"].clear()
+                self.torch.npu.synchronize.side_effect = None
+                _lifecycle.acquire()
+                current = Mock(shape=(4,), dtype=torch.float32, _base=None)
+                current.data_ptr.return_value = 100
+                current.numel.return_value = 4
+                current.element_size.return_value = 4
+                current.is_contiguous.return_value = True
+                registry = self.native._debug_state.return_value["active_allocations"]
+                registry.append({"allocation_base": 100, "allocation_bytes": 16})
+                replacement = _lifecycle._AllocationReplacement(
+                    current, _lifecycle._AllocationSpec((8,), torch.float32, 16))
+                error = RuntimeError(f"injected {stage} failure")
+                if stage == "quiesce":
+                    self.torch.npu.synchronize.side_effect = error
+                with (
+                    patch("hyper_parallel.core.multicore.shmem._api.free",
+                          side_effect=error if stage == "release" else lambda _: registry.clear()) as free,
+                    patch("hyper_parallel.core.multicore.shmem._api.empty", side_effect=error) as empty,
+                    self.assertRaisesRegex(RuntimeError, f"injected {stage} failure"),
+                ):
+                    _lifecycle._restart(
+                        heap_size_bytes=128, replacements=(replacement,), preflight_hook=lambda: "layout",
+                        allow_existing_runtime=True,
+                    )
+                self.assertFalse(_lifecycle._runtime_is_healthy())
+                if stage == "quiesce":
+                    free.assert_not_called()
+                if stage != "restore":
+                    empty.assert_not_called()
+                self.native._shutdown.assert_not_called()
 
     def test_restart_preserves_active_udma_configuration(self) -> None:
         """A heap restart retains the agreed engine and non-default QP bank."""
