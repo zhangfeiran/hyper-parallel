@@ -45,7 +45,13 @@ class SharedFillConfig:
     trigger: int
 
     def fill(self, cfg: RuntimeConfigC, op: OperatorNode, tsv: TaskSplitValue) -> None:
-        """Append a complete shared stage to the graph's task namespace."""
+        """Append a complete shared stage to the graph's task namespace.
+
+        Args:
+            cfg: Cold RuntimeConfig receiving descriptors and queue entries.
+            op: Shared graph operator with an assigned task count.
+            tsv: Running descriptor and queue offsets.
+        """
         cube = op.op_type == OpType.GMM
         queue = cfg.cube_task_indices if cube else cfg.vector_task_indices
         queue_start = tsv.pre_cube_task_num if cube else tsv.pre_vector_task_num
@@ -108,12 +114,29 @@ def add_shared_graph(
     group = TensorSpec("shared_group_list", [1], runtime_slot, dtype_size=8)
 
     def tensor(name: str, shape: list[int], index: int, transpose: bool = False) -> TensorSpec:
-        """Describe one caller-owned local shared tensor."""
+        """Describe one caller-owned local shared tensor.
+
+        Args:
+            name: Graph tensor name.
+            shape: Physical tensor shape.
+            index: Address-table entry owned by the caller.
+            transpose: Whether the GMM consumes a transposed view.
+        """
         return TensorSpec(name, shape, index, transpose=transpose)
 
     def add(name: str, kind: OpType, inputs: list[TensorSpec], output: TensorSpec,
             tiling: int, dependency: int, trigger: int) -> OperatorNode:
-        """Append a complete local stage with explicit device event dependencies."""
+        """Append a complete local stage with explicit device event dependencies.
+
+        Args:
+            name: Stage name in the shared graph.
+            kind: Compute operation type.
+            inputs: Caller-owned source tensors.
+            output: Caller-owned destination tensor.
+            tiling: Byte offset within the shared runtime buffer.
+            dependency: Required producer event or EVENT_INVALID_ID.
+            trigger: Completion event published by this stage.
+        """
         cube = kind == OpType.GMM
         count = cores if cube else tokens // 128
         op = OperatorNode(
@@ -174,6 +197,24 @@ def add_shared_graph(
         graph.add_edge(first, middle).add_edge(middle, gate).add_edge(middle, weight)
 
 
+
+def _task_ids_by_stage(graph: ComputeGraph) -> dict[str, list[int]]:
+    """Return each graph stage's contiguous cold descriptor identifiers.
+
+    Args:
+        graph: Graph whose task counts have already been propagated.
+
+    Returns:
+        Task identifiers keyed by stage name in topological descriptor order.
+    """
+    stages = {}
+    offset = 0
+    for operator in graph.topological_sort():
+        stages[operator.name] = list(range(offset, offset + operator.task_num))
+        offset += operator.task_num
+    return stages
+
+
 def reorder_shared_tasks(
     cfg: RuntimeConfigC, graph: ComputeGraph, tsv: TaskSplitValue, cores: int,
     *, backward: bool, placement: str,
@@ -190,11 +231,7 @@ def reorder_shared_tasks(
     """
     if placement not in ("idle", "front"):
         raise ValueError("shared placement must be idle or front")
-    stages = {}
-    offset = 0
-    for op in graph.topological_sort():
-        stages[op.name] = list(range(offset, offset + op.task_num))
-        offset += op.task_num
+    stages = _task_ids_by_stage(graph)
     shared_ids = {index for name, ids in stages.items() if name.startswith("shared_") for index in ids}
     cube = [index for index in cfg.cube_task_indices[:cfg.task_index_num[0]] if index not in shared_ids]
     vector = [index for index in cfg.vector_task_indices[:cfg.task_index_num[1]] if index not in shared_ids]
@@ -234,6 +271,49 @@ def reorder_shared_tasks(
         vector = vector[:activation_start] + activation + vector[activation_start:]
     cfg.cube_task_indices[:len(cube)] = cube
     cfg.vector_task_indices[:len(vector)] = vector
+
+
+
+def _prioritize_shared_forward_rounds(
+    config: RuntimeConfigC,
+    graph: ComputeGraph,
+    *,
+    num_cube_cores: int,
+    include_down: bool = False,
+) -> None:
+    """Move complete independent shared forward rounds while preserving all task contracts.
+
+    Args:
+        config: Cold forward RuntimeConfig; no device image may have been published yet.
+        graph: The same graph used to build the task descriptors.
+        num_cube_cores: Complete Cube round width.
+        include_down: Move shared Down immediately after Up; otherwise retain its original relative position.
+
+    Raises:
+        ValueError: If shared forward rounds are absent, incomplete, or not uniquely present in the Cube queue.
+    """
+    if isinstance(num_cube_cores, bool) or not isinstance(num_cube_cores, int) or num_cube_cores <= 0:
+        raise ValueError("num_cube_cores must be a positive integer")
+    stages = _task_ids_by_stage(graph)
+    selected = ("shared_up_proj", "shared_down_proj") if include_down else ("shared_up_proj",)
+    rounds = []
+    queue = list(config.cube_task_indices[:config.task_index_num[0]])
+    for name in selected:
+        identifiers = stages.get(name, [])
+        if len(identifiers) != num_cube_cores:
+            raise ValueError(f"{name} must contain one complete Cube round")
+        for identifier in identifiers:
+            task = config.all_tasks[identifier]
+            if (task.task_type, task.inputs[0].tensor_type) != (TaskType.TASK_GROUPED_MATMUL, 2):
+                raise ValueError(f"{name} contains a non-shared GMM task")
+            if queue.count(identifier) != 1:
+                raise ValueError(f"{name} must appear exactly once in the Cube queue")
+        if sorted(config.all_tasks[index].task_index for index in identifiers) != list(range(num_cube_cores)):
+            raise ValueError(f"{name} has incomplete logical Cube ownership")
+        rounds.extend(identifiers)
+    moved = set(rounds)
+    reordered = rounds + [index for index in queue if index not in moved]
+    config.cube_task_indices[:len(reordered)] = reordered
 
 
 def _shared_l1_view(*_args: object, **_kwargs: object) -> None:
