@@ -16,9 +16,13 @@
 
 import random
 import unittest
+from dataclasses import replace
+from unittest.mock import patch
 
+from hyper_parallel.core.expert_parallel.hot_replica import planner
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica.planner import _improve_copies
+from tests.common.mark_utils import arg_mark
 
 
 def _exhaustive_improve(copies: list[dict[int, int]], config: ExpertReplicaConfig, target: int) -> None:
@@ -49,6 +53,58 @@ def _exhaustive_improve(copies: list[dict[int, int]], config: ExpertReplicaConfi
 
 class TestReplicaPlannerFast(unittest.TestCase):
     """Require exact choices against exhaustive enumeration, not just legality."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_integer_quota_prefix_matches_independent_wider_search(self) -> None:
+        """Feature: Integer quota search prefix.
+        Description: Extend narrow searches over EP4, EP16, and EP64 layouts.
+        Expectation: Quotas, ties, and insertion order match independent wider searches exactly.
+        """
+        generator = random.Random(2601105)
+        for size in (4, 16, 64):
+            for iteration in range(24):
+                with self.subTest(size=size, iteration=iteration):
+                    config = ExpertReplicaConfig(size * 6, size, 2)
+                    totals = [generator.randrange(8000) for _ in range(config.num_experts)]
+                    if iteration % 3 == 0:
+                        totals[:6] = [40000] * 6
+                    loads = [sum(totals[rank * 6:(rank + 1) * 6]) for rank in range(size)]
+                    target = (sum(loads) + size - 1) // size
+                    limit = max(loads)
+                    prefix = planner._QuotaSearchPrefix()
+                    planner._uncalibrated_copies(totals, loads, config, limit, limit, target, prefix=prefix)
+                    wider = replace(config, replica_slots_per_rank=6)
+                    expected = planner._uncalibrated_copies(totals, loads, wider, limit, limit, target)
+                    actual = planner._uncalibrated_copies(totals, loads, wider, limit, limit, target, prefix=prefix)
+                    self.assertEqual(actual, expected)
+                    if actual is not None:
+                        self.assertEqual([tuple(row.items()) for row in actual],
+                                         [tuple(row.items()) for row in expected])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_integer_quota_prefix_reuses_edges_without_borrowing_mutable_quotas(self) -> None:
+        """Feature: Integer quota search prefix.
+        Description: Mutate returned narrow quotas before extending the same search.
+        Expectation: One edge construction produces the original independent wider result.
+        """
+        config = ExpertReplicaConfig(24, 4, 2)
+        totals = [5000] * 6 + [10] * 18
+        loads = [sum(totals[rank * 6:(rank + 1) * 6]) for rank in range(4)]
+        target, limit = 8000, 30000
+        wider = replace(config, replica_slots_per_rank=6)
+        expected = planner._uncalibrated_copies(totals, loads, wider, limit, limit, target)
+        prefix = planner._QuotaSearchPrefix()
+        with patch.object(planner, "_balanced_edges", wraps=planner._balanced_edges) as edges:
+            narrow = planner._uncalibrated_copies(totals, loads, config, limit, limit, target, prefix=prefix)
+            if narrow is not None:
+                for row in narrow:
+                    row.clear()
+            actual = planner._uncalibrated_copies(totals, loads, wider, limit, limit, target, prefix=prefix)
+        self.assertEqual(edges.call_count, 1)
+        self.assertEqual(actual, expected)
+        self.assertEqual([tuple(row.items()) for row in actual], [tuple(row.items()) for row in expected])
 
     def test_random_initial_layouts_match_exhaustive_move_order(self) -> None:
         """Cover existing guests, full budgets, zero keys and empty owner quotas."""

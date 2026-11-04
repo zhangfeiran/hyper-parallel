@@ -485,19 +485,46 @@ class _UncalibratedCandidate:
                 == (limit, resident, target, minimum_rows, admission, saved_rows))
 
 
+@dataclass
+class _QuotaSearchPrefix:
+    """Keep integer screening state for one optional B2-to-home budget expansion.
+
+    The caller owns this state within one search and preserves totals, loads,
+    topology, and capacity targets. It must not cross invocations or retries.
+    Mutable expert quotas are never retained here.
+    """
+
+    next_budget: int = 1
+    edges: list | None = None
+    edge_rows: list[tuple[int, int, int]] | None = None
+    fallback_budget: int | None = None
+    best_peak: int = 0
+    reached_target: bool = False
+
+
 def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
-                         limit: int, resident: int, target: int) -> list[dict[int, int]] | None:
+                         limit: int, resident: int, target: int, *,
+                         prefix: _QuotaSearchPrefix | None = None) -> list[dict[int, int]] | None:
     """Select source-independent quotas, using None for unchanged owner placement."""
+    prefix = _QuotaSearchPrefix() if prefix is None else prefix
     owner_peak = max(loads)
     preferred_peak = min(target, resident)
     if owner_peak <= preferred_peak:
+        prefix.reached_target = True
         return None
     home = config.home_experts
-    edges = _balanced_edges(loads, totals, home)
-    edge_rows = [(donor, receiver, sum(rows for _, rows in segments)) for donor, receiver, segments in edges]
-    fallback = 0 if owner_peak <= limit else None
-    best_peak = owner_peak
-    for budget in range(1, min(config.replica_slots_per_rank, home) + 1):
+    start = prefix.next_budget
+    stop = min(config.replica_slots_per_rank, home)
+    if start == 1:
+        edges = _balanced_edges(loads, totals, home)
+        edge_rows = [(donor, receiver, sum(rows for _, rows in segments)) for donor, receiver, segments in edges]
+        fallback = 0 if owner_peak <= limit else None
+        best_peak = owner_peak
+        prefix.edges, prefix.edge_rows = edges, edge_rows
+    else:
+        edges, edge_rows = prefix.edges, prefix.edge_rows
+        fallback, best_peak = prefix.fallback_budget, prefix.best_peak
+    for budget in range(start, stop + 1):
         # Thinning moves the same integer quota on each edge regardless of
         # the experts that supply it. Only the selected budget needs quotas.
         candidate_loads = loads.copy()
@@ -507,9 +534,12 @@ def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertRepl
             candidate_loads[receiver] += moved
         peak = max(candidate_loads)
         if peak <= preferred_peak:
+            prefix.reached_target = True
             return _bounded_copies(loads, totals, replace(config, replica_slots_per_rank=budget), edges=edges)
         if peak <= limit and (fallback is None or peak < best_peak):
             fallback, best_peak = budget, peak
+    prefix.next_budget = stop + 1
+    prefix.fallback_budget, prefix.best_peak = fallback, best_peak
     if fallback == 0:
         return None
     chosen = config if fallback is None else replace(config, replica_slots_per_rank=fallback)
@@ -521,16 +551,28 @@ def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertRepl
     return copies
 
 
+def _can_project_quota(config: ExpertReplicaConfig, loads: list[int], limit: int,
+                       target: int, nodes: tuple[int, ...]) -> bool:
+    """Limit wider searches to optional two-slot plans with room above the mean."""
+    return (bool(nodes) and config.replica_slots_per_rank == 2 and config.home_experts > 2
+            and target > (sum(loads) + config.ep_size - 1) // config.ep_size
+            and min(loads) < max(loads) <= limit)
+
+
 def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
                                   limit: int, resident: int, target: int, minimum_rows: int,
                                   admission: int, saved_rows: int, *,
                                   allow_complete_search: bool = False,
-                                  projected_rank_nodes: tuple[int, ...] = ()) -> list[dict[int, int]] | None:
+                                  projected_rank_nodes: tuple[int, ...] = (),
+                                  prefix: _QuotaSearchPrefix | None = None) -> list[dict[int, int]] | None:
     """Admit feasible quotas using the selected uncalibrated placement policy."""
-    copies = _uncalibrated_copies(totals, loads, config, limit, resident, target)
     wider_cap = config.replica_slots_per_rank == 2 and config.home_experts > 2
     search_wider = wider_cap and (allow_complete_search or projected_rank_nodes)
     average = (sum(loads) + config.ep_size - 1) // config.ep_size if search_wider else target
+    project = _can_project_quota(config, loads, limit, target, projected_rank_nodes)
+    if project:
+        prefix = _QuotaSearchPrefix()
+    copies = _uncalibrated_copies(totals, loads, config, limit, resident, target, prefix=prefix)
     if copies is not None:
         peak = max(sum(row.values()) for row in copies)
         ceiling = min(limit, max(resident, peak))
@@ -541,12 +583,13 @@ def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: E
             copies = None
         elif (allow_complete_search and wider_cap and peak > target > average
               and max(loads) >= _COMPLETE_GUEST_HOTSPOT_FACTOR * average):
-            complete = _complete_bounded_copies(totals, loads, config, copies, ceiling, minimum_rows, peak)
+            complete = _complete_bounded_copies(totals, loads, config, copies, ceiling, minimum_rows, peak,
+                                                edges=prefix.edges if prefix is not None else None)
             if complete is not None:
                 copies = complete
-    if projected_rank_nodes and wider_cap and target > average and min(loads) < max(loads) <= limit:
+    if project and not prefix.reached_target:
         projected = _project_wider_quota(totals, loads, config, copies, limit, resident, target,
-                                        minimum_rows, admission, saved_rows, projected_rank_nodes)
+                                        minimum_rows, admission, saved_rows, projected_rank_nodes, prefix)
         if projected is not None:
             return projected
     return copies
@@ -570,7 +613,7 @@ def _copy_pressure(copies: list[dict[int, int]], home: int, nodes: tuple[int, ..
 def _project_wider_quota(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
                          current: list[dict[int, int]] | None, limit: int, resident: int, target: int,
                          minimum_rows: int, admission: int, saved_rows: int,
-                         nodes: tuple[int, ...]) -> list[dict[int, int]] | None:
+                         nodes: tuple[int, ...], prefix: _QuotaSearchPrefix) -> list[dict[int, int]] | None:
     """Try wider quota selection without consuming more physical guest slots."""
     grain = max(1, minimum_rows)
     home = config.home_experts
@@ -580,7 +623,7 @@ def _project_wider_quota(totals: list[int], loads: list[int], config: ExpertRepl
         return None
     virtual = replace(config, replica_slots_per_rank=home)
     proposal = _admitted_uncalibrated_copies(totals, loads, virtual, limit, resident, target, minimum_rows,
-                                            admission, saved_rows)
+                                            admission, saved_rows, prefix=prefix)
     if proposal is None or any(sum(bool(count) and expert // home != rank for expert, count in row.items())
                                > config.replica_slots_per_rank for rank, row in enumerate(proposal)):
         return None
@@ -608,10 +651,11 @@ def _complete_guest_search_enabled() -> bool:
 
 def _complete_bounded_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
                              current: list[dict[int, int]], ceiling: int, minimum_rows: int,
-                             peak: int) -> list[dict[int, int]] | None:
+                             peak: int, *, edges: list | None = None) -> list[dict[int, int]] | None:
     """Keep a complete quota only when every receiver already fits the physical cap."""
     home = config.home_experts
-    edges = _balanced_edges(loads, totals, home)
+    if edges is None:
+        edges = _balanced_edges(loads, totals, home)
     # The balancing skeleton emits at most one edge per receiver. There is no
     # need to shrink its rows when the full edge fits the reserved guest slots.
     if any(len(segments) > config.replica_slots_per_rank for _, _, segments in edges):
