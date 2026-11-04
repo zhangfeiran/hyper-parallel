@@ -102,11 +102,18 @@ them in a `ModuleList`.
 - [Original-width one-logical-layer scratch recipe](recipes/train_one_layer.yaml)
 - [Local validation manifest](validation.yaml)
 
-The one-layer recipe uses 16 ranks with EP16, dense FSDP16 and expert FSDP1. Its model config only
-changes `num_layers` and disables the inference cache: hidden size 6144, expert intermediate size 2048,
-dense intermediate size 12288, real/identity expert counts 512/256, Top-K 12, vocabulary 131072, 64 heads,
-Q-LoRA rank 1536 and KV-LoRA rank 512 retain the original values. A logical layer still contains both
-attention and dense sublayers plus shortcut MoE. Sequence length is 2048 and global batch is 16.
+The one-layer recipe uses 16 ranks with EP16, dense FSDP16 and expert FSDP1. A smaller EP job preserves
+local expert ownership: the EP64 reference has 512 real and 256 identity experts, or eight real and four
+identity experts per rank. Therefore EP16 uses 128 real and 64 identity experts; EP4 uses 32 real and
+16 identity experts. Scale the global expert pool with EP degree when cropping a cluster. Retaining all
+512 experts at EP4 would change both local parameter storage and tokens per expert.
+
+The crop keeps hidden size 6144, expert intermediate size 2048, dense intermediate size 12288, Top-K 12,
+vocabulary 131072, 64 heads, Q-LoRA rank 1536 and KV-LoRA rank 512. It sets `num_layers: 1` and disables
+the inference cache. A logical layer still contains both attention and dense sublayers plus shortcut MoE.
+Sequence length is 2048 and global batch is 16. The component benchmark derives default global expert
+counts from EP degree with the same eight-real/four-identity ownership; explicit overrides are available
+for diagnostics. Record actual local tensor shapes and per-expert route counts in every run.
 It initializes scratch parameters and requires local tokenizer/data paths; it never downloads weights.
 
 Native GMM and literal HF per-expert `F.linear` are separate numerical references. The HF SwiGLU cast
@@ -138,7 +145,7 @@ python -m hyper_parallel.tools.model_integration parity --manifest hyper_paralle
 
 The portable validation builders preserve all 28 logical blocks and routing cardinalities 512/256/12
 while reducing parameter widths for CPU contract checks. They are diagnostics, not original-width
-accelerator acceptance. Use the one-layer recipe for depth-only cropping on NPU. The validation manifest's
+accelerator acceptance. Use the one-layer recipe for original widths and constant local expert ownership on NPU. The validation manifest's
 generated handoff covers the declared structural/portable expert checks; measured accelerator evidence
 remains separate from full pretrained training acceptance.
 

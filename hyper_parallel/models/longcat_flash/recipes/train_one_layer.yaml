@@ -1,4 +1,4 @@
-# Original architecture widths and cardinalities; only logical depth is cropped.
+# Preserve original widths and the EP64 ownership of eight real experts per rank.
 # Run on 16 logical NPUs with local tokenizer/data assets.
 model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_config
@@ -6,6 +6,8 @@ model:
     _target_: transformers.LongcatFlashConfig.from_dict
     config_dict:
       num_layers: 1
+      n_routed_experts: 128
+      zero_expert_num: 64
       use_cache: false
   torch_dtype: bfloat16
   attn_implementation: eager

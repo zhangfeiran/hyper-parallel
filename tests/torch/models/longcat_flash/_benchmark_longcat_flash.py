@@ -159,13 +159,16 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument("--hidden", type=int, default=6144)
     parser.add_argument("--intermediate", type=int, default=2048)
-    parser.add_argument("--real", type=int, default=512)
-    parser.add_argument("--zero", type=int, default=256)
+    parser.add_argument("--real", type=int, default=None, help="Global real experts; defaults to eight per EP rank")
+    parser.add_argument("--zero", type=int, default=None, help="Global identity experts; defaults to four per EP rank")
     parser.add_argument("--top-k", type=int, default=12)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--output", type=Path, required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.real = 8 * args.ep if args.real is None else args.real
+    args.zero = 4 * args.ep if args.zero is None else args.zero
+    return args
 
 
 def main() -> None:
@@ -211,6 +214,7 @@ def main() -> None:
               "hyper_parallel_source": hyper_parallel.__file__,
               "warmup": args.warmup, "samples": args.samples, "identities": identities,
               "parameter_local_shapes": parameter_shapes, "native_operator_census": operators, "routing": routing,
+              "local_experts": {"real": args.real // args.ep, "identity": args.zero // args.ep},
               "phases": phases, "finite_gradients": finite_gradients,
               "unused_gate_rows_gradient_zero": unused_gradient_zero,
               "shmem_after_close": shmem.debug_state(), "environment": environment_identity()}
