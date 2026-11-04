@@ -395,7 +395,7 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
         for rank, node in enumerate(rank_nodes):
             node_sources.setdefault(node, []).append(rank)
     slot_map = []
-    by_expert = [[] for _ in range(config.num_experts)]
+    by_expert: dict[int, list[list[int]]] = {}
     for rank, row in enumerate(copies):
         guests = sorted(expert for expert, count in row.items() if expert // home != rank and count)
         if len(guests) > config.replica_slots_per_rank:
@@ -403,19 +403,20 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
         slots = list(range(rank * home, (rank + 1) * home)) + guests
         slots.extend([-1] * (width - len(slots)))
         slot_map.append(tuple(slots))
-        for slot, expert in enumerate(slots):
-            if expert >= 0 and row.get(expert, 0):
-                by_expert[expert].append([rank * width + slot, row[expert]])
+        for slot, expert in enumerate(guests, start=home):
+            by_expert.setdefault(expert, []).append([rank * width + slot, row[expert]])
     padding = (0,) * config.replica_slots_per_rank
     starts = range(0, config.num_experts, home)
     dispatch = [list(chain.from_iterable(row[start:start + home] + padding for start in starts)) for row in counts]
-    for expert, quotas in enumerate(by_expert):
-        # Empty experts already have zero source counts in the owner layout.
-        if not quotas:
-            continue
-        owner_physical = expert // home * width + expert % home
-        if len(quotas) == 1 and quotas[0][0] == owner_physical:
-            continue
+    for expert, quotas in by_expert.items():
+        # Only a guest can change an expert's prefilled owner columns. Insert
+        # its remaining home work in the original physical tie-break order.
+        owner, local_expert = divmod(expert, home)
+        owner_physical = owner * width + local_expert
+        owner_rows = copies[owner].get(expert, 0)
+        if owner_rows:
+            quotas.append([owner_physical, owner_rows])
+            quotas.sort(key=lambda quota: quota[0])
         for output_row in dispatch:
             output_row[owner_physical] = 0
         if len(quotas) == 1:
