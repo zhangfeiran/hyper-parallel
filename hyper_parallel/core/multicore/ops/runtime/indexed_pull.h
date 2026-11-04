@@ -201,6 +201,26 @@ namespace MulticoreRuntime {
     }
   }
 
+  struct TokenPullGeometry {
+    uint64_t metadata_bytes;
+    int64_t chunk_elements;
+  };
+
+  template <typename T>
+  __aicore__ inline TokenPullGeometry GetTokenPullGeometry(int64_t hidden) {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    constexpr int64_t FULL_ROW_ELEMENTS = 5120;
+    // A smaller metadata window fits one complete row in the same 16 KiB
+    // lease, reducing payload DMA calls without changing row publication.
+    if (sizeof(T) == sizeof(uint16_t) && hidden == FULL_ROW_ELEMENTS) {
+      return {4096, FULL_ROW_ELEMENTS};
+    }
+#else
+    (void)hidden;
+#endif
+    return {8192, 3072};
+  }
+
   template <typename T, bool Count = false, bool InputTiles = false>
   __aicore__ inline void PullTokenBlocks(
       const TaskDesc &task, __gm__ T *source, __gm__ T *destination, __gm__ int32_t *remote_metadata,
@@ -208,9 +228,10 @@ namespace MulticoreRuntime {
       int64_t token_start, int64_t token_rows, int64_t hidden, uint32_t top_k,
       int64_t rank, int64_t source_pe, int64_t local_experts, int64_t source_tokens, uint64_t *statistics,
       __gm__ int64_t *expert_groups = nullptr, __gm__ int32_t *input_tiles = nullptr, uint64_t tile_stride = 0) {
-    constexpr uint64_t META_BYTES = 8192;
+    const auto geometry = GetTokenPullGeometry<T>(hidden);
+    const uint64_t META_BYTES = geometry.metadata_bytes;
     constexpr uint64_t CREDIT_BYTES = 64 * sizeof(int32_t);
-    constexpr int64_t CHUNK = 3072;
+    const int64_t CHUNK = geometry.chunk_elements;
     auto *metadata = reinterpret_cast<__ubuf__ int32_t *>(scratch);
     auto *credits = reinterpret_cast<__ubuf__ int32_t *>(scratch + META_BYTES);
     auto *firsts = credits + 64;
