@@ -115,6 +115,10 @@ Sequence length is 2048 and global batch is 16. The component benchmark derives 
 counts from EP degree with the same eight-real/four-identity ownership; explicit overrides are available
 for diagnostics. Record actual local tensor shapes and per-expert route counts in every run.
 It initializes scratch parameters and requires local tokenizer/data paths; it never downloads weights.
+The one-layer MegaMoE recipe reserves `initial_token_capacity: 24576`, the compact-real upper bound
+`2048 * 12`, before its first call. This avoids restarting SHMEM when learned routing produces more
+real rows later. The generic reservation defaults to 128, and automatic growth remains available for
+larger inputs or destination imbalance. Measure the reserved memory with the performance result.
 
 Native GMM and literal HF per-expert `F.linear` are separate numerical references. The HF SwiGLU cast
 option aligns activation semantics, while different GEMM implementations can retain BF16 rounding

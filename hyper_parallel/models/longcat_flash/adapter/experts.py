@@ -57,6 +57,20 @@ def identity_contribution(hidden: torch.Tensor, ids: torch.Tensor, weights: torc
     return output
 
 
+def _initial_token_capacity(value: int | None) -> int | None:
+    """Validate the optional compact-real reservation owned by the model adapter.
+
+    Args:
+        value: Requested initial source rows, or None for the generic default.
+
+    Returns:
+        The validated optional row count.
+    """
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+        raise ValueError("LongCat initial_token_capacity must be a positive integer or None")
+    return value
+
+
 @module_replacement
 class LongcatFlashMegaMoeExperts(nn.Module):
     """Retain HF parameter names and execute only real expert assignments."""
@@ -66,7 +80,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
                  dispatch_mode: str = "push", replica_slots_per_rank: int = 0,
                  expert_weight_layout: str = "EOI", swiglu_precision: str = "hf",
                  optimize_tasks: bool = True, routing_backend: str = "torch",
-                 direct_weight_gradients: bool = True) -> None:
+                 direct_weight_gradients: bool = True, initial_token_capacity: int | None = None) -> None:
         """Bind a complete HF expert module before EP and FSDP sharding.
 
         Args:
@@ -78,6 +92,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             replica_slots_per_rank: Optional real-expert guest budget.
             expert_weight_layout: EOI avoids copies; EIO enables current hot replicas.
             direct_weight_gradients: Retain full Gate/Up gradients without clearing the active prefix.
+            initial_token_capacity: Optional initial compact-real-row reservation; automatic growth remains enabled.
             routing_backend: Ordered Torch routing, or explicit optional Ascend Triton fusion.
             optimize_tasks: Use exact route bounds and one-expert MegaMoE task addressing.
             swiglu_precision: HF BF16 intermediate casts, or explicit native fused arithmetic.
@@ -102,6 +117,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             raise ValueError("LongCat direct_weight_gradients must be boolean")
         self.direct_weight_gradients = all((direct_weight_gradients, optimize_tasks,
                                             expert_weight_layout == "EOI", replica_slots_per_rank == 0))
+        self.initial_token_capacity = _initial_token_capacity(initial_token_capacity)
         self.routing_backend = routing_backend
         self.optimize_tasks = optimize_tasks
         self.swiglu_precision = swiglu_precision
@@ -189,6 +205,8 @@ class LongcatFlashMegaMoeExperts(nn.Module):
         if self.num_experts and self.backend == "megamoe":
             from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
 
+            capacity = ({} if self.initial_token_capacity is None
+                        else {"initial_token_capacity": self.initial_token_capacity})
             self._executor = MegaMoeExperts(
                 hidden_size=self.hidden_size, intermediate_size=self.intermediate_size,
                 num_experts=self.num_experts, top_k=1, ep_group=ep_group, ep_size=ep_size,
@@ -197,7 +215,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
                 route_task_bounds=self.optimize_tasks, single_expert_tasks=self.optimize_tasks,
                 gate_up_expert_padding=(self.zero_expert_num
                                         if self.direct_weight_gradients and not self.replica_slots_per_rank else 0),
-                dispatch_mode=self.dispatch_mode, replica_slots_per_rank=self.replica_slots_per_rank,
+                dispatch_mode=self.dispatch_mode, replica_slots_per_rank=self.replica_slots_per_rank, **capacity,
             )
         self._configured = True
 

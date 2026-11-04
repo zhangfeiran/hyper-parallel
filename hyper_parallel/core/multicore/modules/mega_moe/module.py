@@ -66,6 +66,7 @@ from .route import prepare_topk_route, restore_topk_output
 from .spec import (
     MegaMoeSpec,
     _COMMUNICATION_SPLIT,
+    _align_capacity,
     _resolve_capacity_factors,
     bind_mega_moe_spec,
     initial_receive_capacity,
@@ -96,6 +97,7 @@ def _critical_execution_signature(module: Any, resources: Any) -> str:
                  'replica_transport', 'replica_slots_per_rank')}
     metadata.update(weight_layout=resources.spec.expert_weight_layout, swiglu_limit=resources.spec.swiglu_limit,
                     swiglu_hf_bf16=resources.spec.swiglu_hf_bf16,
+                    initial_token_capacity=resources.spec.local_num_tokens,
                     single_expert_tasks=resources.spec.single_expert_tasks,
                     gate_up_expert_padding=resources.spec.gate_up_expert_padding,
                     route_task_bounds=resources.spec.route_task_bounds,
@@ -472,6 +474,7 @@ class MegaMoeExperts(MulticoreModule):
         expert_weight_layout: ExpertWeightLayout = "EIO",
         dispatch_mode: str = "push",
         initial_capacity_factor: float | None = None,
+        initial_token_capacity: int = _COMMUNICATION_SPLIT,
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
@@ -491,6 +494,8 @@ class MegaMoeExperts(MulticoreModule):
             top_k: Experts selected for every token.
             initial_capacity_factor: Push initial receive rows as a multiple of local routed rows.
                 Defaults to 1.25 for push; omitted for pull. Must be finite and at least 1.0.
+            initial_token_capacity: Initial automatic source-row reservation, rounded up to 128.
+                Defaults to 128; larger inputs still grow automatically.
             capacity_growth_factor: Push capacity multiplier on overflow, defaulting to 1.25.
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
@@ -562,8 +567,9 @@ class MegaMoeExperts(MulticoreModule):
             reduction_basis_points(replica_minimum_load_reduction)
         self.replica_minimum_load_reduction = replica_minimum_load_reduction
         self.replica_transport = replica_transport
+        _integer(initial_token_capacity, "initial_token_capacity", 1)
         specification = {
-            "local_num_tokens": _COMMUNICATION_SPLIT,
+            "local_num_tokens": _align_capacity(initial_token_capacity),
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": replica_config.physical_experts,
@@ -610,6 +616,7 @@ class MegaMoeExperts(MulticoreModule):
         self, specification: Mapping[str, Any], *, create_parameters: bool,
     ) -> None:
         """Bind normalized configuration and initialize expert parameters."""
+        self.initial_token_capacity = specification["local_num_tokens"]
         self.hidden_size = specification["hidden_size"]
         self.intermediate_size = specification["intermediate_size"]
         self.num_experts = self.replica_config.num_experts
