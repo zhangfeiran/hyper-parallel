@@ -28,13 +28,23 @@ import torch.distributed.distributed_c10d as c10d
 from . import _collective
 
 _LOGGER = logging.getLogger(__name__)
+_REGISTERED_ROOT = object()
 
 
-def exchange(value: Any) -> list[Any]:
-    """Exchange resource metadata on the registered cleanup Root."""
+def exchange(value: Any, *, group: Any = _REGISTERED_ROOT) -> list[Any]:
+    """Exchange metadata on the cleanup Root or an explicit group.
+
+    Args:
+        value: Picklable local lifecycle state.
+        group: Omission selects the registered Root; None explicitly selects WORLD.
+
+    Returns:
+        Metadata in process-group rank order, or the local value when distributed is unavailable.
+    """
+    selected_group = _CLEANUP.root_group if group is _REGISTERED_ROOT else group
     return _collective.exchange(
         value,
-        group=_CLEANUP.root_group,
+        group=selected_group,
         failure_prefix="Multicore metadata exchange failed while converging rank results",
     )
 
@@ -43,12 +53,20 @@ def collective_call(
     callback: Callable[[], None],
     *,
     stage: str,
+    group: Any = _REGISTERED_ROOT,
 ) -> None:
-    """Converge resource callback failures on the registered cleanup Root."""
+    """Converge callback failures on the cleanup Root or an explicit group.
+
+    Args:
+        callback: Lifecycle stage entered by every group member in the same order.
+        stage: Stable operation label included in collective failure diagnostics.
+        group: Omission selects the registered Root; None explicitly selects WORLD.
+    """
+    selected_group = _CLEANUP.root_group if group is _REGISTERED_ROOT else group
     _collective.collective_call(
         callback,
         stage=stage,
-        group=_CLEANUP.root_group,
+        group=selected_group,
     )
 
 

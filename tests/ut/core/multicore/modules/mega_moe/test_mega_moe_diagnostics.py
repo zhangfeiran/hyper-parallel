@@ -15,10 +15,13 @@
 """MegaMoe-owned diagnostic names and expert resolution tests."""
 
 import unittest
+from dataclasses import replace
 
 from hyper_parallel.core.multicore.diagnostics.common.graph import DiagnosticSpec, build_graph_metadata
 from hyper_parallel.core.multicore.modules.mega_moe.diagnostics import _mega_moe_owner_options
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts, _build_task_values
+from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.scheduler.config import TaskDescC, TaskSplitValue, TaskType
 from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config
 from tests.common.mark_utils import arg_mark
@@ -83,3 +86,30 @@ class TestMegaMoeDiagnostics(unittest.TestCase):
         self.assertEqual(metadata.task_owner_ids[2], 10)
         self.assertEqual(metadata.task_owner_ids[3], 11)
         self.assertEqual(metadata.task_owner_ids[4], 10)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_indexed_backward_metadata_keeps_token_gradients_without_expert_owner(self) -> None:
+        """Feature: Indexed backward profiling metadata.
+        Description: Build real backward metadata with and without shared experts.
+        Expectation: Source-token route-gradient jobs have stage names without a single expert owner.
+        """
+        base = MegaMoeSpec(512, 5120, 1792, 32, 8, None, 4096, 4, None, 0, 32,
+                           dispatch_mode="pull", forward_ingress_mode="indexed", backward_ingress_mode="indexed")
+        for shared in (False, True):
+            with self.subTest(shared=shared):
+                spec = (replace(base, shared_intermediate_size=2048, forward_shared_expert=True,
+                                backward_shared_expert=True, shared_placement="idle") if shared else base)
+                _, _, graph, runtime = _build_runtime_artifacts(spec)
+                original = bytes(runtime)
+                options = _mega_moe_owner_options(_build_task_values(spec), num_cube_cores=32)
+
+                metadata = build_graph_metadata(graph, runtime, DiagnosticSpec("mega_moe", **options))
+
+                self.assertEqual(bytes(runtime), original)
+                route_tasks = [index for index in range(runtime.task_num)
+                               if runtime.all_tasks[index].task_type == TaskType.TASK_MOE_ROUTE_GRAD]
+                self.assertTrue(route_tasks, msg=f"Expected source-token route jobs, actual={route_tasks}")
+                for index in route_tasks:
+                    self.assertIsNone(metadata.task_owner_ids.get(index))
+                    self.assertIn("Route", metadata.task_stage_names[index])

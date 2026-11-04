@@ -38,8 +38,11 @@ from hyper_parallel.core.multicore.torch import ops as multicore_ops
 from .inactive_tasks import GuestTaskPrefix, apply_guest_task_prefix, select_guest_task_prefix
 from .kernel_gradients import prepare_kernel_gradient_return
 from .plan import MegaMoePlan, record_plan_stream
-from .route import PreparedTopKRoute, RouteMetadata
+from .route import _peer_owner_flags, PreparedTopKRoute, RouteMetadata
+from .spec import MegaMoeSpec, _route_metadata_rows
 from .workspace import MegaMoeWorkspace
+from .shared import pointer_table, shared_forward_buffers, shared_backward_buffers
+from .indexed_backward import publish_backward_route
 
 
 @dataclass
@@ -138,6 +141,7 @@ class _ForwardExecution:
     runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
     task_prefix: GuestTaskPrefix | None = None
     prefix_cache: dict[int, tuple[Any, int]] | None = None
+    shared_ptrs: Any = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +158,7 @@ class _BackwardExecution:
     runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
     task_prefix: GuestTaskPrefix | None = None
     prefix_cache: dict[int, tuple[Any, int]] | None = None
+    shared_ptrs: Any = None
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -182,11 +187,15 @@ def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple
     if not ctx.has_unpermute:
         source.copy_(grad_output)
         return source, None
+    if getattr(ctx.plan.spec, "backward_ingress_mode", "legacy") == "indexed":
+        mapping, expert_output, probs, sorted_slots = permutation_inputs
+        return publish_backward_route(ctx.workspace, grad_output, mapping, expert_output, probs, sorted_slots,
+                                      needs_probability_grad=ctx.needs_input_grad[7])
     mapping, expert_output, probs = permutation_inputs
     grad_probs = torch.empty_like(probs)
     if ctx.source_rows:
         multicore_ops.mega_moe_unpermute_grad_out(expert_output, grad_output, mapping, probs, source, grad_probs)
-    return source, grad_probs.to(ctx.topk_dtype) if ctx.needs_input_grad[7] else None
+    return source, grad_probs if ctx.needs_input_grad[7] else None
 
 
 def _allocate_forward_intermediates(
@@ -331,7 +340,9 @@ def _prepare_backward_execution(
         grad_x=grad_x,
         diagnostics=diagnostics,
         event_counters=workspace.prepare_event_counters(forward=False),
-        gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
+        gmm_workspace=(_workspace_tensor(workspace.backward_route_metadata, "backward_route_metadata").view(torch.uint8)
+                       if getattr(plan.spec, "backward_ingress_mode", "legacy") == "indexed" else
+                       _workspace_tensor(workspace.gmm_workspace, "gmm_workspace")),
         swiglu_workspace=_workspace_tensor(
             workspace.swiglu_grad_workspace,
             "swiglu_grad_workspace",
@@ -458,6 +469,22 @@ def _runtime_image(base: torch.Tensor, data: bytes,
     if cache is not None:
         cache[id(base)] = (base, data, result)
     return result
+def _patch_forward_row_thresholds(plan: MegaMoePlan, metadata: RouteMetadata, runtime_config: Any) -> None:
+    """Update the actual ordinary/profile/dump image under the same workspace lease."""
+    offset = getattr(plan, "row_credit_element_offset", None)
+    if offset is None:
+        return
+    if metadata.expert_row_counts is None:
+        raise RuntimeError("Owner overlap requires per-expert receive row counts")
+    runtime_config.view(torch.int32)[offset:offset + plan.spec.local_experts].copy_(metadata.expert_row_counts)
+
+
+def _reset_forward_tile_credits(spec: MegaMoeSpec, storage: torch.Tensor) -> None:
+    """Reset only the local readiness table while the caller owns the forward lease."""
+    if spec.forward_ingress_mode != "peer_tile":
+        return
+    prefix_rows = _route_metadata_rows(spec.routed_slots, spec.num_experts, spec.ep_size, "peer_token")
+    storage.view(-1)[prefix_rows * 4:].zero_()
 
 
 def _launch_forward_kernel(
@@ -490,6 +517,7 @@ def _launch_forward_kernel(
         metadata.combine_size * spec.hidden_size,
     )
     if not plan.fwd_diagnostics.is_active:
+        _patch_forward_row_thresholds(plan, metadata, plan.fwd_runtime_config)
         record_plan_stream(plan, plan.fwd_runtime_config)
         multicore_ops.mega_moe(
             *kernel_parameters,
@@ -506,14 +534,24 @@ def _launch_forward_kernel(
             spec.num_experts,
             spec.hidden_size,
             getattr(spec, "plan_tokens", spec.local_num_tokens),
+            **({"shared_ptrs": execution.shared_ptrs, "shared_runtime": plan.shared_forward_runtime}
+               if execution.shared_ptrs is not None else {}),
         )
         return
 
+    diagnostic_parameters = (kernel_parameters if spec.forward_ingress_mode == "legacy"
+                             else (*kernel_parameters, execution.gmm_workspace))
+    if execution.shared_ptrs is not None:
+        diagnostic_parameters = (*kernel_parameters, execution.gmm_workspace, plan.up_proj_tiling,
+                                 plan.swiglu_tiling, plan.down_proj_tiling, plan.fwd_runtime_config,
+                                 None, None, None, execution.event_counters, None,
+                                 execution.shared_ptrs, plan.shared_forward_runtime)
     with plan.fwd_diagnostics.launch(
-        kernel_parameters,
+        diagnostic_parameters,
         direction="forward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
+        _patch_forward_row_thresholds(plan, metadata, diagnostic_call.runtime_config)
         record_plan_stream(plan, diagnostic_call.runtime_config)
         multicore_ops.mega_moe_with_diagnostic_buffer(
             *kernel_parameters,
@@ -531,6 +569,8 @@ def _launch_forward_kernel(
             spec.num_experts,
             spec.hidden_size,
             getattr(spec, "plan_tokens", spec.local_num_tokens),
+            **({"shared_ptrs": execution.shared_ptrs, "shared_runtime": plan.shared_forward_runtime}
+               if execution.shared_ptrs is not None else {}),
         )
 
 
@@ -545,6 +585,8 @@ def _launch_backward_kernel(
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
     diagnostics = execution.diagnostics or plan.bwd_diagnostics
+    if getattr(spec, "backward_ingress_mode", "legacy") == "indexed":
+        multicore_ops.require_indexed_backward_support()
     gradients = execution.intermediates
     kernel_parameters = (
         execution.dispatch,
@@ -590,11 +632,20 @@ def _launch_backward_kernel(
             spec.num_experts,
             spec.hidden_size,
             getattr(spec, "plan_tokens", spec.local_num_tokens),
+            **({"shared_ptrs": execution.shared_ptrs, "shared_runtime": plan.shared_backward_runtime}
+               if execution.shared_ptrs is not None else {}),
         )
         return
 
+    diagnostic_parameters = kernel_parameters
+    if execution.shared_ptrs is not None:
+        diagnostic_parameters = (*kernel_parameters, plan.act_grad_tiling, plan.gate_grad_tiling,
+                                 plan.w1_grad_tiling, plan.w2_grad_tiling, plan.swiglu_grad_tiling,
+                                 execution.gmm_workspace, execution.swiglu_workspace, plan.bwd_runtime_config,
+                                 None, None, None, execution.event_counters, None,
+                                 execution.shared_ptrs, plan.shared_backward_runtime)
     with diagnostics.launch(
-        kernel_parameters,
+        diagnostic_parameters,
         direction="backward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
@@ -619,6 +670,8 @@ def _launch_backward_kernel(
             spec.num_experts,
             spec.hidden_size,
             getattr(spec, "plan_tokens", spec.local_num_tokens),
+            **({"shared_ptrs": execution.shared_ptrs, "shared_runtime": plan.shared_backward_runtime}
+               if execution.shared_ptrs is not None else {}),
         )
 
 
@@ -650,9 +703,11 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         route: RouteMetadata,
         plan: MegaMoePlan,
         workspace: MegaMoeWorkspace,
-        permutation: tuple[Any, Any, Any] | None,
+        permutation: tuple[Any, ...] | None,
         topk_weights: torch.Tensor | None,
         workspace_claimed: bool,
+        shared_weight1: torch.Tensor | None,
+        shared_weight2: torch.Tensor | None,
     ) -> Any:
         """Launch the legacy forward op and save owned backward inputs.
 
@@ -668,6 +723,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 when the first tensor argument contains original token rows.
             topk_weights: Optional Router weights for pull source-output gradients.
             workspace_claimed: Whether the caller owns the forward workspace lease.
+            shared_weight1: Optional current shared gate/up weight.
+            shared_weight2: Optional current shared down-projection weight.
 
         Returns:
             Owned expert-major output rows.
@@ -675,15 +732,28 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         spec = plan.spec
         if topk_weights is not None and (spec.dispatch_mode != "pull" or permutation is None):
             raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
+        ctx.has_shared = shared_weight1 is not None
+        ctx.shared_backward = ctx.has_shared and getattr(spec, "backward_shared_expert", False)
+        shared_input = routed_tokens
         metadata = route
         ctx.replica_route = route.replica_route
         home_weights = (weight1, weight2)
         permutation_inputs = ()
+        indexed_ingress = getattr(spec, "forward_ingress_mode", "legacy") != "legacy"
+        permute_src_index = None
         if permutation is not None:
-            routed_tokens, _, unpermute_mapping = permutation
+            prepared_rows, _, unpermute_mapping = permutation[:3]
+            if indexed_ingress:
+                if len(permutation) < 4 or permutation[3] is None or prepared_rows is not None:
+                    raise ValueError("Indexed ingress requires scalar route indices and original token rows")
+                permute_src_index = permutation[3]
+            else:
+                routed_tokens = prepared_rows
             if ctx.needs_input_grad[0] or topk_weights is not None:
                 permutation_inputs = (unpermute_mapping,)
-        ctx.source_rows = routed_tokens.shape[0]
+        elif indexed_ingress:
+            raise ValueError("Indexed ingress requires a prepared Top-K route")
+        ctx.source_rows = routed_tokens.shape[0] * (spec.top_k if indexed_ingress else 1)
         ctx.token_rows = ctx.source_rows // spec.top_k
         ctx.has_permutation = permutation is not None
         ctx.has_unpermute = topk_weights is not None
@@ -717,6 +787,45 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution = replace(execution, task_prefix=select_guest_task_prefix(
                     plan.fwd_task_prefixes, slots,
                     all_slot_to_logical=None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical))
+            shared_saved = ()
+            shared_output = None
+            if ctx.has_shared:
+                if getattr(spec, "forward_shared_expert", True):
+                    shared_up, shared_activation, shared_output = shared_forward_buffers(
+                        shared_input, spec.shared_intermediate_size)
+                    execution = replace(execution, shared_ptrs=pointer_table(
+                        (shared_input, shared_weight1, shared_weight2, shared_up, shared_activation,
+                         shared_output, workspace.gmm_workspace), idle_vectors=True))
+                else:
+                    shared_up, shared_activation, shared_output = _native_shared_forward(
+                        shared_input, shared_weight1, shared_weight2, spec.swiglu_limit)
+                shared_saved = (shared_input, shared_weight1, shared_weight2, shared_up, shared_activation)
+            if indexed_ingress:
+                # Port 16 is unused by Blaze F2. Keep its read-only metadata in
+                # symmetric storage until the all-rank source-read completion.
+                metadata_storage = _workspace_tensor(workspace.route_metadata, "route_metadata")
+                _reset_forward_tile_credits(spec, metadata_storage)
+                metadata_buffer = metadata_storage[:ctx.source_rows]
+                if spec.forward_ingress_mode in ("peer_token", "peer_tile"):
+                    # Packed records are indexed by original slot. The gap up to
+                    # NK*16 bytes preserves the common diagnostic-tail address.
+                    packed = torch.stack((permutation[1].reshape(-1).to(torch.int32), permutation[4]), dim=1)
+                    metadata_storage.view(-1)[:ctx.source_rows * 2].view(-1, 2).copy_(packed)
+                else:
+                    metadata_buffer[:, 0].copy_(permute_src_index)
+                    if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap"):
+                        metadata_buffer[:, 2].copy_(permutation[1].reshape(-1))
+                        metadata_buffer[:, 3].copy_(permutation[4])
+                        if spec.forward_ingress_mode == "peer_overlap":
+                            metadata_buffer[:, 1].copy_(_peer_owner_flags(
+                                permutation[1], permute_src_index, spec.local_experts))
+                execution = replace(execution, gmm_workspace=metadata_storage.view(torch.uint8))
+            if getattr(plan, "ingress_diagnostics", None) is not None:
+                ingress_plan = replace(plan, fwd_diagnostics=plan.ingress_diagnostics, ingress_diagnostics=None)
+                _launch_forward_kernel(ingress_plan, metadata, execution.source, weight1, weight2, execution)
+                # Same-stream reset follows the complete ingress kernel. Keep
+                # persistent ready generations for the following full graph.
+                execution = replace(execution, event_counters=workspace.prepare_event_counters(forward=True))
             _launch_forward_kernel(
                 plan,
                 metadata,
@@ -737,6 +846,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 probs = topk_weights.float().contiguous()
                 ctx.topk_dtype = topk_weights.dtype
                 permutation_inputs += (output, probs)
+                if getattr(spec, "backward_ingress_mode", "legacy") == "indexed":
+                    permutation_inputs += (permute_src_index,)
                 output = (torch_npu.npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
                           if ctx.source_rows else output[:0])
             _save_forward_state(
@@ -749,8 +860,16 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 home_weights[0],
                 home_weights[1],
                 metadata,
-                permutation_inputs,
+                permutation_inputs + (shared_saved if ctx.shared_backward else ()),
             )
+            if ctx.has_shared:
+                ctx.routed_output_shape = tuple(output.shape)
+                if ctx.shared_backward:
+                    ctx.mark_non_differentiable(shared_up, shared_activation)
+                else:
+                    ctx.mark_non_differentiable(shared_output, shared_up, shared_activation)
+                ctx.set_materialize_grads(False)
+                return output, shared_output, shared_up, shared_activation
             return output
         finally:
             leases.close()
@@ -759,12 +878,18 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
 
     @staticmethod
     # pylint: disable-next=arguments-differ
-    def backward(ctx: Any, grad_output: Any) -> tuple[Any, ...]:
+    def backward(
+        ctx: Any, grad_output: Any, grad_shared_output: Any = None,
+        _grad_shared_up: Any = None, _grad_shared_activation: Any = None,
+    ) -> tuple[Any, ...]:
         """Launch the legacy backward op into zero-safe gradient buffers.
 
         Args:
             ctx: Autograd context populated by ``forward``.
             grad_output: Expert-major output gradient rows.
+            grad_shared_output: Token-major shared output gradient when shared backward is fused.
+            _grad_shared_up: Unused non-differentiable shared preactivation.
+            _grad_shared_activation: Unused non-differentiable shared activation.
 
         Returns:
             Gradients aligned with the differentiable forward inputs.
@@ -778,13 +903,17 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         generation = ctx.replica_weight_generation
         if isinstance(generation, _ReplicaWeightGeneration):
             generation = generation.value
-        permutation_inputs = saved_tensors[12:]
+        shared_backward = getattr(ctx, "shared_backward", False) is True
+        shared_saved = saved_tensors[-5:] if shared_backward else ()
+        permutation_inputs = saved_tensors[12:-5] if shared_backward else saved_tensors[12:]
         del saved_tensors
         workspace.claim()
         has_replica_transfers = ctx.replica_route is not None and bool(ctx.replica_route.plan.transfers)
         execution = None
         leases = ExitStack()
         try:
+            if grad_output is None:
+                grad_output = saved.weight1.new_zeros(ctx.routed_output_shape)
             provider = workspace.replica_provider
             overwrite_guests = has_replica_transfers and getattr(provider, "kernel_gradients", False)
             pool = None if not has_replica_transfers else leases.enter_context(
@@ -792,7 +921,6 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                                  backward=True, provider=provider, overlap=True,
                                  reuse_generation=generation, _overwrite_gradients=overwrite_guests))
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
-            permutation_inputs = permutation_inputs[:1]
             kernel_return = has_replica_transfers and getattr(provider, "kernel_gradients", False)
             kernel_w13 = kernel_return and bool(plan.replica_w13_events)
             execution = _prepare_backward_execution(
@@ -814,6 +942,15 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution = replace(execution, task_prefix=select_guest_task_prefix(
                     prefixes, slots,
                     all_slot_to_logical=None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical))
+            shared_tensors = ()
+            if shared_backward:
+                if grad_shared_output is None:
+                    grad_shared_output = torch.zeros_like(shared_saved[0])
+                shared_tensors, pointers = shared_backward_buffers(
+                    grad_shared_output, shared_saved, idle_vectors=plan.spec.num_cube_cores != 32,
+                    native_activation_grad=plan.spec.num_cube_cores == 32, swiglu_limit=plan.spec.swiglu_limit,
+                )
+                execution = replace(execution, shared_ptrs=pointers)
             early_return = prepare_kernel_gradient_return(
                 plan, ctx.replica_route, provider, execution.intermediates.grad_weight2,
                 None if pool is None else pool.gradients[1],
@@ -834,6 +971,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 else:
                     grad_weight1, grad_weight2 = return_gradients(
                         (grad_weight1, grad_weight2), ctx.replica_route, pool.gradients, provider, consume=True)
+            permutation_inputs = permutation_inputs[:1]
+            if grad_topk_weights is not None:
+                grad_topk_weights = grad_topk_weights.to(ctx.topk_dtype)
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
             execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
@@ -848,6 +988,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             grad_weight2 = _restore_weight_gradient_layout(
                 plan.spec, execution.intermediates.grad_weight2
             )
+            shared_dw1 = shared_dw2 = None
+            if shared_backward:
+                if grad_input is not None:
+                    grad_input = grad_input + shared_tensors[8]
+                shared_dw1 = shared_tensors[10].t() if ctx.needs_input_grad[9] else None
+                shared_dw2 = shared_tensors[2].t() if ctx.needs_input_grad[10] else None
             _release_completed_graph(ctx, workspace)
             return (
                 grad_input,
@@ -859,10 +1005,91 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None,
                 grad_topk_weights,
                 None,
+                shared_dw1,
+                shared_dw2,
             )
         finally:
             leases.close()
             workspace.release()
+
+
+def _native_shared_forward(
+    source: torch.Tensor, first: torch.Tensor, second: torch.Tensor, limit: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute native shared intermediates once without staging copies or backward recomputation.
+
+    Args:
+        source: Dense token-major input.
+        first: Current shared gate/up weight.
+        second: Current shared down-projection weight.
+        limit: Optional clamp applied to the SwiGLU branches.
+
+    Returns:
+        Owned preactivation, activation and output in native dense layouts.
+    """
+    # Pylint cannot infer the callable signature of Torch's C linear binding.
+    up = torch.nn.functional.linear(source, first)  # pylint: disable=not-callable
+    activation_input = up
+    if limit is not None and limit > 0:
+        gate, branch = up.chunk(2, dim=-1)
+        activation_input = torch.cat((gate.clamp(max=limit), branch.clamp(-limit, limit)), dim=-1)
+    activation = torch_npu.npu_swiglu(activation_input, dim=-1)
+    return up, activation, torch.nn.functional.linear(activation, second)  # pylint: disable=not-callable
+
+
+class _NativeSharedBackward(torch.autograd.Function):
+    """Keep native shared gradients independent of the routed kernel's completion."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, source: torch.Tensor, first: torch.Tensor, second: torch.Tensor,
+        up: torch.Tensor, activation: torch.Tensor, output: torch.Tensor, limit: float | None,
+    ) -> torch.Tensor:
+        """Attach native backward to the shared forward result and owned intermediates.
+
+        Args:
+            ctx: Autograd state retaining this invocation's tensors.
+            source: Original token rows before TopK expansion.
+            first: Current dense gate/up weight.
+            second: Current dense down-projection weight.
+            up: Owned gate/up result produced by the fused forward.
+            activation: Owned shared activation produced by the fused forward.
+            output: Owned shared output produced by the fused forward.
+            limit: Optional SwiGLU branch clamp, matching the native MLP.
+
+        Returns:
+            The shared output with an independent native backward node.
+        """
+        ctx.save_for_backward(source, first, second, up, activation)
+        ctx.limit = limit
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[Any, ...]:
+        """Use the same dense layouts and activation derivative as native shared MLP.
+
+        Args:
+            ctx: Invocation-specific saved tensors and gradient requirements.
+            gradient: Token-major shared output gradient.
+
+        Returns:
+            Input and weight gradients followed by non-differentiable state slots.
+        """
+        source, first, second, up, activation = ctx.saved_tensors
+        grad_activation = torch.mm(gradient, second)
+        activation_input = up
+        if ctx.limit is not None and ctx.limit > 0:
+            gate, branch = up.chunk(2, dim=-1)
+            activation_input = torch.cat((gate.clamp(max=ctx.limit), branch.clamp(-ctx.limit, ctx.limit)), dim=-1)
+        grad_up = torch.ops.npu.npu_swiglu_backward(grad_activation, activation_input, -1)
+        if ctx.limit is not None and ctx.limit > 0:
+            grad_gate, grad_branch = grad_up.chunk(2, dim=-1)
+            grad_up = torch.cat((torch.where(gate <= ctx.limit, grad_gate, 0),
+                                 torch.where((branch >= -ctx.limit) & (branch <= ctx.limit), grad_branch, 0)), dim=-1)
+        grad_source = torch.mm(grad_up, first) if ctx.needs_input_grad[0] else None
+        grad_first = torch.mm(grad_up.t(), source) if ctx.needs_input_grad[1] else None
+        grad_second = torch.mm(gradient.t(), activation) if ctx.needs_input_grad[2] else None
+        return grad_source, grad_first, grad_second, None, None, None, None
 
 
 def execute_mega_moe(
@@ -898,6 +1125,8 @@ def execute_mega_moe(
         None,
         None,
         False,
+        None,
+        None,
     )
 
 
@@ -912,7 +1141,9 @@ def execute_mega_moe_with_permutation(
     *,
     topk_weights: torch.Tensor | None = None,
     workspace_claimed: bool = False,
-) -> torch.Tensor:
+    shared_weight1: torch.Tensor | None = None,
+    shared_weight2: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Include input permutation backward within the workspace lease.
 
     Args:
@@ -926,19 +1157,42 @@ def execute_mega_moe_with_permutation(
         topk_weights: Optional Router probabilities for integrated pull output unpermutation.
         workspace_claimed: Borrow a caller-held forward lease without releasing it.
             Backward always acquires its own lease on the original workspace.
+        shared_weight1: Optional caller-owned dense shared gate/up weight.
+        shared_weight2: Optional caller-owned dense shared down-projection weight.
 
     Returns:
         Owned expert-major rows, or token-major rows when topk_weights is provided,
         differentiable with respect to input tokens, expert weights and Router probabilities.
     """
-    return _MegaMoeFunction.apply(
+    # Shared descriptors bind dense rows; keep the layout copy in the caller's autograd graph.
+    if shared_weight1 is not None:
+        hidden_states = hidden_states.contiguous()
+    forward_shared = getattr(plan.spec, "forward_shared_expert", True)
+    backward_shared = getattr(plan.spec, "backward_shared_expert", False)
+    fused_shared = shared_weight1 is not None and (forward_shared or backward_shared)
+    result = _MegaMoeFunction.apply(
         hidden_states,
         _native_weight_operand(weight1, plan),
         _native_weight_operand(weight2, plan),
         route.metadata,
         plan,
         workspace,
-        (route.routed_tokens, topk_ids, route.unpermute_mapping),
+        (route.routed_tokens, topk_ids, route.unpermute_mapping, getattr(route, "permute_src_index", None),
+         getattr(route, "peer_row_ordinals", None)),
         topk_weights,
         workspace_claimed,
+        (shared_weight1 if backward_shared else shared_weight1.detach()) if fused_shared else None,
+        (shared_weight2 if backward_shared else shared_weight2.detach()) if fused_shared else None,
     )
+    if shared_weight1 is None:
+        return result
+    if not fused_shared:
+        return result, _native_shared_forward(hidden_states, shared_weight1, shared_weight2, plan.spec.swiglu_limit)[2]
+    routed_output, shared_output, shared_up, shared_activation = result
+    if backward_shared:
+        return routed_output, shared_output
+    shared_output = _NativeSharedBackward.apply(
+        hidden_states, shared_weight1, shared_weight2, shared_up, shared_activation,
+        shared_output, plan.spec.swiglu_limit,
+    )
+    return routed_output, shared_output

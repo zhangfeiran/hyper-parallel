@@ -21,6 +21,7 @@ __all__ = [
     "release",
 ]
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -29,7 +30,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, NoReturn, Optional
 
 from .. import _collective
-from ._runtime import _load_native, _torch_modules
+from ._runtime import _load_native, _torch_modules, configured_udma_qp_count
 
 if TYPE_CHECKING:
     import torch
@@ -196,9 +197,13 @@ def _subgroup_unique_id(
 
 
 def _validate_active_root(selected_group: Any, dist: Any, heap_size_bytes: int | None) -> None:
-    """Validate another owner against the initialized root."""
+    """Check that another owner can join the currently initialized root."""
+    config = _load_native()._debug_state()["config"]  # pylint: disable=protected-access
+    if config["data_engine"] != os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte"):
+        raise RuntimeError("SHMEM data engine differs from the active Runtime")
+    if config.get("udma_qp_num", 32) != configured_udma_qp_count():
+        raise RuntimeError("SHMEM UDMA QP count differs from the active Runtime")
     if heap_size_bytes is not None:
-        config = _load_native()._debug_state()["config"]  # pylint: disable=protected-access
         if config["heap_size_bytes"] < heap_size_bytes:
             raise RuntimeError("active SHMEM heap is smaller than the requested managed layout")
     if dist.is_initialized() != _root_uses_distributed:
@@ -221,9 +226,9 @@ def acquire(root_group: ProcessGroup | None = None, *, heap_size_bytes: int | No
 
     Args:
         heap_size_bytes: Optional explicit initialization size, overriding the environment for this lifecycle.
-        root_group: The EP ProcessGroup, which may be a subgroup of Torch WORLD. ``None`` selects WORLD when
-            Torch distributed is initialized, or a one-PE Root otherwise. Disjoint groups initialize independently;
-            one process cannot participate in two different active SHMEM roots simultaneously.
+        root_group: The EP ProcessGroup, which may be a subgroup of WORLD. ``None`` selects WORLD when
+            distributed communication is initialized, or a one-PE Root otherwise. Disjoint groups initialize
+            independently; one process cannot participate in two different active SHMEM roots simultaneously.
 
     Raises:
         RuntimeError: If the Root identity or framework state differs from the active lifecycle, or the Runtime was
@@ -483,8 +488,11 @@ def _restart(
                 root_group=_root_group,
             )
 
+        preflight_state: tuple[Any, ...] = ()
+
         def preflight() -> tuple[Any, ...]:
             """Capture and validate the complete local pre-destructive state."""
+            nonlocal preflight_state
             if _runtime_invalidated:
                 raise _RuntimeUnavailableError(_INVALIDATED_RUNTIME_MESSAGE)
             if _users != 1:
@@ -510,13 +518,20 @@ def _restart(
                 raise RuntimeError("current NPU device differs from the SHMEM Runtime device")
             if torch.npu.is_current_stream_capturing():
                 raise RuntimeError("SHMEM restart is unavailable during graph capture")
+            requested_engine = os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte")
+            if native_state["config"]["data_engine"] != requested_engine:
+                raise RuntimeError("SHMEM restart cannot change the active data engine")
+            if native_state["config"].get("udma_qp_num", 32) != configured_udma_qp_count():
+                raise RuntimeError("SHMEM restart cannot change the active UDMA QP count")
             business_state = preflight_hook()
             current_manifest, target_manifest = _validate_replacements(
                 replacements,
                 native_state,
                 heap_size_bytes,
             )
-            return heap_size_bytes, business_state, current_manifest, target_manifest
+            preflight_state = (heap_size_bytes, business_state, current_manifest, target_manifest,
+                               native_state["config"]["data_engine"], configured_udma_qp_count())
+            return preflight_state
 
         try:
             stages_ms = {
@@ -573,6 +588,8 @@ def _restart(
                     _root_size,
                     unique_id,
                     heap_size_bytes,
+                    data_engine=preflight_state[4],
+                    udma_qp_num=preflight_state[5],
                 )
                 native_state = native._debug_state()  # pylint: disable=protected-access
                 if int(native_state["device_index"]) != _device_index:

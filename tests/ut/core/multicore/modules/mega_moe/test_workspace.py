@@ -43,7 +43,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
 
     def test_restart_rebinds_replica_storage_and_invalidates_old_address_views(self) -> None:
         """A committed Heap restart must replace every replica address and cached runtime image."""
-        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=8, intermediate_size=4,
+        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, top_k=2, hidden_size=8, intermediate_size=4,
                                ep_size=2, num_experts=6, dispatch_mode="push", replica_slots_per_rank=1,
                                replica_transport="shmem_signal_kernel_gradient_bands")
         workspace = MegaMoeWorkspace(shared=True)
@@ -261,7 +261,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
 
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Retain expanded event storage when allocating through the SHMEM API."""
-        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
+        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, top_k=2, hidden_size=16,
                                ep_size=64, num_experts=1024, dispatch_mode="push", replica_slots_per_rank=0)
         workspace = MegaMoeWorkspace(shared=True)
         with (

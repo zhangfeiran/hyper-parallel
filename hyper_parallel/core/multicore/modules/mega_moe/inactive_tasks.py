@@ -143,6 +143,8 @@ def build_guest_task_prefixes(config: RuntimeConfigC, *, home_experts: int, ep_s
         task = config.all_tasks[task_id]
         if task.task_type not in (TaskType.TASK_GROUPED_MATMUL, TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
             continue
+        if task.inputs[0].tensor_type == 2:
+            continue
         if task.task_split_num < local or task.task_split_num % local:
             return ()
         experts[task_id] = int(task.task_index) // (int(task.task_split_num) // local)

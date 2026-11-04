@@ -28,6 +28,7 @@ struct ConfigInput {
   std::optional<std::string> heap_size;
   std::optional<std::string> timeout;
   std::optional<std::string> data_engine;
+  std::optional<std::string> udma_qp_num;
   std::optional<std::string> bootstrap_endpoint_base;
 };
 
@@ -109,12 +110,22 @@ Result<Config> ParseConfig(const ConfigInput &input) {
 
   const std::string_view data_engine =
     input.data_engine.has_value() ? std::string_view(*input.data_engine) : kDefaultDataEngine;
-  if (data_engine != kDefaultDataEngine) {
+  if (data_engine != kDefaultDataEngine && data_engine != "mte_udma") {
     return Result<Config>::Failure(InvalidConfig(std::string(kDataEngineEnv) +
-                                                 " only accepts the case-sensitive value 'mte', but got '" +
+                                                 " only accepts 'mte' or 'mte_udma', but got '" +
                                                  std::string(data_engine) + "'"));
   }
-  config.data_engine = DataEngine::Mte;
+  config.data_engine = data_engine == "mte_udma" ? DataEngine::MteUdma : DataEngine::Mte;
+  if (input.udma_qp_num.has_value()) {
+    const std::string &value = *input.udma_qp_num;
+    if (value != "16" && value != "32") {
+      return Result<Config>::Failure(InvalidConfig(std::string(kUdmaQpNumEnv) + " must be 16 or 32"));
+    }
+    config.udma_qp_num = value == "16" ? 16U : 32U;
+  }
+  if (config.udma_qp_num != 32U && config.data_engine != DataEngine::MteUdma) {
+    return Result<Config>::Failure(InvalidConfig("A reduced UDMA QP bank requires mte_udma"));
+  }
 
   const std::string_view endpoint = input.bootstrap_endpoint_base.has_value()
                                       ? std::string_view(*input.bootstrap_endpoint_base)
@@ -135,6 +146,7 @@ Result<Config> LoadConfigFromEnvironment() {
   input.heap_size = ReadEnvironment(kHeapSizeEnv);
   input.timeout = ReadEnvironment(kTimeoutEnv);
   input.data_engine = ReadEnvironment(kDataEngineEnv);
+  input.udma_qp_num = ReadEnvironment(kUdmaQpNumEnv);
   input.bootstrap_endpoint_base = ReadEnvironment(kBootstrapEndpointEnv);
   return ParseConfig(input);
 }

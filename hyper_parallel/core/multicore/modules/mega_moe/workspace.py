@@ -39,8 +39,11 @@ from hyper_parallel.core.multicore.scheduler.config import (
     mega_moe_event_capacity,
 )
 from hyper_parallel.core.multicore.shmem import _lifecycle
+from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 
-from .spec import MegaMoeSpec, initial_receive_capacity
+from .spec import MegaMoeSpec, initial_receive_capacity, _route_metadata_rows
+from .indexed_backward import BACKWARD_METADATA_PREFIX_ROWS
+from .udma_order import SUBMISSION_ORDER, validate_transport
 
 # The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
 # tensor arguments. Keep non-empty ABI placeholders; native tiling reserves
@@ -48,8 +51,10 @@ from .spec import MegaMoeSpec, initial_receive_capacity
 _GMM_WORKSPACE_BYTES = 512
 _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
-_SYMMETRIC_FIELDS = ("source_buffer", "expert_buffer", "routed_buffer",
-                     "forward_event_counters", "backward_event_counters", "replica_inbox")
+_SYMMETRIC_FIELDS = (
+    "source_buffer", "expert_buffer", "routed_buffer", "forward_event_counters", "backward_event_counters",
+    "replica_inbox", "route_metadata", "backward_route_metadata",
+)
 
 
 def _workspace_allocation_specs(
@@ -62,11 +67,19 @@ def _workspace_allocation_specs(
     num_experts: int,
     dtype: torch.dtype,
     replica_inbox_bytes: int = 0,
+    shared_expert: bool = False,
+    forward_ingress_mode: str = "legacy",
+    backward_ingress_mode: str = "legacy",
+    top_k: int = 1,
 ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
     """Return the single ordered physical Allocation description for a workspace."""
     data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
     data_rows = routed_slots if dispatch_mode == "pull" else receive_capacity
-    event_bytes = event_workspace_bytes(ep_size, num_experts)
+    if backward_ingress_mode == "indexed":
+        if dispatch_mode != "pull" or forward_ingress_mode != "indexed" or top_k <= 0:
+            raise ValueError("Compact backward allocations require paired indexed pull ingress")
+        data_rows = routed_slots // top_k
+    event_bytes = event_workspace_bytes(ep_size, num_experts, shared_expert=shared_expert)
     allocation_spec = _lifecycle._AllocationSpec  # pylint: disable=protected-access
     allocations = (
         (data_field, allocation_spec((data_rows, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
@@ -77,6 +90,15 @@ def _workspace_allocation_specs(
     if replica_inbox_bytes:
         allocations += (("replica_inbox", allocation_spec(
             (replica_inbox_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),)
+    if forward_ingress_mode != "legacy":
+        # The tail holds one private 128-byte cache line per diagnostic task.
+        # Peers never read it; scalar counter stores cannot share cache lines.
+        metadata_rows = _route_metadata_rows(routed_slots, num_experts, ep_size, forward_ingress_mode)
+        allocations += (("route_metadata", allocation_spec(
+            (metadata_rows, 4), torch.int32, _WORKSPACE_ALIGNMENT)),)
+    if backward_ingress_mode == "indexed":
+        allocations += (("backward_route_metadata", allocation_spec(
+            (BACKWARD_METADATA_PREFIX_ROWS + routed_slots, 4), torch.int32, _WORKSPACE_ALIGNMENT)),)
     return allocations
 
 
@@ -113,6 +135,10 @@ def _spec_workspace_bytes(
         num_experts=specification["num_experts"],
         dtype=dtype,
         replica_inbox_bytes=_replica_inbox_bytes(specification),
+        shared_expert=bool(specification.get("shared_intermediate_size", 0)),
+        forward_ingress_mode=specification.get("forward_ingress_mode", "legacy"),
+        backward_ingress_mode=specification.get("backward_ingress_mode", "legacy"),
+        top_k=specification["top_k"],
     )
     return sum(
         spec.dtype.itemsize * math.prod(spec.shape)
@@ -134,6 +160,9 @@ class MegaMoeWorkspace:
     source_buffer: Any | None = None
     expert_buffer: Any | None = None
     routed_buffer: Any | None = None
+    route_metadata: Any | None = None
+    backward_route_metadata: Any | None = None
+    backward_ingress_mode: str = "legacy"
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
     replica_inbox: Any | None = None
@@ -153,6 +182,13 @@ class MegaMoeWorkspace:
     heap_manager: Any | None = field(default=None, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
+    uses_udma: bool = field(init=False, repr=False)
+    udma_qp_count: int = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Bind process-wide QP ownership to this workspace's data engine."""
+        self.uses_udma = validate_transport()
+        self.udma_qp_count = configured_udma_qp_count()
 
     def describe_restart_allocations(
         self,
@@ -165,6 +201,9 @@ class MegaMoeWorkspace:
             return ()
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
+            forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
+            backward_ingress_mode=getattr(spec, "backward_ingress_mode", "legacy"),
+            top_k=spec.top_k,
             routed_slots=spec.routed_slots,
             receive_capacity=receive_capacity,
             hidden_size=spec.hidden_size,
@@ -172,6 +211,7 @@ class MegaMoeWorkspace:
             num_experts=spec.num_experts,
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
+            shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
         )
         replacement = _lifecycle._AllocationReplacement  # pylint: disable=protected-access
         return tuple(replacement(getattr(self, field_name), target) for field_name, target in targets)
@@ -195,6 +235,9 @@ class MegaMoeWorkspace:
             return False
         expected = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
+            forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
+            backward_ingress_mode=getattr(spec, "backward_ingress_mode", "legacy"),
+            top_k=spec.top_k,
             routed_slots=spec.routed_slots,
             receive_capacity=current_capacity,
             hidden_size=spec.hidden_size,
@@ -202,6 +245,7 @@ class MegaMoeWorkspace:
             num_experts=spec.num_experts,
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
+            shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
         )
         if len(replacements) != len(expected):
             raise RuntimeError("materialized workspace has an incomplete restart Allocation mapping")
@@ -224,6 +268,9 @@ class MegaMoeWorkspace:
         """Bind validated replacement Tensors without allocating or running collectives."""
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
+            forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
+            backward_ingress_mode=getattr(spec, "backward_ingress_mode", "legacy"),
+            top_k=spec.top_k,
             routed_slots=spec.routed_slots,
             receive_capacity=receive_capacity,
             hidden_size=spec.hidden_size,
@@ -231,17 +278,21 @@ class MegaMoeWorkspace:
             num_experts=spec.num_experts,
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
+            shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
         )
         self.source_buffer = None
         self.expert_buffer = None
         for tensor, (field_name, _) in zip(tensors, targets):
             setattr(self, field_name, tensor)
         self.dispatch_mode = spec.dispatch_mode
+        self.backward_ingress_mode = getattr(spec, "backward_ingress_mode", "legacy")
         self.dtype = dtype
         self.device = device
         self.expert_capacity = receive_capacity
         self.routed_slots = spec.routed_slots
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
+        self.event_counter_bytes = mega_moe_event_capacity(
+            spec.num_experts, spec.ep_size, shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
+        ) * 4
         self.forward_ready_initialized = False
         self.backward_ready_initialized = False
         for _, _, image in self.replica_runtime_images.values():
@@ -262,6 +313,9 @@ class MegaMoeWorkspace:
         """Validate a complete replacement slice without modifying workspace state."""
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
+            forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
+            backward_ingress_mode=getattr(spec, "backward_ingress_mode", "legacy"),
+            top_k=spec.top_k,
             routed_slots=spec.routed_slots,
             receive_capacity=receive_capacity,
             hidden_size=spec.hidden_size,
@@ -269,6 +323,7 @@ class MegaMoeWorkspace:
             num_experts=spec.num_experts,
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
+            shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
         )
         if len(tensors) != len(targets):
             raise RuntimeError("SHMEM restart returned an unexpected Allocation count")
@@ -319,6 +374,7 @@ class MegaMoeWorkspace:
         if self.expert_buffer is not None or self.source_buffer is not None:
             compatible = (
                 self.dispatch_mode == spec.dispatch_mode
+                and self.backward_ingress_mode == getattr(spec, "backward_ingress_mode", "legacy")
                 and self.dtype == dtype
                 and self.device == device
                 and self.routed_slots == spec.routed_slots
@@ -330,6 +386,9 @@ class MegaMoeWorkspace:
 
         allocations = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
+            forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
+            backward_ingress_mode=getattr(spec, "backward_ingress_mode", "legacy"),
+            top_k=spec.top_k,
             routed_slots=spec.routed_slots,
             receive_capacity=requested_capacity,
             hidden_size=spec.hidden_size,
@@ -337,13 +396,17 @@ class MegaMoeWorkspace:
             num_experts=spec.num_experts,
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
+            shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
         )
         self.dispatch_mode = spec.dispatch_mode
+        self.backward_ingress_mode = getattr(spec, "backward_ingress_mode", "legacy")
         self.dtype = dtype
         self.device = device
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
+        self.event_counter_bytes = mega_moe_event_capacity(
+            spec.num_experts, spec.ep_size, shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
+        ) * 4
         try:
             for field_name, allocation in allocations:
                 setattr(self, field_name, shmem.empty(
@@ -414,12 +477,16 @@ class MegaMoeWorkspace:
     def claim(self) -> None:
         """Claim the serial workspace and order it after the previous stream."""
         with self._access(), self.lock:
+            if configured_udma_qp_count() != self.udma_qp_count:
+                raise RuntimeError("UDMA QP count differs from the bound workspace")
             if self.closing:
                 raise RuntimeError("cannot claim a closing MegaMoe workspace.")
             if self.in_use:
                 raise RuntimeError("MegaMoe execution resources do not support concurrent calls.")
             if self.used:
                 torch.npu.current_stream().wait_event(self.completion_event)
+            if self.uses_udma:
+                SUBMISSION_ORDER.claim(torch.npu.current_stream())
             self.in_use = True
 
     def release(self) -> None:
@@ -428,6 +495,8 @@ class MegaMoeWorkspace:
             if not self.in_use:
                 raise RuntimeError("MegaMoe workspace was released without an active lease.")
             self.completion_event.record(torch.npu.current_stream())
+            if self.uses_udma:
+                SUBMISSION_ORDER.release(torch.npu.current_stream(), self.completion_event)
             self.in_use = False
             self.used = True
 

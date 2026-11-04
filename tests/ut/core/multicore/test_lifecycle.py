@@ -77,8 +77,40 @@ class TestLifecycle(unittest.TestCase):
             member._get_execution_resources(SimpleNamespace(device="cpu", dtype="float32"))
         return member, resources
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_metadata_exchange_distinguishes_registered_root_and_world(self) -> None:
+        """Feature: Lifecycle metadata group selection.
+        Description: Exercise omitted, explicit WORLD, and explicit subgroup selection.
+        Expectation: Only omission inherits the managed cleanup root.
+        """
+        registered_root, subgroup = object(), object()
+        distributed = SimpleNamespace(
+            is_initialized=Mock(return_value=True),
+            get_world_size=Mock(return_value=2),
+            all_gather_object=Mock(side_effect=lambda values, value, **_kwargs: values.__setitem__(
+                slice(None), [value, value])),
+        )
+        with patch.object(_collective, "dist", distributed), patch.object(
+                _automatic._CLEANUP, "root_group", registered_root):
+            for kwargs, expected_group in (({}, registered_root), ({"group": None}, None),
+                                           ({"group": subgroup}, subgroup)):
+                with self.subTest(kwargs=kwargs):
+                    distributed.all_gather_object.reset_mock()
+
+                    self.assertEqual(_automatic.exchange("state", **kwargs), ["state", "state"])
+
+                    distributed.get_world_size.assert_called_with(expected_group)
+                    distributed.all_gather_object.assert_called_once_with(
+                        ["state", "state"], "state", group=expected_group)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_failed_close_retains_handles_for_retry(self):
-        """Failed explicit close keeps its finalizer, handles and retry path."""
+        """Feature: Multicore resource lifecycle.
+        Description: Failed explicit close keeps its finalizer, handles and retry path.
+        Expectation: A failed close retains resources and its finalizer until retry succeeds.
+        """
         member, resources = self._bind()
         resources.close.side_effect = RuntimeError("busy")
         with self.assertRaisesRegex(RuntimeError, "busy"):
@@ -161,19 +193,25 @@ class TestLifecycle(unittest.TestCase):
         ):
             self.assertEqual(_automatic.exchange("default"), ["default"])
             _automatic.collective_call(Mock(), stage="registered close")
+            _automatic.collective_call(Mock(), stage="explicit close", group=explicit_group)
+            _automatic.collective_call(Mock(), stage="world close", group=None)
             self.assertEqual(
                 _collective.exchange("explicit", group=explicit_group, failure_prefix="exchange failed"), ["explicit"]
             )
             self.assertEqual(_collective.exchange("world", group=None, failure_prefix="exchange failed"), ["world"])
             _collective.collective_call(Mock(), stage="explicit close", group=explicit_group)
 
-        self.assertEqual(gathered_groups, [registered_group, registered_group, explicit_group, None, explicit_group])
+        self.assertEqual(gathered_groups, [
+            registered_group, registered_group, explicit_group, None, explicit_group, None, explicit_group,
+        ])
         with (
             patch.object(_collective.dist, "is_initialized", return_value=False),
             patch.object(_collective.dist, "all_gather_object") as gather_mock,
         ):
             for group in (None, explicit_group):
-                self.assertEqual(_collective.exchange("local", group=group, failure_prefix="exchange failed"), ["local"])
+                self.assertEqual(
+                    _collective.exchange("local", group=group, failure_prefix="exchange failed"), ["local"],
+                )
             gather_mock.assert_not_called()
         for method in ("is_initialized", "get_world_size", "all_gather_object"):
             error = ValueError("invalid communicator")
@@ -213,8 +251,13 @@ class TestLifecycle(unittest.TestCase):
             self.assertFalse(self.manager._groups)
             self.assertIsNone(self.manager.runtime_release)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_retained_graph_and_partial_free(self):
-        """A retained graph blocks close; retry never repeats a successful free."""
+        """Feature: Multicore resource lifecycle.
+        Description: A retained graph blocks close; retry never repeats a successful free.
+        Expectation: Live graphs block close and retries preserve already completed frees.
+        """
         workspace = MegaMoeWorkspace(shared=False)
         output = _Graph.apply(ones(1, requires_grad=True), workspace)
         output.sum().backward(retain_graph=True)
@@ -231,8 +274,13 @@ class TestLifecycle(unittest.TestCase):
             workspace._free_symmetric_tensors()
         self.assertEqual(free.call_count, 3)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_orphan_pool_reuses_and_evicts_without_explicit_close(self):
-        """Repeated model replacement reuses one slot and evicts incompatible orphans."""
+        """Feature: Multicore resource lifecycle.
+        Description: Repeated model replacement reuses one slot and evicts incompatible orphans.
+        Expectation: Compatible orphan slots are reused and incompatible slots are released.
+        """
         member, resources = self._bind()
         for _ in range(8):
             del member
@@ -249,6 +297,8 @@ class TestLifecycle(unittest.TestCase):
         replacement.close()
         release.assert_called_once_with()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_workspace_retry_keeps_stages_aligned_and_rejects_claim(self):
         """A local free failure retains the event and re-enters both barriers on retry."""
         root_group = object()
@@ -282,8 +332,13 @@ class TestLifecycle(unittest.TestCase):
         self.assertEqual(barrier.call_count, 6)
         self.assertIsNone(workspace.completion_event)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_orphan_reuse_requires_all_ranks_idle(self):
-        """A remote live owner or a local graph blocks reuse without blocking allocation."""
+        """Feature: Multicore resource lifecycle.
+        Description: A remote live owner or a local graph blocks reuse without blocking allocation.
+        Expectation: Remote owners and local graphs prevent orphan reuse.
+        """
         member, resources = self._bind()
         del member
         resources.can_close.return_value = False
@@ -297,8 +352,13 @@ class TestLifecycle(unittest.TestCase):
         self.assertIsNot(replacement._resource_group.resources, resources)
         resources.close.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_backend_hook_orders_cleanup_and_preserves_retry(self):
-        """Backend interception covers aliases, unrelated groups, exit and release errors."""
+        """Feature: Multicore resource lifecycle.
+        Description: Backend interception covers aliases, unrelated groups, exit and release errors.
+        Expectation: Dependency cleanup precedes backend teardown and retains retryable ownership.
+        """
         events = []
         backend = type("Backend", (), {"shutdown": Mock(side_effect=lambda *_: events.append("backend"))})
         dependency, unrelated = backend(), backend()

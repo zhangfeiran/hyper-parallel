@@ -58,6 +58,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
 )
 from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capacity
+from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
@@ -77,6 +78,7 @@ from .workspace import MegaMoeWorkspace
 
 ExpertWeightLayout = Literal["EIO", "EOI"]
 _EXPERT_WEIGHT_LAYOUTS = frozenset(("EIO", "EOI"))
+_MAX_A5_ROW_PLANS = 50
 _CHECKPOINT_GRAD_MODE_KEY = object()
 
 
@@ -280,6 +282,10 @@ class _MegaMoeExecutionResources:
             self.spec.expert_weight_layout,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
+            self.spec.forward_ingress_mode, self.spec.backward_ingress_mode,
+            self.spec.shared_intermediate_size, self.spec.shared_placement,
+            self.spec.forward_shared_expert, self.spec.backward_shared_expert,
+            self.workspace.udma_qp_count,
         )
 
     def prepare_auto_workspace(self, tokens: int, received: int, tensor: torch.Tensor) -> None:
@@ -312,11 +318,12 @@ class _MegaMoeExecutionResources:
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
                   "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens",
                   "_replica_cost_model_enabled", "_replica_critical_path_identity",
-                  "replica_slots_per_rank", "replica_transport")
+                  "replica_slots_per_rank", "replica_transport", "forward_ingress_mode", "backward_ingress_mode",
+                  "shared_intermediate_size", "shared_placement", "forward_shared_expert", "backward_shared_expert")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v4", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications),
-                    getattr(self, 'soc_name', ''))
+                    getattr(self, 'soc_name', ''), configured_udma_qp_count())
         if any(spec.get('_replica_critical_path_identity') for spec in specifications):
             manifest += (_critical_native_fingerprint(),)
         # Resource groups must have the same order as their symmetric allocations.
@@ -344,14 +351,19 @@ class _MegaMoeExecutionResources:
             raise RuntimeError(f"MegaMoe schedule exceeds committed token capacity: "
                                f"requested={tokens}, capacity={self._token_capacity}")
         bucket = 1 << (max(128, tokens) - 1).bit_length()
-        key = (bucket, True) if home_only else bucket
+        exact_rows = spec.forward_ingress_mode != "legacy" or bool(spec.shared_intermediate_size)
+        key = ("a5_rows", tokens, home_only) if exact_rows else ((bucket, True) if home_only else bucket)
         plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
             schedule_tokens = min(bucket, self._token_capacity)
-            plan = build_mega_moe_plan(replace(spec, schedule_tokens=schedule_tokens), device)
+            execution_spec = (replace(spec, local_num_tokens=tokens, schedule_tokens=tokens) if exact_rows
+                              else replace(spec, schedule_tokens=schedule_tokens))
+            plan = build_mega_moe_plan(execution_spec, device)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.
             self._plans[key] = plan
+            if exact_rows and len(self._plans) > _MAX_A5_ROW_PLANS:
+                self._plans.pop(next(iter(self._plans)))
         return plan
 
     def close(self) -> None:
@@ -456,6 +468,12 @@ class MegaMoeExperts(MulticoreModule):
         replica_planner: str = "cpu",
         replica_target_load: int | None = None,
         replica_minimum_load_reduction: float | None = None,
+        forward_ingress_mode: str = "legacy",
+        backward_ingress_mode: str = "legacy",
+        shared_intermediate_size: int = 0,
+        shared_placement: str = "idle",
+        forward_shared_expert: bool = True,
+        backward_shared_expert: bool = False,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -491,6 +509,16 @@ class MegaMoeExperts(MulticoreModule):
                 for the intended shape and use the same value on all EP ranks.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
+            forward_ingress_mode: Experimental Ascend 950 BF16 ingress: "legacy" or
+                "indexed", "peer_dedup", or "peer_overlap". Indexed modes require static pull and Blaze F2.
+                Peer overlap uses owner-first vector queues and dynamic per-expert row credits.
+                Peer token uses original-token jobs and packed fanout metadata.
+                Peer tile publishes input-tile credits to the unchanged Blaze F2 arithmetic.
+                Peer dedup uses a dispatch prepass followed by the original compute graph.
+                It preserves the legacy backward source capacity and receive layout.
+            backward_ingress_mode: Experimental "indexed" backward publishes original dY rows and
+                computes route-weight gradients in the backward graph. Requires indexed forward,
+                static pull on Ascend 950, and hidden size divisible by 32 and at most 8192.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
                 Must be a positive multiple of 128.
             combine_split: Combine tile rows in forward and backward, with the same
@@ -505,9 +533,15 @@ class MegaMoeExperts(MulticoreModule):
                 ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
                 ``[experts, out_features, in_features]`` and accepts Torch linear storage directly. ``EOI`` weights
                 must use dense contiguous storage for zero-copy execution.
-            ep_group: Explicit EP group; expert ownership follows group-local rank order.
-                Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
-                can be active in SHMEM per process.
+            shared_intermediate_size: Width of caller-owned local shared weights; zero disables the branch.
+            shared_placement: Place shared kernel tasks in idle slots or at the front of the queues.
+            forward_shared_expert: Fuse shared forward. A5 uses native shared forward below 512 token rows
+                to retain strict shared-gradient agreement. Defaults to the existing forward-only behavior.
+            backward_shared_expert: Fuse shared backward independently; experimental and disabled by default.
+            ep_group: Torch expert-parallel process group, possibly a subgroup of
+                WORLD. Expert ownership follows group-local rank order. Disjoint
+                PP/DP groups bootstrap independently; one process can have only
+                one ordered EP membership active in SHMEM at a time.
         """
         if replica_transport not in ("p2p", *KERNEL_GRADIENT_TRANSPORT_MODES):
             raise ValueError("Unsupported replica_transport; expected p2p or a kernel-gradient transport")
@@ -526,6 +560,32 @@ class MegaMoeExperts(MulticoreModule):
             reduction_basis_points(replica_minimum_load_reduction)
         self.replica_minimum_load_reduction = replica_minimum_load_reduction
         self.replica_transport = replica_transport
+        if (isinstance(shared_intermediate_size, bool) or not isinstance(shared_intermediate_size, int)
+                or shared_intermediate_size < 0):
+            raise ValueError("shared_intermediate_size must be a nonnegative integer")
+        if shared_placement not in ("idle", "front"):
+            raise ValueError("shared_placement must be idle or front")
+        if not isinstance(forward_shared_expert, bool) or not isinstance(backward_shared_expert, bool):
+            raise ValueError("forward_shared_expert and backward_shared_expert must be booleans")
+        if backward_ingress_mode not in ("legacy", "indexed"):
+            raise ValueError("backward_ingress_mode must be legacy or indexed")
+        if backward_ingress_mode == "indexed":
+            if forward_ingress_mode != "indexed" or dispatch_mode != "pull":
+                raise ValueError("Indexed backward ingress requires indexed forward and static pull dispatch")
+            if hidden_size > 8192 or hidden_size % 32:
+                raise ValueError("Indexed backward ingress requires hidden_size divisible by 32 and at most 8192")
+            if top_k > 32:
+                raise ValueError("Indexed backward ingress currently supports top_k at most 32")
+        if forward_ingress_mode not in ("legacy", "indexed", "peer_dedup", "peer_overlap", "peer_token", "peer_tile"):
+            raise ValueError("forward_ingress_mode must be legacy, indexed, peer_dedup, "
+                             "peer_overlap, peer_token or peer_tile")
+        if forward_ingress_mode != "legacy":
+            if dispatch_mode != "pull":
+                raise ValueError("Indexed forward ingress requires static pull dispatch")
+            if forward_ingress_mode in ("peer_dedup", "peer_overlap", "peer_token", "peer_tile") and top_k > 16:
+                raise ValueError("Peer dedup ingress currently supports top_k at most 16")
+            if forward_ingress_mode in ("peer_overlap", "peer_token", "peer_tile") and num_experts // ep_size > 64:
+                raise ValueError("Peer overlap supports at most 64 local experts")
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT,
             "hidden_size": hidden_size,
@@ -544,6 +604,12 @@ class MegaMoeExperts(MulticoreModule):
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
+            "forward_ingress_mode": forward_ingress_mode,
+            "backward_ingress_mode": backward_ingress_mode,
+            "shared_intermediate_size": shared_intermediate_size,
+            "shared_placement": shared_placement,
+            "forward_shared_expert": forward_shared_expert,
+            "backward_shared_expert": backward_shared_expert,
         }
         specification["auto_tokens"] = True
         if replica_slots_per_rank:
@@ -580,6 +646,7 @@ class MegaMoeExperts(MulticoreModule):
         self.dispatch_mode = specification["dispatch_mode"]
         self.dispatch_split = specification["dispatch_split"]
         self.combine_split = specification["combine_split"]
+        self.shared_intermediate_size = specification.get("shared_intermediate_size", 0)
         self.swiglu_limit = specification["swiglu_limit"]
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
@@ -804,6 +871,8 @@ class MegaMoeExperts(MulticoreModule):
         *,
         tokens_per_expert: torch.Tensor | None = None,
         expert_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+        shared_gate_up_weight: torch.Tensor | None = None,
+        shared_down_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Route token states through the configured experts.
 
@@ -828,6 +897,9 @@ class MegaMoeExperts(MulticoreModule):
             The steady-state path validates metadata but deliberately does not
             rebuild and compare the histogram.
         """
+        if self._resource_group.specification.get("forward_ingress_mode", "legacy") != "legacy":
+            if topk_ids.numel() > 2**24:
+                raise ValueError("Indexed scalar route sorting requires at most 2**24 route slots")
         weights = ((self.gate_up_weight, self.down_weight) if expert_weights is None else expert_weights)
         hidden_flat = self._validate_forward_inputs(
             hidden_states,
@@ -836,6 +908,18 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
             weights,
         )
+        shared_weights = (shared_gate_up_weight, shared_down_weight)
+        if self.shared_intermediate_size:
+            expected_shapes = ((2 * self.shared_intermediate_size, self.hidden_size),
+                               (self.hidden_size, self.shared_intermediate_size))
+            for weight, expected in zip(shared_weights, expected_shapes):
+                if weight is None or tuple(weight.shape) != expected:
+                    raise ValueError(f"Shared weight must have shape {expected}")
+                if (weight.device != hidden_flat.device or weight.dtype != hidden_flat.dtype
+                        or not weight.is_contiguous()):
+                    raise ValueError("Shared weights must be contiguous and match the input device and dtype")
+        elif any(weight is not None for weight in shared_weights):
+            raise ValueError("Shared weights require shared_intermediate_size at construction")
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
@@ -938,18 +1022,25 @@ class MegaMoeExperts(MulticoreModule):
                 resources.workspace,
                 topk_weights=topk_weights if pull else None,
                 workspace_claimed=pull,
+                **({"shared_weight1": shared_gate_up_weight, "shared_weight2": shared_down_weight}
+                   if self.shared_intermediate_size else {}),
             )
         finally:
             if claimed:
                 resources.workspace.release()
+        shared_output = None
+        if self.shared_intermediate_size:
+            expert_output, shared_output = expert_output
         if pull:
-            return expert_output.reshape_as(hidden_states)
+            output = expert_output.reshape_as(hidden_states)
+            return output if shared_output is None else output + shared_output.reshape_as(hidden_states)
         output = restore_topk_output(
             expert_output,
             route.unpermute_mapping,
             topk_weights,
         )
-        return output.reshape(hidden_states.shape)
+        output = output.reshape(hidden_states.shape)
+        return output if shared_output is None else output + shared_output.reshape_as(hidden_states)
 
     def _create_execution_resources(
         self,

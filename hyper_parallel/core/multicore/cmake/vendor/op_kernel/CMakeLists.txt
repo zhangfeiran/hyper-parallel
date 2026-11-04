@@ -17,10 +17,12 @@ if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
     set(KERNEL_COMPUTE_UNIT ascend910b1)
 elseif(ASCEND_COMPUTE_UNIT STREQUAL "ascend910_93")
     set(KERNEL_COMPUTE_UNIT ascend910_9391)
+elseif(ASCEND_COMPUTE_UNIT STREQUAL "ascend950")
+    set(KERNEL_COMPUTE_UNIT ascend950dt_9582)
 else()
     message(
         FATAL_ERROR
-        "Unsupported HyperMegaMoe compute unit: ${ASCEND_COMPUTE_UNIT}"
+        "Unsupported Multicore compute unit: ${ASCEND_COMPUTE_UNIT}"
     )
 endif()
 
@@ -36,6 +38,7 @@ npu_op_kernel_library(ascendc_kernels
 
 npu_op_kernel_options(ascendc_kernels ALL OPTIONS
     -I${CANN_OP_COMMON_INCLUDE}
+    -I${HP_SHMEM_SDK_ROOT}/src
     -I${HP_SHMEM_SDK_ROOT}/include
     -I${HP_SHMEM_SDK_ROOT}/src/device
     -I${HP_MULTICORE_SOURCE_ROOT}/shmem

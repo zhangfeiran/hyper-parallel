@@ -42,9 +42,14 @@ using namespace AscendC;  // NOLINT(build/namespaces)
 namespace MulticoreRuntime {
 
 constexpr uint32_t VECTOR_WORKER_STRIDE = 2;
-constexpr int64_t EVENT_REFRESH_TIME_UNIT_CYCLES = 50;
-constexpr int64_t CUBE_EVENT_REFRESH_INTERVAL_UNITS = 50;     // 2,500 system cycles.
-constexpr int64_t VECTOR_EVENT_REFRESH_INTERVAL_UNITS = 150;  // 7,500 system cycles.
+// GetSystemCycle measures the fixed system counter, not the AI Core clock.
+#if __NPU_ARCH__ == 3510
+constexpr int64_t SYSTEM_CYCLES_PER_US = 1000;
+#else
+constexpr int64_t SYSTEM_CYCLES_PER_US = 50;
+#endif
+constexpr int64_t CUBE_EVENT_REFRESH_INTERVAL_US = 50;
+constexpr int64_t VECTOR_EVENT_REFRESH_INTERVAL_US = 150;
 // The selected SwiGLU tiling uses baseRowLen=19; smaller dynamic tails must lower it.
 constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
 constexpr int64_t READY_SIGNAL_RADIX = 2;
@@ -63,6 +68,8 @@ template <typename Derived, VectorWorkerPolicy WorkerPolicy = VectorWorkerPolicy
           RuntimeStorageBoundsPolicy StorageBoundsPolicy = RuntimeStorageBoundsPolicy::NATIVE_TILING>
 class KernelWorkerBase {
  public:
+  static constexpr uint32_t SHARED_PTRS_IDX = 0xFFFFFFFF;
+
   __aicore__ inline KernelWorkerBase() {}
 
   static constexpr uint32_t PROFILE_DESC_WAIT_DEPENDENCY = 0x10000;
@@ -132,7 +139,7 @@ class KernelWorkerBase {
     }
     this->runtime_task_capacity = getRuntimeTaskCapacity(runtimeConfigPtr);
     this->runtime_event_capacity = getRuntimeEventCapacity(runtimeConfigPtr);
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     // The worker's scratch region is fixed for the lifetime of this task graph.
     this->grouped_matmul_group_list_offset_ = getGroupedMatmulGroupListOffsetById(runtimeConfigPtr, worker_id);
 #endif
@@ -157,10 +164,18 @@ class KernelWorkerBase {
     this->vector_num = getNumWorkers(this->runtimeConfigPtr);
     this->core_num = this->vector_num / 2;
     this->active_vector_num = WorkerPolicy == VectorWorkerPolicy::ALL ? this->vector_num : this->vector_num / 2;
+    if constexpr (Derived::SHARED_PTRS_IDX != 0xFFFFFFFF) {
+      // Replica gradient helpers own even AIV workers; shared tasks then use the ordinary odd-worker queue.
+      if (replica_gradient_config_ == nullptr &&
+          input_list[Derived::SHARED_PTRS_IDX] != input_list[Derived::EVENT_IDX] &&
+          reinterpret_cast<__gm__ uint64_t *>(input_list[Derived::SHARED_PTRS_IDX])[0] == 1) {
+        shared_vector_count_ = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 4) / 128;
+      }
+    }
   }
 
   __aicore__ inline void Process() {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0 && replica_gradient_config_ != nullptr) {
       ProcessReplicaGradients();
       return;
@@ -208,13 +223,13 @@ class KernelWorkerBase {
   GM_ADDR replica_gradient_config_ = nullptr;
 
   __aicore__ inline void ProcessReplicaGradients() {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     __gm__ uint64_t *config = reinterpret_cast<__gm__ uint64_t *>(replica_gradient_config_);
     CycleTraceRecorder trace;
     const bool profiling = isCycleProfileEnabled(runtimeConfigPtr);
     if (profiling) {
       trace.Init(worker_id_, input_list[Derived::DIAGNOSTIC_IDX], getAicProfileRecordCapacity(runtimeConfigPtr),
-                  getAivProfileRecordCapacity(runtimeConfigPtr));
+                  getAivProfileRecordCapacity(runtimeConfigPtr), getCubeWorkerCapacity(runtimeConfigPtr));
     }
     if (config[0] == 2) {
       ProcessReplicaGradient(config + config[1], 0x10008, trace, profiling);
@@ -248,7 +263,7 @@ class KernelWorkerBase {
 
   __aicore__ inline void ProcessReplicaGradient(__gm__ uint64_t *config, uint32_t profile_desc,
                                                 CycleTraceRecorder &trace, bool profiling) {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     const int32_t rank = config[1];
     const int32_t slots = config[2];
     const int32_t epoch = config[3];
@@ -297,7 +312,7 @@ class KernelWorkerBase {
   __aicore__ inline void CompleteReplicaGradient(__gm__ uint64_t *config, __gm__ uint64_t *owned,
                                                 __gm__ uint64_t *incoming, int32_t worker,
                                                 CycleTraceRecorder &trace, bool profiling, uint32_t profile_desc) {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     const int32_t rank = config[1], slots = config[2], epoch = config[3];
     const int32_t owned_count = config[11], incoming_count = config[10];
     GM_ADDR done = reinterpret_cast<GM_ADDR>(config[9]);
@@ -335,7 +350,7 @@ class KernelWorkerBase {
 
   __aicore__ inline void WaitBandIncomingAcks(__gm__ uint64_t *config, CycleTraceRecorder *trace,
                                                uint32_t projection) {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     if (config[0] != 7) {
       return;
     }
@@ -400,7 +415,7 @@ class KernelWorkerBase {
 
   __aicore__ inline void ProcessGradientBands(__gm__ uint64_t *config, __gm__ uint64_t *owned,
                                                uint32_t profile_desc, CycleTraceRecorder &trace, bool profiling) {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     if (profiling) {
       ProcessGradientBandsProfiled(config, owned, profile_desc, trace);
       return;
@@ -451,7 +466,7 @@ class KernelWorkerBase {
 
   __aicore__ inline void ProcessGradientBandsProfiled(__gm__ uint64_t *config, __gm__ uint64_t *owned,
                                                      uint32_t profile_desc, CycleTraceRecorder &trace) {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     const int32_t bands = config[17], band_rows = config[14];
     const int64_t elements = config[4], columns = config[16];
     if (band_rows <= 0 || config[15] <= 0 || columns <= 0 || config[15] * columns != elements ||
@@ -507,8 +522,16 @@ class KernelWorkerBase {
     }
   }
 
+  __aicore__ inline GM_ADDR SharedTensorAddress(const TensorDesc &desc) {
+    GM_ADDR address = input_list[desc.input_position];
+    if (desc.tensor_type == 2) {
+      address = reinterpret_cast<GM_ADDR>(reinterpret_cast<__gm__ uint64_t *>(address)[desc.dynamic_dim + 1]);
+    }
+    return address + desc.base_ptr_offset * desc.data_type;
+  }
+
   __aicore__ inline void ProcessFast() {
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     uint32_t block_idx = this->worker_id_;
     do {
       if (block_idx >= this->cube_task_num) {
@@ -524,18 +547,27 @@ class KernelWorkerBase {
       return;
     }
     do {
-      if (block_idx >= this->vector_task_num) {
-        return;
+      uint32_t end = this->vector_task_num;
+      if (shared_vector_count_ != 0) {
+        end = this->worker_id_ % 2 == 0 ? this->vector_task_num - 1
+                                      : this->vector_task_num - shared_vector_count_ - 1;
+      }
+      if (block_idx >= end) {
+        break;
       }
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskFast(task_index);
       block_idx = block_idx + this->active_vector_num;
     } while (1);
+    if (shared_vector_count_ != 0 && this->worker_id_ % 2 == 1 &&
+        this->worker_id_ / 2 == (this->vector_task_num - 1) % this->core_num) {
+      ExecuteTaskFast(GetTaskIndex(this->vector_task_num - 1));
+    }
 #endif
   }
 
   __aicore__ inline void ProcessL1Dump() {
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     uint32_t block_idx = this->worker_id_;
     do {
       if (block_idx >= this->cube_task_num) {
@@ -551,20 +583,29 @@ class KernelWorkerBase {
       return;
     }
     do {
-      if (block_idx >= this->vector_task_num) {
-        return;
+      uint32_t end = this->vector_task_num;
+      if (shared_vector_count_ != 0) {
+        end = this->worker_id_ % 2 == 0 ? this->vector_task_num - 1
+                                      : this->vector_task_num - shared_vector_count_ - 1;
+      }
+      if (block_idx >= end) {
+        break;
       }
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskL1Dump(task_index);
       block_idx = block_idx + this->active_vector_num;
     } while (1);
+    if (shared_vector_count_ != 0 && this->worker_id_ % 2 == 1 &&
+        this->worker_id_ / 2 == (this->vector_task_num - 1) % this->core_num) {
+      ExecuteTaskL1Dump(GetTaskIndex(this->vector_task_num - 1));
+    }
 #endif
   }
 
   __aicore__ inline void ProcessProfiled() {
     CycleTraceRecorder recorder;
     recorder.Init(worker_id_, input_list[Derived::DIAGNOSTIC_IDX], getAicProfileRecordCapacity(runtimeConfigPtr),
-                  getAivProfileRecordCapacity(runtimeConfigPtr));
+                  getAivProfileRecordCapacity(runtimeConfigPtr), getCubeWorkerCapacity(runtimeConfigPtr));
     ProcessProfiledQueue(recorder);
     const uint64_t done = recorder.Now();
     recorder.Record(0x1001E, 0, 0, 0xFFFFFFFF, done, done);
@@ -578,7 +619,7 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void ProcessProfiledQueue(CycleTraceRecorder &cycle_trace_recorder) {
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     uint32_t block_idx = this->worker_id_;
     do {
       if (block_idx >= this->cube_task_num) {
@@ -594,13 +635,22 @@ class KernelWorkerBase {
       return;
     }
     do {
-      if (block_idx >= this->vector_task_num) {
-        return;
+      uint32_t end = this->vector_task_num;
+      if (shared_vector_count_ != 0) {
+        end = this->worker_id_ % 2 == 0 ? this->vector_task_num - 1
+                                      : this->vector_task_num - shared_vector_count_ - 1;
+      }
+      if (block_idx >= end) {
+        break;
       }
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskProfiled(task_index, cycle_trace_recorder);
       block_idx = block_idx + this->active_vector_num;
     } while (1);
+    if (shared_vector_count_ != 0 && this->worker_id_ % 2 == 1 &&
+        this->worker_id_ / 2 == (this->vector_task_num - 1) % this->core_num) {
+      ExecuteTaskProfiled(GetTaskIndex(this->vector_task_num - 1), cycle_trace_recorder);
+    }
 #endif
   }
 
@@ -610,7 +660,7 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void PublishDeviceReady(const ReadyHandshakeMeta &meta, bool completion = false) {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
     int64_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
     constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
@@ -648,13 +698,13 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     if (this->worker_id_ % 2 == 0) {
       return;
     }
 #endif
     TriggerEvent(meta.completion_event);
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     if (this->worker_id_ == 1) {
       WaitForDependency(meta.completion_event);
       if (meta.ready_event != 0) {
@@ -689,7 +739,7 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     WaitForDependency(meta.ready_event);
 #else
     if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
@@ -703,7 +753,7 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline TaskId GetTaskIndex(uint32_t task_id) {
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     return cube_task_indexs.GetValue(task_id);
 #else
     return vector_task_indexs.GetValue(task_id);
@@ -714,19 +764,28 @@ class KernelWorkerBase {
     if constexpr (WorkerPolicy == VectorWorkerPolicy::ALL) {
       return this->worker_id_ < this->active_vector_num ? this->worker_id_ : INVALID_VECTOR_SCHEDULE_INDEX;
     }
+    if (shared_vector_count_ != 0 && this->worker_id_ % 2 == 0) {
+      return this->vector_task_num - shared_vector_count_ - 1 + this->worker_id_ / 2;
+    }
     return this->worker_id_ % 2 == 0 ? INVALID_VECTOR_SCHEDULE_INDEX : this->worker_id_ / 2;
   }
 
   __aicore__ inline void AtomicAddForAllEventCounters(uint32_t event_index) {
+#if defined(__DAV_CUBE__) && defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    // Ascend 950 cannot copy L1 to GM; publish after the task's device writes complete.
+    PipeBarrier<PIPE_ALL>();
+    (void)AscendC::AtomicAdd<int32_t>(this->all_event_counters.GetPhyAddr(event_index), 1);
+    PipeBarrier<PIPE_ALL>();
+#else
     TPipe eventPipe;
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     TBuf<AscendC::TPosition::A1> eventBuffer;
 #else
     TBuf<AscendC::TPosition::VECOUT> eventBuffer;
 #endif
     eventPipe.InitBuffer(eventBuffer, DISPATCH_TOKEN_UB_SIZE);
     LocalTensor<int32_t> localSet = eventBuffer.GetWithOffset<int32_t>(EXP_TOKEN_COUNT_FLAG_CNT, 0);
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     SyncFunc<AscendC::HardEvent::S_MTE2>();
     DataCopy(localSet, this->atomic_add_values, EXP_TOKEN_COUNT_FLAG_CNT);
     SyncFunc<AscendC::HardEvent::MTE2_S>();
@@ -737,7 +796,7 @@ class KernelWorkerBase {
     AscendC::SetAtomicNone();
 #else
     localSet.SetValue(0, 1);
-    for (int32_t i = 1; i < EXP_TOKEN_COUNT_FLAG_CNT; ++i) {
+    for (uint32_t i = 1; i < EXP_TOKEN_COUNT_FLAG_CNT; ++i) {
       localSet.SetValue(i, 0);
     }
     AscendC::SetAtomicAdd<int32_t>();
@@ -748,6 +807,7 @@ class KernelWorkerBase {
 #endif
     eventBuffer.FreeTensor(localSet);
     eventPipe.Destroy();
+#endif
   }
 
   __aicore__ inline void ExecuteTaskFast(TaskId task_id) {
@@ -764,7 +824,9 @@ class KernelWorkerBase {
       WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
     }
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
-    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL &&
+        task_desc.task_type != TaskType::TASK_MOE_OWNER_GET &&
+        task_desc.task_type != TaskType::TASK_MOE_TOKEN_GET) {
       TriggerProducerEvent(task_desc);
       TriggerEvent(task_desc.trigger_event);
     }
@@ -787,7 +849,9 @@ class KernelWorkerBase {
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     PipeBarrier<PIPE_ALL>();
     CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_AFTER);
-    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL &&
+        task_desc.task_type != TaskType::TASK_MOE_OWNER_GET &&
+        task_desc.task_type != TaskType::TASK_MOE_TOKEN_GET) {
       TriggerEvent(task_desc.trigger_event);
     }
   }
@@ -826,7 +890,9 @@ class KernelWorkerBase {
     replica_trace_ = nullptr;
     cycle_trace_recorder.Record(profile_desc_id, task_id, task_desc.task_index, owner_id, compute_start_cycle,
                                 compute_end_cycle);
-    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL &&
+        task_desc.task_type != TaskType::TASK_MOE_OWNER_GET &&
+        task_desc.task_type != TaskType::TASK_MOE_TOKEN_GET) {
       uint64_t trigger_start_cycle = cycle_trace_recorder.Now();
       TriggerProducerEvent(task_desc);
       TriggerEvent(task_desc.trigger_event);
@@ -839,15 +905,15 @@ class KernelWorkerBase {
   __aicore__ inline void WaitForDependency(uint32_t event_index, uint32_t poll_interval_us = 0) {
     // Pull producers signal locally after MTE3 completion. Observe short-lived
     // GMM/SwiGLU dependencies promptly while retaining a bounded refresh rate.
-#ifdef __DAV_C220_CUBE__
-    const uint32_t default_poll_interval_us = pull_protocol_ ? 10 : CUBE_EVENT_REFRESH_INTERVAL_UNITS;
+#ifdef __DAV_CUBE__
+    const uint32_t default_poll_interval_us = pull_protocol_ ? 10 : CUBE_EVENT_REFRESH_INTERVAL_US;
 #else
-    const uint32_t default_poll_interval_us = pull_protocol_ ? 30 : VECTOR_EVENT_REFRESH_INTERVAL_UNITS;
+    const uint32_t default_poll_interval_us = pull_protocol_ ? 30 : VECTOR_EVENT_REFRESH_INTERVAL_US;
 #endif
     if (poll_interval_us == 0) {
       poll_interval_us = default_poll_interval_us;
     }
-    constexpr int64_t cycles_per_us = EVENT_REFRESH_TIME_UNIT_CYCLES;
+    constexpr int64_t cycles_per_us = SYSTEM_CYCLES_PER_US;
     int32_t needed = all_event_num_triggers.GetValue(event_index);
     DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
       all_event_counters[event_index]);
@@ -884,6 +950,7 @@ class KernelWorkerBase {
     }
   }
 
+  uint32_t shared_vector_count_ = 0;
   bool pull_protocol_ = false;
   uint32_t worker_id_ = 0;
   uint32_t grouped_matmul_group_list_offset_ = 0;

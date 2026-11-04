@@ -22,6 +22,7 @@ namespace hyper_parallel::multicore::shmem::runtime {
 inline constexpr std::string_view kHeapSizeEnv = "HYPER_PARALLEL_SHMEM_HEAP_SIZE";
 inline constexpr std::string_view kTimeoutEnv = "HYPER_PARALLEL_SHMEM_TIMEOUT_SEC";
 inline constexpr std::string_view kDataEngineEnv = "HYPER_PARALLEL_SHMEM_DATA_ENGINE";
+inline constexpr std::string_view kUdmaQpNumEnv = "HYPER_PARALLEL_SHMEM_UDMA_QP_NUM";
 inline constexpr std::string_view kBootstrapEndpointEnv = "HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT";
 
 inline constexpr uint64_t kDefaultHeapSizeBytes = 1073741824ULL;
@@ -33,6 +34,7 @@ inline constexpr std::size_t kMaxBootstrapEndpointBytes = 63U;
 /** @brief Data engines accepted by the first Runtime release. */
 enum class DataEngine : uint8_t {
   Mte,
+  MteUdma,
 };
 
 /** @brief Validated, framework-independent Runtime configuration. */
@@ -41,10 +43,11 @@ struct Config {
   uint32_t timeout_seconds;
   DataEngine data_engine;
   std::string bootstrap_endpoint_base;
+  uint32_t udma_qp_num = 32U;
 };
 
 /**
- * @brief Load and validate the four HYPER_PARALLEL_SHMEM_* Runtime variables.
+ * @brief Load and validate the HYPER_PARALLEL_SHMEM_* Runtime variables.
  *
  * @return A normalized Config, or ErrorCode::InvalidConfig for an invalid environment value.
  */

@@ -222,3 +222,18 @@ pytest -q tests/torch/multicore/test_deepseek_v41_megamoe.py -k megamoe_parallel
 - [私有 SHMEM](docs/shmem.md)：通信、容量与 runtime 生命周期。
 
 - [有上限的专家副本自适应](docs/adaptive_replicas.md)
+
+## Ascend 950 and expert replicas
+
+The Ascend 950 plan supports indexed pull ingress and independent shared-expert
+forward/backward fusion on the dynamic token executor. Indexed route metadata
+uses the current physical expert IDs after optional replica placement; the
+original token and Top-K positions remain available for gradients.
+
+On 32-Cube devices, routed BF16 GEMMs use the qualified A5 tilings. The tagged
+kernel selector is independent of replica producer events. FP32 replica weight
+gradients retain the grouped GEMM gradient-band producer and owner-return path.
+When replica gradient helpers occupy the even vector workers, shared tasks run
+in the ordinary vector queue; shared computation and gradient ownership remain
+unchanged. Without active replica returns, the shared idle-worker schedule is
+available. Native small-row shared forward remains the conservative A5 policy.

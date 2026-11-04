@@ -59,18 +59,21 @@ class RouteMetadata:
     local_num_tokens: int | None = None
     plan_tokens: int | None = None
     replica_route: ReplicaRoute | None = None
+    expert_row_counts: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
 class PreparedTopKRoute:
     """Permuted payload and exact metadata for one Router decision."""
 
-    routed_tokens: torch.Tensor
+    routed_tokens: torch.Tensor | None
     unpermute_mapping: torch.Tensor
     tokens_per_expert: torch.Tensor
     received_counts: torch.Tensor
     metadata: RouteMetadata
     maximum_received_slots: int = 0
+    permute_src_index: torch.Tensor | None = None
+    peer_row_ordinals: torch.Tensor | None = None
 
 
 def _validate_topk_inputs(
@@ -246,6 +249,8 @@ def _compute_route_metadata(
             local_destination_prefix[:, -1] + local_destination_counts[:, -1]
         ).to(torch.int64),
         expert_capacity=expert_capacity,
+        expert_row_counts=(received_counts.sum(0, dtype=torch.int32)
+                           if spec.forward_ingress_mode in ("peer_overlap", "peer_token") else None),
     )
 
 
@@ -342,6 +347,35 @@ def _pack_host_route(
         group_list=offsets[4],
         expert_capacity=capacity,
     )
+def _build_route_indices(topk_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sort scalar route slots without constructing Top-K expanded token vectors."""
+    if topk_ids.numel() > 2**24:
+        raise ValueError("Indexed scalar route sorting requires at most 2**24 route slots")
+    route_slots = torch.arange(topk_ids.numel(), dtype=torch.float32, device=topk_ids.device).reshape(-1, 1)
+    permuted_slots, inverse_order = torch_npu.npu_moe_token_permute(route_slots, topk_ids.reshape(-1, 1))
+    return (permuted_slots.reshape(-1).to(torch.int32).contiguous(),
+            inverse_order.reshape(-1).to(torch.int32).contiguous())
+
+
+def _peer_row_ordinals(
+    topk_ids: torch.Tensor, sorted_slots: torch.Tensor, counts: torch.Tensor,
+) -> torch.Tensor:
+    """Map each original route slot to its exact row within its source expert."""
+    slots = sorted_slots.to(torch.int64)
+    ids = topk_ids.reshape(-1).to(torch.int64)
+    prefix = counts.cumsum(0, dtype=torch.int32) - counts
+    positions = torch.arange(slots.numel(), dtype=torch.int32, device=slots.device)
+    sorted_ordinals = positions - prefix[ids[slots]]
+    return torch.empty_like(sorted_slots).scatter_(0, slots, sorted_ordinals)
+
+
+def _peer_owner_flags(topk_ids: torch.Tensor, sorted_slots: torch.Tensor, local_experts: int) -> torch.Tensor:
+    """Identify the first Top-K slot selecting each peer before any remote metadata reads."""
+    peers = topk_ids // local_experts
+    selected = torch.arange(topk_ids.shape[1], device=topk_ids.device)
+    earlier = selected[None, :] < selected[:, None]
+    duplicate = ((peers[:, :, None] == peers[:, None, :]) & earlier).any(-1)
+    return (~duplicate).reshape(-1).to(torch.int32)[sorted_slots.to(torch.int64)]
 
 
 def prepare_topk_route(
@@ -394,7 +428,11 @@ def prepare_topk_route(
         counts_by_source, count_work = _start_count_gather(counts, spec)
     else:
         counts_by_source, count_work = replica_route.counts_by_source, None
-    if permutation_output is None:
+    permute_src_index = None
+    if spec.forward_ingress_mode != "legacy":
+        permute_src_index, unpermute_mapping = _build_route_indices(topk_ids)
+        routed_tokens = None
+    elif permutation_output is None:
         routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     else:
         routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
@@ -407,6 +445,10 @@ def prepare_topk_route(
         tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum_received_slots,
+        permute_src_index=permute_src_index,
+        peer_row_ordinals=(
+            _peer_row_ordinals(topk_ids, permute_src_index, counts)
+            if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap", "peer_token", "peer_tile") else None),
         metadata=replace(_compute_route_metadata(
             counts,
             counts_by_source,
@@ -460,6 +502,10 @@ def _summarize_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec,
                             *, defer_receive_limit: bool = False) -> tuple[int, int, int]:
     """Keep overflow and participation checks common to both metadata policies."""
     _validate_dynamic_rows(rows, spec)
+    if spec.forward_ingress_mode != "legacy" or spec.shared_intermediate_size:
+        sizes = {row[1] for row in rows}
+        if len(sizes) != 1 or min(sizes) <= 0 or min(sizes) % 128:
+            raise RuntimeError("Indexed/shared execution requires equal positive token rows aligned to 128")
     maximum = max(row[6] for row in rows)
     maximum_tokens = max(row[1] for row in rows) if spec.auto_tokens else spec.local_num_tokens
     maximum_capacity = _align_capacity(spec.ep_size * maximum_tokens * spec.top_k)
@@ -597,8 +643,12 @@ def _prepare_dynamic_route(
         if prepare_workspace is None:
             raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
         prepare_workspace(summary[1], summary[2])
+    scalar_routes = None
     if invalid:
         permuted = None
+    elif spec.forward_ingress_mode != "legacy":
+        scalar_routes, inverse = _build_route_indices(topk_ids)
+        permuted = (None, inverse)
     elif spec.dispatch_mode == "pull":
         permuted = _permute_dynamic_pull(hidden_states, topk_ids, spec, workspace)
     elif permuted is None:
@@ -625,7 +675,13 @@ def _prepare_dynamic_route(
     else:
         metadata = _host_route_metadata(host_rows, spec, capacity, hidden_states.device)
         received_counts = metadata.combine_size.reshape(spec.ep_size, spec.local_experts)
+    if spec.forward_ingress_mode in ("peer_overlap", "peer_token"):
+        metadata = replace(metadata, expert_row_counts=received_counts.sum(0, dtype=torch.int32))
     return PreparedTopKRoute(
+        permute_src_index=scalar_routes if spec.forward_ingress_mode != "legacy" else None,
+        peer_row_ordinals=(_peer_row_ordinals(topk_ids, scalar_routes, counts)
+                           if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap", "peer_token", "peer_tile")
+                           else None),
         routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum,

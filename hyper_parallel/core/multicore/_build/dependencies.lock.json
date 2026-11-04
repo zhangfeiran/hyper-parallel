@@ -39,7 +39,7 @@
         "patches": [
           {
             "path": "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch",
-            "sha256": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d",
+            "sha256": "ca4cacfad1299b3b37fffeec43d8047fb6325eb4f0fdccdf475f855f45173bef",
             "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks"
           },
           {
@@ -50,13 +50,13 @@
           },
           {
             "path": "hyper_parallel/core/multicore/ops/rms_norm_worker_fusion.patch",
-            "sha256": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f",
-            "purpose": "add a logical token-block entry point while preserving the native RMSNorm entry behavior"
+            "sha256": "d1751299e120709f3a625af9b6d606c1696059fbb55c99ed01788765f1840004",
+            "purpose": "add a logical token-block RMSNorm entry point and non-atomic Ascend950 backward-cache writes"
           },
           {
             "path": "hyper_parallel/core/multicore/ops/rms_norm_grad_worker_fusion.patch",
-            "sha256": "b55856bdaa183684576febdcbf2df01cace97932f00d2a336e54cb7d59ee8964",
-            "purpose": "add a task-local RMSNormGrad entry point and explicit fused-task pipe cleanup"
+            "sha256": "0d6eacd29418c897cd3ac42bd4b62eb331912a62a36fa506a4df80f6fffd1ce2",
+            "purpose": "add task-local RMSNormGrad execution without shared-workspace initialization, explicit pipe cleanup and Ascend950 BF16 output packing"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
@@ -72,7 +72,7 @@
         "patches": [
           {
             "path": "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch",
-            "sha256": "9311b39fc5b152935662cb665ea1ddb8a353ea6706aa8b3dacfd0d2d3ef72837",
+            "sha256": "27d7f1405462d0f3443ec11c884ba150cb210e6d49466bcc499a7774188ca597",
             "purpose": "expose the selected grouped-matmul path as an inline building block"
           },
           {
@@ -115,15 +115,23 @@
         ],
         "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation"
       },
+      "nlohmann_json": {
+        "version": "v3.11.3",
+        "repository": "https://gitcode.com/GitHub_Trending/js/json.git",
+        "commit": "9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+        "tree": "5af76d5aa32f4b473b5dd7f82fb9f2a4257322c6",
+        "git_archive_tar_sha256": "0a59c5f4e31190d4ab72e4adaac69a978199c2da1989bfc6273de21f4dc016e4",
+        "resolution": "SHMEM Ascend950 topology-reader header dependency; copied only to the isolated SDK source",
+        "packaging_policy": "build-only header dependency; not a Python runtime requirement"
+      },
       "shmem": {
-        "version": "d30702bb55d0",
+        "version": "v1.7.0",
         "repository": "https://gitcode.com/cann/shmem.git",
-        "fetch_ref": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
-        "tag_object": null,
-        "commit": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
-        "tree": "dec6d50ff39113fe892cdc3d52d35e56b24cd0c0",
-        "git_archive_tar_sha256": "c3f207178b6a4f020bc1f98187ca703814e4876064b83e7416010f2f379385f9",
-        "resolution": "exact upstream commit with a locked Runtime symbol-loading adapter applied only to an isolated source copy",
+        "tag_object": "9912aa1aaa231a0c6d2e9b80593d4a1a8e654148",
+        "commit": "ecea088d28c057e67181a313cf8abfa1dc777d8a",
+        "tree": "703e460a43ae870d2ddc22ad9f8f038266dd747c",
+        "git_archive_tar_sha256": "6c19650b7f97e435e5e4b2feadb4b0004146ea5d7ecb7ceca21853a58b917c77",
+        "resolution": "Exact upstream v1.7.0; private SDK for Ascend950 MTE and UDMA transport",
         "patches": [
           {
             "path": "hyper_parallel/core/multicore/shmem/_build/patches/cann_runtime_symbols.patch",
@@ -135,6 +143,26 @@
             "sha256": "3ec6f508509a70add2bb55671acf32cbfa77ef4eb2f75e2a56da2080607c2eb5",
             "upstream_issue": "https://gitcode.com/cann/shmem/issues/704",
             "purpose": "provide the HP-private hpshmem_log sink interface"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/shmem/_build/patches/diagnostic_explicit_mesh_fabric.patch",
+            "sha256": "367a5e17e2af6ad4095274b95f5fa39699a43fff862f70aa7a20bbce1df2421b",
+            "purpose": "Honor explicit Mesh network type before inferred topology classification on Ascend950"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/shmem/_build/patches/udma_queue_state_flush_v170.patch",
+            "sha256": "b7e8c920158020442363a50021f80de663000256eb76e42ad7ec7f911712d40b",
+            "purpose": "Backport release/v1.7.0 d942c05 device queue publication and CQ tail flushing without changing the host ABI"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/shmem/_build/patches/host_rma_vector_entries.patch",
+            "sha256": "76dec73419d53279e439d639a973217b889beda5b05f27abc36813d0b2913b04",
+            "purpose": "Restrict five Host RMA wrapper kernels to Vector execution as in upstream 9c72fd3"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/shmem/_build/patches/bootstrap_client_disconnect.patch",
+            "sha256": "3d14e41c0b14b61ee2f819b949790fe6fb7cb0de6a7a54885ef07701fc735c59",
+            "purpose": "Keep each bootstrap server alive until session clients disconnect and propagate bounded close errors"
           }
         ],
         "packaging_policy": {
