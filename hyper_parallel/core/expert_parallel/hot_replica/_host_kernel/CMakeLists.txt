@@ -12,7 +12,7 @@
 cmake_minimum_required(VERSION 3.18)
 project(hyper_parallel_replica_host LANGUAGES CXX)
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
-python3_add_library(_replica_host MODULE WITH_SOABI host.cpp)
+python3_add_library(_replica_host MODULE WITH_SOABI host.cpp dispatch.cpp)
 target_compile_features(_replica_host PRIVATE cxx_std_17)
 target_compile_options(_replica_host PRIVATE
     -O3 -fno-fast-math -ffp-contract=off -Wall -Wextra)
