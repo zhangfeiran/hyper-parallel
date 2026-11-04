@@ -377,6 +377,47 @@ def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any
     )
 
 
+def _restore_forward_output(
+    ctx: Any, spec: MegaMoeSpec, execution: _ForwardExecution,
+    topk_weights: torch.Tensor | None, unpermute_mapping: torch.Tensor | None,
+    permute_src_index: torch.Tensor | None, permutation_inputs: tuple[Any, ...],
+    save_backward: bool,
+) -> tuple[Any, Any, tuple[Any, ...]]:
+    """Consume borrowed receive rows before releasing the forward workspace.
+
+    Args:
+        ctx: Autograd context containing per-call permutation requirements.
+        spec: Current transport and ingress configuration.
+        execution: Borrowed receive storage and owned expert intermediates.
+        topk_weights: Optional Router probabilities for integrated unpermutation.
+        unpermute_mapping: Inverse mapping for token-major output restoration.
+        permute_src_index: Source slots retained by indexed backward ingress.
+        permutation_inputs: Existing per-call permutation state.
+        save_backward: Whether backward will read expert-major output rows.
+
+    Returns:
+        Owned final output, saved dispatch storage, and backward permutation state.
+    """
+    output = execution.combine[:ctx.source_rows]
+    if save_backward or not ctx.has_unpermute or not ctx.source_rows:
+        output = output.clone()
+    if spec.dispatch_mode == "pull" or not save_backward:
+        saved_dispatch = execution.dispatch
+    else:
+        # Combine consumed down_proj before the symmetric dispatch storage is reused.
+        execution.intermediates.down_proj.copy_(execution.dispatch[:execution.intermediates.down_proj.shape[0]])
+        saved_dispatch = execution.intermediates.down_proj
+    if ctx.has_unpermute:
+        probs = topk_weights.float().contiguous()
+        ctx.topk_dtype = topk_weights.dtype
+        permutation_inputs += (output, probs)
+        if getattr(spec, "backward_ingress_mode", "legacy") == "indexed":
+            permutation_inputs += (permute_src_index,)
+        output = (torch_npu.npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
+                  if ctx.source_rows else output[:0])
+    return output, saved_dispatch, permutation_inputs
+
+
 def _save_forward_state(
     ctx: Any,
     plan: MegaMoePlan,
@@ -708,6 +749,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         workspace_claimed: bool,
         shared_weight1: torch.Tensor | None,
         shared_weight2: torch.Tensor | None,
+        save_backward: bool,
     ) -> Any:
         """Launch the legacy forward op and save owned backward inputs.
 
@@ -725,6 +767,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             workspace_claimed: Whether the caller owns the forward workspace lease.
             shared_weight1: Optional current shared gate/up weight.
             shared_weight2: Optional current shared down-projection weight.
+            save_backward: Whether the caller's active autograd graph needs saved intermediates.
 
         Returns:
             Owned expert-major output rows.
@@ -741,6 +784,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         permutation_inputs = ()
         indexed_ingress = getattr(spec, "forward_ingress_mode", "legacy") != "legacy"
         permute_src_index = None
+        unpermute_mapping = None
         if permutation is not None:
             prepared_rows, _, unpermute_mapping = permutation[:3]
             if indexed_ingress:
@@ -835,33 +879,23 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution,
                 pool,
             )
-            output = execution.combine[:ctx.source_rows].clone()
-            if spec.dispatch_mode == "pull":
-                saved_dispatch = execution.dispatch
-            else:
-                # Combine has consumed down_proj before SHMEM dispatch is reused.
-                execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
-                saved_dispatch = execution.intermediates.down_proj
-            if ctx.has_unpermute:
-                probs = topk_weights.float().contiguous()
-                ctx.topk_dtype = topk_weights.dtype
-                permutation_inputs += (output, probs)
-                if getattr(spec, "backward_ingress_mode", "legacy") == "indexed":
-                    permutation_inputs += (permute_src_index,)
-                output = (torch_npu.npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
-                          if ctx.source_rows else output[:0])
-            _save_forward_state(
-                ctx,
-                plan,
-                workspace,
-                saved_dispatch,
-                execution.intermediates.up_proj,
-                execution.intermediates.activation,
-                home_weights[0],
-                home_weights[1],
-                metadata,
-                permutation_inputs + (shared_saved if ctx.shared_backward else ()),
+            output, saved_dispatch, permutation_inputs = _restore_forward_output(
+                ctx, spec, execution, topk_weights, unpermute_mapping, permute_src_index,
+                permutation_inputs, save_backward,
             )
+            if save_backward:
+                _save_forward_state(
+                    ctx,
+                    plan,
+                    workspace,
+                    saved_dispatch,
+                    execution.intermediates.up_proj,
+                    execution.intermediates.activation,
+                    home_weights[0],
+                    home_weights[1],
+                    metadata,
+                    permutation_inputs + (shared_saved if ctx.shared_backward else ()),
+                )
             if ctx.has_shared:
                 ctx.routed_output_shape = tuple(output.shape)
                 if ctx.shared_backward:
@@ -1007,6 +1041,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None,
                 shared_dw1,
                 shared_dw2,
+                None,
             )
         finally:
             leases.close()
@@ -1092,6 +1127,18 @@ class _NativeSharedBackward(torch.autograd.Function):
         return grad_source, grad_first, grad_second, None, None, None, None
 
 
+def _requires_backward(*tensors: torch.Tensor | None) -> bool:
+    """Inspect autograd outside the custom Function's always-disabled forward scope.
+
+    Args:
+        tensors: Differentiable caller-owned input and parameter tensors.
+
+    Returns:
+        Whether the current call can construct a backward graph.
+    """
+    return torch.is_grad_enabled() and any(tensor is not None and tensor.requires_grad for tensor in tensors)
+
+
 def execute_mega_moe(
     routed_tokens: Any,
     weight1: Any,
@@ -1127,6 +1174,7 @@ def execute_mega_moe(
         False,
         None,
         None,
+        _requires_backward(routed_tokens, weight1, weight2),
     )
 
 
@@ -1183,6 +1231,9 @@ def execute_mega_moe_with_permutation(
         workspace_claimed,
         (shared_weight1 if backward_shared else shared_weight1.detach()) if fused_shared else None,
         (shared_weight2 if backward_shared else shared_weight2.detach()) if fused_shared else None,
+        _requires_backward(hidden_states, weight1, weight2, topk_weights,
+                           shared_weight1 if backward_shared else None,
+                           shared_weight2 if backward_shared else None),
     )
     if shared_weight1 is None:
         return result

@@ -16,7 +16,6 @@
 
 import struct
 import unittest
-from functools import partial
 import weakref
 from functools import partial
 from types import SimpleNamespace
@@ -44,6 +43,96 @@ class TestMegaMoeFunction(unittest.TestCase):
     """Exercise real autograd contexts with mocked communication and kernels."""
 
     # pylint: disable=protected-access
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_no_grad_unpermutation_owns_outputs_without_saving_expanded_rows(self) -> None:
+        """Feature: No-grad integrated output ownership.
+        Description: Reuse and poison SHMEM after two no-grad forwards with trainable weights.
+        Expectation: Dense outputs stay exact without saving or cloning the expanded receive buffer.
+        """
+        spec = SimpleNamespace(dispatch_mode="pull", forward_ingress_mode="legacy", hidden_size=4,
+                               intermediate_size=2, top_k=2, forward_shared_expert=True,
+                               backward_shared_expert=False, expert_weight_layout="EIO",
+                               replica_slots_per_rank=0, auto_tokens=False)
+        plan = SimpleNamespace(spec=spec, ingress_diagnostics=None)
+        workspace = Mock(source_buffer=torch.zeros(4, 4), routed_buffer=torch.zeros(4, 4),
+                         gmm_workspace=torch.zeros(1))
+        workspace.release.side_effect = lambda: workspace.routed_buffer.fill_(float("nan"))
+        hidden = torch.ones(2, 4)
+        first, second = torch.ones(2, 4, 4, requires_grad=True), torch.ones(2, 2, 4, requires_grad=True)
+        metadata = SimpleNamespace(expert_capacity=4, group_list=torch.tensor([2, 4]), replica_route=None)
+        for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
+                     "combine_src_off", "combine_target_off", "combine_size"):
+            setattr(metadata, name, torch.zeros(2, dtype=torch.int64))
+        route = SimpleNamespace(metadata=metadata, routed_tokens=hidden.repeat_interleave(2, dim=0),
+                                unpermute_mapping=torch.arange(4, dtype=torch.int32))
+        probabilities = torch.tensor([[0.25, 0.75], [0.25, 0.75]])
+        expected = torch.arange(16).reshape(2, 2, 4).float().mul(probabilities.unsqueeze(-1)).sum(1)
+        launch_count = 0
+
+        def launch(
+            _plan: Any, _route: Any, _source: Any, _first: Any, _second: Any,
+            execution: Any, _pool: Any = None,
+        ) -> None:
+            """Write distinct complete receive buffers on each invocation.
+
+            Args:
+                _plan: Unused device plan.
+                _route: Unused communication metadata.
+                _source: Unused published source.
+                _first: Unused expert weight.
+                _second: Unused expert weight.
+                execution: Receive buffer to poison after output consumption.
+                _pool: Unused replica pool.
+            """
+            nonlocal launch_count
+            execution.combine.copy_(torch.arange(16).reshape(4, 4) + 100 * launch_count)
+            launch_count += 1
+
+        def unpermute(rows: torch.Tensor, _mapping: Any, *, probs: torch.Tensor) -> torch.Tensor:
+            """Reduce expanded rows into independent dense storage.
+
+            Args:
+                rows: Current receive buffer.
+                _mapping: Unused identity route mapping.
+                probs: Per-token route probabilities.
+            """
+            return (rows.reshape(2, 2, 4) * probs.unsqueeze(-1)).sum(1)
+
+        old_clone = torch.Tensor.clone
+        expanded_clones = []
+
+        def clone(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+            """Count owned copies of the expanded receive view.
+
+            Args:
+                tensor: Tensor whose storage is copied.
+                args: Positional clone options.
+                kwargs: Keyword clone options.
+            """
+            if tuple(tensor.shape) == (4, 4):
+                expanded_clones.append(tensor.data_ptr())
+            return old_clone(tensor, *args, **kwargs)
+
+        with (patch.object(torch.Tensor, "clone", new=clone),
+              patch.object(function_module, "_launch_forward_kernel", side_effect=launch),
+              patch.object(function_module, "_save_forward_state", wraps=function_module._save_forward_state) as save,
+              patch.object(function_module.torch_npu, "npu_moe_token_unpermute", side_effect=unpermute)):
+            outputs = []
+            for context in (torch.no_grad, torch.inference_mode):
+                with context():
+                    output = function_module.execute_mega_moe_with_permutation(
+                        hidden, torch.tensor([[0, 1], [0, 1]]), first, second, route, plan, workspace,
+                        topk_weights=probabilities)
+                outputs.append(output)
+            torch.testing.assert_close(outputs[0], expected, rtol=0, atol=0)
+            torch.testing.assert_close(outputs[1], expected + 100, rtol=0, atol=0)
+            self.assertNotEqual(outputs[0].data_ptr(), workspace.routed_buffer.data_ptr())
+            self.assertFalse(outputs[0].requires_grad)
+            self.assertEqual(expanded_clones, [], f"expected=[] actual={expanded_clones}")
+            save.assert_not_called()
+            workspace.track_graph.assert_not_called()
 
     def test_ragged_pull_uses_reserved_source_prefix(self) -> None:
         """Forward and backward retain SHMEM addresses while exposing only actual rows."""
