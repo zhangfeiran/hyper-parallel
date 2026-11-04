@@ -486,30 +486,36 @@ def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertRepl
                          limit: int, resident: int, target: int) -> list[dict[int, int]] | None:
     """Select source-independent quotas, using None for unchanged owner placement."""
     owner_peak = max(loads)
-    if owner_peak <= min(target, resident):
+    preferred_peak = min(target, resident)
+    if owner_peak <= preferred_peak:
         return None
-    fallback = (owner_peak, None) if owner_peak <= limit else None
-    edges = _balanced_edges(loads, totals, config.home_experts)
-    for budget in range(1, min(config.replica_slots_per_rank, config.home_experts) + 1):
-        candidate = ExpertReplicaConfig(config.num_experts, config.ep_size, budget)
-        copies = _bounded_copies(loads, totals, candidate, edges=edges)
-        peak = max(sum(row.values()) for row in copies)
-        if peak <= min(target, resident):
-            return copies
-        if peak <= limit and (fallback is None or peak < fallback[0]):
-            fallback = peak, copies
-    if fallback is None:
-        # Thinning can exceed a hard limit before spare guest slots are filled.
-        # Complete the bounded candidate once before declaring it infeasible.
-        copies = _bounded_copies(loads, totals, config, edges=edges)
-        _improve_copies(copies, config, min(target, resident))
-        if max(sum(row.values()) for row in copies) <= limit:
-            return copies
+    home = config.home_experts
+    edges = _balanced_edges(loads, totals, home)
+    edge_rows = [(donor, receiver, sum(rows for _, rows in segments)) for donor, receiver, segments in edges]
+    fallback = 0 if owner_peak <= limit else None
+    best_peak = owner_peak
+    for budget in range(1, min(config.replica_slots_per_rank, home) + 1):
+        # Thinning moves the same integer quota on each edge regardless of
+        # the experts that supply it. Only the selected budget needs quotas.
+        candidate_loads = loads.copy()
+        for donor, receiver, rows in edge_rows:
+            moved = budget * rows // home
+            candidate_loads[donor] -= moved
+            candidate_loads[receiver] += moved
+        peak = max(candidate_loads)
+        if peak <= preferred_peak:
+            return _bounded_copies(loads, totals, replace(config, replica_slots_per_rank=budget), edges=edges)
+        if peak <= limit and (fallback is None or peak < best_peak):
+            fallback, best_peak = budget, peak
+    if fallback == 0:
+        return None
+    chosen = config if fallback is None else replace(config, replica_slots_per_rank=fallback)
+    copies = _bounded_copies(loads, totals, chosen, edges=edges)
+    # Thinning can exceed the hard limit before spare guest slots are filled.
+    _improve_copies(copies, config, preferred_peak)
+    if fallback is None and max(sum(row.values()) for row in copies) > limit:
         raise ValueError("Adaptive replica cap cannot satisfy capacity_limit")
-    selected = fallback[1]
-    if selected is not None:
-        _improve_copies(selected, config, min(target, resident))
-    return selected
+    return copies
 
 
 def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertReplicaConfig,
