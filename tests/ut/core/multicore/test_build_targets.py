@@ -22,6 +22,7 @@ import tempfile
 import unittest
 
 import hyper_parallel
+from tests.common.mark_utils import arg_mark
 
 
 _ROOT = Path(hyper_parallel.__file__).resolve().parent.parent
@@ -33,8 +34,15 @@ _SOC_QUERY = 'set -e; hp_cann_version_at_least() { return 0; }; source "$1"; hp_
 class TestBuildTargets(unittest.TestCase):
     """Validate real shell profile selection without compiling or initializing a device."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_runtime_backend_accepts_only_its_device_generation(self) -> None:
-        """Compile both host backend contracts without Torch, CANN or an NPU."""
+        """Compile both host backend contracts without Torch, CANN or an NPU.
+
+        Feature: Multicore native build target selection.
+        Description: Compile both host backend contracts without Torch, CANN or an NPU.
+        Expectation: Each compiled backend accepts its own supported device generations.
+        """
         source = '''
 #include <string_view>
 #include "device/device_model.h"
@@ -64,8 +72,15 @@ int main() { return 0; }
                     result = subprocess.run([str(executable)], capture_output=True, check=False, text=True)
                     self.assertEqual(result.returncode, 0, f"expected=0 actual={result.returncode}: {result.stderr}")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_grouped_matmul_helper_architecture_selection(self) -> None:
-        """Retain the A2/A3 helper and expose it on A5 without redefining device macros."""
+        """Retain the A2/A3 helper and expose it on A5 without redefining device macros.
+
+        Feature: Multicore native build target selection.
+        Description: Retain the A2/A3 helper and expose it on A5 without redefining device macros.
+        Expectation: The helper is selected only for the supported A2, A3 and A5 architectures.
+        """
         component = _ROOT / "hyper_parallel/core/multicore"
         adapter = component / "ops/grouped_matmul_fusion.patch"
         lock = json.loads((component / "_build/dependencies.lock.json").read_text(encoding="utf-8"))
@@ -88,8 +103,15 @@ int main() { return 0; }
                 actual = "HP_GROUP_LIST_HELPER" in result.stdout
                 self.assertEqual(actual, expected, f"expected={expected} actual={actual}: {result.stdout}")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_vendor_kernel_compute_units(self) -> None:
-        """All six kernels use the selected CANN target, including the 950 target."""
+        """All six kernels use the selected CANN target, including the 950 target.
+
+        Feature: Multicore native build target selection.
+        Description: All six kernels use the selected CANN target, including the 950 target.
+        Expectation: All six kernels receive the selected A2, A3 or DT9582 compute unit.
+        """
         kernel_cmake = _ROOT / "hyper_parallel/core/multicore/cmake/vendor/op_kernel/CMakeLists.txt"
         script = '''
 function(npu_op_kernel_library)
@@ -105,7 +127,7 @@ endfunction()
 include("${HP_KERNEL_CMAKE}")
 '''
         targets = (("ascend910b", "ascend910b1"), ("ascend910_93", "ascend910_9391"),
-                   ("ascend950", "ascend950pr_9599"))
+                   ("ascend950", "ascend950dt_9582"))
         with tempfile.TemporaryDirectory() as temporary:
             script_path = Path(temporary) / "kernel-targets.cmake"
             script_path.write_text(script, encoding="utf-8")
@@ -120,8 +142,15 @@ include("${HP_KERNEL_CMAKE}")
                     for kernel in kernels:
                         self.assertTrue(kernel.endswith(f":{expected}"), f"expected={expected} actual={kernel}")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_swiglu_bf16_downcasts_use_supported_rounding(self) -> None:
-        """Preprocess the actual forward/backward adapter hunks for A2/A3 and A5."""
+        """Preprocess the actual forward/backward adapter hunks for A2/A3 and A5.
+
+        Feature: Multicore native build target selection.
+        Description: Preprocess the actual forward/backward adapter hunks for A2/A3 and A5.
+        Expectation: Each forward and backward adapter uses its supported BF16 rounding mode.
+        """
         component = _ROOT / "hyper_parallel/core/multicore"
         adapter = component / "ops/swi_glu_fusion.patch"
         lock = json.loads((component / "_build/dependencies.lock.json").read_text(encoding="utf-8"))
@@ -147,8 +176,15 @@ include("${HP_KERNEL_CMAKE}")
                     other = "CAST_NONE" if expected == "CAST_RINT" else "CAST_RINT"
                     self.assertNotIn(other, result.stdout, f"expected={other} absent actual={result.stdout}")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_vendor_host_registers_all_device_generations(self) -> None:
-        """Every forward and backward definition advertises the same three SoCs."""
+        """Every forward and backward definition advertises the same three SoCs.
+
+        Feature: Multicore native build target selection.
+        Description: Every forward and backward definition advertises the same three SoCs.
+        Expectation: Every operator definition registers all three supported SoC families.
+        """
         definitions = list((_ROOT / "hyper_parallel/core/multicore/ops").glob("*/op_host/*_def.cpp"))
         self.assertEqual(len(definitions), 6, f"expected=6 actual={definitions}")
         for definition in definitions:
@@ -157,8 +193,15 @@ include("${HP_KERNEL_CMAKE}")
                 with self.subTest(operator=definition.parent.parent.name, soc=soc):
                     self.assertIn(f'AddConfig("{soc}",', source, f"expected={soc} actual={definition}")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_worker_and_trace_select_the_actual_core_type(self) -> None:
-        """Both device generations must compile Cube queues and profiler slots on Cube cores."""
+        """Both device generations must compile Cube queues and profiler slots on Cube cores.
+
+        Feature: Multicore native build target selection.
+        Description: Both device generations must compile Cube queues and profiler slots on Cube cores.
+        Expectation: Cube and Vector preprocessing selects the corresponding runtime branches.
+        """
         runtime = _ROOT / "hyper_parallel/core/multicore/ops/runtime"
         source = "\n".join(line for name in ("worker_kernel.h", "cycle_trace_recorder.h")
                            for line in (runtime / name).read_text(encoding="utf-8").splitlines()
@@ -179,8 +222,15 @@ include("${HP_KERNEL_CMAKE}")
                     actual = "return vector_task_indexs.GetValue(task_id);" in result.stdout
                     self.assertEqual(actual, not is_cube, f"expected={not is_cube} actual={actual}")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_sdk_soc_selection(self) -> None:
-        """Keep A2/A3 together and isolate the A5 SDK family."""
+        """Keep A2/A3 together and isolate the A5 SDK family.
+
+        Feature: Multicore native build target selection.
+        Description: Keep A2/A3 together and isolate the A5 SDK family.
+        Expectation: A2 and A3 share the 910B SDK family while A5 selects Ascend950.
+        """
         for selection, expected in (("ascend910b", "Ascend910B"), ("ascend910_93", "Ascend910B"),
                                     ("ascend910b,ascend910_93", "Ascend910B"), (" ascend950 ", "Ascend950")):
             with self.subTest(selection=selection):
@@ -191,8 +241,15 @@ include("${HP_KERNEL_CMAKE}")
                 self.assertEqual(result.stdout.strip(), expected, f"expected={expected} actual={result.stdout.strip()}")
                 self.assertEqual(result.stderr, "", f"expected empty stderr actual={result.stderr}")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_sdk_rejects_mixed_or_unknown_families(self) -> None:
-        """A single SDK must never silently serve the wrong device generation."""
+        """A single SDK must never silently serve the wrong device generation.
+
+        Feature: Multicore native build target selection.
+        Description: A single SDK must never silently serve the wrong device generation.
+        Expectation: Mixed, unknown and empty SoC families fail before SDK preparation.
+        """
         for selection in ("ascend910b,ascend950", "ascend950,ascend910_93", "ascend970", ""):
             with self.subTest(selection=selection):
                 result = subprocess.run(["bash", "-c", _SOC_QUERY,

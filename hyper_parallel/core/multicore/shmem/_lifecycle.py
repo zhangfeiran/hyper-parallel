@@ -173,9 +173,9 @@ def acquire(root_group: ProcessGroup | None = None, *, heap_size_bytes: int | No
 
     Args:
         heap_size_bytes: Optional explicit initialization size, overriding the environment for this lifecycle.
-        root_group: The EP ProcessGroup, which may be a subgroup of Torch WORLD. ``None`` selects WORLD when
-            Torch distributed is initialized, or a one-PE Root otherwise. Disjoint groups initialize independently;
-            one process cannot participate in two different active SHMEM roots simultaneously.
+        root_group: The EP ProcessGroup, which may be a subgroup of WORLD. ``None`` selects WORLD when
+            distributed communication is initialized, or a one-PE Root otherwise. Disjoint groups initialize
+            independently; one process cannot participate in two different active SHMEM roots simultaneously.
 
     Raises:
         RuntimeError: If the Root identity or framework state differs from the active lifecycle, or a previous Native
@@ -515,7 +515,7 @@ def release() -> None:
             _users -= 1
             return
 
-        _automatic.collective_call(_prepare_shutdown)
+        _automatic.collective_call(_prepare_shutdown, group=_root_group)
         _, dist = _torch_modules()
         if _root_uses_distributed:
             dist.barrier(group=_root_group)
@@ -523,7 +523,7 @@ def release() -> None:
         _shutdown_failed = True
         try:
             # All peers become terminal if any Native shutdown fails; none may reinitialize alone.
-            _automatic.collective_call(_load_native()._shutdown)  # pylint: disable=protected-access
+            _automatic.collective_call(_load_native()._shutdown, group=_root_group)  # pylint: disable=protected-access
         finally:
             _users = 0
             _root_group = None

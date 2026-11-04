@@ -84,8 +84,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         _lifecycle._device_index = None  # pylint: disable=protected-access
         _lifecycle._shutdown_failed = False  # pylint: disable=protected-access
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_single_process_runtime_is_reference_counted(self) -> None:
-        """Keep one Root PE active until its final reference is released."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Keep one Root PE active until its final reference is released.
+        Expectation: Only the final release shuts down the active runtime.
+        """
         self.dist.is_initialized.return_value = False
         self.assertEqual(_lifecycle._reference_count(), 0)  # pylint: disable=protected-access
 
@@ -109,8 +114,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.dist.barrier.assert_not_called()
         self.native._shutdown.assert_called_once_with()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_equivalent_process_group_shares_runtime(self) -> None:
-        """Count a distinct ProcessGroup object describing the same complete WORLD."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Count a distinct ProcessGroup object describing the same complete WORLD.
+        Expectation: Equivalent WORLD memberships share one initialization and reference count.
+        """
         equivalent_world = object()
 
         _lifecycle.acquire(self.world)
@@ -123,8 +133,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.native._shutdown.assert_not_called()
         _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_active_runtime_rejects_changed_data_engine(self) -> None:
-        """Reject a new user before it can reinterpret the active device state."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Reject a new user before it can reinterpret the active device state.
+        Expectation: A changed engine fails before adding a runtime reference.
+        """
         _lifecycle.acquire(self.world)
 
         with patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma"}):
@@ -134,8 +149,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertEqual(_lifecycle._reference_count(), 1)
         _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_active_runtime_rejects_changed_qp_count(self) -> None:
-        """Retain the original QP bank and consumer reference after a rejected join."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Retain the original QP bank and consumer reference after a rejected join.
+        Expectation: A changed QP count preserves the original configuration and reference count.
+        """
         self.native._debug_state.return_value['config'].update(data_engine='mte_udma', udma_qp_num=16)
         with patch.dict(os.environ, {'HYPER_PARALLEL_SHMEM_DATA_ENGINE': 'mte_udma',
                                      'HYPER_PARALLEL_SHMEM_UDMA_QP_NUM': '16'}):
@@ -146,8 +166,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
             self.assertEqual(_lifecycle._reference_count(), 1)
             _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_active_udma_runtime_accepts_the_same_data_engine(self) -> None:
-        """Keep the shared QP engine fixed while adding an equivalent owner."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Keep the shared QP engine fixed while adding an equivalent owner.
+        Expectation: An equivalent UDMA owner adds and releases one reference safely.
+        """
         self.native._debug_state.return_value["config"]["data_engine"] = "mte_udma"
 
         with patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma"}):
@@ -157,8 +182,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
             _lifecycle.release()
             _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_different_root_is_rejected(self) -> None:
-        """Reject a later ProcessGroup with a different ordered membership."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Reject a later ProcessGroup with a different ordered membership.
+        Expectation: A different root fails without replacing the active runtime.
+        """
         different_group = object()
 
         def ranks(group: object) -> list[int]:
@@ -175,8 +205,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertEqual(_lifecycle._reference_count(), 1)  # pylint: disable=protected-access
         _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_distributed_state_change_is_rejected(self) -> None:
-        """Keep the framework mode fixed throughout one active lifecycle."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Keep the framework mode fixed throughout one active lifecycle.
+        Expectation: Changing distributed initialization state preserves the active runtime.
+        """
         self.dist.is_initialized.return_value = False
         _lifecycle.acquire()
         self.dist.is_initialized.return_value = True
@@ -189,8 +224,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.dist.is_initialized.return_value = False
         _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_collective_runtime_operation_order(self) -> None:
-        """Order Root convergence before initialization and quiescence before shutdown."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Order Root convergence before initialization and quiescence before shutdown.
+        Expectation: Initialization and shutdown follow the asserted collective sequence.
+        """
         operations = Mock()
         operations.attach_mock(self.dist.barrier, "barrier")
         operations.attach_mock(self.native._initialize, "initialize")
@@ -213,8 +253,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
             ],
         )
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_clean_release_allows_new_runtime(self) -> None:
-        """Run Native initialization and shutdown again after a clean lifecycle."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Run Native initialization and shutdown again after a clean lifecycle.
+        Expectation: A clean release allows another complete runtime lifecycle.
+        """
         for _ in range(2):
             _lifecycle.acquire()
             _lifecycle.release()
@@ -224,8 +269,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertEqual(self.dist.barrier.call_count, 4)
         self.assertFalse(_lifecycle._shutdown_failed)  # pylint: disable=protected-access
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_entry_barrier_failure_is_retryable(self) -> None:
-        """Retry when Root convergence fails before entering Native initialization."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Retry when Root convergence fails before entering Native initialization.
+        Expectation: A failed entry barrier leaves native initialization available for retry.
+        """
         self.dist.barrier.side_effect = RuntimeError("root convergence failed")
 
         with self.assertRaisesRegex(RuntimeError, "root convergence failed"):
@@ -238,8 +288,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         _lifecycle.acquire()
         _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_final_release_precondition_failure_is_retryable(self) -> None:
-        """Retain lifecycle state when shutdown validation, sync, or barrier fails."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Retain lifecycle state when shutdown validation, sync, or barrier fails.
+        Expectation: Precondition errors retain the final reference for a successful retry.
+        """
         for operation in (self.native._validate_shutdown, self.torch.npu.synchronize, self.dist.barrier):
             with self.subTest(operation=operation):
                 self._reset_runtime()
@@ -261,8 +316,41 @@ class TestRuntimeLifecycle(unittest.TestCase):
                 operation.side_effect = None
                 _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_bare_subgroup_release_uses_its_own_root(self) -> None:
+        """Feature: Bare SHMEM subgroup teardown.
+        Description: Release two root members while fourteen WORLD peers do unrelated work.
+        Expectation: Both teardown metadata exchanges use the acquired root, independent of managed cleanup.
+        """
+        subgroup = object()
+        self.dist.get_world_size.side_effect = lambda group=None: 2 if group is subgroup else 16
+        self.dist.get_process_group_ranks.return_value = [0, 8]
+        for registered_root in (None, object()):
+            with self.subTest(registered_root=registered_root), patch.object(
+                    _lifecycle._automatic, "dist", self.dist), patch.object(
+                    _lifecycle._automatic._CLEANUP, "root_group", registered_root):
+                _lifecycle.acquire(subgroup)
+                self.dist.all_gather_object.reset_mock()
+                self.dist.barrier.reset_mock()
+
+                _lifecycle.release()
+
+                self.assertEqual(self.dist.all_gather_object.call_args_list, [
+                    call([None, None], None, group=subgroup),
+                    call([None, None], None, group=subgroup),
+                ])
+                self.dist.barrier.assert_called_once_with(group=subgroup)
+                self.assertEqual(_lifecycle._reference_count(), 0)
+                self.assertFalse(_lifecycle._shutdown_failed)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_native_initialize_failure_is_retryable(self) -> None:
-        """Retry Native initialization after a failed attempt; only shutdown failure blocks."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Retry Native initialization after a failed attempt; only shutdown failure blocks.
+        Expectation: Initialization can retry without entering a terminal shutdown state.
+        """
         self.native._initialize.side_effect = RuntimeError("initialize failed")
 
         with self.assertRaisesRegex(RuntimeError, "initialize failed"):
@@ -277,8 +365,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertEqual(self.native._initialize.call_count, 2)
         _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_peer_shutdown_errors_are_coordinated(self) -> None:
-        """A peer precheck failure blocks the barrier; a peer native failure is terminal."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: A peer precheck failure blocks the barrier; a peer native failure is terminal.
+        Expectation: Peer precheck errors are retryable and peer shutdown errors are terminal.
+        """
         _lifecycle.acquire()
         self.dist.barrier.reset_mock()
         with patch.object(_lifecycle._automatic, "exchange", return_value=[None, "peer busy"]):
@@ -295,8 +388,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Native shutdown failure"):
             _lifecycle.acquire()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_native_shutdown_failure_blocks_future_acquire(self) -> None:
-        """Clear Root ownership but reject a new lifecycle after Native shutdown fails."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Clear Root ownership but reject a new lifecycle after Native shutdown fails.
+        Expectation: A failed native shutdown clears ownership and rejects new acquisition.
+        """
         _lifecycle.acquire()
         self.native._shutdown.side_effect = RuntimeError("finalize failed")
 
@@ -309,13 +407,23 @@ class TestRuntimeLifecycle(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Native shutdown failure"):
             _lifecycle.acquire()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_release_without_reference_is_rejected(self) -> None:
-        """Expose an unmatched release instead of silently underflowing the user count."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Expose an unmatched release instead of silently underflowing the user count.
+        Expectation: An unmatched release reports an error without underflowing references.
+        """
         with self.assertRaisesRegex(RuntimeError, "no active reference"):
             _lifecycle.release()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_runtime_restart_preserves_collective_operation_order(self) -> None:
-        """Rebuild explicit Allocations around one Native restart."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Rebuild explicit Allocations around one Native restart.
+        Expectation: Explicit allocations survive the asserted coordinated native restart.
+        """
         _lifecycle.acquire()
         operations = []
         clock = [10.0]
@@ -399,8 +507,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertAlmostEqual(result.stages_ms["finalize_ms"], 5.0)
         self.assertFalse(_lifecycle._shutdown_failed)  # pylint: disable=protected-access
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_runtime_restart_preflight_failure_preserves_runtime(self) -> None:
-        """Converge ownership, device, Allocation and hook failures before teardown."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Converge ownership, device, Allocation and hook failures before teardown.
+        Expectation: Preflight errors converge before destructive runtime operations.
+        """
         _lifecycle.acquire()
         _lifecycle.acquire()
         with self.assertRaisesRegex(RuntimeError, "one healthy Runtime user"):
@@ -475,8 +588,13 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.native._shutdown.assert_not_called()
         self.assertFalse(_lifecycle._shutdown_failed)  # pylint: disable=protected-access
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_runtime_restart_destructive_failure_is_terminal(self) -> None:
-        """Invalidate the Runtime after Allocation release begins and fails."""
+        """Feature: SHMEM runtime lifecycle.
+        Description: Invalidate the Runtime after Allocation release begins and fails.
+        Expectation: Destructive restart errors invalidate subsequent runtime access.
+        """
         _lifecycle.acquire()
         self.native._shutdown.side_effect = RuntimeError("finalize failed")
         with self.assertRaisesRegex(RuntimeError, "finalize failed"):

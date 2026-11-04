@@ -18,7 +18,7 @@ if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
 elseif(ASCEND_COMPUTE_UNIT STREQUAL "ascend910_93")
     set(KERNEL_COMPUTE_UNIT ascend910_9391)
 elseif(ASCEND_COMPUTE_UNIT STREQUAL "ascend950")
-    set(KERNEL_COMPUTE_UNIT ascend950pr_9599)
+    set(KERNEL_COMPUTE_UNIT ascend950dt_9582)
 else()
     message(
         FATAL_ERROR

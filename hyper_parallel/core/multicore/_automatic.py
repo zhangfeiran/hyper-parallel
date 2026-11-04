@@ -24,27 +24,31 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 
 _LOGGER = logging.getLogger(__name__)
+_REGISTERED_ROOT = object()
 
 
-def exchange(value: Any) -> list[Any]:
+def exchange(value: Any, *, group: Any = _REGISTERED_ROOT) -> list[Any]:
     """Exchange cold-path lifecycle metadata across the registered root.
 
     Args:
         value: Picklable local lifecycle state.
+        group: Explicit metadata group. Omission selects the registered root; None selects WORLD.
     """
     if not dist.is_initialized():
         return [value]
-    group = _CLEANUP.root_group
+    if group is _REGISTERED_ROOT:
+        group = _CLEANUP.root_group
     values = [None] * dist.get_world_size(group)
     dist.all_gather_object(values, value, group=group)
     return values
 
 
-def collective_call(callback: Callable[[], None]) -> None:
+def collective_call(callback: Callable[[], None], *, group: Any = _REGISTERED_ROOT) -> None:
     """Keep peers at the same teardown stage when a local operation raises.
 
     Args:
         callback: Teardown stage entered by every rank in the same order.
+        group: Explicit metadata group. Omission selects the registered root; None selects WORLD.
     """
     failure = None
     try:
@@ -52,7 +56,8 @@ def collective_call(callback: Callable[[], None]) -> None:
     # Peers must see ordinary local errors before entering the next collective.
     except Exception as error:  # pylint: disable=broad-exception-caught
         failure = error
-    failures = exchange(None if failure is None else f"{type(failure).__name__}: {failure}")
+    value = None if failure is None else f"{type(failure).__name__}: {failure}"
+    failures = exchange(value) if group is _REGISTERED_ROOT else exchange(value, group=group)
     if any(error is not None for error in failures):
         raise RuntimeError(f"multicore teardown stage failed: {failures}") from failure
 
