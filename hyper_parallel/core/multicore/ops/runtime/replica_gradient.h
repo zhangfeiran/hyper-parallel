@@ -24,7 +24,7 @@ namespace MulticoreRuntime {
 // Every worker owns disjoint blocks; peers visit each block in the same FP32 order.
 __aicore__ inline void AddReplicaGradient(GM_ADDR output, GM_ADDR source, int64_t elements,
                                          int32_t peer, int32_t worker, int32_t workers) {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
   constexpr int32_t block_elements = 4096;
   AscendC::TPipe pipe;
   AscendC::TBuf<AscendC::TPosition::VECCALC> buffer;
