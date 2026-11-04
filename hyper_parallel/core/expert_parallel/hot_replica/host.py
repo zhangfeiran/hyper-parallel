@@ -45,6 +45,15 @@ def _validate_counts(rows: tuple[tuple[int, ...], ...]) -> bool:
     return module is not None and module.validate_counts(rows)
 
 
+def _materialize_dispatch(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int]],
+                          home: int, budget: int, nodes: tuple[int, ...]) -> tuple | None:
+    """Use the additive integer primitive while retaining optional backend fallback."""
+    module = _native_backend()
+    if module is None or not hasattr(module, "materialize_dispatch"):
+        return None
+    return module.materialize_dispatch(counts, copies, home, budget, nodes)
+
+
 def _rank_compute(
     experts: dict[int, int], source: tuple[int, ...] | None, home: int, rank: int,
     durations: dict[int, tuple[float, float]], forward: tuple, backward: tuple,

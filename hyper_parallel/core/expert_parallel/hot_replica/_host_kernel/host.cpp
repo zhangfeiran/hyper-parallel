@@ -20,6 +20,10 @@
 #include <cstdint>
 #include <limits>
 
+namespace ReplicaHost {
+PyObject *MaterializeDispatch(PyObject *, PyObject *);
+}
+
 namespace {
 
 class Owned {
@@ -253,6 +257,8 @@ PyMethodDef methods[] = {
   {"validate_counts", ValidateCounts, METH_O, "Validate a frozen ordinary integer matrix."},
   {"rank_compute", RankCompute, METH_VARARGS, "Accumulate exact ordered calibrated expert compute bins."},
   {"ordered_compute", OrderedCompute, METH_VARARGS, "Interpolate ordered guest rows and serially sum home rows."},
+  {"materialize_dispatch", ReplicaHost::MaterializeDispatch, METH_VARARGS,
+   "Materialize exact physical slots and source dispatch quotas."},
   {nullptr, nullptr, 0, nullptr},
 };
 

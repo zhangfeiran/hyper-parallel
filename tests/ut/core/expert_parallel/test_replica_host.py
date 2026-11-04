@@ -29,6 +29,7 @@ from unittest.mock import patch
 from hyper_parallel.core.expert_parallel.hot_replica import cost, host, planner
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica.critical_path import DeviceCriticalPathCalibration
+from tests.common.mark_utils import arg_mark
 
 
 @unittest.skipUnless(shutil.which("cmake") and shutil.which("c++"), "CPU native tests require CMake and C++")
@@ -79,6 +80,94 @@ class TestReplicaHost(unittest.TestCase):
                     except ValueError as error:
                         outcomes.append(("error", str(error)))
             self.assertEqual(outcomes[0], outcomes[1])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_materialization_matches_all_source_quotas_and_slots(self) -> None:
+        """Feature: Native integer dispatch materialization.
+        Description: Replay empty sources, guest budgets, and arbitrary node labels through the real C API.
+        Expectation: Every physical slot and source quota exactly matches the Python reference.
+        """
+        generator = random.Random(2641105)
+        for size in (2, 4, 8, 16, 64):
+            for budget in (0, 1, 2, 6):
+                for iteration in range(8):
+                    with self.subTest(size=size, budget=budget, iteration=iteration):
+                        config = ExpertReplicaConfig(size * 6, size, budget)
+                        counts = tuple(tuple(0 if iteration % 2 and rank % 3 == 0 else
+                                             generator.randrange(80) * (8 if expert < 6 else 1)
+                                             for expert in range(size * 6)) for rank in range(size))
+                        nodes = tuple(101 + 7 * (rank // 2) for rank in range(size)) if iteration % 3 else ()
+                        with patch.object(host, "_native_backend", return_value=None):
+                            selected = planner._build_expert_replica_plan(
+                                counts, budget, adaptive=bool(budget), _rank_nodes=nodes)
+                            copies = [{expert: rows for expert, rows in zip(slots, destination) if expert >= 0}
+                                      for slots, destination in zip(selected.slot_to_logical,
+                                                                    selected.destination_counts)]
+                            expected = planner._materialize(counts, copies, config, rank_nodes=nodes)
+                        before = [tuple(row.items()) for row in copies]
+                        slots, dispatch = self.native.materialize_dispatch(counts, copies, 6, budget, nodes)
+                        self.assertEqual(slots, expected.slot_to_logical)
+                        self.assertEqual(dispatch, expected.dispatch_counts)
+                        self.assertEqual(before, [tuple(row.items()) for row in copies])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_materialization_preserves_fallback_and_capacity_errors(self) -> None:
+        """Feature: Native materialization boundary.
+        Description: Cross Python integer limits and mapping subclasses with exact capacity checks.
+        Expectation: Unsupported inputs retain the Python result and capacity errors remain descriptive.
+        """
+        counts = ((12, 0, 0, 0), (0, 0, 0, 0))
+        copies = [{0: 4, 1: 0}, {2: 0, 3: 0, 0: 8}]
+        config = ExpertReplicaConfig(4, 2, 1)
+        unsupported = (
+            (((2**80, 0, 0, 0), (0, 0, 0, 0)), [{0: 2**80 - 8, 1: 0}, copies[1]]),
+            (counts, [OrderedDict(copies[0]), copies[1]]),
+        )
+        for values, quotas in unsupported:
+            with self.subTest(values=values, quotas=quotas):
+                self.assertIsNone(self.native.materialize_dispatch(values, quotas, 2, 1, (0, 0)))
+                outcomes = []
+                for backend in (None, self.native):
+                    with patch.object(host, "_native_backend", return_value=backend):
+                        outcomes.append(planner._materialize(values, quotas, config, rank_nodes=(0, 0)))
+                self.assertEqual(outcomes[0], outcomes[1])
+        with patch.object(host, "_native_backend", return_value=self.native):
+            with self.assertRaisesRegex(ValueError, "exceeds capacity_limit"):
+                planner._materialize(counts, copies, config, 7)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_materializer_is_reached_by_the_real_planner(self) -> None:
+        """Feature: Native materialization reachability.
+        Description: Spy on the concrete primitive used by an active guest plan.
+        Expectation: The planner consumes the native dispatch result and validates its complete plan.
+        """
+        counts = ((600, 300, 50, 50, 20, 10, 0, 0),) * 4
+        with patch.object(host, "_native_backend", return_value=self.native), patch.object(
+                planner, "_materialize_dispatch", wraps=host._materialize_dispatch) as called:
+            plan = planner._build_expert_replica_plan(counts, 2, adaptive=True, _rank_nodes=(0, 0, 1, 1))
+        plan.validate()
+        self.assertTrue(plan.transfers)
+        called.assert_called_once()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_prior_domain_abi_retains_python_materialization_without_the_additive_method(self) -> None:
+        """Feature: Optional native materialization capability.
+        Description: Present a domain-compatible module without the additional integer primitive.
+        Expectation: Dispatch uses the Python reference while the existing domain ABI remains unchanged.
+        """
+        counts = ((12, 0, 0, 0), (0, 0, 0, 0))
+        copies = [{0: 4, 1: 0}, {2: 0, 3: 0, 0: 8}]
+        config = ExpertReplicaConfig(4, 2, 1)
+        with patch.object(host, "_native_backend", return_value=None):
+            expected = planner._materialize(counts, copies, config)
+        with patch.object(host, "_native_backend", return_value=object()):
+            actual = planner._materialize(counts, copies, config)
+        self.assertEqual(actual, expected)
+        self.assertEqual(self.native.abi_version(), 3)
 
     def test_ordered_costs_match_double_bits_and_cache(self) -> None:
         """Feature: Ordered calibrated costs.

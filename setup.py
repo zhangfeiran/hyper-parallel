@@ -248,7 +248,8 @@ if __name__ == '__main__':
         include_package_data=True,
         ext_modules=[Extension(
             'hyper_parallel.core.expert_parallel.hot_replica._host_kernel._replica_host',
-            sources=['hyper_parallel/core/expert_parallel/hot_replica/_host_kernel/host.cpp'],
+            sources=['hyper_parallel/core/expert_parallel/hot_replica/_host_kernel/host.cpp',
+                     'hyper_parallel/core/expert_parallel/hot_replica/_host_kernel/dispatch.cpp'],
             language='c++',
             extra_compile_args=['-std=c++17', '-O3', '-fno-fast-math', '-ffp-contract=off'],
             optional=True,
