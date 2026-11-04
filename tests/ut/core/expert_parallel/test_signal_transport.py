@@ -37,6 +37,60 @@ from tests.common.mark_utils import arg_mark
 class TestSignalReplicaTransport(unittest.TestCase):
     """Keep host boundary checks alongside real-stream NPU protocol acceptance."""
 
+    def test_a5_joins_outgoing_rma_before_incoming_readiness_and_consumer(self) -> None:
+        """Complete the AIV copy phase before admitting a full-device consumer.
+
+        Feature: Ascend950 replica weight publication.
+        Description: Exercise a bidirectional lease through its real host protocol with mocked streams.
+        Expectation: A5 uses RMA and joins outgoing streams before incoming ready waits and the consumer.
+        """
+        weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16), torch.ones(1, 2, 1, dtype=torch.bfloat16))
+        storage = torch.empty(signal_storage_bytes(((2, 2), (2, 1)), 1, 2, 2), dtype=torch.uint8)
+        runtime = MagicMock()
+        runtime.debug_state.return_value = {'device_model': 'ascend_950'}
+        provider = SignalReplicaTransport(runtime, storage, 1, 2)
+        transfers = (SimpleNamespace(owner_rank=0, owner_slot=0, target_rank=1, target_slot=1),
+                     SimpleNamespace(owner_rank=1, owner_slot=0, target_rank=0, target_slot=1))
+        route = SimpleNamespace(rank=0, plan=SimpleNamespace(
+            config=SimpleNamespace(replica_slots_per_rank=1, ep_size=2, home_experts=1), transfers=transfers))
+        backend, order = MagicMock(), []
+        backend.current_stream.return_value.wait_event.side_effect = lambda event: order.append('outgoing_join')
+        with patch.object(torch, 'cpu', backend), patch.object(torch.Tensor, 'record_stream'):
+            provider._bind(weights)
+            addresses = {value.data_ptr() for value in provider.projection_signals}
+
+            def wait(signal: torch.Tensor, *args: object, **kwargs: object) -> None:
+                if signal.data_ptr() in addresses:
+                    order.append('incoming_ready')
+
+            runtime.wait_signal.side_effect = wait
+            with provider.lease(weights, route, overlap=True):
+                order.append('consumer')
+                self.assertEqual(order, ['outgoing_join', 'incoming_ready', 'incoming_ready', 'consumer'])
+                self.assertTrue(all(call.kwargs['use_sdma'] is False for call in runtime.put.call_args_list))
+        self.assertEqual(runtime.put.call_count, 4)
+
+    def test_a3_retains_overlapped_sdma_publication(self) -> None:
+        """Preserve the qualified A3 projection overlap and transport selection.
+
+        Feature: Replica weight publication across device generations.
+        Description: Enter an outgoing A3 lease and observe its transport before consumer submission.
+        Expectation: Matrix and readiness writes use SDMA without an early outgoing-stream join.
+        """
+        weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16),)
+        storage = torch.empty(signal_storage_bytes(((2, 2),), 1, 2, 2), dtype=torch.uint8)
+        runtime = MagicMock()
+        runtime.debug_state.return_value = {'device_model': 'ascend_910c'}
+        provider = SignalReplicaTransport(runtime, storage, 1, 2)
+        route = SimpleNamespace(rank=0, plan=SimpleNamespace(
+            config=SimpleNamespace(replica_slots_per_rank=1, ep_size=2, home_experts=1),
+            transfers=(SimpleNamespace(owner_rank=0, owner_slot=0, target_rank=1, target_slot=1),)))
+        backend = MagicMock()
+        with patch.object(torch, 'cpu', backend), patch.object(torch.Tensor, 'record_stream'):
+            with provider.lease(weights, route, overlap=True):
+                self.assertTrue(all(call.kwargs['use_sdma'] is True for call in runtime.put.call_args_list))
+                backend.current_stream.return_value.wait_event.assert_not_called()
+
     def test_observer_reports_payload_hits_without_reporting_matrix_transfers(self) -> None:
         """Observe actual matrix traffic while fresh readiness survives a cache hit."""
         weights = (torch.ones(1, 2, 2, dtype=torch.bfloat16), torch.ones(1, 2, 1, dtype=torch.bfloat16))

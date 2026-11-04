@@ -88,9 +88,10 @@ def signal_storage_bytes(shapes: tuple[tuple[int, ...], ...], slots: int,
 class SignalReplicaTransport:
     """Lease symmetric slots with credit, projection readiness and final ACKs.
 
-    SDMA weight copies run on one stream per peer. Fused backward workers return
-    FP32 gradients; schedules without complete projection fences use parallel
-    SDMA internally. All ranks submit the same invocation and epoch sequence.
+    Weight copies run on one stream per peer. Ascend950 uses device RMA and
+    completes the AIV copy phase before admitting a fused consumer. Fused backward
+    workers return FP32 gradients; incomplete projection fences use SDMA GET
+    internally. All ranks submit the same invocation and epoch sequence.
     """
 
     def __init__(self, runtime: Any, storage: torch.Tensor, slots: int, ep_size: int,
@@ -98,7 +99,7 @@ class SignalReplicaTransport:
         """Bind externally owned, aligned symmetric uint8 storage.
 
         Args:
-            runtime: Stream-ordered SDMA put/get, signal/wait and host-barrier provider.
+            runtime: Stream-ordered RMA, signal/wait, host-barrier and native device-identity provider.
             storage: Symmetric storage retained through all remote consumers.
             slots: Guest expert budget per rank.
             ep_size: Number of ranks in the runtime's peer namespace.
@@ -110,6 +111,7 @@ class SignalReplicaTransport:
         _integer(slots, "slots")
         _integer(ep_size, "ep_size")
         self.runtime, self.storage, self.slots, self.ep_size = runtime, storage, slots, ep_size
+        self._use_sdma = runtime.debug_state()["device_model"] != "ascend_950"
         self.pool = self.signals = self.projection_signals = None
         self.gradient_bands = gradient_bands
         self._gradient_band_storage = {}
@@ -352,7 +354,8 @@ class SignalReplicaTransport:
                                                     physical_slot=item.target_slot,
                                                     bytes=source.numel() * source.element_size())
                                      if observer is not None else None)
-                            self.runtime.put(self.pool.weights[index][slot], source, item.target_rank, use_sdma=True)
+                            self.runtime.put(self.pool.weights[index][slot], source, item.target_rank,
+                                             use_sdma=self._use_sdma)
                             if observer is not None:
                                 observer.end(stamp)
                         elif observer is not None:
@@ -362,9 +365,19 @@ class SignalReplicaTransport:
                                            physical_slot=item.target_slot, bytes=0)
                         # A hit skips payload bytes, never the current invocation's readiness.
                         self.runtime.put(self.projection_signals[index, slot, :1], value,
-                                         item.target_rank, use_sdma=True)
+                                         item.target_rank, use_sdma=self._use_sdma)
             ready = (tuple(signal.data_ptr() for signal in self.projection_signals), epoch)
             prefetched = ReplicaPrefetch(self.pool, _wait, projection_ready=ready)
+            copy_done = []
+            if not self._use_sdma:
+                # A full-device consumer must not occupy AIV workers needed by an outgoing RMA copy.
+                caller = backend.current_stream(weights[0].device)
+                for stream in streams.values():
+                    done = backend.Event()
+                    done.record(stream)
+                    caller.wait_event(done)
+                    copy_done.append(done)
+                prefetched.wait_weights()
             try:
                 yield prefetched
             finally:
