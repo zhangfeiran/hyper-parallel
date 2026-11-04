@@ -76,6 +76,10 @@ class TestA5SharedGmm(unittest.TestCase):
 #define HYPER_MULTICORE_BF16_GMM_BLAZE_WORKER_H_
 #define __aicore__
 bool on_aiv = false;
+int overflow_calls = 0;
+namespace AscendC::AscendCUtils {
+void SetOverflow(int value) { assert(value == 1); ++overflow_calls; }
+}
 #define ASCEND_IS_AIV (on_aiv)
 using GM_ADDR = unsigned char*;
 struct TCubeTiling { int32_t M, N, Ka; };
@@ -112,10 +116,12 @@ int main() {
     assert(got.m == uint64_t(s.m) && got.n == uint64_t(s.n) && got.k == uint64_t(s.k));
     assert(got.a == a && got.b == b && got.c == c && got.lane == 7 && got.cubes == 32);
     assert(got.ta == s.ta && got.tb == s.tb);
+    assert(overflow_calls == MulticoreBf16::calls);
     on_aiv = true;
     const int before = MulticoreBf16::calls;
     MulticoreBf16::ExecuteSharedBlazeTask(task,a,b,c,reinterpret_cast<GM_ADDR>(&tiling),7,32);
     assert(MulticoreBf16::calls == before);
+    assert(overflow_calls == before);
     on_aiv = false;
   }
 }

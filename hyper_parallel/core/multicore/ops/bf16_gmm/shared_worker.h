@@ -13,6 +13,7 @@ __aicore__ inline void ExecuteSharedBlazeTask(const Task &task, GM_ADDR a, GM_AD
   if ASCEND_IS_AIV {
     return;
   }
+  AscendC::AscendCUtils::SetOverflow(1);
   GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, tiling, tiling_address);
   const Problem problem{
     static_cast<uint64_t>(tiling.M), static_cast<uint64_t>(tiling.N), static_cast<uint64_t>(tiling.Ka), 0, 0, 0};
