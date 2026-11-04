@@ -16,10 +16,11 @@ experts. Each selected identity contributes its routing probability multiplied b
 Real and identity contributions are accumulated in expert order, retaining the reference's per-contribution
 cast. Identity weights and the input bypass remain differentiable. Storage-sharing identity input views and
 an ordered gather backward preserve HF's per-expert BF16 input-gradient accumulation without expanding
-identity tokens. `swiglu_precision: hf` is the model default: the optional generic MegaMoE switch
-`swiglu_hf_bf16=True` rounds the SiLU intermediate in forward and the two multiply branches in backward.
-The generic MegaMoE default remains fused. `swiglu_precision: fused` explicitly selects that arithmetic
-for both reference and candidate; validation reports distinguish the two modes.
+identity tokens. `swiglu_precision: fused` is the model default for both native and MegaMoE backends.
+The native NPU path calls `torch_npu.npu_swiglu`; MegaMoE embeds CANN `swi_glu` / `swi_glu_grad` inside
+its persistent kernel. Accelerator parity uses the native operator as the activation oracle.
+Explicit `swiglu_precision: hf` enables the optional generic `swiglu_hf_bf16=True` compatibility switch,
+which rounds the SiLU intermediate in forward and both multiply branches in backward.
 
 `LongcatFlashMegaMoeExperts` compacts active real assignments into a K=1 `MegaMoeExperts` executor.
 The `megamoe` backend requires BF16 NPU inputs and supports push and pull. The explicit `native` backend
@@ -67,7 +68,7 @@ implementation:
   backend: megamoe
   optimize_tasks: true
   routing_backend: triton
-  swiglu_precision: hf
+  swiglu_precision: fused
 ```
 
 Use `backend: native` with the same routing and activation options for the stronger native control.
@@ -156,7 +157,8 @@ remains separate from full pretrained training acceptance.
 The distributed worker uses the actual recipe replacements and sharding planner. A reduced two-layer case
 is a smoke test. Set `HP_LONGCAT_FULL_DEPTH=1` to preserve the released depth and routing cardinalities.
 Set `HP_LONGCAT_REFERENCE=same_dense` to compare against HF experts with identical non-MoE replacements;
-the default `hf` control retains the unmodified HF model. Reports record this distinction.
+the NPU default `native` control uses GMM and `npu_swiglu`; explicit `hf` retains the unmodified HF model.
+Reports record this distinction.
 
 Activate a matching CANN/native payload and acquire the shared NPU launcher lock before running the
 NPU launcher `tests/torch/models/longcat_flash/test_longcat_flash.py`. The parent launcher imports no

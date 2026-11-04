@@ -297,6 +297,22 @@ class TestLongcatIntegration(unittest.TestCase):
         self.assertLess(abs(float(experts.gate_up_proj.detach().std()) - 0.01), 0.002)
         self.assertLess(abs(float(experts.down_proj.detach().std()) - 0.01), 0.002)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_fused_activation_default_and_explicit_hf_compatibility(self) -> None:
+        """Feature: Default NPU SwiGLU semantics.
+
+        Description: Configure expert execution without allocating accelerator resources.
+        Expectation: Fused arithmetic is default and HF cast compatibility remains explicit.
+        """
+        for options, expected in (({}, False), ({"swiglu_precision": "hf"}, True)):
+            with self.subTest(options=options):
+                source = LongcatFlashExperts(LongcatFlashConfig.from_dict(small_config()))
+                adapter = LongcatFlashMegaMoeExperts(module=source, **options)
+                self.addCleanup(adapter.close_runtime)
+                adapter.configure()
+                self.assertEqual(adapter.swiglu_precision, "hf" if expected else "fused")
+                self.assertEqual(adapter._executor.swiglu_hf_bf16, expected)  # pylint: disable=protected-access
+
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")
     def test_recipe_optimizer_builds_fp32_main_parameters(self) -> None:

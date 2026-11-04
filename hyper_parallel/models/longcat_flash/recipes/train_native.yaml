@@ -56,7 +56,7 @@ plan_overrides:
     source_type: transformers.models.longcat_flash.modeling_longcat_flash.LongcatFlashExperts
     implementation:
       _target_: hyper_parallel.models.longcat_flash.adapter.experts.LongcatFlashMegaMoeExperts
-      swiglu_precision: hf
+      swiglu_precision: fused
       backend: native
       dispatch_mode: push
 - match: model.layers.*.mlps.[01]

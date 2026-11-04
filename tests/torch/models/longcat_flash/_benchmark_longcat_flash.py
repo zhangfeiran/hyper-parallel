@@ -156,7 +156,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--no-optimize-tasks", action="store_true")
     parser.add_argument("--no-direct-weight-gradients", action="store_true")
     parser.add_argument("--initial-token-capacity", type=int, default=None)
-    parser.add_argument("--swiglu-precision", choices=("hf", "fused"), default="hf")
+    parser.add_argument("--swiglu-precision", choices=("hf", "fused"), default="fused")
     parser.add_argument("--ep", type=int, default=4)
     parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument("--hidden", type=int, default=6144)
@@ -204,6 +204,16 @@ def main() -> None:
                            for parameter in experts.parameters())
     unused_gradient_zero = not bool(experts.gate_up_proj.grad[args.real // args.ep:].count_nonzero())
     parameter_shapes = {name: list(value.shape) for name, value in experts.named_parameters()}
+    activation_execution = {"mode": args.swiglu_precision}
+    if args.backend == "native":
+        activation_execution.update(operator="torch_npu.npu_swiglu" if args.swiglu_precision == "fused"
+                                    else "torch.nn.functional.silu + multiply", operator_calls=operators["npu_swiglu"])
+    else:
+        resources = experts._executor._resource_group.resources  # pylint: disable=protected-access
+        plan = resources.last_execution_plan
+        activation_execution.update(operator="embedded CANN swi_glu / swi_glu_grad",
+            forward_hf_bf16=plan.forward_graph.get_op("swiglu").fill_config.hf_bf16,
+            backward_hf_bf16=plan.backward_graph.get_op("swiglu_grad").fill_config.hf_bf16)
     experts.close_runtime()
     torch.npu.synchronize()
     report = {"rank": rank, "pid": os.getpid(), "backend": args.backend,
@@ -217,6 +227,7 @@ def main() -> None:
               "hyper_parallel_source": hyper_parallel.__file__,
               "warmup": args.warmup, "samples": args.samples, "identities": identities,
               "parameter_local_shapes": parameter_shapes, "native_operator_census": operators, "routing": routing,
+              "activation_execution": activation_execution,
               "local_experts": {"real": args.real // args.ep, "identity": args.zero // args.ep},
               "phases": phases, "finite_gradients": finite_gradients,
               "unused_gate_rows_gradient_zero": unused_gradient_zero,

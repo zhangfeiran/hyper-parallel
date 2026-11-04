@@ -40,6 +40,11 @@ from hyper_parallel.trainer.config.parser import parse_training_args
 from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime
 
 
+def _reference_mode(device_type: str) -> str:
+    """Use native fused NPU mathematics unless the HF oracle is requested."""
+    return os.getenv("HP_LONGCAT_REFERENCE", "native" if device_type == "npu" else "hf")
+
+
 def _resolve_entries(backend: str, mode: str, device_type: str) -> list:
     """Resolve actual recipe actions with explicit test-only backend selection."""
     root = Path(__file__).resolve().parents[4]
@@ -51,7 +56,9 @@ def _resolve_entries(backend: str, mode: str, device_type: str) -> list:
             if implementation.callable is LongcatFlashMegaMoeExperts:
                 entries[index] = dataclass_replace(entry, replace=dataclass_replace(
                     entry.replace, implementation=implementation.replace(backend=backend, dispatch_mode=mode,
-                                                        expert_weight_layout=os.getenv("HP_LONGCAT_LAYOUT", "EOI"))))
+                                                        expert_weight_layout=os.getenv("HP_LONGCAT_LAYOUT", "EOI"),
+                                                        swiglu_precision=os.getenv(
+                                                            "HP_LONGCAT_SWIGLU_PRECISION", "fused"))))
     if device_type == "cpu":
         entries = [entry for entry in entries if not (
             entry.replace is not None and entry.replace.kind == "module"
@@ -71,7 +78,7 @@ def _build_case(backend: str, device_type: str, mode: str, world: int,
     model = build_longcat_flash(config)
     reference = copy.deepcopy(model)
     entries = _resolve_entries(backend, mode, device_type)
-    reference_mode = os.getenv("HP_LONGCAT_REFERENCE", "hf")
+    reference_mode = _reference_mode(device_type)
     if reference_mode in ("same_dense", "native"):
         reference_entries = _resolve_entries("native", mode, device_type) if reference_mode == "native" else entries
         dense_entries = [entry for entry in reference_entries if reference_mode == "native" or not (
@@ -171,7 +178,7 @@ def _expert_reference_gradient(name: str, parameters: dict, gradient: Any) -> An
 def _expected_gradient(name: str, parameters: dict, config: dict, world: int, rank: int) -> Any:
     """Resolve physical owner gradients or reduce and pack the unsharded HF oracle."""
     gradient = _reference_gradient(name, parameters)
-    sharded_reference = ".experts." in name and os.getenv("HP_LONGCAT_REFERENCE", "hf") == "native"
+    sharded_reference = ".experts." in name and _reference_mode(parameters[name].device.type) == "native"
     if ".experts." in name and not sharded_reference:
         gradient = _expert_reference_gradient(name, parameters, gradient)
     if isinstance(gradient, DTensor):
@@ -277,7 +284,8 @@ def test_longcat_flash_ep() -> None:
     if device_type == "npu":
         torch.npu.synchronize()
     report = {"rank": rank, "world_size": world, "backend": backend, "dispatch": mode,
-              "reference": os.getenv("HP_LONGCAT_REFERENCE", "hf"), "depth": config["num_layers"],
+              "reference": _reference_mode(device_type), "depth": config["num_layers"],
+              "swiglu_precision": os.getenv("HP_LONGCAT_SWIGLU_PRECISION", "fused"),
               "real_experts": config["n_routed_experts"], "zero_experts": config["zero_expert_num"],
               "top_k": config["moe_topk"], "loss": float(candidate_output.loss.detach()),
               "reference_loss": float(reference_output.loss.detach()),

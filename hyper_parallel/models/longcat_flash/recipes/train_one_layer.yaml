@@ -65,7 +65,7 @@ plan_overrides:
       _target_: hyper_parallel.models.longcat_flash.adapter.experts.LongcatFlashMegaMoeExperts
       backend: megamoe
       dispatch_mode: push
-      swiglu_precision: hf
+      swiglu_precision: fused
       initial_token_capacity: 24576
 - match: model.layers.*.mlps.[01]
   params:

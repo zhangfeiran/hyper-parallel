@@ -78,7 +78,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None, backend: str = "megamoe",
                  dispatch_mode: str = "push", replica_slots_per_rank: int = 0,
-                 expert_weight_layout: str = "EOI", swiglu_precision: str = "hf",
+                 expert_weight_layout: str = "EOI", swiglu_precision: str = "fused",
                  optimize_tasks: bool = True, routing_backend: str = "torch",
                  direct_weight_gradients: bool = True, initial_token_capacity: int | None = None) -> None:
         """Bind a complete HF expert module before EP and FSDP sharding.
@@ -95,7 +95,7 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             initial_token_capacity: Optional initial compact-real-row reservation; automatic growth remains enabled.
             routing_backend: Ordered Torch routing, or explicit optional Ascend Triton fusion.
             optimize_tasks: Use exact route bounds and one-expert MegaMoE task addressing.
-            swiglu_precision: HF BF16 intermediate casts, or explicit native fused arithmetic.
+            swiglu_precision: Native fused arithmetic by default, or explicit HF BF16 intermediate casts.
         """
         super().__init__()
         del module_fqn
