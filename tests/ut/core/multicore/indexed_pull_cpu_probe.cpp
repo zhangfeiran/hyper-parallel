@@ -311,7 +311,7 @@ void Fixture::Verify() {
   }
 }
 
-template <bool InputTiles>
+template <bool InputTiles, bool Count = true>
 uint64_t Run(int64_t hidden, int64_t tokens, uint32_t topk, int pattern, int rank, bool reverse_ordinals) {
   Fixture fixture(hidden, tokens, topk, pattern, rank, reverse_ordinals);
   auto &machine = fixture.machine;
@@ -323,21 +323,45 @@ uint64_t Run(int64_t hidden, int64_t tokens, uint32_t topk, int pattern, int ran
     machine.source = fixture.inputs[peer].data();
     machine.metadata = fixture.metadata[peer].data();
     std::array<uint64_t, 6> statistics{};
-    MulticoreRuntime::PullTokenBlocks<uint16_t, true, InputTiles>(
+    MulticoreRuntime::PullTokenBlocks<uint16_t, Count, InputTiles>(
       TaskDesc{0}, fixture.inputs[peer].data(), fixture.destination.data(), fixture.metadata[peer].data(),
       fixture.offsets.data(), fixture.events.data(), machine.ub_begin, 0, tokens, hidden, topk, rank, peer,
       kLocalExperts, tokens, statistics.data(), fixture.groups.data(), fixture.tiles.data(), fixture.stride);
     assert(machine.reads.empty() && machine.stores.empty());
-    assert(statistics[0] == wanted * hidden * 2);
-    assert(statistics[1] == routes * hidden * 2);
-    assert(statistics[2] == machine.metadata_bytes);
-    assert(statistics[3] == wanted);
+    if constexpr (Count) {
+      assert(statistics[0] == wanted * hidden * 2);
+      assert(statistics[1] == routes * hidden * 2);
+      assert(statistics[2] == machine.metadata_bytes);
+      assert(statistics[3] == wanted);
+    } else {
+      assert(std::all_of(statistics.begin(), statistics.end(), [](uint64_t value) { return value == 0; }));
+    }
   }
   fixture.Verify<InputTiles>();
   if (total_wanted == 0) {
     assert(machine.payload_calls == 0);
   }
   return machine.payload_calls / std::max(uint64_t{1}, total_wanted);
+}
+
+template <bool Count>
+uint64_t RunRoutingSuite() {
+  uint64_t cases = 0;
+  for (int pattern = 0; pattern < 3; ++pattern) {
+    for (int rank = 0; rank < 4; ++rank) {
+      Run<false, Count>(5120, 129, 8, pattern, rank, true);
+      Run<true, Count>(5120, 129, 8, pattern, rank, true);
+      cases += 2;
+    }
+  }
+  for (auto topk : {1U, 8U, 12U, 16U}) {
+    for (auto tokens : {1, 31, 32, 33, 41, 42, 43, 63, 64, 65, 127, 128, 129, 257}) {
+      Run<false, Count>(5120, tokens, topk, 1, 1, true);
+      Run<true, Count>(5120, tokens, topk, 1, 1, true);
+      cases += 2;
+    }
+  }
+  return cases;
 }
 
 int main(int argc, char **argv) {
@@ -361,21 +385,12 @@ int main(int argc, char **argv) {
       assert(observed == static_cast<uint64_t>((hidden + 3071) / 3072));
       ++cases;
     }
+    const auto wide_type = MulticoreRuntime::GetTokenPullGeometry<float>(5120);
+    assert(wide_type.metadata_bytes == 8192 && wide_type.chunk_elements == 3072);
   } else if (suite == "routing") {
-    for (int pattern = 0; pattern < 3; ++pattern) {
-      for (int rank = 0; rank < 4; ++rank) {
-        Run<false>(5120, 129, 8, pattern, rank, true);
-        Run<true>(5120, 129, 8, pattern, rank, true);
-        cases += 2;
-      }
-    }
-    for (auto topk : {1U, 8U, 12U, 16U}) {
-      for (auto tokens : {1, 31, 32, 33, 41, 42, 43, 63, 64, 65, 127, 128, 129, 257}) {
-        Run<false>(5120, tokens, topk, 1, 1, true);
-        Run<true>(5120, tokens, topk, 1, 1, true);
-        cases += 2;
-      }
-    }
+    cases = RunRoutingSuite<true>();
+  } else if (suite == "normal") {
+    cases = RunRoutingSuite<false>();
   } else {
     return 2;
   }

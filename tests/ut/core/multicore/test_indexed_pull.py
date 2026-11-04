@@ -110,3 +110,13 @@ class TestIndexedPull(unittest.TestCase):
         """
         result = self.run_probe("routing")
         self.assertEqual(result["cases"], 136, f"expected_cases=136 actual={result['cases']}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_normal_path_preserves_rows_and_credits_without_statistics_writes(self) -> None:
+        """Feature: Peer ingress without diagnostic counters.
+        Description: Run both credit modes across routing and metadata boundary cases with counters disabled.
+        Expectation: Rows and credits are exact, and the diagnostic record remains untouched.
+        """
+        result = self.run_probe("normal")
+        self.assertEqual(result["cases"], 136, f"expected_cases=136 actual={result['cases']}")
