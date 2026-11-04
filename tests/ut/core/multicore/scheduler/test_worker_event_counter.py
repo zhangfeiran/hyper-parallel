@@ -21,10 +21,52 @@ import tempfile
 import unittest
 
 import hyper_parallel
+from tests.common.mark_utils import arg_mark
 
 
 class TestWorkerEventCounter(unittest.TestCase):
     """Keep Cube/Vector event publication and time units valid without NPU hardware."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_tagged_gmm_metadata_preserves_default_event_polling(self) -> None:
+        """Compile the production decoder and keep unrelated poll values unchanged."""
+        compiler = shutil.which("g++")
+        if compiler is None:
+            self.skipTest("g++ is required for the native dependency-metadata test")
+        source = Path(hyper_parallel.__file__).resolve().parent / "core/multicore/ops/runtime/worker_kernel.h"
+        source_text = source.read_text(encoding="utf-8")
+        begin = "  __aicore__ inline uint32_t TaskDependencyPollInterval("
+        end = "  __aicore__ inline void WaitForDependency("
+        method = begin + source_text.split(begin, 1)[1].split(end, 1)[0]
+        probe = """
+#include <cstdint>
+#define __aicore__
+enum class TaskType { TASK_GROUPED_MATMUL, TASK_SHMEM_PUT_MEM_SIGNAL };
+struct TaskDesc { TaskType task_type; uint32_t extra_value_1; uint32_t extra_value_2; };
+""" + method + """
+int main() {
+  for (uint32_t flag : {0x41350002U, 0x41350003U, 0x4D54494CU}) {
+    TaskDesc task{TaskType::TASK_GROUPED_MATMUL, 77U, flag};
+    if (TaskDependencyPollInterval(task) != 0 || task.extra_value_1 != 77U || task.extra_value_2 != flag) return 1;
+    task.task_type = TaskType::TASK_SHMEM_PUT_MEM_SIGNAL;
+    if (TaskDependencyPollInterval(task) != flag) return 2;
+  }
+  for (uint32_t delay : {0U, 7U, 30U, 300U}) {
+    TaskDesc task{TaskType::TASK_GROUPED_MATMUL, 99U, delay};
+    if (TaskDependencyPollInterval(task) != delay) return 3;
+  }
+  return 0;
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="hp-dependency-metadata-") as directory:
+            root = Path(directory)
+            unit, binary = root / "probe.cpp", root / "probe"
+            unit.write_text("#include <initializer_list>\n" + probe, encoding="utf-8")
+            result = subprocess.run([compiler, "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror", str(unit),
+                                     "-o", str(binary)], capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(subprocess.run([str(binary)], check=False, timeout=10).returncode, 0)
+        self.assertEqual(source_text.count("TaskDependencyPollInterval(task_desc)"), 3)
 
     def test_production_event_publication_and_polling(self) -> None:
         """Check concurrent increments and actual refresh thresholds on both device generations."""

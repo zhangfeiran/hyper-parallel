@@ -821,7 +821,7 @@ class KernelWorkerBase {
       AscendC::Trap();
     }
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
-      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
+      WaitForDependency(task_desc.dependent_event, TaskDependencyPollInterval(task_desc));
     }
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL &&
@@ -843,7 +843,7 @@ class KernelWorkerBase {
       AscendC::Trap();
     }
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
-      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
+      WaitForDependency(task_desc.dependent_event, TaskDependencyPollInterval(task_desc));
     }
     CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_BEFORE);
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
@@ -873,7 +873,7 @@ class KernelWorkerBase {
     uint32_t owner_id = getTaskProfileOwnerId(this->runtimeConfigPtr, task_id);
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
       uint64_t wait_start_cycle = cycle_trace_recorder.Now();
-      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
+      WaitForDependency(task_desc.dependent_event, TaskDependencyPollInterval(task_desc));
       uint64_t wait_end_cycle = cycle_trace_recorder.Now();
       cycle_trace_recorder.Record(Derived::PROFILE_DESC_WAIT_DEPENDENCY, task_id, task_desc.task_index, owner_id,
                                   wait_start_cycle, wait_end_cycle);
@@ -900,6 +900,18 @@ class KernelWorkerBase {
       cycle_trace_recorder.Record(Derived::PROFILE_DESC_TRIGGER_EVENT, task_id, task_desc.task_index, owner_id,
                                   trigger_start_cycle, trigger_end_cycle);
     }
+  }
+
+  __aicore__ inline uint32_t TaskDependencyPollInterval(const TaskDesc &task) {
+    // Tagged GMM metadata selects the compute kernel, not an event polling delay.
+    constexpr uint32_t a5_gmm_kernel_tag = 0x41350000;
+    constexpr uint32_t peer_tile_gmm_tag = 0x4D54494C;
+    if (task.task_type == TaskType::TASK_GROUPED_MATMUL &&
+        ((task.extra_value_2 & 0xFFFF0000U) == a5_gmm_kernel_tag ||
+         task.extra_value_2 == peer_tile_gmm_tag)) {
+      return 0;
+    }
+    return task.extra_value_2;
   }
 
   __aicore__ inline void WaitForDependency(uint32_t event_index, uint32_t poll_interval_us = 0) {
