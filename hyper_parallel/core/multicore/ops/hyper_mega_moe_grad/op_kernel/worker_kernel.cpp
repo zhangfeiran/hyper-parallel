@@ -22,6 +22,7 @@
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
 #include "bf16_gmm/cgmct_worker.h"
 #include "bf16_gmm/blaze_worker.h"
+#include "bf16_gmm/shared_worker.h"
 #endif
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
@@ -259,14 +260,29 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     }
   }
 
+  __aicore__ inline void ExecuteSharedGroupedMatmul(const TaskDesc &task_desc) {
+    GM_ADDR tiling_address =
+      input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset + 2016 * AscendC::GetBlockIdx();
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+      if (task_desc.extra_value_0 == MulticoreBf16::SHARED_BLAZE_TAG &&
+          task_desc.outputs[0].data_type == sizeof(bfloat16_t)) {
+        MulticoreBf16::ExecuteSharedBlazeTask(
+          task_desc, SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.inputs[1]),
+          SharedTensorAddress(task_desc.outputs[0]), tiling_address, task_desc.task_index, this->core_num);
+        return;
+      }
+    }
+#endif
+    grouped_matmul(SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.inputs[1]), nullptr, nullptr,
+                   nullptr, nullptr, nullptr, SharedTensorAddress(task_desc.inputs[2]), nullptr,
+                   SharedTensorAddress(task_desc.outputs[0]), input_list[WORKSPACE_IDX], tiling_address,
+                   task_desc.inputs[0].transpose_flag == 1, task_desc.inputs[1].transpose_flag == 1);
+  }
+
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
     if (task_desc.inputs[0].tensor_type == 2) {
-      GM_ADDR tiling_address = input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset +
-                               2016 * AscendC::GetBlockIdx();
-      grouped_matmul(SharedTensorAddress(task_desc.inputs[0]), SharedTensorAddress(task_desc.inputs[1]),
-                     nullptr, nullptr, nullptr, nullptr, nullptr, SharedTensorAddress(task_desc.inputs[2]),
-                     nullptr, SharedTensorAddress(task_desc.outputs[0]), input_list[WORKSPACE_IDX], tiling_address,
-                     task_desc.inputs[0].transpose_flag == 1, task_desc.inputs[1].transpose_flag == 1);
+      ExecuteSharedGroupedMatmul(task_desc);
       return;
     }
 
