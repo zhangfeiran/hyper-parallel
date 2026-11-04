@@ -261,6 +261,9 @@ class TestMegaMoeHeapManager(unittest.TestCase):
 
     def setUp(self) -> None:
         """Install one-rank lifecycle and configuration boundaries."""
+        identity_patch = patch.object(shmem, "debug_state", return_value={"device_model": "ascend_910c"})
+        identity_patch.start()
+        self.addCleanup(identity_patch.stop)
         self.reference = SimpleNamespace(
             device="npu:0",
             dtype=torch.bfloat16,

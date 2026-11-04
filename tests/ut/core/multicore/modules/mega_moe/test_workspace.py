@@ -41,6 +41,13 @@ from tests.common.mark_utils import arg_mark
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
 
+    def setUp(self) -> None:
+        """Provide an active native identity while all allocations remain on CPU."""
+        identity_patch = patch.object(workspace_module.shmem, "debug_state",
+                                      return_value={"device_model": "ascend_910c"})
+        identity_patch.start()
+        self.addCleanup(identity_patch.stop)
+
     def test_restart_rebinds_replica_storage_and_invalidates_old_address_views(self) -> None:
         """A committed Heap restart must replace every replica address and cached runtime image."""
         spec = SimpleNamespace(receive_capacity=128, routed_slots=256, top_k=2, hidden_size=8, intermediate_size=4,

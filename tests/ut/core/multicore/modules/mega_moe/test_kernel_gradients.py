@@ -38,7 +38,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 class TestKernelGradientReturn(unittest.TestCase):
     """Retain per-call completion storage and encode only a verified ready dependency."""
 
-    def test_band_metadata_retains_flags_and_orders_peers_for_multiple_slots(self):
+    def test_band_metadata_retains_flags_and_orders_peers_for_multiple_slots(self) -> None:
         """Each matrix uses compact physical bands, distinct epochs and invocation-owned flags."""
         placement = build_expert_replica_plan([[100, 80, 0, 0, 0, 0, 0, 0]] * 4, 2)
         plan = SimpleNamespace(replica_w2_events=(32, 64, 96, 128),
@@ -49,8 +49,10 @@ class TestKernelGradientReturn(unittest.TestCase):
                 shapes = ((256, 64), (128, 64))
                 size = signal_transport.signal_storage_bytes(shapes, 2, 4, 2,
                                                              gradient_bands=True)
+                runtime = Mock()
+                runtime.debug_state.return_value = {"device_model": "ascend_910c"}
                 provider = signal_transport.SignalReplicaTransport(
-                    Mock(), torch.empty(size, dtype=torch.uint8), 2, 4,
+                    runtime, torch.empty(size, dtype=torch.uint8), 2, 4,
                     gradient_bands=True)
                 provider._bind(tuple(torch.zeros(2, *shape, dtype=torch.bfloat16) for shape in shapes))
                 route = SimpleNamespace(plan=placement, rank=rank)

@@ -268,10 +268,10 @@ hp_apply_torch_cxx_standard(probe "${STACK_CXX_STANDARD}")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_torch_native_targets_use_shared_build_contract(self):
+    def test_torch_native_targets_use_shared_build_contract(self) -> None:
         """Feature: Torch native build compatibility.
         Description: Inspect adapter and SHMEM CMake integration boundaries.
-        Expectation: Torch targets share the probe, host code stays C++17, no Torch version probing.
+        Expectation: Targets share ABI probes and select the installed Torch operator API.
         """
         root = Path(multicore.__file__).parent
         sources = {name: (root / name).read_text(encoding="utf-8") for name in (
@@ -288,11 +288,12 @@ hp_apply_torch_cxx_standard(probe "${STACK_CXX_STANDARD}")
         adapter = sources["torch/CMakeLists.txt"]
         definitions = re.findall(r"CURRENT_VERSION=([^\s)]+)", adapter)
         self.assertEqual(
-            definitions, ["VERSION_NEWEST", "VERSION_NEWEST"],
-            msg=f"Expected two VERSION_NEWEST definitions, actual={definitions}",
+            definitions, ["${TORCH_OP_PLUGIN_VERSION}", "${TORCH_OP_PLUGIN_VERSION}"],
+            msg=f"Expected both bridges to select the installed Torch API, actual={definitions}",
         )
         for forbidden in ("torch.__version__", "torch.__config__.show()"):
-            present = [name for name, source in sources.items() if forbidden in source]
+            present = [name for name, source in sources.items() if forbidden in source
+                       and not (forbidden == "torch.__version__" and name == "torch/CMakeLists.txt")]
             self.assertEqual(present, [], msg=f"Expected no {forbidden} consumer, actual={present}")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
