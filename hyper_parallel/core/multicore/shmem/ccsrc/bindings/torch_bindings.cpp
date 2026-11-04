@@ -404,7 +404,8 @@ AllocationView TensorView(const at::Tensor &tensor) {
 
 py::bytes GetUniqueId() { return py::bytes(UnwrapOperation(cann::host::get_unique_id(), "GetUniqueId")); }
 
-void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id, uint64_t heap_size_bytes) {
+void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id, uint64_t heap_size_bytes,
+                const std::optional<std::string> &data_engine, const std::optional<uint32_t> &udma_qp_num) {
   const auto config = runtime::LoadConfigFromEnvironment();
   if (!config.ok()) {
     ThrowStatus(config.error(), DfxOperation::Initialize, DfxPhase::Validation);
@@ -412,6 +413,22 @@ void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id
   auto effective_config = config.value();
   if (heap_size_bytes != 0) {
     effective_config.heap_size_bytes = heap_size_bytes;
+  }
+  if (data_engine.has_value()) {
+    if (*data_engine != "mte" && *data_engine != "mte_udma") {
+      throw py::value_error("data_engine must be 'mte' or 'mte_udma'");
+    }
+    effective_config.data_engine = *data_engine == "mte_udma" ? runtime::DataEngine::MteUdma
+                                                             : runtime::DataEngine::Mte;
+  }
+  if (udma_qp_num.has_value()) {
+    if (*udma_qp_num != 16 && *udma_qp_num != 32) {
+      throw py::value_error("udma_qp_num must be 16 or 32");
+    }
+    effective_config.udma_qp_num = *udma_qp_num;
+  }
+  if (effective_config.data_engine != runtime::DataEngine::MteUdma && effective_config.udma_qp_num != 32) {
+    throw py::value_error("udma_qp_num=16 requires data_engine='mte_udma'");
   }
   RequireOk(
     Runtime::Instance().Initialize(RootWorldInfo{root_rank, root_size}, effective_config,
@@ -813,7 +830,8 @@ PYBIND11_MODULE(hyper_parallel_shmem_torch, module) {
   module.doc() = "Private Torch binding for the Hyper-Parallel SHMEM Runtime";
   module.def("_get_unique_id", &bindings::GetUniqueId);
   module.def("_initialize", &bindings::Initialize, py::arg("root_rank"), py::arg("root_size"),
-             py::arg("unique_id") = py::bytes(), py::arg("heap_size_bytes") = 0);
+             py::arg("unique_id") = py::bytes(), py::arg("heap_size_bytes") = 0, py::kw_only(),
+             py::arg("data_engine") = std::nullopt, py::arg("udma_qp_num") = std::nullopt);
   module.def("_empty", &bindings::Empty, py::arg("shape"), py::arg("dtype"), py::arg("alignment") = std::nullopt);
   module.def("_free", &bindings::Free, py::arg("tensor"));
   module.def("_barrier", &bindings::Barrier, py::kw_only(), py::arg("blocking") = true);
