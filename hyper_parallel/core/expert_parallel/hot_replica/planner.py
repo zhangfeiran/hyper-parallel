@@ -1009,8 +1009,10 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
                        min(cost_model.forward_ms[-1][0], cost_model.backward_ms[-1][0]))
             if (alternate_peak <= ceiling and covered and
                     _optional_peak_is_useful(alternate_peak, loads, ceiling, admission, minimum_saved_rows)):
-                after, before = key(alternative), key(copies)
-                if after < before:
+                # Every changed locality proposal removes at least one remote
+                # edge and never exceeds the original receive peak. Its integer
+                # key therefore strictly improves without another layout scan.
+                if cost_model is None or key(alternative) < key(copies):
                     copies = alternative
         return materialize(copies)
     limit = _pruning_capacity(counts, loads, config) if capacity_limit is None else capacity_limit
