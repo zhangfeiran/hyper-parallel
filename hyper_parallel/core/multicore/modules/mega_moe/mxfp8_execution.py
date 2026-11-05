@@ -283,8 +283,9 @@ class MXFP8Execution:
         grad_probs = torch.empty_like(probs)
         da = torch.empty((capacity, spec.intermediate_size), dtype=torch.bfloat16, device=device)
         dx = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
-        dw1 = torch.zeros((spec.local_experts, *weight1.logical_shape[1:]), dtype=torch.float32, device=device)
-        dw2 = torch.zeros((spec.local_experts, *weight2.logical_shape[1:]), dtype=torch.float32, device=device)
+        # TN stores complete matrices; its zero-K path explicitly clears empty experts.
+        dw1 = torch.empty((spec.local_experts, *weight1.logical_shape[1:]), dtype=torch.float32, device=device)
+        dw2 = torch.empty((spec.local_experts, *weight2.logical_shape[1:]), dtype=torch.float32, device=device)
         workspace.claim()
         try:
             multicore_ops.mega_moe_unpermute_grad_out(
