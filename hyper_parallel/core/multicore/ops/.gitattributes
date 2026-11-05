@@ -1,0 +1,3 @@
+# Unified patches require a single-space prefix on blank context lines.
+mxfp8/*.patch -whitespace
+mxfp8_quant/*.patch -whitespace

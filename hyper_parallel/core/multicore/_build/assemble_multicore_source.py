@@ -129,6 +129,13 @@ def main() -> int:
         transformer_copy,
         transformer_mhc_copy,
     )
+    mx_nn = work_dir / "mx-adapter-inputs" / "ops-nn"
+    mx_transformer = work_dir / "mx-adapter-inputs" / "ops-transformer"
+    shutil.copytree(ops_nn_copy / "quant", mx_nn / "quant")
+    shutil.copytree(ops_nn_copy / "common", mx_nn / "common")
+    shutil.copytree(transformer_copy / "gmm/common/cgmct", mx_transformer / "gmm/common/cgmct")
+    _apply_locked_adapters(mx_nn, {"patches": lock["ops_nn"]["mxfp8_patches"]})
+    _apply_locked_adapters(mx_transformer, {"patches": lock["ops_transformer"]["mxfp8_patches"]})
     mx_operator = source_root / "pangu_mxfp8_task_graph"
     shutil.copytree(_MULTICORE_OPS / "pangu_mxfp8_task_graph", mx_operator)
     kernel = mx_operator / "op_kernel"
@@ -136,8 +143,8 @@ def main() -> int:
     shutil.copytree(_MULTICORE_OPS / "hyper_mega_moe/op_kernel/put_mem_signal", kernel / "put_mem_signal")
     shutil.copytree(_MULTICORE_OPS / "mxfp8", kernel / "mxfp8")
     shutil.copytree(_MULTICORE_OPS / "mxfp8_quant", kernel / "mxfp8_quant")
-    compose_quant_sources(ops_nn_copy, kernel / "mxfp8_quant")
-    shutil.copytree(transformer_copy / "gmm/common/cgmct", kernel / "cgmct")
+    compose_quant_sources(mx_nn, kernel / "mxfp8_quant")
+    shutil.copytree(mx_transformer / "gmm/common/cgmct", kernel / "cgmct")
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
     return 0

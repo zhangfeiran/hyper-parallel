@@ -59,7 +59,19 @@
             "purpose": "add task-local RMSNormGrad execution without shared-workspace initialization, explicit pipe cleanup and Ascend950 BF16 output packing"
           }
         ],
-        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+        "mxfp8_patches": [
+          {
+            "path": "hyper_parallel/core/multicore/ops/mxfp8_quant/logical_vector_worker.patch",
+            "sha256": "30f4b3adae3a2335385ec8d8e32d9d46d773795fc236ad9d3a3b13a2acfc719c",
+            "purpose": "accept a task-local logical vector index while preserving original standalone defaults"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/mxfp8_quant/row_only_logical_worker.patch",
+            "sha256": "7e7e3eaa1aeacfb26d0b48225d693beae1b939bd8cc3868f5dacf58acd8079ff",
+            "purpose": "Expose logical worker index for the unchanged standard row-only SwiGLU primitive."
+          }
+        ]
       },
       "ops_transformer": {
         "version": "v9.1.0.pre",
@@ -81,7 +93,14 @@
             "purpose": "publish complete-K gradient row bands after final GM write fences"
           }
         ],
-        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix",
+        "mxfp8_patches": [
+          {
+            "path": "hyper_parallel/core/multicore/ops/mxfp8/mx_gmm_logical_worker.patch",
+            "sha256": "f657cdb4d3d4446ac8ff072af428aadba5b2529462cdbb88599406d0c3392919",
+            "purpose": "expose task-local MX grouped GEMM execution through a logical cube partition"
+          }
+        ]
       },
       "ops_transformer_mhc": {
         "version": "58b4a6bde",
