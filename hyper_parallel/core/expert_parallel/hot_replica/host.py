@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import lru_cache
 from importlib import import_module
 import os
@@ -45,7 +46,7 @@ def _validate_counts(rows: tuple[tuple[int, ...], ...]) -> bool:
     return module is not None and module.validate_counts(rows)
 
 
-def _column_totals(rows: tuple[tuple[int, ...], ...]) -> list[int] | None:
+def _column_totals(rows: Sequence[Sequence[int]]) -> list[int] | None:
     """Reduce ordinary columns while preserving older ABI3 and arbitrary-precision fallbacks."""
     module = _native_backend()
     if module is None or not hasattr(module, "column_totals"):

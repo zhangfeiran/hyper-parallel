@@ -33,6 +33,7 @@ from ._metadata import _async_device_bytes, _recompute_metadata
 from .capacity import ExpertReplicaConfig, _integer, align_capacity
 from .cost import ExpertReplicaCostModel
 from .count_kernel import try_count_payload
+from .host import _column_totals
 from .device import DeviceExpertExecutionPlan, ReplicaPlanSummary, build_device_expert_replica_plan
 from .device import validate_planner_backend
 from .plan import ExpertExecutionPlan, ExpertReplicaTransfer
@@ -84,6 +85,12 @@ class _GatheredReplicaCounts:
     counts: torch.Tensor
     source_summary: list[list[int]]
     host_counts: list[list[int]] | None = None
+
+
+def _host_column_totals(counts: list[list[int]]) -> list[int]:
+    """Use the existing host agreement without freezing or reading device counts again."""
+    totals = _column_totals(counts)
+    return list(map(sum, zip(*counts))) if totals is None else totals
 
 
 @dataclass(frozen=True)
@@ -407,7 +414,7 @@ def _try_compact_home_route(
             host = gathered_counts.host_counts
             diagonal = [sum(row[owner * config.home_experts:(owner + 1) * config.home_experts])
                         for owner, row in enumerate(host)]
-            totals = list(map(sum, zip(*host)))
+            totals = _host_column_totals(host)
         if cost_model is not None:
             # Native agreement already validated the source controls and owner loads.
             rows = [[0] + list(row) + [local] for row, local in zip(gathered_counts.source_summary, diagonal)]
@@ -437,7 +444,7 @@ def _try_compact_home_route(
             average = (sum(destination_loads) + config.ep_size - 1) // config.ep_size
             if _optional_peak_is_useful(average, destination_loads, resident, admission, minimum_saved_rows):
                 if gathered_counts is not None and gathered_counts.host_counts is not None:
-                    totals = list(map(sum, zip(*gathered_counts.host_counts)))
+                    totals = _host_column_totals(gathered_counts.host_counts)
                 else:
                     totals = logical.sum(0, dtype=torch.int64).cpu().tolist()
                 target = max(average, target_load or 0)
