@@ -34,9 +34,9 @@ _native: Any | None = None
 def configured_udma_qp_count() -> int:
     """Read the qualified process-wide bank size before binding execution resources."""
     value = os.environ.get("HYPER_PARALLEL_SHMEM_UDMA_QP_NUM", "32")
-    if value not in ("16", "32"):
-        raise ValueError("HYPER_PARALLEL_SHMEM_UDMA_QP_NUM must be 16 or 32")
-    if value == "16" and os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte") != "mte_udma":
+    if value not in ("1", "8", "16", "32"):
+        raise ValueError("HYPER_PARALLEL_SHMEM_UDMA_QP_NUM must be 1, 8, 16 or 32")
+    if value != "32" and os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte") != "mte_udma":
         raise ValueError("A reduced UDMA QP bank requires mte_udma")
     return int(value)
 

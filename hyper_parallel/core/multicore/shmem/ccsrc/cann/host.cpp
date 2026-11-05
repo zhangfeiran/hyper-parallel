@@ -275,8 +275,9 @@ runtime::Status initialize(const InitOptions &options) {
   }
 
   if (options.data_engine == runtime::DataEngine::MteUdma) {
-    if (options.udma_qp_num != 16U && options.udma_qp_num != 32U) {
-      return InvalidArgument("UDMA QP count must be 16 or 32");
+    if (options.udma_qp_num != 1U && options.udma_qp_num != 8U &&
+        options.udma_qp_num != 16U && options.udma_qp_num != 32U) {
+      return InvalidArgument("UDMA QP count must be 1, 8, 16 or 32");
     }
     const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, options.udma_qp_num);
     if (qp_status != ACLSHMEM_SUCCESS) {

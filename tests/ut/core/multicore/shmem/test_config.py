@@ -49,7 +49,7 @@ class TestNativeUdmaConfiguration(unittest.TestCase):
     def test_default_and_explicit_pools(self) -> None:
         """Preserve default32 and admit both qualified hybrid pool sizes."""
         self.assertEqual(self.run_probe({}).stdout.strip(), '32')
-        for count in (16, 32):
+        for count in (1, 8, 16, 32):
             with self.subTest(count=count):
                 result = self.run_probe({'HYPER_PARALLEL_SHMEM_DATA_ENGINE': 'mte_udma',
                                          'HYPER_PARALLEL_SHMEM_UDMA_QP_NUM': str(count)})
@@ -58,12 +58,12 @@ class TestNativeUdmaConfiguration(unittest.TestCase):
 
     def test_invalid_pools_are_rejected(self) -> None:
         """Reject malformed settings in native code even without the Python consumer."""
-        for value in ('', '0', '8', '17', ' 16', '16 ', '+16', '16.0'):
+        for value in ('', '0', '2', '17', ' 16', '16 ', '+16', '16.0'):
             with self.subTest(value=value):
                 result = self.run_probe({'HYPER_PARALLEL_SHMEM_DATA_ENGINE': 'mte_udma',
                                          'HYPER_PARALLEL_SHMEM_UDMA_QP_NUM': value})
                 self.assertEqual(result.returncode, 2)
-                self.assertIn('16 or 32', result.stderr)
+                self.assertIn('1, 8, 16 or 32', result.stderr)
 
     def test_reduced_pool_requires_hybrid_engine(self) -> None:
         """Do not silently ignore a resource request on the MTE-only path."""

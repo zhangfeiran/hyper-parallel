@@ -53,6 +53,7 @@ from hyper_parallel.core.multicore.scheduler.vector_roles import configure_vecto
 from hyper_parallel.core.multicore.scheduler.dispatch_quant import DispatchQuantStage, configure_dispatch_quant_queue
 from hyper_parallel.core.multicore.scheduler.planned_queue import configure_planned_queue
 from hyper_parallel.core.multicore.scheduler.window_queue import configure_window_queue
+from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 from hyper_parallel.core.multicore.tasks.alltoall import AllToAllFillConfig, AllToAllType
 from hyper_parallel.core.multicore.tasks.utils import (
     add_dynamic_data,
@@ -320,6 +321,8 @@ def build_mxfp8_runtime(
         raise ValueError("Row-only SwiGLU is valid only for a forward without saved backward state.")
     if spec.dispatch_mode != "push" or spec.swiglu_limit is not None:
         raise ValueError("MXFP8 task graphs currently require push transport and unclamped SwiGLU.")
+    if configured_udma_qp_count() < 16 and spec.mx_vector_policy != "window2":
+        raise ValueError("QP1/QP8 MXFP8 requires the owner-validated window2 queue")
     role_policy = spec.mx_vector_policy in ("roles", "roles_ready", "roles_rule", "planned", "window2")
     ready_policy = spec.mx_vector_policy == "roles_ready"
     if role_policy and (

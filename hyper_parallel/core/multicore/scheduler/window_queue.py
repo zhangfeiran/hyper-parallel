@@ -92,6 +92,6 @@ def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) ->
                 vectors[2 * lane].extend(tasks(inputs[0], expert + 1, lane))
             vectors[2 * lane].extend(tasks(inputs[1], expert, lane))
     qps = configured_udma_qp_count()
-    if qps == 16:
+    if qps < 32:
         _validate_qp_owners(cfg, spec, vectors, qps)
     install_worker_queues(cfg, cubes, vectors)

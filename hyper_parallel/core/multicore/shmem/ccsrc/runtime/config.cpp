@@ -118,10 +118,10 @@ Result<Config> ParseConfig(const ConfigInput &input) {
   config.data_engine = data_engine == "mte_udma" ? DataEngine::MteUdma : DataEngine::Mte;
   if (input.udma_qp_num.has_value()) {
     const std::string &value = *input.udma_qp_num;
-    if (value != "16" && value != "32") {
-      return Result<Config>::Failure(InvalidConfig(std::string(kUdmaQpNumEnv) + " must be 16 or 32"));
+    if (value != "1" && value != "8" && value != "16" && value != "32") {
+      return Result<Config>::Failure(InvalidConfig(std::string(kUdmaQpNumEnv) + " must be 1, 8, 16 or 32"));
     }
-    config.udma_qp_num = value == "16" ? 16U : 32U;
+    config.udma_qp_num = static_cast<uint32_t>(std::stoul(value));
   }
   if (config.udma_qp_num != 32U && config.data_engine != DataEngine::MteUdma) {
     return Result<Config>::Failure(InvalidConfig("A reduced UDMA QP bank requires mte_udma"));

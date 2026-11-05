@@ -87,10 +87,10 @@ class PutMemSignalKernel {
         AscendC::Trap();
       }
       const uint32_t qp_count = aclshmemi_udma_qp_info_fetch()->qp_num;
-      if (qp_count != 16 && qp_count != 32) {
+      if (qp_count != 1 && qp_count != 8 && qp_count != 16 && qp_count != 32) {
         AscendC::Trap();
       }
-      const uint32_t qp = qp_count == 16 ? worker / 4 : worker / 2;
+      const uint32_t qp = worker / (64 / qp_count);
       AscendC::TBuf<AscendC::TPosition::VECOUT> staging;
       pipe.InitBuffer(staging, ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE);
       auto scratch = reinterpret_cast<__ubuf__ uint8_t *>(staging.Get<uint8_t>().GetPhyAddr());

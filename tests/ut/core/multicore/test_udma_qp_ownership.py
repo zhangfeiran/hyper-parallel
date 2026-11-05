@@ -32,7 +32,7 @@ class TestUdmaQpOwnership(unittest.TestCase):
 
     def test_configuration_defaults_and_explicit_values(self) -> None:
         """Keep the existing bank size unless the hybrid consumer opts in."""
-        for count in (16, 32):
+        for count in (1, 8, 16, 32):
             with self.subTest(count=count), patch.dict(os.environ, {
                 'HYPER_PARALLEL_SHMEM_DATA_ENGINE': 'mte_udma',
                 'HYPER_PARALLEL_SHMEM_UDMA_QP_NUM': str(count),
@@ -43,12 +43,12 @@ class TestUdmaQpOwnership(unittest.TestCase):
 
     def test_invalid_values_are_rejected(self) -> None:
         """Refuse malformed or unqualified pools before native initialization."""
-        for value in ('', '0', '1', '8', '17', ' 16', '16 ', '+16', '16.0'):
+        for value in ('', '0', '2', '3', '17', ' 16', '16 ', '+16', '16.0'):
             with self.subTest(value=value), patch.dict(os.environ, {
                 'HYPER_PARALLEL_SHMEM_DATA_ENGINE': 'mte_udma',
                 'HYPER_PARALLEL_SHMEM_UDMA_QP_NUM': value,
             }):
-                with self.assertRaisesRegex(ValueError, '16 or 32'):
+                with self.assertRaisesRegex(ValueError, '1, 8, 16 or 32'):
                     _runtime.configured_udma_qp_count()
 
     def test_reduced_pool_requires_hybrid_transport(self) -> None:

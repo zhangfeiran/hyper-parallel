@@ -16,6 +16,7 @@
 
 from contextlib import contextmanager
 from collections.abc import Iterator
+import os
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -35,6 +36,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_weights import (
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.scheduler.config import TaskType, mega_moe_event_capacity
 from hyper_parallel.core.multicore.scheduler.mxfp8 import MX_GMM_TASK_TYPE, MxGmmDescriptor
+from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
 
 
 def _physical(experts: int, rows: int, columns: int) -> MXFP8PhysicalWeight:
@@ -88,6 +90,43 @@ class TestMXFP8Integration(unittest.TestCase):
                         tn = [record for record in records if record.layout == 2]
                         self.assertEqual(bool(tn), not forward)
                         self.assertTrue(all(record.output_dtype == 1 for record in tn))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_reduced_qp_preserves_all_runtime_and_math_descriptors(self) -> None:
+        """Feature: Reduced MXFP8 QP banks.
+        Description: Build EP64 QP1 and EP4 QP8 B0/B2 forward/backward graphs.
+        Expectation: Every queue and compute descriptor matches QP16 exactly.
+        """
+        for ep, qps in ((64, 1), (4, 8)):
+            for slots in (0, 2):
+                specification = MegaMoeSpec(
+                    4096, 5120, 1792, ep * (6 + slots), 8, 1.25, 40960,
+                    ep, None, ep - 1, 32, mx_vector_policy="window2")
+                for forward in (True, False):
+                    with self.subTest(ep=ep, qps=qps, slots=slots, forward=forward):
+                        with mock.patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma",
+                                                         "HYPER_PARALLEL_SHMEM_UDMA_QP_NUM": "16"}):
+                            control = build_mxfp8_runtime(specification, forward=forward)
+                        with mock.patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma",
+                                                         "HYPER_PARALLEL_SHMEM_UDMA_QP_NUM": str(qps)}):
+                            actual = build_mxfp8_runtime(specification, forward=forward)
+                        self.assertEqual(serialize_runtime_config(actual.config),
+                                         serialize_runtime_config(control.config))
+                        self.assertEqual(actual.gmm_descriptors, control.gmm_descriptors)
+                        self.assertEqual(actual.quant_descriptors, control.quant_descriptors)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_qp1_rejects_ep4_peer_owner_collision(self) -> None:
+        """Feature: Physical QP ownership.
+        Description: Build an EP4 window whose odd workers alias one peer/QP.
+        Expectation: Graph construction rejects the collision before submission.
+        """
+        specification = MegaMoeSpec(4096, 5120, 1792, 24, 8, 1.25, 40960,
+                                   4, None, 0, 32, mx_vector_policy="window2")
+        with mock.patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma",
+                                         "HYPER_PARALLEL_SHMEM_UDMA_QP_NUM": "1"}):
+            with self.assertRaisesRegex(ValueError, "QP owner collision"):
+                build_mxfp8_runtime(specification, forward=True)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_forward_root_is_resolved_again_after_backward_regather(self) -> None:

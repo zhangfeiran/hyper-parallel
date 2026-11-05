@@ -360,7 +360,8 @@ Status Runtime::ValidateInitialInput(const RootWorldInfo &root, const Config &co
   }
   if (config.heap_size_bytes == 0 || config.timeout_seconds == 0 ||
       (config.data_engine != DataEngine::Mte && config.data_engine != DataEngine::MteUdma) ||
-      (config.udma_qp_num != 16U && config.udma_qp_num != 32U) ||
+      (config.udma_qp_num != 1U && config.udma_qp_num != 8U &&
+       config.udma_qp_num != 16U && config.udma_qp_num != 32U) ||
       (config.udma_qp_num != 32U && config.data_engine != DataEngine::MteUdma)) {
     return MakeError(ErrorCode::InvalidConfig,
                      "Runtime Config requires positive heap/timeout values and a supported "

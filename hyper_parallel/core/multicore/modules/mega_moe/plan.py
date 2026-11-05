@@ -284,6 +284,8 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
                 elif direction == 1 and task.task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL:
                     task.extra_value_1 = 1
     qp_count = configured_udma_qp_count()
+    if qp_count not in (16, 32):
+        raise ValueError("BF16 MegaMoE requires 16 or 32 UDMA QPs")
     if qp_count != 32:
         for config in (forward_data, backward_data):
             validate_udma_qp_owners(config, ep_size=spec.ep_size, num_experts=spec.num_experts,

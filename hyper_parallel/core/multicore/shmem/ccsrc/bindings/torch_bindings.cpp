@@ -422,13 +422,13 @@ void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id
                                                              : runtime::DataEngine::Mte;
   }
   if (udma_qp_num.has_value()) {
-    if (*udma_qp_num != 16 && *udma_qp_num != 32) {
-      throw py::value_error("udma_qp_num must be 16 or 32");
+    if (*udma_qp_num != 1 && *udma_qp_num != 8 && *udma_qp_num != 16 && *udma_qp_num != 32) {
+      throw py::value_error("udma_qp_num must be 1, 8, 16 or 32");
     }
     effective_config.udma_qp_num = *udma_qp_num;
   }
   if (effective_config.data_engine != runtime::DataEngine::MteUdma && effective_config.udma_qp_num != 32) {
-    throw py::value_error("udma_qp_num=16 requires data_engine='mte_udma'");
+    throw py::value_error("A reduced udma_qp_num requires data_engine='mte_udma'");
   }
   RequireOk(
     Runtime::Instance().Initialize(RootWorldInfo{root_rank, root_size}, effective_config,
