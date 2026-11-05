@@ -27,8 +27,8 @@ class MXFP8PhysicalWeight:
     """Borrow one phase's physical data and packed E8M0 scales without conversion."""
 
     logical_shape: tuple[int, int, int]
-    col_data: torch.Tensor
-    col_scale: torch.Tensor
+    col_data: torch.Tensor | None
+    col_scale: torch.Tensor | None
     row_data: torch.Tensor | None = None
     row_scale: torch.Tensor | None = None
 

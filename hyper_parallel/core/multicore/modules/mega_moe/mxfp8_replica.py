@@ -31,8 +31,9 @@ def materialize_replica_weights(
 ) -> tuple[MXFP8PhysicalWeight, ...]:
     """Append B physical slots without dequantizing or requantizing any axis.
 
-    Only current-phase axes are exchanged. Forward accepts column-only FSDP
-    roots; backward resolves and transfers freshly gathered row and column axes.
+    Only current-phase axes are exchanged. Forward consumes column weights;
+    backward consumes freshly gathered row weights. Unused axes are dropped
+    from the materialized view while the original FSDP root remains unchanged.
     Empty slots are zeroed and have no routed rows. The eager transport keeps
     the existing projected B2 placement policy independent of BF16 kernel ABIs.
 
@@ -42,7 +43,7 @@ def materialize_replica_weights(
     """
     if route is None or route.home_only:
         return weights
-    fields = ("col_data", "col_scale", "row_data", "row_scale") if backward else ("col_data", "col_scale")
+    fields = ("row_data", "row_scale") if backward else ("col_data", "col_scale")
     originals = []
     for weight in weights:
         for field in fields:
@@ -66,7 +67,8 @@ def materialize_replica_weights(
             assembled.append(data.reshape((config.home_experts + config.replica_slots_per_rank), *tensor.shape[1:]))
     result = []
     for index, weight in enumerate(weights):
-        values = dict(zip(fields, assembled[index * len(fields) : (index + 1) * len(fields)]))
+        values = dict.fromkeys(("col_data", "col_scale", "row_data", "row_scale"))
+        values.update(zip(fields, assembled[index * len(fields) : (index + 1) * len(fields)]))
         result.append(
             replace(
                 weight,

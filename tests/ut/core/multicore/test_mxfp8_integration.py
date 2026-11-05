@@ -153,10 +153,10 @@ class TestMXFP8Integration(unittest.TestCase):
         self.assertEqual(backward.row_scale.data_ptr(), refreshed.row_scale.data_ptr())
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
-    def test_replica_byte_copy_preserves_both_axes_and_scale_bits(self) -> None:
+    def test_replica_byte_copy_preserves_only_current_phase_axes(self) -> None:
         """Feature: MXFP8 replicas.
         Description: Append exact guest data and scale bytes.
-        Expectation: Both axes preserve every byte and inactive slots are zero.
+        Expectation: Required axes preserve every byte, unused axes are absent, and inactive slots are zero.
         """
         owner, guest = _physical(2, 64, 128), _physical(1, 64, 128)
         config = ExpertReplicaConfig(4, 2, 2)
@@ -164,12 +164,15 @@ class TestMXFP8Integration(unittest.TestCase):
         route = SimpleNamespace(plan=SimpleNamespace(config=config, transfers=(transfer,)), rank=1, home_only=False)
         for backward in (False, True):
             with self.subTest(backward=backward):
-                fields = ("col_data", "col_scale", "row_data", "row_scale") if backward else ("col_data", "col_scale")
+                fields = ("row_data", "row_scale") if backward else ("col_data", "col_scale")
 
                 @contextmanager
                 def prefetch(aliases: tuple, current_route: object) -> Iterator[SimpleNamespace]:
                     """Provide exact guest payload bytes without a distributed backend."""
                     self.assertIs(current_route, route)
+                    self.assertEqual(len(aliases), len(fields))
+                    for alias, field in zip(aliases, fields):
+                        self.assertTrue(torch.equal(alias, getattr(owner, field).view(torch.uint8).reshape(2, -1)))
                     values = []
                     for field in fields:
                         payload = getattr(guest, field).view(torch.uint8).reshape(1, -1)
@@ -180,6 +183,9 @@ class TestMXFP8Integration(unittest.TestCase):
                 with mock.patch(path, side_effect=prefetch):
                     (actual,) = materialize_replica_weights((owner,), route, backward=backward)
                 self.assertEqual(actual.logical_shape, (4, 64, 128))
+                unused = ("col_data", "col_scale") if backward else ("row_data", "row_scale")
+                for field in unused:
+                    self.assertIsNone(getattr(actual, field))
                 for field in fields:
                     value = getattr(actual, field).view(torch.uint8)
                     self.assertTrue(torch.equal(value[:2], getattr(owner, field).view(torch.uint8)))
