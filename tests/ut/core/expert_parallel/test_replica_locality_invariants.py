@@ -44,7 +44,8 @@ def _totals(copies: list[dict[int, int]]) -> Counter:
 class TestReplicaLocalityInvariants(unittest.TestCase):
     """Keep the monotonicity proof executable before removing redundant objective scans."""
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_move_merge_swap_and_noop_preserve_quotas_and_objective(self) -> None:
         """Feature: Integer locality admission.
         Description: Exercise new local guests, guest merges, two-edge swaps and a saturated no-op.
@@ -72,7 +73,8 @@ class TestReplicaLocalityInvariants(unittest.TestCase):
                 else:
                     self.assertIs(proposal, selected)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_seeded_placements_preserve_strict_order_and_slot_cap(self) -> None:
         """Feature: Locality proof across topology and guest budgets.
         Description: Explore sparse owner quotas and interleaved physical nodes with fixed random inputs.
