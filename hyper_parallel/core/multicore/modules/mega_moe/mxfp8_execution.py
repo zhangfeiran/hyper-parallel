@@ -402,9 +402,15 @@ class MXFP8Execution:
                           for weight in weights)
         if not clear_all:
             # Exact CPU quotas avoid another readback. Empty owners must start at zero before guest additions.
-            for expert in empty:
-                for gradient in gradients:
-                    gradient[expert].zero_()
+            start = None
+            for expert in range(owners + 1):
+                is_empty = expert < owners and counts[expert] == 0
+                if is_empty and start is None:
+                    start = expert
+                elif not is_empty and start is not None:
+                    for gradient in gradients:
+                        gradient[start:expert].zero_()
+                    start = None
         return gradients
 
     def _launch_backward(self, buffers: list[torch.Tensor], events: torch.Tensor, plan: Any,

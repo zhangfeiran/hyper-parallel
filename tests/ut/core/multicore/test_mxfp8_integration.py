@@ -122,6 +122,38 @@ class TestMXFP8GradientInitialization(unittest.TestCase):
                 MXFP8Execution._weight_gradient_buffers(self._plan(True), weights, "cpu", route=route)
         allocate.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_adjacent_empty_experts_share_one_clear_per_projection(self) -> None:
+        """Feature: Coalesced empty-expert gradient clearing.
+        Description: Count real tensor clears for contiguous and separated empty home experts.
+        Expectation: Each maximal empty interval uses one clear per projection without touching active rows.
+        """
+        original_zero = torch.Tensor.zero_
+        weights = (_physical(6, 64, 128), _physical(6, 128, 64))
+        for counts, expected in (((7, 0, 0, 0, 0, 0, 0, 0), [5]),
+                                 ((7, 0, 0, 3, 0, 4, 0, 0), [2, 1])):
+            with self.subTest(counts=counts):
+                clears = []
+
+                def zero(tensor: torch.Tensor) -> torch.Tensor:
+                    """Record each clear while preserving its real CPU tensor update."""
+                    clears.append(tuple(tensor.shape))
+                    return original_zero(tensor)
+
+                route = SimpleNamespace(rank=0, plan=SimpleNamespace(destination_counts=(counts,)))
+                with mock.patch.object(torch.Tensor, "zero_", zero), mock.patch(
+                        "hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution.torch.empty",
+                        side_effect=lambda shape, **kwargs: torch.full(shape, float("nan"), **kwargs)):
+                    gradients = MXFP8Execution._weight_gradient_buffers(self._plan(True), weights, "cpu", route=route)
+                self.assertEqual(clears, [shape for size in expected
+                                          for shape in ((size, 64, 128), (size, 128, 64))])
+                for value in gradients:
+                    for expert, count in enumerate(counts[:6]):
+                        if count:
+                            self.assertTrue(torch.isnan(value[expert]).all().item())
+                        else:
+                            self.assertEqual(torch.count_nonzero(value[expert]).item(), 0)
+
 
 class TestMXFP8Integration(unittest.TestCase):
     """Protect the combined ABI and exact physical payloads without NPU execution."""
