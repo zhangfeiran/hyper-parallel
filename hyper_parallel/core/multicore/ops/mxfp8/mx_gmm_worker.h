@@ -126,8 +126,27 @@ __aicore__ inline MxGmmDescriptor LoadMxGmmDescriptor(const __gm__ MxGmmDescript
   return r;
 }
 
+struct MxOutputRange {
+  GM_ADDR address;
+  uint64_t capacity;
+};
+
 template <class Task>
-__aicore__ inline void ExecuteMxGmmTask(const Task &task, GM_ADDR *inputs, const __gm__ MxLaunchDescriptor *launch) {
+__aicore__ inline MxOutputRange ResolveMxOutput(const Task &task, const MxGmmDescriptor &r, GM_ADDR *inputs,
+                                                const __gm__ MxLaunchDescriptor *launch,
+                                                GM_ADDR guest_output, uint64_t home_experts) {
+  if (guest_output == nullptr || home_experts == 0 || r.layout != static_cast<uint32_t>(MxLayout::TN) ||
+      r.group_list_offset / sizeof(int64_t) < home_experts) {
+    return {inputs[task.outputs[0].input_position], launch->buffer_bytes[task.outputs[0].input_position]};
+  }
+  const uint64_t local = launch->experts / launch->ep;
+  if (home_experts >= local || r.output_dtype != static_cast<uint32_t>(MxOutput::FP32)) AscendC::Trap();
+  return {guest_output, (local - home_experts) * r.m * r.n * sizeof(float)};
+}
+
+template <class Task>
+__aicore__ inline void ExecuteMxGmmTask(const Task &task, GM_ADDR *inputs, const __gm__ MxLaunchDescriptor *launch,
+                                      GM_ADDR guest_output = nullptr, uint64_t home_experts = 0) {
   CheckMxRange(static_cast<uint64_t>(task.extra_value_0) * sizeof(MxGmmDescriptor), sizeof(MxGmmDescriptor),
                launch->buffer_bytes[task.inputs[3].input_position]);
   auto table = reinterpret_cast<__gm__ MxGmmDescriptor *>(inputs[task.inputs[3].input_position]);
@@ -152,14 +171,15 @@ __aicore__ inline void ExecuteMxGmmTask(const Task &task, GM_ADDR *inputs, const
   }
   const uint64_t m = r.m, n = r.n, k = r.k;
   const uint64_t output_bytes = r.output_dtype == static_cast<uint32_t>(MxOutput::BF16) ? 2 : 4;
+  const auto output = ResolveMxOutput(task, r, inputs, launch, guest_output, home_experts);
   CheckMxRange(r.x_offset, m * k, launch->buffer_bytes[task.inputs[0].input_position]);
   CheckMxRange(r.w_offset, n * k, launch->buffer_bytes[task.inputs[1].input_position]);
-  CheckMxRange(r.y_offset, m * n * output_bytes, launch->buffer_bytes[task.outputs[0].input_position]);
+  CheckMxRange(r.y_offset, m * n * output_bytes, output.capacity);
   CheckMxRange(r.x_scale_offset, m * ((k + 63) / 64) * 2, launch->buffer_bytes[r.x_scale_position]);
   CheckMxRange(r.w_scale_offset, n * ((k + 63) / 64) * 2, launch->buffer_bytes[r.w_scale_position]);
   ExecuteMxGmm(r, inputs[task.inputs[0].input_position] + r.x_offset,
                inputs[task.inputs[1].input_position] + r.w_offset, inputs[r.x_scale_position] + r.x_scale_offset,
-               inputs[r.w_scale_position] + r.w_scale_offset, inputs[task.outputs[0].input_position] + r.y_offset);
+               inputs[r.w_scale_position] + r.w_scale_offset, output.address + r.y_offset);
 }
 }  // namespace MulticoreMx
 #endif

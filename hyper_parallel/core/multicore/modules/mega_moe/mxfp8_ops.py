@@ -30,7 +30,7 @@ from .spec import MegaMoeSpec
 @lru_cache(maxsize=1)
 def _load_mxfp8_native() -> None:
     _load_native()
-    if torch.ops.hyper_parallel.mxfp8_task_graph_version() != 4:
+    if torch.ops.hyper_parallel.mxfp8_task_graph_version() != 5:
         raise RuntimeError("MXFP8 task-graph adapter ABI mismatch; rebuild the local multicore component.")
 
 
@@ -72,7 +72,7 @@ def serialize_mxfp8_launch(
     if spec.mx_vector_policy != "window2" or spec.replica_transport != "shmem_signal_kernel_gradient":
         raise ValueError("MX gradient return requires its dedicated transport and window2 queue")
     record = MxLaunchDescriptor.from_buffer_copy(content)
-    record.version, record.reserved = 8, 7
+    record.version, record.reserved = 11, 10
     return bytes(record)
 
 

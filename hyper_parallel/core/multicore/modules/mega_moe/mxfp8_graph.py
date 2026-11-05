@@ -140,7 +140,6 @@ class _GmmStage:
     home_experts: int = 0
     guest_data_position: int = 0
     guest_scale_position: int = 0
-    guest_output_position: int = 0
 
     def fill(self, cfg: Any, op: OperatorNode, tsv: TaskSplitValue) -> None:
         """Populate one task per expert and worker with byte-accurate descriptors.
@@ -177,13 +176,10 @@ class _GmmStage:
                 if self.layout == "TN":
                     self.records[-1].flags |= _MX_GMM_PREZEROED_OUTPUT
         _fill_compute_stage(cfg, op, tsv, MX_GMM_TASK_TYPE, self.workers, False, indices)
-        if self.home_experts:
+        if self.home_experts and self.layout != "TN":
             for index in range(self.home_experts * self.workers, len(indices)):
                 task = cfg.all_tasks[task_start + index]
-                if self.guest_output_position:
-                    task.outputs[0].input_position = self.guest_output_position
-                else:
-                    task.inputs[1].input_position = self.guest_data_position
+                task.inputs[1].input_position = self.guest_data_position
 
 
 @dataclass
@@ -400,8 +396,7 @@ def _mx_guest_positions(spec: MegaMoeSpec, forward: bool, name: str, layout: str
         return {}
     home = spec.local_experts - spec.replica_slots_per_rank
     if layout == "TN":
-        return ({"home_experts": home, "guest_output_position": 37 if name == "dw2" else 38}
-                if kernel_gradients else {})
+        return {"home_experts": home} if kernel_gradients else {}
     matrix = 0 if name in ("up", "dx") else 1
     position = (27 if forward else 33) + 2 * matrix
     return {"home_experts": home, "guest_data_position": position, "guest_scale_position": position + 1}
@@ -577,7 +572,7 @@ def build_mxfp8_runtime(
         cfg,
         serialize_mx_gmm_descriptors(gmms),
         serialize_mx_quant_descriptors(quants),
-        len(specs) + 4 * bool(spec.replica_slots_per_rank) + 2 * kernel_gradients,
+        len(specs) + 4 * bool(spec.replica_slots_per_rank),
         swiglu_row_only,
         transport_schedule,
         kernel_gradients,

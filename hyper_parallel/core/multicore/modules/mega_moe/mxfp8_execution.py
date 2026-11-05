@@ -365,6 +365,5 @@ class MXFP8Execution:
         with lease_replica_weights(weights, self.replica_route, backward=True) as guests:
             buffers.extend(guests)
             with lease_mx_gradient_return(self.resources, plan, self.replica_route, gradients,
-                                          weights) as (runtime, guest_gradients):
-                buffers.extend(guest_gradients)
+                                          weights) as runtime:
                 self._launch(buffers, runtime, events, plan, device, direction="backward")

@@ -36,7 +36,9 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
       case 10:
         break;
       case 160:
-        MulticoreMx::ExecuteMxGmmTask(task, this->input_list, launch);
+        MulticoreMx::ExecuteMxGmmTask(task, this->input_list, launch,
+                                     this->replica_matrix_bases_[task.outputs[0].input_position == 6 ? 3 : 2],
+                                     this->home_experts_);
         break;
       default:
         Trap();
@@ -154,7 +156,7 @@ __aicore__ inline void RunMxTaskGraph(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR 
   auto launch = reinterpret_cast<__gm__ MulticoreMx::MxLaunchDescriptor *>(launch_metadata);
   static_assert(Policy == MulticoreRuntime::VectorWorkerPolicy::LEGACY_ODD,
                 "The integrated MX payload supports legacy and window2 queues only");
-  const bool gradients = launch->version == 8 && launch->reserved == 7;
+  const bool gradients = launch->version == 11 && launch->reserved == 10;
   const bool window = (launch->version == 6 && launch->reserved == 5) || gradients;
   const bool legacy = launch->version == 1 && launch->reserved == 0;
   if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || (!window && !legacy) || launch->buffer_count == 0 ||

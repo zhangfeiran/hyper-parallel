@@ -51,7 +51,7 @@ class TestMXFP8Gradients(unittest.TestCase):
                 current = build_mxfp8_runtime(replace(spec, replica_transport="shmem_signal_kernel_gradient"),
                                              forward=False)
                 self.assertTrue(current.kernel_gradients)
-                self.assertEqual(current.buffer_count, old.buffer_count + 2)
+                self.assertEqual(current.buffer_count, old.buffer_count)
                 cfg, baseline = current.config, old.config
                 self.assertEqual(list(cfg.cube_task_indices), list(baseline.cube_task_indices))
                 count = cfg.task_index_num[1]
@@ -72,7 +72,7 @@ class TestMXFP8Gradients(unittest.TestCase):
                     expert = task.task_index // 32
                     if record.layout == 2 and expert >= 6:
                         changed += 1
-                        self.assertIn(task.outputs[0].input_position, (37, 38))
+                        self.assertIn(task.outputs[0].input_position, (6, 18))
                         self.assertEqual(record.y_offset, (expert - 6) * record.m * record.n * 4)
                 self.assertEqual(changed, 2 * 2 * 32)
                 for outputs in ((6, 37), (18, 38)):

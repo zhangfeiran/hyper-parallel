@@ -70,12 +70,12 @@ class _MXFP8Plan:
     @cached_property
     def replica_w2_events(self) -> tuple[int, ...]:
         """Require every Cube producer before publishing second-projection gradients."""
-        return mx_projection_events(self.backward.host.config, self.spec.local_experts, (6, 37))
+        return mx_projection_events(self.backward.host.config, self.spec.local_experts, (6,))
 
     @cached_property
     def replica_w13_events(self) -> tuple[int, ...]:
         """Require every Cube producer before publishing first-projection gradients."""
-        return mx_projection_events(self.backward.host.config, self.spec.local_experts, (18, 38))
+        return mx_projection_events(self.backward.host.config, self.spec.local_experts, (18,))
 
 
 def _device_runtime(host: Any, device: Any, spec: Any) -> _DeviceRuntime:

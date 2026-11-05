@@ -121,7 +121,7 @@ def lease_mx_gradient_inbox(provider: Any, weights: tuple[torch.Tensor, ...], ro
 @contextmanager
 def lease_mx_gradient_return(resources: Any, plan: Any, route: Any,
                              gradients: tuple[torch.Tensor, torch.Tensor],
-                             weights: tuple[Any, Any]) -> Iterator[tuple[Any, tuple[torch.Tensor, ...]]]:
+                             weights: tuple[Any, Any]) -> Iterator[Any]:
     """Retain symmetric FP32 destinations and final ACKs through kernel submission.
 
     Args:
@@ -132,7 +132,7 @@ def lease_mx_gradient_return(resources: Any, plan: Any, route: Any,
         weights: Phase-current physical weight axes providing logical matrix shapes.
     """
     if not plan.backward.host.kernel_gradients:
-        yield plan.backward, ()
+        yield plan.backward
         return
     provider, workspace = resources.workspace.replica_provider, resources.workspace
     if route is None or route.home_only or provider is None:
@@ -151,4 +151,4 @@ def lease_mx_gradient_return(resources: Any, plan: Any, route: Any,
                               *ready, 1, metadata.metadata.data_ptr())
         runtime = _runtime_image(plan.backward.runtime, content, workspace.replica_runtime_images, static=False)
         provider.last_kernel_gradient_matrices = metadata.matrices
-        yield replace(plan.backward, runtime=runtime), (second, first)
+        yield replace(plan.backward, runtime=runtime)
