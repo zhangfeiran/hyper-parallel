@@ -18,21 +18,31 @@ import unittest
 
 import torch
 
+from tests.common.mark_utils import arg_mark
+
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution import _quantized_buffers
 
 
 class TestMXFP8ActivationBuffers(unittest.TestCase):
     """Check real CPU storage bounds without native or distributed initialization."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_dual_axis_storage_remains_independent(self) -> None:
-        """Retained activations must preserve independent row and column storage."""
+        """Feature: Retained dual-axis activation storage.
+        Description: Allocate ordinary row and column data with expert-padded scales.
+        Expectation: Each binding has its own full-size storage.
+        """
         buffers = _quantized_buffers(128, 256, 8, "cpu")
         self.assertEqual([tuple(value.shape) for value in buffers],
                          [(128, 256), (128, 4, 2), (128, 256), (10, 256, 2)])
         self.assertEqual(len({value.untyped_storage().data_ptr() for value in buffers}), 4)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_row_only_uses_two_full_size_storages(self) -> None:
-        """Unused column bindings must remain in bounds while reusing row data storage."""
+        """Feature: Row-only unused column storage reuse.
+        Description: Rebind column outputs to existing row storage.
+        Expectation: All shapes and byte bounds remain valid with only two allocations.
+        """
         buffers = _quantized_buffers(128, 256, 8, "cpu", row_only=True)
         row, row_scale, column, column_scale = buffers
         self.assertEqual([tuple(value.shape) for value in buffers],
@@ -47,8 +57,12 @@ class TestMXFP8ActivationBuffers(unittest.TestCase):
         storages = {value.untyped_storage().data_ptr(): value.untyped_storage().nbytes() for value in buffers}
         self.assertEqual(sum(storages.values()), 128 * 256 + 128 * 4 * 2)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_tiny_capacity_keeps_scale_binding_in_bounds(self) -> None:
-        """Small row storage cannot back expert-padded column scales."""
+        """Feature: Small-capacity packed scale fallback.
+        Description: Use fewer row bytes than expert-padded column scale bytes.
+        Expectation: Scales receive an independent full-size allocation.
+        """
         row, _, column, column_scale = _quantized_buffers(1, 64, 8, "cpu", row_only=True)
         self.assertEqual(row.data_ptr(), column.data_ptr())
         self.assertEqual(tuple(column_scale.shape), (9, 64, 2))
