@@ -104,11 +104,11 @@ class TestMXFP8Integration(unittest.TestCase):
         try:
             with mock.patch.object(mxfp8_ops, "_load_native"):
                 with mock.patch.object(torch.ops.hyper_parallel, "mxfp8_task_graph_version",
-                                       return_value=2, create=True):
+                                       return_value=5, create=True):
                     with self.assertRaisesRegex(RuntimeError, "ABI mismatch"):
                         mxfp8_ops._load_mxfp8_native()
                 with mock.patch.object(torch.ops.hyper_parallel, "mxfp8_task_graph_version",
-                                       return_value=3, create=True):
+                                       return_value=6, create=True):
                     mxfp8_ops._load_mxfp8_native()
         finally:
             mxfp8_ops._load_mxfp8_native.cache_clear()
@@ -240,6 +240,7 @@ class TestMXFP8Integration(unittest.TestCase):
         self.assertEqual(module.local_experts, 6)
         self.assertEqual(module._resource_group.specification["num_experts"], 512)
         self.assertFalse(module._cost_model_enabled)
+        self.assertIsNotNone(module._rejected_quota_memo)
         self.assertEqual(module.dispatch_split, 512)
         module.close()
 

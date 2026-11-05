@@ -25,6 +25,6 @@ TORCH_LIBRARY_FRAGMENT(hyper_parallel, m) {
   m.def(
     "mxfp8_task_graph(Tensor(a!)[] buffers, Tensor(b!) runtime_config, Tensor(c!) events, "
     "Tensor(d!) diagnostic, Tensor launch_metadata) -> ()");
-  m.def("mxfp8_task_graph_version() -> int", []() -> int64_t { return 3; });
+  m.def("mxfp8_task_graph_version() -> int", []() -> int64_t { return 6; });
 }
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) { m.impl("mxfp8_task_graph", &Mxfp8TaskGraph); }

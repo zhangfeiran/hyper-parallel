@@ -64,6 +64,7 @@ from hyper_parallel.core.multicore.tasks.utils import (
 )
 
 from .spec import MegaMoeSpec
+from .mxfp8_gradients import configure_mx_gradient_helpers
 
 
 _MX_GMM_PREZEROED_OUTPUT = 2
@@ -88,6 +89,8 @@ class MXFP8Runtime:
     buffer_count: int
     swiglu_row_only: bool = False
     transport_schedule: str = "legacy_odd"
+    kernel_gradients: bool = False
+    weight_prefetch: bool = False
 
 
 def _fill_compute_stage(
@@ -161,22 +164,23 @@ class _GmmStage:
                         n=self.n,
                         k=self.k,
                         x_scale_position=self.x_scale,
-                        w_scale_position=self.guest_scale_position if guest else self.w_scale,
+                        w_scale_position=self.guest_scale_position if guest and self.layout != "TN" else self.w_scale,
                         cube_count=self.workers,
                         cube_index=worker,
                         group_list_offset=expert * 8,
                         w_offset=0 if self.layout == "TN" else weight_slot * self.n * self.k,
                         w_scale_offset=0 if self.layout == "TN" else weight_slot * self.n * self.k // 32,
-                        y_offset=expert * self.m * self.n * 4 if self.layout == "TN" else 0,
+                        y_offset=weight_slot * self.m * self.n * 4 if self.layout == "TN" else 0,
                         output_dtype=MX_GMM_OUTPUT_FP32 if self.layout == "TN" else 0,
                     )
                 )
                 if self.layout == "TN":
                     self.records[-1].flags |= _MX_GMM_PREZEROED_OUTPUT
         _fill_compute_stage(cfg, op, tsv, MX_GMM_TASK_TYPE, self.workers, False, indices)
-        if self.home_experts:
+        if self.home_experts and self.layout != "TN":
             for index in range(self.home_experts * self.workers, len(indices)):
-                cfg.all_tasks[task_start + index].inputs[1].input_position = self.guest_data_position
+                task = cfg.all_tasks[task_start + index]
+                task.inputs[1].input_position = self.guest_data_position
 
 
 @dataclass
@@ -371,8 +375,56 @@ def _configure_mx_vector_policy(cfg: Any, graph: ComputeGraph, spec: MegaMoeSpec
         transport_schedule = "planned CSR: fixed odd communication, arbitrary AIV mathematics"
     if spec.mx_vector_policy == "window2":
         configure_window_queue(cfg, graph, spec, forward=forward)
+        if _mx_gradient_return(spec, forward):
+            configure_mx_gradient_helpers(cfg)
         transport_schedule = "window2 CSR: odd communication, even math, two-expert Cube lookahead"
     return transport_schedule
+
+
+def _mx_gradient_return(spec: MegaMoeSpec, forward: bool) -> bool:
+    """Keep the dedicated projection-return protocol behind its supported queue."""
+    enabled = bool(not forward and spec.replica_slots_per_rank
+                   and spec.replica_transport == "shmem_signal_kernel_gradient")
+    if enabled and spec.mx_vector_policy != "window2":
+        raise ValueError("MX kernel gradient return requires window2 queues")
+    return enabled
+
+
+def _mx_guest_positions(spec: MegaMoeSpec, forward: bool, name: str, layout: str,
+                        kernel_gradients: bool) -> dict[str, int]:
+    """Select separate current guest weight axes or symmetric FP32 destinations."""
+    if not spec.replica_slots_per_rank:
+        return {}
+    home = spec.local_experts - spec.replica_slots_per_rank
+    if layout == "TN":
+        return {"home_experts": home} if kernel_gradients else {}
+    matrix = 0 if name in ("up", "dx") else 1
+    position = (27 if forward else 33) + 2 * matrix
+    return {"home_experts": home, "guest_data_position": position, "guest_scale_position": position + 1}
+
+
+def _tag_mx_weight_readers(config: Any, spec: MegaMoeSpec, ready_buffer: int) -> None:
+    """Fence only guest matrix reads; preserve home/TN tasks and every producer event."""
+    if spec.replica_transport != "shmem_signal_kernel_gradient" or spec.mx_vector_policy != "window2":
+        raise ValueError("MX projection prefetch requires window2 and the symmetric gradient inbox")
+    home = spec.local_experts - spec.replica_slots_per_rank
+    for task in config.all_tasks[:config.task_num]:
+        if (task.task_type == MX_GMM_TASK_TYPE and task.outputs[0].input_position in (7, 8, 11, 12)
+                and task.inputs[1].input_position in (27, 29, 33, 35)):
+            if task.task_index // spec.num_cube_cores < home or task.extra_value_1:
+                raise ValueError("MX prefetch reader tags must refer only to guest weight matrices")
+            task.extra_value_1 = ready_buffer + 1
+
+
+def _finish_mx_runtime(graph: ComputeGraph, cfg: Any, gmms: list, quants: list, base_buffers: int,
+                        spec: MegaMoeSpec, row_only: bool, schedule: str,
+                        gradients: bool, prefetch: bool) -> MXFP8Runtime:
+    """Bind reader flags and byte-buffer bounds to the exact completed native protocol."""
+    ready_buffer = base_buffers + 4 * bool(spec.replica_slots_per_rank)
+    if prefetch:
+        _tag_mx_weight_readers(cfg, spec, ready_buffer)
+    return MXFP8Runtime(graph, cfg, serialize_mx_gmm_descriptors(gmms), serialize_mx_quant_descriptors(quants),
+                        ready_buffer + prefetch, row_only, schedule, gradients, prefetch)
 
 
 def build_mxfp8_runtime(
@@ -382,6 +434,7 @@ def build_mxfp8_runtime(
     swiglu_row_only: bool = False,
     expert_window: int = 0,
     dispatch_quant: bool = False,
+    weight_prefetch: bool = False,
 ) -> MXFP8Runtime:
     """Serialize phase-specific MX tasks with per-expert producer/consumer events.
 
@@ -390,6 +443,8 @@ def build_mxfp8_runtime(
     """
     _validate_mx_options(spec, forward, swiglu_row_only, expert_window)
     ready_policy = spec.mx_vector_policy == "roles_ready"
+    kernel_gradients = _mx_gradient_return(spec, forward)
+    weight_prefetch = bool(weight_prefetch and spec.replica_slots_per_rank)
     values = _MXTaskValues(
         tp=1,
         ep=spec.ep_size,
@@ -470,15 +525,7 @@ def build_mxfp8_runtime(
             output: Native business-buffer output position.
             scales: Input and weight scale buffer positions.
         """
-        guest_positions = {}
-        if spec.replica_slots_per_rank and layout != "TN":
-            matrix = 0 if name in ("up", "dx") else 1
-            guest_data = (27 if forward else 33) + 2 * matrix
-            guest_positions = {
-                "home_experts": spec.local_experts - spec.replica_slots_per_rank,
-                "guest_data_position": guest_data,
-                "guest_scale_position": guest_data + 1,
-            }
+        guest_positions = _mx_guest_positions(spec, forward, name, layout, kernel_gradients)
         _add_compute(
             graph,
             name,
@@ -547,12 +594,5 @@ def build_mxfp8_runtime(
     configure_ready_handshake(cfg, values)
     validate_runtime_config(cfg, values, cubes)
     transport_schedule = _configure_mx_vector_policy(cfg, graph, spec, forward, transport_schedule)
-    return MXFP8Runtime(
-        graph,
-        cfg,
-        serialize_mx_gmm_descriptors(gmms),
-        serialize_mx_quant_descriptors(quants),
-        len(specs) + 4 * bool(spec.replica_slots_per_rank),
-        swiglu_row_only,
-        transport_schedule,
-    )
+    return _finish_mx_runtime(graph, cfg, gmms, quants, len(specs), spec,
+                              swiglu_row_only, transport_schedule, kernel_gradients, weight_prefetch)

@@ -21,7 +21,7 @@ from collections.abc import Sequence
 
 import torch
 
-from hyper_parallel.core.multicore.scheduler.mxfp8 import serialize_mx_launch_metadata
+from hyper_parallel.core.multicore.scheduler.mxfp8 import MxLaunchDescriptor, serialize_mx_launch_metadata
 from hyper_parallel.core.multicore.torch.ops import _load_native
 
 from .spec import MegaMoeSpec
@@ -30,7 +30,7 @@ from .spec import MegaMoeSpec
 @lru_cache(maxsize=1)
 def _load_mxfp8_native() -> None:
     _load_native()
-    if torch.ops.hyper_parallel.mxfp8_task_graph_version() != 3:
+    if torch.ops.hyper_parallel.mxfp8_task_graph_version() != 6:
         raise RuntimeError("MXFP8 task-graph adapter ABI mismatch; rebuild the local multicore component.")
 
 
@@ -44,7 +44,8 @@ def _byte_aliases(buffers: Sequence[torch.Tensor]) -> list[torch.Tensor]:
 
 
 def serialize_mxfp8_launch(
-    buffers: Sequence[torch.Tensor], runtime: torch.Tensor, events: torch.Tensor, spec: MegaMoeSpec
+    buffers: Sequence[torch.Tensor], runtime: torch.Tensor, events: torch.Tensor, spec: MegaMoeSpec,
+    *, kernel_gradients: bool = False, weight_prefetch: bool = False,
 ) -> bytes:
     """Serialize exact current byte bounds without reading device tensor contents.
 
@@ -54,7 +55,7 @@ def serialize_mxfp8_launch(
         events: Symmetric event and persistent ready-generation storage.
         spec: Validated physical expert topology and current capacity.
     """
-    return serialize_mx_launch_metadata(
+    content = serialize_mx_launch_metadata(
         [tensor.numel() * tensor.element_size() for tensor in buffers],
         rank=spec.rank_id,
         ep=spec.ep_size,
@@ -66,10 +67,18 @@ def serialize_mxfp8_launch(
         event_bytes=events.numel(),
         vector_policy=spec.mx_vector_policy,
     )
+    if not kernel_gradients and not weight_prefetch:
+        return content
+    if spec.mx_vector_policy != "window2" or spec.replica_transport != "shmem_signal_kernel_gradient":
+        raise ValueError("MX gradient return requires its dedicated transport and window2 queue")
+    record = MxLaunchDescriptor.from_buffer_copy(content)
+    record.version, record.reserved = ((13, 12) if kernel_gradients else (12, 11)) if weight_prefetch else (11, 10)
+    return bytes(record)
 
 
 def prepare_mxfp8_launch(
-    buffers: Sequence[torch.Tensor], runtime: torch.Tensor, events: torch.Tensor, spec: MegaMoeSpec
+    buffers: Sequence[torch.Tensor], runtime: torch.Tensor, events: torch.Tensor, spec: MegaMoeSpec,
+    *, kernel_gradients: bool = False, weight_prefetch: bool = False,
 ) -> torch.Tensor:
     """Transfer the byte-bounds launch descriptor to the active device.
 
@@ -79,7 +88,8 @@ def prepare_mxfp8_launch(
         events: Symmetric event and persistent ready-generation storage.
         spec: Validated physical expert topology and current capacity.
     """
-    metadata = serialize_mxfp8_launch(buffers, runtime, events, spec)
+    metadata = serialize_mxfp8_launch(buffers, runtime, events, spec, kernel_gradients=kernel_gradients,
+                                     weight_prefetch=weight_prefetch)
     return torch.frombuffer(bytearray(metadata), dtype=torch.uint8).to(device=runtime.device)
 
 

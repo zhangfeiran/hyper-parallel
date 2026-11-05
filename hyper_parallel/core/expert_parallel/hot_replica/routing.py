@@ -135,6 +135,26 @@ class _RejectedReplicaQuotas:
                 == (target, admission, saved_rows, minimum_rows))
 
 
+class _RejectedQuotaMemo:
+    """Keep one exact CPU-only rejection after fresh count and capacity agreement."""
+
+    def __init__(self) -> None:
+        """Start without reusable rejection evidence or retained device storage."""
+        self.signature: tuple[Any, ...] | None = None
+        self.hits = 0
+
+    def contains(self, signature: tuple[Any, ...]) -> bool:
+        """Reuse only the complete pure-search inputs, never invocation metadata.
+
+        Args:
+            signature: Exact topology, expert totals, loads, capacity and benefit-policy inputs.
+        """
+        if self.signature != signature:
+            return False
+        self.hits += 1
+        return True
+
+
 class _RecomputedReplicaPlans:
     """Retain immutable CPU plans and home-decision evidence for one invocation."""
 
@@ -365,6 +385,7 @@ def _try_compact_home_route(
     minimum_replica_rows: int = 0,
     capacity_budget: Callable[[int], int] | None = None,
     gathered_counts: _GatheredReplicaCounts | None = None,
+    rejected_quota_memo: _RejectedQuotaMemo | None = None,
 ) -> ReplicaRoute | _UncalibratedCandidate | None:
     """Read bounded statistics before deciding whether a full CPU table is needed."""
     # A larger allowance must not replace the original checkpoint graph with
@@ -448,27 +469,35 @@ def _try_compact_home_route(
                 else:
                     totals = logical.sum(0, dtype=torch.int64).cpu().tolist()
                 target = max(average, target_load or 0)
+                rejection = _RejectedReplicaQuotas(config, tuple(totals), destination_loads,
+                                                   target, admission, minimum_saved_rows, minimum_replica_rows)
+                complete_search = _complete_guest_search_enabled()
+                projected_nodes = _projected_rank_nodes(nodes)
+                signature = (rejection, upper, resident, complete_search, nodes, projected_nodes)
                 previous = None
                 if cache is not None and cache.cursor < len(cache.entries):
                     previous = cache.entries[cache.cursor][0]
                 # Allocator limits above the owner peak cannot change the
                 # quota search or fragment pruning, whose bound is owner peak.
-                if not (isinstance(previous, _RejectedReplicaQuotas) and previous.matches(
-                        config, totals, destination_loads, target, admission, minimum_saved_rows,
-                        minimum_replica_rows)):
+                replay_rejected = isinstance(previous, _RejectedReplicaQuotas) and previous.matches(
+                    config, totals, destination_loads, target, admission, minimum_saved_rows, minimum_replica_rows)
+                memo_rejected = rejected_quota_memo is not None and rejected_quota_memo.contains(signature)
+                if not (replay_rejected or memo_rejected):
                     candidate = _admitted_uncalibrated_copies(
                         totals, list(destination_loads), config, upper, resident, target,
                         minimum_replica_rows, admission, minimum_saved_rows,
-                        allow_complete_search=_complete_guest_search_enabled(),
-                        projected_rank_nodes=_projected_rank_nodes(nodes))
+                        allow_complete_search=complete_search, projected_rank_nodes=projected_nodes)
                     if candidate is not None and any(expert // config.home_experts != rank and count
                                                      for rank, row in enumerate(candidate)
                                                      for expert, count in row.items()):
+                        if rejected_quota_memo is not None:
+                            rejected_quota_memo.signature = None
                         return _UncalibratedCandidate(config, tuple(totals), candidate, upper, resident,
                                                       target, minimum_replica_rows, admission, minimum_saved_rows)
-                if state is not None and not state.is_recomputing:
-                    decision = _RejectedReplicaQuotas(config, tuple(totals), destination_loads,
-                                                      target, admission, minimum_saved_rows, minimum_replica_rows)
+                if state is None or not state.is_recomputing:
+                    decision = rejection
+                    if rejected_quota_memo is not None:
+                        rejected_quota_memo.signature = signature
         elif not _compact_home_cost_dominates(totals, rows, config, cost_model):
             return None
     counts = logical.to(torch.int32).contiguous()
@@ -496,6 +525,7 @@ def prepare_replica_route(
     _trusted_counts: torch.Tensor | None = None,
     _gathered_counts: _GatheredReplicaCounts | None = None,
     _replica_transfer_row_credit: int = 0,
+    _rejected_quota_memo: _RejectedQuotaMemo | None = None,
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
@@ -607,7 +637,7 @@ def prepare_replica_route(
             minimum_saved_rows=minimum_saved_rows,
             minimum_replica_rows=minimum_replica_rows,
             cost_model=_cost_model, rank_nodes=_rank_nodes, capacity_budget=_capacity_budget,
-            gathered_counts=_gathered_counts)
+            gathered_counts=_gathered_counts, rejected_quota_memo=_rejected_quota_memo)
         if isinstance(ordinary, ReplicaRoute):
             return ordinary
         prepared_candidate = ordinary

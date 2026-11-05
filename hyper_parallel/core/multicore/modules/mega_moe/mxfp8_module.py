@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 from functools import cached_property
+import os
 
 import torch
 import torch.distributed as dist
@@ -36,6 +37,8 @@ from .mxfp8_execution import MXFP8Execution
 from .mxfp8_diagnostics import prepare_mx_diagnostics
 from .mxfp8_function import execute_mxfp8_experts
 from .mxfp8_graph import build_mxfp8_runtime
+from .mxfp8_gradients import mx_projection_events
+from .mxfp8_prefetch import MXProjectionPrefetch
 from .mxfp8_weights import MXFP8ExpertWeightBinding
 from .spec import bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace
@@ -65,6 +68,16 @@ class _MXFP8Plan:
     spec: Any
     forward: _DeviceRuntime
     backward: _DeviceRuntime
+
+    @cached_property
+    def replica_w2_events(self) -> tuple[int, ...]:
+        """Require every Cube producer before publishing second-projection gradients."""
+        return mx_projection_events(self.backward.host.config, self.spec.local_experts, (6,))
+
+    @cached_property
+    def replica_w13_events(self) -> tuple[int, ...]:
+        """Require every Cube producer before publishing first-projection gradients."""
+        return mx_projection_events(self.backward.host.config, self.spec.local_experts, (18,))
 
 
 def _device_runtime(host: Any, device: Any, spec: Any) -> _DeviceRuntime:
@@ -103,6 +116,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
     ) -> None:
         """Bind validated invocation resources without retaining gathered weight views."""
         self.spec = bind_mega_moe_spec(specification, tensor)
+        self.weight_prefetch = MXProjectionPrefetch() if specification.get("mx_weight_prefetch", False) else None
         if self.spec.num_cube_cores != 32:
             raise ValueError("MXFP8 MegaMoE requires the Ascend 950 32-Cube kernel.")
         self.soc_name = ""
@@ -145,7 +159,19 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             self.spec.mx_vector_policy,
             self.spec.mx_poll_policy,
             self.spec.compute_stages,
+            self.weight_prefetch is not None,
         )
+
+    def _validate_distributed_configuration(self, specifications: tuple[Mapping[str, Any], ...]) -> None:
+        """Agree on projection readiness before any rank can allocate or launch its protocol."""
+        super()._validate_distributed_configuration(specifications)
+        if self.spec.ep_size == 1:
+            return
+        flags = tuple(bool(spec.get("mx_weight_prefetch", False)) for spec in specifications)
+        gathered = [None] * self.spec.ep_size
+        dist.all_gather_object(gathered, flags, group=self.spec.ep_group)
+        if any(value != flags for value in gathered):
+            raise ValueError("MXFP8 projection-prefetch configuration differs across expert ranks")
 
     def plan_for_capacity(self, capacity: int, device: Any, *, home_only: bool = False) -> _MXFP8Plan:
         """Cache pointer-free MX plans against the current symmetric receive bound.
@@ -162,8 +188,10 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             spec = replace(selected, receive_capacity=capacity)
             self._plans[key] = _MXFP8Plan(
                 spec,
-                _device_runtime(build_mxfp8_runtime(spec, forward=True), device, spec),
-                _device_runtime(build_mxfp8_runtime(spec, forward=False), device, spec),
+                _device_runtime(build_mxfp8_runtime(spec, forward=True,
+                                                   weight_prefetch=self.weight_prefetch is not None), device, spec),
+                _device_runtime(build_mxfp8_runtime(spec, forward=False,
+                                                   weight_prefetch=self.weight_prefetch is not None), device, spec),
             )
         self._plans.move_to_end(key)
         while len(self._plans) > 4:
@@ -190,6 +218,7 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
         combine_split: Return transport rows per task.
         vector_policy: Adopted two-expert lookahead or the legacy control schedule.
         nograd_no_clone: Avoid the intermediate clone for checkpoint forwards.
+        replica_transport: Exact weight P2P with optional fused FP32 projection-gradient return.
     """
 
     def __init__(
@@ -210,6 +239,8 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
         combine_split: int = 512,
         vector_policy: str = "window2",
         nograd_no_clone: bool = True,
+        replica_transport: str = "p2p",
+        overlap_weights: bool = False,
     ) -> None:
         """Bind validated invocation resources without retaining gathered weight views."""
         if hidden_size % 64 or intermediate_size % 64:
@@ -218,12 +249,22 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             raise ValueError("MXFP8 vector_policy must be window2 or legacy_odd.")
         if not isinstance(nograd_no_clone, bool):
             raise ValueError("nograd_no_clone must be a boolean.")
+        if replica_transport not in ("p2p", "shmem_signal_kernel_gradient"):
+            raise ValueError("MXFP8 replica transport must be p2p or shmem_signal_kernel_gradient.")
+        if replica_transport != "p2p" and vector_policy != "window2":
+            raise ValueError("MXFP8 kernel gradient return requires window2 queues.")
+        if not isinstance(overlap_weights, bool):
+            raise ValueError("MXFP8 overlap_weights must be a boolean.")
+        if overlap_weights and replica_transport != "shmem_signal_kernel_gradient":
+            raise ValueError("MXFP8 projection prefetch requires the symmetric FP32 gradient inbox.")
+        if overlap_weights and os.environ.get("HCCL_OP_EXPANSION_MODE") != "AICPU_CacheDisable":
+            raise ValueError("MXFP8 projection prefetch requires HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable.")
         config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_planner = "cpu"
         self.replica_min_rows = replica_min_rows
         self.replica_target_load = None
         self.replica_minimum_load_reduction = None
-        self.replica_transport = "p2p"
+        self.replica_transport = replica_transport
         self._cost_model_enabled = False
         specification = {
             "local_num_tokens": local_num_tokens,
@@ -242,7 +283,8 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
             "replica_slots_per_rank": replica_slots_per_rank,
-            "replica_transport": "p2p",
+            "replica_transport": replica_transport,
+            "mx_weight_prefetch": overlap_weights,
             "auto_tokens": False,
             "compute_stages": 6,
             "mx_vector_policy": vector_policy,

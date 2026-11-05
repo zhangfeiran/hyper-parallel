@@ -51,7 +51,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.device import (
     validate_planner_backend,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.routing import (
-    ReplicaRoute, _GatheredReplicaCounts, prepare_replica_route,
+    ReplicaRoute, _GatheredReplicaCounts, _RejectedQuotaMemo, prepare_replica_route,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
     KERNEL_GRADIENT_TRANSPORT_MODES,
@@ -642,6 +642,7 @@ class MegaMoeExperts(MulticoreModule):
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
         self.replica_config = replica_config
+        self._rejected_quota_memo = _RejectedQuotaMemo() if replica_config.replica_slots_per_rank else None
         self.replica_slots_per_rank = replica_config.replica_slots_per_rank
         self._initialize_module_state(specification, create_parameters=create_parameters)
 
@@ -874,6 +875,7 @@ class MegaMoeExperts(MulticoreModule):
             _capacity_budget=(resources.receive_capacity_limit
                               if self.dispatch_mode != "pull" else None),
             _trusted_counts=counts, _gathered_counts=gathered,
+            _rejected_quota_memo=self._rejected_quota_memo,
         )
 
     def forward(
