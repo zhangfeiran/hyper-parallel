@@ -54,6 +54,14 @@ def _column_totals(rows: Sequence[Sequence[int]]) -> list[int] | None:
     return module.column_totals(rows)
 
 
+def _locality_moves(copies: list[dict[int, int]], home: int, budget: int, nodes: tuple[int, ...]) -> tuple | None:
+    """Use an additive ABI3 primitive while preserving the Python fallback and dict order."""
+    module = _native_backend()
+    if module is None or not hasattr(module, 'locality_moves'):
+        return None
+    return module.locality_moves(copies, home, budget, nodes)
+
+
 def _materialize_dispatch(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int]],
                           home: int, budget: int, nodes: tuple[int, ...]) -> tuple | None:
     """Use the additive integer primitive while retaining optional backend fallback."""

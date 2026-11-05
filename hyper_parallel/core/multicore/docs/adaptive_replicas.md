@@ -74,6 +74,23 @@ the small-copy threshold. Existing copies of the same owner may take over work;
 no new matrix edge is created and the receive peak cannot increase. Cross-node
 edges and owners with larger fanout are considered first.
 
+After final locality placement and consolidation, a bounded pass can refill
+already retained guest matrices from their own logical expert's remaining home
+rows. Existing guest rows and uncopied home rows establish a lower bound on the
+expert peak, so the pass skips home fragments that cannot reduce it. It creates
+no matrix edges or active slots. The proposal must reduce the largest expert
+fragment while keeping the rank receive peak and every source/node traffic
+objective nonincreasing. This pass uses no
+additional budget candidates, public parameter, calibration table or collective.
+Zero admission/fragment compatibility policies, explicit placement experiments,
+and matched cost models retain their existing paths. Structural improvement is
+not a latency guarantee.
+
+The optional ABI3 host extension can emit the same ordered whole-guest locality
+moves as Python. Python applies each move in sequence to preserve dictionary
+insertion order and remains the fallback for unsupported integer ranges or
+older extension builds. This CPU primitive does not change device kernels.
+
 For training, MegaMoe derives an internal activation-row credit from its own
 expert shape and gradient flags. With intermediate dimension `I`, it credits
 `floor(I * (2 * grad_gate_up + grad_down) / 6)` extra remote rows per deleted

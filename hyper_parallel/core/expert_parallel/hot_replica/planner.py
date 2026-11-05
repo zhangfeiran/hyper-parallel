@@ -28,7 +28,7 @@ from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
 from .cost import ExpertReplicaCostModel, _QuotaCostState, refine_replica_quotas
 from .topology import _validate_rank_nodes
-from .host import _column_totals, _materialize_dispatch, _validate_counts
+from .host import _column_totals, _locality_moves, _materialize_dispatch, _validate_counts
 
 _COMPLETE_GUEST_HOTSPOT_FACTOR = 3
 
@@ -112,10 +112,17 @@ def _improve_copies(copies: list[dict[int, int]], config: ExpertReplicaConfig, t
                 existing_by_owner[expert // home].append((receiver, expert))
     donors = [(-load, rank) for rank, load in enumerate(loads) if load > target]
     heapify(donors)
+    if not donors:
+        return
+    free_ranks = [rank for rank, load in enumerate(loads)
+                  if load < target and guest_counts[rank] < config.replica_slots_per_rank]
     while donors:
         _, donor = heappop(donors)
-        free = [(rank, target - load) for rank, load in enumerate(loads)
-                if load < target and guest_counts[rank] < config.replica_slots_per_rank]
+        # Donors stop at target and receivers only gain rows or slots, so
+        # this initially eligible set can only shrink during the search.
+        free_ranks = [rank for rank in free_ranks
+                      if loads[rank] < target and guest_counts[rank] < config.replica_slots_per_rank]
+        free = [(rank, target - loads[rank]) for rank in free_ranks]
         headroom = max((rows for _, rows in free), default=0)
         best_score = (0, 0, 0, 0)
         best = None
@@ -290,12 +297,21 @@ def _consolidate_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, .
     if 1 < len(set(rank_nodes)) < config.ep_size:
         for rank, node in enumerate(rank_nodes):
             node_ranks.setdefault(node, []).append(rank)
+    rank_gain = {}
     for negative_remote, _, _, target, expert in candidates:
         rows = copies[target][expert]
+        owner = expert // home
+        if owner not in rank_gain:
+            # Returning home work and filling retained guests cannot recover
+            # more rank-local rows than their current uncovered source demand.
+            retained = [(owner, logical) for logical in copies[owner]] + by_owner[owner]
+            rank_gain[owner] = sum(max(counts[rank][logical] - copies[rank].get(logical, 0), 0)
+                                   for rank, logical in retained if logical // home == owner)
+        if min(counts[target][expert], rows) > rank_gain[owner] + transfer_row_credit:
+            continue
         replacements = _replacement_rows(copies, loads, home, target, expert, rows, ceiling, by_owner)
         if replacements is None:
             continue
-        owner = expert // home
         changes = {(owner, expert): rows, (target, expert): -rows}
         for rank, logical, moved in replacements:
             key = owner, logical
@@ -313,6 +329,7 @@ def _consolidate_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, .
             else:
                 del copies[rank][logical]
             loads[rank] += change
+        rank_gain.pop(owner, None)
 
 
 def _rebalance_existing_copies(copies: list[dict[int, int]], config: ExpertReplicaConfig) -> None:
@@ -903,12 +920,26 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
 def _locality_copies(selected: list[dict[int, int]], config: ExpertReplicaConfig,
                      rank_nodes: tuple[int, ...]) -> list[dict[int, int]]:
     """Move, merge or swap whole guest fragments without adding replica edges or receive peak."""
+    operations = _locality_moves(selected, config.home_experts, config.replica_slots_per_rank, rank_nodes)
+    if operations is not None:
+        if not operations:
+            return selected
+        copies = [dict(row) for row in selected]
+        for source, target, expert, other in operations:
+            rows = copies[source].pop(expert)
+            if other < 0:
+                copies[target][expert] = copies[target].get(expert, 0) + rows
+            else:
+                amount = copies[target].pop(other)
+                copies[source][other], copies[target][expert] = amount, rows
+        return selected if copies == selected else copies
     copies = [dict(row) for row in selected]
     home = config.home_experts
     current = [sum(row.values()) for row in copies]
     ceiling = max(current)
-    guests = [sum(expert // home != rank and bool(rows) for expert, rows in row.items())
-              for rank, row in enumerate(copies)]
+    guest_rows = [{expert: rows for expert, rows in row.items() if rows and expert // home != rank}
+                  for rank, row in enumerate(copies)]
+    guests = list(map(len, guest_rows))
     edges = sorted((-rows, rank, expert) for rank, row in enumerate(copies) for expert, rows in row.items()
                    if rows and expert // home != rank and rank_nodes[expert // home] != rank_nodes[rank])
     if not edges:
@@ -918,24 +949,34 @@ def _locality_copies(selected: list[dict[int, int]], config: ExpertReplicaConfig
     node_ranks: dict[int, list[int]] = {}
     for rank, node in enumerate(rank_nodes):
         node_ranks.setdefault(node, []).append(rank)
+    free_room = {}
     for negative_rows, source, expert in edges:
         rows = -negative_rows
         if copies[source].get(expert) != rows:
             continue
         owner = expert // home
-        local = sorted(node_ranks[rank_nodes[owner]],
-                       key=lambda rank: (expert not in copies[rank], current[rank], rank))
+        node = rank_nodes[owner]
+        local = node_ranks[node]
+        if node not in free_room:
+            free_room[node] = max(ceiling - current[rank] for rank in local)
         moved = False
-        for target in local:
+        direct = (sorted(local, key=lambda rank: (expert not in copies[rank], current[rank], rank))
+                  if rows <= free_room[node] else ())
+        for target in direct:
             if (current[target] + rows <= ceiling and
                     (expert in copies[target] or guests[target] < config.replica_slots_per_rank)):
                 if expert not in copies[target] and owner != target:
                     guests[target] += 1
                 copies[target][expert] = copies[target].get(expert, 0) + rows
+                if owner != target:
+                    guest_rows[target][expert] = copies[target][expert]
                 del copies[source][expert]
+                del guest_rows[source][expert]
                 guests[source] -= 1
                 current[source] -= rows
                 current[target] += rows
+                free_room.pop(rank_nodes[source], None)
+                free_room.pop(rank_nodes[target], None)
                 moved = True
                 break
         if moved:
@@ -945,8 +986,9 @@ def _locality_copies(selected: list[dict[int, int]], config: ExpertReplicaConfig
         for target in local:
             if expert in copies[target]:
                 continue
-            for other, amount in copies[target].items():
-                if not amount or other // home == target or other in copies[source]:
+            lower, upper = current[target] + rows - ceiling, ceiling - current[source] + rows
+            for other, amount in guest_rows[target].items():
+                if amount < lower or amount > upper or other in copies[source]:
                     continue
                 saved = (1 + int(rank_nodes[other // home] != rank_nodes[target])
                          - int(rank_nodes[other // home] != rank_nodes[source]))
@@ -961,8 +1003,13 @@ def _locality_copies(selected: list[dict[int, int]], config: ExpertReplicaConfig
             del copies[source][expert]
             del copies[target][other]
             copies[source][other], copies[target][expert] = amount, rows
+            del guest_rows[source][expert]
+            del guest_rows[target][other]
+            guest_rows[source][other], guest_rows[target][expert] = amount, rows
             current[source] += amount - rows
             current[target] += rows - amount
+            free_room.pop(rank_nodes[source], None)
+            free_room.pop(rank_nodes[target], None)
     return selected if copies == selected else copies
 
 
@@ -973,6 +1020,102 @@ def _optional_peak_is_useful(candidate_peak, loads, limit, admission, minimum_sa
         return True
     saved = peak - candidate_peak
     return saved >= minimum_saved_rows and saved * 10000 >= peak * admission
+
+
+def _fill_critical_guest_rows(copies: list[dict[int, int]], home: int) -> None:
+    """Fill retained matrices only when their home fragment can reduce the expert peak."""
+    loads = [sum(row.values()) for row in copies]
+    guests: dict[int, list[int]] = {}
+    for target, row in enumerate(copies):
+        for expert, rows in row.items():
+            if rows and expert // home != target:
+                guests.setdefault(expert, []).append(target)
+    # Guest rows and uncopied home rows cannot be reduced by this pass.
+    floor = max((rows for rank, row in enumerate(copies) for expert, rows in row.items()
+                 if expert not in guests or expert // home != rank), default=0)
+    for expert in sorted(guests, key=lambda logical: (-copies[logical // home][logical], logical)):
+        owner = expert // home
+        if copies[owner][expert] <= floor:
+            continue
+        receivers = sorted((loads[target], target) for target in guests[expert])
+        total, participants = loads[owner], 0
+        for load, _target in receivers:
+            if load >= (total + participants) // (participants + 1):
+                break
+            total += load
+            participants += 1
+        if not participants:
+            continue
+        ceiling = (total + participants) // (participants + 1)
+        moved = min(copies[owner][expert], loads[owner] - ceiling)
+        if not moved:
+            continue
+        # Raise the lowest retained receivers together, using only this
+        # owner's remaining rows. Integer remainders follow stable receiver order.
+        remaining, level, width = moved, receivers[0][0], 1
+        for load, _target in receivers[1:participants]:
+            required = (load - level) * width
+            if required > remaining:
+                break
+            remaining -= required
+            level, width = load, width + 1
+        level += remaining // width
+        remainder = remaining % width
+        copies[owner][expert] -= moved
+        loads[owner] -= moved
+        for index, (load, target) in enumerate(receivers[:width]):
+            rows = level - load + int(index < remainder)
+            copies[target][expert] += rows
+            loads[target] += rows
+            floor = max(floor, copies[target][expert])
+
+
+def _quota_traffic(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
+                    nodes: tuple[int, ...], node_counts: dict[int, tuple[int, ...]]) -> tuple[int, ...]:
+    """Use the materializer's exact source-local and node-local quota intersections."""
+    source_out, target_in = [], []
+    node_local, node_loads = {}, {}
+    node_quotas: dict[int, dict[int, int]] = {}
+    for rank, row in enumerate(copies):
+        local = sum(min(counts[rank][expert], rows) for expert, rows in row.items())
+        source_out.append(sum(counts[rank]) - local)
+        target_in.append(sum(row.values()) - local)
+        if nodes:
+            quotas = node_quotas.setdefault(nodes[rank], {})
+            for expert, rows in row.items():
+                quotas[expert] = quotas.get(expert, 0) + rows
+    for node, quotas in node_quotas.items():
+        node_local[node] = sum(min(node_counts[node][expert], rows) for expert, rows in quotas.items())
+        node_loads[node] = sum(quotas.values())
+    node_out = [sum(node_counts[node]) - local for node, local in node_local.items()]
+    node_in = [node_loads[node] - local for node, local in node_local.items()]
+    return (sum(source_out), max(source_out), max(target_in), sum(node_out),
+            max(node_out, default=0), max(node_in, default=0))
+
+
+def _rebalance_retained_copies(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
+                                home: int, nodes: tuple[int, ...]) -> list[dict[int, int]]:
+    """Shorten the largest expert without raising receive or exact token traffic pressure."""
+    proposal = [dict(row) for row in copies]
+    _fill_critical_guest_rows(proposal, home)
+    if proposal == copies:
+        return copies
+    before = (max(sum(row.values()) for row in copies),
+              max(rows for row in copies for rows in row.values()))
+    after = (max(sum(row.values()) for row in proposal),
+             max(rows for row in proposal for rows in row.values()))
+    # A lower aggregate receive peak can leave the critical expert unchanged.
+    if after[1] >= before[1] or after[0] > before[0]:
+        return copies
+    grouped = {}
+    for rank, node in enumerate(nodes):
+        grouped.setdefault(node, []).append(counts[rank])
+    node_counts = {node: tuple(map(sum, zip(*rows))) for node, rows in grouped.items()}
+    previous_traffic = _quota_traffic(copies, counts, nodes, node_counts)
+    next_traffic = _quota_traffic(proposal, counts, nodes, node_counts)
+    # The pass only adds rows to existing positive guests. Matrix edges,
+    # owner/node fanout and actual slot occupancy therefore stay identical.
+    return proposal if all(new <= old for new, old in zip(next_traffic, previous_traffic)) else copies
 
 
 def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replica_slots_per_rank: int,
@@ -1086,6 +1229,9 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
             """Consolidate the final uncalibrated layout before assigning source quotas."""
             if cost_model is None:
                 _consolidate_copies(copies, counts, config, rank_nodes, _replica_transfer_row_credit)
+                if (minimum_replica_rows > 0 and admission > 0
+                        and not (_complete_guest_search_enabled() or _projected_rank_nodes(rank_nodes))):
+                    copies = _rebalance_retained_copies(copies, counts, config.home_experts, rank_nodes)
             return _materialize(counts, copies, config, capacity_limit, rank_nodes=rank_nodes)
 
         resident = min(limit, receive_capacity) if receive_capacity is not None else limit

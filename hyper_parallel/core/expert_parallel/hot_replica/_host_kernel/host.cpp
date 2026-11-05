@@ -25,6 +25,7 @@
 
 namespace ReplicaHost {
 PyObject *MaterializeDispatch(PyObject *, PyObject *);
+PyObject *LocalityMoves(PyObject *, PyObject *);
 }
 
 namespace {
@@ -318,6 +319,8 @@ PyMethodDef methods[] = {
   {"ordered_compute", OrderedCompute, METH_VARARGS, "Interpolate ordered guest rows and serially sum home rows."},
   {"materialize_dispatch", ReplicaHost::MaterializeDispatch, METH_VARARGS,
    "Materialize exact physical slots and source dispatch quotas."},
+  {"locality_moves", ReplicaHost::LocalityMoves, METH_VARARGS,
+   "Return exact whole-guest placement operations without changing Python input objects."},
   {nullptr, nullptr, 0, nullptr},
 };
 
