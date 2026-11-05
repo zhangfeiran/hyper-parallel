@@ -125,7 +125,11 @@ def main() -> None:
     (work / 'cpu-placement.json').write_text(json.dumps(record, indent=2) + '\n')
     if os.environ.get('DSV41_PLACEMENT_DRY_RUN') == '1':
         return
-    if os.environ.get('DSV41_CRASH_CAPTURE') == '1':
+    if os.environ.get('DSV41_ROUTE_SCHEDULE'):
+        if os.environ.get('DSV41_CRASH_CAPTURE') == '1' or os.environ.get('CLEAN_PROFILE_TAIL') == '1':
+            raise ValueError('Scheduled full-model timing requires profiler and crash capture to be disabled')
+        module = 'benchmark_deepseek_v41_schedule'
+    elif os.environ.get('DSV41_CRASH_CAPTURE') == '1':
         module = 'benchmark_deepseek_v41_capture'
     else:
         module = ('benchmark_deepseek_v41_profile' if os.environ.get('CLEAN_PROFILE_TAIL') == '1'

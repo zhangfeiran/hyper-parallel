@@ -95,7 +95,8 @@ def case_matrix(include_pull: bool = False) -> tuple[Case, ...]:
 def validate_statuses(statuses: list[dict[str, Any]]) -> None:
     """Require clean cross-node termination before accepting any case."""
     if not statuses or not all(row['training_exit_status'] == 0 and row['monitor_exit_status'] == 0
-                               and row['cleanup_ok'] and not row['peer_failed'] for row in statuses):
+                               and row['cleanup_ok'] and not row['peer_failed']
+                               and row.get('artifact_exit_status', 0) == 0 for row in statuses):
         raise RuntimeError(f'Clean ABC-CBA case failed: {statuses}')
 
 
