@@ -137,19 +137,17 @@ class MXFP8Execution:
             retain_backward: Whether to retain owned activations for a later backward.
         """
         resources, workspace = self.resources, self.resources.workspace
-        spec = resources.spec
+        home_only = self.replica_route is not None and self.replica_route.home_only
+        spec = resources.home_spec if home_only else resources.spec
         flat = hidden.reshape(-1, spec.hidden_size)
         route = prepare_topk_route(
             flat, ids, probs, spec, self.counts, workspace=workspace, replica_route=self.replica_route
         )
         resources.ensure_capacity(route.maximum_received_slots)
-        workspace.ensure(spec, hidden.dtype, hidden.device)
-        row_only = _use_row_only(spec, retain_backward)
-        plan = (
-            resources.plan_for_capacity(workspace.expert_capacity, hidden.device, swiglu_row_only=True)
-            if row_only
-            else resources.plan_for_capacity(workspace.expert_capacity, hidden.device)
-        )
+        workspace.ensure(resources.spec, hidden.dtype, hidden.device)
+        row_only = False
+        plan = resources.plan_for_capacity(workspace.expert_capacity, hidden.device, home_only=home_only)
+        resources.last_execution_plan = plan
         metadata = route.metadata
         capacity, device = metadata.expert_capacity, hidden.device
         x_row, x_scale, x_col, x_col_scale = _quantized_buffers(capacity, spec.hidden_size, spec.local_experts, device)

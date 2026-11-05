@@ -26,7 +26,7 @@ from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_graph import build_mxfp8_runtime
-from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_module import MXFP8MegaMoeExperts
+from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_module import MXFP8MegaMoeExperts, _mx_home_spec
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_replica import materialize_replica_weights
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_weights import (
     MXFP8ExpertWeightBinding,
@@ -122,7 +122,7 @@ class TestMXFP8Integration(unittest.TestCase):
         owner, guest = _physical(2, 64, 128), _physical(1, 64, 128)
         config = ExpertReplicaConfig(4, 2, 2)
         transfer = SimpleNamespace(target_rank=1, target_slot=2)
-        route = SimpleNamespace(plan=SimpleNamespace(config=config, transfers=(transfer,)), rank=1)
+        route = SimpleNamespace(plan=SimpleNamespace(config=config, transfers=(transfer,)), rank=1, home_only=False)
         for backward in (False, True):
             with self.subTest(backward=backward):
                 fields = ("col_data", "col_scale", "row_data", "row_scale") if backward else ("col_data", "col_scale")
@@ -167,3 +167,33 @@ class TestMXFP8Integration(unittest.TestCase):
         self.assertFalse(module._cost_model_enabled)
         self.assertEqual(module.dispatch_split, 512)
         module.close()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_home_only_replica_plan_borrows_owner_axes(self) -> None:
+        """Feature: MXFP8 adaptive B0 path.
+        Description: Reject all guest materialization when the planner retains home ownership.
+        Expectation: EP64 B2 keeps six compute experts without copying or appending axes.
+        """
+        spec = MegaMoeSpec(
+            4096,
+            5120,
+            1792,
+            512,
+            8,
+            1.25,
+            40960,
+            64,
+            None,
+            0,
+            32,
+            logical_num_experts=384,
+            replica_slots_per_rank=2,
+            compute_stages=6,
+        )
+        home = _mx_home_spec(spec)
+        self.assertEqual(home.local_experts, 6)
+        self.assertEqual(home.num_experts, 384)
+        weights = (_physical(2, 64, 128),)
+        route = SimpleNamespace(home_only=True)
+        self.assertIs(materialize_replica_weights(weights, route, backward=False), weights)
+        self.assertIs(materialize_replica_weights(weights, route, backward=True), weights)

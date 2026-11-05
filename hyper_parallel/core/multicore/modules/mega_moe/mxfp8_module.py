@@ -28,9 +28,10 @@ import torch.distributed as dist
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.multicore import _collective
 from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
+from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capacity
 
 from .heap_manager import _get_heap_manager, _workspace_layout
-from .module import MegaMoeExperts, _MegaMoeExecutionResources
+from .module import MegaMoeExperts, _MegaMoeExecutionResources, _checkpoint_contract
 from .mxfp8_execution import MXFP8Execution
 from .mxfp8_diagnostics import prepare_mx_diagnostics
 from .mxfp8_function import execute_mxfp8_experts
@@ -77,6 +78,18 @@ def _device_runtime(host: Any, device: Any, spec: Any) -> _DeviceRuntime:
     )
 
 
+def _mx_home_spec(spec: Any) -> Any:
+    """Keep home-only graphs within the reserved physical ready-counter layout."""
+    if not spec.replica_slots_per_rank:
+        return None
+    home = replace(spec, num_experts=spec.logical_num_experts, replica_slots_per_rank=0)
+    if mega_moe_event_capacity(home.num_experts, home.ep_size, compute_stages=6) != mega_moe_event_capacity(
+        spec.num_experts, spec.ep_size, compute_stages=6
+    ):
+        return None
+    return home
+
+
 class _MXFP8Resources(_MegaMoeExecutionResources):
     """Retain the existing heap restart protocol without building BF16 graphs."""
 
@@ -96,7 +109,8 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         self.rank_nodes = (0,) * self.spec.ep_size
         self._token_capacity = self.spec.local_num_tokens
         self._plans = OrderedDict()
-        self.home_spec = self.home_plan = self.last_execution_plan = None
+        self.home_spec = _mx_home_spec(self.spec)
+        self.home_plan = self.last_execution_plan = None
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
@@ -133,24 +147,28 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             self.spec.compute_stages,
         )
 
-    def plan_for_capacity(self, capacity: int, device: Any) -> _MXFP8Plan:
+    def plan_for_capacity(self, capacity: int, device: Any, *, home_only: bool = False) -> _MXFP8Plan:
         """Cache pointer-free MX plans against the current symmetric receive bound.
 
         Args:
             capacity: Current symmetric receive-row bound.
             device: Device owning execution and diagnostic storage.
         """
-        if capacity not in self._plans:
-            spec = replace(self.spec, receive_capacity=capacity)
-            self._plans[capacity] = _MXFP8Plan(
+        key = (capacity, home_only)
+        selected = self.home_spec if home_only else self.spec
+        if selected is None:
+            raise ValueError("MX home-only graph does not fit the physical event layout.")
+        if key not in self._plans:
+            spec = replace(selected, receive_capacity=capacity)
+            self._plans[key] = _MXFP8Plan(
                 spec,
                 _device_runtime(build_mxfp8_runtime(spec, forward=True), device, spec),
                 _device_runtime(build_mxfp8_runtime(spec, forward=False), device, spec),
             )
-        self._plans.move_to_end(capacity)
+        self._plans.move_to_end(key)
         while len(self._plans) > 4:
             self._plans.popitem(last=False)
-        return self._plans[capacity]
+        return self._plans[key]
 
 
 class MXFP8MegaMoeExperts(MegaMoeExperts):
@@ -277,6 +295,7 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MXFP8 push transport does not support graph capture.")
         resources = self._get_execution_resources(flat)
+        _checkpoint_contract()
         replica_route = None
         if self.replica_slots_per_rank:
             mask = (

@@ -40,7 +40,7 @@ def materialize_replica_weights(
         weights: Current physical owner weight axes, never cached across FSDP phases.
         route: Immutable replica plan and exact physical dispatch metadata.
     """
-    if route is None:
+    if route is None or route.home_only:
         return weights
     fields = ("col_data", "col_scale", "row_data", "row_scale") if backward else ("col_data", "col_scale")
     originals = []
@@ -86,7 +86,7 @@ def reduce_replica_gradients(
         gradients: Fresh FP32 physical partials, including active guests.
         route: Immutable replica plan and exact physical dispatch metadata.
     """
-    if route is None:
+    if route is None or route.home_only:
         return gradients
     if any(gradient.dtype != torch.float32 for gradient in gradients):
         raise TypeError("MXFP8 replica owner reduction requires FP32 gradient partials.")

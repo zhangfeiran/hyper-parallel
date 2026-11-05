@@ -116,7 +116,8 @@ int main() { return 0; }
         script = '''
 function(npu_op_kernel_library)
 endfunction()
-function(npu_op_kernel_options)
+function(npu_op_kernel_options target_name op_type)
+    message(STATUS "HP_OPTIONS=${op_type}:${ARGN}")
 endfunction()
 function(npu_op_kernel_sources)
     cmake_parse_arguments(KERNEL "" "OP_TYPE;COMPUTE_UNIT" "" ${ARGN})
@@ -137,6 +138,13 @@ include("${HP_KERNEL_CMAKE}")
                         ["cmake", f"-DASCEND_COMPUTE_UNIT={selection}", f"-DHP_KERNEL_CMAKE={kernel_cmake}",
                          "-P", str(script_path)], capture_output=True, check=False, text=True)
                     self.assertEqual(result.returncode, 0, f"expected=0 actual={result.returncode}: {result.stderr}")
+                    mx_options = [line for line in result.stdout.splitlines()
+                                  if "HP_OPTIONS=PanguMxfp8TaskGraph:" in line]
+                    self.assertEqual(len(mx_options), int(selection == "ascend950"),
+                                     f"expected={selection} actual={mx_options}")
+                    if mx_options:
+                        self.assertIn("pangu_mxfp8_task_graph/op_kernel", mx_options[0])
+                        self.assertIn("pangu_mxfp8_task_graph/op_kernel/cgmct/utils", mx_options[0])
                     kernels = [line for line in result.stdout.splitlines() if "HP_KERNEL=" in line]
                     count = 7 if selection == "ascend950" else 6
                     self.assertEqual(len(kernels), count, f"expected={count} actual={kernels}")
