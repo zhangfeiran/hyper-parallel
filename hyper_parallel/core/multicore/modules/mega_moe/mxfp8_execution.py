@@ -44,14 +44,32 @@ class _ExecutionMetadata:
     probs_dtype: torch.dtype
 
 
-def _quantized_buffers(rows: int, columns: int, experts: int, device: Any) -> tuple[torch.Tensor, ...]:
-    """Allocate both data axes and preserve grouped packed-column padding."""
-    return (
-        torch.empty((rows, columns), dtype=torch.float8_e4m3fn, device=device),
-        torch.empty((rows, columns // 64, 2), dtype=torch.uint8, device=device),
-        torch.empty((rows, columns), dtype=torch.float8_e4m3fn, device=device),
-        torch.empty(((rows + 63) // 64 + experts, columns, 2), dtype=torch.uint8, device=device),
-    )
+def _quantized_buffers(
+    rows: int, columns: int, experts: int, device: Any, *, row_only: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Allocate live axes while retaining full byte bounds for unused column bindings.
+
+    Args:
+        rows: Current token workspace capacity.
+        columns: Activation width in elements.
+        experts: Physical local experts, including guest slots.
+        device: Device receiving activation storage.
+        row_only: Whether the graph neither reads nor writes column outputs.
+
+    Returns:
+        Row data and scales followed by column data and packed column scales.
+    """
+    row = torch.empty((rows, columns), dtype=torch.float8_e4m3fn, device=device)
+    row_scale = torch.empty((rows, columns // 64, 2), dtype=torch.uint8, device=device)
+    column = row if row_only else torch.empty((rows, columns), dtype=torch.float8_e4m3fn, device=device)
+    scale_shape = ((rows + 63) // 64 + experts, columns, 2)
+    scale_bytes = scale_shape[0] * columns * 2
+    if row_only and scale_bytes <= row.numel():
+        # Row-only graphs leave both column bindings untouched; keep their original byte bounds.
+        column_scale = row.view(torch.uint8).view(-1)[:scale_bytes].view(scale_shape)
+    else:
+        column_scale = torch.empty(scale_shape, dtype=torch.uint8, device=device)
+    return row, row_scale, column, column_scale
 
 
 def _use_row_only(spec: Any, retain_backward: bool) -> bool:
@@ -175,7 +193,7 @@ class MXFP8Execution:
         capacity, device = metadata.expert_capacity, hidden.device
         x_row, x_scale, x_col, x_col_scale = _quantized_buffers(capacity, spec.hidden_size, spec.local_experts, device)
         a_row, a_scale, a_col, a_col_scale = _quantized_buffers(
-            capacity, spec.intermediate_size, spec.local_experts, device
+            capacity, spec.intermediate_size, spec.local_experts, device, row_only=row_only
         )
         up = torch.empty((capacity, 2 * spec.intermediate_size), dtype=torch.bfloat16, device=device)
         down = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)

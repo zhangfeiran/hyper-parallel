@@ -175,6 +175,23 @@ class TestMXFP8Graph(unittest.TestCase):
         self.assertFalse(_use_row_only(enabled, True))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_row_only_graph_does_not_reference_column_activation_bindings(self) -> None:
+        """Feature: Row-only activation storage sharing.
+        Description: Inspect every input and output position in EP4/16/64 prefetch graphs.
+        Expectation: No task reads or writes either unused column activation binding.
+        """
+        for ep in (4, 16, 64):
+            os.environ["HYPER_PARALLEL_SHMEM_UDMA_QP_NUM"] = "1" if ep == 64 else "16"
+            spec = replace(_shape(ep, 512), num_experts=ep * 8, logical_num_experts=ep * 6,
+                           replica_slots_per_rank=2, replica_transport="shmem_signal_kernel_gradient")
+            runtime = build_mxfp8_runtime(spec, forward=True, swiglu_row_only=True, weight_prefetch=True)
+            for task in runtime.config.all_tasks:
+                inputs = [task.inputs[index].input_position for index in range(task.num_inputs)]
+                outputs = [task.outputs[index].input_position for index in range(task.num_outputs)]
+                self.assertTrue(set(inputs + outputs).isdisjoint({21, 22}),
+                                msg=f"Unused column positions 21/22 appear in inputs={inputs}, outputs={outputs}")
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_unsupported_environment_is_rejected_before_execution(self) -> None:
         """Feature: MX readiness configuration validation.
         Description: Supply invalid depths and an incompatible queue policy.

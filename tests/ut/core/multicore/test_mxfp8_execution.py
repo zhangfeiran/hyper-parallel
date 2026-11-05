@@ -1,0 +1,56 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Protect physical activation storage for row-only checkpoint forwards."""
+
+import unittest
+
+import torch
+
+from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution import _quantized_buffers
+
+
+class TestMXFP8ActivationBuffers(unittest.TestCase):
+    """Check real CPU storage bounds without native or distributed initialization."""
+
+    def test_dual_axis_storage_remains_independent(self) -> None:
+        """Retained activations must preserve independent row and column storage."""
+        buffers = _quantized_buffers(128, 256, 8, "cpu")
+        self.assertEqual([tuple(value.shape) for value in buffers],
+                         [(128, 256), (128, 4, 2), (128, 256), (10, 256, 2)])
+        self.assertEqual(len({value.untyped_storage().data_ptr() for value in buffers}), 4)
+
+    def test_row_only_uses_two_full_size_storages(self) -> None:
+        """Unused column bindings must remain in bounds while reusing row data storage."""
+        buffers = _quantized_buffers(128, 256, 8, "cpu", row_only=True)
+        row, row_scale, column, column_scale = buffers
+        self.assertEqual([tuple(value.shape) for value in buffers],
+                         [(128, 256), (128, 4, 2), (128, 256), (10, 256, 2)])
+        self.assertEqual(column.dtype, torch.float8_e4m3fn)
+        self.assertEqual(column_scale.dtype, torch.uint8)
+        self.assertTrue(all(value.is_contiguous() for value in buffers))
+        self.assertEqual(row.data_ptr(), column.data_ptr())
+        self.assertEqual(row.untyped_storage().data_ptr(), column_scale.untyped_storage().data_ptr())
+        self.assertNotEqual(row.data_ptr(), row_scale.data_ptr())
+        self.assertLessEqual(column_scale.numel(), column_scale.untyped_storage().nbytes())
+        storages = {value.untyped_storage().data_ptr(): value.untyped_storage().nbytes() for value in buffers}
+        self.assertEqual(sum(storages.values()), 128 * 256 + 128 * 4 * 2)
+
+    def test_tiny_capacity_keeps_scale_binding_in_bounds(self) -> None:
+        """Small row storage cannot back expert-padded column scales."""
+        row, _, column, column_scale = _quantized_buffers(1, 64, 8, "cpu", row_only=True)
+        self.assertEqual(row.data_ptr(), column.data_ptr())
+        self.assertEqual(tuple(column_scale.shape), (9, 64, 2))
+        self.assertNotEqual(row.untyped_storage().data_ptr(), column_scale.untyped_storage().data_ptr())
+        self.assertLessEqual(column_scale.numel(), column_scale.untyped_storage().nbytes())
