@@ -371,8 +371,14 @@ def _fill_node_quotas(quotas: list[list[int]], pending: list[int], dispatch: lis
                     index += 1
 
 
-def _capacity_checked_plan(plan: ExpertExecutionPlan, capacity_limit: int | None) -> ExpertExecutionPlan:
+def _capacity_checked_plan(plan: ExpertExecutionPlan, capacity_limit: int | None, *,
+                           copies: list[dict[int, int]]) -> ExpertExecutionPlan:
     """Apply the same receive bound to Python and native dispatch results."""
+    # Materialization consumes these final quotas without changing them. Keep
+    # their immutable slot totals instead of reducing the full source matrix.
+    destination = tuple(tuple(row.get(expert, 0) if expert >= 0 else 0 for expert in slots)
+                        for row, slots in zip(copies, plan.slot_to_logical))
+    object.__setattr__(plan, "destination_counts", destination)
     if capacity_limit is not None and max(plan.destination_loads) > capacity_limit:
         raise ValueError("replica plan exceeds capacity_limit; use a feasible receive bound")
     return plan
@@ -405,10 +411,11 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
         slots = tuple(tuple(range(rank * home, (rank + 1) * home)) + (-1,) * config.replica_slots_per_rank
                       for rank in range(config.ep_size))
         dispatch = tuple(map(tuple, _pad_owner_rows(counts, config))) if config.replica_slots_per_rank else counts
-        return _capacity_checked_plan(ExpertExecutionPlan(config, counts, slots, dispatch), capacity_limit)
+        return _capacity_checked_plan(ExpertExecutionPlan(config, counts, slots, dispatch), capacity_limit, copies=copies)
     native = _materialize_dispatch(counts, copies, home, config.replica_slots_per_rank, rank_nodes)
     if native is not None:
-        return _capacity_checked_plan(ExpertExecutionPlan(config, counts, native[0], native[1]), capacity_limit)
+        return _capacity_checked_plan(
+            ExpertExecutionPlan(config, counts, native[0], native[1]), capacity_limit, copies=copies)
     node_sources = {}
     if rank_nodes and 1 < len(set(rank_nodes)) < config.ep_size:
         for rank, node in enumerate(rank_nodes):
@@ -466,7 +473,8 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
     # Inputs are validated at entry and source quotas are conserved by this
     # construction. Full plan.validate() remains available to diagnostics/tests.
     return _capacity_checked_plan(
-        ExpertExecutionPlan(config, counts, tuple(slot_map), tuple(tuple(row) for row in dispatch)), capacity_limit)
+        ExpertExecutionPlan(config, counts, tuple(slot_map), tuple(tuple(row) for row in dispatch)),
+        capacity_limit, copies=copies)
 
 
 def _home_layout(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig, *,
