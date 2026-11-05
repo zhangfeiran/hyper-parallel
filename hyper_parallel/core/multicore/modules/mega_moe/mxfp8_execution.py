@@ -315,7 +315,7 @@ class MXFP8Execution:
         grad_probs = torch.empty_like(probs)
         da = torch.empty((capacity, spec.intermediate_size), dtype=torch.bfloat16, device=device)
         dx = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
-        dw1, dw2 = self._weight_gradient_buffers(plan, (weight1, weight2), device)
+        dw1, dw2 = self._weight_gradient_buffers(plan, (weight1, weight2), device, route=self.replica_route)
         workspace.claim()
         try:
             multicore_ops.mega_moe_unpermute_grad_out(
@@ -377,13 +377,35 @@ class MXFP8Execution:
 
     @staticmethod
     def _weight_gradient_buffers(plan: Any, weights: tuple[MXFP8PhysicalWeight, ...],
-                                 device: Any) -> tuple[torch.Tensor, ...]:
-        """Preclear empty experts before the TN graph and allocate only ordinary owner outputs when fused."""
+                                 device: Any, *, route: Any = None) -> tuple[torch.Tensor, ...]:
+        """Clear skipped matrices while complete-K TN tasks overwrite nonempty outputs.
+
+        Args:
+            plan: Current graph and owner/guest output geometry.
+            weights: Current physical roots supplying matrix dimensions.
+            device: Device receiving fresh FP32 partials.
+            route: Optional exact CPU replica quotas; absent quotas retain full clearing.
+
+        Returns:
+            Fresh first and second projection partials, ready for their TN producers.
+        """
         owners = plan.spec.local_experts
         if plan.backward.host.kernel_gradients:
             owners -= plan.spec.replica_slots_per_rank
-        return tuple(torch.zeros((owners, *weight.logical_shape[1:]), dtype=torch.float32, device=device)
-                     for weight in weights)
+        counts = None if route is None else route.plan.destination_counts[route.rank][:owners]
+        if counts is not None and len(counts) != owners:
+            raise ValueError("MX gradient output geometry exceeds the exact replica destination quotas")
+        empty = None if counts is None else tuple(expert for expert, rows in enumerate(counts) if rows == 0)
+        clear_all = empty is None or len(empty) == owners
+        allocate = torch.zeros if clear_all else torch.empty
+        gradients = tuple(allocate((owners, *weight.logical_shape[1:]), dtype=torch.float32, device=device)
+                          for weight in weights)
+        if not clear_all:
+            # Exact CPU quotas avoid another readback. Empty owners must start at zero before guest additions.
+            for expert in empty:
+                for gradient in gradients:
+                    gradient[expert].zero_()
+        return gradients
 
     def _launch_backward(self, buffers: list[torch.Tensor], events: torch.Tensor, plan: Any,
                           gradients: tuple[torch.Tensor, ...], weights: tuple[MXFP8PhysicalWeight, ...]) -> None:

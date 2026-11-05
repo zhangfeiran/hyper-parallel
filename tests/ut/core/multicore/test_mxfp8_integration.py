@@ -28,6 +28,7 @@ from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_graph import build_mxfp8_runtime
+from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution import MXFP8Execution
 from hyper_parallel.core.multicore.modules.mega_moe import mxfp8_ops
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_module import MXFP8MegaMoeExperts, _mx_home_spec
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_replica import lease_replica_weights
@@ -50,6 +51,76 @@ def _physical(experts: int, rows: int, columns: int) -> MXFP8PhysicalWeight:
         data.flip(0).view(torch.float8_e4m3fn).reshape(experts, rows, columns),
         torch.full((experts, rows, columns // 64, 2), 231, dtype=torch.uint8),
     )
+
+
+class TestMXFP8GradientInitialization(unittest.TestCase):
+    """Check exact empty-expert initialization without reading device route counters."""
+
+    @staticmethod
+    def _plan(fused: bool) -> SimpleNamespace:
+        """Provide physical output geometry for P2P or fused owner returns."""
+        return SimpleNamespace(spec=SimpleNamespace(local_experts=8, replica_slots_per_rank=2),
+                               backward=SimpleNamespace(host=SimpleNamespace(kernel_gradients=fused)))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_missing_host_counts_preserves_full_zero_initialization(self) -> None:
+        """Feature: Conservative MX gradient fallback.
+        Description: Allocate outputs without a CPU replica plan.
+        Expectation: All physical matrices remain zero-initialized.
+        """
+        gradients = MXFP8Execution._weight_gradient_buffers(
+            self._plan(False), (_physical(6, 64, 128), _physical(6, 128, 64)), "cpu")
+        self.assertEqual([tuple(value.shape) for value in gradients], [(8, 64, 128), (8, 128, 64)])
+        self.assertTrue(all(torch.count_nonzero(value).item() == 0 for value in gradients))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_exact_counts_only_clear_empty_owner_matrices(self) -> None:
+        """Feature: Selective MX owner gradient initialization.
+        Description: Poison allocations and use exact destination quotas with fused returns.
+        Expectation: Only empty home experts are cleared; guest matrices are not allocated.
+        """
+        counts = (7, 0, 2, 0, 0, 8, 13, 0)
+        route = SimpleNamespace(rank=0, plan=SimpleNamespace(destination_counts=(counts,)))
+        with mock.patch("hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution.torch.empty",
+                        side_effect=lambda shape, **kwargs: torch.full(shape, float("nan"), **kwargs)):
+            gradients = MXFP8Execution._weight_gradient_buffers(
+                self._plan(True), (_physical(6, 64, 128), _physical(6, 128, 64)), "cpu", route=route)
+        for value in gradients:
+            self.assertEqual(value.shape[0], 6)
+            for expert, count in enumerate(counts[:6]):
+                if count:
+                    self.assertTrue(torch.isnan(value[expert]).all().item())
+                else:
+                    self.assertEqual(torch.count_nonzero(value[expert]).item(), 0)
+                    value[expert].add_(1)
+                    self.assertTrue(torch.equal(value[expert], torch.ones_like(value[expert])))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_all_empty_rank_uses_one_full_clear_per_projection(self) -> None:
+        """Feature: Entirely empty MX destinations.
+        Description: Supply no local rows and observe the allocation primitive.
+        Expectation: Full clearing uses two tensors rather than per-expert kernels.
+        """
+        route = SimpleNamespace(rank=0, plan=SimpleNamespace(destination_counts=((0,) * 8,)))
+        weights = (_physical(6, 64, 128), _physical(6, 128, 64))
+        with mock.patch("hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution.torch.zeros",
+                        wraps=torch.zeros) as allocate:
+            gradients = MXFP8Execution._weight_gradient_buffers(self._plan(True), weights, "cpu", route=route)
+        self.assertEqual(allocate.call_count, 2)
+        self.assertTrue(all(torch.count_nonzero(value).item() == 0 for value in gradients))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_incomplete_host_quotas_fail_before_allocation(self) -> None:
+        """Feature: MX output geometry validation.
+        Description: Supply a host quota row shorter than the physical outputs.
+        Expectation: Invalid output geometry fails before uninitialized storage is allocated.
+        """
+        route = SimpleNamespace(rank=0, plan=SimpleNamespace(destination_counts=((1,),)))
+        weights = (_physical(6, 64, 128), _physical(6, 128, 64))
+        with mock.patch("hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution.torch.empty") as allocate:
+            with self.assertRaisesRegex(ValueError, "geometry exceeds"):
+                MXFP8Execution._weight_gradient_buffers(self._plan(True), weights, "cpu", route=route)
+        allocate.assert_not_called()
 
 
 class TestMXFP8Integration(unittest.TestCase):
