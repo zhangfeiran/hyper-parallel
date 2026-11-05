@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from functools import cached_property
 
 from .capacity import ExpertReplicaConfig
+from .host import _column_totals
 
 
 @dataclass(frozen=True)
@@ -53,7 +54,8 @@ class ExpertExecutionPlan:
         width = self.config.slots_per_rank
         if any(len(row) != self.config.physical_experts for row in self.dispatch_counts):
             raise ValueError("dispatch row does not match physical expert count")
-        totals = tuple(map(sum, zip(*self.dispatch_counts)))
+        columns = _column_totals(self.dispatch_counts)
+        totals = tuple(columns) if columns is not None else tuple(map(sum, zip(*self.dispatch_counts)))
         return tuple(totals[rank * width:(rank + 1) * width] for rank in range(self.config.ep_size))
 
     @cached_property

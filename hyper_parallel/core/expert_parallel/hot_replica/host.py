@@ -45,6 +45,14 @@ def _validate_counts(rows: tuple[tuple[int, ...], ...]) -> bool:
     return module is not None and module.validate_counts(rows)
 
 
+def _column_totals(rows: tuple[tuple[int, ...], ...]) -> list[int] | None:
+    """Reduce ordinary columns while preserving older ABI3 and arbitrary-precision fallbacks."""
+    module = _native_backend()
+    if module is None or not hasattr(module, "column_totals"):
+        return None
+    return module.column_totals(rows)
+
+
 def _materialize_dispatch(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int]],
                           home: int, budget: int, nodes: tuple[int, ...]) -> tuple | None:
     """Use the additive integer primitive while retaining optional backend fallback."""
