@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -32,10 +33,28 @@ from typing import Any
 QUALITY_REJECTED_EXIT = 20
 
 
+class CalibrationRejected(RuntimeError):
+    """Keep completed quality rejections separate from failed observations."""
+
+
 def _write(path: Path, value: Any) -> None:
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(value, indent=2) + '\n')
     temporary.replace(path)
+
+
+def _publish_closed(source: Path, destination: Path) -> None:
+    """Publish only completed node-local files using an atomic shared rename."""
+    if source.resolve() == destination.resolve() or not source.exists():
+        return
+    for path in sorted(source.rglob('*')):
+        if not path.is_file():
+            continue
+        target = destination / path.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + f'.tmp-{os.getpid()}')
+        shutil.copy2(path, temporary)
+        temporary.replace(target)
 
 
 def _run(command: list[str], log: Path, timeout: int, peers: list[Path] | None = None) -> int:
@@ -68,10 +87,12 @@ def _run(command: list[str], log: Path, timeout: int, peers: list[Path] | None =
             raise
 
 
-def _wait(paths: list[Path], timeout: int) -> list[dict[str, Any]]:
+def _wait(paths: list[Path], timeout: int, *, quality_gate: bool = False) -> list[dict[str, Any]]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         present = [json.loads(path.read_text()) for path in paths if path.exists()]
+        if quality_gate and any(record['exit_status'] == QUALITY_REJECTED_EXIT for record in present):
+            raise CalibrationRejected('Completed replica calibration was rejected by its quality gates')
         if any(record['exit_status'] for record in present):
             raise RuntimeError(f'Calibration stage failed: {present}')
         if len(present) == len(paths):
@@ -135,6 +156,11 @@ def main() -> None:
     os.environ.update(MASTER_ADDR=address, NNODES=str(nodes), NUM_CARDS=str(cards))
     os.environ.pop('HYPER_PARALLEL_REPLICA_CALIBRATION_DIR', None)
     os.environ.setdefault('OMP_NUM_THREADS', '1')
+    local_setting = os.environ.get('CALIBRATION_NODE_LOCAL_ROOT')
+    capture_root = Path(local_setting) if local_setting else args.output
+    if local_setting and (str(capture_root).startswith(('/work/', '/home/ma-user/work/'))
+                          or capture_root.resolve().is_relative_to(args.output.resolve())):
+        raise ValueError('CALIBRATION_NODE_LOCAL_ROOT must use separate node-local storage')
     base = [sys.executable, '-m', 'torch.distributed.run', f'--nnodes={nodes}', f'--node-rank={node}',
             f'--nproc-per-node={cards}', f'--master-addr={address}']
     worker = ['-m', 'tests.torch.expert_parallel._replica_capture_launcher',
@@ -142,13 +168,13 @@ def main() -> None:
               '--manifest', str(args.manifest.resolve())]
     fitter = [sys.executable, '-m', 'hyper_parallel.core.expert_parallel.hot_replica.autocalibration',
               '--manifest', str(args.manifest.resolve()), '--output', str(args.output / 'models')]
-    commands = {'collect': base + [f'--master-port={port}'] + worker + ['--output', str(args.output / 'collect'),
-                            '--placement-output', str(args.output / 'collect' / 'placement')],
+    commands = {'collect': base + [f'--master-port={port}'] + worker + ['--output', str(capture_root / 'collect'),
+                            '--placement-output', str(capture_root / 'collect' / 'placement')],
                 'fit': fitter + ['--input', str(args.output / 'collect')],
-                'verify': base + [f'--master-port={port+2}'] + worker + ['--output', str(args.output / 'verify'),
+                'verify': base + [f'--master-port={port+2}'] + worker + ['--output', str(capture_root / 'verify'),
                                                                  '--candidate-directory', str(args.output / 'models')],
                 'publish': fitter + ['--input', str(args.output / 'verify'), '--verify']}
-    commands['verify'] += ['--placement-output', str(args.output / 'verify' / 'placement')]
+    commands['verify'] += ['--placement-output', str(capture_root / 'verify' / 'placement')]
     shmem_host = _shmem_host(address, dry_run=args.dry_run)
     stage_environment = {
         phase: {'HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT': _shmem_endpoint(shmem_host, endpoint_port)}
@@ -163,15 +189,20 @@ def main() -> None:
     node_root = args.output / 'nodes' / f'node_{node}'
     node_root.mkdir(parents=True, exist_ok=True)
     (node_root / 'started').mkdir()
+    log_root = capture_root / 'nodes' / f'node_{node}'
+    log_root.mkdir(parents=True, exist_ok=True)
     terminal = 1
-    outcome = None
+    collection_complete = False
+    fit_rejected = False
+    catalog = args.output / 'models' / 'catalog.json'
     try:
         for phase in ('collect', 'fit', 'verify', 'publish'):
             if phase in ('collect', 'verify'):
                 os.environ.update(stage_environment[phase])
                 peers = [args.output / f'{phase}-node{index}.json' for index in range(nodes)]
                 try:
-                    status = _run(commands[phase], node_root / f'{phase}.log', timeout, peers)
+                    status = _run(commands[phase], log_root / f'{phase}.log', timeout, peers)
+                    _publish_closed(capture_root / phase, args.output / phase)
                 except BaseException:
                     _write(args.output / f'{phase}-node{node}.json', {'exit_status': 1, 'node': node})
                     raise
@@ -181,46 +212,61 @@ def main() -> None:
                            if not (args.output / phase / f'status-rank{rank}.json').exists()]
                 if missing:
                     raise RuntimeError(f'Missing completed rank evidence: {phase}: {missing}')
+                if phase == 'collect':
+                    collection_complete = True
             else:
                 if node == 0:
                     try:
-                        status = _run(commands[phase], node_root / f'{phase}.log', timeout)
+                        if phase == 'publish' and fit_rejected:
+                            _write(args.output / 'private-verification-only.json', dict(
+                                collection_complete=True, private_verification_complete=True,
+                                catalog_published=False, reason='Initial untouched holdout rejected the candidate'))
+                            status = QUALITY_REJECTED_EXIT
+                        else:
+                            status = _run(commands[phase], log_root / f'{phase}.log', timeout)
                     except BaseException:
                         _write(args.output / f'{phase}-done.json', {'exit_status': 1, 'node': node})
                         raise
-                    rejected = status == QUALITY_REJECTED_EXIT
                     _write(args.output / f'{phase}-done.json', {
-                        'exit_status': 0 if rejected else status, 'worker_exit_status': status,
-                        'quality_rejected': rejected, 'node': node})
-                phase_result = _wait([args.output / f'{phase}-done.json'], timeout)[0]
-                if phase_result.get('quality_rejected'):
-                    if node == 0:
-                        if (args.output / 'models/catalog.json').exists():
-                            raise RuntimeError('Rejected calibration unexpectedly published a catalog')
-                        _write(args.output / 'outcome.json', {
-                            'exit_status': 0, 'status': 'rejected', 'collection_complete': True,
-                            'catalog_published': False, 'rejected_phase': phase,
-                            'worker_exit_status': QUALITY_REJECTED_EXIT,
-                            'report': str(args.output / 'models/fit-report.json'),
-                            'runtime_environment': {}})
-                    outcome = _wait([args.output / 'outcome.json'], timeout)[0]
-                    break
-        if outcome is None:
-            if node == 0:
-                if not (args.output / 'models/catalog.json').is_file():
-                    raise RuntimeError('Calibration publication completed without a validated catalog')
-                _write(args.output / 'outcome.json', {
-                    'exit_status': 0, 'status': 'validated', 'collection_complete': True,
-                    'catalog_published': True, 'calibration_directory': str(args.output / 'models'),
-                    'runtime_environment': {
-                        'HYPER_PARALLEL_REPLICA_CALIBRATION_DIR': str(args.output / 'models')}})
-            outcome = _wait([args.output / 'outcome.json'], timeout)[0]
-        terminal = QUALITY_REJECTED_EXIT if outcome['status'] == 'rejected' else 0
+                        'exit_status': status, 'worker_exit_status': status, 'node': node,
+                        'quality_rejected': status == QUALITY_REJECTED_EXIT})
+                try:
+                    _wait([args.output / f'{phase}-done.json'], timeout, quality_gate=True)
+                except CalibrationRejected:
+                    if phase != 'fit':
+                        raise
+                    # Failed-quality candidates remain private. A fresh capture
+                    # still explains changed decisions without authorizing publication.
+                    fit_rejected = True
+                    missing = [f'{mode}-b{cap}.json'
+                               for mode in manifest.get('dispatch_modes', ['push', 'pull'])
+                               for cap in manifest.get('replica_caps', [1, 2, 6])
+                               if not (args.output / 'models' / f'{mode}-b{cap}.json').is_file()]
+                    if missing:
+                        if node == 0:
+                            _write(args.output / 'private-verification-skipped.json', dict(
+                                collection_complete=True, private_verification_complete=False,
+                                catalog_published=False, missing_candidates=missing,
+                                reason='The rejected TRAIN design did not fit a complete private candidate set'))
+                        raise CalibrationRejected('Private verification requires complete fitted candidates') from None
+        if not catalog.is_file():
+            raise RuntimeError('Calibration finished without a validated catalog')
+        if node == 0:
+            _write(args.output / 'outcome.json', dict(
+                status='validated', collection_complete=collection_complete, catalog_published=True))
+        terminal = 0
+    except CalibrationRejected:
+        terminal = QUALITY_REJECTED_EXIT
+        if node == 0:
+            _write(args.output / 'outcome.json', dict(
+                status='rejected', collection_complete=collection_complete, catalog_published=False,
+                rejected_phase='fit' if fit_rejected else phase))
+        raise SystemExit(QUALITY_REJECTED_EXIT) from None
     finally:
+        _publish_closed(log_root, node_root)
         _write(node_root / 'terminal.json', {'exit_status': terminal, 'node': node})
-    print(json.dumps(outcome))
-    if terminal == QUALITY_REJECTED_EXIT:
-        raise SystemExit(QUALITY_REJECTED_EXIT)
+    print(json.dumps({'status': 'validated', 'calibration_directory': str(args.output / 'models'),
+                      'runtime_environment': {'HYPER_PARALLEL_REPLICA_CALIBRATION_DIR': str(args.output / 'models')}}))
 
 
 if __name__ == '__main__':

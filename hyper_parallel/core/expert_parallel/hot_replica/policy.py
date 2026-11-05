@@ -37,6 +37,20 @@ _LOGGER = logging.getLogger(__name__)
 _SHARED_SOC_CALIBRATIONS = {'Ascend910_9382': 'Ascend910_9392'}
 
 
+def _record_selection(record: dict) -> None:
+    """Persist cache-miss selection evidence only in an explicitly audited launch."""
+    directory = os.environ.get('HYPER_PARALLEL_REPLICA_CALIBRATION_AUDIT_DIR')
+    if not directory:
+        return
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    destination = Path(directory) / f'rank{rank}' / 'calibration-selection.json'
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    previous = json.loads(destination.read_text())['selections'] if destination.exists() else []
+    temporary = destination.with_suffix('.tmp')
+    temporary.write_text(json.dumps(dict(rank=rank, selections=previous + [record]), indent=2) + '\n')
+    temporary.replace(destination)
+
+
 def _cost_model_enabled() -> bool:
     """Read the diagnostic switch once per execution owner, before communication."""
     value = os.environ.get('HYPER_PARALLEL_REPLICA_COST_MODEL', '1')
@@ -119,6 +133,16 @@ def _resolve_cost_model(backend: str, hidden: int, intermediate: int, ep_size: i
                      num_experts, top_k, soc_name, table_soc if model is not None else 'none', checkpointed,
                      bool(model is not None and model.weight_fanout_ms),
                      bool(model is not None and model.critical_path is not None), execution_signature, schedule)
+    _record_selection(dict(status='matched' if model is not None else 'fallback', backend=backend,
+        hidden_size=hidden, intermediate_size=intermediate, ep_size=ep_size, transport=transport,
+        num_experts=num_experts, top_k=top_k, soc_name=soc_name, checkpointed=checkpointed,
+        execution_signature=execution_signature, schedule=schedule,
+        scorer=('effective_group' if model is not None and model.effective_group_ms else
+                'critical_path' if model is not None and model.critical_path is not None else 'legacy'),
+        minimum_gain_ms=model.minimum_gain_ms if model is not None else None,
+        effective_group_ms=list(model.effective_group_ms) if model is not None else []))
+    if model is None and os.environ.get('HYPER_PARALLEL_REPLICA_REQUIRE_CALIBRATION') == '1':
+        raise ValueError(f'Required replica calibration did not match: {backend}/{execution_signature}/{schedule}')
     if model is None:
         return None
     return replace(model, forward_repeats=2 if checkpointed else 1,

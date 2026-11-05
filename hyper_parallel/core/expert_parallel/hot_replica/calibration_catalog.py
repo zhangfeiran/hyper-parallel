@@ -33,10 +33,15 @@ EXECUTION_FILES = tuple('hyper_parallel/' + name for name in (
     'core/expert_parallel/hot_replica/host.py', 'core/expert_parallel/hot_replica/policy.py',
     'core/expert_parallel/hot_replica/signal_transport.py', 'core/expert_parallel/hot_replica/routing.py',
     'core/expert_parallel/hot_replica/planner.py', 'core/expert_parallel/hot_replica/cost.py',
+    'core/expert_parallel/hot_replica/plan.py',
     'core/activation_memory/recompute_state.py'))
 ENVIRONMENT_DEFAULTS = {'HYPER_PARALLEL_REPLICA_WEIGHT_RESIDENCY': '1',
                         'HYPER_PARALLEL_REPLICA_METADATA_REUSE': '0',
-                        'HYPER_PARALLEL_REPLICA_HOST_NATIVE': '1'}
+                        'HYPER_PARALLEL_REPLICA_HOST_NATIVE': '1',
+                        'HYPER_PARALLEL_REPLICA_RANK_LOCAL_COMM': '0',
+                        'HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH': '0',
+                        'HYPER_PARALLEL_REPLICA_PROJECTED_GUEST_SEARCH': '0',
+                        'HYPER_PARALLEL_SHMEM_FIXED_HEAP_REPACK': '0'}
 
 
 def _host_extension(directory: Path) -> Path | None:

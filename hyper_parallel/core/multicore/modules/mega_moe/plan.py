@@ -63,7 +63,8 @@ from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 
 from .diagnostics import _mega_moe_owner_options
-from .inactive_tasks import GuestTaskPrefix, build_guest_task_prefixes
+from .inactive_tasks import RANK_LOCAL_GUEST_SUFFIX_SCHEDULE, GuestTaskPrefix, build_guest_task_prefixes
+from .inactive_tasks import replica_runtime_schedule
 from .spec import MegaMoeSpec
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
 
@@ -268,7 +269,9 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         "num_cube_cores": spec.num_cube_cores,
     }
     prefix_options = {"home_experts": spec.local_experts - spec.replica_slots_per_rank,
-                      "ep_size": spec.ep_size, "dispatch_mode": spec.dispatch_mode}
+                      "ep_size": spec.ep_size, "dispatch_mode": spec.dispatch_mode,
+                      "rank_local_communication": (spec.replica_slots_per_rank > 0
+                                                   and replica_runtime_schedule() == RANK_LOCAL_GUEST_SUFFIX_SCHEDULE)}
     return MegaMoePlan(
         spec=spec,
         fwd_task_prefixes=(build_guest_task_prefixes(forward_config, **prefix_options)

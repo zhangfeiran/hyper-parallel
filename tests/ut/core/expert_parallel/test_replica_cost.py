@@ -147,6 +147,32 @@ class TestReplicaCost(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(source_sums, [1, 1])
 
+    def test_group_state_skips_unused_rank_costs_during_refinement(self) -> None:
+        """Group scoring and quota acceptance must not compute ignored legacy phase sums."""
+        counts, config = ((10, 0, 0, 0), (6, 0, 0, 0)), ExpertReplicaConfig(4, 2, 1)
+        copies = [{0: 8, 1: 0}, {2: 0, 3: 0, 0: 8}]
+        model = self._model(effective_group_ms=(.5, 1., 2., 3., .25, 4.), _rank_nodes=(0, 1))
+        with patch.object(cost._QuotaCostState, '_rank_cost', side_effect=AssertionError('Unused rank cost')):
+            state = cost._QuotaCostState(model, copies, counts, config)
+            first = state.score()
+            copies[0][0], copies[1][0] = 9, 7
+            second = state.trial_score(0, 1, 0, (0., 0.))
+            state.accept(0, 1, 0)
+            self.assertEqual(state.score(), second)
+            self.assertNotEqual(first, second)
+            cost.refine_replica_quotas(copies, counts, config, 16, model, minimum_replica_rows=8)
+        plan = _materialize(counts, copies, config, 16)
+        plan.validate()
+        self.assertLessEqual(model.estimate_ms(plan), first)
+
+    def test_group_state_retains_interpolation_coverage_checks(self) -> None:
+        """Skipping unused sums must not turn out-of-range expert rows into valid predictions."""
+        model = self._model(effective_group_ms=(.5, 1., 2., 3., .25, 4.), _rank_nodes=(0, 1))
+        counts = ((129, 0, 0, 0), (0, 0, 0, 0))
+        copies = [{0: 129, 1: 0}, {2: 0, 3: 0}]
+        with self.assertRaisesRegex(ValueError, 'calibrated cost range'):
+            cost._QuotaCostState(model, copies, counts, ExpertReplicaConfig(4, 2, 1))
+
     def test_small_copy_is_removed_on_score_plateau_before_search_guard(self) -> None:
         """A cheap deletion must not require a strict gain or expensive quota search."""
         counts = ((10, 0, 0, 0, 20, 0, 0, 0),) + ((0,) * 8,) * 3
@@ -401,3 +427,17 @@ class TestReplicaCost(unittest.TestCase):
             candidate.validate()
         with self.assertRaisesRegex(ValueError, "quota_search_budget_ms"):
             self._model(quota_search_budget_ms=-1)
+
+    def test_disabled_quota_sweep_retains_capacity_required_replicas(self) -> None:
+        """A no-sweep table still checks whether an owner-only plan is feasible."""
+        counts = [[10, 4, 0, 0]] * 2
+        model = self._model(quota_search_budget_ms=None, minimum_replica_gain_ms=100)
+        with patch.object(cost, "_refine_edge", side_effect=AssertionError("Disabled quota sweep ran")):
+            loose = build_expert_replica_plan(counts, 1, capacity_limit=28, cost_model=model, adaptive=True)
+            tight = build_expert_replica_plan(counts, 1, capacity_limit=14, cost_model=model, adaptive=True)
+
+        loose.validate()
+        tight.validate()
+        self.assertFalse(loose.transfers)
+        self.assertTrue(tight.transfers)
+        self.assertEqual(max(tight.destination_loads), 14)

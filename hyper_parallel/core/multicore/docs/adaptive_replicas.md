@@ -108,10 +108,22 @@ change is needed for these rules.
 CPU 计划的 `replica_slots_used` 返回各 rank 的实际使用量。
 没有副本且 event 偏移兼容时使用 home-only 图。
 
-Push 可选布局必须装入初始接收预留；预留不足时保留必要副本或执行有界扩容。
+Push 根据已绑定的对称堆预算、其他 workspace 和当前 source 容量计算接收硬上限。
+初始接收预留仍是布局偏好，实际选择后才分配或扩容，B0 和 B>0 使用相同规则。
 Pull/Native 的接收张量按所选布局分配。底层规划器的 `capacity_limit` 可表达接收硬约束。
 checkpoint 重算检查计数、配置和调用顺序后复用原计划；接收预留扩大不会改变原调用的重算布局。
 backward 保留本次调用自己的不可变计划和权重 generation。
+
+实验开关默认为关闭，须在作业启动前对所有参与 rank 一致设置：
+
+| 环境变量 | 启用时的行为 |
+| --- | --- |
+| `HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH=1` | 无表 B2 强热点下比较完整配额，只接受仍装入两个物理槽且改善接收峰的候选。 |
+| `HYPER_PARALLEL_REPLICA_PROJECTED_GUEST_SEARCH=1` | 用拓扑感知的准入规则比较可投影到 B2 的更宽配额。 |
+| `HYPER_PARALLEL_SHMEM_FIXED_HEAP_REPACK=1` | 堆字节数不变时保留 SHMEM runtime，仍同步并重建 workspace 分配。 |
+| `HYPER_PARALLEL_REPLICA_RANK_LOCAL_COMM=1` | 按 rank 裁剪空 combine/Pull dispatch，按实际发端同步修正接收信号计数。 |
+
+校准表按运行签名匹配，包含上述开关和通信图身份。
 
 本版不自动探测可用 HBM、不在线采集校准表，也不做副本池热扩缩容。
 

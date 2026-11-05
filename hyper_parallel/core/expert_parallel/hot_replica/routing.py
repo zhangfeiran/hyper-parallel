@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 import math
 import struct
@@ -46,6 +46,9 @@ from .planner import (
     _projected_rank_nodes,
 )
 from .topology import _validate_rank_nodes
+
+
+_SEVERE_OWNER_SKEW = 3
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,21 @@ def _host_column_totals(counts: list[list[int]]) -> list[int]:
     """Use the existing host agreement without freezing or reading device counts again."""
     totals = _column_totals(counts)
     return list(map(sum, zip(*counts))) if totals is None else totals
+
+
+def _gathered_owner_statistics(
+    gathered: _GatheredReplicaCounts, config: ExpertReplicaConfig,
+) -> tuple[list[int], list[int]]:
+    """Read cost-only statistics after compact owner admission needs them."""
+    if gathered.host_counts is not None:
+        totals = _host_column_totals(gathered.host_counts)
+        home = config.home_experts
+        diagonal = [sum(row[rank * home:(rank + 1) * home]) for rank, row in enumerate(gathered.host_counts)]
+        return totals, diagonal
+    logical = gathered.counts
+    grouped = logical.reshape(config.ep_size, config.ep_size, config.home_experts).sum(2, dtype=torch.int64)
+    compact = torch.cat((logical.sum(0, dtype=torch.int64), grouped.diagonal())).cpu().tolist()
+    return compact[:config.num_experts], compact[config.num_experts:]
 
 
 @dataclass(frozen=True)
@@ -329,9 +347,18 @@ def _compact_home_cost_dominates(
         source_floor = model.effective_source_row_floor * max(row[4] for row in rows)
         received = max(max(row[7] for row in rows), source_floor)
         tokens = max((row[4] + row[7] - 2 * row[8]) / 2 for row in rows)
-        fixed, row_ms, _, _, token_ms, active_ms = model.effective_group_ms
+        fixed, row_ms, _, _, token_ms, active_ms = model.effective_group_ms[:6]
+        expert_cell = len(model.effective_group_ms) == 7
+        if expert_cell:
+            tasks = int(any(totals))
         owner = fixed * tasks + row_ms * received + token_ms * tokens
         optimistic = row_ms * max(sum(row[7] for row in rows) / config.ep_size, source_floor) + active_ms
+        if expert_cell:
+            expert_ms = model.effective_group_ms[6]
+            owner += expert_ms * max(totals)
+            expert_floor = max(max(totals) / config.ep_size,
+                               sum(totals) / (config.ep_size * config.home_experts))
+            optimistic += fixed * tasks + expert_ms * expert_floor
         return owner <= optimistic + max(model.minimum_gain_ms, model.minimum_replica_gain_ms or 0)
     durations: dict[int, tuple[float, float]] = {}
     costs = []
@@ -403,21 +430,9 @@ def _try_compact_home_route(
         totals = compact[config.ep_size * width:]
     else:
         logical = gathered_counts.counts
-        if cost_model is None:
-            rows = [[0] + list(row) for row in gathered_counts.source_summary]
-            totals = []
-        elif gathered_counts.host_counts is None:
-            grouped = logical.reshape(config.ep_size, config.ep_size, config.home_experts).sum(2, dtype=torch.int64)
-            compact = torch.cat((grouped.diagonal(), logical.sum(0, dtype=torch.int64))).cpu().tolist()
-            diagonal, totals = compact[:config.ep_size], compact[config.ep_size:]
-        else:
-            host = gathered_counts.host_counts
-            diagonal = [sum(row[owner * config.home_experts:(owner + 1) * config.home_experts])
-                        for owner, row in enumerate(host)]
-            totals = _host_column_totals(host)
-        if cost_model is not None:
-            # Native agreement already validated the source controls and owner loads.
-            rows = [[0] + list(row) + [local] for row, local in zip(gathered_counts.source_summary, diagonal)]
+        # Native agreement already validated the source controls and owner loads.
+        rows = [[0] + list(row) for row in gathered_counts.source_summary]
+        totals = []
     if any(row[0] for row in rows):
         raise ValueError("hot replication requires in-range, distinct expert IDs per token")
     maximum_tokens = max(row[2] for row in rows)
@@ -469,8 +484,14 @@ def _try_compact_home_route(
                 if state is not None and not state.is_recomputing:
                     decision = _RejectedReplicaQuotas(config, tuple(totals), destination_loads,
                                                       target, admission, minimum_saved_rows, minimum_replica_rows)
-        elif not _compact_home_cost_dominates(totals, rows, config, cost_model):
+        elif cost_model.critical_path is not None:
             return None
+        else:
+            if gathered_counts is not None:
+                totals, diagonal = _gathered_owner_statistics(gathered_counts, config)
+                rows = [row + [local] for row, local in zip(rows, diagonal, strict=True)]
+            if not _compact_home_cost_dominates(totals, rows, config, cost_model):
+                return None
     counts = logical.to(torch.int32).contiguous()
     plan = _HomeOnlyPlan(config, counts, destination_loads)
     _record_home_decision(decision)
@@ -596,6 +617,16 @@ def prepare_replica_route(
         remapped = _remap_replica_ids(ids.to(torch.int64), plan, slots, lengths)
         return ReplicaRoute(plan, remapped.to(topk_ids.dtype), device_plan.dispatch_counts.to(torch.int32),
                             rank, group, device_plan=device_plan, dynamic_summary=dynamic_summary)
+    if (compact_home and dynamic_header is not None and config.replica_slots_per_rank >= 2
+            and _cost_model is None and _gathered_counts is not None and _gathered_counts.host_counts is None
+            and (minimum_load_reduction or minimum_saved_rows)):
+        loads = tuple(row[6] for row in _gathered_counts.source_summary)
+        total = sum(loads)
+        if (total and max(loads) * size >= _SEVERE_OWNER_SKEW * total
+                and _optional_peak_is_useful((total + size - 1) // size, loads, max(loads),
+                                             reduction_basis_points(minimum_load_reduction), minimum_saved_rows)):
+            # On a severe hotspot, use the same table for admission and dispatch.
+            _gathered_counts = replace(_gathered_counts, host_counts=logical_counts.cpu().tolist())
     prepared_candidate = None
     if (compact_home and dynamic_header is not None and config.replica_slots_per_rank
             and (_gathered_counts is None or _cost_model is not None
@@ -622,7 +653,10 @@ def prepare_replica_route(
         logical_host = (_gathered_counts.host_counts if _gathered_counts.host_counts is not None
                         else logical_counts.cpu().tolist())
     # Every planner must use the same bound when source ranks have unequal or zero rows.
-    maximum_tokens = max(sum(row) for row in logical_host) // top_k
+    # Integrated routing already checked the exact count sums against these
+    # headers. Reusing them avoids a second Python scan of the source table.
+    maximum_tokens = (max(row[1] for row in _gathered_counts.source_summary)
+                      if _gathered_counts is not None else max(sum(row) for row in logical_host) // top_k)
     target_load, receive_capacity = _automatic_capacity_options(
         maximum_tokens, top_k, target_load, receive_capacity, _auto_capacity_factor, _capacity_budget)
     upper = config.maximum_receive_rows(max(1, maximum_tokens), top_k, alignment=1)

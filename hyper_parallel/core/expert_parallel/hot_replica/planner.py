@@ -31,6 +31,7 @@ from .topology import _validate_rank_nodes
 from .host import _column_totals, _materialize_dispatch, _validate_counts
 
 _COMPLETE_GUEST_HOTSPOT_FACTOR = 3
+_COMPLETE_GUEST_SEARCH_HITS = 0
 
 
 def _counts_matrix(counts: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:
@@ -377,6 +378,20 @@ def _capacity_checked_plan(plan: ExpertExecutionPlan, capacity_limit: int | None
     return plan
 
 
+def _pad_owner_rows(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig) -> list[list[int]]:
+    """Place zero guest columns after each owner's source quota."""
+    boundaries = range(config.num_experts, 0, -config.home_experts)
+    padding = [0] * config.replica_slots_per_rank
+    output = []
+    for source in counts:
+        row = list(source)
+        # Insert from the end so earlier owner boundaries keep their offsets.
+        for end in boundaries:
+            row[end:end] = padding
+        output.append(row)
+    return output
+
+
 def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int]],
                  config: ExpertReplicaConfig, capacity_limit: int | None = None,
                  *, rank_nodes: tuple[int, ...] = ()) -> ExpertExecutionPlan:
@@ -389,10 +404,7 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
         # provide exact quotas; expanding and redistributing them is redundant.
         slots = tuple(tuple(range(rank * home, (rank + 1) * home)) + (-1,) * config.replica_slots_per_rank
                       for rank in range(config.ep_size))
-        padding = (0,) * config.replica_slots_per_rank
-        starts = range(0, config.num_experts, home)
-        dispatch = tuple(tuple(chain.from_iterable(row[start:start + home] + padding for start in starts))
-                         for row in counts)
+        dispatch = tuple(map(tuple, _pad_owner_rows(counts, config))) if config.replica_slots_per_rank else counts
         return _capacity_checked_plan(ExpertExecutionPlan(config, counts, slots, dispatch), capacity_limit)
     native = _materialize_dispatch(counts, copies, home, config.replica_slots_per_rank, rank_nodes)
     if native is not None:
@@ -412,9 +424,7 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
         slot_map.append(tuple(slots))
         for slot, expert in enumerate(guests, start=home):
             by_expert.setdefault(expert, []).append([rank * width + slot, row[expert]])
-    padding = (0,) * config.replica_slots_per_rank
-    starts = range(0, config.num_experts, home)
-    dispatch = [list(chain.from_iterable(row[start:start + home] + padding for start in starts)) for row in counts]
+    dispatch = _pad_owner_rows(counts, config)
     for expert, quotas in by_expert.items():
         # Only a guest can change an expert's prefilled owner columns. Insert
         # its remaining home work in the original physical tie-break order.
@@ -520,7 +530,10 @@ def _uncalibrated_copies(totals: list[int], loads: list[int], config: ExpertRepl
     stop = min(config.replica_slots_per_rank, config.home_experts)
     if start == 1:
         fallback = (owner_peak, None) if owner_peak <= limit else None
-        edges = _balanced_edges(loads, totals, config.home_experts)
+        edges = (prefix.edges if prefix is not None and prefix.edges is not None else
+                 _balanced_edges(loads, totals, config.home_experts))
+        if prefix is not None:
+            prefix.edges = edges
     else:
         fallback, edges = prefix.fallback, prefix.edges
     for budget in range(start, stop + 1):
@@ -560,11 +573,12 @@ def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: E
                                   projected_rank_nodes: tuple[int, ...] = (),
                                   prefix: _QuotaSearchPrefix | None = None) -> list[dict[int, int]] | None:
     """Admit feasible quotas using the selected uncalibrated placement policy."""
+    global _COMPLETE_GUEST_SEARCH_HITS  # pylint: disable=global-statement
     wider_cap = config.replica_slots_per_rank == 2 and config.home_experts > 2
     search_wider = wider_cap and (allow_complete_search or projected_rank_nodes)
     average = (sum(loads) + config.ep_size - 1) // config.ep_size if search_wider else target
     project = bool(projected_rank_nodes) and wider_cap and target > average and min(loads) < max(loads) <= limit
-    if project:
+    if project or (allow_complete_search and wider_cap and prefix is None):
         prefix = _QuotaSearchPrefix()
     copies = _uncalibrated_copies(totals, loads, config, limit, resident, target, prefix=prefix)
     if copies is not None:
@@ -575,11 +589,19 @@ def _admitted_uncalibrated_copies(totals: list[int], loads: list[int], config: E
         peak = max(sum(row.values()) for row in copies)
         if not _optional_peak_is_useful(peak, loads, ceiling, admission, saved_rows):
             copies = None
+            if (allow_complete_search and wider_cap and not project and target > average
+                    and _optional_peak_is_useful(average, loads, ceiling, admission, saved_rows)):
+                # A different soft target needs fresh quota trials, but the
+                # original owner balancing edges are unchanged.
+                return _admitted_uncalibrated_copies(
+                    totals, loads, config, limit, resident, average, minimum_rows, admission, saved_rows,
+                    prefix=_QuotaSearchPrefix(edges=prefix.edges))
         elif (allow_complete_search and wider_cap and peak > target > average
               and max(loads) >= _COMPLETE_GUEST_HOTSPOT_FACTOR * average):
             complete = _complete_bounded_copies(totals, loads, config, copies, ceiling, minimum_rows, peak,
                                                 edges=prefix.edges if prefix is not None else None)
             if complete is not None:
+                _COMPLETE_GUEST_SEARCH_HITS += 1
                 copies = complete
     if project and not prefix.reached_target:
         projected = _project_wider_quota(totals, loads, config, copies, limit, resident, target,
@@ -775,21 +797,32 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
     for completed, candidate_score in deferred:
         if improves(candidate_score):
             best, best_score = completed, candidate_score
+    if len(model.effective_group_ms) == 7 and baseline_score is not None and best_score is not None:
+        # Clear the owner margin once, then compare qualified layouts directly.
+        candidate = _admitted_uncalibrated_copies(
+            totals, loads, config, limit, resident, target, minimum_replica_rows, admission, minimum_saved_rows,
+            prefix=_QuotaSearchPrefix(edges=edges))
+        if candidate is not None and max(sum(row.values()) for row in candidate) <= resident:
+            value = score(candidate)
+            if value is not None and value < best_score and value + margin < baseline_score:
+                best, best_score = candidate, value
+    search_budget = model.quota_search_budget_ms
     if (best is home and best_score is not None and isfinite(best_score)
             and baseline_score is not None and isfinite(baseline_score)
             and (model.effective_group_ms or model.critical_path is not None)
-            and model.quota_search_budget_ms > 0):
+            and search_budget is not None and search_budget > 0):
         retry_target = (sum(loads) + config.ep_size - 1) // config.ep_size
         if (retry_target < target
                 and _optional_peak_is_useful(retry_target, loads, resident, admission, minimum_saved_rows)):
             # Charge extra search on top of the uncertainty margin, against the
             # feasible owner route that would otherwise execute.
-            retry = _admitted_uncalibrated_copies(totals, loads, config, limit, resident, retry_target,
-                                                  minimum_replica_rows, admission, minimum_saved_rows)
+            retry = _admitted_uncalibrated_copies(
+                totals, loads, config, limit, resident, retry_target, minimum_replica_rows, admission, minimum_saved_rows,
+                prefix=_QuotaSearchPrefix(edges=edges))
             if retry is not None and max(sum(row.values()) for row in retry) <= resident:
                 retry_score = score(retry)
                 if (retry_score is not None and isfinite(retry_score)
-                        and improves(retry_score + model.quota_search_budget_ms)):
+                        and improves(retry_score + search_budget)):
                     best, best_score = retry, retry_score
     if best_score is not None:
         return best, None if model.critical_path is not None else (best_score, optimistic)
@@ -963,9 +996,10 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
                             for rank, row in enumerate(copies) for expert, rows in row.items())
                 # Admission already compared owner-only. Reuse its lower bound
                 # when no cheap deletion or worthwhile quota search remains.
-                search = (bounds is None or bounds[0] - bounds[1]
-                          > cost_model.minimum_gain_ms + cost_model.quota_search_budget_ms)
-                if small or search:
+                budget = cost_model.quota_search_budget_ms
+                search = (budget is not None and (bounds is None or bounds[0] - bounds[1]
+                                                  > cost_model.minimum_gain_ms + budget))
+                if small or search or bounds is None:
                     refine_replica_quotas(copies, counts, config, ceiling, cost_model,
                                           minimum_replica_rows=minimum_replica_rows, _durations=durations)
             else:

@@ -35,10 +35,43 @@ from .plan import ExpertExecutionPlan
 MEASUREMENT_CONTRACT = 'rank_cumulative_f_r_b_v2'
 CAPTURE_POLICY = 'runtime_default_admission_v1'
 HOT_OWNER_EXCESS = 2.5
+_OWNER_COVERAGE_FRAME = 1
 
 
 class CalibrationDesignRejected(ValueError):
     """Report valid captures that cannot identify a stable TRAIN-only service model."""
+
+
+def _validate_route_templates(manifest: dict[str, Any]) -> None:
+    """Require one exact expert histogram per template or per EP source rank."""
+    templates = manifest.get('route_templates', [])
+    if not isinstance(templates, list):
+        raise ValueError('Route templates must be a list')
+    if not templates:
+        return
+    if manifest['frames'] != 12 + len(templates):
+        raise ValueError('Route templates must follow the twelve bounded calibration frames')
+    experts, tokens, top_k = (manifest[k] for k in ('num_experts', 'local_num_tokens', 'top_k'))
+    names = set()
+    for template in templates:
+        if not isinstance(template, dict):
+            raise ValueError('Each route template must be a mapping')
+        name, family = template.get('name'), template.get('family')
+        shared = 'source_expert_counts' in template
+        ranked = 'source_expert_counts_by_rank' in template
+        if shared == ranked:
+            raise ValueError('Route templates require exactly one shared or per-source histogram')
+        counts = [template['source_expert_counts']] if shared else template['source_expert_counts_by_rank']
+        if not isinstance(counts, list) or len(counts) != (1 if shared else manifest['ep_size']):
+            raise ValueError('A per-source route template requires one histogram per EP rank')
+        if (not isinstance(name, str) or not name or name in names or not isinstance(family, str) or not family):
+            raise ValueError('Route templates require unique nonempty names and nonempty families')
+        for source in counts:
+            if (not isinstance(source, list) or len(source) != experts
+                    or any(type(value) is not int or not 0 <= value <= tokens for value in source)
+                    or sum(source) != tokens * top_k):
+                raise ValueError(f'Route template {name!r} must conserve distinct Top-K source counts')
+        names.add(name)
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -82,32 +115,31 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise ValueError(f'{name} must be at least {minimum}')
     if result.get('replica_transport', 'shmem_signal_kernel_gradient_bands') != 'shmem_signal_kernel_gradient_bands':
         raise ValueError('Automatic calibration requires gradient-band transport')
-    templates = result.get('route_templates', [])
-    if templates:
-        if not isinstance(templates, list) or result['frames'] != 12 + len(templates):
-            raise ValueError('Route templates must follow the twelve bounded calibration frames')
-        names = set()
-        for template in templates:
-            counts = template.get('source_expert_counts', [])
-            name, family = template.get('name'), template.get('family')
-            if (not isinstance(name, str) or not name or name in names
-                    or not isinstance(family, str) or not family
-                    or len(counts) != result['num_experts']
-                    or any(type(count) is not int or not 0 <= count <= result['local_num_tokens'] for count in counts)
-                    or sum(counts) != result['local_num_tokens'] * result['top_k']):
-                raise ValueError('Route templates require unique names, families and conserved distinct-TopK counts')
-            names.add(name)
+    _validate_route_templates(result)
     return result
 
 
-def calibration_ids(tokens: int, manifest: dict[str, Any], frame: int, nodes: tuple[int, ...]) -> torch.Tensor:
+def calibration_ids(tokens: int, manifest: dict[str, Any], frame: int, nodes: tuple[int, ...],
+                    *, source_rank: int | None = None) -> torch.Tensor:
     """Build bounded expert histograms with distinct logical experts in each token row."""
     experts, top_k, size = manifest['num_experts'], manifest['top_k'], manifest['ep_size']
     templates = manifest.get('route_templates', [])
     if templates and frame >= 12:
         if tokens != manifest['local_num_tokens'] or frame - 12 >= len(templates):
             raise ValueError('A frozen route template requires its exact declared source-token shape')
-        counts = templates[frame - 12]['source_expert_counts']
+        template = templates[frame - 12]
+        if 'source_expert_counts_by_rank' in template:
+            if type(source_rank) is not int or not 0 <= source_rank < size:
+                raise ValueError('A per-source route template requires a valid group-local source rank')
+            counts = template['source_expert_counts_by_rank'][source_rank]
+        else:
+            counts = template['source_expert_counts']
+        flat = torch.repeat_interleave(torch.arange(experts), torch.tensor(counts))
+        return flat.reshape(top_k, tokens).T.contiguous().int()
+    if frame == _OWNER_COVERAGE_FRAME and experts > 1:
+        # Distinct Top-K permits every token to select one shared hot expert.
+        quotient, remainder = divmod(tokens * (top_k - 1), experts - 1)
+        counts = [tokens] + [quotient + (expert < remainder) for expert in range(experts - 1)]
         flat = torch.repeat_interleave(torch.arange(experts), torch.tensor(counts))
         return flat.reshape(top_k, tokens).T.contiguous().int()
     counts = [tokens * top_k // experts] * experts
@@ -231,6 +263,8 @@ def _samples(reports: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]
                     or np.any(component <= 0) or np.any(local_target > component + .1 + .01 * component)):
                 raise ValueError('Cumulative F/R/B must fit inside each measured whole component interval')
             result.append(row | {'features': features, 'target': target, 'local_target': local_target, 'plan': plan,
+                                 'expert_peak_rows': max(max(max(rank) for rank in plan.destination_counts),
+                                     max(plan.destination_loads) / plan.config.home_experts),
                                  'observed_ms': float(max(local_target)),
                                  'component_rank_max_ms': float(max(component)),
                                  'phase_rank_max_sum_ms': float(2 * target[0] + target[1])})
@@ -241,18 +275,26 @@ def _candidate(manifest: dict[str, Any], report: dict[str, Any], budget: int,
                beta: np.ndarray, margin: float, coverage: int, source_floor: float = 0.) -> dict[str, Any]:
     def curve(fixed: float, slope: float) -> tuple:
         return ((0, 0.), (1, float(fixed + slope)), (max(2, coverage), float(fixed + slope * max(2, coverage))))
+    # A whole-call intercept and a peak-expert term cannot be summed over
+    # every expert as a compute lower bound during quota refinement.
+    # The owner-width floor still supplies a conservative row-linear bound.
+    compute_fixed = beta[0] / 3 if len(beta) == 6 else 0.
+    compute_slope = beta[1] / 3
+    if len(beta) == 7:
+        compute_slope += beta[6] / (3 * (manifest['num_experts'] // manifest['ep_size']))
     model = ExpertReplicaCostModel(
         calibration_version=2, backend=report['backend'], hidden_size=manifest['hidden_size'],
         intermediate_size=manifest['intermediate_size'], ep_size=manifest['ep_size'],
-        transport='shmem_signal_kernel_gradient_bands', forward_ms=curve(beta[0] / 3, beta[1] / 3),
-        backward_ms=curve(beta[0] / 3, beta[1] / 3), weight_ms=0., gradient_ms=0.,
+        transport='shmem_signal_kernel_gradient_bands', forward_ms=curve(compute_fixed, compute_slope),
+        backward_ms=curve(compute_fixed, compute_slope), weight_ms=0., gradient_ms=0.,
         token_ms_per_row=float(beta[4] / 3),
         forward_repeats=2, backward_weight_ms=0., replica_overhead_ms=float(beta[5] / 2),
         intra_node_weight_ms=float(beta[2] / 3), inter_node_weight_ms=float(beta[3] / 3),
         intra_node_gradient_ms=float(beta[2] / 3), inter_node_gradient_ms=float(beta[3] / 3),
         intra_node_backward_weight_ms=0., inter_node_backward_weight_ms=0.,
         effective_group_ms=tuple(float(value) for value in beta), _rank_nodes=tuple(report['rank_nodes']),
-        effective_source_row_floor=source_floor,
+        # The fitted component costs cover candidate scoring, not repeated quota trials.
+        effective_source_row_floor=source_floor, quota_search_budget_ms=None,
         schedule=report['schedule'], minimum_gain_ms=margin, minimum_replica_gain_ms=margin)
     return {'selector': {'soc_name': report['soc_name'], 'num_experts': manifest['num_experts'],
                          'top_k': manifest['top_k'], 'execution_signature': report['execution_signature']},
@@ -270,6 +312,10 @@ def _paired_training(train: list[dict[str, Any]]) -> tuple[np.ndarray, ...]:
         raise ValueError('Service fitting accepts TRAIN frames only')
     if not train or len({row['group_leader'] for row in train}) != 1:
         raise ValueError('Service fitting requires one TRAIN EP group')
+    peaks = ['expert_peak_rows' in row for row in train]
+    if any(peaks) and not all(peaks):
+        raise ValueError('Expert-cell training requires peak rows for every observation')
+    expert_cell = all(peaks)
     indexed = {}
     for row in train:
         key = row['group_leader'], row['frame'], row['sample']
@@ -289,7 +335,14 @@ def _paired_training(train: list[dict[str, Any]]) -> tuple[np.ndarray, ...]:
         family = lambda row: row.get('cv_group', str(row['frame'] % 4 + 4 * int(4 <= row['frame'] % 12 < 8)))
         if family(owner) != family(replica):
             raise ValueError('Matched observations cannot cross route-family folds')
-        features.append([row['features'][0][:, [0, 1, 4, 5, 8, 9]].max(axis=0) for row in (owner, replica)])
+        pair = []
+        for row in (owner, replica):
+            values = row['features'][0][:, [0, 1, 4, 5, 8, 9]].max(axis=0)
+            if expert_cell:
+                values[0] = int(any(map(sum, row['plan'].logical_counts)))
+                values = np.append(values, row['expert_peak_rows'])
+            pair.append(values)
+        features.append(pair)
         target.append([owner['observed_ms'], replica['observed_ms']])
         gains.append(owner['component_rank_max_ms'] - replica['component_rank_max_ms'])
         folds.append(family(owner))
@@ -304,13 +357,15 @@ def _owner_services(features: np.ndarray, target: np.ndarray,
     """Anchor fixed, receive-row and token services exclusively to owner-only observations."""
     candidates, errors = [], []
     bases = ((0, 1, 4), (0, 1), (1, 4), (0, 4), (0,), (1,), (4,))
+    if features.shape[1] == 7:
+        bases += ((0, 1, 4, 6), (0, 1, 6), (1, 4, 6), (1, 6), (0, 6), (4, 6), (6,))
     for floor, basis in ((floor, basis) for floor in (0., .5, .75, 1.) for basis in bases):
         design = features.copy()
         design[:, 1] = np.maximum(design[:, 1], source_rows * floor)
         columns = list(basis)
         try:
             predicted = np.zeros_like(target)
-            coefficients = np.zeros((len(target), 6))
+            coefficients = np.zeros((len(target), features.shape[1]))
             for fold in sorted(set(folds)):
                 fit_rows, valid_rows = folds != fold, folds == fold
                 values, _ = fit_nonnegative_services(design[fit_rows][:, columns], target[fit_rows])
@@ -328,7 +383,7 @@ def _owner_services(features: np.ndarray, target: np.ndarray,
     design = features.copy()
     design[:, 1] = np.maximum(design[:, 1], source_rows * floor)
     values, fit = fit_nonnegative_services(design[:, columns], target)
-    beta = np.zeros(6)
+    beta = np.zeros(features.shape[1])
     beta[columns] = values
     fit.update(basis=columns, source_row_floor=floor, cross_validation=cv, rejected_training_bases=errors)
     return beta, coefficients, fit
@@ -367,7 +422,7 @@ def _replica_services(features: np.ndarray, target: np.ndarray, gains: np.ndarra
     design = np.stack([features[:, 1, list(group)].sum(axis=1) for group in groups], axis=1)
     residual = target[:, 1] - target[:, 0] - delta @ owner
     values, fit = _fit_nonnegative_services(design, residual)
-    beta = np.zeros(6)
+    beta = np.zeros(features.shape[2])
     for group, value in zip(groups, values):
         beta[list(group)] = value
     fit.update(link_groups=groups, cross_validation=cv, rejected_training_bases=errors)
@@ -388,7 +443,8 @@ def _fit_services(train: list[dict[str, Any]]) -> tuple[np.ndarray, dict[str, An
     gain_error = predicted[:, 0] - predicted[:, 1] - gains
     cv_gain_error = cv_predicted[:, 0] - cv_predicted[:, 1] - gains
     absolute_p95 = float(np.quantile(np.abs(predicted - target), .95))
-    fit = dict(parameterization='b0_anchored_paired_group_nnls_v2', measurement_contract=MEASUREMENT_CONTRACT,
+    schema = 'b0_anchored_paired_expert_cell_nnls_v3' if len(beta) == 7 else 'b0_anchored_paired_group_nnls_v2'
+    fit = dict(parameterization=schema, measurement_contract=MEASUREMENT_CONTRACT,
         basis=sorted(set(owner_fit['basis']) | {column for group in replica_fit['link_groups'] for column in group}),
         owner_fit=owner_fit, replica_fit=replica_fit, paired_train_samples=len(gains),
         source_row_floor=owner_fit['source_row_floor'],
@@ -415,23 +471,31 @@ def validate_profile(payload: dict[str, Any], samples: list[dict[str, Any]], bas
     if not isinstance(absolute_bound, (int, float)) or not math.isfinite(absolute_bound) or absolute_bound < 0:
         raise ValueError('Absolute prediction uncertainty must be finite and nonnegative')
     reference = {(row['group_leader'], row['frame'], row['sample']): row for row in baseline}
+    trained = min(model.forward_ms[-1][0], model.backward_ms[-1][0])
     errors, under, harmful, gain_errors, matched, required = [], [], [], [], 0, 0
     for row in samples:
+        key = row['group_leader'], row['frame'], row['sample']
+        if key not in reference:
+            raise ValueError('Missing matched B0 holdout')
+        owner = reference[key]
+        for candidate in (owner, row):
+            plan = candidate['plan']
+            peak = max(max(rank) for rank in plan.destination_counts)
+            if peak > trained:
+                raise CalibrationDesignRejected(
+                    f'Holdout outside TRAIN coverage: frame={row["frame"]} sample={row["sample"]} '
+                    f'budget={plan.config.replica_slots_per_rank} observed={peak} trained={trained}')
         effective = ExpertReplicaCostModel(**(payload['model'] | {'_rank_nodes': tuple(row['rank_nodes'])}))
         predicted = effective.estimate_ms(row['plan'])
         observed = row['observed_ms']
         errors.append(abs(predicted - observed) / max(observed, 1e-6))
         under.append(observed - predicted)
-        key = row['group_leader'], row['frame'], row['sample']
-        if key not in reference:
-            raise ValueError('Missing matched B0 holdout')
-        owner = reference[key]
         predicted_gain = effective.estimate_ms(owner['plan']) - predicted
         observed_gain = owner['component_rank_max_ms'] - row['component_rank_max_ms']
         gain_errors.append(predicted_gain - observed_gain)
         if predicted_gain > model.minimum_gain_ms and observed_gain < -model.minimum_gain_ms:
             harmful.append({'frame': row['frame'], 'predicted_gain_ms': predicted_gain,
-                            'observed_component_gain_ms': observed_gain})
+                            'observed_wall_gain_ms': observed_gain})
         home = row['plan'].config.home_experts
         loads = [sum(sum(source[start:start + home]) for source in row['plan'].logical_counts)
                  for start in range(0, row['plan'].config.num_experts, home)]
@@ -442,7 +506,8 @@ def validate_profile(payload: dict[str, Any], samples: list[dict[str, Any]], bas
         raise ValueError('Need at least four disjoint holdout observations')
     p95 = float(np.quantile(errors, .95))
     worst = max(under)
-    gain_gate = payload.get('fit', {}).get('parameterization') == 'b0_anchored_paired_group_nnls_v2'
+    gain_gate = payload.get('fit', {}).get('parameterization') in (
+        'b0_anchored_paired_group_nnls_v2', 'b0_anchored_paired_expert_cell_nnls_v3')
     return {'status': 'passed' if p95 <= maximum_relative_error and worst <= absolute_bound
             and (not gain_gate or max(gain_errors) <= model.minimum_gain_ms) and not harmful else 'failed',
             'holdout_samples': len(errors), 'relative_error_p95': p95,
@@ -476,6 +541,13 @@ def fit_directory(manifest: dict[str, Any], source: Path, output: Path, *, verif
         if (report.get('completed') is not True or report['runtime_contract'] != contract
                 or report['manifest'] != manifest):
             raise ValueError('Observation runtime or model manifest mismatch')
+        expected = {(frame, sample) for frame in range(manifest['frames']) for sample in range(manifest['samples'])}
+        actual = {(row['frame'], row['sample']) for row in report['records']}
+        if len(report['records']) != len(expected) or actual != expected:
+            raise ValueError('Incomplete or duplicated observation frame/sample matrix')
+        if not report['ep_members'] or any(row['group_leader'] != report['ep_members'][0]
+                                           for row in report['records']):
+            raise ValueError('Observation leader differs from its EP group')
     results, catalog = [], []
     for backend in manifest['dispatch_modes']:
         group = [row for row in reports if row['backend'] == backend]
@@ -502,7 +574,11 @@ def fit_directory(manifest: dict[str, Any], source: Path, output: Path, *, verif
                 if payload['selector']['execution_signature'] not in signatures:
                     raise ValueError('Candidate execution signature changed during verification')
                 validation = validate_profile(payload, holdout, baseline)
-                if validation['runtime_matched_samples'] != validation['runtime_lookup_required_samples']:
+                validation['initial_status'] = payload['validation']['status']
+                if validation['initial_status'] != 'candidate':
+                    validation['status'] = 'failed'
+                    validation['reason'] = 'Initial untouched holdout rejected this profile'
+                elif validation['runtime_matched_samples'] != validation['runtime_lookup_required_samples']:
                     validation['status'] = 'failed'
                     validation['reason'] = 'Candidate did not reach every runtime holdout'
             else:
@@ -523,14 +599,16 @@ def fit_directory(manifest: dict[str, Any], source: Path, output: Path, *, verif
             raw = json.dumps(payload, indent=2, allow_nan=False).encode() + b'\n'
             (output / filename).write_bytes(raw)
             results.append({'backend': backend, 'budget': budget, **validation})
-            catalog.append({'file': filename, 'sha256': hashlib.sha256(raw).hexdigest()})
-    accepted = all(row['status'] == ('passed' if verify else 'candidate') for row in results)
-    report = {'status': ('validated' if verify else 'candidate') if accepted else 'failed', 'profiles': results,
+            if verify and validation['status'] == 'passed':
+                catalog.append({'file': filename, 'sha256': hashlib.sha256(raw).hexdigest()})
+    accepted = sum(row['status'] == ('passed' if verify else 'candidate') for row in results)
+    status = ('validated' if verify else 'candidate') if accepted else 'failed'
+    calibration_status = ('partial' if 0 < accepted < len(results) else status) if accepted else 'rejected'
+    report = {'status': status, 'profiles': results,
               'runtime_contract': contract, 'script_only': True, 'collection_complete': True,
-              'calibration_status': ('validated' if verify else 'candidate') if accepted else 'rejected',
-              'catalog_published': bool(accepted and verify)}
+              'calibration_status': calibration_status, 'catalog_published': bool(catalog)}
     (output / 'fit-report.json').write_text(json.dumps(report, indent=2) + '\n')
-    if accepted and verify:
+    if catalog:
         artifact = {'schema_version': 1, 'status': 'validated', 'runtime_contract': contract, 'profiles': catalog}
         temporary = output / 'catalog.json.tmp'
         temporary.write_text(json.dumps(artifact, indent=2) + '\n')

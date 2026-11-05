@@ -62,7 +62,7 @@ from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capaci
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
-from .inactive_tasks import UNMAPPED_GUEST_SUFFIX_SCHEDULE
+from .inactive_tasks import replica_runtime_schedule
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
@@ -118,7 +118,7 @@ def _critical_execution_signature(module: Any, resources: Any, *, execution_toke
                     global_world_size=dist.get_world_size() if dist.is_initialized() else module.ep_size,
                     template='replica_ready_ack_v1', weight_dtype='bfloat16', partial_dtype='float32')
     if module.replica_slots_per_rank:
-        metadata['runtime_schedule'] = UNMAPPED_GUEST_SUFFIX_SCHEDULE
+        metadata['runtime_schedule'] = replica_runtime_schedule()
     metadata['runtime_environment'] = {name: os.environ.get(name, default)
                                        for name, default in ENVIRONMENT_DEFAULTS.items()}
     if execution_tokens is not None:
@@ -319,6 +319,11 @@ class _MegaMoeExecutionResources:
                     getattr(self, 'soc_name', ''))
         if any(spec.get('_replica_critical_path_identity') for spec in specifications):
             manifest += (_critical_native_fingerprint(),)
+        if any(spec.get('replica_slots_per_rank') for spec in specifications):
+            manifest += (replica_runtime_schedule(),)
+        if any(spec.get('replica_slots_per_rank') == 2 for spec in specifications):
+            manifest += (os.environ.get('HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH', '0'),
+                         os.environ.get('HYPER_PARALLEL_REPLICA_PROJECTED_GUEST_SEARCH', '0'))
         # Resource groups must have the same order as their symmetric allocations.
         manifest += (_local_node_identity(),)
         manifests = [None] * self.spec.ep_size
@@ -752,7 +757,7 @@ class MegaMoeExperts(MulticoreModule):
         gathered: _GatheredReplicaCounts | None = None,
     ) -> ReplicaRoute:
         """Resolve the unchanged bounded policy only when placement is needed."""
-        selection = ({'execution_schedule': UNMAPPED_GUEST_SUFFIX_SCHEDULE}
+        selection = ({'execution_schedule': replica_runtime_schedule()}
                      if self.replica_slots_per_rank else {})
         if self._cost_model_enabled and _critical_path_available(
                 self.dispatch_mode, self.hidden_size, self.intermediate_size, self.ep_size,

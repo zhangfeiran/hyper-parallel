@@ -43,6 +43,35 @@ class TestQuotaAdmission(unittest.TestCase):
                    for rank in range(64)]
         return ids, routing._GatheredReplicaCounts(logical, summary, logical.tolist())
 
+    def test_severe_hotspot_reads_exact_source_counts_once(self) -> None:
+        """Use one source table for quota admission and exact source materialization."""
+        remainder = 4096 * 7
+        counts = [4096] + [remainder // 383 + int(index < remainder % 383) for index in range(383)]
+        ids, native = self.gathered(counts)
+        gathered = routing._GatheredReplicaCounts(native.counts, native.source_summary)
+        readback_shapes = []
+        original_cpu = torch.Tensor.cpu
+
+        def track(tensor: torch.Tensor) -> torch.Tensor:
+            readback_shapes.append(tuple(tensor.shape))
+            return original_cpu(tensor)
+
+        with patch.object(routing, 'dist') as distributed:
+            distributed.is_initialized.return_value = True
+            distributed.get_world_size.return_value = 64
+            distributed.get_rank.return_value = 0
+            options = dict(compact_home=True, minimum_replica_rows=1024, minimum_load_reduction=.4,
+                           dynamic_header=(0, 4096, 31), _auto_capacity_factor=1.25,
+                           _capacity_budget=Mock(return_value=300000))
+            config = ExpertReplicaConfig(384, 64, 2)
+            expected = routing.prepare_replica_route(ids, config, _gathered_counts=native, **options)
+            with patch.object(torch.Tensor, 'cpu', track):
+                route = routing.prepare_replica_route(ids, config, _gathered_counts=gathered, **options)
+        self.assertTrue(route.plan.transfers)
+        self.assertEqual(readback_shapes, [(64, 384)])
+        self.assertEqual(route.plan, expected.plan)
+        torch.testing.assert_close(route.physical_ids, expected.physical_ids, rtol=0, atol=0)
+
     def test_rejected_quotas_skip_full_cpu_source_dispatch(self) -> None:
         """A legal owner fallback need not build the full EP64 virtual dispatch matrix."""
         counts = self.counts()

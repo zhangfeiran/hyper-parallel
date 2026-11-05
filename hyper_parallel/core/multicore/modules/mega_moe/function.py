@@ -137,7 +137,7 @@ class _ForwardExecution:
     intermediates: _ForwardIntermediates
     runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
     task_prefix: GuestTaskPrefix | None = None
-    prefix_cache: dict[int, tuple[Any, int]] | None = None
+    prefix_cache: dict[int, tuple[Any, tuple[int, int, int, int]]] | None = None
 
 
 @dataclass(frozen=True)
@@ -153,7 +153,7 @@ class _BackwardExecution:
     diagnostics: Any = None
     runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
     task_prefix: GuestTaskPrefix | None = None
-    prefix_cache: dict[int, tuple[Any, int]] | None = None
+    prefix_cache: dict[int, tuple[Any, tuple[int, int, int, int]]] | None = None
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -411,7 +411,7 @@ def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool =
                    gradient_return: torch.Tensor | None = None, home_only: bool = False,
                    cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None,
                    task_prefix: GuestTaskPrefix | None = None,
-                   prefix_cache: dict[int, tuple[Any, int]] | None = None) -> torch.Tensor:
+                   prefix_cache: dict[int, tuple[Any, tuple[int, int, int, int]]] | None = None) -> torch.Tensor:
     """Append split addresses after profiler preparation, retaining the base ABI."""
     if gradient_return is not None and (not backward or getattr(pool, "projection_ready", None) is None):
         raise ValueError("Kernel gradient metadata requires a projection-ready backward lease")

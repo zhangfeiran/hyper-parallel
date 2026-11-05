@@ -45,7 +45,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCo
 from hyper_parallel.core.expert_parallel.hot_replica.planner import _home_layout, _materialize
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega
-from hyper_parallel.core.multicore.modules.mega_moe.inactive_tasks import UNMAPPED_GUEST_SUFFIX_SCHEDULE
+from hyper_parallel.core.multicore.modules.mega_moe.inactive_tasks import replica_runtime_schedule
 
 
 def _checkpoint_operation(operation: Callable, *arguments: torch.Tensor, contract: str) -> torch.Tensor:
@@ -77,7 +77,7 @@ def _profiles(directory: Path | None) -> dict:
 
 
 def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
-             device: torch.device, output: Path) -> None:
+             device: torch.device, output: Path, *, selected_frame: int | None = None) -> None:
     rank, size = dist.get_rank(group), dist.get_world_size(group)
     global_rank = dist.get_rank()
     # Equal quota layouts must retain the same admission defaults and host paths as training.
@@ -100,9 +100,14 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
     original_plan, original_cost = routing._plan_replica_route, mega._runtime_cost_model
 
     def plan_hook(*arguments: Any, **options: Any) -> Any:
-        begin = time.perf_counter()
+        begin = time.perf_counter_ns()
+        begin_thread = time.thread_time_ns()
         result = original_plan(*arguments, **options)
-        active['planner_cpu_ms'] = active.get('planner_cpu_ms', 0.) + (time.perf_counter() - begin) * 1000
+        thread_ms = (time.thread_time_ns() - begin_thread) / 1e6
+        wall_ms = (time.perf_counter_ns() - begin) / 1e6
+        # Retain the historical wall-clock field for the fitting/report contract.
+        active['planner_cpu_ms'] = active.get('planner_cpu_ms', 0.) + wall_ms
+        active['planner_thread_cpu_ms'] = active.get('planner_thread_cpu_ms', 0.) + thread_ms
         active['planner_entry_calls'] = active.get('planner_entry_calls', 0) + 1
         active['plan'] = result[0]
         return result
@@ -121,7 +126,8 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
     try:
         with (patch.object(routing, '_plan_replica_route', plan_hook),
               patch.object(mega, '_runtime_cost_model', cost_hook)):
-            for frame in range(manifest['frames']):
+            frames = range(manifest['frames']) if selected_frame is None else (selected_frame,)
+            for frame in frames:
                 frozen = bool(manifest.get('route_templates')) and frame >= 12
                 tokens = manifest['local_num_tokens'] // (2 if not frozen and 4 <= frame % 12 < 8
                                                          and rank % 2 == 0 else 1)
@@ -130,7 +136,7 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
                 frame_tokens = [None] * size
                 dist.all_gather_object(frame_tokens, tokens, group=group)
                 maximum_tokens = max(frame_tokens)
-                ids = calibration_ids(tokens, manifest, frame, nodes).to(device)
+                ids = calibration_ids(tokens, manifest, frame, nodes, source_rank=rank).to(device)
                 local_counts = torch.bincount(ids.flatten().long(), minlength=manifest['num_experts']).cpu().tolist()
                 for sample in range(-manifest['warmup'], manifest['samples']):
                     torch.manual_seed(113 + frame * 11 + sample + rank)
@@ -186,7 +192,8 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
                              'component_ms': component_ms,
                              'execution_replica_slots': resources.last_execution_plan.spec.replica_slots_per_rank,
                              'signature': active['signature'], 'matched': active.get('cost_model_matched', False),
-                             'planner_cpu_ms': active.get('planner_cpu_ms', 0.)}
+                             'planner_cpu_ms': active.get('planner_cpu_ms', 0.),
+                             'planner_thread_cpu_ms': active.get('planner_thread_cpu_ms', 0.)}
                     gathered = [None] * size
                     dist.all_gather_object(gathered, local, group=group)
                     if not all(row['finite'] for row in gathered):
@@ -217,6 +224,8 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
                                                         for phase in ('forward', 'recompute', 'backward')),
                             'wall_rank_max_ms': max(row['wall_ms'] for row in gathered),
                             'planner_cpu_ms': max(row['planner_cpu_ms'] for row in gathered),
+                            'rank_planner_wall_ms': [row['planner_cpu_ms'] for row in gathered],
+                            'rank_planner_thread_cpu_ms': [row['planner_thread_cpu_ms'] for row in gathered],
                             'planner_entry_calls': active.get('planner_entry_calls', 0),
                             'plan_bypassed': active.get('plan') is None,
                             'execution_replica_slots': [row['execution_replica_slots'] for row in gathered],
@@ -234,7 +243,7 @@ def _capture(manifest: dict[str, Any], mode: str, budget: int, group: object,
             'ep_members': dist.get_process_group_ranks(group),
             'soc_name': policy._SHARED_SOC_CALIBRATIONS.get(torch.npu.get_device_name(device),
                                                             torch.npu.get_device_name(device)),
-            'schedule': UNMAPPED_GUEST_SUFFIX_SCHEDULE, 'execution_signature': active['signature'],
+            'schedule': replica_runtime_schedule(), 'execution_signature': active['signature'],
             'runtime_contract': runtime_contract(), 'records': records, 'completed': True}
         (output / f'{mode}-b{budget}-group{global_rank}.json').write_text(json.dumps(payload) + '\n')
 
@@ -245,15 +254,18 @@ def main() -> None:
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--candidate-directory', type=Path)
+    parser.add_argument('--frame', type=int, help='Capture one diagnostic frame without fitting or publishing a model.')
     args = parser.parse_args()
     manifest = load_manifest(args.manifest)
+    if args.frame is not None and (not 0 <= args.frame < manifest['frames'] or args.candidate_directory is not None):
+        raise ValueError('Diagnostic frame must be in the manifest and cannot use a fitted candidate')
     if os.environ.get('HYPER_PARALLEL_REPLICA_WEIGHT_RESIDENCY') != '0':
         raise ValueError('Automatic calibration requires force_normal_miss residency')
     torch.npu.set_device(int(os.environ['LOCAL_RANK']))
     if not os.environ.get('HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT'):
         os.environ['HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT'] = (
             f"tcp://{socket.gethostbyname(os.environ['MASTER_ADDR'])}:{int(os.environ['MASTER_PORT']) + 1}")
-    dist.init_process_group('hccl', timeout=timedelta(seconds=7200))
+    dist.init_process_group('hccl', timeout=timedelta(seconds=600))
     try:
         size, rank, ep = dist.get_world_size(), dist.get_rank(), manifest['ep_size']
         if size % ep:
@@ -273,7 +285,7 @@ def main() -> None:
             for mode in manifest['dispatch_modes']:
                 for budget in [0] + manifest['replica_caps']:
                     device = torch.device('npu', int(os.environ['LOCAL_RANK']))
-                    _capture(manifest, mode, budget, group, device, args.output)
+                    _capture(manifest, mode, budget, group, device, args.output, selected_frame=args.frame)
         (args.output / f'status-rank{rank}.json').write_text(json.dumps({'rank': rank, 'completed': True}) + '\n')
     finally:
         dist.destroy_process_group()
