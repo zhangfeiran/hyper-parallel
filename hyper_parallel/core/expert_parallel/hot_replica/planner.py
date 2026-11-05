@@ -28,7 +28,7 @@ from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
 from .cost import ExpertReplicaCostModel, _QuotaCostState, refine_replica_quotas
 from .topology import _validate_rank_nodes
-from .host import _materialize_dispatch, _validate_counts
+from .host import _column_totals, _materialize_dispatch, _validate_counts
 
 _COMPLETE_GUEST_HOTSPOT_FACTOR = 3
 
@@ -463,7 +463,9 @@ def _home_layout(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfi
                   _home_counts: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
                   ) -> tuple[list[int], list[int], list[dict[int, int]]]:
     """Create original owner quotas and rank loads from exact integer counts."""
-    totals = list(map(sum, zip(*counts))) if _home_counts is None else list(_home_counts[0])
+    totals = _column_totals(counts) if _home_counts is None else list(_home_counts[0])
+    if totals is None:
+        totals = list(map(sum, zip(*counts)))
     home = config.home_experts
     copies = [{expert: totals[expert] for expert in range(rank * home, (rank + 1) * home)}
               for rank in range(config.ep_size)]

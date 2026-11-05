@@ -23,12 +23,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from hyper_parallel.core.expert_parallel.hot_replica import cost, host, planner
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica.critical_path import DeviceCriticalPathCalibration
+from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
 from tests.common.mark_utils import arg_mark
 
 
@@ -65,6 +67,118 @@ class TestReplicaHost(unittest.TestCase):
                   "weight_ms": .007, "gradient_ms": .011, "token_ms_per_row": .0001,
                   "forward_repeats": 2, "backward_weight_ms": 0}
         return cost.ExpertReplicaCostModel(**(values | options))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_column_totals_match_logical_and_physical_count_matrices(self) -> None:
+        """Feature: Exact native column reductions.
+        Description: Sum real logical and padded physical matrix geometries with empty source ranks.
+        Expectation: Every integer total exactly matches the independent Python reduction.
+        """
+        generator = random.Random(20261105)
+        for peers in (1, 4, 16, 64):
+            for budget in (0, 1, 2, 6):
+                width = peers * (6 + budget)
+                matrix = tuple(tuple(0 if rank % 3 == 2 else generator.randrange(2000)
+                                     for _ in range(width)) for rank in range(peers))
+                with self.subTest(peers=peers, budget=budget):
+                    self.assertEqual(self.native.column_totals(matrix), list(map(sum, zip(*matrix))))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_column_totals_keep_python_fallback_for_unsupported_values_and_overflow(self) -> None:
+        """Feature: Native integer reduction boundaries.
+        Description: Cross scalar, tuple, shape and signed-64-bit accumulation limits.
+        Expectation: Unsupported inputs return None without replacing arbitrary-precision Python behavior.
+        """
+        class CountSubclass(int):
+            """Keep custom scalar arithmetic on the Python reference path."""
+
+        class RowSubclass(tuple):
+            """Keep custom sequence iteration on the Python reference path."""
+
+        cases = ((), ((),), ((1,), ()), ((True,),), ((-1,),), ((1.5,),), ((2**80,),),
+                 ((2**63-1,), (1,)), ((CountSubclass(1),),), (RowSubclass((1,)),), [(1,)])
+        for matrix in cases:
+            with self.subTest(matrix=matrix):
+                self.assertIsNone(self.native.column_totals(matrix))
+        for matrix in (((2**63-1, 0), (0, 1)), ((0, 0), (0, 0))):
+            self.assertEqual(self.native.column_totals(matrix), list(map(sum, zip(*matrix))))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_column_totals_reach_owner_and_destination_summaries_without_changing_types(self) -> None:
+        """Feature: Real planner summary integration.
+        Description: Run owner and destination summaries through the actual compiled primitive and fallback.
+        Expectation: Both call sites consume native results and preserve list, tuple and overflow behavior.
+        """
+        matrix = ((3, 1, 0, 0, 5, 0, 0, 0),) * 4
+        config = ExpertReplicaConfig(8, 4, 0)
+        slots = tuple(tuple(range(rank*2, (rank+1)*2)) for rank in range(4))
+        with patch.object(host, "_native_backend", return_value=None):
+            expected_home = planner._home_layout(matrix, config)
+            expected_destination = ExpertExecutionPlan(config, matrix, slots, matrix).destination_counts
+        with patch.object(host, "_native_backend", return_value=self.native), \
+                patch.object(self.native, "column_totals", wraps=self.native.column_totals) as actual:
+            home = planner._home_layout(matrix, config)
+            destination = ExpertExecutionPlan(config, matrix, slots, matrix).destination_counts
+        self.assertEqual(actual.call_count, 2)
+        self.assertEqual(home, expected_home)
+        self.assertIs(type(home[0]), list)
+        self.assertEqual(destination, expected_destination)
+        self.assertEqual(tuple(map(type, destination)), (tuple,) * len(destination))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_column_totals_callers_keep_big_integer_and_older_abi3_results(self) -> None:
+        """Feature: End-to-end column reduction fallback.
+        Description: Run both consumers with overflowing column sums and an older ABI3 capability set.
+        Expectation: Arbitrary-precision values and original container types match the Python reference.
+        """
+        older = SimpleNamespace(abi_version=lambda: 3, validate_counts=self.native.validate_counts,
+                                materialize_dispatch=self.native.materialize_dispatch)
+        for matrix in (((3, 1), (4, 0)), ((2**63-1, 0), (1, 0))):
+            config = ExpertReplicaConfig(2, 2, 0)
+            slots = ((0,), (1,))
+            with patch.object(host, "_native_backend", return_value=None):
+                expected_home = planner._home_layout(matrix, config)
+                expected_destination = ExpertExecutionPlan(config, matrix, slots, matrix).destination_counts
+            for backend in (self.native, older):
+                with self.subTest(matrix=matrix, older=backend is older), \
+                        patch.object(host, "_native_backend", return_value=backend):
+                    actual_home = planner._home_layout(matrix, config)
+                    actual_destination = ExpertExecutionPlan(config, matrix, slots, matrix).destination_counts
+                    self.assertEqual(actual_home, expected_home)
+                    self.assertIs(type(actual_home[0]), list)
+                    self.assertEqual(actual_destination, expected_destination)
+                    self.assertEqual(tuple(map(type, actual_destination)), (tuple,) * len(actual_destination))
+
+    @unittest.skipUnless(sys.platform == "linux", "The allocation boundary probe uses Linux address-space accounting")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_column_totals_reject_jagged_rows_before_native_allocation(self) -> None:
+        """Feature: Shape-first native reduction.
+        Description: Limit a child process after constructing a wide first row and an empty second row.
+        Expectation: Invalid shape returns None before a native vector can exceed the small allocation allowance.
+        """
+        program = f'''
+import importlib.util
+import os
+from pathlib import Path
+import resource
+spec = importlib.util.spec_from_file_location("_replica_host", {self.native.__file__!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+matrix = ((0,) * (2**20), ())
+current = int(Path("/proc/self/statm").read_text().split()[0]) * os.sysconf("SC_PAGE_SIZE")
+limit = current + 4 * 1024**2
+resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+if module.column_totals(matrix) is not None:
+    raise AssertionError("A jagged matrix entered native column reduction")
+print("shape rejected before allocation")
+'''
+        completed = subprocess.run([sys.executable, "-S", "-c", program], check=True,
+                                   capture_output=True, text=True, timeout=15)
+        self.assertIn("shape rejected before allocation", completed.stdout)
 
     def test_count_validation_retains_python_boundary_behavior(self) -> None:
         """Feature: Host count validation.
