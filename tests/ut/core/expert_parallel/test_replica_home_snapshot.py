@@ -19,7 +19,7 @@ import random
 import unittest
 from unittest.mock import patch
 
-from hyper_parallel.core.expert_parallel.hot_replica import planner
+from hyper_parallel.core.expert_parallel.hot_replica import planner, plan as plan_module
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica.cost import ExpertReplicaCostModel
 from tests.common.mark_utils import arg_mark
@@ -27,6 +27,34 @@ from tests.common.mark_utils import arg_mark
 
 class TestReplicaHomeSnapshot(unittest.TestCase):
     """Preserve quotas, float scores and mutable ownership while removing a second matrix pass."""
+
+    def test_final_destination_quotas_match_independent_dispatch_reduction(self) -> None:
+        """Reuse final quotas while retaining exact integer destination metadata."""
+        generator = random.Random(20261105)
+        for budget in (0, 1, 2, 6):
+            for iteration in range(12):
+                counts = tuple(tuple(generator.randrange(50) + (300 if expert == 0 else 0)
+                                     for expert in range(24)) for _ in range(4))
+                result = planner._build_expert_replica_plan(
+                    counts, budget, adaptive=bool(budget), _rank_nodes=(0, 1, 0, 1))
+                width = result.config.slots_per_rank
+                expected = tuple(tuple(sum(source[rank * width + slot] for source in result.dispatch_counts)
+                                       for slot in range(width)) for rank in range(4))
+                with self.subTest(budget=budget, iteration=iteration), patch.object(
+                        plan_module, "_column_totals", side_effect=AssertionError("Unexpected second reduction")):
+                    self.assertEqual(result.destination_counts, expected)
+                    self.assertEqual(result.destination_loads, tuple(map(sum, expected)))
+                result.validate()
+
+    def test_validation_rejects_destination_cache_drift(self) -> None:
+        """Diagnostic validation must independently check any prefilled quota cache."""
+        counts = ((10, 1, 0, 0, 3, 2, 0, 0),) * 4
+        result = planner._build_expert_replica_plan(counts, 1, adaptive=True)
+        original = result.destination_counts
+        changed = (tuple(value + 1 for value in original[0]), *original[1:])
+        object.__setattr__(result, "destination_counts", changed)
+        with self.assertRaisesRegex(ValueError, "cached destination quotas"):
+            result.validate()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

@@ -141,6 +141,86 @@ class TestHeuristicReplicaRouting(unittest.TestCase):
                 self.assertEqual(bool(route.plan.transfers), copies)
 
 
+class TestSparseCompletedQuotas(unittest.TestCase):
+    """Retain useful completed quotas without calibrated latency coefficients."""
+
+    @staticmethod
+    def counts(hot: list[int], top_k: int) -> tuple[tuple[int, ...], ...]:
+        """Construct distinct-TopK histograms with one overloaded owner."""
+        tokens, experts, ranks = 4096, 192, 32
+        remaining = tokens * top_k - sum(hot)
+        quotient, remainder = divmod(remaining, experts - len(hot))
+        source = tuple(hot) + tuple(quotient + (index < remainder) for index in range(experts - len(hot)))
+        return (source,) * ranks
+
+    def test_completed_single_guest_quotas_rescue_rejected_two_slot_layouts(self) -> None:
+        """Complete thin seeds before discarding an affordable strong-hotspot layout."""
+        for hot in ([397, 396, 396, 396, 396, 396], [1457, 184, 184, 184, 184, 184],
+                    [1068, 262, 262, 262, 262, 261]):
+            with self.subTest(hot=hot):
+                plan = planner._build_expert_replica_plan(
+                    self.counts(hot, 6), 2, target_load=30720, capacity_limit=786432,
+                    receive_capacity=786432, minimum_replica_rows=1024, minimum_load_reduction=.4,
+                    adaptive=True, _rank_nodes=(0,) * 16 + (1,) * 16)
+                plan.validate()
+                self.assertTrue(plan.transfers)
+                self.assertLessEqual(max(plan.destination_loads), 40000)
+                self.assertLessEqual(len(plan.transfers), 8)
+
+    def test_sparse_quota_trades_bounded_receive_rows_for_fewer_matrix_edges(self) -> None:
+        """An extreme single expert need not replicate onto every idle rank."""
+        counts = self.counts([4096], 8)
+        with patch.object(planner, '_balanced_edges', wraps=planner._balanced_edges) as edges:
+            plan = planner._build_expert_replica_plan(
+                counts, 6, target_load=40960, capacity_limit=786432, receive_capacity=786432,
+                minimum_replica_rows=1024, minimum_load_reduction=.4, adaptive=True,
+                _rank_nodes=(0,) * 16 + (1,) * 16)
+        plan.validate()
+        self.assertEqual(edges.call_count, 1)
+        self.assertLessEqual(len(plan.transfers), 15)
+        self.assertLessEqual(max(plan.destination_loads), 2 * 32768)
+        self.assertLessEqual(max(max(row) for row in plan.destination_counts), 32768)
+
+    def test_sparse_quota_respects_a_tighter_receive_limit(self) -> None:
+        """A communication preference cannot replace a required feasible layout."""
+        plan = planner._build_expert_replica_plan(
+            self.counts([4096], 8), 6, target_load=32768, capacity_limit=32768,
+            receive_capacity=32768, minimum_replica_rows=1024, minimum_load_reduction=.4,
+            adaptive=True, _rank_nodes=(0,) * 16 + (1,) * 16)
+        plan.validate()
+        self.assertEqual(max(plan.destination_loads), 32768)
+
+    def test_native_agreement_admits_and_replays_completed_quotas(self) -> None:
+        """The default-fragment runtime path must reuse the newly admitted quotas."""
+        counts = self.counts([1068, 262, 262, 262, 262, 261], 6)
+        logical = torch.tensor(counts, dtype=torch.int32)
+        ids = torch.repeat_interleave(torch.arange(192), logical[0]).reshape(6, 4096).T.contiguous().int()
+        summary = [[0, 4096, 31, sum(row), min(row), max(row), 32 * sum(row[rank * 6:(rank + 1) * 6])]
+                   for rank, row in enumerate(counts)]
+        gathered = routing._GatheredReplicaCounts(logical, summary, counts)
+        forward, replay = create_recompute_contexts()
+        options = {'compact_home': True, 'minimum_replica_rows': 1024, 'minimum_load_reduction': .4,
+                   'dynamic_header': (0, 4096, 31), '_auto_capacity_factor': 1.25,
+                   '_capacity_budget': lambda _tokens: 786432, '_gathered_counts': gathered,
+                   '_rank_nodes': (0,) * 16 + (1,) * 16}
+        with (patch.object(routing, 'dist') as distributed,
+              patch.object(routing, 'build_expert_replica_plan', wraps=routing.build_expert_replica_plan) as build):
+            distributed.is_initialized.return_value = True
+            distributed.get_world_size.return_value = 32
+            distributed.get_rank.return_value = 0
+            with forward:
+                first = routing.prepare_replica_route(ids, ExpertReplicaConfig(192, 32, 2), **options)
+            with replay:
+                repeated = routing.prepare_replica_route(ids, ExpertReplicaConfig(192, 32, 2), **options)
+        first.plan.validate()
+        self.assertFalse(first.home_only)
+        self.assertTrue(first.plan.transfers)
+        self.assertLessEqual(max(first.plan.destination_loads), 40000)
+        self.assertTrue(repeated.plan_reused)
+        self.assertIs(first.plan, repeated.plan)
+        self.assertEqual(build.call_count, 1)
+
+
 class TestHeuristicReplicaConsolidation(unittest.TestCase):
     """Remove complete matrix transfers without raising receive peaks or the traffic budget."""
 
