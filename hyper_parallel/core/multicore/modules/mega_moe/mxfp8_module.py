@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 from functools import cached_property
+import os
 
 import torch
 import torch.distributed as dist
@@ -256,6 +257,8 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             raise ValueError("MXFP8 overlap_weights must be a boolean.")
         if overlap_weights and replica_transport != "shmem_signal_kernel_gradient":
             raise ValueError("MXFP8 projection prefetch requires the symmetric FP32 gradient inbox.")
+        if overlap_weights and os.environ.get("HCCL_OP_EXPANSION_MODE") != "AICPU_CacheDisable":
+            raise ValueError("MXFP8 projection prefetch requires HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable.")
         config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_planner = "cpu"
         self.replica_min_rows = replica_min_rows

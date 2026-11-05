@@ -15,6 +15,7 @@
 """Projection weight readiness preserves exact bytes, queue ownership and lease joins."""
 
 from dataclasses import replace
+import os
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -144,3 +145,8 @@ class TestMXFP8Prefetch(unittest.TestCase):
             MXFP8MegaMoeExperts(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
                                num_experts=24, top_k=8, ep_size=4, replica_slots_per_rank=2,
                                overlap_weights=True)
+        with mock.patch.dict(os.environ, {"HCCL_OP_EXPANSION_MODE": "AIV"}):
+            with self.assertRaisesRegex(ValueError, "AICPU_CacheDisable"):
+                MXFP8MegaMoeExperts(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
+                                   num_experts=24, top_k=8, ep_size=4, replica_slots_per_rank=2,
+                                   replica_transport="shmem_signal_kernel_gradient", overlap_weights=True)
