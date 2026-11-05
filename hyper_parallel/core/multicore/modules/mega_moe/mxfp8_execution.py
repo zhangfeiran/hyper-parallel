@@ -76,6 +76,26 @@ def _use_row_only(spec: Any, retain_backward: bool) -> bool:
     return spec.mx_swiglu_row_only and not retain_backward
 
 
+def _empty_expert_ranges(counts: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
+    """Return maximal empty expert intervals without reading device state.
+
+    Args:
+        counts: Exact CPU row totals in physical expert order.
+
+    Returns:
+        Consecutive half-open ranges containing only zero-row experts.
+    """
+    ranges, start = [], None
+    for expert in range(len(counts) + 1):
+        if expert < len(counts) and counts[expert] == 0:
+            if start is None:
+                start = expert
+        elif start is not None:
+            ranges.append((start, expert))
+            start = None
+    return tuple(ranges)
+
+
 def _unpermute_mx_output(expert_output: torch.Tensor, mapping: torch.Tensor, probs: torch.Tensor,
                          routed_buffer: torch.Tensor, require_owned: bool) -> tuple[torch.Tensor, torch.Tensor]:
     """Restore tokens while keeping a no-clone checkpoint result independent of workspace reuse."""
@@ -402,15 +422,9 @@ class MXFP8Execution:
                           for weight in weights)
         if not clear_all:
             # Exact CPU quotas avoid another readback. Empty owners must start at zero before guest additions.
-            start = None
-            for expert in range(owners + 1):
-                is_empty = expert < owners and counts[expert] == 0
-                if is_empty and start is None:
-                    start = expert
-                elif not is_empty and start is not None:
-                    for gradient in gradients:
-                        gradient[start:expert].zero_()
-                    start = None
+            for start, end in _empty_expert_ranges(counts):
+                for gradient in gradients:
+                    gradient[start:end].zero_()
         return gradients
 
     def _launch_backward(self, buffers: list[torch.Tensor], events: torch.Tensor, plan: Any,
