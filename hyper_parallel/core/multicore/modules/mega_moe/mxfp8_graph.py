@@ -132,6 +132,9 @@ class _GmmStage:
     w_scale: int
     workers: int
     records: list
+    home_experts: int = 0
+    guest_data_position: int = 0
+    guest_scale_position: int = 0
 
     def fill(self, cfg: Any, op: OperatorNode, tsv: TaskSplitValue) -> None:
         """Populate one task per expert and worker with byte-accurate descriptors.
@@ -142,7 +145,10 @@ class _GmmStage:
             tsv: Current task offsets and per-expert split values.
         """
         indices = []
+        task_start = tsv.pre_task_num
         for expert in range(tsv.single_rank_expert_num):
+            guest = self.home_experts > 0 and expert >= self.home_experts
+            weight_slot = expert - self.home_experts if guest else expert
             for worker in range(self.workers):
                 indices.append(len(self.records))
                 self.records.append(
@@ -152,17 +158,20 @@ class _GmmStage:
                         n=self.n,
                         k=self.k,
                         x_scale_position=self.x_scale,
-                        w_scale_position=self.w_scale,
+                        w_scale_position=self.guest_scale_position if guest else self.w_scale,
                         cube_count=self.workers,
                         cube_index=worker,
                         group_list_offset=expert * 8,
-                        w_offset=0 if self.layout == "TN" else expert * self.n * self.k,
-                        w_scale_offset=0 if self.layout == "TN" else expert * self.n * self.k // 32,
+                        w_offset=0 if self.layout == "TN" else weight_slot * self.n * self.k,
+                        w_scale_offset=0 if self.layout == "TN" else weight_slot * self.n * self.k // 32,
                         y_offset=expert * self.m * self.n * 4 if self.layout == "TN" else 0,
                         output_dtype=MX_GMM_OUTPUT_FP32 if self.layout == "TN" else 0,
                     )
                 )
         _fill_compute_stage(cfg, op, tsv, MX_GMM_TASK_TYPE, self.workers, False, indices)
+        if self.home_experts:
+            for index in range(self.home_experts * self.workers, len(indices)):
+                cfg.all_tasks[task_start + index].inputs[1].input_position = self.guest_data_position
 
 
 @dataclass
@@ -304,6 +313,63 @@ def _apply_mx_poll_policy(cfg: Any, policy: str) -> None:
                 task.extra_value_2 = interval
 
 
+def _validate_mx_options(spec: MegaMoeSpec, forward: bool, row_only: bool, expert_window: int) -> None:
+    """Reject unsupported precision and queue combinations before graph construction."""
+    if row_only and not forward:
+        raise ValueError("Row-only SwiGLU is valid only for a forward without saved backward state.")
+    if spec.dispatch_mode != "push" or spec.swiglu_limit is not None:
+        raise ValueError("MXFP8 task graphs currently require push transport and unclamped SwiGLU.")
+    if configured_udma_qp_count() < 16 and spec.mx_vector_policy != "window2":
+        raise ValueError("QP1/QP8 MXFP8 requires the owner-validated window2 queue")
+    roles = spec.mx_vector_policy in ("roles", "roles_ready", "roles_rule", "planned", "window2")
+    if roles and (spec.num_cube_cores != 32 or row_only or expert_window
+                  or spec.dispatch_split != spec.combine_split):
+        raise ValueError("Vector roles require Cube32, dual-axis, equal transport splits and no expert window.")
+
+
+def _validate_dispatch_quant(spec: MegaMoeSpec, row_only: bool, expert_window: int, event_base: int) -> None:
+    """Bound the optional dispatch-quant prototype by its existing event reservation."""
+    if row_only:
+        raise ValueError("Dispatch quant prototype requires the rebuilt dual-axis entry; row-only is not built.")
+    if expert_window or spec.mx_vector_policy not in ("roles", "roles_rule", "planned") or spec.dispatch_split % 64:
+        raise ValueError(
+            "Dispatch quant requires roles, roles_rule or planned, no expert window and a 64-row aligned split."
+        )
+    fragments = spec.local_num_tokens // spec.dispatch_split
+    if event_base + spec.local_experts * (fragments + 1) + ATOMIC_ADD_VALUE_LEN > MIN_EVENT_CAPACITY:
+        raise ValueError("Dispatch quant exceeds the existing event budget; SHMEM expansion is forbidden.")
+
+
+def _revise_mx_task_queue(cfg: Any, values: TaskSplitValue, graph: ComputeGraph, order: list[str]) -> None:
+    """Count vector mathematics separately from dispatch and combine queue work."""
+    middle_vectors = sum(
+        graph.get_op(name).task_num
+        for name in order
+        if name not in ("dispatch", "combine") and graph.get_op(name).op_type == OpType.SWIGLU
+    )
+    revise_task_queue(cfg, values, graph.get_op("dispatch").task_num,
+                      middle_vectors, graph.get_op("combine").task_num)
+
+
+def _configure_mx_vector_policy(cfg: Any, graph: ComputeGraph, spec: MegaMoeSpec, forward: bool,
+                                transport_schedule: str) -> str:
+    """Apply the selected existing queue policy without changing its event contract."""
+    _apply_mx_poll_policy(cfg, spec.mx_poll_policy)
+    if spec.mx_vector_policy in ("roles", "roles_ready", "roles_rule", "planned", "window2"):
+        configure_vector_roles(cfg, graph, ready=spec.mx_vector_policy == "roles_ready", forward=forward)
+        transport_schedule = spec.mx_vector_policy + ": odd communication, even mathematics, no padding"
+    if spec.mx_vector_policy == "roles_rule":
+        configure_rule_stages(cfg, graph, forward=forward)
+        transport_schedule = "roles_rule: explicit ready heads, fair dispatch/combine"
+    if spec.mx_vector_policy == "planned":
+        configure_planned_queue(cfg, spec, forward=forward)
+        transport_schedule = "planned CSR: fixed odd communication, arbitrary AIV mathematics"
+    if spec.mx_vector_policy == "window2":
+        configure_window_queue(cfg, graph, spec, forward=forward)
+        transport_schedule = "window2 CSR: odd communication, even math, two-expert Cube lookahead"
+    return transport_schedule
+
+
 def build_mxfp8_runtime(
     spec: MegaMoeSpec,
     *,
@@ -317,18 +383,8 @@ def build_mxfp8_runtime(
     Args:
         spec: Validated physical expert topology and current capacity.
     """
-    if swiglu_row_only and not forward:
-        raise ValueError("Row-only SwiGLU is valid only for a forward without saved backward state.")
-    if spec.dispatch_mode != "push" or spec.swiglu_limit is not None:
-        raise ValueError("MXFP8 task graphs currently require push transport and unclamped SwiGLU.")
-    if configured_udma_qp_count() < 16 and spec.mx_vector_policy != "window2":
-        raise ValueError("QP1/QP8 MXFP8 requires the owner-validated window2 queue")
-    role_policy = spec.mx_vector_policy in ("roles", "roles_ready", "roles_rule", "planned", "window2")
+    _validate_mx_options(spec, forward, swiglu_row_only, expert_window)
     ready_policy = spec.mx_vector_policy == "roles_ready"
-    if role_policy and (
-        spec.num_cube_cores != 32 or swiglu_row_only or expert_window or spec.dispatch_split != spec.combine_split
-    ):
-        raise ValueError("Vector roles require Cube32, dual-axis, equal transport splits and no expert window.")
     values = _MXTaskValues(
         tp=1,
         ep=spec.ep_size,
@@ -346,14 +402,7 @@ def build_mxfp8_runtime(
     fragments = spec.local_num_tokens // spec.dispatch_split
     event_base = (values.all_event_num + 3 + 2 * ATOMIC_ADD_VALUE_LEN + 15) // 16 * 16
     if dispatch_quant:
-        if swiglu_row_only:
-            raise ValueError("Dispatch quant prototype requires the rebuilt dual-axis entry; row-only is not built.")
-        if expert_window or spec.mx_vector_policy not in ("roles", "roles_rule", "planned") or spec.dispatch_split % 64:
-            raise ValueError(
-                "Dispatch quant requires roles, roles_rule or planned, no expert window and a 64-row aligned split."
-            )
-        if event_base + spec.local_experts * (fragments + 1) + ATOMIC_ADD_VALUE_LEN > MIN_EVENT_CAPACITY:
-            raise ValueError("Dispatch quant exceeds the existing event budget; SHMEM expansion is forbidden.")
+        _validate_dispatch_quant(spec, swiglu_row_only, expert_window, event_base)
 
     def quant(name: str, kind: int, columns: int, inputs: list[int], outputs: list[int], first: bool = False) -> None:
         """Add an activation quantization stage and its producer dependencies.
@@ -416,13 +465,22 @@ def build_mxfp8_runtime(
             output: Native business-buffer output position.
             scales: Input and weight scale buffer positions.
         """
+        guest_positions = {}
+        if spec.replica_slots_per_rank and layout != "TN":
+            matrix = 0 if name in ("up", "dx") else 1
+            guest_data = (27 if forward else 33) + 2 * matrix
+            guest_positions = {
+                "home_experts": spec.local_experts - spec.replica_slots_per_rank,
+                "guest_data_position": guest_data,
+                "guest_scale_position": guest_data + 1,
+            }
         _add_compute(
             graph,
             name,
             specs,
             inputs + [glist, gtable],
             [output],
-            _GmmStage(layout, *dims, *scales, cubes, gmms),
+            _GmmStage(layout, *dims, *scales, cubes, gmms, **guest_positions),
             cubes,
         )
 
@@ -472,12 +530,7 @@ def build_mxfp8_runtime(
         op.fill_config.fill(cfg, op, values)
     combine = graph.get_op("combine")
     add_terminate(cfg, values, combine.task_num)
-    middle_vectors = sum(
-        graph.get_op(name).task_num
-        for name in order
-        if name not in ("dispatch", "combine") and graph.get_op(name).op_type == OpType.SWIGLU
-    )
-    revise_task_queue(cfg, values, graph.get_op("dispatch").task_num, middle_vectors, combine.task_num)
+    _revise_mx_task_queue(cfg, values, graph, order)
     reorder_mx_expert_windows(cfg, graph, spec.local_experts, expert_window, forward)
     transport_schedule = balance_all_transport(cfg, graph, spec)
     if dispatch_quant_stage is not None:
@@ -488,25 +541,13 @@ def build_mxfp8_runtime(
     cfg.atomic_add_values[0] = 1
     configure_ready_handshake(cfg, values)
     validate_runtime_config(cfg, values, cubes)
-    _apply_mx_poll_policy(cfg, spec.mx_poll_policy)
-    if role_policy:
-        configure_vector_roles(cfg, graph, ready=ready_policy, forward=forward)
-        transport_schedule = spec.mx_vector_policy + ": odd communication, even mathematics, no padding"
-    if spec.mx_vector_policy == "roles_rule":
-        configure_rule_stages(cfg, graph, forward=forward)
-        transport_schedule = "roles_rule: explicit ready heads, fair dispatch/combine"
-    if spec.mx_vector_policy == "planned":
-        configure_planned_queue(cfg, spec, forward=forward)
-        transport_schedule = "planned CSR: fixed odd communication, arbitrary AIV mathematics"
-    if spec.mx_vector_policy == "window2":
-        configure_window_queue(cfg, graph, spec, forward=forward)
-        transport_schedule = "window2 CSR: odd communication, even math, two-expert Cube lookahead"
+    transport_schedule = _configure_mx_vector_policy(cfg, graph, spec, forward, transport_schedule)
     return MXFP8Runtime(
         graph,
         cfg,
         serialize_mx_gmm_descriptors(gmms),
         serialize_mx_quant_descriptors(quants),
-        27 if forward else 33,
+        len(specs) + 4 * bool(spec.replica_slots_per_rank),
         swiglu_row_only,
         transport_schedule,
     )

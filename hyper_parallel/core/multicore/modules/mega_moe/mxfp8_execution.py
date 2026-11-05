@@ -29,7 +29,7 @@ from .mxfp8_function import MXFP8ForwardState
 from .mxfp8_diagnostics import current_mx_profile_scope, mx_profile_capture_enabled, profile_mx_launch
 from .mxfp8_ops import launch_mxfp8_task_graph, prepare_mxfp8_launch, serialize_mxfp8_launch
 from .mxfp8_weights import MXFP8PhysicalWeight
-from .mxfp8_replica import materialize_replica_weights, reduce_replica_gradients
+from .mxfp8_replica import lease_replica_weights, reduce_replica_gradients
 from .route import prepare_topk_route
 
 
@@ -53,6 +53,16 @@ def _quantized_buffers(rows: int, columns: int, experts: int, device: Any) -> tu
 
 def _use_row_only(spec: Any, retain_backward: bool) -> bool:
     return spec.mx_swiglu_row_only and not retain_backward
+
+
+def _unpermute_mx_output(expert_output: torch.Tensor, mapping: torch.Tensor, probs: torch.Tensor,
+                         routed_buffer: torch.Tensor, require_owned: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """Restore tokens while keeping a no-clone checkpoint result independent of workspace reuse."""
+    probabilities = probs.float().contiguous()
+    output = torch_npu.npu_moe_token_unpermute(expert_output, mapping, probs=probabilities)
+    if require_owned and output.untyped_storage().data_ptr() == routed_buffer.untyped_storage().data_ptr():
+        raise RuntimeError("No-grad MX unpermute output must not alias shared routed storage.")
+    return output, probabilities
 
 
 class MXFP8Execution:
@@ -145,7 +155,6 @@ class MXFP8Execution:
         )
         resources.ensure_capacity(route.maximum_received_slots)
         workspace.ensure(resources.spec, hidden.dtype, hidden.device)
-        row_only = False
         plan = resources.plan_for_capacity(workspace.expert_capacity, hidden.device, home_only=home_only)
         resources.last_execution_plan = plan
         metadata = route.metadata
@@ -156,7 +165,6 @@ class MXFP8Execution:
         )
         up = torch.empty((capacity, 2 * spec.intermediate_size), dtype=torch.bfloat16, device=device)
         down = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
-        weight1, weight2 = materialize_replica_weights((weight1, weight2), self.replica_route, backward=False)
         workspace.claim()
         try:
             buffers = [
@@ -189,21 +197,15 @@ class MXFP8Execution:
                 plan.forward.quant,
             ]
             events = workspace.prepare_event_counters(forward=True)
-            if row_only:
-                self._launch(buffers, plan.forward, events, plan, device, swiglu_row_only=True)
-            else:
+            with lease_replica_weights((weight1, weight2), self.replica_route, backward=False) as guests:
+                buffers.extend(guests)
                 self._launch(buffers, plan.forward, events, plan, device)
             expert_output = workspace.routed_buffer[: route.routed_tokens.shape[0]]
             if retain_backward or not self.nograd_no_clone:
                 expert_output = expert_output.clone()
-            probabilities = probs.float().contiguous()
-            output = torch_npu.npu_moe_token_unpermute(expert_output, route.unpermute_mapping, probs=probabilities)
-            if (
-                self.nograd_no_clone
-                and not retain_backward
-                and output.untyped_storage().data_ptr() == workspace.routed_buffer.untyped_storage().data_ptr()
-            ):
-                raise RuntimeError("No-grad MX unpermute output must not alias shared routed storage.")
+            output, probabilities = _unpermute_mx_output(
+                expert_output, route.unpermute_mapping, probs, workspace.routed_buffer,
+                self.nograd_no_clone and not retain_backward)
             saved = (
                 (
                     x_col,
@@ -281,9 +283,8 @@ class MXFP8Execution:
         grad_probs = torch.empty_like(probs)
         da = torch.empty((capacity, spec.intermediate_size), dtype=torch.bfloat16, device=device)
         dx = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
-        weight1, weight2 = materialize_replica_weights((weight1, weight2), self.replica_route, backward=True)
-        dw1 = torch.zeros(weight1.logical_shape, dtype=torch.float32, device=device)
-        dw2 = torch.zeros(weight2.logical_shape, dtype=torch.float32, device=device)
+        dw1 = torch.zeros((spec.local_experts, *weight1.logical_shape[1:]), dtype=torch.float32, device=device)
+        dw2 = torch.zeros((spec.local_experts, *weight2.logical_shape[1:]), dtype=torch.float32, device=device)
         workspace.claim()
         try:
             multicore_ops.mega_moe_unpermute_grad_out(
@@ -330,7 +331,9 @@ class MXFP8Execution:
                 plan.backward.quant,
             ]
             events = workspace.prepare_event_counters(forward=False)
-            self._launch(buffers, plan.backward, events, plan, device, direction="backward")
+            with lease_replica_weights((weight1, weight2), self.replica_route, backward=True) as guests:
+                buffers.extend(guests)
+                self._launch(buffers, plan.backward, events, plan, device, direction="backward")
             grad_hidden = multicore_ops.moe_token_permute_grad(
                 workspace.routed_buffer[: metadata.source_rows],
                 mapping,

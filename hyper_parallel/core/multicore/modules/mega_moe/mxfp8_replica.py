@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from contextlib import ExitStack, contextmanager
+from typing import Iterator
 
 import torch
 
@@ -26,57 +27,47 @@ from hyper_parallel.core.expert_parallel.hot_replica.transport import prefetch_w
 from .mxfp8_weights import MXFP8PhysicalWeight
 
 
-def materialize_replica_weights(
+@contextmanager
+def lease_replica_weights(
     weights: tuple[MXFP8PhysicalWeight, ...], route: ReplicaRoute | None, *, backward: bool
-) -> tuple[MXFP8PhysicalWeight, ...]:
-    """Append B physical slots without dequantizing or requantizing any axis.
+) -> Iterator[tuple[torch.Tensor, ...]]:
+    """Borrow phase-current guest buffers until the caller submits every consumer.
 
-    Only current-phase axes are exchanged. Forward consumes column weights;
-    backward consumes freshly gathered row weights. Unused axes are dropped
-    from the materialized view while the original FSDP root remains unchanged.
-    Empty slots are zeroed and have no routed rows. The eager transport keeps
-    the existing projected B2 placement policy independent of BF16 kernel ABIs.
+    Home tasks read the original FSDP storage directly. Guest tasks use separate
+    buffers in weight/data-scale order, without copying home matrices. The pool
+    records its consumer-stream event only after the native launch is submitted.
 
     Args:
         weights: Current physical owner weight axes, never cached across FSDP phases.
         route: Immutable replica plan and exact physical dispatch metadata.
     """
-    if route is None or route.home_only:
-        return weights
-    fields = ("row_data", "row_scale") if backward else ("col_data", "col_scale")
-    originals = []
-    for weight in weights:
-        for field in fields:
-            tensor = getattr(weight, field)
-            if tensor is None:
-                raise ValueError(f"MXFP8 replica phase is missing {field}.")
-            originals.append(tensor)
-    aliases = tuple(tensor.view(torch.uint8).reshape(tensor.shape[0], -1) for tensor in originals)
-    config = route.plan.config
-    with prefetch_weights(aliases, route) as pool:
-        active = {
-            item.target_slot - config.home_experts for item in route.plan.transfers if item.target_rank == route.rank
-        }
-        for guest in pool.weights:
-            for slot in range(config.replica_slots_per_rank):
-                if slot not in active:
-                    guest[slot].zero_()
-        assembled = []
-        for tensor, alias, guest in zip(originals, aliases, pool.weights):
-            data = torch.cat((alias, guest), dim=0).view(tensor.dtype)
-            assembled.append(data.reshape((config.home_experts + config.replica_slots_per_rank), *tensor.shape[1:]))
-    result = []
-    for index, weight in enumerate(weights):
-        values = dict.fromkeys(("col_data", "col_scale", "row_data", "row_scale"))
-        values.update(zip(fields, assembled[index * len(fields) : (index + 1) * len(fields)]))
-        result.append(
-            replace(
-                weight,
-                logical_shape=((config.home_experts + config.replica_slots_per_rank), *weight.logical_shape[1:]),
-                **values,
+    with ExitStack() as leases:
+        guests = ()
+        if route is not None and not route.home_only:
+            fields = ("row_data", "row_scale") if backward else ("col_data", "col_scale")
+            originals = []
+            for weight in weights:
+                for field in fields:
+                    tensor = getattr(weight, field)
+                    if tensor is None:
+                        raise ValueError(f"MXFP8 replica phase is missing {field}.")
+                    originals.append(tensor)
+            aliases = tuple(tensor.view(torch.uint8).reshape(tensor.shape[0], -1) for tensor in originals)
+            config = route.plan.config
+            pool = leases.enter_context(prefetch_weights(aliases, route))
+            active = {
+                item.target_slot - config.home_experts
+                for item in route.plan.transfers if item.target_rank == route.rank
+            }
+            for guest in pool.weights:
+                for slot in range(config.replica_slots_per_rank):
+                    if slot not in active:
+                        guest[slot].zero_()
+            guests = tuple(
+                guest.view(tensor.dtype).reshape((config.replica_slots_per_rank, *tensor.shape[1:]))
+                for tensor, guest in zip(originals, pool.weights)
             )
-        )
-    return tuple(result)
+        yield guests
 
 
 def reduce_replica_gradients(
