@@ -26,6 +26,7 @@ import torch
 import torch_npu
 
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
+from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
 
 from .mxfp8_function import MXFP8ForwardState
 from .mxfp8_gradients import lease_mx_gradient_return
@@ -412,7 +413,8 @@ class MXFP8Execution:
         owners = plan.spec.local_experts
         if plan.backward.host.kernel_gradients:
             owners -= plan.spec.replica_slots_per_rank
-        counts = None if route is None else route.plan.destination_counts[route.rank][:owners]
+        cpu_plan = route is not None and isinstance(route.plan, ExpertExecutionPlan)
+        counts = route.plan.destination_counts[route.rank][:owners] if cpu_plan else None
         if counts is not None and len(counts) != owners:
             raise ValueError("MX gradient output geometry exceeds the exact replica destination quotas")
         empty = None if counts is None else tuple(expert for expert, rows in enumerate(counts) if rows == 0)

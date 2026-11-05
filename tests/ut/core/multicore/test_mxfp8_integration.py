@@ -27,6 +27,8 @@ import torch
 from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
+from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
+from hyper_parallel.core.expert_parallel.hot_replica.routing import _HomeOnlyPlan
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_graph import build_mxfp8_runtime
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution import MXFP8Execution
 from hyper_parallel.core.multicore.modules.mega_moe import mxfp8_ops
@@ -80,7 +82,7 @@ class TestMXFP8GradientInitialization(unittest.TestCase):
         Expectation: Only empty home experts are cleared; guest matrices are not allocated.
         """
         counts = (7, 0, 2, 0, 0, 8, 13, 0)
-        route = SimpleNamespace(rank=0, plan=SimpleNamespace(destination_counts=(counts,)))
+        route = SimpleNamespace(rank=0, plan=mock.Mock(spec=ExpertExecutionPlan, destination_counts=(counts,)))
         with mock.patch("hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution.torch.empty",
                         side_effect=lambda shape, **kwargs: torch.full(shape, float("nan"), **kwargs)):
             gradients = MXFP8Execution._weight_gradient_buffers(
@@ -101,7 +103,7 @@ class TestMXFP8GradientInitialization(unittest.TestCase):
         Description: Supply no local rows and observe the allocation primitive.
         Expectation: Full clearing uses two tensors rather than per-expert kernels.
         """
-        route = SimpleNamespace(rank=0, plan=SimpleNamespace(destination_counts=((0,) * 8,)))
+        route = SimpleNamespace(rank=0, plan=mock.Mock(spec=ExpertExecutionPlan, destination_counts=((0,) * 8,)))
         weights = (_physical(6, 64, 128), _physical(6, 128, 64))
         with mock.patch("hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution.torch.zeros",
                         wraps=torch.zeros) as allocate:
@@ -115,7 +117,7 @@ class TestMXFP8GradientInitialization(unittest.TestCase):
         Description: Supply a host quota row shorter than the physical outputs.
         Expectation: Invalid output geometry fails before uninitialized storage is allocated.
         """
-        route = SimpleNamespace(rank=0, plan=SimpleNamespace(destination_counts=((1,),)))
+        route = SimpleNamespace(rank=0, plan=mock.Mock(spec=ExpertExecutionPlan, destination_counts=((1,),)))
         weights = (_physical(6, 64, 128), _physical(6, 128, 64))
         with mock.patch("hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution.torch.empty") as allocate:
             with self.assertRaisesRegex(ValueError, "geometry exceeds"):
@@ -140,7 +142,7 @@ class TestMXFP8GradientInitialization(unittest.TestCase):
                     clears.append(tuple(tensor.shape))
                     return original_zero(tensor)
 
-                route = SimpleNamespace(rank=0, plan=SimpleNamespace(destination_counts=(counts,)))
+                route = SimpleNamespace(rank=0, plan=mock.Mock(spec=ExpertExecutionPlan, destination_counts=(counts,)))
                 with mock.patch.object(torch.Tensor, "zero_", zero), mock.patch(
                         "hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution.torch.empty",
                         side_effect=lambda shape, **kwargs: torch.full(shape, float("nan"), **kwargs)):
@@ -153,6 +155,21 @@ class TestMXFP8GradientInitialization(unittest.TestCase):
                             self.assertTrue(torch.isnan(value[expert]).all().item())
                         else:
                             self.assertEqual(torch.count_nonzero(value[expert]).item(), 0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_compact_home_plan_does_not_read_diagnostic_counts(self) -> None:
+        """Feature: Zero-readback compact home fallback.
+        Description: Forbid the diagnostic CPU conversion on an actual compact home-only plan.
+        Expectation: Gradient initialization uses full clearing without reading device counts.
+        """
+        compact = _HomeOnlyPlan(ExpertReplicaConfig(24, 4, 2), torch.ones(4, 24, dtype=torch.int32), (24,) * 4)
+        route = SimpleNamespace(rank=0, plan=compact, home_only=True)
+        plan = self._plan(False)
+        plan.spec.local_experts = 6
+        weights = (_physical(6, 64, 128), _physical(6, 128, 64))
+        with mock.patch.object(torch.Tensor, "cpu", side_effect=AssertionError("Diagnostic readback is forbidden")):
+            gradients = MXFP8Execution._weight_gradient_buffers(plan, weights, "cpu", route=route)
+        self.assertTrue(all(torch.count_nonzero(value).item() == 0 for value in gradients))
 
 
 class TestMXFP8Integration(unittest.TestCase):
