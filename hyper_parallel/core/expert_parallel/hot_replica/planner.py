@@ -459,13 +459,16 @@ def _materialize(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int
         ExpertExecutionPlan(config, counts, tuple(slot_map), tuple(tuple(row) for row in dispatch)), capacity_limit)
 
 
-def _home_layout(counts, config):
+def _home_layout(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig, *,
+                  _home_counts: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
+                  ) -> tuple[list[int], list[int], list[dict[int, int]]]:
     """Create original owner quotas and rank loads from exact integer counts."""
-    totals = list(map(sum, zip(*counts)))
+    totals = list(map(sum, zip(*counts))) if _home_counts is None else list(_home_counts[0])
     home = config.home_experts
     copies = [{expert: totals[expert] for expert in range(rank * home, (rank + 1) * home)}
               for rank in range(config.ep_size)]
-    return totals, [sum(row.values()) for row in copies], copies
+    loads = [sum(row.values()) for row in copies] if _home_counts is None else list(_home_counts[1])
+    return totals, loads, copies
 
 
 @dataclass(frozen=True)
@@ -665,9 +668,12 @@ def _adaptive_copies(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaC
                      durations: dict[int, tuple[float, float]] | None = None,
                      admission: int = 0, minimum_saved_rows: int = 0,
                      rank_nodes: tuple[int, ...] = (),
+                     *, _home_counts: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
                      ) -> tuple[list[dict[int, int]], tuple[float, float] | None]:
     """Return bounded quotas and their optional (score, optimistic lower bound)."""
-    totals, loads, home = _home_layout(counts, config)
+    # Reuse only this invocation's immutable summaries. Owner dictionaries stay
+    # private because calibrated refinement may mutate a home-only candidate.
+    totals, loads, home = _home_layout(counts, config, _home_counts=_home_counts)
     resident = min(limit, receive_capacity) if receive_capacity is not None else limit
     if model is None:
         selected = _admitted_uncalibrated_copies(totals, loads, config, limit, resident, target,
@@ -979,7 +985,7 @@ def _build_expert_replica_plan(counts_by_source: Sequence[Sequence[int]], replic
         else:
             copies, bounds = _adaptive_copies(counts, config, limit, receive_capacity, cost_model, target,
                                               minimum_replica_rows, durations, admission, minimum_saved_rows,
-                                              rank_nodes)
+                                              rank_nodes, _home_counts=(tuple(expert_counts), tuple(loads)))
         if cost_model is not None:
             copies = refine(copies, bounds)
         has_guests = any(expert // config.home_experts != rank and rows
