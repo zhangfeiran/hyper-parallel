@@ -41,6 +41,8 @@ def record_failure(work: Path, error: BaseException) -> None:
 class BenchmarkControl:
     """Coordinate matched steps without inserting timing collectives into HCCL WORLD."""
 
+    backend = 'tcpstore'
+
     def __init__(self, work: Path) -> None:
         """Use a separate namespace in the static torchrun agent's TCPStore."""
         if not dist.is_initialized():
@@ -53,7 +55,7 @@ class BenchmarkControl:
         self.store = dist.PrefixStore('dsv41/benchmark/',
                                      dist.TCPStore(host, port, None, False, timeout=self.timeout))
         self.step: int | None = None
-        write_json(work / 'benchmark-control.json', dict(backend='tcpstore', timing_device='cpu',
+        write_json(work / 'benchmark-control.json', dict(backend=self.backend, timing_device='cpu',
             timeout_seconds=self.timeout.total_seconds(), training_process_group_unchanged=True,
             world_size=dist.get_world_size(), rank=dist.get_rank()))
 

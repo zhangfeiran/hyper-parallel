@@ -536,6 +536,7 @@ def main() -> None:
     if len(rows) != args.steps:
         raise RuntimeError(f"Incomplete training: {len(rows)} of {args.steps} steps")
     measured = rows[args.warmup_steps:]
+    control_backend = diagnostics.control.backend if diagnostics.control is not None else 'hccl_world'
     result = {"vision_enabled": args.modality == "vlm", **vars(args), "native_lib": str(args.native_lib),
               "rank": rank, "world_size": world,
               "steps_detail": rows, "peak_allocated_bytes": max(row["peak_allocated_bytes"] for row in rows),
@@ -550,7 +551,7 @@ def main() -> None:
               "mega_module_counts": module_counts,
               "complete_guest_search_hits": replica_planner._COMPLETE_GUEST_SEARCH_HITS,
               "attention_module_counts": attention_counts,
-              "benchmark_control_backend": 'gloo' if diagnostics.control is not None else 'hccl_world',
+              "benchmark_control_backend": control_backend,
               "fused_rmsnorm_module_count": fused_norm_count,
               "shmem_state": shmem.debug_state() if experts else None,
               "owner_use_grouped_gemm": args.backend == "owner_ep"}
