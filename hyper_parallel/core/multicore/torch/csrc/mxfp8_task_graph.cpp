@@ -3,9 +3,8 @@
 #include <torch/library.h>
 #include "cached_op_api.h"
 namespace {
-void ExecuteTaskGraph(const hyper_parallel::multicore::CachedOpApi &api, at::TensorList buffers,
-                      const at::Tensor &runtime, const at::Tensor &events, const at::Tensor &diagnostic,
-                      const at::Tensor &launch) {
+void Mxfp8TaskGraph(at::TensorList buffers, const at::Tensor &runtime, const at::Tensor &events,
+                    const at::Tensor &diagnostic, const at::Tensor &launch) {
   TORCH_CHECK(!buffers.empty() && buffers.size() <= 64, "MX graph requires 1..64 buffers");
   for (const auto &buffer : buffers) {
     TORCH_CHECK(buffer.scalar_type() == at::kByte && buffer.is_contiguous() && buffer.dim() == 1,
@@ -19,13 +18,7 @@ void ExecuteTaskGraph(const hyper_parallel::multicore::CachedOpApi &api, at::Ten
   }
   TORCH_CHECK(launch.numel() == 592, "MX launch descriptor must contain 592 bytes");
   int64_t count = buffers.size();
-  hyper_parallel::multicore::execute_cached_op(api, buffers, runtime, events, diagnostic, launch, buffers, count);
-}
-void Mxfp8TaskGraph(at::TensorList buffers, const at::Tensor &runtime, const at::Tensor &events,
-                    const at::Tensor &diagnostic, const at::Tensor &launch) {
-  static const hyper_parallel::multicore::CachedOpApi api("aclnnPanguMxfp8TaskGraph",
-                                                          "aclnnPanguMxfp8TaskGraphGetWorkspaceSize");
-  ExecuteTaskGraph(api, buffers, runtime, events, diagnostic, launch);
+  HYPER_EXEC_NPU_CMD_EXT(aclnnPanguMxfp8TaskGraph, buffers, runtime, events, diagnostic, launch, buffers, count);
 }
 }  // namespace
 TORCH_LIBRARY_FRAGMENT(hyper_parallel, m) {
