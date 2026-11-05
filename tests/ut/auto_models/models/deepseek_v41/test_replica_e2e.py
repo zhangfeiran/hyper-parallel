@@ -163,6 +163,10 @@ class TestReplicaMatrix(unittest.TestCase):
             runner.stages('push_b0,push_b6_repack', complete_guest_comparison=True)
         b6_pair = runner.stages('push_b6,push_b6_repack', complete_guest_comparison=True)
         self.assertEqual([(stage.budget, stage.policy) for stage in b6_pair], [(6, None), (6, 'repack')])
+        with self.assertRaisesRegex(ValueError, 'requires stock Pull B2'):
+            runner.stages('pull_b0,pull_b2_heap2g', complete_guest_comparison=True)
+        heap_pair = runner.stages('pull_b2,pull_b2_heap2g', complete_guest_comparison=True)
+        self.assertEqual([(stage.budget, stage.policy) for stage in heap_pair], [(2, None), (2, 'heap2g')])
 
     def test_selected_commands_parse_into_actual_training_recipe(self) -> None:
         """Feature: Cluster stage reachability.

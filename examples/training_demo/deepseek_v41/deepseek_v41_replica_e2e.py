@@ -77,7 +77,7 @@ def stages(selection: str | None = None, *, schedule_comparison: bool = False,
         matrix += tuple(Stage(backend, 2) for backend in ('native', 'push', 'pull'))
     if complete_guest_comparison:
         matrix += (Stage('push', 2, policy='complete'), Stage('push', 2, policy='complete_repack'),
-                   Stage('push', 6, policy='repack'))
+                   Stage('push', 6, policy='repack'), Stage('pull', 2, policy='heap2g'))
     names = selection.split(',')
     lookup = {stage.name: stage for stage in matrix}
     if not names or len(set(names)) != len(names) or any(name not in lookup for name in names):
@@ -88,6 +88,8 @@ def stages(selection: str | None = None, *, schedule_comparison: bool = False,
         raise ValueError('Repacking comparison requires the same complete layout without repacking')
     if 'push_b6_repack' in names and 'push_b6' not in names:
         raise ValueError('B6 repacking comparison requires stock Push B6 in the same run')
+    if 'pull_b2_heap2g' in names and 'pull_b2' not in names:
+        raise ValueError('Pull heap comparison requires stock Pull B2 in the same run')
     return tuple(lookup[name] for name in names)
 
 
@@ -137,6 +139,7 @@ def command_for(stage: Stage, index: int) -> list[str]:
             'HYPER_PARALLEL_REPLICA_CALIBRATION_DIR=',
             'HYPER_PARALLEL_REPLICA_REQUIRE_CALIBRATION=0',
             'HYPER_PARALLEL_REPLICA_COST_MODEL=0',
+            f'HYPER_PARALLEL_SHMEM_HEAP_SIZE={2**31 if stage.policy == "heap2g" else 2**32}',
             'HYPER_PARALLEL_REPLICA_PROJECTED_GUEST_SEARCH=0',
             f'HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH={int(stage.policy in ("complete", "complete_repack"))}',
             f'HYPER_PARALLEL_SHMEM_FIXED_HEAP_REPACK={int(stage.policy in ("repack", "complete_repack"))}',
@@ -389,6 +392,12 @@ def publish(root: Path, matrix: tuple[Stage, ...], nodes: int, cards: int) -> di
                 folder, folder / 'nodes', nodes, cards, int(os.environ['TRAIN_ITERS']),
                 int(os.environ['WARMUP_STEPS']), stage.backend)
             cases[stage.name] = {**item, 'initialization_sha256': _identity(folder, stage, nodes, cards)}
+            if stage.policy == 'heap2g':
+                outputs = (folder / stage.backend / f'rank{rank}' / 'result.json' for rank in range(nodes * cards))
+                sizes = [json.loads(path.read_text())['shmem_state']['config']['heap_size_bytes'] for path in outputs]
+                if sizes != [2**31] * (nodes * cards):
+                    raise ValueError('Pull heap comparison did not use 2 GiB on every rank')
+                cases[stage.name]['verified_heap_bytes'] = 2**31
             if os.environ.get('REPLICA_SCHEDULE_E2E') == '1':
                 cases[stage.name]['runtime_graph'] = _graph_identity(folder, stage, nodes)
             if stage.policy in ('heuristic', 'calibrated'):
@@ -414,7 +423,7 @@ def publish(root: Path, matrix: tuple[Stage, ...], nodes: int, cards: int) -> di
             baselines += ('push_b2', 'push_b6')
             if stage.policy == 'complete_repack':
                 baselines += ('push_b2_complete',)
-        elif stage.policy == 'repack':
+        elif stage.policy in ('repack', 'heap2g'):
             baselines += (Stage(stage.backend, stage.budget).name,)
         for baseline in dict.fromkeys(baselines):
             if baseline == stage.name or baseline not in cases:
