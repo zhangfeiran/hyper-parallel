@@ -175,6 +175,15 @@ class _RecomputedReplicaPlans:
         return plan if plan is not None and signature == expected and counts == plan.logical_counts else None
 
 
+def _has_home_recompute_hint() -> bool:
+    """Hint local permutation overlap without consuming or trusting fresh routes."""
+    state = get_recompute_state()
+    if state is None or not state.is_recomputing:
+        return False
+    cache = state.get_resource(_RecomputedReplicaPlans, _RecomputedReplicaPlans)
+    return cache.cursor < len(cache.entries) and cache.entries[cache.cursor][1] is None
+
+
 def _record_home_decision(decision: _RejectedReplicaQuotas | None = None) -> None:
     """Preserve replay ordering even when a call never enters the CPU planner."""
     state = get_recompute_state()

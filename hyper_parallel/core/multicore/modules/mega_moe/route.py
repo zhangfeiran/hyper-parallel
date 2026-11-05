@@ -26,7 +26,9 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, _replica_count_payload
+from hyper_parallel.core.expert_parallel.hot_replica.routing import (
+    ReplicaRoute, _has_home_recompute_hint, _replica_count_payload,
+)
 
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
@@ -565,11 +567,13 @@ def _prepare_dynamic_route(
         workspace.wait_for_reuse()
     gathered, work = (_start_dynamic_gather(payload, spec) if payload is not None
                       else (replica_route.counts_by_source, None))
-    # Ordinary Push overlaps the count exchange. Replica admission waits so a
-    # physical rewrite never requires a second expanded-token permutation.
+    # A trusted home replay can overlap local permutation with count exchange.
+    # Fresh agreement and admission remain authoritative. A changed physical
+    # placement discards this local result before remote publication.
     permuted = (_permute_topk_input(hidden_states, topk_ids)
                 if spec.auto_tokens and spec.dispatch_mode == "push" and not invalid
-                and select_replica_route is None else None)
+                and (select_replica_route is None
+                     or (supplied_counts is not None and _has_home_recompute_hint())) else None)
     summary, host_rows = None, None
     if spec.auto_tokens:
         if work is not None:

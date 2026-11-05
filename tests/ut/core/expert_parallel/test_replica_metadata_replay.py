@@ -79,6 +79,28 @@ class TestReplicaMetadataReplay(unittest.TestCase):
         return routing._plan_replica_route(self.counts if counts is None else counts, self.config, self.group, 0,
                                           **(self.options | changes))
 
+    def test_home_hint_is_replay_local_and_does_not_consume_records(self) -> None:
+        """A home hint predicts local work without replacing the fresh plan guard."""
+        self.assertFalse(routing._has_home_recompute_hint())
+        forward, replay = create_recompute_contexts()
+        with forward:
+            routing._record_home_decision()
+            self.assertFalse(routing._has_home_recompute_hint())
+        with replay:
+            self.assertTrue(routing._has_home_recompute_hint())
+            self.assertTrue(routing._has_home_recompute_hint())
+            routing._record_home_decision()
+            self.assertFalse(routing._has_home_recompute_hint())
+        self.assertFalse(routing._has_home_recompute_hint())
+
+    def test_hot_plan_is_not_a_home_hint(self) -> None:
+        """An existing expert plan cannot trigger speculative home permutation."""
+        forward, replay = create_recompute_contexts()
+        with forward:
+            self._plan()
+        with replay:
+            self.assertFalse(routing._has_home_recompute_hint())
+
     def test_replay_reuses_storage_and_remaps_current_ids(self) -> None:
         """Feature: Exact metadata hit.
         Description: Replay the same counts with a different per-token ordering.
