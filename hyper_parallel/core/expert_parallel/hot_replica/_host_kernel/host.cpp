@@ -70,25 +70,27 @@ PyObject *ValidateCounts(PyObject *, PyObject *rows) {
   Py_RETURN_TRUE;
 }
 
+bool ExactSequence(PyObject *value) { return PyTuple_CheckExact(value) || PyList_CheckExact(value); }
+
 bool ColumnShape(PyObject *rows, Py_ssize_t *width) {
-  if (!PyTuple_CheckExact(rows) || PyTuple_GET_SIZE(rows) == 0) return false;
-  PyObject *first = PyTuple_GET_ITEM(rows, 0);
-  if (!PyTuple_CheckExact(first) || PyTuple_GET_SIZE(first) == 0) return false;
-  *width = PyTuple_GET_SIZE(first);
+  if (!ExactSequence(rows) || PySequence_Fast_GET_SIZE(rows) == 0) return false;
+  PyObject *first = PySequence_Fast_GET_ITEM(rows, 0);
+  if (!ExactSequence(first) || PySequence_Fast_GET_SIZE(first) == 0) return false;
+  *width = PySequence_Fast_GET_SIZE(first);
   // Reject every malformed row before allocating even the bounded native vector.
-  for (Py_ssize_t rank = 0; rank < PyTuple_GET_SIZE(rows); ++rank) {
-    PyObject *row = PyTuple_GET_ITEM(rows, rank);
-    if (!PyTuple_CheckExact(row) || PyTuple_GET_SIZE(row) != *width) return false;
+  for (Py_ssize_t rank = 0; rank < PySequence_Fast_GET_SIZE(rows); ++rank) {
+    PyObject *row = PySequence_Fast_GET_ITEM(rows, rank);
+    if (!ExactSequence(row) || PySequence_Fast_GET_SIZE(row) != *width) return false;
   }
   return true;
 }
 
 bool SumColumns(PyObject *rows, std::vector<int64_t> *totals) {
-  for (Py_ssize_t rank = 0; rank < PyTuple_GET_SIZE(rows); ++rank) {
-    PyObject *row = PyTuple_GET_ITEM(rows, rank);
+  for (Py_ssize_t rank = 0; rank < PySequence_Fast_GET_SIZE(rows); ++rank) {
+    PyObject *row = PySequence_Fast_GET_ITEM(rows, rank);
     for (size_t column = 0; column < totals->size(); ++column) {
       int64_t count = 0;
-      if (!Integer(PyTuple_GET_ITEM(row, column), &count) ||
+      if (!Integer(PySequence_Fast_GET_ITEM(row, column), &count) ||
           count > std::numeric_limits<int64_t>::max() - (*totals)[column]) return false;
       (*totals)[column] += count;
     }
@@ -311,7 +313,7 @@ PyObject *AbiVersion(PyObject *, PyObject *) { return PyLong_FromLong(3); }
 PyMethodDef methods[] = {
   {"abi_version", AbiVersion, METH_NOARGS, "Return the host primitive ABI version."},
   {"validate_counts", ValidateCounts, METH_O, "Validate a frozen ordinary integer matrix."},
-  {"column_totals", ColumnTotals, METH_O, "Sum exact frozen integer columns within the native signed range."},
+  {"column_totals", ColumnTotals, METH_O, "Sum ordinary tuple/list integer columns within the native signed range."},
   {"rank_compute", RankCompute, METH_VARARGS, "Accumulate exact ordered calibrated expert compute bins."},
   {"ordered_compute", OrderedCompute, METH_VARARGS, "Interpolate ordered guest rows and serially sum home rows."},
   {"materialize_dispatch", ReplicaHost::MaterializeDispatch, METH_VARARGS,
