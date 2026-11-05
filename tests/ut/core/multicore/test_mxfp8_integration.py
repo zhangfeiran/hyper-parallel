@@ -240,6 +240,7 @@ class TestMXFP8Integration(unittest.TestCase):
         self.assertEqual(module.local_experts, 6)
         self.assertEqual(module._resource_group.specification["num_experts"], 512)
         self.assertFalse(module._cost_model_enabled)
+        self.assertIsNotNone(module._rejected_quota_memo)
         self.assertEqual(module.dispatch_split, 512)
         module.close()
 
