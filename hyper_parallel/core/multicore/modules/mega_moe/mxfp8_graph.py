@@ -68,6 +68,9 @@ from .mxfp8_gradients import configure_mx_gradient_helpers
 
 
 _MX_GMM_PREZEROED_OUTPUT = 2
+MX_PROJECTION_READY_MASK = 0x0000FFFF
+MX_READY_DEPTH8 = 0x00010000
+MX_READY_DEPTH1 = 0x00020000
 
 
 @dataclass
@@ -331,7 +334,7 @@ def _validate_mx_options(spec: MegaMoeSpec, forward: bool, row_only: bool, exper
     if configured_udma_qp_count() < 16 and spec.mx_vector_policy != "window2":
         raise ValueError("QP1/QP8 MXFP8 requires the owner-validated window2 queue")
     roles = spec.mx_vector_policy in ("roles", "roles_ready", "roles_rule", "planned", "window2")
-    if roles and (spec.num_cube_cores != 32 or row_only or expert_window
+    if roles and (spec.num_cube_cores != 32 or (row_only and spec.mx_vector_policy != "window2") or expert_window
                   or spec.dispatch_split != spec.combine_split):
         raise ValueError("Vector roles require Cube32, dual-axis, equal transport splits and no expert window.")
 
@@ -427,6 +430,23 @@ def _finish_mx_runtime(graph: ComputeGraph, cfg: Any, gmms: list, quants: list, 
                         ready_buffer + prefetch, row_only, schedule, gradients, prefetch)
 
 
+def _configure_mx_ready_depth(config: Any, depth: int) -> None:
+    """Keep the projection-ready buffer code while marking bounded math lookahead."""
+    if not depth:
+        return
+    if config.task_index_num[0] // 32 > 64 or any(
+            config.mix_task_indices[worker + 1] - config.mix_task_indices[worker] > 64
+            for worker in range(0, 64, 2)):
+        raise ValueError("Ready math queues support at most 64 tasks per worker.")
+    flag = MX_READY_DEPTH8 if depth == 8 else MX_READY_DEPTH1
+    for task in config.all_tasks[:config.task_num]:
+        if task.task_type in (MX_GMM_TASK_TYPE, MX_QUANT_TASK, MX_SWIGLU_TASK,
+                              MX_SWIGLU_GRAD_TASK, MX_SWIGLU_ROW_TASK):
+            if task.extra_value_1 & ~MX_PROJECTION_READY_MASK:
+                raise ValueError("MX task flags overlap the projection-ready buffer code.")
+            task.extra_value_1 |= flag
+
+
 def build_mxfp8_runtime(
     spec: MegaMoeSpec,
     *,
@@ -435,6 +455,7 @@ def build_mxfp8_runtime(
     expert_window: int = 0,
     dispatch_quant: bool = False,
     weight_prefetch: bool = False,
+    ready_depth: int = 0,
 ) -> MXFP8Runtime:
     """Serialize phase-specific MX tasks with per-expert producer/consumer events.
 
@@ -445,6 +466,8 @@ def build_mxfp8_runtime(
     ready_policy = spec.mx_vector_policy == "roles_ready"
     kernel_gradients = _mx_gradient_return(spec, forward)
     weight_prefetch = bool(weight_prefetch and spec.replica_slots_per_rank)
+    if ready_depth not in (0, 1, 8) or (ready_depth and spec.mx_vector_policy != "window2"):
+        raise ValueError("Ready depth must be 0, 1 or 8 on window2.")
     values = _MXTaskValues(
         tp=1,
         ep=spec.ep_size,
@@ -594,5 +617,7 @@ def build_mxfp8_runtime(
     configure_ready_handshake(cfg, values)
     validate_runtime_config(cfg, values, cubes)
     transport_schedule = _configure_mx_vector_policy(cfg, graph, spec, forward, transport_schedule)
-    return _finish_mx_runtime(graph, cfg, gmms, quants, len(specs), spec,
-                              swiglu_row_only, transport_schedule, kernel_gradients, weight_prefetch)
+    runtime = _finish_mx_runtime(graph, cfg, gmms, quants, len(specs), spec,
+                                swiglu_row_only, transport_schedule, kernel_gradients, weight_prefetch)
+    _configure_mx_ready_depth(cfg, ready_depth)
+    return runtime

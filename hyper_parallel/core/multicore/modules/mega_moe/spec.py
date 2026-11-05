@@ -84,6 +84,7 @@ class MegaMoeSpec:
     compute_stages: int = 3
     mx_vector_policy: str = "legacy_odd"
     mx_swiglu_row_only: bool = False
+    mx_ready_depth: int = 0
     mx_poll_policy: str = "0"
     mx_schedule_dir: str = ""
 
@@ -271,6 +272,8 @@ def bind_mega_moe_spec(
         replica_slots_per_rank=specification.get("replica_slots_per_rank", 0),
         compute_stages=specification.get("compute_stages", 3),
         mx_vector_policy=specification.get("mx_vector_policy", "legacy_odd"),
+        mx_swiglu_row_only=specification.get("mx_swiglu_row_only", False),
+        mx_ready_depth=specification.get("mx_ready_depth", 0),
         mx_poll_policy=specification.get("mx_poll_policy", "0"),
         replica_transport=specification.get("replica_transport", "shmem_signal_kernel_gradient_bands"),
         top_k=top_k,

@@ -578,6 +578,29 @@ CURRENT_REASON_CODE="CANN_VENDOR_MERGE_FAILED"
 
 CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
 validate_multicore_vendor "${VENDOR_ROOT}" "${CANN_SOC_LIST}"
+"${PYTHON_BIN}" - "${VENDOR_ROOT}" "${OUTPUT_ROOT}" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import sys
+
+vendor, output = map(Path, sys.argv[1:])
+kernels = vendor / 'op_impl/ai_core/tbe/kernel/ascend950/pangu_mxfp8_task_graph'
+if kernels.is_dir():
+    objects = list(kernels.glob('*.o'))
+    if len(objects) != 1:
+        raise RuntimeError(f'Expected one MXFP8 primary object, found {objects}')
+    binary = objects[0]
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    metadata = json.loads(binary.with_suffix('.json').read_text())
+    if metadata.get('sha256') != digest:
+        raise RuntimeError(f'MXFP8 kernel metadata does not match {binary}')
+    receipt = {'schema': 7, 'object': binary.name, 'sha256': digest,
+               'features': ['nograd_row_only', 'ready_math']}
+    target = output / 'capabilities/mxfp8_window.json'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(receipt, indent=2) + '\n')
+PY
 cp "${PROJECT_ROOT}/hyper_parallel/core/multicore/set_env.bash" "${OUTPUT_ROOT}/set_env.bash"
 
 export HP_MULTICORE_VENDOR_ROOT="${VENDOR_ROOT}"

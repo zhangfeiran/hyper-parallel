@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -55,6 +55,7 @@ class MegaKernelDiagnostics:
     def launch(
         self, parameters: Sequence[torch.Tensor | None], *, direction: str,
         fallback_event_counters: torch.Tensor | None = None,
+        tags: Mapping[str, str] | None = None,
     ) -> DiagnosticCall:
         """Select exactly one tool, or return an ordinary no-op context.
 
@@ -65,8 +66,14 @@ class MegaKernelDiagnostics:
             parameters: Complete native ABI bindings for this invocation.
             direction: Forward or backward invocation direction.
             fallback_event_counters: Existing execution-owned event counters, if any.
+            tags: String metadata copied per invocation, independently of shared runtime plans.
         """
-        context = LaunchContext(self._runtime, parameters, direction, fallback_event_counters)
+        if tags is not None and (not isinstance(tags, Mapping)
+                                 or any(not isinstance(key, str) or not isinstance(value, str)
+                                        for key, value in tags.items())):
+            raise ValueError("diagnostic tags must map strings to strings")
+        context = LaunchContext(self._runtime, parameters, direction, fallback_event_counters,
+                                dict(tags) if tags else None)
         session = _get_active_session()
         if session is None or not session.is_capture_enabled():
             return DiagnosticCall(context.ordinary_arguments())

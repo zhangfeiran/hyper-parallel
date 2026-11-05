@@ -115,10 +115,13 @@ class MXFP8Execution:
             serialize_launch = partial(serialize_launch, weight_prefetch=True)
         if mx_profile_capture_enabled():
             scope = current_mx_profile_scope()
+            if direction != "forward" and scope is None:
+                scope = self._profile_scope
+            if plan.spec.mx_ready_depth:
+                scope = dict(scope or {}, ready_depth=str(plan.spec.mx_ready_depth),
+                             ready_scan_wait="unrecorded_scheduler_gap")
             if direction == "forward":
                 self._profile_scope = scope
-            elif scope is None:
-                scope = self._profile_scope
             if scope is not None and direction == "backward":
                 scope = {**scope, "phase": "backward"}
             profile_mx_launch(
@@ -165,7 +168,10 @@ class MXFP8Execution:
         )
         resources.ensure_capacity(route.maximum_received_slots)
         workspace.ensure(resources.spec, hidden.dtype, hidden.device)
-        plan = resources.plan_for_capacity(workspace.expert_capacity, hidden.device, home_only=home_only)
+        row_only = _use_row_only(spec, retain_backward)
+        plan = resources.plan_for_capacity(
+            workspace.expert_capacity, hidden.device, home_only=home_only, swiglu_row_only=row_only
+        )
         resources.last_execution_plan = plan
         metadata = route.metadata
         capacity, device = metadata.expert_capacity, hidden.device

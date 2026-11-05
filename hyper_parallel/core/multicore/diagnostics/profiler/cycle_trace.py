@@ -37,6 +37,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
 from hyper_parallel.core.multicore.diagnostics.common.graph import _scheduled_task_ids
 from hyper_parallel.core.multicore.diagnostics.common.runtime import DiagnosticMode, PreparedDiagnosticRuntime
 from hyper_parallel.core.multicore.scheduler.runtime import runtime_cube_worker_capacity
+from hyper_parallel.core.multicore.scheduler.planned_queue import PLANNED_QUEUE_TAG
 
 CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
 VECTOR_SLOT_COUNT = NUM_WORKERS_VECTOR
@@ -300,6 +301,21 @@ def _calculate_event_driven_profile_layout(
         int(runtime_config.task_index_num[1]),
         num_workers // vector_worker_stride,
     )
+    if int(runtime_config.task_index_num[3]) == PLANNED_QUEUE_TAG:
+        scheduled = int(runtime_config.task_index_num[1])
+        if len(runtime_config.mix_task_indices) < num_workers + 1:
+            raise ValueError("planned vector queue offsets exceed RuntimeConfig capacity")
+        offsets = [int(runtime_config.mix_task_indices[worker]) for worker in range(num_workers + 1)]
+        if (offsets[0] != 0 or offsets[-1] != scheduled
+                or any(start < 0 or start > end or end > scheduled
+                       for start, end in zip(offsets, offsets[1:]))):
+            raise ValueError("planned vector queue offsets must cover the scheduled tasks monotonically")
+        # Planned workers consume contiguous CSR slices rather than round-robin indices.
+        aiv_required_records = max((
+            sum(_records_for_task(runtime_config.all_tasks[runtime_config.vector_task_indices[position]])
+                for position in range(start, end))
+            for start, end in zip(offsets, offsets[1:])
+        ), default=0)
     # Reserved gradient workers bypass the task queue and record both projections.
     aic_required_records += producer_records + 2
     aiv_required_records = max(aiv_required_records, replica_gradient_records) + 2

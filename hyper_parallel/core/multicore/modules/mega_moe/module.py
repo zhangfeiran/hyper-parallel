@@ -325,7 +325,7 @@ class _MegaMoeExecutionResources:
                   "_replica_cost_model_enabled", "_replica_critical_path_identity",
                   "replica_slots_per_rank", "replica_transport", "forward_ingress_mode", "backward_ingress_mode",
                   "shared_intermediate_size", "shared_placement", "forward_shared_expert", "backward_shared_expert",
-                  "compute_stages", "mx_vector_policy", "mx_poll_policy")
+                  "compute_stages", "mx_vector_policy", "mx_poll_policy", "mx_swiglu_row_only", "mx_ready_depth")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v4", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications),

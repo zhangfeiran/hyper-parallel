@@ -28,6 +28,7 @@ from hyper_parallel.core.multicore.diagnostics.common.session import _reset_acti
 from hyper_parallel.core.multicore.diagnostics import DiagnosticAction, schedule
 from hyper_parallel.core.multicore.diagnostics.profiler import api as torch_profiler
 from hyper_parallel.core.multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments
+from hyper_parallel.core.multicore.diagnostics.api import MegaKernelDiagnostics
 from hyper_parallel.core.multicore.diagnostics.common.session import _get_active_session
 from hyper_parallel.core.multicore.torch import ops as multicore_adapter
 from tests.common.mark_utils import arg_mark
@@ -223,6 +224,49 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
     def tearDown(self) -> None:
         """Reset the process-local diagnostic session after each test."""
         _reset_active_session_for_test()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_launch_tags_survive_independent_invocations_and_export(self) -> None:
+        """Feature: Independent launch provenance tags.
+        Description: Export two profiled calls while mutating the caller's original mapping.
+        Expectation: Both invocation and event records retain their original owned tags.
+        """
+        runtime = _FakeRuntime()
+        runtime.parameter_count = 1
+        diagnostics = MegaKernelDiagnostics(runtime)
+        profiler = torch_profiler.mega_kernel_profile(max_pending_calls=32)
+        profiler._profile_runtimes[runtime] = runtime
+        expected = [{"layer": "2", "phase": "forward"}, {"layer": "7", "phase": "backward"}]
+        buffers = [_FakeProfileBuffer(b"1000"), _FakeProfileBuffer(b"1100")]
+        with patch.object(torch_profiler.torch, "npu", _FakeNpu()), \
+                patch.object(torch_profiler.torch, "empty", side_effect=buffers):
+            with profiler:
+                for tags in expected:
+                    supplied = dict(tags)
+                    with diagnostics.launch([None], direction=tags["phase"], tags=supplied):
+                        supplied["layer"] = "mutated"
+                profiler.step()
+        with tempfile.TemporaryDirectory() as directory:
+            trace = profiler.export_chrome_trace(Path(directory) / "trace.json")
+        self.assertEqual([x["tags"] for x in trace["megaKernelCycleTrace"]["invocations"]], expected)
+        events = [x for x in trace["traceEvents"] if x["ph"] == "X"]
+        self.assertEqual([x["args"]["tags"] for x in events], expected)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_launch_tags_validate_strings_without_allocating_device_storage(self) -> None:
+        """Feature: Profiler launch tag validation.
+        Description: Supply invalid mappings and a valid inactive diagnostic call.
+        Expectation: Invalid mappings fail early and the inactive call allocates no device storage.
+        """
+        runtime = _FakeRuntime()
+        diagnostics = MegaKernelDiagnostics(runtime)
+        for tags in (["layer"], {1: "layer"}, {"layer": {"nested": 1}}):
+            with self.subTest(tags=tags), self.assertRaisesRegex(ValueError, "tags"):
+                diagnostics.launch([], direction="forward", tags=tags)
+        with patch.object(torch_profiler.torch, "empty") as allocation:
+            call = diagnostics.launch([], direction="forward", tags={"layer": "3"})
+        self.assertEqual(call.runtime_config, runtime.normal_tensor)
+        allocation.assert_not_called()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

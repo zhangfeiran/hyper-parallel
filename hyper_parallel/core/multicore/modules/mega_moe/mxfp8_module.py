@@ -39,6 +39,7 @@ from .mxfp8_function import execute_mxfp8_experts
 from .mxfp8_graph import build_mxfp8_runtime
 from .mxfp8_gradients import mx_projection_events
 from .mxfp8_prefetch import MXProjectionPrefetch
+from .mxfp8_ops import require_mxfp8_window_feature
 from .mxfp8_weights import MXFP8ExpertWeightBinding
 from .spec import bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace
@@ -127,6 +128,16 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         self.home_plan = self.last_execution_plan = None
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
+
+        def validate_features() -> None:
+            """Check the selected binary before creating symmetric resources."""
+            if self.spec.mx_ready_depth:
+                require_mxfp8_window_feature("ready_math")
+            if self.spec.mx_swiglu_row_only:
+                require_mxfp8_window_feature("nograd_row_only")
+
+        if self.spec.mx_ready_depth or self.spec.mx_swiglu_row_only:
+            _collective.collective_call(validate_features, stage="MXFP8 window capabilities", group=self.spec.ep_group)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
         added = self.heap_manager.reserve(reservations, allow_resize=True)
@@ -158,6 +169,8 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             "mxfp8_v1",
             self.spec.mx_vector_policy,
             self.spec.mx_poll_policy,
+            self.spec.mx_swiglu_row_only,
+            self.spec.mx_ready_depth,
             self.spec.compute_stages,
             self.weight_prefetch is not None,
         )
@@ -173,14 +186,16 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         if any(value != flags for value in gathered):
             raise ValueError("MXFP8 projection-prefetch configuration differs across expert ranks")
 
-    def plan_for_capacity(self, capacity: int, device: Any, *, home_only: bool = False) -> _MXFP8Plan:
+    def plan_for_capacity(
+        self, capacity: int, device: Any, *, home_only: bool = False, swiglu_row_only: bool = False
+    ) -> _MXFP8Plan:
         """Cache pointer-free MX plans against the current symmetric receive bound.
 
         Args:
             capacity: Current symmetric receive-row bound.
             device: Device owning execution and diagnostic storage.
         """
-        key = (capacity, home_only)
+        key = (capacity, home_only, swiglu_row_only)
         selected = self.home_spec if home_only else self.spec
         if selected is None:
             raise ValueError("MX home-only graph does not fit the physical event layout.")
@@ -188,10 +203,12 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             spec = replace(selected, receive_capacity=capacity)
             self._plans[key] = _MXFP8Plan(
                 spec,
-                _device_runtime(build_mxfp8_runtime(spec, forward=True,
-                                                   weight_prefetch=self.weight_prefetch is not None), device, spec),
-                _device_runtime(build_mxfp8_runtime(spec, forward=False,
-                                                   weight_prefetch=self.weight_prefetch is not None), device, spec),
+                _device_runtime(build_mxfp8_runtime(
+                    spec, forward=True, swiglu_row_only=swiglu_row_only, ready_depth=spec.mx_ready_depth,
+                    weight_prefetch=self.weight_prefetch is not None), device, spec),
+                _device_runtime(build_mxfp8_runtime(
+                    spec, forward=False, ready_depth=spec.mx_ready_depth,
+                    weight_prefetch=self.weight_prefetch is not None), device, spec),
             )
         self._plans.move_to_end(key)
         while len(self._plans) > 4:
@@ -259,6 +276,14 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             raise ValueError("MXFP8 projection prefetch requires the symmetric FP32 gradient inbox.")
         if overlap_weights and os.environ.get("HCCL_OP_EXPANSION_MODE") != "AICPU_CacheDisable":
             raise ValueError("MXFP8 projection prefetch requires HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable.")
+        depth = os.environ.get("PANGU_MX_READY_DEPTH", "0")
+        row_only = os.environ.get("PANGU_MX_SWIGLU_ROW_ONLY", "0")
+        if depth not in ("0", "1", "8"):
+            raise ValueError("PANGU_MX_READY_DEPTH must be 0, 1 or 8.")
+        if row_only not in ("0", "1"):
+            raise ValueError("PANGU_MX_SWIGLU_ROW_ONLY must be 0 or 1.")
+        if vector_policy != "window2" and (depth != "0" or row_only == "1"):
+            raise ValueError("MXFP8 ready selection and no-grad row-only require window2.")
         config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_planner = "cpu"
         self.replica_min_rows = replica_min_rows
@@ -288,6 +313,8 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             "auto_tokens": False,
             "compute_stages": 6,
             "mx_vector_policy": vector_policy,
+            "mx_swiglu_row_only": row_only == "1",
+            "mx_ready_depth": int(depth),
             "mx_poll_policy": "0",
             "_replica_cost_model_enabled": False,
         }

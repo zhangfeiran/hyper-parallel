@@ -5,6 +5,7 @@
 #include "kernel_operator.h"
 #include "mx_gmm_descriptor.h"
 #include "mx_launch_descriptor.h"
+#include "mx_task_flags.h"
 #include "mx_a5_policy.h"
 #include "mx_blaze/gemm/block/block_mmad_qgmm_mx.h"
 #include "mx_blaze/gemm/kernel/kernel_qgmm_mx.h"
@@ -153,11 +154,12 @@ __aicore__ inline MxWeightReady ResolveMxWeightReady(const Task &task, const MxG
 template <class Task>
 __aicore__ inline void WaitMxWeightProjection(const Task &task, const MxGmmDescriptor &r, GM_ADDR *inputs,
                                               const __gm__ MxLaunchDescriptor *launch) {
-  if (task.extra_value_1 == 0) return;
+  const uint32_t position_code = task.extra_value_1 & MX_PROJECTION_READY_MASK;
+  if (position_code == 0) return;
   const bool forward = launch->version == 12 && launch->reserved == 11;
   const bool backward = launch->version == 13 && launch->reserved == 12;
   if ((!forward && !backward) || r.layout == static_cast<uint32_t>(MxLayout::TN)) AscendC::Trap();
-  const uint32_t position = task.extra_value_1 - 1;
+  const uint32_t position = position_code - 1;
   if (position >= launch->buffer_count || launch->buffer_bytes[position] != 5 * sizeof(uint64_t)) AscendC::Trap();
   if (r.m == 0 || r.k == 0) return;
   const auto ready = ResolveMxWeightReady(task, r, reinterpret_cast<__gm__ uint64_t *>(inputs[position]), forward);

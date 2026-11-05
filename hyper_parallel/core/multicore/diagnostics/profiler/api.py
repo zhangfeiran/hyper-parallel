@@ -47,6 +47,7 @@ class _RawInvocation:
     step: int
     invocation_id: int
     replica_lease_id: int | None = None
+    tags: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -85,6 +86,8 @@ class _TraceAccumulator:
         })
         if invocation.replica_lease_id is not None:
             self.invocation_metadata[-1]["replicaLeaseId"] = invocation.replica_lease_id
+        if invocation.tags:
+            self.invocation_metadata[-1]["tags"] = dict(invocation.tags)
         self._append_events(trace["traceEvents"], invocation, shift_us)
 
     def _append_events(
@@ -111,6 +114,8 @@ class _TraceAccumulator:
             }
             if invocation.replica_lease_id is not None:
                 copied_event["args"]["replica_lease_id"] = invocation.replica_lease_id
+            if invocation.tags:
+                copied_event["args"]["tags"] = dict(invocation.tags)
             self.trace_events.append(copied_event)
 
 
@@ -143,6 +148,7 @@ class _ProfileCall(DiagnosticCall):
         self.step = step
         self.invocation_id = invocation_id
         self.finished = False
+        self.tags: dict[str, str] = {}
 
     def complete(self) -> None:
         """Mark the direct-write profile buffer as complete after a successful launch."""
@@ -301,7 +307,9 @@ class TorchMegaKernelProfiler:
         if runtime is None:
             runtime = _PreparedProfileRuntime(context.runtime)
             self._profile_runtimes[context.runtime] = runtime
-        return self.acquire_call(runtime, context.fallback_event_counters, context.direction)
+        call = self.acquire_call(runtime, context.fallback_event_counters, context.direction)
+        call.tags = dict(context.tags or {})
+        return call
 
     def acquire_call(
         self,
@@ -426,6 +434,7 @@ class TorchMegaKernelProfiler:
                         step=call.step,
                         invocation_id=call.invocation_id,
                         replica_lease_id=getattr(call, "replica_lease_id", None),
+                        tags=dict(call.tags),
                     )
                 )
             self._release_profile_buffer(call, cache=True)

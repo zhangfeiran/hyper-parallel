@@ -97,18 +97,19 @@ class TestMXFP8Integration(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_preinitialized_tn_rejects_an_older_native_adapter(self) -> None:
         """Feature: MX preinitialized TN output.
-        Description: Reject a native adapter that predates the prezeroed-output contract.
+        Description: Reject adapters predating prezeroed output or packed readiness flags.
         Expectation: An old adapter fails before launch; the matching adapter is accepted.
         """
         mxfp8_ops._load_mxfp8_native.cache_clear()
         try:
             with mock.patch.object(mxfp8_ops, "_load_native"):
+                for version in (5, 6):
+                    with self.subTest(version=version), mock.patch.object(
+                            torch.ops.hyper_parallel, "mxfp8_task_graph_version", return_value=version, create=True):
+                        with self.assertRaisesRegex(RuntimeError, "ABI mismatch"):
+                            mxfp8_ops._load_mxfp8_native()
                 with mock.patch.object(torch.ops.hyper_parallel, "mxfp8_task_graph_version",
-                                       return_value=5, create=True):
-                    with self.assertRaisesRegex(RuntimeError, "ABI mismatch"):
-                        mxfp8_ops._load_mxfp8_native()
-                with mock.patch.object(torch.ops.hyper_parallel, "mxfp8_task_graph_version",
-                                       return_value=6, create=True):
+                                       return_value=7, create=True):
                     mxfp8_ops._load_mxfp8_native()
         finally:
             mxfp8_ops._load_mxfp8_native.cache_clear()

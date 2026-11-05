@@ -18,11 +18,14 @@ from __future__ import annotations
 
 from functools import lru_cache
 from collections.abc import Sequence
+import hashlib
+import json
 
 import torch
 
 from hyper_parallel.core.multicore.scheduler.mxfp8 import MxLaunchDescriptor, serialize_mx_launch_metadata
 from hyper_parallel.core.multicore.torch.ops import _load_native
+from hyper_parallel.core.multicore._loader import get_multicore_paths
 
 from .spec import MegaMoeSpec
 
@@ -30,8 +33,28 @@ from .spec import MegaMoeSpec
 @lru_cache(maxsize=1)
 def _load_mxfp8_native() -> None:
     _load_native()
-    if torch.ops.hyper_parallel.mxfp8_task_graph_version() != 6:
+    if torch.ops.hyper_parallel.mxfp8_task_graph_version() != 7:
         raise RuntimeError("MXFP8 task-graph adapter ABI mismatch; rebuild the local multicore component.")
+
+
+@lru_cache(maxsize=None)
+def require_mxfp8_window_feature(feature: str) -> None:
+    """Require a matching native capability receipt before submitting optional tasks.
+
+    Args:
+        feature: Optional task capability required by the current graph.
+    """
+    _load_mxfp8_native()
+    vendor, _ = get_multicore_paths()
+    receipt = json.loads((vendor.parent.parent / "capabilities/mxfp8_window.json").read_text())
+    expected = "PanguMxfp8TaskGraph_ed65f2bbd39f9cc68999acec5148f3f8.o"
+    if receipt.get("schema") != 7 or feature not in receipt.get("features", ()):
+        raise RuntimeError(f"MX window feature is unavailable: {feature}")
+    if receipt.get("object") != expected:
+        raise RuntimeError("MX window capability receipt names an unexpected binary.")
+    binary = vendor / "op_impl/ai_core/tbe/kernel/ascend950/pangu_mxfp8_task_graph" / expected
+    if hashlib.sha256(binary.read_bytes()).hexdigest() != receipt.get("sha256"):
+        raise RuntimeError("MX window capability receipt does not match the loaded vendor payload.")
 
 
 def _byte_aliases(buffers: Sequence[torch.Tensor]) -> list[torch.Tensor]:
@@ -114,6 +137,8 @@ def launch_mxfp8_task_graph(
     """
     aliases = _byte_aliases(buffers)
     _load_mxfp8_native()
-    if vector_policy not in ("legacy_odd", "window2") or swiglu_row_only:
-        raise ValueError("The integrated MX payload supports legacy_odd/window2 dual-axis graphs only.")
+    if vector_policy not in ("legacy_odd", "window2") or (swiglu_row_only and vector_policy != "window2"):
+        raise ValueError("The integrated MX payload supports legacy_odd and window2 graphs only.")
+    if swiglu_row_only:
+        require_mxfp8_window_feature("nograd_row_only")
     torch.ops.hyper_parallel.mxfp8_task_graph(aliases, runtime, events, diagnostic, launch)

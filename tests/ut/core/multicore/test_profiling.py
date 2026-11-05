@@ -281,6 +281,31 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         self.assertEqual(layout.aic_record_capacity, 32)
         self.assertEqual(layout.aiv_record_capacity, 16)
         self.assertEqual(layout.buffer_size, 53760)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_planned_vector_capacity_uses_csr_worker_ownership(self) -> None:
+        """Feature: Planned AIV profiler capacity.
+        Description: Place a long contiguous queue on a non-first vector worker.
+        Expectation: Capacity follows CSR ownership and malformed offsets are rejected.
+        """
+        config = _runtime_config(128)
+        config.num_workers = 64
+        config.task_num = 70
+        config.task_index_num[1] = 70
+        config.task_index_num[3] = -1
+        for task_id in range(70):
+            config.vector_task_indices[task_id] = task_id
+            task = config.all_tasks[task_id]
+            task.task_type = TaskType.TASK_SWI_GLU
+            task.dependent_event = EVENT_INVALID_ID
+        for worker in range(65):
+            config.mix_task_indices[worker] = 0 if worker <= 5 else 70
+        layout = _calculate_profile_layout(config)
+        self.assertEqual(layout.aiv_required_records, 142)
+        self.assertEqual(layout.aiv_record_capacity, 144)
+        config.mix_task_indices[5] = -1
+        with self.assertRaisesRegex(ValueError, 'planned.*offset'):
+            _calculate_profile_layout(config)
         self.assertLess(layout.buffer_size, MAX_PROFILE_BUFFER_BYTES)
 
     def test_layout_preserves_records_beyond_legacy_capacity(self):
