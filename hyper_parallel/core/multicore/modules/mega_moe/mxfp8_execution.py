@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+from collections.abc import Iterator
 from functools import partial
 from typing import Any
 
@@ -108,6 +110,9 @@ class MXFP8Execution:
         if runtime.host.kernel_gradients:
             prepare_launch = partial(prepare_launch, kernel_gradients=True)
             serialize_launch = partial(serialize_launch, kernel_gradients=True)
+        if runtime.host.weight_prefetch:
+            prepare_launch = partial(prepare_launch, weight_prefetch=True)
+            serialize_launch = partial(serialize_launch, weight_prefetch=True)
         if mx_profile_capture_enabled():
             scope = current_mx_profile_scope()
             if direction == "forward":
@@ -202,8 +207,9 @@ class MXFP8Execution:
                 plan.forward.quant,
             ]
             events = workspace.prepare_event_counters(forward=True)
-            with lease_replica_weights((weight1, weight2), self.replica_route, backward=False) as guests:
+            with self._lease_weights((weight1, weight2), plan.forward, backward=False) as (guests, ready):
                 buffers.extend(guests)
+                buffers.extend(ready)
                 self._launch(buffers, plan.forward, events, plan, device)
             expert_output = workspace.routed_buffer[: route.routed_tokens.shape[0]]
             if retain_backward or not self.nograd_no_clone:
@@ -362,8 +368,22 @@ class MXFP8Execution:
                           gradients: tuple[torch.Tensor, ...], weights: tuple[MXFP8PhysicalWeight, ...],
                           device: Any) -> None:
         """Keep both physical weights and symmetric guest gradients live through the final native join."""
-        with lease_replica_weights(weights, self.replica_route, backward=True) as guests:
+        with self._lease_weights(weights, plan.backward, backward=True) as (guests, ready):
             buffers.extend(guests)
             with lease_mx_gradient_return(self.resources, plan, self.replica_route, gradients,
                                           weights) as runtime:
+                buffers.extend(ready)
                 self._launch(buffers, runtime, events, plan, device, direction="backward")
+
+    @contextmanager
+    def _lease_weights(self, weights: tuple[MXFP8PhysicalWeight, ...], runtime: Any,
+                        *, backward: bool) -> Iterator[tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]]:
+        """Keep exact guest bytes and projection-ready storage live until native consumers join."""
+        if runtime.host.weight_prefetch:
+            with self.resources.weight_prefetch.lease(weights, self.replica_route,
+                                                      self.resources.workspace.replica_provider,
+                                                      backward=backward) as (guests, information):
+                yield guests, (information,)
+        else:
+            with lease_replica_weights(weights, self.replica_route, backward=backward) as guests:
+                yield guests, ()

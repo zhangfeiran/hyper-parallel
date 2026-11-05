@@ -90,6 +90,7 @@ class MXFP8Runtime:
     swiglu_row_only: bool = False
     transport_schedule: str = "legacy_odd"
     kernel_gradients: bool = False
+    weight_prefetch: bool = False
 
 
 def _fill_compute_stage(
@@ -402,6 +403,30 @@ def _mx_guest_positions(spec: MegaMoeSpec, forward: bool, name: str, layout: str
     return {"home_experts": home, "guest_data_position": position, "guest_scale_position": position + 1}
 
 
+def _tag_mx_weight_readers(config: Any, spec: MegaMoeSpec, ready_buffer: int) -> None:
+    """Fence only guest matrix reads; preserve home/TN tasks and every producer event."""
+    if spec.replica_transport != "shmem_signal_kernel_gradient" or spec.mx_vector_policy != "window2":
+        raise ValueError("MX projection prefetch requires window2 and the symmetric gradient inbox")
+    home = spec.local_experts - spec.replica_slots_per_rank
+    for task in config.all_tasks[:config.task_num]:
+        if (task.task_type == MX_GMM_TASK_TYPE and task.outputs[0].input_position in (7, 8, 11, 12)
+                and task.inputs[1].input_position in (27, 29, 33, 35)):
+            if task.task_index // spec.num_cube_cores < home or task.extra_value_1:
+                raise ValueError("MX prefetch reader tags must refer only to guest weight matrices")
+            task.extra_value_1 = ready_buffer + 1
+
+
+def _finish_mx_runtime(graph: ComputeGraph, cfg: Any, gmms: list, quants: list, base_buffers: int,
+                        spec: MegaMoeSpec, row_only: bool, schedule: str,
+                        gradients: bool, prefetch: bool) -> MXFP8Runtime:
+    """Bind reader flags and byte-buffer bounds to the exact completed native protocol."""
+    ready_buffer = base_buffers + 4 * bool(spec.replica_slots_per_rank)
+    if prefetch:
+        _tag_mx_weight_readers(cfg, spec, ready_buffer)
+    return MXFP8Runtime(graph, cfg, serialize_mx_gmm_descriptors(gmms), serialize_mx_quant_descriptors(quants),
+                        ready_buffer + prefetch, row_only, schedule, gradients, prefetch)
+
+
 def build_mxfp8_runtime(
     spec: MegaMoeSpec,
     *,
@@ -409,6 +434,7 @@ def build_mxfp8_runtime(
     swiglu_row_only: bool = False,
     expert_window: int = 0,
     dispatch_quant: bool = False,
+    weight_prefetch: bool = False,
 ) -> MXFP8Runtime:
     """Serialize phase-specific MX tasks with per-expert producer/consumer events.
 
@@ -418,6 +444,7 @@ def build_mxfp8_runtime(
     _validate_mx_options(spec, forward, swiglu_row_only, expert_window)
     ready_policy = spec.mx_vector_policy == "roles_ready"
     kernel_gradients = _mx_gradient_return(spec, forward)
+    weight_prefetch = bool(weight_prefetch and spec.replica_slots_per_rank)
     values = _MXTaskValues(
         tp=1,
         ep=spec.ep_size,
@@ -567,13 +594,5 @@ def build_mxfp8_runtime(
     configure_ready_handshake(cfg, values)
     validate_runtime_config(cfg, values, cubes)
     transport_schedule = _configure_mx_vector_policy(cfg, graph, spec, forward, transport_schedule)
-    return MXFP8Runtime(
-        graph,
-        cfg,
-        serialize_mx_gmm_descriptors(gmms),
-        serialize_mx_quant_descriptors(quants),
-        len(specs) + 4 * bool(spec.replica_slots_per_rank),
-        swiglu_row_only,
-        transport_schedule,
-        kernel_gradients,
-    )
+    return _finish_mx_runtime(graph, cfg, gmms, quants, len(specs), spec,
+                              swiglu_row_only, transport_schedule, kernel_gradients, weight_prefetch)

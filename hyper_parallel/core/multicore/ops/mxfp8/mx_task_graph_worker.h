@@ -150,14 +150,25 @@ __aicore__ inline void ValidateMxWindowRuntime(GM_ADDR runtime, const __gm__ Mul
     Trap();
 }
 
+__aicore__ inline bool HasMxPrefetch(const __gm__ MulticoreMx::MxLaunchDescriptor *launch) {
+  return (launch->version == 12 && launch->reserved == 11) ||
+         (launch->version == 13 && launch->reserved == 12);
+}
+
+__aicore__ inline bool HasMxGradientReturn(const __gm__ MulticoreMx::MxLaunchDescriptor *launch) {
+  return (launch->version == 11 && launch->reserved == 10) ||
+         (launch->version == 13 && launch->reserved == 12);
+}
+
 template <MulticoreRuntime::VectorWorkerPolicy Policy>
 __aicore__ inline void RunMxTaskGraph(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR events, GM_ADDR diagnostic,
                                       GM_ADDR launch_metadata) {
   auto launch = reinterpret_cast<__gm__ MulticoreMx::MxLaunchDescriptor *>(launch_metadata);
   static_assert(Policy == MulticoreRuntime::VectorWorkerPolicy::LEGACY_ODD,
                 "The integrated MX payload supports legacy and window2 queues only");
-  const bool gradients = launch->version == 11 && launch->reserved == 10;
-  const bool window = (launch->version == 6 && launch->reserved == 5) || gradients;
+  const bool prefetch = HasMxPrefetch(launch);
+  const bool gradients = HasMxGradientReturn(launch);
+  const bool window = (launch->version == 6 && launch->reserved == 5) || gradients || prefetch;
   const bool legacy = launch->version == 1 && launch->reserved == 0;
   if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || (!window && !legacy) || launch->buffer_count == 0 ||
       launch->buffer_count > 64 || !MulticoreMx::IsMxLaunchTopologyValid(launch->ep, launch->experts))
