@@ -26,6 +26,7 @@ import torch_npu
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .mxfp8_function import MXFP8ForwardState
+from .mxfp8_gradients import lease_mx_gradient_return
 from .mxfp8_diagnostics import current_mx_profile_scope, mx_profile_capture_enabled, profile_mx_launch
 from .mxfp8_ops import launch_mxfp8_task_graph, prepare_mxfp8_launch, serialize_mxfp8_launch
 from .mxfp8_weights import MXFP8PhysicalWeight
@@ -103,6 +104,10 @@ class MXFP8Execution:
         )
         if swiglu_row_only:
             launch_graph = partial(launch_graph, swiglu_row_only=True)
+        prepare_launch, serialize_launch = prepare_mxfp8_launch, serialize_mxfp8_launch
+        if runtime.host.kernel_gradients:
+            prepare_launch = partial(prepare_launch, kernel_gradients=True)
+            serialize_launch = partial(serialize_launch, kernel_gradients=True)
         if mx_profile_capture_enabled():
             scope = current_mx_profile_scope()
             if direction == "forward":
@@ -112,15 +117,15 @@ class MXFP8Execution:
             if scope is not None and direction == "backward":
                 scope = {**scope, "phase": "backward"}
             profile_mx_launch(
-                buffers, runtime, events, plan.spec, direction, prepare_mxfp8_launch, launch_graph, scope=scope
+                buffers, runtime, events, plan.spec, direction, prepare_launch, launch_graph, scope=scope
             )
             return
         diagnostic = torch.zeros(64, dtype=torch.uint8, device=device)
         if getattr(self.resources, "metadata_transfer", None) is None:
-            launch = prepare_mxfp8_launch(buffers, runtime.runtime, events, plan.spec)
+            launch = prepare_launch(buffers, runtime.runtime, events, plan.spec)
             launch_graph(buffers, runtime.runtime, events, diagnostic, launch)
         else:
-            content = serialize_mxfp8_launch(buffers, runtime.runtime, events, plan.spec)
+            content = serialize_launch(buffers, runtime.runtime, events, plan.spec)
             self.resources.metadata_transfer.launch(
                 content,
                 runtime.runtime.device,
@@ -283,9 +288,7 @@ class MXFP8Execution:
         grad_probs = torch.empty_like(probs)
         da = torch.empty((capacity, spec.intermediate_size), dtype=torch.bfloat16, device=device)
         dx = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
-        # TN stores complete matrices; its zero-K path explicitly clears empty experts.
-        dw1 = torch.empty((spec.local_experts, *weight1.logical_shape[1:]), dtype=torch.float32, device=device)
-        dw2 = torch.empty((spec.local_experts, *weight2.logical_shape[1:]), dtype=torch.float32, device=device)
+        dw1, dw2 = self._weight_gradient_buffers(plan, (weight1, weight2), device)
         workspace.claim()
         try:
             multicore_ops.mega_moe_unpermute_grad_out(
@@ -332,16 +335,36 @@ class MXFP8Execution:
                 plan.backward.quant,
             ]
             events = workspace.prepare_event_counters(forward=False)
-            with lease_replica_weights((weight1, weight2), self.replica_route, backward=True) as guests:
-                buffers.extend(guests)
-                self._launch(buffers, plan.backward, events, plan, device, direction="backward")
+            self._launch_backward(buffers, events, plan, (dw1, dw2), (weight1, weight2), device)
             grad_hidden = multicore_ops.moe_token_permute_grad(
                 workspace.routed_buffer[: metadata.source_rows],
                 mapping,
                 gradient.numel() // spec.hidden_size,
                 spec.top_k,
             )
-            dw1, dw2 = reduce_replica_gradients((dw1, dw2), self.replica_route)
+            if not plan.backward.host.kernel_gradients:
+                dw1, dw2 = reduce_replica_gradients((dw1, dw2), self.replica_route)
             return grad_hidden.reshape(metadata.hidden_shape), grad_probs.to(metadata.probs_dtype), dw1, dw2
         finally:
             workspace.release()
+
+    @staticmethod
+    def _weight_gradient_buffers(plan: Any, weights: tuple[MXFP8PhysicalWeight, ...],
+                                 device: Any) -> tuple[torch.Tensor, ...]:
+        """Preclear empty experts before the TN graph and allocate only ordinary owner outputs when fused."""
+        owners = plan.spec.local_experts
+        if plan.backward.host.kernel_gradients:
+            owners -= plan.spec.replica_slots_per_rank
+        return tuple(torch.zeros((owners, *weight.logical_shape[1:]), dtype=torch.float32, device=device)
+                     for weight in weights)
+
+    def _launch_backward(self, buffers: list[torch.Tensor], events: torch.Tensor, plan: Any,
+                          gradients: tuple[torch.Tensor, ...], weights: tuple[MXFP8PhysicalWeight, ...],
+                          device: Any) -> None:
+        """Keep both physical weights and symmetric guest gradients live through the final native join."""
+        with lease_replica_weights(weights, self.replica_route, backward=True) as guests:
+            buffers.extend(guests)
+            with lease_mx_gradient_return(self.resources, plan, self.replica_route, gradients,
+                                          weights) as (runtime, guest_gradients):
+                buffers.extend(guest_gradients)
+                self._launch(buffers, runtime, events, plan, device, direction="backward")

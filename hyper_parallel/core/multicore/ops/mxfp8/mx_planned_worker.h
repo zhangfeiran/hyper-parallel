@@ -4,11 +4,19 @@
 namespace MulticoreRuntime {
 class MxPlannedWorker : public MxTaskWorker<VectorWorkerPolicy::ALL> {
  public:
-  __aicore__ inline void ProcessPlanned() {
+  __aicore__ inline void ProcessPlanned(bool gradients = false) {
+    if (gradients != (this->replica_gradient_config_ != nullptr)) AscendC::Trap();
     ReadyHandshakeMeta meta;
     const bool has_ready = this->LoadReadyHandshakeMeta(&meta);
     if (meta.completion_event != 0 || this->core_num != 32) AscendC::Trap();
     if (has_ready) this->WaitForDeviceReady(meta);
+#ifndef __DAV_CUBE__
+    if (this->replica_gradient_config_ != nullptr && this->worker_id_ % 2 == 0 && this->worker_id_ < 8) {
+      this->core_num = 4;
+      this->ProcessReplicaGradients();
+      return;
+    }
+#endif
     const auto mode = getDiagnosticMode(this->runtimeConfigPtr);
     if (mode == DiagnosticMode::PROFILE)
       Run<true>();

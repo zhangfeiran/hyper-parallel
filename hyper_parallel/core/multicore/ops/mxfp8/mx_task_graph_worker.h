@@ -30,23 +30,35 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
     for (uint32_t i = 0; i < task.num_outputs; ++i) {
       if (task.outputs[i].input_position >= launch->buffer_count) Trap();
     }
+#ifdef __DAV_CUBE__
     switch (static_cast<uint32_t>(task.task_type)) {
       case 0:
       case 10:
         break;
-#ifdef __DAV_CUBE__
       case 160:
         MulticoreMx::ExecuteMxGmmTask(task, this->input_list, launch);
         break;
+      default:
+        Trap();
+    }
 #else
+    ExecuteVectorTask(task);
+#endif
+  }
+
+ private:
+#ifndef __DAV_CUBE__
+  __aicore__ inline void ExecuteVectorTask(TaskDesc task) {
+    switch (static_cast<uint32_t>(task.task_type)) {
+      case 0:
+      case 10:
+        break;
 #ifdef PANGU_MX_ROW_ONLY
       case 164:
 #endif
       case 161:
       case 162:
       case 163:
-        MulticoreMx::ExecuteMxQuantTask(task, this->input_list);
-        break;
       case 153:
         MulticoreMx::ExecuteMxQuantTask(task, this->input_list);
         break;
@@ -56,14 +68,11 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
       case 141:
         this->template ExecuteShmemGetMem<bfloat16_t>(task);
         break;
-#endif
       default:
         Trap();
     }
   }
 
- private:
-#ifndef __DAV_CUBE__
   __aicore__ inline void ExecuteShmemPutMem(TaskDesc task_desc) {
     GM_ADDR signal = this->input_list[EVENT_IDX];
 
@@ -113,46 +122,55 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
 }  // namespace MulticoreRuntime
 #include "mx_role_worker.h"
 #include "mx_planned_worker.h"
+__aicore__ inline void LoadMxGraphInputs(GM_ADDR buffers, const __gm__ MulticoreMx::MxLaunchDescriptor *launch,
+                                         GM_ADDR *inputs) {
+  auto list_words = reinterpret_cast<__gm__ uint64_t *>(buffers);
+  const uint64_t pointer_offset = list_words[0];
+  if (!MulticoreMx::IsMxByteListHeaderValid(pointer_offset, launch->buffer_count)) Trap();
+  auto data_pointers = list_words + pointer_offset / sizeof(uint64_t);
+  for (uint32_t i = 0; i < launch->buffer_count; ++i) {
+    if (!MulticoreMx::IsMxByteVectorShapeValid(list_words[1 + 2 * i], list_words[2 + 2 * i], launch->buffer_bytes[i]))
+      Trap();
+    inputs[i] = reinterpret_cast<GM_ADDR>(data_pointers[i]);
+  }
+}
+
+__aicore__ inline void ValidateMxWindowRuntime(GM_ADDR runtime, const __gm__ MulticoreMx::MxLaunchDescriptor *launch) {
+#if __NPU_ARCH__ != 3510
+  Trap();
+#endif
+  MulticoreRuntime::ReadyHandshakeMeta meta;
+  MulticoreRuntime::getReadyHandshakeMeta(runtime, &meta);
+  if (meta.completion_event != 0 || launch->cube_count != 32 || MulticoreRuntime::getNumWorkers(runtime) != 64 ||
+      *reinterpret_cast<__gm__ uint32_t *>(runtime + offsetof(MulticoreRuntime::RuntimeHeader, protocol_version)) != 0 ||
+      *reinterpret_cast<__gm__ int32_t *>(runtime + MulticoreRuntime::getTaskIndexNumOffset(runtime) +
+                                          3 * sizeof(int32_t)) != -1)
+    Trap();
+}
+
 template <MulticoreRuntime::VectorWorkerPolicy Policy>
 __aicore__ inline void RunMxTaskGraph(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR events, GM_ADDR diagnostic,
                                       GM_ADDR launch_metadata) {
   auto launch = reinterpret_cast<__gm__ MulticoreMx::MxLaunchDescriptor *>(launch_metadata);
   static_assert(Policy == MulticoreRuntime::VectorWorkerPolicy::LEGACY_ODD,
                 "The integrated MX payload supports legacy and window2 queues only");
-  const bool window = launch->version == 6 && launch->reserved == 5;
+  const bool gradients = launch->version == 8 && launch->reserved == 7;
+  const bool window = (launch->version == 6 && launch->reserved == 5) || gradients;
   const bool legacy = launch->version == 1 && launch->reserved == 0;
   if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || (!window && !legacy) || launch->buffer_count == 0 ||
       launch->buffer_count > 64 || !MulticoreMx::IsMxLaunchTopologyValid(launch->ep, launch->experts))
     Trap();
-  auto list_words = reinterpret_cast<__gm__ uint64_t *>(buffers);
-  const uint64_t pointer_offset = list_words[0];
-  if (!MulticoreMx::IsMxByteListHeaderValid(pointer_offset, launch->buffer_count)) Trap();
-  auto data_pointers = list_words + pointer_offset / sizeof(uint64_t);
   GM_ADDR inputs[68] = {};
-  for (uint32_t i = 0; i < launch->buffer_count; ++i) {
-    if (!MulticoreMx::IsMxByteVectorShapeValid(list_words[1 + 2 * i], list_words[2 + 2 * i], launch->buffer_bytes[i]))
-      Trap();
-    inputs[i] = reinterpret_cast<GM_ADDR>(data_pointers[i]);
-  }
+  LoadMxGraphInputs(buffers, launch, inputs);
   inputs[64] = runtime;
   inputs[65] = events;
   inputs[66] = diagnostic;
   inputs[67] = launch_metadata;
   if (window) {
-#if __NPU_ARCH__ != 3510
-    Trap();
-#endif
-    MulticoreRuntime::ReadyHandshakeMeta meta;
-    MulticoreRuntime::getReadyHandshakeMeta(runtime, &meta);
-    if (meta.completion_event != 0 || launch->cube_count != 32 || MulticoreRuntime::getNumWorkers(runtime) != 64 ||
-        *reinterpret_cast<__gm__ uint32_t *>(runtime + offsetof(MulticoreRuntime::RuntimeHeader, protocol_version)) !=
-          0 ||
-        *reinterpret_cast<__gm__ int32_t *>(runtime + MulticoreRuntime::getTaskIndexNumOffset(runtime) +
-                                            3 * sizeof(int32_t)) != -1)
-      Trap();
+    ValidateMxWindowRuntime(runtime, launch);
     MulticoreRuntime::MxPlannedWorker worker;
     worker.Init(GetBlockIdx(), runtime, inputs);
-    worker.ProcessPlanned();
+    worker.ProcessPlanned(gradients);
     return;
   }
   MulticoreRuntime::MxTaskWorker<Policy> worker;

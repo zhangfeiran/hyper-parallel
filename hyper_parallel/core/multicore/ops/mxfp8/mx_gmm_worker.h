@@ -10,6 +10,7 @@
 #include "mx_blaze/gemm/kernel/kernel_qgmm_mx.h"
 
 namespace MulticoreMx {
+constexpr uint32_t MX_GMM_PREZEROED_OUTPUT = 2;
 
 template <class LayoutA, class LayoutB, class Output>
 __aicore__ inline void ExecuteMxGmmMatrix(const MxGmmDescriptor &r, GM_ADDR x, GM_ADDR w, GM_ADDR xs, GM_ADDR ws,
@@ -77,7 +78,7 @@ __aicore__ inline void ZeroMxWeightGradient(const MxGmmDescriptor &r, GM_ADDR y)
 
 __aicore__ inline void ExecuteMxGmm(const MxGmmDescriptor &r, GM_ADDR x, GM_ADDR w, GM_ADDR xs, GM_ADDR ws, GM_ADDR y) {
   if (r.m == 0 || r.k == 0) {
-    if (r.layout == static_cast<uint32_t>(MxLayout::TN)) {
+    if (r.layout == static_cast<uint32_t>(MxLayout::TN) && !(r.flags & MX_GMM_PREZEROED_OUTPUT)) {
       ZeroMxWeightGradient(r, y);
     }
     return;
@@ -132,7 +133,11 @@ __aicore__ inline void ExecuteMxGmmTask(const Task &task, GM_ADDR *inputs, const
   auto table = reinterpret_cast<__gm__ MxGmmDescriptor *>(inputs[task.inputs[3].input_position]);
   MxGmmDescriptor r = LoadMxGmmDescriptor(table + task.extra_value_0);
   if (!IsMxGmmDescriptorValid(r) || r.x_scale_position >= launch->buffer_count ||
-      r.w_scale_position >= launch->buffer_count || (r.flags & ~MX_GMM_DYNAMIC_GROUP) != 0) {
+      r.w_scale_position >= launch->buffer_count ||
+      (r.flags & ~(MX_GMM_DYNAMIC_GROUP | MX_GMM_PREZEROED_OUTPUT)) != 0 ||
+      ((r.flags & MX_GMM_PREZEROED_OUTPUT) &&
+       (r.layout != static_cast<uint32_t>(MxLayout::TN) ||
+        r.output_dtype != static_cast<uint32_t>(MxOutput::FP32)))) {
     AscendC::Trap();
   }
   if (r.flags & MX_GMM_DYNAMIC_GROUP) {
