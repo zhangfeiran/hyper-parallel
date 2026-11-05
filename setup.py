@@ -161,8 +161,7 @@ class EggInfo(egg_info):
 
     def run(self) -> None:
         """Regenerate package metadata and normalize its permissions."""
-        egg_info_dir = os.path.join(os.path.dirname(
-            __file__), 'hyper_parallel.egg-info')
+        egg_info_dir = self.egg_info
         shutil.rmtree(egg_info_dir, ignore_errors=True)
         super().run()
         update_permissions(egg_info_dir)
