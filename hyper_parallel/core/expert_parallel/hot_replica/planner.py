@@ -842,12 +842,19 @@ def _locality_copies(selected: list[dict[int, int]], config: ExpertReplicaConfig
               for rank, row in enumerate(copies)]
     edges = sorted((-rows, rank, expert) for rank, row in enumerate(copies) for expert, rows in row.items()
                    if rows and expert // home != rank and rank_nodes[expert // home] != rank_nodes[rank])
+    if not edges:
+        return selected
+    # Membership is immutable within this invocation; only the ordering key
+    # changes as preceding moves update quotas and receive loads.
+    node_ranks: dict[int, list[int]] = {}
+    for rank, node in enumerate(rank_nodes):
+        node_ranks.setdefault(node, []).append(rank)
     for negative_rows, source, expert in edges:
         rows = -negative_rows
         if copies[source].get(expert) != rows:
             continue
         owner = expert // home
-        local = sorted((rank for rank, node in enumerate(rank_nodes) if node == rank_nodes[owner]),
+        local = sorted(node_ranks[rank_nodes[owner]],
                        key=lambda rank: (expert not in copies[rank], current[rank], rank))
         moved = False
         for target in local:
