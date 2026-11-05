@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -26,6 +27,38 @@ from hyper_parallel.core.activation_memory.recompute_state import create_recompu
 from hyper_parallel.core.expert_parallel.hot_replica import _metadata, routing
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica.planner import _build_expert_replica_plan
+
+
+class TestReplicaMetadataSetting(unittest.TestCase):
+    """Reject malformed switches instead of silently measuring the disabled path."""
+
+    def tearDown(self) -> None:
+        """Restore the cached setting after every isolated check."""
+        _metadata._metadata_reuse_enabled.cache_clear()
+
+    def test_default_is_disabled(self) -> None:
+        """An absent setting preserves the guarded default."""
+        with patch.dict(os.environ):
+            os.environ.pop("HYPER_PARALLEL_REPLICA_METADATA_REUSE", None)
+            _metadata._metadata_reuse_enabled.cache_clear()
+            self.assertFalse(_metadata._metadata_reuse_enabled())
+
+    def test_accepts_binary_switch(self) -> None:
+        """Only the two explicit binary settings select a mode."""
+        for value, expected in (("0", False), ("1", True)):
+            with self.subTest(value=value), patch.dict(
+                    os.environ, {"HYPER_PARALLEL_REPLICA_METADATA_REUSE": value}):
+                _metadata._metadata_reuse_enabled.cache_clear()
+                self.assertIs(_metadata._metadata_reuse_enabled(), expected)
+
+    def test_rejects_malformed_switch(self) -> None:
+        """Invalid benchmark controls must fail before a false comparison."""
+        for value in ("1-state", "", "true", "2"):
+            with self.subTest(value=value), patch.dict(
+                    os.environ, {"HYPER_PARALLEL_REPLICA_METADATA_REUSE": value}):
+                _metadata._metadata_reuse_enabled.cache_clear()
+                with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
+                    _metadata._metadata_reuse_enabled()
 
 
 class TestReplicaMetadataReplay(unittest.TestCase):

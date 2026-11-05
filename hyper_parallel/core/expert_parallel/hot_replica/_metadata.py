@@ -31,7 +31,10 @@ from .plan import ExpertExecutionPlan
 @lru_cache(maxsize=1)
 def _metadata_reuse_enabled() -> bool:
     """Keep the unvalidated device experiment behind one internal switch."""
-    return os.environ.get("HYPER_PARALLEL_REPLICA_METADATA_REUSE", "0") == "1"
+    value = os.environ.get("HYPER_PARALLEL_REPLICA_METADATA_REUSE", "0")
+    if value not in ("0", "1"):
+        raise ValueError("HYPER_PARALLEL_REPLICA_METADATA_REUSE must be 0 or 1")
+    return value == "1"
 
 
 @dataclass(frozen=True)
