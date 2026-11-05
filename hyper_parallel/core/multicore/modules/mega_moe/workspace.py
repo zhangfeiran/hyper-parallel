@@ -68,6 +68,7 @@ def _workspace_allocation_specs(
     dtype: torch.dtype,
     replica_inbox_bytes: int = 0,
     shared_expert: bool = False,
+    compute_stages: int = 3,
     forward_ingress_mode: str = "legacy",
     backward_ingress_mode: str = "legacy",
     top_k: int = 1,
@@ -79,7 +80,8 @@ def _workspace_allocation_specs(
         if not _supports_indexed_backward_pair(forward_ingress_mode, dispatch_mode) or top_k <= 0:
             raise ValueError("Compact backward allocations require original-row indexed or peer pull ingress")
         data_rows = routed_slots // top_k
-    event_bytes = event_workspace_bytes(ep_size, num_experts, shared_expert=shared_expert)
+    event_bytes = event_workspace_bytes(
+        ep_size, num_experts, shared_expert=shared_expert, compute_stages=compute_stages)
     allocation_spec = _lifecycle._AllocationSpec  # pylint: disable=protected-access
     allocations = (
         (data_field, allocation_spec((data_rows, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
@@ -136,6 +138,7 @@ def _spec_workspace_bytes(
         dtype=dtype,
         replica_inbox_bytes=_replica_inbox_bytes(specification),
         shared_expert=bool(specification.get("shared_intermediate_size", 0)),
+        compute_stages=specification.get("compute_stages", 3),
         forward_ingress_mode=specification.get("forward_ingress_mode", "legacy"),
         backward_ingress_mode=specification.get("backward_ingress_mode", "legacy"),
         top_k=specification["top_k"],
@@ -196,7 +199,13 @@ class MegaMoeWorkspace:
         dtype: torch.dtype,
         receive_capacity: int,
     ) -> tuple[_lifecycle._AllocationReplacement, ...]:  # pylint: disable=protected-access
-        """Project materialized symmetric fields into ordered restart replacements."""
+        """Project materialized symmetric fields into ordered restart replacements.
+
+        Args:
+            spec: Validated physical expert topology and current capacity.
+            dtype: Activation dtype used by the symmetric workspace.
+            receive_capacity: Committed receive-row capacity for the replacement workspace.
+        """
         if self.completion_event is None:
             return ()
         targets = _workspace_allocation_specs(
@@ -212,6 +221,7 @@ class MegaMoeWorkspace:
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
             shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
+            compute_stages=getattr(spec, "compute_stages", 3),
         )
         replacement = _lifecycle._AllocationReplacement  # pylint: disable=protected-access
         return tuple(replacement(getattr(self, field_name), target) for field_name, target in targets)
@@ -223,7 +233,14 @@ class MegaMoeWorkspace:
         current_capacity: int,
         replacements: tuple[_lifecycle._AllocationReplacement, ...],  # pylint: disable=protected-access
     ) -> bool:
-        """Validate the read-only workspace state captured for restart preflight."""
+        """Validate the read-only workspace state captured for restart preflight.
+
+        Args:
+            spec: Validated physical expert topology and current capacity.
+            dtype: Activation dtype used by the symmetric workspace.
+            current_capacity: Receive-row capacity recorded in the current generation.
+            replacements: Ordered symmetric allocation replacements captured during preflight.
+        """
         if self.in_use:
             raise RuntimeError("active workspace lease prevents heap growth")
         if self.closing:
@@ -246,6 +263,7 @@ class MegaMoeWorkspace:
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
             shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
+            compute_stages=getattr(spec, "compute_stages", 3),
         )
         if len(replacements) != len(expected):
             raise RuntimeError("materialized workspace has an incomplete restart Allocation mapping")
@@ -265,7 +283,15 @@ class MegaMoeWorkspace:
         receive_capacity: int,
         tensors: tuple[torch.Tensor, ...],
     ) -> None:
-        """Bind validated replacement Tensors without allocating or running collectives."""
+        """Bind validated replacement Tensors without allocating or running collectives.
+
+        Args:
+            spec: Validated physical expert topology and current capacity.
+            dtype: Activation dtype used by the symmetric workspace.
+            device: Device owning execution and diagnostic storage.
+            receive_capacity: Committed receive-row capacity for the replacement workspace.
+            tensors: New symmetric allocation views returned by the restart transaction.
+        """
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
             forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
@@ -279,6 +305,7 @@ class MegaMoeWorkspace:
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
             shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
+            compute_stages=getattr(spec, "compute_stages", 3),
         )
         self.source_buffer = None
         self.expert_buffer = None
@@ -292,6 +319,7 @@ class MegaMoeWorkspace:
         self.routed_slots = spec.routed_slots
         self.event_counter_bytes = mega_moe_event_capacity(
             spec.num_experts, spec.ep_size, shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
+            compute_stages=getattr(spec, "compute_stages", 3),
         ) * 4
         self.forward_ready_initialized = False
         self.backward_ready_initialized = False
@@ -310,7 +338,14 @@ class MegaMoeWorkspace:
         receive_capacity: int,
         tensors: tuple[torch.Tensor, ...],
     ) -> None:
-        """Validate a complete replacement slice without modifying workspace state."""
+        """Validate a complete replacement slice without modifying workspace state.
+
+        Args:
+            spec: Validated physical expert topology and current capacity.
+            dtype: Activation dtype used by the symmetric workspace.
+            receive_capacity: Committed receive-row capacity for the replacement workspace.
+            tensors: New symmetric allocation views returned by the restart transaction.
+        """
         targets = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
             forward_ingress_mode=getattr(spec, "forward_ingress_mode", "legacy"),
@@ -324,6 +359,7 @@ class MegaMoeWorkspace:
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
             shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
+            compute_stages=getattr(spec, "compute_stages", 3),
         )
         if len(tensors) != len(targets):
             raise RuntimeError("SHMEM restart returned an unexpected Allocation count")
@@ -397,6 +433,7 @@ class MegaMoeWorkspace:
             dtype=dtype,
             replica_inbox_bytes=_replica_inbox_bytes(vars(spec)),
             shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
+            compute_stages=getattr(spec, "compute_stages", 3),
         )
         self.dispatch_mode = spec.dispatch_mode
         self.backward_ingress_mode = getattr(spec, "backward_ingress_mode", "legacy")
@@ -406,6 +443,7 @@ class MegaMoeWorkspace:
         self.routed_slots = spec.routed_slots
         self.event_counter_bytes = mega_moe_event_capacity(
             spec.num_experts, spec.ep_size, shared_expert=bool(getattr(spec, "shared_intermediate_size", 0)),
+            compute_stages=getattr(spec, "compute_stages", 3),
         ) * 4
         try:
             for field_name, allocation in allocations:

@@ -81,6 +81,11 @@ class MegaMoeSpec:
     replica_transport: str = "shmem_signal_kernel_gradient_bands"
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    compute_stages: int = 3
+    mx_vector_policy: str = "legacy_odd"
+    mx_swiglu_row_only: bool = False
+    mx_poll_policy: str = "0"
+    mx_schedule_dir: str = ""
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -142,7 +147,11 @@ def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tu
 
 
 def initial_receive_capacity(specification: Mapping[str, Any]) -> int:
-    """Resolve the receive reservation independently of the physical guest slot cap."""
+    """Resolve the receive reservation independently of the physical guest slot cap.
+
+    Args:
+        specification: Validated unbound executor configuration.
+    """
     capacity = _resolve_receive_capacity(
         specification["initial_capacity_factor"],
         specification["local_num_tokens"] * specification["top_k"], specification["ep_size"],
@@ -260,6 +269,9 @@ def bind_mega_moe_spec(
         num_experts=specification["num_experts"],
         logical_num_experts=specification.get("logical_num_experts", specification["num_experts"]),
         replica_slots_per_rank=specification.get("replica_slots_per_rank", 0),
+        compute_stages=specification.get("compute_stages", 3),
+        mx_vector_policy=specification.get("mx_vector_policy", "legacy_odd"),
+        mx_poll_policy=specification.get("mx_poll_policy", "0"),
         replica_transport=specification.get("replica_transport", "shmem_signal_kernel_gradient_bands"),
         top_k=top_k,
         initial_capacity_factor=initial_capacity_factor,

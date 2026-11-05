@@ -29,6 +29,7 @@ import tempfile
 from typing import Any
 
 from prepare_dependencies import verify_git_dependency
+from mxfp8_quant_sources import QUANT_SOURCE_PATHS, compose_quant_sources
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -42,6 +43,7 @@ _OPS_NN_PATHS = (
     "norm/rms_norm_grad/op_kernel",
     "index/linear_index/op_host/op_api",
 )
+_OPS_NN_PATHS += QUANT_SOURCE_PATHS
 _OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel", "gmm/common/cgmct")
 _OPS_TRANSFORMER_MHC_PATHS = (
     "common/include",
@@ -127,6 +129,15 @@ def main() -> int:
         transformer_copy,
         transformer_mhc_copy,
     )
+    mx_operator = source_root / "pangu_mxfp8_task_graph"
+    shutil.copytree(_MULTICORE_OPS / "pangu_mxfp8_task_graph", mx_operator)
+    kernel = mx_operator / "op_kernel"
+    shutil.copytree(_MULTICORE_OPS / "runtime", kernel / "runtime")
+    shutil.copytree(_MULTICORE_OPS / "hyper_mega_moe/op_kernel/put_mem_signal", kernel / "put_mem_signal")
+    shutil.copytree(_MULTICORE_OPS / "mxfp8", kernel / "mxfp8")
+    shutil.copytree(_MULTICORE_OPS / "mxfp8_quant", kernel / "mxfp8_quant")
+    compose_quant_sources(ops_nn_copy, kernel / "mxfp8_quant")
+    shutil.copytree(transformer_copy / "gmm/common/cgmct", kernel / "cgmct")
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
     return 0

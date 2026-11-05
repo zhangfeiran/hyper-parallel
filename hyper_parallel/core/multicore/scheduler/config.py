@@ -45,7 +45,9 @@ EVENT_INVALID_ID         = 0xFFFFFFFF
 RUNTIME_PROTOCOL_VERSION = 1
 
 
-def mega_moe_event_capacity(num_experts: int, ep_size: int, *, shared_expert: bool = False) -> int:
+def mega_moe_event_capacity(
+    num_experts: int, ep_size: int, *, shared_expert: bool = False, compute_stages: int = 3,
+) -> int:
     """Reserve graph events and the complete atomic write at the last trigger.
 
     Args:
@@ -60,6 +62,8 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int, *, shared_expert: bo
     # Optional per-expert producer fences follow the ready/completion atomic lanes.
     final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
     required = final_event + 2 * ATOMIC_ADD_VALUE_LEN + num_experts // ep_size + (32 if shared_expert else 0)
+    required = max(required, num_experts + compute_stages * (num_experts // ep_size)
+                   + 3 + 2 * ATOMIC_ADD_VALUE_LEN) if compute_stages > 3 else required
     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
 
 
@@ -541,7 +545,9 @@ def configure_ready_handshake(cfg: RuntimeConfigC, tsv: TaskSplitValue) -> None:
     cfg.all_event_num_triggers[completion_event] = cfg.num_workers
 
 
-def event_workspace_bytes(ep_size: int, num_experts: int, *, shared_expert: bool = False) -> int:
+def event_workspace_bytes(
+    ep_size: int, num_experts: int, *, shared_expert: bool = False, compute_stages: int = 3,
+) -> int:
     """Return graph counters plus separate ready and completion generations.
 
     Args:
@@ -551,7 +557,8 @@ def event_workspace_bytes(ep_size: int, num_experts: int, *, shared_expert: bool
     Returns:
         Required byte count for one direction's event workspace.
     """
-    counter_bytes = mega_moe_event_capacity(num_experts, ep_size, shared_expert=shared_expert) * 4
+    counter_bytes = mega_moe_event_capacity(
+        num_experts, ep_size, shared_expert=shared_expert, compute_stages=compute_stages) * 4
     if ep_size <= 1:
         return counter_bytes
     return counter_bytes + 2 * (ep_size + 1) * READY_CACHE_LINE_BYTES

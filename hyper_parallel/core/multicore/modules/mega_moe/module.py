@@ -304,7 +304,11 @@ class _MegaMoeExecutionResources:
             self.workspace.claim()
 
     def receive_capacity_limit(self, tokens: int) -> int:
-        """Query the allocator's common Push growth limit before selecting a route."""
+        """Query the allocator's common Push growth limit before selecting a route.
+
+        Args:
+            tokens: Current source-token count used to project the allocation budget.
+        """
         return self.heap_manager.receive_capacity_limit(self.workspace, tokens)
 
     def can_close(self) -> bool:
@@ -320,7 +324,8 @@ class _MegaMoeExecutionResources:
                   "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens",
                   "_replica_cost_model_enabled", "_replica_critical_path_identity",
                   "replica_slots_per_rank", "replica_transport", "forward_ingress_mode", "backward_ingress_mode",
-                  "shared_intermediate_size", "shared_placement", "forward_shared_expert", "backward_shared_expert")
+                  "shared_intermediate_size", "shared_placement", "forward_shared_expert", "backward_shared_expert",
+                  "compute_stages", "mx_vector_policy", "mx_poll_policy")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v4", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications),
@@ -622,6 +627,13 @@ class MegaMoeExperts(MulticoreModule):
                     dispatch_mode, hidden_size, intermediate_size, ep_size,
                     replica_transport, num_experts, top_k)
         specification = self._resolve_specification(specification)
+        self._initialize_execution_specification(specification, replica_config, create_parameters)
+
+    def _initialize_execution_specification(
+        self, specification: dict[str, Any], replica_config: ExpertReplicaConfig, create_parameters: bool,
+    ) -> None:
+        """Register the validated BF16 or MX owner before allocating any parameters."""
+        ep_group = specification["ep_group"]
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
         super().__init__(
@@ -630,7 +642,7 @@ class MegaMoeExperts(MulticoreModule):
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
         self.replica_config = replica_config
-        self.replica_slots_per_rank = replica_slots_per_rank
+        self.replica_slots_per_rank = replica_config.replica_slots_per_rank
         self._initialize_module_state(specification, create_parameters=create_parameters)
 
     def _initialize_module_state(
@@ -968,7 +980,13 @@ class MegaMoeExperts(MulticoreModule):
                         def select_replica_route(
                             counts: torch.Tensor, summary: list[list[int]], host_counts: list[list[int]] | None,
                         ) -> tuple[MegaMoeSpec, ReplicaRoute] | None:
-                            """Keep equal owner loads in the already-prepared home route."""
+                            """Keep equal owner loads in the already-prepared home route.
+
+                            Args:
+                                counts: Exact per-source counts for the current final route.
+                                summary: Gathered per-source token and receive-load summary.
+                                host_counts: Optional immutable host count rows from the existing exchange.
+                            """
                             loads = [row[6] for row in summary]
                             if min(loads) == max(loads):
                                 return None

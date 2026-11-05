@@ -138,7 +138,8 @@ include("${HP_KERNEL_CMAKE}")
                          "-P", str(script_path)], capture_output=True, check=False, text=True)
                     self.assertEqual(result.returncode, 0, f"expected=0 actual={result.returncode}: {result.stderr}")
                     kernels = [line for line in result.stdout.splitlines() if "HP_KERNEL=" in line]
-                    self.assertEqual(len(kernels), 6, f"expected=6 actual={kernels}")
+                    count = 7 if selection == "ascend950" else 6
+                    self.assertEqual(len(kernels), count, f"expected={count} actual={kernels}")
                     for kernel in kernels:
                         self.assertTrue(kernel.endswith(f":{expected}"), f"expected={expected} actual={kernel}")
 
@@ -186,10 +187,12 @@ include("${HP_KERNEL_CMAKE}")
         Expectation: Every operator definition registers all three supported SoC families.
         """
         definitions = list((_ROOT / "hyper_parallel/core/multicore/ops").glob("*/op_host/*_def.cpp"))
-        self.assertEqual(len(definitions), 6, f"expected=6 actual={definitions}")
+        self.assertEqual(len(definitions), 7, f"expected=7 actual={definitions}")
         for definition in definitions:
             source = definition.read_text(encoding="utf-8")
-            for soc in ("ascend910b", "ascend910_93", "ascend950"):
+            targets = ("ascend950",) if definition.parent.parent.name == "pangu_mxfp8_task_graph" else (
+                "ascend910b", "ascend910_93", "ascend950")
+            for soc in targets:
                 with self.subTest(operator=definition.parent.parent.name, soc=soc):
                     self.assertIn(f'AddConfig("{soc}",', source, f"expected={soc} actual={definition}")
 

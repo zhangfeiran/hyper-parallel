@@ -83,6 +83,14 @@ npu_op_kernel_sources(ascendc_kernels
     COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
 )
 
+if(ASCEND_COMPUTE_UNIT STREQUAL "ascend950")
+    npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE PanguMxfp8TaskGraph
+        KERNEL_DIR ./pangu_mxfp8_task_graph/op_kernel
+        KERNEL_FILE pangu_mxfp8_task_graph.cpp
+        COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT})
+endif()
+
 npu_op_package_add(${package_name}
     LIBRARY ascendc_kernels
 )
