@@ -430,6 +430,12 @@ def _finish_mx_runtime(graph: ComputeGraph, cfg: Any, gmms: list, quants: list, 
                         ready_buffer + prefetch, row_only, schedule, gradients, prefetch)
 
 
+def _validate_mx_ready_depth(spec: MegaMoeSpec, depth: int) -> None:
+    """Reject invalid lookahead before allocating or scheduling a native runtime image."""
+    if depth not in (0, 1, 8) or (depth and spec.mx_vector_policy != "window2"):
+        raise ValueError("Ready depth must be 0, 1 or 8 on window2.")
+
+
 def _configure_mx_ready_depth(config: Any, depth: int) -> None:
     """Keep the projection-ready buffer code while marking bounded math lookahead."""
     if not depth:
@@ -463,11 +469,10 @@ def build_mxfp8_runtime(
         spec: Validated physical expert topology and current capacity.
     """
     _validate_mx_options(spec, forward, swiglu_row_only, expert_window)
+    _validate_mx_ready_depth(spec, ready_depth)
     ready_policy = spec.mx_vector_policy == "roles_ready"
     kernel_gradients = _mx_gradient_return(spec, forward)
     weight_prefetch = bool(weight_prefetch and spec.replica_slots_per_rank)
-    if ready_depth not in (0, 1, 8) or (ready_depth and spec.mx_vector_policy != "window2"):
-        raise ValueError("Ready depth must be 0, 1 or 8 on window2.")
     values = _MXTaskValues(
         tp=1,
         ep=spec.ep_size,

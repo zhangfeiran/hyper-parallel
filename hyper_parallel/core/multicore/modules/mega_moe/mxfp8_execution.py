@@ -92,7 +92,6 @@ class MXFP8Execution:
         runtime: Any,
         events: torch.Tensor,
         plan: Any,
-        device: Any,
         direction: str = "forward",
         *,
         swiglu_row_only: bool = False,
@@ -128,7 +127,7 @@ class MXFP8Execution:
                 buffers, runtime, events, plan.spec, direction, prepare_launch, launch_graph, scope=scope
             )
             return
-        diagnostic = torch.zeros(64, dtype=torch.uint8, device=device)
+        diagnostic = runtime.normal_diagnostic
         if getattr(self.resources, "metadata_transfer", None) is None:
             launch = prepare_launch(buffers, runtime.runtime, events, plan.spec)
             launch_graph(buffers, runtime.runtime, events, diagnostic, launch)
@@ -169,9 +168,8 @@ class MXFP8Execution:
         resources.ensure_capacity(route.maximum_received_slots)
         workspace.ensure(resources.spec, hidden.dtype, hidden.device)
         row_only = _use_row_only(spec, retain_backward)
-        plan = resources.plan_for_capacity(
-            workspace.expert_capacity, hidden.device, home_only=home_only, swiglu_row_only=row_only
-        )
+        plan = resources.plan_for_capacity(workspace.expert_capacity, hidden.device,
+                                           home_only=home_only, swiglu_row_only=row_only)
         resources.last_execution_plan = plan
         metadata = route.metadata
         capacity, device = metadata.expert_capacity, hidden.device
@@ -216,7 +214,7 @@ class MXFP8Execution:
             with self._lease_weights((weight1, weight2), plan.forward, backward=False) as (guests, ready):
                 buffers.extend(guests)
                 buffers.extend(ready)
-                self._launch(buffers, plan.forward, events, plan, device)
+                self._launch(buffers, plan.forward, events, plan)
             expert_output = workspace.routed_buffer[: route.routed_tokens.shape[0]]
             if retain_backward or not self.nograd_no_clone:
                 expert_output = expert_output.clone()
@@ -225,8 +223,7 @@ class MXFP8Execution:
                 self.nograd_no_clone and not retain_backward)
             saved = (
                 (
-                    x_col,
-                    x_col_scale,
+                    x_col, x_col_scale,
                     a_col,
                     a_col_scale,
                     up,
@@ -347,7 +344,7 @@ class MXFP8Execution:
                 plan.backward.quant,
             ]
             events = workspace.prepare_event_counters(forward=False)
-            self._launch_backward(buffers, events, plan, (dw1, dw2), (weight1, weight2), device)
+            self._launch_backward(buffers, events, plan, (dw1, dw2), (weight1, weight2))
             grad_hidden = multicore_ops.moe_token_permute_grad(
                 workspace.routed_buffer[: metadata.source_rows],
                 mapping,
@@ -371,15 +368,14 @@ class MXFP8Execution:
                      for weight in weights)
 
     def _launch_backward(self, buffers: list[torch.Tensor], events: torch.Tensor, plan: Any,
-                          gradients: tuple[torch.Tensor, ...], weights: tuple[MXFP8PhysicalWeight, ...],
-                          device: Any) -> None:
+                          gradients: tuple[torch.Tensor, ...], weights: tuple[MXFP8PhysicalWeight, ...]) -> None:
         """Keep both physical weights and symmetric guest gradients live through the final native join."""
         with self._lease_weights(weights, plan.backward, backward=True) as (guests, ready):
             buffers.extend(guests)
             with lease_mx_gradient_return(self.resources, plan, self.replica_route, gradients,
                                           weights) as runtime:
                 buffers.extend(ready)
-                self._launch(buffers, runtime, events, plan, device, direction="backward")
+                self._launch(buffers, runtime, events, plan, direction="backward")
 
     @contextmanager
     def _lease_weights(self, weights: tuple[MXFP8PhysicalWeight, ...], runtime: Any,

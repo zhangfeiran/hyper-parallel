@@ -59,6 +59,11 @@ class _DeviceRuntime:
     spec: Any
 
     @cached_property
+    def normal_diagnostic(self) -> torch.Tensor:
+        """Keep one zeroed diagnostic placeholder for ordinary launches of this runtime."""
+        return torch.zeros(64, dtype=torch.uint8, device=self.runtime.device)
+
+    @cached_property
     def diagnostics(self) -> Any:
         """Materialize diagnostic metadata only for an explicit capture."""
         return prepare_mx_diagnostics(self.host, self.spec, self.runtime.device)
@@ -216,6 +221,19 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         return self._plans[key]
 
 
+def _mx_window_options(vector_policy: str) -> tuple[int, bool]:
+    """Parse optional window settings before creating shared runtime resources."""
+    depth = os.environ.get("PANGU_MX_READY_DEPTH", "0")
+    row_only = os.environ.get("PANGU_MX_SWIGLU_ROW_ONLY", "0")
+    if depth not in ("0", "1", "8"):
+        raise ValueError("PANGU_MX_READY_DEPTH must be 0, 1 or 8.")
+    if row_only not in ("0", "1"):
+        raise ValueError("PANGU_MX_SWIGLU_ROW_ONLY must be 0 or 1.")
+    if vector_policy != "window2" and (depth != "0" or row_only == "1"):
+        raise ValueError("MXFP8 ready selection and no-grad row-only require window2.")
+    return int(depth), row_only == "1"
+
+
 class MXFP8MegaMoeExperts(MegaMoeExperts):
     """Execute MXFP8 experts while keeping FSDP root Parameters phase-current.
 
@@ -276,14 +294,7 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             raise ValueError("MXFP8 projection prefetch requires the symmetric FP32 gradient inbox.")
         if overlap_weights and os.environ.get("HCCL_OP_EXPANSION_MODE") != "AICPU_CacheDisable":
             raise ValueError("MXFP8 projection prefetch requires HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable.")
-        depth = os.environ.get("PANGU_MX_READY_DEPTH", "0")
-        row_only = os.environ.get("PANGU_MX_SWIGLU_ROW_ONLY", "0")
-        if depth not in ("0", "1", "8"):
-            raise ValueError("PANGU_MX_READY_DEPTH must be 0, 1 or 8.")
-        if row_only not in ("0", "1"):
-            raise ValueError("PANGU_MX_SWIGLU_ROW_ONLY must be 0 or 1.")
-        if vector_policy != "window2" and (depth != "0" or row_only == "1"):
-            raise ValueError("MXFP8 ready selection and no-grad row-only require window2.")
+        depth, row_only = _mx_window_options(vector_policy)
         config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_planner = "cpu"
         self.replica_min_rows = replica_min_rows
@@ -313,8 +324,8 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             "auto_tokens": False,
             "compute_stages": 6,
             "mx_vector_policy": vector_policy,
-            "mx_swiglu_row_only": row_only == "1",
-            "mx_ready_depth": int(depth),
+            "mx_swiglu_row_only": row_only,
+            "mx_ready_depth": depth,
             "mx_poll_policy": "0",
             "_replica_cost_model_enabled": False,
         }

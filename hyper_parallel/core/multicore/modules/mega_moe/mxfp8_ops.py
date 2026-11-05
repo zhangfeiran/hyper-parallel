@@ -58,11 +58,13 @@ def require_mxfp8_window_feature(feature: str) -> None:
 
 
 def _byte_aliases(buffers: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+    """Keep exact byte views while avoiding redundant dtype or dimension conversions."""
     aliases = []
     for tensor in buffers:
         if not tensor.is_contiguous():
             raise ValueError("MXFP8 task buffers must be contiguous; implicit physical weight copies are forbidden.")
-        aliases.append(tensor.view(torch.uint8).reshape(-1))
+        alias = tensor if tensor.dtype == torch.uint8 else tensor.view(torch.uint8)
+        aliases.append(alias if alias.ndim == 1 else alias.reshape(-1))
     return aliases
 
 
