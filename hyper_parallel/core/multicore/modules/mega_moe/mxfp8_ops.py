@@ -30,7 +30,7 @@ from .spec import MegaMoeSpec
 @lru_cache(maxsize=1)
 def _load_mxfp8_native() -> None:
     _load_native()
-    if torch.ops.hyper_parallel.mxfp8_task_graph_version() != 2:
+    if torch.ops.hyper_parallel.mxfp8_task_graph_version() != 3:
         raise RuntimeError("MXFP8 task-graph adapter ABI mismatch; rebuild the local multicore component.")
 
 

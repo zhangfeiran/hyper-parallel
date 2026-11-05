@@ -66,6 +66,9 @@ from hyper_parallel.core.multicore.tasks.utils import (
 from .spec import MegaMoeSpec
 
 
+_MX_GMM_PREZEROED_OUTPUT = 2
+
+
 @dataclass
 class _MXTaskValues(TaskSplitValue):
     compute_stages: int = 4
@@ -168,6 +171,8 @@ class _GmmStage:
                         output_dtype=MX_GMM_OUTPUT_FP32 if self.layout == "TN" else 0,
                     )
                 )
+                if self.layout == "TN":
+                    self.records[-1].flags |= _MX_GMM_PREZEROED_OUTPUT
         _fill_compute_stage(cfg, op, tsv, MX_GMM_TASK_TYPE, self.workers, False, indices)
         if self.home_experts:
             for index in range(self.home_experts * self.workers, len(indices)):

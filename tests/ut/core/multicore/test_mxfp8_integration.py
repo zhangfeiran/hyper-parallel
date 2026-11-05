@@ -28,6 +28,7 @@ from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_graph import build_mxfp8_runtime
+from hyper_parallel.core.multicore.modules.mega_moe import mxfp8_ops
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_module import MXFP8MegaMoeExperts, _mx_home_spec
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_replica import lease_replica_weights
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_weights import (
@@ -91,6 +92,26 @@ class TestMXFP8Integration(unittest.TestCase):
                         tn = [record for record in records if record.layout == 2]
                         self.assertEqual(bool(tn), not forward)
                         self.assertTrue(all(record.output_dtype == 1 for record in tn))
+                        self.assertTrue(all(record.flags == 3 for record in tn))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_preinitialized_tn_rejects_an_older_native_adapter(self) -> None:
+        """Feature: MX preinitialized TN output.
+        Description: Reject a native adapter that predates the prezeroed-output contract.
+        Expectation: An old adapter fails before launch; the matching adapter is accepted.
+        """
+        mxfp8_ops._load_mxfp8_native.cache_clear()
+        try:
+            with mock.patch.object(mxfp8_ops, "_load_native"):
+                with mock.patch.object(torch.ops.hyper_parallel, "mxfp8_task_graph_version",
+                                       return_value=2, create=True):
+                    with self.assertRaisesRegex(RuntimeError, "ABI mismatch"):
+                        mxfp8_ops._load_mxfp8_native()
+                with mock.patch.object(torch.ops.hyper_parallel, "mxfp8_task_graph_version",
+                                       return_value=3, create=True):
+                    mxfp8_ops._load_mxfp8_native()
+        finally:
+            mxfp8_ops._load_mxfp8_native.cache_clear()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_reduced_qp_preserves_all_runtime_and_math_descriptors(self) -> None:
