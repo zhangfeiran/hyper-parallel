@@ -115,3 +115,14 @@ def default_schedule() -> RouteSchedule:
     for name, profile in (('balanced', 'balanced'), ('medium', '1'), ('hot', '0.1')):
         windows.append(RouteWindow(name, profile, 42, windows[-1].end, 2, 8))
     return RouteSchedule(tuple(windows))
+
+
+def dense_schedule() -> RouteSchedule:
+    """Measure near-balanced profiles before growing resources for later hotspots."""
+    profiles = ('balanced', '10000', '1000', '100', '50', '30', '20', '15', '12', '10',
+                '8', '6', '5', '4', '3', '2.5', '2', '1.5', '1', '0.5', '0.1')
+    windows = [RouteWindow('primer', 'balanced', 42, 0, 5, 0)]
+    for profile in profiles:
+        name = 'balanced' if profile == 'balanced' else 'alpha_' + profile.replace('.', 'p')
+        windows.append(RouteWindow(name, profile, 42, windows[-1].end, 2, 7))
+    return RouteSchedule(tuple(windows))

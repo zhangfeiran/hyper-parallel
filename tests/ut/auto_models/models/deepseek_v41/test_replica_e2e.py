@@ -128,6 +128,22 @@ class TestReplicaRecipe(unittest.TestCase):
 class TestReplicaMatrix(unittest.TestCase):
     """Check stage selection and generated commands before cluster scheduling."""
 
+    def test_no_table_load_controls_leave_heap_automatic(self) -> None:
+        """Ordinary performance controls must not inherit a diagnostic fixed heap."""
+        environment = dict(
+            HYPER_ROOT='/source', RUN_ROOT='/results', MASTER_PORT_BASE='28600',
+            SHMEM_HOST='127.0.0.1', MASTER_ADDR='127.0.0.1', NNODES='8', NODE_RANK='0',
+            NUM_CARDS='16', TRAIN_ITERS='194', WARMUP_STEPS='5', MODEL_DIR='/model',
+            ENGRAM='/engram.json', DATA='/data.jsonl', NATIVE_LIB='/native',
+            DSV41_COMPLETE_GUEST_SEARCH_E2E='1')
+        with patch.dict('os.environ', environment, clear=True):
+            for backend, budget in (('native', 0), ('push', 0), ('push', 2), ('push', 6),
+                                    ('pull', 0), ('pull', 2), ('pull', 6)):
+                with self.subTest(backend=backend, budget=budget):
+                    command = runner.command_for(runner.Stage(backend, budget), 0)
+                    self.assertFalse(any(value.startswith('HYPER_PARALLEL_SHMEM_HEAP_SIZE=')
+                                         for value in command))
+
     def test_schedule_matrix_has_three_baselines_and_four_adjacent_graph_pairs(self) -> None:
         """The whole-model schedule comparison preserves B0 and compares every changed cap."""
         matrix = runner.stages(schedule_comparison=True)

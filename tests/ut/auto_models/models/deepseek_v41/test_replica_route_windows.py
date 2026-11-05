@@ -27,7 +27,7 @@ import torch
 from examples.training_demo.deepseek_v41 import benchmark_deepseek_v41_schedule as worker
 from examples.training_demo.deepseek_v41 import deepseek_v41_replica_e2e as runner
 from examples.training_demo.deepseek_v41.deepseek_v41_route_schedule import (
-    RouteSchedule, RouteWindow, default_schedule,
+    RouteSchedule, RouteWindow, default_schedule, dense_schedule,
 )
 from examples.training_demo.deepseek_v41.dirichlet_routes import make_route, route_metadata
 
@@ -95,6 +95,20 @@ class TestReplicaRouteWindows(unittest.TestCase):
                          [list(range(7, 15)), list(range(17, 25)), list(range(27, 35))])
         self.assertEqual([selected.at(index).name for index in range(5)], ['primer'] * 5)
 
+    def test_dense_schedule_starts_balanced_and_retains_separate_settling(self) -> None:
+        """Cover near-balanced loads before allocating for later hotspot windows."""
+        selected = dense_schedule()
+        self.assertEqual((selected.steps, selected.warmup), (194, 5))
+        self.assertEqual(selected.windows[0].profile, 'balanced')
+        self.assertEqual(len(selected.windows[1:]), 21)
+        profiles = {window.profile for window in selected.windows[1:]}
+        self.assertTrue({'balanced', '10000', '1000', '100', '30', '15', '12',
+                         '8', '6', '4', '2.5', '1.5', '0.1'} <= profiles)
+        self.assertTrue(all((window.settle, window.measured) == (2, 7) for window in selected.windows[1:]))
+        indices = [index for window in selected.windows[1:] for index in window.measured_indices]
+        self.assertEqual(len(indices), 147)
+        self.assertEqual(len(set(indices)), 147)
+
     def test_forward_replay_share_ids_and_counts_describe_replacement_routes(self) -> None:
         """Different profiles keep learned weights, cached replay IDs and current exact counts."""
         selected = RouteSchedule((RouteWindow('primer', '0.1', 42, 0, 1, 0),
@@ -159,6 +173,18 @@ class TestReplicaRouteWindows(unittest.TestCase):
                 self.assertEqual(set(result), {'balanced', 'medium', 'hot'})
                 self.assertTrue(all(row['median_seconds'] == 6.5 for row in result.values()))
                 self.assertTrue(all(row['rank_max_seconds'] == list(range(3, 11)) for row in result.values()))
+                path = folder / 'result.json'
+                timings = json.loads(path.read_text())
+                window = selected.windows[1]
+                timings['steps_detail'][window.start]['heap_growth'] = [{'epoch': 1}]
+                path.write_text(json.dumps(timings))
+                self.assertEqual(runner._route_windows(root, runner.Stage('push', 1), 1, 2), result)
+                timings['steps_detail'][window.measured_indices.start]['heap_growth'] = [{'epoch': 2}]
+                path.write_text(json.dumps(timings))
+                with self.assertRaisesRegex(ValueError, 'Heap growth.*balanced.*rank 1'):
+                    runner._route_windows(root, runner.Stage('push', 1), 1, 2)
+                timings['steps_detail'][window.measured_indices.start].pop('heap_growth')
+                path.write_text(json.dumps(timings))
                 reference = runner.validate_route_windows(record, selected)
                 profiles = {f'{window.profile}/s{window.seed}': reference[window.name]
                             for window in selected.windows}

@@ -139,11 +139,13 @@ def command_for(stage: Stage, index: int) -> list[str]:
             'HYPER_PARALLEL_REPLICA_CALIBRATION_DIR=',
             'HYPER_PARALLEL_REPLICA_REQUIRE_CALIBRATION=0',
             'HYPER_PARALLEL_REPLICA_COST_MODEL=0',
-            f'HYPER_PARALLEL_SHMEM_HEAP_SIZE={2**31 if stage.policy == "heap2g" else 2**32}',
             'HYPER_PARALLEL_REPLICA_PROJECTED_GUEST_SEARCH=0',
             f'HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH={int(stage.policy in ("complete", "complete_repack"))}',
             f'HYPER_PARALLEL_SHMEM_FIXED_HEAP_REPACK={int(stage.policy in ("repack", "complete_repack"))}',
         ]
+        if stage.policy in ('repack', 'complete_repack', 'heap2g'):
+            calibration_environment.append(
+                f'HYPER_PARALLEL_SHMEM_HEAP_SIZE={2**31 if stage.policy == "heap2g" else 2**32}')
     if os.environ.get('DSV41_ROUTE_SCHEDULE'):
         selected = load_schedule(Path(os.environ['DSV41_ROUTE_SCHEDULE']))
         if (selected.steps != int(os.environ['TRAIN_ITERS']) or selected.warmup != int(os.environ['WARMUP_STEPS'])
@@ -372,6 +374,10 @@ def _route_windows(folder: Path, stage: Stage, nodes: int, cards: int) -> dict[s
     for window in selected.windows:
         if not window.measured:
             continue
+        for rank, rank_rows in enumerate(rows):
+            growth = [index + 1 for index in window.measured_indices if rank_rows[index].get('heap_growth')]
+            if growth:
+                raise ValueError(f'Heap growth in measured window {window.name} at rank {rank}, steps {growth}')
         times = [max(rank_rows[index]['local_seconds'] for rank_rows in rows) for index in window.measured_indices]
         result[window.name] = dict(profile=window.profile, seed=window.seed, **identity[window.name],
                                    measured_steps=[index + 1 for index in window.measured_indices],
