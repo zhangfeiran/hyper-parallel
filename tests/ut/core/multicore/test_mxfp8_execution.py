@@ -15,16 +15,35 @@
 """Protect physical activation storage for row-only checkpoint forwards."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from tests.common.mark_utils import arg_mark
 
-from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution import _quantized_buffers
+from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution import (
+    _forward_quantized_buffers, _quantized_buffers,
+)
 
 
 class TestMXFP8ActivationBuffers(unittest.TestCase):
     """Check real CPU storage bounds without native or distributed initialization."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_forward_axes_follow_the_same_backward_retention_contract(self) -> None:
+        """Feature: Forward activation axis retention.
+        Description: Exercise both activation families with and without backward retention.
+        Expectation: Column data is shared only when unused; scales always remain independent.
+        """
+        spec = SimpleNamespace(hidden_size=256, intermediate_size=128, local_experts=8)
+        for row_only in (False, True):
+            with self.subTest(row_only=row_only):
+                activations = _forward_quantized_buffers(spec, 128, "cpu", row_only=row_only)
+                self.assertEqual([tuple(axis[0].shape) for axis in activations], [(128, 256), (128, 128)])
+                for row, row_scale, column, column_scale in activations:
+                    self.assertEqual(row.data_ptr() == column.data_ptr(), row_only)
+                    self.assertNotEqual(row.data_ptr(), column_scale.data_ptr())
+                    self.assertNotEqual(row_scale.data_ptr(), column_scale.data_ptr())
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_dual_axis_storage_remains_independent(self) -> None:

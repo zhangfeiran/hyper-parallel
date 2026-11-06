@@ -143,4 +143,5 @@ def launch_mxfp8_task_graph(
         raise ValueError("The integrated MX payload supports legacy_odd and window2 graphs only.")
     if swiglu_row_only:
         require_mxfp8_window_feature("nograd_row_only")
+        require_mxfp8_window_feature("nograd_x_row_only")
     torch.ops.hyper_parallel.mxfp8_task_graph(aliases, runtime, events, diagnostic, launch)

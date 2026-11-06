@@ -42,6 +42,7 @@ from hyper_parallel.core.multicore.scheduler.mxfp8_quant import (
     MX_SWIGLU_TASK,
     MX_SWIGLU_GRAD_TASK,
     MX_SWIGLU_ROW_TASK,
+    MX_QUANT_ROW_TASK,
     MxQuantDescriptor,
     serialize_mx_quant_descriptors,
 )
@@ -447,7 +448,7 @@ def _configure_mx_ready_depth(config: Any, depth: int) -> None:
     flag = MX_READY_DEPTH8 if depth == 8 else MX_READY_DEPTH1
     for task in config.all_tasks[:config.task_num]:
         if task.task_type in (MX_GMM_TASK_TYPE, MX_QUANT_TASK, MX_SWIGLU_TASK,
-                              MX_SWIGLU_GRAD_TASK, MX_SWIGLU_ROW_TASK):
+                              MX_SWIGLU_GRAD_TASK, MX_SWIGLU_ROW_TASK, MX_QUANT_ROW_TASK):
             if task.extra_value_1 & ~MX_PROJECTION_READY_MASK:
                 raise ValueError("MX task flags overlap the projection-ready buffer code.")
             task.extra_value_1 |= flag
@@ -565,7 +566,9 @@ def build_mxfp8_runtime(
         )
 
     if forward:
-        quant("quant_x", MX_QUANT_TASK, h, [0], [16, 17, 18, 19], first=True)
+        x_kind, x_outputs = {False: (MX_QUANT_TASK, [16, 17, 18, 19]),
+                             True: (MX_QUANT_ROW_TASK, [16, 17])}[swiglu_row_only]
+        quant("quant_x", x_kind, h, [0], x_outputs, first=True)
         gmm("up", "NN", (capacity, 2 * width, h), [16, 5], 7, (17, 23))
         quant(
             "swiglu_quant",

@@ -140,6 +140,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
                 require_mxfp8_window_feature("ready_math")
             if self.spec.mx_swiglu_row_only:
                 require_mxfp8_window_feature("nograd_row_only")
+                require_mxfp8_window_feature("nograd_x_row_only")
 
         if self.spec.mx_ready_depth or self.spec.mx_swiglu_row_only:
             _collective.collective_call(validate_features, stage="MXFP8 window capabilities", group=self.spec.ep_group)

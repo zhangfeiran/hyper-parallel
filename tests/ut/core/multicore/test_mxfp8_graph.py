@@ -36,7 +36,7 @@ from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_co
 from hyper_parallel.core.multicore.scheduler.config import TaskType
 from hyper_parallel.core.multicore.scheduler.mxfp8 import MX_GMM_TASK_TYPE
 from hyper_parallel.core.multicore.scheduler.mxfp8_quant import (
-    MX_QUANT_TASK, MX_SWIGLU_TASK, MX_SWIGLU_GRAD_TASK, MX_SWIGLU_ROW_TASK,
+    MX_QUANT_TASK, MX_SWIGLU_TASK, MX_SWIGLU_GRAD_TASK, MX_SWIGLU_ROW_TASK, MX_QUANT_ROW_TASK,
 )
 
 
@@ -103,7 +103,10 @@ class TestMXFP8Graph(unittest.TestCase):
                                 self.assertEqual(bytes(after), bytes(before))
                         self.assertEqual(sum(task.task_type == MX_SWIGLU_ROW_TASK for task in actual.config.all_tasks),
                                          384 if row_only else 0)
-                        self.assertEqual(sum(task.task_type == MX_QUANT_TASK for task in actual.config.all_tasks), 384)
+                        self.assertEqual(sum(task.task_type == MX_QUANT_TASK for task in actual.config.all_tasks),
+                                         0 if row_only else 384)
+                        self.assertEqual(sum(task.task_type == MX_QUANT_ROW_TASK for task in actual.config.all_tasks),
+                                         384 if row_only else 0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_backward_changes_only_math_selection_flags(self) -> None:
@@ -188,8 +191,8 @@ class TestMXFP8Graph(unittest.TestCase):
             for task in runtime.config.all_tasks:
                 inputs = [task.inputs[index].input_position for index in range(task.num_inputs)]
                 outputs = [task.outputs[index].input_position for index in range(task.num_outputs)]
-                self.assertTrue(set(inputs + outputs).isdisjoint({21, 22}),
-                                msg=f"Unused column positions 21/22 appear in inputs={inputs}, outputs={outputs}")
+                self.assertTrue(set(inputs + outputs).isdisjoint({18, 19, 21, 22}),
+                                msg=f"Unused column bindings appear in inputs={inputs}, outputs={outputs}")
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_unsupported_environment_is_rejected_before_execution(self) -> None:

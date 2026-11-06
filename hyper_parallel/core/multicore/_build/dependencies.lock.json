@@ -70,6 +70,11 @@
             "path": "hyper_parallel/core/multicore/ops/mxfp8_quant/row_only_logical_worker.patch",
             "sha256": "7e7e3eaa1aeacfb26d0b48225d693beae1b939bd8cc3868f5dacf58acd8079ff",
             "purpose": "Expose logical worker index for the unchanged standard row-only SwiGLU primitive."
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/mxfp8_quant/x_row_only_worker.patch",
+            "sha256": "1e9089b709ae3ebb47162c7859696d40759ba488d5cbcc3ddbe84be865c03098",
+            "purpose": "Skip unused column-axis quantization in original no-grad forward while preserving row math and standalone defaults."
           }
         ]
       },

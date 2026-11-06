@@ -11,6 +11,7 @@ constexpr uint32_t MX_QUANT_TASK = 161;
 constexpr uint32_t MX_SWIGLU_TASK = 162;
 constexpr uint32_t MX_SWIGLU_GRAD_TASK = 163;
 constexpr uint32_t MX_SWIGLU_ROW_TASK = 164;
+constexpr uint32_t MX_QUANT_ROW_TASK = 165;
 constexpr uint32_t MX_DISPATCH_QUANT_TASK = 153;
 
 struct MxQuantDescriptor {
@@ -27,20 +28,32 @@ static_assert(offsetof(MxQuantDescriptor, reserved) == 40, "MX quant reserved of
 #ifdef __NPU_ARCH__
 __aicore__
 #endif
+  inline bool IsMxQuantHeaderValid(const MxQuantDescriptor &r) {
+  return r.magic == MX_QUANT_MAGIC && r.size == sizeof(r) && r.input_bytes == 2 && r.columns > 0 &&
+         r.columns % 64 == 0 && r.worker_count > 0 && r.worker_index < r.worker_count;
+}
+
+#ifdef __NPU_ARCH__
+__aicore__
+#endif
+  inline bool IsMxDispatchQuantDescriptorValid(const MxQuantDescriptor &r) {
+  const uint64_t roles = r.reserved[2];
+  return IsMxQuantHeaderValid(r) && r.version == 2 && r.block_rows == 64 &&
+         r.block_columns == 256 && r.reserved[1] > 0 && r.reserved[1] % 64 == 0 && (roles & 255) < 64 &&
+         ((roles >> 8) & 255) < 64 && ((roles >> 16) & 65535) > 0 && ((roles >> 32) & 65535) > r.expert_index &&
+         (roles >> 48) == 0;
+}
+
+#ifdef __NPU_ARCH__
+__aicore__
+#endif
   inline bool IsMxQuantDescriptorValid(const MxQuantDescriptor &r) {
-  if (r.task_type == MX_DISPATCH_QUANT_TASK) {
-    const uint64_t roles = r.reserved[2];
-    return r.magic == MX_QUANT_MAGIC && r.version == 2 && r.size == sizeof(r) && r.input_bytes == 2 && r.columns > 0 &&
-           r.columns % 64 == 0 && r.worker_count > 0 && r.worker_index < r.worker_count && r.block_rows == 64 &&
-           r.block_columns == 256 && r.reserved[1] > 0 && r.reserved[1] % 64 == 0 && (roles & 255) < 64 &&
-           ((roles >> 8) & 255) < 64 && ((roles >> 16) & 65535) > 0 && ((roles >> 32) & 65535) > r.expert_index &&
-           (roles >> 48) == 0;
-  }
+  if (r.task_type == MX_DISPATCH_QUANT_TASK) return IsMxDispatchQuantDescriptorValid(r);
   const bool supported = r.task_type == MX_QUANT_TASK || r.task_type == MX_SWIGLU_TASK ||
-                         r.task_type == MX_SWIGLU_GRAD_TASK || r.task_type == MX_SWIGLU_ROW_TASK;
+                         r.task_type == MX_SWIGLU_GRAD_TASK || r.task_type == MX_SWIGLU_ROW_TASK ||
+                         r.task_type == MX_QUANT_ROW_TASK;
   const uint32_t block_columns = r.task_type == MX_SWIGLU_GRAD_TASK ? 128 : 256;
-  return r.magic == MX_QUANT_MAGIC && r.version == 1 && r.size == sizeof(r) && r.input_bytes == 2 && r.columns > 0 &&
-         r.columns % 64 == 0 && r.worker_count > 0 && r.worker_index < r.worker_count && supported &&
+  return IsMxQuantHeaderValid(r) && r.version == 1 && supported &&
          (r.task_type != MX_SWIGLU_GRAD_TASK || r.columns % 128 == 0) &&
          r.block_rows == (r.task_type == MX_SWIGLU_ROW_TASK ? 16 : 64) && r.block_columns == block_columns;
 }

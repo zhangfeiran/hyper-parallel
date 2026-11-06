@@ -73,6 +73,16 @@ def _use_row_only(spec: Any, retain_backward: bool) -> bool:
     return spec.mx_swiglu_row_only and not retain_backward
 
 
+def _forward_quantized_buffers(
+    spec: Any, rows: int, device: Any, *, row_only: bool,
+) -> tuple[tuple[torch.Tensor, ...], ...]:
+    """Apply the same retained-axis contract to both forward activations."""
+    return tuple(
+        _quantized_buffers(rows, width, spec.local_experts, device, row_only=row_only)
+        for width in (spec.hidden_size, spec.intermediate_size)
+    )
+
+
 def _empty_expert_ranges(counts: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
     """Return maximal empty expert intervals without reading device state.
 
@@ -208,10 +218,9 @@ class MXFP8Execution:
         resources.last_execution_plan = plan
         metadata = route.metadata
         capacity, device = metadata.expert_capacity, hidden.device
-        x_row, x_scale, x_col, x_col_scale = _quantized_buffers(capacity, spec.hidden_size, spec.local_experts, device)
-        a_row, a_scale, a_col, a_col_scale = _quantized_buffers(
-            capacity, spec.intermediate_size, spec.local_experts, device, row_only=row_only
-        )
+        x_buffers, a_buffers = _forward_quantized_buffers(spec, capacity, device, row_only=row_only)
+        x_row, x_scale, x_col, x_col_scale = x_buffers
+        a_row, a_scale, a_col, a_col_scale = a_buffers
         up = torch.empty((capacity, 2 * spec.intermediate_size), dtype=torch.bfloat16, device=device)
         down = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
         workspace.claim()

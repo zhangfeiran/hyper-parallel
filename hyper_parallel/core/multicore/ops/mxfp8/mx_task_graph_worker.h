@@ -57,6 +57,7 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
         break;
 #ifdef PANGU_MX_ROW_ONLY
       case 164:
+      case 165:
 #endif
       case 161:
       case 162:

@@ -24,6 +24,7 @@ MX_QUANT_TASK = 161
 MX_SWIGLU_TASK = 162
 MX_SWIGLU_GRAD_TASK = 163
 MX_SWIGLU_ROW_TASK = 164
+MX_QUANT_ROW_TASK = 165
 MX_DISPATCH_QUANT_TASK = 153
 MX_QUANT_MAGIC = 0x4D585154
 _RECORD = struct.Struct("<IHH8I3Q")
@@ -56,7 +57,9 @@ class MxQuantDescriptor:
             raise ValueError("MX quant columns must be a positive multiple of 64")
         if self.worker_count == 0 or self.worker_index >= self.worker_count:
             raise ValueError("MX quant worker_index must be smaller than positive worker_count")
-        if self.task_type not in (MX_QUANT_TASK, MX_SWIGLU_TASK, MX_SWIGLU_GRAD_TASK, MX_SWIGLU_ROW_TASK):
+        if self.task_type not in (
+            MX_QUANT_TASK, MX_SWIGLU_TASK, MX_SWIGLU_GRAD_TASK, MX_SWIGLU_ROW_TASK, MX_QUANT_ROW_TASK,
+        ):
             raise ValueError("Unsupported MX quant task type")
         if self.task_type == MX_SWIGLU_GRAD_TASK and self.columns % 128:
             raise ValueError("SwiGLU backward output columns must be a multiple of 128")
