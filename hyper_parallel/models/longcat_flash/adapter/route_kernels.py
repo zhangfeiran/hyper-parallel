@@ -93,12 +93,67 @@ def _input_gradient_kernel(real_gradient, identity_gradient, inverse, output,
     tl.store(output + token * H + columns, acc.to(tl.bfloat16, fp_downcast_rounding="rtne"), columns < H)
 
 
+@triton.jit
+def _real_slot_count(inverse, token, K: tl.constexpr):
+    slots = tl.arange(0, triton.next_power_of_2(K))
+    routes = tl.load(inverse + token * K + slots, slots < K, -1)
+    return tl.sum(((slots < K) & (routes >= 0)).to(tl.int32), 0)
+
+
+@triton.jit
+def _identity_prefix_gradient_kernel(gradient, inverse, weights, output,
+                                     row_start, H: tl.constexpr, K: tl.constexpr, B: tl.constexpr):
+    token = tl.program_id(0) + row_start
+    columns = tl.program_id(1) * B + tl.arange(0, B)
+    real = _real_slot_count(inverse, token, K)
+    dy = tl.load(gradient + token * H + columns, columns < H, 0).to(tl.float32)
+    acc = tl.full((B,), 0, tl.float32)
+    for position in range(K - real):
+        slot = K - 1 - position
+        probability = tl.load(weights + token * K + slot)
+        value = _bf16_round(dy * probability)
+        acc = _bf16_round(acc + value)
+    if real > 0:
+        acc = tl.where(acc == 0, 0., acc)
+    tl.store(output + token * H + columns, acc.to(tl.bfloat16, fp_downcast_rounding="rtne"), columns < H)
+
+
+@triton.jit
+def _input_prefix_gradient_kernel(real_gradient, identity_gradient, inverse, output,
+                                  row_start, H: tl.constexpr, K: tl.constexpr, B: tl.constexpr):
+    token = tl.program_id(0) + row_start
+    columns = tl.program_id(1) * B + tl.arange(0, B)
+    real = _real_slot_count(inverse, token, K)
+    acc = tl.load(identity_gradient + token * H + columns, columns < H, 0).to(tl.float32)
+    if real < K:
+        acc = tl.where(acc == 0, 0., acc)
+    for position in range(real):
+        slot = real - 1 - position
+        route = tl.load(inverse + token * K + slot)
+        value = tl.load(real_gradient + route * H + columns, columns < H, 0).to(tl.float32)
+        acc = _bf16_round(acc + value)
+    tl.store(output + token * H + columns, acc.to(tl.bfloat16, fp_downcast_rounding="rtne"), columns < H)
+
+
+@triton.jit
+def _empty_input_gradient_kernel(identity_gradient, output,
+                                 row_start, H: tl.constexpr, K: tl.constexpr, B: tl.constexpr):
+    token = tl.program_id(0) + row_start
+    columns = tl.program_id(1) * B + tl.arange(0, B)
+    value = tl.load(identity_gradient + token * H + columns, columns < H, 0).to(tl.float32)
+    if K > 0:
+        value = tl.where(value == 0, 0., value)
+    tl.store(output + token * H + columns, value.to(tl.bfloat16, fp_downcast_rounding="rtne"), columns < H)
+
+
 def _launch(kernel: Any, rows: int, hidden_size: int, *args: torch.Tensor, top_k: int) -> None:
     """Launch only nonempty grids and disable multiply/add reassociation."""
     # A complete expert-gradient row reuses its scalar token and probability
     # loads. Bound the tile so the pointwise rounding fits the tested UB budget.
     block = (triton.next_power_of_2(hidden_size)
              if kernel is _expert_gradient_kernel and hidden_size <= 8192 else 2048)
+    if kernel is _input_prefix_gradient_kernel:
+        block = 4096
     columns = triton.cdiv(hidden_size, block)
     maximum_rows = max(1, 65535 // columns)
     for offset in range(0, rows, maximum_rows):
@@ -136,7 +191,17 @@ class OrderedGather(torch.autograd.Function):
         """
         inverse, = ctx.saved_tensors
         output = torch.empty_like(identity_gradient)
-        _launch(_input_gradient_kernel, ctx.shape[0], ctx.shape[1],
+        specialized = ctx.shape[1] == 6144 and inverse.shape[1] == 12
+        if specialized and not real_gradient.shape[0]:
+            _launch(_empty_input_gradient_kernel, ctx.shape[0], ctx.shape[1],
+                    identity_gradient, output, top_k=inverse.shape[1])
+            return output, None, None
+        # The adapter sorts real experts before identity experts. Skip their
+        # zero contributions while retaining the descending BF16 sum order.
+        kernel = (_input_prefix_gradient_kernel
+                  if specialized and real_gradient.shape[0] < ctx.shape[0] * inverse.shape[1]
+                  else _input_gradient_kernel)
+        _launch(kernel, ctx.shape[0], ctx.shape[1],
                real_gradient, identity_gradient, inverse, output, top_k=inverse.shape[1])
         return output, None, None
 
@@ -174,11 +239,17 @@ class OrderedCombine(torch.autograd.Function):
         """
         hidden, expert_output, weights, inverse, token, slot = ctx.saved_tensors
         gradient = gradient.contiguous()
-        identity_gradient = torch.empty_like(hidden)
         expert_gradient = torch.empty_like(expert_output)
         top_k = weights.shape[1]
-        _launch(_identity_gradient_kernel, hidden.shape[0], hidden.shape[1],
-               gradient, inverse, weights, identity_gradient, top_k=top_k)
+        specialized = hidden.shape[1] == 6144 and top_k == 12
+        if specialized and token.numel() == hidden.shape[0] * top_k:
+            identity_gradient = torch.zeros_like(hidden)
+        else:
+            identity_gradient = torch.empty_like(hidden)
+            kernel = (_identity_prefix_gradient_kernel
+                      if specialized and token.numel() else _identity_gradient_kernel)
+            _launch(kernel, hidden.shape[0], hidden.shape[1],
+                    gradient, inverse, weights, identity_gradient, top_k=top_k)
         _launch(_expert_gradient_kernel, token.numel(), hidden.shape[1],
                gradient, token.contiguous(), slot.contiguous(), weights, expert_gradient, top_k=top_k)
         identity_probability = (gradient.float() * hidden.float()).sum(-1)

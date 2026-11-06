@@ -24,7 +24,10 @@ from transformers.models.longcat_flash.modeling_longcat_flash import LongcatFlas
 from hyper_parallel.core.multicore.modules.mega_moe.assignments import masked_expert_forward
 from hyper_parallel.models.longcat_flash.adapter.experts import identity_contribution
 from hyper_parallel.models.longcat_flash.adapter.routing import OrderedInputGather
-from hyper_parallel.models.longcat_flash.adapter.route_kernels import OrderedCombine, OrderedGather
+from hyper_parallel.models.longcat_flash.adapter.route_kernels import (
+    OrderedCombine, OrderedGather, _empty_input_gradient_kernel, _identity_gradient_kernel,
+    _identity_prefix_gradient_kernel, _input_gradient_kernel, _input_prefix_gradient_kernel, _launch,
+)
 
 
 class _RouteOnlyExecutor:
@@ -77,6 +80,43 @@ def test_longcat_ordered_route_kernels() -> None:
         actual.backward(upstream)
         for observed, target in ((actual, expected), (candidate.grad, reference.grad), (other.grad, weights.grad)):
             torch.testing.assert_close(observed, target, rtol=0, atol=0, msg=case)
+    torch.npu.synchronize()
+
+
+def test_longcat_prefix_gradient_kernels() -> None:
+    """Feature: Ordered real-prefix gradient kernels.
+
+    Description: Compare original full-slot sums with varying real prefixes and signed zeros at H6144.
+    Expectation: Identity, mixed input and empty input gradients retain every BF16 bit.
+    """
+    torch.npu.set_device(0)
+    torch.npu.manual_seed(4601)
+    gradient = torch.randn(2048, 6144, device="npu", dtype=torch.bfloat16)
+    identity = torch.randn_like(gradient)
+    gradient[:, 0], gradient[:, 1], gradient[:, 2] = -0.0, 1e-36, -1e-36
+    identity[:, 0] = -0.0
+    weights = torch.randn(2048, 12, device="npu").softmax(-1)
+    choices = torch.tensor([0, 1, 4, 8, 12], device="npu")
+    counts = choices[torch.arange(2048, device="npu") % choices.numel()]
+    columns = torch.arange(12, device="npu")[None, :]
+    token, slot = (columns < counts[:, None]).nonzero(as_tuple=True)
+    inverse = torch.full((2048, 12), -1, device="npu", dtype=torch.int32)
+    inverse[token, slot] = torch.arange(token.numel(), device="npu", dtype=torch.int32)
+    real = torch.randn(token.numel(), 6144, device="npu", dtype=torch.bfloat16)
+    expected, actual = torch.empty_like(gradient), torch.empty_like(gradient)
+    _launch(_identity_gradient_kernel, 2048, 6144,
+            gradient, inverse, weights, expected, top_k=12)
+    _launch(_identity_prefix_gradient_kernel, 2048, 6144,
+            gradient, inverse, weights, actual, top_k=12)
+    torch.testing.assert_close(actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
+    _launch(_input_gradient_kernel, 2048, 6144, real, identity, inverse, expected, top_k=12)
+    _launch(_input_prefix_gradient_kernel, 2048, 6144, real, identity, inverse, actual, top_k=12)
+    torch.testing.assert_close(actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
+    inverse.fill_(-1)
+    empty = real[:0]
+    _launch(_input_gradient_kernel, 2048, 6144, empty, identity, inverse, expected, top_k=12)
+    _launch(_empty_input_gradient_kernel, 2048, 6144, identity, actual, top_k=12)
+    torch.testing.assert_close(actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
     torch.npu.synchronize()
 
 

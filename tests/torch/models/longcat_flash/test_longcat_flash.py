@@ -66,3 +66,15 @@ def test_longcat_hot_replicas() -> None:
     """
     torchrun_case(file_name=str(Path(__file__).with_name("_test_longcat_replicas.py")),
                   case_name="test_longcat_hot_replicas", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard",
+          essential_mark="essential")
+def test_longcat_prefix_gradient_kernels() -> None:
+    """Feature: Ordered real-prefix routing gradients.
+
+    Description: Check varying prefix lengths, empty real routes and signed zeros at production width.
+    Expectation: Every BF16 bit matches the original full-slot kernels.
+    """
+    torchrun_case(file_name=str(Path(__file__).with_name("_test_longcat_ordered_route_kernels.py")),
+                  case_name="test_longcat_prefix_gradient_kernels", num_proc=1)
