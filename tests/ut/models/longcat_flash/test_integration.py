@@ -52,6 +52,39 @@ def small_config(layers: int = 1, zero: int = 3) -> dict:
 class TestLongcatIntegration(unittest.TestCase):
     """Use the independent, unmodified HF model as the numerical oracle."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_eoi_replicas_bind_real_prefix_and_retain_unused_gradients(self) -> None:
+        """Feature: LongCat EOI hot replicas.
+
+        Description: Configure local packed HF weights without transposing the real-expert prefix.
+        Expectation: Replica execution retains parameter storage and zero unused-row derivatives.
+        """
+        config = small_config(zero=4)
+        config["n_routed_experts"] = 8
+        source = LongcatFlashExperts(LongcatFlashConfig.from_dict(config))
+        target = LongcatFlashMegaMoeExperts(
+            module=source, context={"ep_size": 2, "ep": True}, replica_slots_per_rank=1, expert_weight_layout="EOI"
+        )
+        target.gate_up_proj = torch.nn.Parameter(target.gate_up_proj[:6].detach().clone())
+        target.down_proj = torch.nn.Parameter(target.down_proj[:4].detach().clone())
+        try:
+            target.configure(ep_size=2)
+            gate, down = target._real_weights()
+            self.assertEqual(gate.data_ptr(), target.gate_up_proj.data_ptr())
+            self.assertEqual(down.data_ptr(), target.down_proj.data_ptr())
+            self.assertEqual(tuple(gate.shape), (4, 16, 16))
+            self.assertTrue(gate.is_contiguous())
+            self.assertEqual(target._executor.expert_weight_layout, "EOI")
+            self.assertEqual(target._executor.replica_slots_per_rank, 1)
+            self.assertEqual(target._executor.replica_granularity, "expert")
+            self.assertFalse(target._executor._cost_model_enabled)
+            (gate.sum() + down.sum()).backward()
+            torch.testing.assert_close(target.gate_up_proj.grad[:4], torch.ones_like(gate))
+            torch.testing.assert_close(target.gate_up_proj.grad[4:], torch.zeros_like(target.gate_up_proj[4:]))
+        finally:
+            target.close_runtime()
+
+
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")
     def test_lazy_registration(self) -> None:

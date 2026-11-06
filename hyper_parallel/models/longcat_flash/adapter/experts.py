@@ -80,7 +80,11 @@ class LongcatFlashMegaMoeExperts(nn.Module):
                  dispatch_mode: str = "push", replica_slots_per_rank: int = 0,
                  expert_weight_layout: str = "EOI", swiglu_precision: str = "fused",
                  optimize_tasks: bool = True, routing_backend: str = "torch",
-                 direct_weight_gradients: bool = True, initial_token_capacity: int | None = None) -> None:
+                 direct_weight_gradients: bool = True, initial_token_capacity: int | None = None,
+                 replica_transport: str = "shmem_signal_kernel_gradient_bands",
+                 replica_min_rows: int = 1024,
+                 replica_minimum_load_reduction: float | None = None,
+                 replica_granularity: str = "expert") -> None:
         """Bind a complete HF expert module before EP and FSDP sharding.
 
         Args:
@@ -90,7 +94,12 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             backend: MegaMoE, native NPU big operators, or explicit eager reference.
             dispatch_mode: MegaMoE push or pull transport.
             replica_slots_per_rank: Optional real-expert guest budget.
-            expert_weight_layout: EOI avoids copies; EIO enables current hot replicas.
+            replica_granularity: Complete experts by default to retain GMM reduction order;
+                token enables partial experts with independently validated rounding differences.
+            replica_transport: Weight transfer and FP32 partial-gradient return protocol.
+            replica_min_rows: Soft minimum assignment count per copied real expert.
+            replica_minimum_load_reduction: Optional minimum receive-peak improvement for replica admission.
+            expert_weight_layout: EOI avoids projection transposes; EIO retains the historical layout.
             direct_weight_gradients: Retain full Gate/Up gradients without clearing the active prefix.
             initial_token_capacity: Optional initial compact-real-row reservation; automatic growth remains enabled.
             routing_backend: Ordered Torch routing, or explicit optional Ascend Triton fusion.
@@ -123,6 +132,12 @@ class LongcatFlashMegaMoeExperts(nn.Module):
         self.swiglu_precision = swiglu_precision
         self.backend, self.dispatch_mode = backend, dispatch_mode
         self.replica_slots_per_rank = replica_slots_per_rank
+        if replica_granularity not in ("token", "expert"):
+            raise ValueError("replica_granularity must be token or expert")
+        self.replica_granularity = replica_granularity
+        self.replica_transport = replica_transport
+        self.replica_min_rows = replica_min_rows
+        self.replica_minimum_load_reduction = replica_minimum_load_reduction
         self.expert_weight_layout = expert_weight_layout
         self.initializer_range = 0.02
         self._hp_reset_after_materialization = True
@@ -167,8 +182,6 @@ class LongcatFlashMegaMoeExperts(nn.Module):
             raise ValueError("native LongCat reference does not support expert replicas")
         if expert_weight_layout not in ("EOI", "EIO"):
             raise ValueError("expert_weight_layout must be EOI or EIO")
-        if replica_slots_per_rank and expert_weight_layout != "EIO":
-            raise ValueError("current MegaMoE replicas require expert_weight_layout=EIO")
         if not isinstance(module.act_fn, (nn.SiLU, type(ACT2FN["silu"]))):
             raise ValueError("LongCat MegaMoE requires the source SiLU activation")
 
@@ -207,6 +220,8 @@ class LongcatFlashMegaMoeExperts(nn.Module):
 
             capacity = ({} if self.initial_token_capacity is None
                         else {"initial_token_capacity": self.initial_token_capacity})
+            if self.replica_slots_per_rank:
+                capacity["replica_granularity"] = self.replica_granularity
             self._executor = MegaMoeExperts(
                 hidden_size=self.hidden_size, intermediate_size=self.intermediate_size,
                 num_experts=self.num_experts, top_k=1, ep_group=ep_group, ep_size=ep_size,
@@ -215,7 +230,9 @@ class LongcatFlashMegaMoeExperts(nn.Module):
                 route_task_bounds=self.optimize_tasks, single_expert_tasks=self.optimize_tasks,
                 gate_up_expert_padding=(self.zero_expert_num
                                         if self.direct_weight_gradients and not self.replica_slots_per_rank else 0),
-                dispatch_mode=self.dispatch_mode, replica_slots_per_rank=self.replica_slots_per_rank, **capacity,
+                dispatch_mode=self.dispatch_mode, replica_slots_per_rank=self.replica_slots_per_rank,
+                replica_transport=self.replica_transport, replica_min_rows=self.replica_min_rows,
+                replica_minimum_load_reduction=self.replica_minimum_load_reduction, **capacity,
             )
         self._configured = True
 

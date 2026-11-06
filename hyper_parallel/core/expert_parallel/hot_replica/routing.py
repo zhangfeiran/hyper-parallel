@@ -37,6 +37,7 @@ from .host import _column_totals
 from .device import DeviceExpertExecutionPlan, ReplicaPlanSummary, build_device_expert_replica_plan
 from .device import validate_planner_backend
 from .plan import ExpertExecutionPlan, ExpertReplicaTransfer
+from .whole_experts import build_whole_expert_plan
 from .planner import (
     _build_expert_replica_plan as build_expert_replica_plan,
     _optional_peak_is_useful,
@@ -200,15 +201,29 @@ def _record_home_decision(decision: _RejectedReplicaQuotas | None = None) -> Non
 def _plan_replica_route(counts: Any, config: ExpertReplicaConfig, group: object, rank: int,
                         **options: Any) -> tuple[ExpertExecutionPlan, bool]:
     """Replay the original decision after the usual count exchange validates current inputs."""
+    whole = options.pop("_whole_experts", False)
+
+    def build() -> ExpertExecutionPlan:
+        """Apply the requested granularity before retaining a recomputation decision."""
+        plan = build_expert_replica_plan(counts, config.replica_slots_per_rank, **options)
+        if whole:
+            plan = build_whole_expert_plan(
+                plan, capacity_limit=options.get("capacity_limit"),
+                minimum_load_reduction=options.get("minimum_load_reduction", 0.0),
+                minimum_saved_rows=options.get("minimum_saved_rows", 0))
+        return plan
+
     state = get_recompute_state()
     if state is None:
-        return build_expert_replica_plan(counts, config.replica_slots_per_rank, **options), False
+        return build(), False
     frozen = tuple(tuple(row) for row in counts)
     # Heap allowance and gradient-dependent credits can change between phases.
     # Replaying the original decision preserves the checkpoint's physical graph.
     policy = tuple((key, type(value), value) for key, value in sorted(options.items())
                    if key not in ('receive_capacity', 'capacity_limit', '_replica_transfer_row_credit',
                                   '_uncalibrated_candidate'))
+    if whole:
+        policy += (("whole_experts", bool, True),)
     signature = (config, id(group), rank, policy)
     cache = state.get_resource(_RecomputedReplicaPlans, _RecomputedReplicaPlans)
     if state.is_recomputing:
@@ -216,7 +231,7 @@ def _plan_replica_route(counts: Any, config: ExpertReplicaConfig, group: object,
         limit = options.get('capacity_limit')
         if plan is not None and (limit is None or max(plan.destination_loads) <= limit):
             return plan, True
-    plan = build_expert_replica_plan(frozen, config.replica_slots_per_rank, **options)
+    plan = build()
     if not state.is_recomputing:
         cache.entries.append((signature, plan))
     return plan, False
@@ -526,6 +541,7 @@ def prepare_replica_route(
     _trusted_counts: torch.Tensor | None = None,
     _gathered_counts: _GatheredReplicaCounts | None = None,
     _replica_transfer_row_credit: int = 0,
+    _whole_experts: bool = False,
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
@@ -557,6 +573,10 @@ def prepare_replica_route(
         Invocation-owned placement, physical IDs and dispatch counts.
     """
     validate_planner_backend(planner_backend, minimum_replica_rows, _cost_model)
+    if not isinstance(_whole_experts, bool):
+        raise ValueError("Whole-expert routing must be boolean")
+    if _whole_experts and (planner_backend != "cpu" or _cost_model is not None):
+        raise ValueError("Whole-expert routing requires the counts-only CPU planner")
     if receive_capacity is not None:
         _integer(receive_capacity, "receive_capacity", 0)
     if _capacity_budget is not None and not callable(_capacity_budget):
@@ -686,6 +706,7 @@ def prepare_replica_route(
         _rank_nodes=_rank_nodes,
         _replica_transfer_row_credit=_replica_transfer_row_credit,
         _uncalibrated_candidate=prepared_candidate,
+        **({"_whole_experts": True} if _whole_experts else {}),
     )
     if max(plan.destination_loads) > upper:
         raise RuntimeError("replica planner exceeded the theoretical receive bound")

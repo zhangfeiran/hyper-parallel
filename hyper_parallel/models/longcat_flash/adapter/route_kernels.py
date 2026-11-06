@@ -95,7 +95,10 @@ def _input_gradient_kernel(real_gradient, identity_gradient, inverse, output,
 
 def _launch(kernel: Any, rows: int, hidden_size: int, *args: torch.Tensor, top_k: int) -> None:
     """Launch only nonempty grids and disable multiply/add reassociation."""
-    block = 2048
+    # A complete expert-gradient row reuses its scalar token and probability
+    # loads. Bound the tile so the pointwise rounding fits the tested UB budget.
+    block = (triton.next_power_of_2(hidden_size)
+             if kernel is _expert_gradient_kernel and hidden_size <= 8192 else 2048)
     columns = triton.cdiv(hidden_size, block)
     maximum_rows = max(1, 65535 // columns)
     for offset in range(0, rows, maximum_rows):

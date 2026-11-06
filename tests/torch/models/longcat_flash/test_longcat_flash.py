@@ -54,3 +54,15 @@ def test_longcat_ordered_route_kernels() -> None:
     """
     torchrun_case(file_name=str(Path(__file__).with_name("_test_longcat_ordered_route_kernels.py")),
                   case_name="test_longcat_ordered_route_kernels", num_proc=1)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="essential")
+def test_longcat_hot_replicas() -> None:
+    """Feature: EOI hot replicas with complete-expert reductions.
+
+    Description: Retain LongCat width and local expert counts across ten updates, changing routes and empty cases.
+    Expectation: Push and Pull preserve native GMM output, gradient, parameter and unused-gradient semantics.
+    """
+    torchrun_case(file_name=str(Path(__file__).with_name("_test_longcat_replicas.py")),
+                  case_name="test_longcat_hot_replicas", num_proc=4)

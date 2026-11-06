@@ -183,7 +183,8 @@ class TestAutomaticReplicaCalibration(unittest.TestCase):
         module = SimpleNamespace(dispatch_mode='push', hidden_size=16, intermediate_size=8, ep_size=2,
             num_experts=4, top_k=1, replica_transport='shmem_signal_kernel_gradient_bands', replica_slots_per_rank=1)
         resources = SimpleNamespace(rank_nodes=(0, 0), spec=SimpleNamespace(expert_weight_layout='EIO',
-            swiglu_limit=None, dispatch_split=1, combine_split=1, num_cube_cores=24))
+            swiglu_limit=None, swiglu_hf_bf16=False, local_num_tokens=128, single_expert_tasks=False,
+            gate_up_expert_padding=0, route_task_bounds=False, dispatch_split=1, combine_split=1, num_cube_cores=24))
         signatures = {}
         for contract in ('nonreentrant', 'reentrant'):
             with self.subTest(contract=contract):

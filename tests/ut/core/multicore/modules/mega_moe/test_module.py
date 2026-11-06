@@ -540,14 +540,35 @@ class TestMegaMoeExperts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "EOI expert weights must be contiguous"):
             experts._validate_tensors(hidden_states, (noncontiguous_gate_up, noncontiguous_down))
 
-    def test_eoi_replicas_fail_before_resource_registration(self) -> None:
-        """Replica partials require EIO storage while upstream EOI remains available for B0."""
-        with (patch.object(mega_moe_module.MulticoreModule, "__init__",
-                           side_effect=AssertionError("Unexpected resource registration")),
-              self.assertRaisesRegex(ValueError, "Hot replicas require expert_weight_layout='EIO'")):
-            MegaMoeExperts(hidden_size=16, intermediate_size=8,
-                           num_experts=12, top_k=2, ep_size=4,
-                           replica_slots_per_rank=1, expert_weight_layout="EOI")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_eoi_replicas_keep_native_projection_shapes(self) -> None:
+        """Feature: Native EOI hot experts.
+
+        Description: Bind each replica transport without changing the owned projection layout.
+        Expectation: EOI matrix shapes and replica budgets survive lazy resource registration.
+        """
+        for transport in ("p2p", "shmem_signal_kernel_gradient", "shmem_signal_kernel_gradient_bands"):
+            with self.subTest(transport=transport):
+                experts = MegaMoeExperts(
+                    hidden_size=16,
+                    intermediate_size=8,
+                    num_experts=12,
+                    top_k=2,
+                    ep_size=4,
+                    replica_slots_per_rank=1,
+                    expert_weight_layout="EOI",
+                    replica_transport=transport,
+                )
+                try:
+                    self.assertEqual(tuple(experts.gate_up_weight.shape), (3, 16, 16))
+                    self.assertEqual(tuple(experts.down_weight.shape), (3, 16, 8))
+                    self.assertEqual(experts.replica_slots_per_rank, 1)
+                    self.assertEqual(experts.expert_weight_layout, "EOI")
+                    self.assertIsNone(experts._resource_group.resources)
+                finally:
+                    experts.close()
+
+
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

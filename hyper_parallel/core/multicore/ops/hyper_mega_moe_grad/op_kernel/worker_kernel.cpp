@@ -107,7 +107,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   uint32_t gradient_order_[GRADIENT_ORDER_MAX_EXPERTS];
 
   __aicore__ inline void ValidateGradientTask(const TaskDesc &task, uint32_t experts, uint32_t policy) {
-    if (this->home_experts_ != 0 || task.task_type != TaskType::TASK_GROUPED_MATMUL ||
+    if ((this->home_experts_ != 0 && this->home_experts_ != experts) ||
+        task.task_type != TaskType::TASK_GROUPED_MATMUL ||
         experts == 0 || experts > GRADIENT_ORDER_MAX_EXPERTS || policy < 1 || policy == 5 || policy > 7) AscendC::Trap();
     if (task.outputs[0].input_position != 18 &&
         (task.outputs[0].input_position != 12 || policy != 4)) AscendC::Trap();
@@ -119,7 +120,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       return GRADIENT_LANE_DISABLED;
     }
     const uint32_t position = task.outputs[0].input_position;
-    if (this->home_experts_ != 0 || !getTransposeData(task.inputs[0].transpose_flag) ||
+    const uint32_t experts = task.inputs[2].dim[0];
+    if ((this->home_experts_ != 0 && this->home_experts_ != experts) ||
+        !getTransposeData(task.inputs[0].transpose_flag) ||
         (position != 6 && position != 18)) AscendC::Trap();
     return expert;
   }

@@ -89,8 +89,19 @@ def _replica_inbox_bytes(specification: Mapping[str, Any]) -> int:
     if mode not in KERNEL_GRADIENT_TRANSPORT_MODES:
         raise ValueError("Unsupported replica_transport; expected p2p or a kernel-gradient transport")
     hidden, intermediate = specification["hidden_size"], specification["intermediate_size"]
-    return signal_storage_bytes(((hidden, 2 * intermediate), (intermediate, hidden)), budget,
+    shapes = _replica_matrix_shapes(hidden, intermediate, specification.get("expert_weight_layout", "EIO"))
+    return signal_storage_bytes(shapes, budget,
                                 specification["ep_size"], 2, gradient_bands=mode == GRADIENT_BAND_TRANSPORT)
+
+
+def _replica_matrix_shapes(hidden: int, intermediate: int, layout: str) -> tuple[tuple[int, int], ...]:
+    """Size each projection's gradient bands in its native matrix orientation."""
+    if layout == "EOI":
+        return ((2 * intermediate, hidden), (hidden, intermediate))
+    if layout == "EIO":
+        return ((hidden, 2 * intermediate), (intermediate, hidden))
+    raise ValueError("Replica expert weight layout must be EIO or EOI")
+
 
 
 def _spec_workspace_bytes(
@@ -374,7 +385,8 @@ class MegaMoeWorkspace:
 
     def _allocate_replica_storage(self, spec: MegaMoeSpec) -> None:
         """Recreate provider state with the new symmetric heap generation."""
-        shapes = ((spec.hidden_size, 2 * spec.intermediate_size), (spec.intermediate_size, spec.hidden_size))
+        shapes = _replica_matrix_shapes(spec.hidden_size, spec.intermediate_size,
+                                        getattr(spec, "expert_weight_layout", "EIO"))
         size = signal_storage_bytes(shapes, spec.replica_slots_per_rank, spec.ep_size, 2,
                                     gradient_bands=spec.replica_transport == GRADIENT_BAND_TRANSPORT)
         if self.replica_inbox is None:

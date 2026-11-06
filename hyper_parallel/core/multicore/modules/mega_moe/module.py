@@ -331,7 +331,7 @@ class _MegaMoeExecutionResources:
                   "ep_size", "auto_tokens",
                   "_replica_cost_model_enabled", "_replica_critical_path_identity", "_gradient_queue_order",
                   "_cube_event_refresh_us", "_vector_event_refresh_us", "_batch_empty_dispatch",
-                  "replica_slots_per_rank", "replica_transport")
+                  "replica_slots_per_rank", "replica_transport", "replica_granularity")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v4", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications),
@@ -495,6 +495,7 @@ class MegaMoeExperts(MulticoreModule):
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
         replica_slots_per_rank: int = 0,
+        replica_granularity: str = "token",
         replica_transport: str = "shmem_signal_kernel_gradient_bands",
         replica_min_rows: int = 1024,
         replica_planner: str = "cpu",
@@ -518,6 +519,8 @@ class MegaMoeExperts(MulticoreModule):
             replica_slots_per_rank: Physical guest slot cap per rank. Positive caps use
                 adaptive quotas by default; zero keeps owner-only routing. Matching
                 costs are selected internally, with load-driven fallback for unmeasured shapes.
+            replica_granularity: Token fragments by default, or complete experts to retain
+                each logical expert's reduction order. Complete experts use counts-only CPU placement.
             replica_transport: Defaults to "shmem_signal_kernel_gradient_bands", which
                 publishes completed output row bands directly from Cube workers and
                 consumes them in independent AIV groups. "shmem_signal_kernel_gradient"
@@ -574,8 +577,14 @@ class MegaMoeExperts(MulticoreModule):
         if replica_target_load is not None:
             _integer(replica_target_load, "replica_target_load", 1)
         validate_planner_backend(replica_planner, replica_min_rows, None)
+        if replica_granularity not in ("token", "expert"):
+            raise ValueError("replica_granularity must be token or expert")
+        if replica_granularity == "expert" and replica_planner != "cpu":
+            raise ValueError("Whole-expert replicas require the CPU planner")
+        self.replica_granularity = replica_granularity
         self._cost_model_enabled = (_cost_model_enabled()
-                                    if replica_slots_per_rank and replica_planner == 'cpu' else False)
+                                    if replica_slots_per_rank and replica_planner == 'cpu'
+                                    and replica_granularity == "token" else False)
         self.replica_planner = replica_planner
         self.replica_min_rows = replica_min_rows
         self.replica_target_load = replica_target_load
@@ -603,6 +612,7 @@ class MegaMoeExperts(MulticoreModule):
             "num_experts": replica_config.physical_experts,
             "logical_num_experts": num_experts,
             "replica_slots_per_rank": replica_slots_per_rank,
+            "replica_granularity": replica_granularity,
             "replica_transport": replica_transport,
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
@@ -685,8 +695,6 @@ class MegaMoeExperts(MulticoreModule):
                 "or 'EOI' ([experts, out_features, in_features]), "
                 f"got {expert_weight_layout!r}."
             )
-        if expert_weight_layout == "EOI" and specification.get("replica_slots_per_rank", 0):
-            raise ValueError("Hot replicas require expert_weight_layout='EIO'; EOI is supported with B0")
         initial_capacity_factor, capacity_growth_factor = _resolve_capacity_factors(
             specification["dispatch_mode"],
             specification["initial_capacity_factor"],
@@ -890,6 +898,7 @@ class MegaMoeExperts(MulticoreModule):
                             hidden.shape[0], autograd_mask),
             **self._replica_capacity_options(resources),
             _trusted_counts=counts, _gathered_counts=gathered,
+            **({"_whole_experts": True} if self.replica_granularity == "expert" else {}),
         )
 
     def _prepare_execution_route(

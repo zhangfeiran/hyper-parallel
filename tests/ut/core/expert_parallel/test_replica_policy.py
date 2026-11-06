@@ -211,6 +211,9 @@ class TestReplicaScheduleSelection(unittest.TestCase):
                                    ep_size=2, replica_slots_per_rank=budget)
             self.addCleanup(owner.close)
             resources = SimpleNamespace(spec=SimpleNamespace(expert_weight_layout='EIO', swiglu_limit=10.,
+                                                             swiglu_hf_bf16=False, local_num_tokens=128,
+                                                             single_expert_tasks=False, gate_up_expert_padding=0,
+                                                             route_task_bounds=False,
                                                              dispatch_split=128, combine_split=128),
                                         rank_nodes=(0, 1))
             with (self.subTest(budget=budget),
