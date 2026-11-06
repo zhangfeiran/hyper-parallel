@@ -19,6 +19,8 @@ from unittest import mock
 
 from tests.common.mark_utils import arg_mark
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_graph import build_mxfp8_runtime
+from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_module import _mx_home_spec
+from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.scheduler.config import TaskType
 
@@ -90,7 +92,7 @@ class TestMXPostDispatchMath(unittest.TestCase):
         """Require borrowed quantization to follow every dispatch task."""
         for worker in range(1, 64, 2):
             quant = [index for index, task in enumerate(new[worker])
-                     if after.config.all_tasks[task].task_type in (161, 162, 163, 164)]
+                                     if after.config.all_tasks[task].task_type in (161, 162, 163, 164, 165)]
             self.assertTrue(quant, msg=f'Borrowed worker {worker} has no quantization tasks')
             if mode == 2:
                 self.assertTrue(all(after.config.all_tasks[new[worker][index]].inputs[0].input_position
@@ -133,6 +135,29 @@ class TestMXPostDispatchMath(unittest.TestCase):
                         self.check_wire_ownership(before, after, old, new)
                         self.check_borrowed_workers(after, new, mode)
                         self.check_event_progress(after, ep)
+
+    @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='dryrun', essential_mark='essential')
+    def test_active_policy_selects_exact_previously_qualified_queues(self) -> None:
+        """Feature: Actual-replica policy selection.
+        Description: Compare active and home-only specs in both directions and budgets.
+        Expectation: Mode3 is byte-identical to mode1 for active specs and mode0 for home specs.
+        """
+        for budget in (0, 1, 2, 6):
+            active = MegaMoeSpec(4096, 5120, 1792, 16*(6+budget), 8, 1.25, 40960, 16, None, 15, 32,
+                mx_vector_policy='window2', dispatch_split=512, combine_split=512,
+                logical_num_experts=96 if budget else 0, replica_slots_per_rank=budget,
+                replica_transport='shmem_signal_kernel_gradient')
+            variants = (active, _mx_home_spec(active)) if budget else (active,)
+            for spec in variants:
+                for forward in (False, True):
+                    with self.subTest(budget=budget, slots=spec.replica_slots_per_rank, forward=forward):
+                        os.environ['PANGU_MX_REUSE_DISPATCH_WORKERS'] = str(int(bool(spec.replica_slots_per_rank)))
+                        expected = build_mxfp8_runtime(spec, forward=forward, ready_depth=8)
+                        os.environ['PANGU_MX_REUSE_DISPATCH_WORKERS'] = '3'
+                        actual = build_mxfp8_runtime(spec, forward=forward, ready_depth=8)
+                        self.assertEqual(serialize_runtime_config(actual.config), serialize_runtime_config(expected.config))
+                        self.assertEqual(actual.gmm_descriptors, expected.gmm_descriptors)
+                        self.assertEqual(actual.quant_descriptors, expected.quant_descriptors)
 
     @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='dryrun', essential_mark='essential')
     def test_invalid_flag_fails_before_installing_a_queue(self) -> None:

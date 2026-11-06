@@ -25,12 +25,14 @@ from .planned_queue import install_worker_queues
 
 
 def _reuse_post_dispatch_math(
-    cfg: Any, vectors: list[list[int]], combine_start: int, first_stage: tuple[int, int],
+    cfg: Any, vectors: list[list[int]], combine_start: int, first_stage: tuple[int, int], *, active_replicas: bool,
 ) -> None:
-    """Borrow drained dispatch lanes for all quantization (1) or the input stage (2)."""
+    """Borrow drained lanes for all (1), input (2), or active-replica-only (3) quantization."""
     enabled = os.environ.get("PANGU_MX_REUSE_DISPATCH_WORKERS", "0")
-    if enabled not in ("0", "1", "2"):
-        raise ValueError("PANGU_MX_REUSE_DISPATCH_WORKERS must be exactly 0, 1 or 2")
+    if enabled not in ("0", "1", "2", "3"):
+        raise ValueError("PANGU_MX_REUSE_DISPATCH_WORKERS must be exactly 0, 1, 2 or 3")
+    if enabled == "3":
+        enabled = str(int(active_replicas))
     if enabled == "0":
         return
     for lane in range(32):
@@ -124,7 +126,8 @@ def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) ->
             if expert + 1 < spec.local_experts:
                 vectors[2 * lane].extend(tasks(inputs[0], expert + 1, lane))
             vectors[2 * lane].extend(tasks(inputs[1], expert, lane))
-    _reuse_post_dispatch_math(cfg, vectors, stages["combine"][0], stages[inputs[0]])
+    _reuse_post_dispatch_math(cfg, vectors, stages["combine"][0], stages[inputs[0]],
+                             active_replicas=bool(spec.replica_slots_per_rank))
     qps = configured_udma_qp_count()
     if qps < 32:
         _validate_qp_owners(cfg, spec, vectors, qps)
