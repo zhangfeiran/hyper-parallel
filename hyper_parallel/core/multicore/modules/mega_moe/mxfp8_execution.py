@@ -48,7 +48,7 @@ class _ExecutionMetadata:
 def _quantized_buffers(
     rows: int, columns: int, experts: int, device: Any, *, row_only: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """Allocate live axes while retaining full byte bounds for unused column bindings.
+    """Allocate live axes and independent scale storage for native byte bindings.
 
     Args:
         rows: Current token workspace capacity.
@@ -64,12 +64,8 @@ def _quantized_buffers(
     row_scale = torch.empty((rows, columns // 64, 2), dtype=torch.uint8, device=device)
     column = row if row_only else torch.empty((rows, columns), dtype=torch.float8_e4m3fn, device=device)
     scale_shape = ((rows + 63) // 64 + experts, columns, 2)
-    scale_bytes = scale_shape[0] * columns * 2
-    if row_only and scale_bytes <= row.numel():
-        # Row-only graphs leave both column bindings untouched; keep their original byte bounds.
-        column_scale = row.view(torch.uint8).view(-1)[:scale_bytes].view(scale_shape)
-    else:
-        column_scale = torch.empty(scale_shape, dtype=torch.uint8, device=device)
+    # Native TensorList scale bindings require their own byte-shaped storage.
+    column_scale = torch.empty(scale_shape, dtype=torch.uint8, device=device)
     return row, row_scale, column, column_scale
 
 

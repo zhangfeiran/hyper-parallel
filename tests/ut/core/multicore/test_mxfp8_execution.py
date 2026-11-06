@@ -38,10 +38,10 @@ class TestMXFP8ActivationBuffers(unittest.TestCase):
         self.assertEqual(len({value.untyped_storage().data_ptr() for value in buffers}), 4)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
-    def test_row_only_uses_two_full_size_storages(self) -> None:
+    def test_row_only_reuses_column_data_with_independent_scales(self) -> None:
         """Feature: Row-only unused column storage reuse.
-        Description: Rebind column outputs to existing row storage.
-        Expectation: All shapes and byte bounds remain valid with only two allocations.
+        Description: Rebind column data while preserving a separate native scale binding.
+        Expectation: All shapes and byte bounds remain valid with three allocations.
         """
         buffers = _quantized_buffers(128, 256, 8, "cpu", row_only=True)
         row, row_scale, column, column_scale = buffers
@@ -51,15 +51,15 @@ class TestMXFP8ActivationBuffers(unittest.TestCase):
         self.assertEqual(column_scale.dtype, torch.uint8)
         self.assertTrue(all(value.is_contiguous() for value in buffers))
         self.assertEqual(row.data_ptr(), column.data_ptr())
-        self.assertEqual(row.untyped_storage().data_ptr(), column_scale.untyped_storage().data_ptr())
+        self.assertNotEqual(row.untyped_storage().data_ptr(), column_scale.untyped_storage().data_ptr())
         self.assertNotEqual(row.data_ptr(), row_scale.data_ptr())
         self.assertLessEqual(column_scale.numel(), column_scale.untyped_storage().nbytes())
         storages = {value.untyped_storage().data_ptr(): value.untyped_storage().nbytes() for value in buffers}
-        self.assertEqual(sum(storages.values()), 128 * 256 + 128 * 4 * 2)
+        self.assertEqual(sum(storages.values()), 128 * 256 + 128 * 4 * 2 + 10 * 256 * 2)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_tiny_capacity_keeps_scale_binding_in_bounds(self) -> None:
-        """Feature: Small-capacity packed scale fallback.
+        """Feature: Small-capacity packed scale storage.
         Description: Use fewer row bytes than expert-padded column scale bytes.
         Expectation: Scales receive an independent full-size allocation.
         """
