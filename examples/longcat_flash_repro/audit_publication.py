@@ -25,6 +25,7 @@ SOURCE_FILES = {
     "LICENSE",
     "THIRD_PARTY.md",
     "README.zh-CN.md",
+    "INTEGRATION.zh-CN.md",
     "manifest.json",
     "requirements-no-torch.lock",
     "run.sh",
