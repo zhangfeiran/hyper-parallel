@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -64,7 +64,15 @@ from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 
 from .diagnostics import _mega_moe_owner_options
-from .gradient_queue import mark_device_gradient_queue, require_device_gradient_native, reverse_w1_gradient_queue
+from .gradient_queue import (
+    ACTIVE_GRADIENT_PROJECTIONS,
+    ADAPTIVE_GRADIENT_QUEUE,
+    has_adaptive_gradient_native,
+    mark_active_gradient_lanes,
+    mark_device_gradient_queue,
+    require_device_gradient_native,
+    reverse_w1_gradient_queue,
+)
 from .empty_dispatch import mark_empty_dispatch, require_empty_dispatch_native
 from .event_refresh import apply_event_refresh
 from .inactive_tasks import RANK_LOCAL_GUEST_SUFFIX_SCHEDULE, GuestTaskPrefix, build_guest_task_prefixes
@@ -210,9 +218,11 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
         spec.rank_id,
         spec.num_cube_cores,
     )
-    join_once = spec._gradient_queue_order in ('w1_join_once', 'device_w1_asc_join_once', 'device_w1_asc_join_rotate')
+    adaptive = spec._gradient_queue_order == ADAPTIVE_GRADIENT_QUEUE
+    join_once = adaptive or spec._gradient_queue_order in (
+        'w1_join_once', 'device_w1_asc_join_once', 'device_w1_asc_join_rotate')
     if join_once and not spec.replica_slots_per_rank:
-        if not join_w1_phase_once(backward_data, spec.local_experts, spec.num_cube_cores):
+        if not join_w1_phase_once(backward_data, spec.local_experts, spec.num_cube_cores, apply=not adaptive):
             raise ValueError('W1 phase join requires the canonical owner-only backward queue')
     if spec._gradient_queue_order.startswith('device_') and not spec.replica_slots_per_rank:
         mark_device_gradient_queue(backward_data, backward_graph, spec._gradient_queue_order)
@@ -263,6 +273,22 @@ def _prepare_diagnostics(
     )
 
 
+def _resolve_gradient_queue(spec: MegaMoeSpec, device: Any) -> MegaMoeSpec:
+    """Resolve automatic scheduling using only the runtime ABI and projection."""
+    order = spec._gradient_queue_order
+    if order in ('auto', 'auto_w1'):
+        abi = 4 if spec.replica_slots_per_rank else 3
+        supported = torch.device(device).type == 'npu' and has_adaptive_gradient_native(abi)
+        candidate = 'device_active_lanes' if order == 'auto' else 'device_active_w1_lanes'
+        return replace(spec, _gradient_queue_order=candidate if supported else 'original')
+    if order in ACTIVE_GRADIENT_PROJECTIONS:
+        require_device_gradient_native(order, physical=bool(spec.replica_slots_per_rank))
+        return spec
+    if order.startswith('device_') and not spec.replica_slots_per_rank:
+        require_device_gradient_native(order)
+    return spec
+
+
 def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     """Build trimmed dense forward/backward runtime images without fusion slots.
 
@@ -275,9 +301,15 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     """
     if spec._batch_empty_dispatch:
         require_empty_dispatch_native()
-    if spec._gradient_queue_order.startswith('device_') and not spec.replica_slots_per_rank:
-        require_device_gradient_native(spec._gradient_queue_order)
-    forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec, overlap_w13=False)
+    spec = _resolve_gradient_queue(spec, device)
+    projections = ACTIVE_GRADIENT_PROJECTIONS.get(spec._gradient_queue_order)
+    baseline = replace(spec, _gradient_queue_order='original') if projections else spec
+    forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(
+        baseline, overlap_w13=False,
+    )
+    if projections and not mark_active_gradient_lanes(
+            backward_config, spec.local_experts, spec.num_cube_cores, projections=projections):
+        spec = baseline
     original_reuse = can_reuse_backward_dispatch(backward_config, spec.local_experts, spec.num_cube_cores)
     original_backward_config = backward_config
     fallback = None

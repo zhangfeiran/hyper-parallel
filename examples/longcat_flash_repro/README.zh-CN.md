@@ -1,5 +1,9 @@
 # LongCat Flash 分支复现指南
 
+> 本页描述冻结的历史 `feat/longcat-flash-repro` 分支。
+> 新的 `feat/longcat-flash-hot-replica` 功能与调优分支需要重新编译 native，使用独立的
+> [热副本接入与验收](../../docs/longcat-flash-hot-replicas.md)入口；本页历史源码校验会主动拒绝新代码。
+
 交付分支为 `feat/longcat-flash-repro`，基于客户已经编译并通过 pytest 的 `feat/cann-8.5.0`，
 模型基线提交为 `ca3ce419464f32f43b7299b086d5347da2f5c3e3`。
 分支只增加复现材料和对应 CPU 测试，不改模型或 native 源码；客户保留与该基线匹配且已验证的编译产物。

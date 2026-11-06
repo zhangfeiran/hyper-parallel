@@ -60,6 +60,7 @@ from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capacity
 
 from .event_refresh import event_refresh_intervals
+from .gradient_queue import ACTIVE_GRADIENT_PROJECTIONS, ADAPTIVE_GRADIENT_QUEUE
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
@@ -228,14 +229,28 @@ class _MegaMoeExecutionResources:
         self.spec = bind_mega_moe_spec(specification, tensor)
         self._token_capacity = self.spec.local_num_tokens
         self._plans = {}
-        calibrated = any(item.get('_replica_cost_model_enabled') and _calibration_available(
-            item['dispatch_mode'], item['hidden_size'], item['intermediate_size'], item['ep_size'],
-            item['replica_transport'], item['logical_num_experts'], item['top_k'])
+        has_profiles = any(
+            item.get('_replica_cost_model_enabled') and _calibration_available(
+                item['dispatch_mode'], item['hidden_size'], item['intermediate_size'], item['ep_size'],
+                item['replica_transport'], item['logical_num_experts'], item['top_k'])
             for item in active_specifications)
-        self.soc_name = _soc_name(torch.device(tensor.device)) if calibrated else ''
+        self.soc_name = _soc_name(torch.device(tensor.device)) if has_profiles else ''
+        if (has_profiles and specification.get('_replica_cost_model_enabled')
+                and self.spec._gradient_queue_order == 'auto'
+                and _calibration_available(
+                    self.spec.dispatch_mode, self.spec.hidden_size, self.spec.intermediate_size, self.spec.ep_size,
+                    self.spec.replica_transport, self.spec.logical_num_experts, self.spec.top_k,
+                    soc_name=self.soc_name, execution_schedule=replica_runtime_schedule())):
+            # Published replica costs include the original backward schedule.
+            # Keep both physical and owner fallback images compatible.
+            self.spec = replace(self.spec, _gradient_queue_order='original')
         self.rank_nodes = (0,) * self.spec.ep_size
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
+        if len(set(self.rank_nodes)) > 1 and self.spec._gradient_queue_order == 'auto':
+            # W2 precedes activation gradients and can shift the cross-node
+            # combine path. Keep the ordinary W2 assignment across nodes.
+            self.spec = replace(self.spec, _gradient_queue_order='auto_w1')
         reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         added_specifications = self.heap_manager.reserve(
@@ -593,12 +608,14 @@ class MegaMoeExperts(MulticoreModule):
         self.replica_minimum_load_reduction = replica_minimum_load_reduction
         self.replica_transport = replica_transport
         _integer(initial_token_capacity, "initial_token_capacity", 1)
-        gradient_order = os.environ.get('HYPER_PARALLEL_MOE_GRADIENT_QUEUE_ORDER', 'original')
-        if gradient_order not in ('original', 'w1_reverse', 'w1_join_once', 'device_w1_asc', 'device_w1_desc',
+        gradient_order = os.environ.get('HYPER_PARALLEL_MOE_GRADIENT_QUEUE_ORDER', 'auto')
+        if gradient_order not in ('auto', 'original', 'w1_reverse', 'w1_join_once',
+                                   'device_w1_asc', 'device_w1_desc',
                                    'device_w1_asc_join', 'device_late_auto', 'device_lane_rotate',
-                                   'device_w1_asc_join_once', 'device_w1_asc_join_rotate'):
+                                   'device_w1_asc_join_once', 'device_w1_asc_join_rotate',
+                                   ADAPTIVE_GRADIENT_QUEUE, *ACTIVE_GRADIENT_PROJECTIONS):
             raise ValueError('Unsupported HYPER_PARALLEL_MOE_GRADIENT_QUEUE_ORDER')
-        if gradient_order != 'original' and self._cost_model_enabled:
+        if gradient_order not in ('original', 'auto') and self._cost_model_enabled:
             raise ValueError('Experimental gradient queues require the replica cost model to be disabled')
         cube_refresh, vector_refresh = event_refresh_intervals()
         if (cube_refresh or vector_refresh) and self._cost_model_enabled:

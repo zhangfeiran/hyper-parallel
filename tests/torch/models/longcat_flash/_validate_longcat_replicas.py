@@ -141,6 +141,8 @@ def validate(args: argparse.Namespace, options: argparse.Namespace) -> None:
         args: Original-width component configuration and external output directory.
         options: Replica transport, weight layout, guest budget and update count.
     """
+    if options.updates < 1 or options.budget < 1:
+        raise ValueError("replica acceptance requires positive updates and guest budget")
     rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(rank)
     dist.init_process_group("hccl")
@@ -154,17 +156,24 @@ def validate(args: argparse.Namespace, options: argparse.Namespace) -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     for step in range(options.updates):
         records.append(_one_update(reference, candidate, masters, step, args, rank))
+        status = torch.tensor([records[-1]["strict_pass"]], device="npu", dtype=torch.int32)
+        dist.all_reduce(status, op=dist.ReduceOp.MIN)
+        records[-1]["all_ranks_strict_pass"] = bool(status.item())
         (args.output / f"progress-rank{rank}.json").write_text(json.dumps(records, indent=2) + "\n")
-        if not records[-1]["strict_pass"]:
+        if not records[-1]["all_ranks_strict_pass"]:
             break
+    resources = candidate[0]._executor._resource_group.resources
+    resolved_queue = resources.last_execution_plan.spec._gradient_queue_order
     candidate[0].close_runtime()
     reference[0].close_runtime()
     report = {"rank": rank, "pid": os.getpid(), "dispatch_mode": options.dispatch_mode,
               "layout": options.layout, "budget": options.budget, "granularity": "expert",
+              "resolved_gradient_queue": resolved_queue,
               "transport": options.transport, "records": records,
               "shape": {key: getattr(args, key) for key in
                         ("ep", "tokens", "hidden", "intermediate", "real", "zero", "top_k")},
-              "strict_pass": len(records) == options.updates and all(row["strict_pass"] for row in records),
+              "strict_pass": len(records) == options.updates
+              and all(row["all_ranks_strict_pass"] for row in records),
               "environment": environment_identity(), "shmem_after_close": shmem.debug_state(),
               "scope": "Expert component, FP32 SGD masters and BF16 compute; no full-model Trainer acceptance"}
     (args.output / f"rank{rank}.json").write_text(json.dumps(report, indent=2) + "\n")

@@ -19,7 +19,7 @@ import importlib
 import torch
 
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
-from hyper_parallel.core.multicore.scheduler.config import RuntimeConfigC, TaskSplitValue
+from hyper_parallel.core.multicore.scheduler.config import RuntimeConfigC, TaskSplitValue, TaskType
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 
 __all__ = []
@@ -54,9 +54,54 @@ def reverse_w1_gradient_queue(config: RuntimeConfigC, graph: ComputeGraph, topol
         start += operation.task_num
 
 
+ADAPTIVE_GRADIENT_QUEUE = 'device_w1_shape_auto'
+ACTIVE_GRADIENT_PROJECTIONS = {'device_active_lanes': (6, 18), 'device_active_w1_lanes': (18,)}
 _DEVICE_POLICIES = {'device_w1_asc': 1, 'device_w1_desc': 2, 'device_w1_asc_join': 3, 'device_late_auto': 4,
-                    'device_lane_rotate': 5, 'device_w1_asc_join_once': 6, 'device_w1_asc_join_rotate': 7}
+                    'device_lane_rotate': 5, 'device_w1_asc_join_once': 6, 'device_w1_asc_join_rotate': 7,
+                    ADAPTIVE_GRADIENT_QUEUE: 8}
 _DEVICE_LANE_POLICY = _DEVICE_POLICIES['device_lane_rotate']
+_DEVICE_SHAPE_POLICY = _DEVICE_POLICIES[ADAPTIVE_GRADIENT_QUEUE]
+
+
+def has_adaptive_gradient_native(minimum: int = 2) -> bool:
+    """Query the optional marker ABI once per eligible plan, allowing old payloads."""
+    adapter = importlib.import_module('hyper_parallel.core.multicore.torch.ops')
+    adapter._load_native()  # pylint: disable=protected-access
+    version = getattr(torch.ops.hyper_parallel, 'mega_moe_adaptive_gradient_version', None)
+    return version is not None and version() >= minimum
+
+
+def mark_active_gradient_lanes(
+    config: RuntimeConfigC, experts: int, cores: int, *, projections: tuple[int, ...] = (6, 18),
+) -> bool:
+    """Mark complete W1/W2 waves with the same expert sequence on every Cube.
+
+    The lane ordinal is counted inside each worker and advances only on an
+    actual GEMM. Prove whole-expert waves before writing any descriptor.
+    """
+    queue = config.cube_task_indices[:config.task_index_num[0]]
+    marked = []
+    seen: dict[int, set[int]] = {position: set() for position in projections}
+    for offset in range(0, len(queue), cores):
+        wave = [config.all_tasks[index] for index in queue[offset:offset + cores]]
+        if not any(task.num_outputs and task.outputs[0].input_position in seen for task in wave):
+            continue
+        position = wave[0].outputs[0].input_position
+        expert, lane = divmod(wave[0].task_index, cores)
+        if position not in seen or lane or expert >= experts or expert in seen[position] or len(wave) != cores:
+            return False
+        if any(task.task_type != TaskType.TASK_GROUPED_MATMUL or task.num_inputs != 3 or task.num_outputs != 1
+               or task.outputs[0].input_position != position or task.task_index != expert * cores + lane_id
+               or task.inputs[0].transpose_flag != 1 or task.inputs[2].input_position != 19
+               or task.extra_value_0 for lane_id, task in enumerate(wave)):
+            return False
+        seen[position].add(expert)
+        marked.extend(wave)
+    if any(len(phase) != experts for phase in seen.values()):
+        return False
+    for task in marked:
+        task.extra_value_0 = 0x5A900000
+    return True
 
 
 def mark_device_gradient_queue(config: RuntimeConfigC, graph: ComputeGraph, mode: str) -> None:
@@ -74,12 +119,13 @@ def mark_device_gradient_queue(config: RuntimeConfigC, graph: ComputeGraph, mode
         if operation.name in ('w2_grad', 'gate_grad', 'w1_grad'):
             spans[operation.name] = (start, operation.task_num)
         start += operation.task_num
-    if policy in (_DEVICE_LANE_POLICY, 7):
+    if policy in (_DEVICE_LANE_POLICY, 7, _DEVICE_SHAPE_POLICY):
         stages = ('w2_grad', 'w1_grad') if policy == _DEVICE_LANE_POLICY else ('w2_grad',)
+        marker = _DEVICE_SHAPE_POLICY if policy == _DEVICE_SHAPE_POLICY else _DEVICE_LANE_POLICY
         for name in stages:
             offset, count = spans[name]
             for index in range(offset, offset + count):
-                config.all_tasks[index].extra_value_0 = 0x5A000000 | (_DEVICE_LANE_POLICY << 20)
+                config.all_tasks[index].extra_value_0 = 0x5A000000 | (marker << 20)
         if policy == _DEVICE_LANE_POLICY:
             return
     gate_start, gate_count = spans['gate_grad']
@@ -98,8 +144,14 @@ def mark_device_gradient_queue(config: RuntimeConfigC, graph: ComputeGraph, mode
             task.tiling_data_offset = other
 
 
-def require_device_gradient_native(mode: str = 'device_w1_asc') -> None:
+def require_device_gradient_native(mode: str = 'device_w1_asc', *, physical: bool = False) -> None:
     """Fail before launch when an older native payload cannot interpret policy markers."""
+    if mode == ADAPTIVE_GRADIENT_QUEUE or mode in ACTIVE_GRADIENT_PROJECTIONS:
+        version = 2 if mode == ADAPTIVE_GRADIENT_QUEUE else (4 if physical else 3)
+        if not has_adaptive_gradient_native(version):
+            raise NativeComponentUnavailableError(
+                'Device gradient scheduling requires a matching rebuilt multicore native payload')
+        return
     adapter = importlib.import_module('hyper_parallel.core.multicore.torch.ops')
     adapter._load_native()  # pylint: disable=protected-access
     try:

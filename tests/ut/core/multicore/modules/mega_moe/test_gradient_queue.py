@@ -16,6 +16,7 @@
 
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
@@ -24,16 +25,39 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
     can_reuse_backward_dispatch, join_w1_phase_once,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.gradient_queue import (
-    mark_device_gradient_queue, require_device_gradient_native, reverse_w1_gradient_queue,
+    ADAPTIVE_GRADIENT_QUEUE, mark_active_gradient_lanes, mark_device_gradient_queue, require_device_gradient_native,
+    reverse_w1_gradient_queue,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
-from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts
+from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts, _MegaMoeExecutionResources
+from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts, _resolve_gradient_queue
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.scheduler.config import EVENT_INVALID_ID, TaskSplitValue, validate_runtime_config
 
 
 class TestGradientQueue(unittest.TestCase):
     """Preserve descriptor identity, dependencies and per-core phase boundaries."""
+
+    def test_active_lane_marks_reject_incomplete_waves(self) -> None:
+        """A divergent Cube wave cannot share the same active-expert ordinal."""
+        topology = TaskSplitValue(tp=1, ep=4, seq_size=384, all_expert_num=12, top_k=2, dispatch_mode='push')
+        graph = build_backward_graph(topology, hidden_size=1536, intermediate_size=768)
+        graph.propagate_splits(topology)
+        config = build_config_for_rank(graph, topology, rank_id=0, num_cube_cores=24)
+        queue = config.cube_task_indices
+        index = next(i for i in range(config.task_index_num[0])
+                     if config.all_tasks[queue[i]].outputs[0].input_position == 6)
+        queue[index], queue[index + 1] = queue[index + 1], queue[index]
+        invalid = bytes(config)
+        self.assertFalse(mark_active_gradient_lanes(config, 3, 24))
+        self.assertEqual(bytes(config), invalid)
+        queue[index], queue[index + 1] = queue[index + 1], queue[index]
+        original = bytes(config)
+        self.assertTrue(mark_active_gradient_lanes(config, 3, 24))
+        marked = [task for task in config.all_tasks if task.extra_value_0 == 0x5A900000]
+        self.assertEqual(len(marked), 2 * 3 * 24)
+        for task in marked:
+            task.extra_value_0 = 0
+        self.assertEqual(bytes(config), original)
 
     def test_join_once_device_modes_keep_only_the_first_wait(self) -> None:
         """Both native candidates require a complete owner-only Gate phase proof."""
@@ -78,6 +102,68 @@ class TestGradientQueue(unittest.TestCase):
             task.extra_value_0 = 0
         self.assertEqual(bytes(config), before)
         self.assertTrue(can_reuse_backward_dispatch(config, 6, 24))
+
+    def test_adaptive_markers_keep_original_fallback_descriptors(self) -> None:
+        """An unselected rank must keep the original dependencies in both modes."""
+        spec = MegaMoeSpec(local_num_tokens=512, hidden_size=5120, intermediate_size=1792,
+                           num_experts=24, top_k=8, initial_capacity_factor=1.5,
+                           receive_capacity=6144, ep_size=4, ep_group=None, rank_id=1, num_cube_cores=24)
+        for mode in ('push', 'pull'):
+            with self.subTest(mode=mode):
+                base = replace(spec, dispatch_mode=mode)
+                _, forward, _, reference = _build_runtime_artifacts(base)
+                _, marked_forward, _, actual = _build_runtime_artifacts(
+                    replace(base, _gradient_queue_order=ADAPTIVE_GRADIENT_QUEUE))
+                marked = [task for task in actual.all_tasks if task.extra_value_0 >> 20 == 0x5A8]
+                self.assertEqual(len(marked), 288)
+                self.assertEqual({task.outputs[0].input_position for task in marked}, {6, 18})
+                self.assertEqual({task.inputs[2].input_position for task in marked}, {19})
+                for task in marked:
+                    task.extra_value_0 = task.tiling_data_offset = 0
+                self.assertEqual(bytes(actual), bytes(reference))
+                self.assertEqual(bytes(marked_forward), bytes(forward))
+
+    def test_auto_plan_cache_reuses_a_bucket_without_a_token_whitelist(self) -> None:
+        """A warmed bucket can select the same native policy for another length."""
+        resources = _MegaMoeExecutionResources.__new__(_MegaMoeExecutionResources)
+        resources._token_capacity = 4096
+        resources._plans = {}
+        resources.spec = MegaMoeSpec(local_num_tokens=128, hidden_size=4096, intermediate_size=2304,
+                                     num_experts=32, top_k=4, initial_capacity_factor=1.25,
+                                     receive_capacity=40960, ep_size=8, ep_group=None, rank_id=0, num_cube_cores=20,
+                                     auto_tokens=True, _gradient_queue_order='auto', expert_weight_layout='EOI',
+                                     dispatch_split=128, combine_split=256)
+        module = 'hyper_parallel.core.multicore.modules.mega_moe'
+        with (patch(module + '.plan.torch.device', return_value=SimpleNamespace(type='npu')),
+              patch(module + '.plan.has_adaptive_gradient_native') as abi,
+              patch(module + '.module.build_mega_moe_plan',
+                    side_effect=lambda spec, device: SimpleNamespace(spec=_resolve_gradient_queue(spec, device)))):
+            abi.return_value = False
+            self.assertEqual(_resolve_gradient_queue(replace(resources.spec, schedule_tokens=896), 'npu')
+                             ._gradient_queue_order, 'original')
+            abi.return_value = True
+            large = resources.plan_for_tokens(896, 'npu')
+            self.assertEqual(large.spec._gradient_queue_order, 'device_active_lanes')
+            self.assertIs(resources.plan_for_tokens(768, 'npu'), large)
+            self.assertEqual(abi.call_count, 2)
+
+    def test_auto_requires_physical_marker_support_before_changing_replica_lanes(self) -> None:
+        """Old adapters may rotate ordinary lanes but cannot interpret physical markers."""
+        spec = MegaMoeSpec(local_num_tokens=128, hidden_size=1536, intermediate_size=768,
+                           num_experts=16, top_k=2, initial_capacity_factor=None,
+                           receive_capacity=2048, ep_size=4, ep_group=None, rank_id=0, num_cube_cores=24,
+                           _gradient_queue_order='auto')
+        module = 'hyper_parallel.core.multicore.modules.mega_moe'
+        with (patch(module + '.plan.torch.device', return_value=SimpleNamespace(type='npu')),
+              patch(module + '.plan.has_adaptive_gradient_native', side_effect=lambda version: version <= 3) as abi):
+            self.assertEqual(_resolve_gradient_queue(spec, 'npu')._gradient_queue_order, 'device_active_lanes')
+            physical = replace(spec, replica_slots_per_rank=2, num_experts=24)
+            self.assertEqual(_resolve_gradient_queue(physical, 'npu')._gradient_queue_order, 'original')
+            self.assertEqual([call.args[0] for call in abi.call_args_list], [3, 4])
+            cross_node = replace(spec, _gradient_queue_order='auto_w1')
+            self.assertEqual(_resolve_gradient_queue(cross_node, 'npu')._gradient_queue_order,
+                             'device_active_w1_lanes')
+
 
     def test_w1_join_once_keeps_queue_and_uses_full_gate_event(self) -> None:
         """Every Cube joins before its first W1; later W1 tasks need no extra wait."""
@@ -199,6 +285,18 @@ class TestGradientQueue(unittest.TestCase):
                                        'HYPER_PARALLEL_REPLICA_COST_MODEL': '1'}):
             with self.assertRaisesRegex(ValueError, 'cost model'):
                 MegaMoeExperts(**options, replica_slots_per_rank=1)
+
+    def test_default_queue_does_not_filter_ep_or_replica_budget_at_construction(self) -> None:
+        """The automatic policy is the public default for arbitrary geometries."""
+        cases = [(1, 0), (8, 0), (32, 0), (64, 0), (16, 2)]
+        for ep_size, budget in cases:
+            with self.subTest(ep_size=ep_size, budget=budget), patch.dict('os.environ', {}, clear=True):
+                module = MegaMoeExperts(hidden_size=1536, intermediate_size=768, top_k=2, num_experts=4 * ep_size,
+                                        ep_size=ep_size, replica_slots_per_rank=budget, create_parameters=False,
+                                        expert_weight_layout='EIO' if budget else 'EOI',
+                                        dispatch_split=256, combine_split=128)
+                self.addCleanup(module.close)
+                self.assertEqual(module._resource_group.specification['_gradient_queue_order'], 'auto')
 
     def test_order_is_part_of_resource_identity(self) -> None:
         """Differently ordered layers must not share an execution resource group."""

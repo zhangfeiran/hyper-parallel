@@ -68,7 +68,7 @@ EP本地权重已经切好的客户项目使用第4节，不能把局部张量�
 | `optimize_tasks=True` | 使用当前路由的任务边界和单专家任务寻址，默认开启 |
 | `direct_weight_gradients=True` | EOI、无副本且任务优化开启时，保留完整Gate/Up梯度形状并清零unused尾部，默认开启 |
 | `initial_token_capacity=24576` | 对每卡T2048、TopK12的初始compact-real行预留；变长输入可自动增长，不丢token；其他T应按实际负载设置 |
-| `replica_slots_per_rank=0` | 历史参考实验保持无副本；本地优化分支已支持EOI热副本，LongCat默认按完整专家迁移，见[热副本接入与验收](../../docs/longcat-flash-hot-replicas.md) |
+| `replica_slots_per_rank=0` | 历史参考实验保持无副本；`feat/longcat-flash-hot-replica`分支已支持EOI热副本，LongCat默认按完整专家迁移，见[热副本接入与验收](../../docs/longcat-flash-hot-replicas.md) |
 
 原生Router的TopK仍是12。adapter压紧真实slots以后，内部使用 `num_experts=E, top_k=1` 的执行器，
 逐assignment执行；不要把内部K=1误改为12，也不要把identity ID直接传给通用 `MegaMoeExperts`。

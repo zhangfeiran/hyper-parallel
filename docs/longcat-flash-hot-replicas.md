@@ -1,6 +1,6 @@
 # LongCat Flash 热专家副本接入与验收
 
-本地优化分支已支持 LongCat 原生 EOI 权重布局的热专家副本，包括权重发送、物理槽位路由和 FP32 专家梯度回传。
+`feat/longcat-flash-hot-replica` 分支已支持 LongCat 原生 EOI 权重布局的热专家副本，包括权重发送、物理槽位路由和 FP32 专家梯度回传。
 原 `feat/longcat-flash-repro` 分支的历史参考结果仍然使用 B0；此处是独立实现与验收，不能把旧结果写成已启用副本。
 切换到本优化分支需要重新编译 native，不能直接沿用原客户分支的二进制。客户自建 Torch/PTA 保持原版本。
 
@@ -69,30 +69,57 @@ LongCat 默认 `replica_granularity="expert"`：同一逻辑专家的所有 sour
 连续验证保持同一个副本执行器存活，使用两套独立参数和 FP32 SGD master。
 路由覆盖热 owner 切换、普通路由、一个 source 全 identity、全局 identity；全局 identity 时参数梯度保持 None。
 全局 identity 不更新专家参数，其他步骤的 unused Gate/Up 尾部梯度为零。
+无副本 B0 的 Push/Pull 也在最终 native 库上额外验证，4 个 rank 的全部比较值误差均为 0。
 这是专家组件及独立优化器更新验收，不代表完整 LongCat Trainer、多节点 EP64 或完整层数验收。
 
 固定热点组件中，8 个热真实专家都属于 rank0；每个专家在 4 个 source 上各有 2048 行。
 B0 接收峰值为 65536 行。实际迁移 6 个完整专家后，4 个 rank 均为 16384 行。
 4 个 rank 的最终 SHMEM 状态均为 `Uninitialized/reference_count=0`，运行退出码为 0，所属设备进程已退出。
 
-CPU 回归为 643 项测试、3377 个子用例通过，覆盖 EOI 梯度带容量、无损行计数、guest 预算、硬容量、
+CPU 核心回归为 658 项测试、3401 个子用例通过，另有 8 项交付入口测试及 8 个子用例通过，覆盖 EOI 梯度带容量、无损行计数、guest 预算、硬容量、
 单热专家回退、随机多 owner 规划以及完整专家/分片模式的 checkpoint 策略隔离。
 新增文件的 pylint 和复杂度检查通过；合并进来的 expert 分支仍有独立的全量风格门禁遗留项，不能据此宣称全分支门禁通过。
 
 ## 性能对照
 
-受控热点的 B0/B2 fresh-process ABBA 和反向确认已完成，前后向分别为 66.830 ms 和 41.183 ms，
-配对几何平均加速 1.623 倍。普通路由对照的首轮存在 shell 库路径切换污染风险，已排除，正在独立环境重新确认。
-最终数据单独归档后更新本节；不使用该首轮结果作为普通路由优化验收。
+使用相同完整权重、输入、路由与上游梯度，每次 fresh process，10 次预热、30 次正式样本。
+每步取全部 rank 的最大耗时；每进程取全部样本中位数，再对固定 ABBA 和 BAAB 的进程配对比值取几何平均。
+保留慢样本，没有在看到结果后更换统计口径。普通路由的 3 次控制预跑冻结了 2% 最低耗时改善门限。
+
+| 场景 | 控制路径前后向 | 候选路径前后向 | 配对加速 | 耗时下降 |
+| --- | --- | --- | --- | --- |
+| 普通路由、B0：冻结的 expert 控制 vs 本次最终优化 | 32.225 ms | 29.583 ms | 1.089 倍 | 8.20% |
+| 受控热点：本次 B0 vs 本次 B2 完整专家副本 | 67.085 ms | 41.315 ms | 1.624 倍 | 38.41% |
+
+普通路由保持 B0，不把副本带来的负载分散混入列宽优化收益。
+普通路由的前向为 12.737 vs 12.667 ms，0.55% 的差异未达到预先冻结的 2% 门限；本轮确证收益在前后向路径。
+同样使用新路由前端的原生大算子路径单次 fresh-process 对照为普通路由 40.902 ms、受控热点 104.590 ms，
+这些单次对照来自更新默认 lane 之前的同宽度、同路由前端版本，不具有上表最终版本重复配对比较相同的验收强度。
+热点用固定 bias 集中选择 8 个真实专家和 4 个 identity，未把该分布表述为自然训练路由。
+普通路由优化的门限来自相同普通路由预跑；热点列是独立的重复配对观测，没有把该门限挪作热点保证。
+以上是专家组件结果，不能改写为完整模型或客户 x86 的速度。
+
+Profiler 中，专家输出梯度 kernel 从约 3.05–4.18 ms 降到最终版本的 1.03–1.25 ms，符合完整路径的下降方向。
+本轮也移植了 expert 分支截至 `db372c1` 的 4 个新增提交，包括默认 active gradient lanes，实际解析到 `device_active_lanes`。
+最终 profile 中 W1 仍在 CombineGrad 后约 2.60–2.63 ms 完成；当前数据不支持宣称额外通算/CV 掩盖收益。
+上表是最终组合实现的配对结果，没有把各单项优化相加。
+
+逐进程样本、固定门限、全部 rank 终态审计及原始报告校验值见
+[验收数据](longcat-flash-hot-replicas-results.json)。
+
+所有最终性能进程均隔离库环境，并校验 `/proc/self/maps` 中实际加载的 native 库来自对应工作树。
+首轮普通路由对照存在库路径切换污染风险，已排除；最终表格仅采用重新运行并通过来源检查的结果。
 
 ## 客户运行连续验证
 
-先按仓库的 native 构建说明重新编译本分支，并确认 editable 安装指向当前目录：
+在对应分支的仓库根目录、客户已验证的 Python3.11/CANN8.5.0 环境下重新编译，
+并确认 editable 安装指向当前目录。构建会使用客户的 CPU 架构，不随分支分发本机的 native 二进制：
 
 ```bash
+source "$CANN_ENV"
+bash build.sh --multicore on --soc-list ascend910_93 --strict on
 python -m pip install --no-deps --no-build-isolation -e .
 python -c 'import hyper_parallel; print(hyper_parallel.__file__)'
-source "$CANN_ENV"
 source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
 ```
 
@@ -124,3 +151,9 @@ python -m torch.distributed.run --standalone --nproc-per-node=4 \
 把脚本名换为该入口，删除 `--dispatch-mode/--layout/--updates`，增加 `--fixture hot --warmup 10 --samples 30`。
 分别用 `--backend push --budget 0`、`--backend push --budget 2`、`--backend native --budget 0`，每项单独新建进程与输出目录。
 普通学习路由改为 `--fixture normal`。比较时两边使用同一版本的路由前端与 fused SwiGLU 语义。
+
+## 回退与检查
+
+需要回退调度时，在新进程中设置 `HYPER_PARALLEL_MOE_GRADIENT_QUEUE_ORDER=original`。
+关闭热副本使用 `replica_slots_per_rank=0`。客槽为运行期存储，不改变逻辑专家数或 checkpoint 参数键。
+若切回历史复现分支，请同时使用与该历史源码匹配的 native 产物，按其原入口进行源码、ABI 和 NPU 精度检查。

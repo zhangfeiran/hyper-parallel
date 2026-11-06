@@ -210,12 +210,13 @@ def _guest_w13_indices(cfg: RuntimeConfigC, num_experts: int, num_cores: int,
     return reordered
 
 
-def join_w1_phase_once(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> bool:
+def join_w1_phase_once(cfg: RuntimeConfigC, num_experts: int, num_cores: int, *, apply: bool = True) -> bool:
     """Use one full GateGrad completion fence per ordinary W1 Cube queue.
 
     The last GateGrad event joins the preceding GateGrad work by per-worker
     program order. A worker's subsequent W1 tasks inherit that first wait.
     Unrecognized schedules are left unchanged.
+    Pass apply=False to prove the join without changing the fallback queue.
     """
     weights = _w13_producers(cfg, num_experts, num_cores)
     if not weights:
@@ -235,9 +236,10 @@ def join_w1_phase_once(cfg: RuntimeConfigC, num_experts: int, num_cores: int) ->
             any(task.task_type == TaskType.TASK_GROUPED_MATMUL and task.extra_value_1 == join
                 for task in cube)):
         return False
-    for expert, tasks in enumerate(weights):
-        for task in tasks:
-            task.dependent_event = join if expert == 0 else EVENT_INVALID_ID
+    if apply:
+        for expert, tasks in enumerate(weights):
+            for task in tasks:
+                task.dependent_event = join if expert == 0 else EVENT_INVALID_ID
     return True
 
 

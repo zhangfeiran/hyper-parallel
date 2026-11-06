@@ -120,6 +120,8 @@ class TestReplicaScheduleSelection(unittest.TestCase):
         """Retain real packaged coefficients only as synthetic selector fixtures."""
         policy._resolve_cost_model.cache_clear()
         self.addCleanup(policy._resolve_cost_model.cache_clear)
+        policy._calibration_available.cache_clear()
+        self.addCleanup(policy._calibration_available.cache_clear)
         self.legacy = policy._calibrations()[self.arguments]
 
     def test_new_schedule_rejects_legacy_profile_and_shared_soc_alias(self) -> None:
@@ -129,6 +131,9 @@ class TestReplicaScheduleSelection(unittest.TestCase):
                 arguments = self.arguments[:-1] + (soc,)
                 self.assertIsNone(policy._resolve_cost_model(
                     *arguments, True, execution_schedule=self.schedule))
+                self.assertTrue(policy._calibration_available(*arguments[:-1]))
+                self.assertFalse(policy._calibration_available(
+                    *arguments[:-1], soc_name=soc, execution_schedule=self.schedule))
 
     def test_communication_schedule_does_not_reuse_compute_only_coefficients(self) -> None:
         """Compute-only pruning and communication pruning have distinct execution costs."""
@@ -151,6 +156,10 @@ class TestReplicaScheduleSelection(unittest.TestCase):
         with patch.object(policy, '_calibrations', return_value={self.arguments: measured}):
             matched = policy._resolve_cost_model(*self.arguments, True, execution_schedule=self.schedule)
             stale = policy._resolve_cost_model(*self.arguments, True)
+            self.assertTrue(policy._calibration_available(
+                *self.arguments[:-1], soc_name='Ascend910_9382', execution_schedule=self.schedule))
+            self.assertFalse(policy._calibration_available(
+                *self.arguments[:-1], soc_name='Ascend910_9381', execution_schedule=self.schedule))
         self.assertEqual(matched.schedule, self.schedule)
         self.assertIsNone(stale)
 

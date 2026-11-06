@@ -88,10 +88,15 @@ def _calibrations() -> dict[tuple, ExpertReplicaCostModel]:
 
 @lru_cache(maxsize=128)
 def _calibration_available(backend: str, hidden: int, intermediate: int, ep_size: int, transport: str,
-                           num_experts: int, top_k: int) -> bool:
-    """Avoid hardware queries for executions with no packaged compute calibration."""
+                           num_experts: int, top_k: int, *, soc_name: str | None = None,
+                           execution_schedule: str | None = None) -> bool:
+    """Find candidate profiles without selecting a per-invocation signature."""
     prefix = backend, hidden, intermediate, ep_size, transport, num_experts, top_k
-    return any(key[:7] == prefix for key in _calibrations())
+    compatible_socs = (soc_name, _SHARED_SOC_CALIBRATIONS.get(soc_name)) if soc_name is not None else ()
+    return any(key[:7] == prefix
+               and (not compatible_socs or key[7] in compatible_socs)
+               and (execution_schedule is None or model.schedule == execution_schedule)
+               for key, model in _calibrations().items())
 
 
 @lru_cache(maxsize=128)

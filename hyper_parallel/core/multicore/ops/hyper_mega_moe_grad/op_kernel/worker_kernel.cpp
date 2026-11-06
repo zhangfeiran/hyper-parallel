@@ -46,13 +46,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   __aicore__ inline void ResolveTaskDescriptor(TaskId &task_id, TaskDesc &task) {
 #ifdef __DAV_C220_CUBE__
     if ((task.extra_value_0 & GRADIENT_ORDER_MAGIC_MASK) != GRADIENT_ORDER_MAGIC) return;
-    if (task.extra_value_0 == GRADIENT_LANE_MARKER) return;
+    if (task.extra_value_0 == GRADIENT_LANE_MARKER || task.extra_value_0 == GRADIENT_ACTIVE_LANE_MARKER) return;
     const uint32_t policy = (task.extra_value_0 >> 20) & 0xF;
     const uint32_t join_event = task.extra_value_0 & GRADIENT_ORDER_EVENT_MASK;
     const bool original_w1 = task.outputs[0].input_position == 18;
     const uint32_t experts = task.inputs[2].dim[0];
     ValidateGradientTask(task, experts, policy);
     PrepareGradientOrder(task, experts, policy);
+    if (policy == GRADIENT_SHAPE_POLICY && (!gradient_join_ || !original_w1)) return;
     const uint32_t original_expert = task.task_index / this->core_num;
     const uint32_t lane = task.task_index % this->core_num;
     const uint32_t own_base = task_id - task.task_index;
@@ -103,27 +104,41 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
  private:
   bool gradient_order_ready_ = false;
   bool gradient_join_ = false;
+  uint32_t active_w1_ = 0;
+  uint32_t active_w2_ = 0;
   int64_t gradient_rows_[GRADIENT_ORDER_MAX_EXPERTS];
   uint32_t gradient_order_[GRADIENT_ORDER_MAX_EXPERTS];
 
   __aicore__ inline void ValidateGradientTask(const TaskDesc &task, uint32_t experts, uint32_t policy) {
     if ((this->home_experts_ != 0 && this->home_experts_ != experts) ||
         task.task_type != TaskType::TASK_GROUPED_MATMUL ||
-        experts == 0 || experts > GRADIENT_ORDER_MAX_EXPERTS || policy < 1 || policy == 5 || policy > 7) AscendC::Trap();
-    if (task.outputs[0].input_position != 18 &&
-        (task.outputs[0].input_position != 12 || policy != 4)) AscendC::Trap();
+        experts == 0 || experts > GRADIENT_ORDER_MAX_EXPERTS || policy < 1 || policy == 5 ||
+        policy > GRADIENT_SHAPE_POLICY) AscendC::Trap();
+    const uint32_t position = task.outputs[0].input_position;
+    if (position != 18 && !(position == 12 && policy == 4) &&
+        !(position == 6 && policy == GRADIENT_SHAPE_POLICY)) AscendC::Trap();
   }
 
-  __aicore__ inline uint32_t GradientLaneExpert(const TaskDesc &task, uint32_t expert) {
+  __aicore__ inline uint32_t GradientLaneExpert(const TaskDesc &task, uint32_t expert, bool publishes_bands) {
     const uint32_t mode = task.extra_value_0 & (GRADIENT_ORDER_MAGIC_MASK | 0x00F00000U);
-    if (mode != GRADIENT_LANE_MARKER && mode != (GRADIENT_ORDER_MAGIC | (7U << 20))) {
+    if (mode != GRADIENT_LANE_MARKER && mode != GRADIENT_ACTIVE_LANE_MARKER &&
+        mode != (GRADIENT_ORDER_MAGIC | (7U << 20)) &&
+        !(mode == GRADIENT_SHAPE_MARKER && gradient_join_)) {
       return GRADIENT_LANE_DISABLED;
     }
     const uint32_t position = task.outputs[0].input_position;
-    const uint32_t experts = task.inputs[2].dim[0];
-    if ((this->home_experts_ != 0 && this->home_experts_ != experts) ||
-        !getTransposeData(task.inputs[0].transpose_flag) ||
+    if (!getTransposeData(task.inputs[0].transpose_flag) ||
         (position != 6 && position != 18)) AscendC::Trap();
+    // Called only for nonempty experts. All workers visit the same phase
+    // sequence, so the first real GEMM keeps the original lane assignment.
+    if (mode == GRADIENT_ACTIVE_LANE_MARKER) {
+      // Keep the tile-to-producer mapping of the real communication bands.
+      if (publishes_bands) return GRADIENT_LANE_DISABLED;
+      const uint32_t ordinal = position == 6 ? active_w2_++ : active_w1_++;
+      return ordinal == 0 ? GRADIENT_LANE_DISABLED : ordinal;
+    }
+    const uint32_t experts = task.inputs[2].dim[0];
+    if (this->home_experts_ != 0 && this->home_experts_ != experts) AscendC::Trap();
     return expert;
   }
 
@@ -325,7 +340,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                        this->replica_trace_, task_desc.outputs[0].input_position == 18,
                        getExtraValueFromTiling(input_list[TILING_IDX], 0) % ep, data_index,
                        value, this->home_experts_ > 0, this->home_experts_ > 0 ? 0 : data_index,
-                       GradientLaneExpert(task_desc, data_index));
+                       GradientLaneExpert(task_desc, data_index, band_flags != nullptr));
       }
       return;
     }
