@@ -24,11 +24,13 @@ from .config import TaskType
 from .planned_queue import install_worker_queues
 
 
-def _reuse_post_dispatch_math(cfg: Any, vectors: list[list[int]], combine_start: int) -> None:
-    """Borrow each communication lane only after its entire dispatch prefix completes."""
+def _reuse_post_dispatch_math(
+    cfg: Any, vectors: list[list[int]], combine_start: int, first_stage: tuple[int, int],
+) -> None:
+    """Borrow drained dispatch lanes for all quantization (1) or the input stage (2)."""
     enabled = os.environ.get("PANGU_MX_REUSE_DISPATCH_WORKERS", "0")
-    if enabled not in ("0", "1"):
-        raise ValueError("PANGU_MX_REUSE_DISPATCH_WORKERS must be exactly 0 or 1")
+    if enabled not in ("0", "1", "2"):
+        raise ValueError("PANGU_MX_REUSE_DISPATCH_WORKERS must be exactly 0, 1 or 2")
     if enabled == "0":
         return
     for lane in range(32):
@@ -39,8 +41,13 @@ def _reuse_post_dispatch_math(cfg: Any, vectors: list[list[int]], combine_start:
                          if task >= combine_start or cfg.all_tasks[task].task_type == 0), len(communication))
         # Preserving the full communication subsequence keeps every peer/QP owner.
         # Borrowing a lane before dispatch drains could introduce remote wait cycles.
-        vectors[2 * lane] = math[::2]
-        vectors[2 * lane + 1] = communication[:boundary] + math[1::2] + communication[boundary:]
+        borrowed = math[1::2]
+        if enabled == "2":
+            start, count = first_stage
+            borrowed = [task for task in borrowed if start <= task < start + count]
+        moved = set(borrowed)
+        vectors[2 * lane] = [task for task in math if task not in moved]
+        vectors[2 * lane + 1] = communication[:boundary] + borrowed + communication[boundary:]
 
 
 def _validate_qp_owners(cfg: Any, spec: Any, vectors: list[list[int]], qps: int) -> None:
@@ -117,7 +124,7 @@ def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) ->
             if expert + 1 < spec.local_experts:
                 vectors[2 * lane].extend(tasks(inputs[0], expert + 1, lane))
             vectors[2 * lane].extend(tasks(inputs[1], expert, lane))
-    _reuse_post_dispatch_math(cfg, vectors, stages["combine"][0])
+    _reuse_post_dispatch_math(cfg, vectors, stages["combine"][0], stages[inputs[0]])
     qps = configured_udma_qp_count()
     if qps < 32:
         _validate_qp_owners(cfg, spec, vectors, qps)

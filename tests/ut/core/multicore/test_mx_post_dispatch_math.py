@@ -27,6 +27,7 @@ class TestMXPostDispatchMath(unittest.TestCase):
     """Verify actual serialized task ownership without native or distributed initialization."""
 
     def setUp(self) -> None:
+        """Isolate experimental switches and the qualified CPU graph environment."""
         patch = mock.patch.dict(os.environ, {
             'PANGU_MX_GMM_TILE': 't6', 'HYPER_PARALLEL_SHMEM_DATA_ENGINE': 'mte_udma',
             'HYPER_PARALLEL_SHMEM_UDMA_QP_NUM': '16', 'PANGU_MX_REUSE_DISPATCH_WORKERS': '0',
@@ -74,6 +75,32 @@ class TestMXPostDispatchMath(unittest.TestCase):
             self.assertGreater(progressed, 0, msg=f'Local queue/event replay stalled with {total} tasks pending')
             total -= progressed
 
+    def check_wire_ownership(self, before: object, after: object,
+                             old: list[list[int]], new: list[list[int]]) -> None:
+        """Require exact task coverage and the unchanged communication subsequence on each worker."""
+        self.assertEqual(sorted(task for queue in old for task in queue),
+                         sorted(task for queue in new for task in queue))
+        for worker in range(64):
+            self.assertEqual(
+                [task for task in old[worker] if before.config.all_tasks[task].task_type in (0, 105)],
+                [task for task in new[worker] if after.config.all_tasks[task].task_type in (0, 105)],
+            )
+
+    def check_borrowed_workers(self, after: object, new: list[list[int]], mode: int) -> None:
+        """Require borrowed quantization to follow every dispatch task."""
+        for worker in range(1, 64, 2):
+            quant = [index for index, task in enumerate(new[worker])
+                     if after.config.all_tasks[task].task_type in (161, 162, 163, 164)]
+            self.assertTrue(quant, msg=f'Borrowed worker {worker} has no quantization tasks')
+            if mode == 2:
+                self.assertTrue(all(after.config.all_tasks[new[worker][index]].inputs[0].input_position
+                                    == 0 for index in quant))
+            dispatch = after.graph.get_op('dispatch')
+            start = next(index for index, task in enumerate(after.config.all_tasks)
+                         if task.task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL)
+            dispatch_ids = set(range(start, start + dispatch.task_num))
+            self.assertTrue(all(task in dispatch_ids for task in new[worker][:quant[0]]))
+
     @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='dryrun', essential_mark='essential')
     def test_borrowed_math_preserves_wire_owners_and_task_bytes(self) -> None:
         """Feature: Post-dispatch vector role reuse.
@@ -87,12 +114,12 @@ class TestMXPostDispatchMath(unittest.TestCase):
                     mx_vector_policy='window2', dispatch_split=512, combine_split=512, compute_stages=6,
                     logical_num_experts=ep*6 if budget else 0, replica_slots_per_rank=budget,
                     replica_transport='shmem_signal_kernel_gradient')
-                for forward in (False, True):
-                    with self.subTest(ep=ep, qps=qps, budget=budget, forward=forward):
+                for forward, mode in ((False, 1), (True, 1), (False, 2), (True, 2)):
+                    with self.subTest(ep=ep, qps=qps, budget=budget, forward=forward, mode=mode):
                         os.environ['PANGU_MX_REUSE_DISPATCH_WORKERS'] = '0'
                         before = build_mxfp8_runtime(spec, forward=forward, ready_depth=8,
                                                     weight_prefetch=bool(budget))
-                        os.environ['PANGU_MX_REUSE_DISPATCH_WORKERS'] = '1'
+                        os.environ['PANGU_MX_REUSE_DISPATCH_WORKERS'] = str(mode)
                         after = build_mxfp8_runtime(spec, forward=forward, ready_depth=8,
                                                    weight_prefetch=bool(budget))
                         old, new = self.queues(before.config), self.queues(after.config)
@@ -103,21 +130,8 @@ class TestMXPostDispatchMath(unittest.TestCase):
                         self.assertEqual(list(before.config.cube_task_indices), list(after.config.cube_task_indices))
                         for a, b in zip(before.config.all_tasks, after.config.all_tasks):
                             self.assertEqual(bytes(a), bytes(b))
-                        self.assertEqual(sorted(task for queue in old for task in queue),
-                                         sorted(task for queue in new for task in queue))
-                        for worker in range(64):
-                            wire = lambda task: before.config.all_tasks[task].task_type in (0, 105)
-                            self.assertEqual([task for task in old[worker] if wire(task)],
-                                             [task for task in new[worker] if wire(task)])
-                        for worker in range(1, 64, 2):
-                            quant = [index for index, task in enumerate(new[worker])
-                                     if after.config.all_tasks[task].task_type in (161, 162, 163, 164)]
-                            self.assertTrue(quant, msg=f'Borrowed worker {worker} has no quantization tasks')
-                            dispatch = after.graph.get_op('dispatch')
-                            start = next(index for index, task in enumerate(after.config.all_tasks)
-                                         if task.task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL)
-                            dispatch_ids = set(range(start, start + dispatch.task_num))
-                            self.assertTrue(all(task in dispatch_ids for task in new[worker][:quant[0]]))
+                        self.check_wire_ownership(before, after, old, new)
+                        self.check_borrowed_workers(after, new, mode)
                         self.check_event_progress(after, ep)
 
     @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='dryrun', essential_mark='essential')
