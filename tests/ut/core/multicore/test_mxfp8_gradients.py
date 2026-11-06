@@ -22,6 +22,8 @@ from unittest import mock
 
 import torch
 
+from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
+from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
     SignalReplicaTransport, signal_storage_bytes,
 )
@@ -112,5 +114,41 @@ class TestMXFP8Gradients(unittest.TestCase):
             self.assertGreater(provider.kernel_gradient_signals()[0], first_epoch)
             self.assertTrue(all(int(value.count_nonzero()) == 0 for value in pool.gradients))
         self.assertFalse(provider._lock.locked())
+        runtime.put.assert_not_called()
+        runtime.get.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_exact_guest_quotas_preserve_overwritten_and_unread_storage(self) -> None:
+        """Feature: Selective MX guest gradient initialization.
+        Description: Reuse poisoned symmetric storage with nonempty, empty-assigned and inactive guest slots.
+        Expectation: Only zero-row guests that will return gradients are cleared, without device count readback.
+        """
+        shapes = ((64, 128), (128, 64))
+        weights = tuple(torch.empty((2, *shape), dtype=torch.float8_e4m3fn) for shape in shapes)
+        storage = torch.empty(signal_storage_bytes(shapes, 2, 3, 2), dtype=torch.uint8)
+        runtime = mock.MagicMock()
+        provider = SignalReplicaTransport(runtime, storage, 2, 3)
+        config = ExpertReplicaConfig(6, 3, 2)
+        slots = ((0, 1, 2, 4), (2, 3, -1, -1), (4, 5, -1, -1))
+        for rank, first, second in ((0, 7, 0), (0, 0, 9), (0, 5, 6), (0, 0, 0), (1, 7, 0)):
+            with self.subTest(rank=rank, first=first, second=second):
+                dispatch = ((5, 0, first, second) + (0,) * 8, (0,) * 12, (0,) * 12)
+                logical = ((5, 0, first, 0, second, 0), (0,) * 6, (0,) * 6)
+                plan = ExpertExecutionPlan(config, logical, slots, dispatch)
+                plan.validate()
+                route = SimpleNamespace(plan=plan, rank=rank)
+                with lease_mx_gradient_inbox(provider, weights, route) as pool:
+                    for gradient in pool.gradients:
+                        gradient.fill_(float("nan"))
+                with mock.patch.object(torch.Tensor, "cpu", side_effect=AssertionError("Readback is forbidden")):
+                    with lease_mx_gradient_inbox(provider, weights, route) as pool:
+                        for gradient in pool.gradients:
+                            self.assertEqual(gradient.untyped_storage().data_ptr(), storage.data_ptr())
+                            for slot in range(2):
+                                if rank == 0 and (first, second)[slot] == 0:
+                                    self.assertEqual(int(gradient[slot].count_nonzero()), 0)
+                                else:
+                                    self.assertTrue(torch.isnan(gradient[slot]).all().item())
+                self.assertFalse(provider._lock.locked())
         runtime.put.assert_not_called()
         runtime.get.assert_not_called()

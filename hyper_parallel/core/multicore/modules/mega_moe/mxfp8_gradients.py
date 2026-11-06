@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
 from hyper_parallel.core.multicore.scheduler.mxfp8 import MX_GMM_TASK_TYPE
 
 from .function import _runtime_image
@@ -112,7 +113,18 @@ def lease_mx_gradient_inbox(provider: Any, weights: tuple[torch.Tensor, ...], ro
             provider.slots, *weight.shape[1:]) for weight in weights)
         provider._bind(aliases)
         provider._advance(reserve=2)
-        with provider.pool.lease(backward=True):
+        empty = None
+        if isinstance(route.plan, ExpertExecutionPlan):
+            home = route.plan.config.home_experts
+            counts = route.plan.destination_counts[route.rank]
+            guests = route.plan.slot_to_logical[route.rank][home:]
+            empty = tuple(slot for slot, expert in enumerate(guests) if expert >= 0 and counts[home + slot] == 0)
+        with provider.pool.lease(backward=True, _overwrite_gradients=empty is not None):
+            # Complete-K MX TN producers overwrite nonempty matrices. Only zero-row
+            # guests return gradients without a producer; inactive slots have no readers.
+            for slot in empty or ():
+                for gradient in provider.pool.gradients:
+                    gradient[slot].zero_()
             yield provider.pool
     finally:
         provider._lock.release()
