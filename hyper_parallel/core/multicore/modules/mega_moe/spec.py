@@ -68,6 +68,7 @@ class MegaMoeSpec:
     _cube_event_refresh_us: int = 0
     _vector_event_refresh_us: int = 0
     _batch_empty_dispatch: bool = False
+    _selective_owner_gradient_init: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -262,4 +263,5 @@ def bind_mega_moe_spec(
         _cube_event_refresh_us=specification.get("_cube_event_refresh_us", 0),
         _vector_event_refresh_us=specification.get("_vector_event_refresh_us", 0),
         _batch_empty_dispatch=specification.get("_batch_empty_dispatch", False),
+        _selective_owner_gradient_init=specification.get("_selective_owner_gradient_init", False),
     )

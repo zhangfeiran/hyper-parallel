@@ -2,7 +2,8 @@
 
 本轮在已验收的热副本版本 `ca76a20089d03dc0d9f9f7e8852c93931c5396ef` 上继续调优。
 保留 [LongCat 热副本接入](longcat-flash-hot-replicas.md)中的参数、布局、精度和生命周期契约。
-本轮正式结果是原宽度 EP4 专家组件，不是完整 LongCat Trainer 或客户 x86 NPU 验收。
+本页先记录 prefix 路由优化，再记录后续 expert 增量的独立组件验收；
+完整逻辑层结果单列于 [shortcut 重叠实验](longcat-flash-shortcut-overlap.md)，均不代表完整 Trainer 或客户 x86 NPU 验收。
 
 ## 已合入的路由反向优化
 
@@ -110,3 +111,68 @@ LongCat 逻辑层在 attention0 后分成 shortcut MoE 与 dense0 两条路径�
 profiler 确认 ordered 路径存在独立 CUBE dense MatMul 与 AIV route kernel 的时间区间交叠。
 区间相交不代表硬件占用率，也不能把不同区间的交叠时长相加当作端到端收益。
 完整层、激活重算、FSDP 和 Trainer 验证尚未完成，该多流原型尚未进入默认执行路径。
+
+## 后续移植：expert 分支新增 6 个提交
+
+本轮将冻结至 `de127408c6ac3d053d12ca222b7e7669203515b3` 的下列增量移植到当前调优分支，
+保留 LongCat 已有的 EOI 梯度布局、unused Gate/Up 尾部、完整专家副本、路由缓存和延迟 backward 语义：
+
+- `2e99a58d6` / `cc6d1f08d`：激活梯度优先调度及其默认选择。
+- `16353e0a6` / `b8b4ca4ab`：根据已读取的路由摘要，证明即使理想均衡也无法达到副本准入门限时保留 owner。
+- `1b46e0b8e` / `de127408c`：按当前 owner 专家覆盖证明减少梯度清零。
+
+B0 自动策略在 NPU 上实际解析为 `device_active_lanes_act_first`；B2 继续使用 `device_active_lanes`。
+当前 EP4 路由缓存原先已按精确空专家集合初始化，新增免清零逻辑主要补足只读取设备摘要的路径。
+它不会仅根据 rank 总行数猜测某个专家是否为空，也没有新增完整计数表读取。
+新增 CPU 回归覆盖同一工作区的覆盖证明失效，防止上一步的免清零许可泄漏到下一步空专家路由。
+
+移植后的 B0 Push/Pull 和 B2 EOI Push、EOI Pull、EIO Push 均在原宽度下重新验收。
+后者各 10 步 × 4 rank，每步输出、dX、dP、专家 dW 全值一致，FP32 master 更新后参数哈希一致。
+CPU 完整回归 798 项、4164 个子用例通过，另有新增覆盖证明用例及修改测试元数据后的 78 项回归通过。
+全量 AutoGit 检查仍未通过，包含 expert 分支带入的复杂度、docstring 和既有测试标记问题；不能宣称全分支门禁通过。
+新建的完整层 benchmark 和独立历史前端 validator 的 pylint、复杂度检查单独通过。
+
+仍使用相同三方进程交错、10 次预热、30 个全部 rank-max 样本及预先冻结的 2% 门限：
+
+| 当前组件对照 | 前向 | 前后向 |
+| --- | --- | --- |
+| 原生大算子，同一 Triton 前端 | 18.263 ms | 40.264 ms |
+| 仅 prefix 优化的 MegaMoE 控制 | 12.717 ms | 28.763 ms |
+| prefix 加最新 6 个增量的 MegaMoE | 12.760 ms | 28.907 ms |
+
+最新实现对原生前后向为 **1.39289 倍**，耗时下降 **28.207%**。
+新增 6 个提交相对 prefix 控制的前后向耗时约增加 0.50%，在本轮 2% 门限内；没有确证额外组件加速。
+内部 trace 确认 ActGrad 的首次提交由晚于 W2Grad 约 0.20–0.22 ms，改为早于 W2Grad 约 0.20–0.23 ms。
+但 W1Grad 在 CombineGrad 之后仍有约 2.59–2.65 ms 的尾部；新增 C/V 时间区间交叠未转化为额外未插桩收益。
+因此不把新的调度名称或更早的激活提交当作额外性能收益，不与先前 2.757% 的结果相乘。
+全部 rank、原始样本、运行源码、native 文件和报告哈希见
+[最新 expert 增量验收数据](longcat-flash-expert-latest-results.json)。
+
+包含这些增量的完整逻辑层，则通过有序多流取得了独立正式对照的 **5.23%** 耗时下降，
+见[完整层 shortcut 重叠实验](longcat-flash-shortcut-overlap.md)。该入口还未替换默认 decoder。
+
+## 独立历史路由前端复验
+
+分支提供 `_validate_longcat_route_migration.py`，直接从当前 Git 历史提取冻结的 `ca76a200` 路由源码。
+它只在原生参考执行时使用旧 OrderedGather/OrderedCombine，候选继续运行当前前端。
+这样无需准备额外本地脚本或硬编码另一工作树路径，也避免两侧共享新 kernel 掩盖错误。
+要求本地保留该 Git 历史；浅克隆需要补齐历史，不能将当前前端冒充冻结参考。
+入口要求 Triton 路由、校验实际 native 库所属工作树，并在每个 rank 报告中记录参考源码 SHA256。
+
+在前述已验证环境及自行预留的 4 个逻辑 NPU 上执行：
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  tests/torch/models/longcat_flash/_validate_longcat_route_migration.py \
+  --check component --backend push \
+  --ep 4 --tokens 2048 --real 32 --zero 16 \
+  --hidden 6144 --intermediate 2048 --top-k 12 \
+  --routing-backend triton --swiglu-precision fused \
+  --initial-token-capacity 24576 --output "$INDEPENDENT_OUTPUT"
+```
+
+完整专家副本的连续更新将 `--check component` 改为 `--check replicas`，
+增加 `--dispatch-mode push --layout EOI --budget 2 --updates 10`，使用新的输出目录。
+Pull 或 EIO 可分别切换对应参数；不要重复使用已经存在 rank 报告的输出目录。
+分支内的独立 validator 已在 4 rank 上完成 B0 Push/Pull 和 EOI Push B2 的 10 步连续更新实测，
+全部值为零误差、参数哈希匹配；每 rank 记录到 2 次 owner-only 摘要回退，确认该准入捷径实际生效。

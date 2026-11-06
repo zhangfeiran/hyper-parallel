@@ -1,0 +1,2361 @@
+{
+  "scope": "Original-width complete logical decoder; two MLA, two dense MLP, shortcut MoE; no FSDP/Trainer",
+  "gate": {
+    "pilot_ms": [
+      88.38334655761719,
+      88.40045166015625,
+      88.06929016113281
+    ],
+    "spread": 0.0037468766676259876,
+    "required_fractional_elapsed_reduction": 0.02,
+    "sequence": "A1 B1 B2 A2 B3 A3 A4 B4; A=serial, B=ordered; all deterministic",
+    "aggregation": "Median of all 30 rank-max samples per fresh process; geometric mean of fixed paired process ratios"
+  },
+  "samples": {
+    "A": {
+      "rank_max_ms": [
+        [
+          88.67501068115234,
+          89.63131713867188,
+          88.44773864746094,
+          88.52110290527344,
+          88.40628051757812,
+          89.83307647705078,
+          88.46363830566406,
+          88.63516235351562,
+          88.4103775024414,
+          88.22362518310547,
+          88.00770568847656,
+          88.09536743164062,
+          88.13548278808594,
+          90.80409240722656,
+          87.9117660522461,
+          88.09867858886719,
+          87.92708587646484,
+          88.16527557373047,
+          88.27803802490234,
+          88.4997787475586,
+          88.58305358886719,
+          87.98028564453125,
+          89.56748962402344,
+          87.9318618774414,
+          87.87725067138672,
+          88.24549102783203,
+          87.93311309814453,
+          88.06492614746094,
+          88.0336685180664,
+          88.18819427490234
+        ],
+        [
+          90.6556167602539,
+          88.56231689453125,
+          88.33546447753906,
+          88.89867401123047,
+          89.1609878540039,
+          88.10421752929688,
+          88.59368133544922,
+          89.95712280273438,
+          88.43050384521484,
+          88.50723266601562,
+          88.27474212646484,
+          88.18904876708984,
+          88.32051849365234,
+          90.31365966796875,
+          88.44343566894531,
+          88.48837280273438,
+          88.36604309082031,
+          88.0905990600586,
+          88.12045288085938,
+          87.97491455078125,
+          88.87347412109375,
+          88.14997100830078,
+          88.57296752929688,
+          88.0933609008789,
+          88.2546615600586,
+          88.34738159179688,
+          88.56596374511719,
+          88.06890869140625,
+          89.17523956298828,
+          90.73226165771484
+        ],
+        [
+          88.38240051269531,
+          87.93510437011719,
+          88.04316711425781,
+          88.24604034423828,
+          88.17871856689453,
+          87.981201171875,
+          88.5371322631836,
+          89.1889877319336,
+          88.07374572753906,
+          88.1633071899414,
+          89.9827651977539,
+          88.1521987915039,
+          88.12275695800781,
+          87.86465454101562,
+          88.1502914428711,
+          88.91915893554688,
+          88.0921401977539,
+          88.05992126464844,
+          87.95565795898438,
+          88.41154479980469,
+          88.20066833496094,
+          88.16515350341797,
+          88.36151123046875,
+          89.47412872314453,
+          88.076171875,
+          88.13221740722656,
+          88.24378204345703,
+          88.12570190429688,
+          88.1120376586914,
+          87.95659637451172
+        ],
+        [
+          88.5796127319336,
+          89.00883483886719,
+          89.41297149658203,
+          89.5853271484375,
+          88.70834350585938,
+          89.13508605957031,
+          88.20220184326172,
+          88.2154312133789,
+          88.0907211303711,
+          89.30049133300781,
+          88.26277923583984,
+          88.84733581542969,
+          88.14530944824219,
+          88.1745834350586,
+          88.10227966308594,
+          88.44473266601562,
+          89.9130630493164,
+          88.15680694580078,
+          88.48907470703125,
+          88.99268341064453,
+          88.13019561767578,
+          88.09849548339844,
+          88.44141387939453,
+          88.26348114013672,
+          88.66626739501953,
+          88.18524169921875,
+          88.40885925292969,
+          88.43437194824219,
+          88.25798034667969,
+          87.88069915771484
+        ]
+      ],
+      "process_p50_ms": [
+        88.23455810546875,
+        88.43696975708008,
+        88.1512451171875,
+        88.42161560058594
+      ],
+      "geomean_p50_ms": 88.31101295668782
+    },
+    "B": {
+      "rank_max_ms": [
+        [
+          84.07049560546875,
+          83.31310272216797,
+          83.79292297363281,
+          83.76042175292969,
+          88.98123168945312,
+          83.49288177490234,
+          84.6657943725586,
+          83.65933227539062,
+          84.04670715332031,
+          83.89680480957031,
+          83.63606262207031,
+          83.66718292236328,
+          84.0621109008789,
+          85.71614074707031,
+          85.97908782958984,
+          84.10449981689453,
+          83.87958526611328,
+          83.3643798828125,
+          84.48223114013672,
+          84.38349914550781,
+          83.52046203613281,
+          83.98155212402344,
+          84.06172180175781,
+          83.76021575927734,
+          83.6982421875,
+          84.25553894042969,
+          83.68467712402344,
+          83.15827178955078,
+          83.76204681396484,
+          84.59746551513672
+        ],
+        [
+          84.39767456054688,
+          82.87297821044922,
+          83.14481353759766,
+          83.16725158691406,
+          83.00826263427734,
+          83.77613830566406,
+          83.93921661376953,
+          82.9681167602539,
+          83.7306900024414,
+          83.77620697021484,
+          83.3095932006836,
+          83.26280975341797,
+          83.11482238769531,
+          86.942138671875,
+          83.18189239501953,
+          83.02603912353516,
+          83.79483795166016,
+          83.2723388671875,
+          85.74967956542969,
+          83.37444305419922,
+          84.08551025390625,
+          83.89823150634766,
+          83.0791015625,
+          83.09635925292969,
+          83.01116943359375,
+          83.3929214477539,
+          82.933837890625,
+          83.012451171875,
+          85.92069244384766,
+          83.25214385986328
+        ],
+        [
+          83.72810363769531,
+          84.24533081054688,
+          84.33454132080078,
+          83.7248764038086,
+          83.16409301757812,
+          85.22773742675781,
+          83.37667083740234,
+          84.2763442993164,
+          84.18782806396484,
+          83.37163543701172,
+          83.38561248779297,
+          83.78946685791016,
+          83.5458755493164,
+          83.41272735595703,
+          83.97904968261719,
+          83.72303771972656,
+          84.75621032714844,
+          83.35269927978516,
+          84.64383697509766,
+          85.04115295410156,
+          83.89614868164062,
+          83.31954193115234,
+          83.2439193725586,
+          83.24911499023438,
+          83.1469497680664,
+          83.18034362792969,
+          83.12061309814453,
+          83.14786529541016,
+          83.1731185913086,
+          83.624755859375
+        ],
+        [
+          85.14561462402344,
+          84.00312805175781,
+          84.23683166503906,
+          84.17507934570312,
+          83.93219757080078,
+          83.6749496459961,
+          84.14334869384766,
+          83.46454620361328,
+          84.94229125976562,
+          83.97075653076172,
+          84.06478881835938,
+          84.12274169921875,
+          84.239013671875,
+          83.28752136230469,
+          83.50977325439453,
+          83.84391021728516,
+          84.05062866210938,
+          83.89855194091797,
+          84.23640441894531,
+          83.99349975585938,
+          84.08795166015625,
+          83.84407806396484,
+          84.0701675415039,
+          84.07217407226562,
+          83.73095703125,
+          84.04316711425781,
+          84.02922821044922,
+          84.10393524169922,
+          83.63689422607422,
+          83.6716079711914
+        ]
+      ],
+      "process_p50_ms": [
+        83.8881950378418,
+        83.26757431030273,
+        83.5853157043457,
+        84.03619766235352
+      ],
+      "geomean_p50_ms": 83.69379985919083
+    }
+  },
+  "raw_reports_sha256": {
+    "layer-formal-A1/rank0.json": "4318c5af80f6397d764758da4976926f2530df1b994998cf1793b3d5ffe188f6",
+    "layer-formal-A2/rank0.json": "c4711d62644920535af3f5093db23644a430bea5b351813ab0d42b60b8914596",
+    "layer-formal-A3/rank0.json": "06a3d37aa308cfe11767cf1ab7ed2bf6d1003c315fd4039f44fb31b90d1b30d5",
+    "layer-formal-A4/rank0.json": "e77ce88353b2f33b9e43a759f038f540f311d926eae137c536912e8b7ad80ad4",
+    "layer-formal-B1/rank0.json": "49b3258c997bc5fe413416244418baf631f40ab26206797278255728b9acf6d7",
+    "layer-formal-B2/rank0.json": "de7937715bc5663d9c5f315acb3b61188dcb7bca2935dd205e4040d7330d6241",
+    "layer-formal-B3/rank0.json": "b3bbd7fdbaec004741830ea51958e556e78bcf7d48c4d5d629ecdad89509a90b",
+    "layer-formal-B4/rank0.json": "2c909011b9fe27dc57f946b5b20cfbfce21a3f4b6b6a2fdc0778f455a859c51e",
+    "layer-formal-A1/rank1.json": "f21241095c264374cbd36d00a67a6bab79c8e1b229f347c1ac43517e38c9fed5",
+    "layer-formal-A2/rank1.json": "d73f6ea37b6fa9be961c80eb36016a4c6b4be56d1b232496e49d6596c45394d4",
+    "layer-formal-A3/rank1.json": "599c1b91d4e916fbe9691e436104a75315655a1b5a184e5ae057351e9dc5799b",
+    "layer-formal-A4/rank1.json": "c81276e84eec3ff2dc7c85e0cde4c1af7b8663f4b62fe7553936ebaa94465144",
+    "layer-formal-B1/rank1.json": "68da3b4bb31e9c72e5d4eef4fd5f777f9bf62592e2dc2642d47b72b988c01a06",
+    "layer-formal-B2/rank1.json": "9080167439572392792c9886d0e91cdbf23e2fdfdcdaf73bb1be34928b4689d4",
+    "layer-formal-B3/rank1.json": "a70d0932a5d27a63b4be95d11143dc4a09fcee9e9f0fcca649c8793be4757ef6",
+    "layer-formal-B4/rank1.json": "6f57b116f0c4bb2ec548a857ae101f4fde48104c8a1dca24c359cc92f85337da",
+    "layer-formal-A1/rank2.json": "500a11ab821c6571397bf598eaeabbdbfbab26da90b69b73091e1c5992871327",
+    "layer-formal-A2/rank2.json": "1236187a96f5e6ee680bd289bbd71e75c8aacd6f856af7df5027ac5635b63f33",
+    "layer-formal-A3/rank2.json": "b5e871b7f1d1376d8b341bca7dcae3017e5a0ddbc04a037d4172b7a49c95ce0c",
+    "layer-formal-A4/rank2.json": "3ff2a90547c96c50491b4a08e248d9fc0cd4de5ebff29b9b85391435aa45b3fd",
+    "layer-formal-B1/rank2.json": "b227ab190f3094354af8d45e4c29aa62d532a714c99f196879bb8e5bcd8942a7",
+    "layer-formal-B2/rank2.json": "0eb8c141e3f87ed9369b0b6c3db7a5227223960cd78df491d5cee126c42516f9",
+    "layer-formal-B3/rank2.json": "54927b842fbb181ab128fdb34dbf333b864731472b989c4937a40c3c85ed36c2",
+    "layer-formal-B4/rank2.json": "6745d8ee245d5fa4bc7bf9b9101d7fd3bb040709e734a40184cbe80c836918fa",
+    "layer-formal-A1/rank3.json": "42325463d4b923cf8123c76be1ed140192a91d19c003512303648d7a9755836a",
+    "layer-formal-A2/rank3.json": "f471e34c56fdf0591ed5b5482e82b7bb0ebdfd349649dca4ed6785078f81f31d",
+    "layer-formal-A3/rank3.json": "5d9f7cb451add41873120c0a9db294d9632c469a32419c19e9ae2bb751fe7397",
+    "layer-formal-A4/rank3.json": "4dbcf8897232833a8fe39613c094111912791f0f99ddb500d95718a80ed1f844",
+    "layer-formal-B1/rank3.json": "a6451f50d9ca009f9d7fefd123ee513191b87b89bad11c82d98e2105942c44cc",
+    "layer-formal-B2/rank3.json": "441d52b44d059b7bcd5b5bc4208172921b4ae6d830bc5bc73aa7d76587f17083",
+    "layer-formal-B3/rank3.json": "cb73bd91bc911c9abefddbef26a8e1afca13cdb771ad64454e4b0a377b44b8a1",
+    "layer-formal-B4/rank3.json": "631e4a572c598e1441f735cede90e7520e3ac143a84a213899d25fcc15e22d1f"
+  },
+  "operand_sha256_per_rank": {
+    "0": {
+      "mlp.experts.gate_up_proj": "629457e6592f74915940d70778b632abdfc0260c6cf4334b4deb65af45d6273c",
+      "mlp.experts.down_proj": "c31afb0560be13d4de42b262669ee4c05cda6905d9a588fad0eb8711602757a4",
+      "mlp.router.classifier.weight": "975cfb671104bb5f162dfbe5662f7b44479ec6eabb3d1a36e0242ac6a7716f61",
+      "self_attn.0.linear_qkv.weight": "edc0bedf34001a943cd2fa378791e2741c1a8dbffecde61c94e5e56665f4f92f",
+      "self_attn.0.q_a_layernorm.weight": "cdeeb4b0a640eec9bd80cda4d22bb076db3224559bdec74a31bd447decd0dd3d",
+      "self_attn.0.kv_a_layernorm.weight": "ad755ff209a358c0a9891662926947d163a48a087efa7da7b8ce9348cfe8c2d1",
+      "self_attn.0.q_b_proj.weight": "e6ff0093ec285d097d172bd54cc3f994d222dd3a5d420583010dcf3216e7aa58",
+      "self_attn.0.kv_b_proj.weight": "2a2aa0af55b421e344b438049a0ca08bebf436517580e45f4e613376b0171423",
+      "self_attn.0.o_proj.weight": "fb9e6acf15747fbf321bde49bd6f49d38d4987d8035cded82e87c06fc3dc3bba",
+      "self_attn.1.linear_qkv.weight": "ff4eae5b31671e9a6d5d321d90a792209dba075cb07b8cb03d5efbac1d581b30",
+      "self_attn.1.q_a_layernorm.weight": "cdeeb4b0a640eec9bd80cda4d22bb076db3224559bdec74a31bd447decd0dd3d",
+      "self_attn.1.kv_a_layernorm.weight": "ad755ff209a358c0a9891662926947d163a48a087efa7da7b8ce9348cfe8c2d1",
+      "self_attn.1.q_b_proj.weight": "679e7eaa4c55939a3d55c0f6b7564e2d7dbf2dc50528516aa359f380f773fffc",
+      "self_attn.1.kv_b_proj.weight": "0f33044f36b2630e51797a683d16deb8c139cb9b4f6cb1bac0cfe5bfd45660b3",
+      "self_attn.1.o_proj.weight": "befed542191f8b5cd87c7d81de72341528e405f22c6be47e1cf24b08b44920e1",
+      "mlps.0.gate_proj.weight": "33821270e11957835e353dae75485db3b4fcaac8e37dfccd930fa989b94c9298",
+      "mlps.0.up_proj.weight": "8e55874dd00836468a7fbe436cfd2cb982b515e788ee1bb803612825c3c866d5",
+      "mlps.0.down_proj.weight": "fe8074370488ea9ada9c57743186d3e9f59e6b15fbbd3f029091f0275e696aed",
+      "mlps.1.gate_proj.weight": "218a3f39039afaf2b2a4aa93fd7e9992244956d75448bf25a1efb2571d8121ca",
+      "mlps.1.up_proj.weight": "998023fa2b44f8019975c24ce18289784b603e0129338a861917d2ee799ba609",
+      "mlps.1.down_proj.weight": "a417debe1d6edeafa43f9af811499302fe5c5bffae1bcda9cb873cf5ef354b7d",
+      "input_layernorm.0.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "input_layernorm.1.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "post_attention_layernorm.0.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "post_attention_layernorm.1.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "hidden": "598a477462b812ebf592f32c76cfbc15fe725a7e899618ef50f2ded8af7e2011",
+      "upstream": "4ee2a7fa51cf39a069b46cfe27acdb953a1467f4d18ff518b06c297315b927f7"
+    },
+    "1": {
+      "mlp.experts.gate_up_proj": "73d49704b35a091b023239c3128ab1b5480c90eafd617b608f3f882287fd7a8f",
+      "mlp.experts.down_proj": "6a29f042e7bf3894eb0658923295765cdd3c4e5d7a15a36f4a48ac5f450b5535",
+      "mlp.router.classifier.weight": "975cfb671104bb5f162dfbe5662f7b44479ec6eabb3d1a36e0242ac6a7716f61",
+      "self_attn.0.linear_qkv.weight": "edc0bedf34001a943cd2fa378791e2741c1a8dbffecde61c94e5e56665f4f92f",
+      "self_attn.0.q_a_layernorm.weight": "cdeeb4b0a640eec9bd80cda4d22bb076db3224559bdec74a31bd447decd0dd3d",
+      "self_attn.0.kv_a_layernorm.weight": "ad755ff209a358c0a9891662926947d163a48a087efa7da7b8ce9348cfe8c2d1",
+      "self_attn.0.q_b_proj.weight": "e6ff0093ec285d097d172bd54cc3f994d222dd3a5d420583010dcf3216e7aa58",
+      "self_attn.0.kv_b_proj.weight": "2a2aa0af55b421e344b438049a0ca08bebf436517580e45f4e613376b0171423",
+      "self_attn.0.o_proj.weight": "fb9e6acf15747fbf321bde49bd6f49d38d4987d8035cded82e87c06fc3dc3bba",
+      "self_attn.1.linear_qkv.weight": "ff4eae5b31671e9a6d5d321d90a792209dba075cb07b8cb03d5efbac1d581b30",
+      "self_attn.1.q_a_layernorm.weight": "cdeeb4b0a640eec9bd80cda4d22bb076db3224559bdec74a31bd447decd0dd3d",
+      "self_attn.1.kv_a_layernorm.weight": "ad755ff209a358c0a9891662926947d163a48a087efa7da7b8ce9348cfe8c2d1",
+      "self_attn.1.q_b_proj.weight": "679e7eaa4c55939a3d55c0f6b7564e2d7dbf2dc50528516aa359f380f773fffc",
+      "self_attn.1.kv_b_proj.weight": "0f33044f36b2630e51797a683d16deb8c139cb9b4f6cb1bac0cfe5bfd45660b3",
+      "self_attn.1.o_proj.weight": "befed542191f8b5cd87c7d81de72341528e405f22c6be47e1cf24b08b44920e1",
+      "mlps.0.gate_proj.weight": "33821270e11957835e353dae75485db3b4fcaac8e37dfccd930fa989b94c9298",
+      "mlps.0.up_proj.weight": "8e55874dd00836468a7fbe436cfd2cb982b515e788ee1bb803612825c3c866d5",
+      "mlps.0.down_proj.weight": "fe8074370488ea9ada9c57743186d3e9f59e6b15fbbd3f029091f0275e696aed",
+      "mlps.1.gate_proj.weight": "218a3f39039afaf2b2a4aa93fd7e9992244956d75448bf25a1efb2571d8121ca",
+      "mlps.1.up_proj.weight": "998023fa2b44f8019975c24ce18289784b603e0129338a861917d2ee799ba609",
+      "mlps.1.down_proj.weight": "a417debe1d6edeafa43f9af811499302fe5c5bffae1bcda9cb873cf5ef354b7d",
+      "input_layernorm.0.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "input_layernorm.1.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "post_attention_layernorm.0.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "post_attention_layernorm.1.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "hidden": "a4cac484122b5ceaed088e59dba9afbb3256414bfe77b00cc7f948ccce060c1d",
+      "upstream": "93a5cb5fdc8657d6b83c45a419bfa61e577f5e056d0583a4258c2923f88c1d6f"
+    },
+    "2": {
+      "mlp.experts.gate_up_proj": "bcbfce03e3fef761e68e61106fbd74b2dfd417aadb9c686e4916c0390548c6bd",
+      "mlp.experts.down_proj": "b918f4a2d5d0da980e0b819bbd94251d72659344918774988bf93830e46e7e88",
+      "mlp.router.classifier.weight": "975cfb671104bb5f162dfbe5662f7b44479ec6eabb3d1a36e0242ac6a7716f61",
+      "self_attn.0.linear_qkv.weight": "edc0bedf34001a943cd2fa378791e2741c1a8dbffecde61c94e5e56665f4f92f",
+      "self_attn.0.q_a_layernorm.weight": "cdeeb4b0a640eec9bd80cda4d22bb076db3224559bdec74a31bd447decd0dd3d",
+      "self_attn.0.kv_a_layernorm.weight": "ad755ff209a358c0a9891662926947d163a48a087efa7da7b8ce9348cfe8c2d1",
+      "self_attn.0.q_b_proj.weight": "e6ff0093ec285d097d172bd54cc3f994d222dd3a5d420583010dcf3216e7aa58",
+      "self_attn.0.kv_b_proj.weight": "2a2aa0af55b421e344b438049a0ca08bebf436517580e45f4e613376b0171423",
+      "self_attn.0.o_proj.weight": "fb9e6acf15747fbf321bde49bd6f49d38d4987d8035cded82e87c06fc3dc3bba",
+      "self_attn.1.linear_qkv.weight": "ff4eae5b31671e9a6d5d321d90a792209dba075cb07b8cb03d5efbac1d581b30",
+      "self_attn.1.q_a_layernorm.weight": "cdeeb4b0a640eec9bd80cda4d22bb076db3224559bdec74a31bd447decd0dd3d",
+      "self_attn.1.kv_a_layernorm.weight": "ad755ff209a358c0a9891662926947d163a48a087efa7da7b8ce9348cfe8c2d1",
+      "self_attn.1.q_b_proj.weight": "679e7eaa4c55939a3d55c0f6b7564e2d7dbf2dc50528516aa359f380f773fffc",
+      "self_attn.1.kv_b_proj.weight": "0f33044f36b2630e51797a683d16deb8c139cb9b4f6cb1bac0cfe5bfd45660b3",
+      "self_attn.1.o_proj.weight": "befed542191f8b5cd87c7d81de72341528e405f22c6be47e1cf24b08b44920e1",
+      "mlps.0.gate_proj.weight": "33821270e11957835e353dae75485db3b4fcaac8e37dfccd930fa989b94c9298",
+      "mlps.0.up_proj.weight": "8e55874dd00836468a7fbe436cfd2cb982b515e788ee1bb803612825c3c866d5",
+      "mlps.0.down_proj.weight": "fe8074370488ea9ada9c57743186d3e9f59e6b15fbbd3f029091f0275e696aed",
+      "mlps.1.gate_proj.weight": "218a3f39039afaf2b2a4aa93fd7e9992244956d75448bf25a1efb2571d8121ca",
+      "mlps.1.up_proj.weight": "998023fa2b44f8019975c24ce18289784b603e0129338a861917d2ee799ba609",
+      "mlps.1.down_proj.weight": "a417debe1d6edeafa43f9af811499302fe5c5bffae1bcda9cb873cf5ef354b7d",
+      "input_layernorm.0.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "input_layernorm.1.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "post_attention_layernorm.0.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "post_attention_layernorm.1.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "hidden": "860834b2cfaa171aeafc63f595e9862ef57c1550e3ef29a2ce1e782f86f22829",
+      "upstream": "0838797e73f716ca6aea9be710711e046ad97d685fd0cd1445d05e55b7a31ac3"
+    },
+    "3": {
+      "mlp.experts.gate_up_proj": "4d8ec57a71810eaee2a5bd25227426a85d94555e03da7d711b4dbb0e00ab9f81",
+      "mlp.experts.down_proj": "800aca1ddf1663110bf348c023cbf36219751b249ad7314f0ab4d4cb60c38321",
+      "mlp.router.classifier.weight": "975cfb671104bb5f162dfbe5662f7b44479ec6eabb3d1a36e0242ac6a7716f61",
+      "self_attn.0.linear_qkv.weight": "edc0bedf34001a943cd2fa378791e2741c1a8dbffecde61c94e5e56665f4f92f",
+      "self_attn.0.q_a_layernorm.weight": "cdeeb4b0a640eec9bd80cda4d22bb076db3224559bdec74a31bd447decd0dd3d",
+      "self_attn.0.kv_a_layernorm.weight": "ad755ff209a358c0a9891662926947d163a48a087efa7da7b8ce9348cfe8c2d1",
+      "self_attn.0.q_b_proj.weight": "e6ff0093ec285d097d172bd54cc3f994d222dd3a5d420583010dcf3216e7aa58",
+      "self_attn.0.kv_b_proj.weight": "2a2aa0af55b421e344b438049a0ca08bebf436517580e45f4e613376b0171423",
+      "self_attn.0.o_proj.weight": "fb9e6acf15747fbf321bde49bd6f49d38d4987d8035cded82e87c06fc3dc3bba",
+      "self_attn.1.linear_qkv.weight": "ff4eae5b31671e9a6d5d321d90a792209dba075cb07b8cb03d5efbac1d581b30",
+      "self_attn.1.q_a_layernorm.weight": "cdeeb4b0a640eec9bd80cda4d22bb076db3224559bdec74a31bd447decd0dd3d",
+      "self_attn.1.kv_a_layernorm.weight": "ad755ff209a358c0a9891662926947d163a48a087efa7da7b8ce9348cfe8c2d1",
+      "self_attn.1.q_b_proj.weight": "679e7eaa4c55939a3d55c0f6b7564e2d7dbf2dc50528516aa359f380f773fffc",
+      "self_attn.1.kv_b_proj.weight": "0f33044f36b2630e51797a683d16deb8c139cb9b4f6cb1bac0cfe5bfd45660b3",
+      "self_attn.1.o_proj.weight": "befed542191f8b5cd87c7d81de72341528e405f22c6be47e1cf24b08b44920e1",
+      "mlps.0.gate_proj.weight": "33821270e11957835e353dae75485db3b4fcaac8e37dfccd930fa989b94c9298",
+      "mlps.0.up_proj.weight": "8e55874dd00836468a7fbe436cfd2cb982b515e788ee1bb803612825c3c866d5",
+      "mlps.0.down_proj.weight": "fe8074370488ea9ada9c57743186d3e9f59e6b15fbbd3f029091f0275e696aed",
+      "mlps.1.gate_proj.weight": "218a3f39039afaf2b2a4aa93fd7e9992244956d75448bf25a1efb2571d8121ca",
+      "mlps.1.up_proj.weight": "998023fa2b44f8019975c24ce18289784b603e0129338a861917d2ee799ba609",
+      "mlps.1.down_proj.weight": "a417debe1d6edeafa43f9af811499302fe5c5bffae1bcda9cb873cf5ef354b7d",
+      "input_layernorm.0.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "input_layernorm.1.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "post_attention_layernorm.0.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "post_attention_layernorm.1.weight": "d1cdce4322034c9a2a0c9736d42cedcb3a39e8452a9621e4ffa122a1af123166",
+      "hidden": "6eecc8d43cada4a0bf92a2421c5efdde256fd7e66d28419a71a8486cfedae3e1",
+      "upstream": "c66a8acd2896ce8af103e4f712ecd863c4f0b2755fb4cb6fd9e28c08c2cfc920"
+    }
+  },
+  "precision": [
+    {
+      "process": "layer-formal-A1",
+      "rank": 0,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A2",
+      "rank": 0,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A3",
+      "rank": 0,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A4",
+      "rank": 0,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B1",
+      "rank": 0,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B2",
+      "rank": 0,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B3",
+      "rank": 0,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B4",
+      "rank": 0,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A1",
+      "rank": 1,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A2",
+      "rank": 1,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A3",
+      "rank": 1,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A4",
+      "rank": 1,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B1",
+      "rank": 1,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B2",
+      "rank": 1,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B3",
+      "rank": 1,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B4",
+      "rank": 1,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A1",
+      "rank": 2,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A2",
+      "rank": 2,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A3",
+      "rank": 2,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A4",
+      "rank": 2,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B1",
+      "rank": 2,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B2",
+      "rank": 2,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B3",
+      "rank": 2,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B4",
+      "rank": 2,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A1",
+      "rank": 3,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A2",
+      "rank": 3,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A3",
+      "rank": 3,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-A4",
+      "rank": 3,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B1",
+      "rank": 3,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B2",
+      "rank": 3,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B3",
+      "rank": 3,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    },
+    {
+      "process": "layer-formal-B4",
+      "rank": 3,
+      "all_ranks_exact": true,
+      "max_abs": 0
+    }
+  ],
+  "paired_speedups": [
+    1.0518113790106738,
+    1.06208173457189,
+    1.0546259755600158,
+    1.0521848686663866
+  ],
+  "geomean_speedup": 1.0551679228959026,
+  "fractional_elapsed_reduction": 0.052283548143213565,
+  "gain_accepted": true,
+  "shape": {
+    "ep": 4,
+    "tokens": 2048,
+    "hidden": 6144,
+    "intermediate": 2048,
+    "dense_intermediate": 12288,
+    "real": 32,
+    "zero": 16,
+    "top_k": 12
+  },
+  "runtime_source_sha256": {
+    "hyper_parallel/core/expert_parallel/hot_replica/README.md": "0a599da10c3533840f66edbcb427fbd01aa76f6acb28599fc24c5870174dc5dc",
+    "hyper_parallel/core/expert_parallel/hot_replica/__init__.py": "582579c6538ceb0c368f682ec2e4e539b70fe8b537edc6eed5dd7f7013da5bee",
+    "hyper_parallel/core/expert_parallel/hot_replica/_device_kernel/CMakeLists.txt": "fc163f1512bb83ee31eebc14e7e4a89c36886cf051c72ef4855119c116d130c1",
+    "hyper_parallel/core/expert_parallel/hot_replica/_device_kernel/CPPLINT.cfg": "2bf5dee4cc34b92f1db263760fd7372dc75402bc69b847f08636e1f128bb8594",
+    "hyper_parallel/core/expert_parallel/hot_replica/_device_kernel/algorithm.h": "635bea38c6986cdae47eae61c6df2c2334902f5a9220671e07a2cdd53818363f",
+    "hyper_parallel/core/expert_parallel/hot_replica/_device_kernel/count_algorithm.h": "de3f1a33d92e5999d5943ad3161372ca0fe06294deb35b774db846dfaeb2afb2",
+    "hyper_parallel/core/expert_parallel/hot_replica/_device_kernel/count_kernel.cpp": "b51de43a6cdd7a329a88014a299e647f1b36a269bf40c38580f5dcbccd6687c7",
+    "hyper_parallel/core/expert_parallel/hot_replica/_device_kernel/kernel.cpp": "6484e9657321d991b0ef2cd4e4d37f605c8f036cd02a1a90bb2f32065243c4c8",
+    "hyper_parallel/core/expert_parallel/hot_replica/_host_kernel/CMakeLists.txt": "3e9aba4b7d30dd4d4a8971bddea96a013d49d994b37ff38c5af2972a9159cc5e",
+    "hyper_parallel/core/expert_parallel/hot_replica/_host_kernel/dispatch.cpp": "4aeed9936cbeceb7c3a67ec6043d4758fb04c207860a334cb1b620ea71bc4a31",
+    "hyper_parallel/core/expert_parallel/hot_replica/_host_kernel/host.cpp": "9c90b708fda5ef851dde8bd1cc8008690d4594988f36541ad4c2465bc2c3fe82",
+    "hyper_parallel/core/expert_parallel/hot_replica/_host_kernel/locality.cpp": "75909d08ab16146734a97fdb814c45566fb798bd2a52f1141f640dd51a5b2627",
+    "hyper_parallel/core/expert_parallel/hot_replica/_metadata.py": "dace0b5d897fdf88b3e08c2c23c6a22ad9cb119879cc9a1f60c34ff72b18882d",
+    "hyper_parallel/core/expert_parallel/hot_replica/_observer.py": "5fe12a8aafce559c3ea1f1e729b9960d389ca4071bdce044be73147d4a0f3bcf",
+    "hyper_parallel/core/expert_parallel/hot_replica/admission.py": "942b87ca0d6860ebf4c3296a1acac39c6e7f3323d83dd6151eb3e3d41cef55be",
+    "hyper_parallel/core/expert_parallel/hot_replica/autocalibration.py": "43fe40b24c5482eb0f6709d29b42e28f3df5a5f504eea571984a3ff497aeb42f",
+    "hyper_parallel/core/expert_parallel/hot_replica/calibration_audit.py": "9f43ae5c72315a764aff69984ca197d1271b54cb9300d610853baf44097aa488",
+    "hyper_parallel/core/expert_parallel/hot_replica/calibration_catalog.py": "b11a87f6cc7695bade8156156046b06f749a052c95c9125423147b274b4d7a60",
+    "hyper_parallel/core/expert_parallel/hot_replica/calibrations/pull_ep64_h5120_i2304.json": "bb49712017520eb8b200748f64c5f09f13eff897f05a080eec7651b1b4d09c04",
+    "hyper_parallel/core/expert_parallel/hot_replica/calibrations/push_ep64_h5120_i2304.json": "912f005f85c208bb70a539c19a36c811ff199f6c33f37c557100a5561cd32b9b",
+    "hyper_parallel/core/expert_parallel/hot_replica/capacity.py": "4d4241d8a264fb95b11d9f962e9609278ecb5eef7f593452837e4145272573c9",
+    "hyper_parallel/core/expert_parallel/hot_replica/cost.py": "74eaca67db0a8ff30d989828df55cc9df89d7a3941a15a93787ff257ac7aecf8",
+    "hyper_parallel/core/expert_parallel/hot_replica/count_kernel.py": "2e150615b518b53e778db98dfac3875b2f6311d70d21eb3e02bf234de36e25ca",
+    "hyper_parallel/core/expert_parallel/hot_replica/critical_path.py": "1902e5d1d6e665aa9966ea1559359160d7c3d10e805dad3d15d01bb8c45e4212",
+    "hyper_parallel/core/expert_parallel/hot_replica/device.py": "b3ea96a81cb4dc2467895e99d462236f76c87a300c53de7fc8c8e5608e76b6c7",
+    "hyper_parallel/core/expert_parallel/hot_replica/device_kernel.py": "77ad72d1469c0668ef958d5ba66e2fb4e8ae9ac987d92af328c787227f95a6c7",
+    "hyper_parallel/core/expert_parallel/hot_replica/host.py": "fd0eefe53becf72f16b8c09abc00d0592f70dd54d5ce44fae10f43e76aa6a637",
+    "hyper_parallel/core/expert_parallel/hot_replica/native.py": "850a616dd1c128075350a5f5bee087f26778086eb100899941135509ceadecbf",
+    "hyper_parallel/core/expert_parallel/hot_replica/plan.py": "e867872b50141330a156da17c28c9274ec7e74b04d20af6e3423e276d3393691",
+    "hyper_parallel/core/expert_parallel/hot_replica/planner.py": "539183b1aca115ba3cb7eaab9e045f5ea0aec11466930b4152ffb83a98d72edd",
+    "hyper_parallel/core/expert_parallel/hot_replica/policy.py": "f4b7660ffbf11e0ba33a888d4d5ced8e01dd7d2716c6ccee26f4d46a07f6e26d",
+    "hyper_parallel/core/expert_parallel/hot_replica/pool.py": "c462e656cafa130bbd4950b7622bc86931e8565c6c636102935ce5a2a8c0bd58",
+    "hyper_parallel/core/expert_parallel/hot_replica/residency.py": "2cfad0c079295f2771fbcdfbb24e04107d361b41199ce782a3a120bc998bbfcb",
+    "hyper_parallel/core/expert_parallel/hot_replica/routing.py": "5cc29ba6a5a38447b540ed382a19ea121039360b597763bfa7db82ded8dfa64a",
+    "hyper_parallel/core/expert_parallel/hot_replica/signal_transport.py": "a5018f859734b03dab48e7b126e24194218c1447639ce85c6193637763c3d4d2",
+    "hyper_parallel/core/expert_parallel/hot_replica/static_band_reference.py": "ef8155d9d63d5f700dc52d8bb52d6dcaf90aba963862c1ae270b7e9db7aabfe7",
+    "hyper_parallel/core/expert_parallel/hot_replica/topology.py": "3233a44230327deb6a7f3d4c2fda3e52d42359b4cd22634e655364159f38a503",
+    "hyper_parallel/core/expert_parallel/hot_replica/transport.py": "f86f1838056f3e29f76bb9e3ad3860cff2fff09638fda100cc21e48b02e3538a",
+    "hyper_parallel/core/expert_parallel/hot_replica/whole_experts.py": "8ce4afcac6c0f456be3223c0c6690d2339e711f11d1cd990f00167269d0d71f2",
+    "hyper_parallel/core/multicore/CPPLINT.cfg": "62b39ab25def1a7c878b9ce928eb28ac60442fa7ad736b88b2c5103581519439",
+    "hyper_parallel/core/multicore/README.md": "cea83a9de2a12568cc617e0646648fe56a278d61034c8536d69ef59281ba6556",
+    "hyper_parallel/core/multicore/__init__.py": "665a0989e9834ada171d2badbfd7077d72570545963715aca96f373c6e8fb753",
+    "hyper_parallel/core/multicore/_automatic.py": "4c3a7c2c87ccb3e489a9172668c5b3734ac7251cd9979632a71dba92a91bd4e3",
+    "hyper_parallel/core/multicore/_build/__init__.py": "5f9d6a858baf557b1c18b33bc12aac092a8c97fe111b03843a46066435c1528a",
+    "hyper_parallel/core/multicore/_build/assemble_multicore_source.py": "9fb5532e82348b4caa0d13bc9d5a56fbf7b3d9299239219f4471f53d53b869a4",
+    "hyper_parallel/core/multicore/_build/dependencies.lock.json": "541f1b29ec3bc04d0d3fbfe58137cbfe8cb3db8ab066030aae6cf87ce818e663",
+    "hyper_parallel/core/multicore/_build/merge_multicore_vendors.py": "9019da0e236ce8da02979169343007eb3c0972a33bb636f4c937d23029475b03",
+    "hyper_parallel/core/multicore/_build/prepare_dependencies.py": "12658bcfce8b9fa9621a15b6ef2292979fa518a7c7b8bb4686a1c46f5a7ba28e",
+    "hyper_parallel/core/multicore/_build/validate_kernel_metadata.py": "32bbe15dc28d702c42df02f97a2baa38432a2549ae6b55fd0884498c0290aff2",
+    "hyper_parallel/core/multicore/_collective.py": "2465abd82c41a613aef67cfbea3e8bad9863f7bc7600c39e33bfcfa7ba52f8b5",
+    "hyper_parallel/core/multicore/_loader.py": "c6fd65d2fe80f9dbda6dcebf45204c9bd732dd16f83ffba76763ed434d6d95b8",
+    "hyper_parallel/core/multicore/build.sh": "db87547eb6901c9087196555207aaa63ad12ee48f429d19c720b80ab3c112fad",
+    "hyper_parallel/core/multicore/cmake/hardening.cmake": "907ee8edf0618a24577664bc4755a537f8fe27ca58cde2e82a78dd60f8b2b452",
+    "hyper_parallel/core/multicore/cmake/torch_compat.cmake": "975015b2002614f9bfb1b881cc9c78d3f7f8cfb38d8d6acbbd62dd5bc4b786ff",
+    "hyper_parallel/core/multicore/cmake/vendor/CMakeLists.txt": "87e912892ba8d66bb75f68cc964ff3d278da15fd40914de48e59514caa4d1705",
+    "hyper_parallel/core/multicore/cmake/vendor/op_host/CMakeLists.txt": "7167edb697bec86bbc1801a7b6f8df081ebffcc74b953bca026f9daee97d070d",
+    "hyper_parallel/core/multicore/cmake/vendor/op_kernel/CMakeLists.txt": "5c0d9e60d4eda18f48b0d60bca2bef6638fd935fba85ae679ab0de85c79a13e0",
+    "hyper_parallel/core/multicore/diagnostics/__init__.py": "8dcb9ff331079bc117a54f252e168e212699de4ab32939e19aa439e4c42d410d",
+    "hyper_parallel/core/multicore/diagnostics/api.py": "9609d3f3891a2ad8a273b1bae91a23d1d556b2c8ff617420c15664fcdaf6e371",
+    "hyper_parallel/core/multicore/diagnostics/common/__init__.py": "bc2c811bc178ef71b3d930d0a39a8b69b3e6d522e754a92bb7ee6c643b3e25f0",
+    "hyper_parallel/core/multicore/diagnostics/common/call.py": "387e82e7b4f1e0718a39207cc013154ca28bb17717491f2f02c5d07aa4887ba3",
+    "hyper_parallel/core/multicore/diagnostics/common/graph.py": "8e53753fbfafa7fe93ea6729fa9945ff303d0626d06ef0b4a5de55f9fd7a8fb9",
+    "hyper_parallel/core/multicore/diagnostics/common/runtime.py": "9b795d746e26980e005b79807baa2708c527e828dbe7bec8334a9bbf98d57eed",
+    "hyper_parallel/core/multicore/diagnostics/common/schedule.py": "a393ca65a705a3ff2385f0ca9b2e2f2994adaa62db356fd0a5a09af5e4f8ac38",
+    "hyper_parallel/core/multicore/diagnostics/common/session.py": "ab793d89a46d6833b89e469a6c429207219d6fd838ff670c775b9993c1721e84",
+    "hyper_parallel/core/multicore/diagnostics/dump/__init__.py": "f9505ef2392d544fc1f158b9560554fab63edfb5c2f1ad01ad37b4e3e76e1243",
+    "hyper_parallel/core/multicore/diagnostics/dump/api.py": "bb953889945a1cf0f0ff8cb10593cadb73aff97543ca188ad22a9b67e9854632",
+    "hyper_parallel/core/multicore/diagnostics/dump/l0.py": "a2429b0b2de94c3108807ad9214a14d18b22626d8786c3c97e85c0db78eea804",
+    "hyper_parallel/core/multicore/diagnostics/dump/l1.py": "92ef610325d55e3c79d995c7445e1410cf9784fe2d8e6cd96cd4c024aa52325b",
+    "hyper_parallel/core/multicore/diagnostics/dump/layout.py": "7821bf3148e2995455ca1327753fc5dc72611682c74d43fe0eaf0562eabd2f0c",
+    "hyper_parallel/core/multicore/diagnostics/profiler/__init__.py": "055c49002830791b2c9b14ec61a7c51ae7867fc2950be64399663c7f2ab37bcf",
+    "hyper_parallel/core/multicore/diagnostics/profiler/api.py": "bef0a25610436b99c746678d5858598d695428a9376be0ec4c55a86b6318269b",
+    "hyper_parallel/core/multicore/diagnostics/profiler/cycle_trace.py": "0573b8cee37b962622f8cc95b3eefe80e6add16cae96f0418b6ab2a32033f509",
+    "hyper_parallel/core/multicore/diagnostics/profiler/replica.py": "b91354fa29a8d113c1c5362a7fe5afaf75982d2ea4cc676fddd8f89d3a02ffc2",
+    "hyper_parallel/core/multicore/diagnostics/profiler/trace_merger.py": "715d0c6f34623950615236aeae4a44cd64a567894f787871f604a01f9698cc41",
+    "hyper_parallel/core/multicore/docs/adaptive_replicas.md": "2b8f237fc029b82a68653f2653cdf6baba66de9c0d6b17c9cf9407a919269c47",
+    "hyper_parallel/core/multicore/docs/architecture.md": "64e7357378ac0f04b26744f95369d5f9b1cf1fa61ef3b9065e68f0aa9c1f1bf7",
+    "hyper_parallel/core/multicore/docs/build.md": "e906b9909fa8b2a1f99b2d6ffb30ed087f2a5d4792660c4301cdfd93ce389b45",
+    "hyper_parallel/core/multicore/docs/mega_kernel_profiling.md": "a1066b1369f3513ba6321343c5ffd56171f4548402ecf8d63e43fd125f50cf74",
+    "hyper_parallel/core/multicore/docs/replica_autocalibration.md": "739776f5410f9c2fc9e525a26ab1ad6e9c09f32f9d466e1cab7cd5a3c3ae40d8",
+    "hyper_parallel/core/multicore/docs/replica_calibration_audit.md": "920aeb109a944725410c60f3fb97f36607b7269f27d7396fdef4af6ae76de320",
+    "hyper_parallel/core/multicore/docs/replica_critical_path.md": "71b8dfd106c7259c4f03a5997f76275e5e78b9807b637d4057302107e8cd6593",
+    "hyper_parallel/core/multicore/docs/replica_weight_residency.md": "433bf3b5e5a728b03ecfe4515f63fd11caaf2ea3e3538faa4855758b96f780c6",
+    "hyper_parallel/core/multicore/docs/shmem.md": "2ebf124c7f771e0521803b4c6301babb7b352d60ed4aeb4275377807fb005376",
+    "hyper_parallel/core/multicore/examples/README.md": "b9d6a0bdf87052ced00f7f267ae7a3a2c72d66d8e40e80cc909d083bd6aba14b",
+    "hyper_parallel/core/multicore/examples/_training.py": "6c0cfefd0574aa7d78facc479615bfc466f4abad4fa7091cfe4793685991de90",
+    "hyper_parallel/core/multicore/examples/_transformer.py": "edc04083adc42560132bfc313a38ac75ade217915410974763b878a860729a5b",
+    "hyper_parallel/core/multicore/examples/mhc/README.md": "f201a582b949bfc2823e3b3cac50b6f2f5b520b59ac51cbf5d5671312356a108",
+    "hyper_parallel/core/multicore/examples/mhc/benchmark.py": "969153dcd7a84d8d846b046de86c7acb0150b1ec3189a5cae19daa8791243110",
+    "hyper_parallel/core/multicore/examples/mhc/mhc.py": "c90e91ea83039a4bbc0dc33d448114048a26dd64c6306ae3f383b761a23eba51",
+    "hyper_parallel/core/multicore/examples/mhc/model.py": "b9f59e89a1f0807d8cf0bdcdd6aba4d0173610913fff9644191d579f6a424468",
+    "hyper_parallel/core/multicore/examples/moe/README.md": "2cb015955afd9733cb8d48172648827524297cc6ceefe5388c220ce806aea55b",
+    "hyper_parallel/core/multicore/examples/moe/b1_smoke.py": "72e0858dcf35ab5445847830cd47cf414dbf92a4ec91659784bdb8d7999f7778",
+    "hyper_parallel/core/multicore/examples/moe/benchmark.py": "0e5e9458dd933db9db98db734e915e6aecb0656a46a3870a11aa8a6c94f117c7",
+    "hyper_parallel/core/multicore/examples/moe/experts.py": "a7218d02799ae0c50c319d3a488c8305fd3f6da23b2806296409378d25fe3645",
+    "hyper_parallel/core/multicore/examples/moe/gate.py": "eb4b6377cdf17776d5c6b5050fad8067d5cf2ec19fb49dde3ef8832acbd87cb8",
+    "hyper_parallel/core/multicore/examples/moe/model.py": "9bf3ba7ab377f2438809b27deb4b5b1f2d15056576c6677b41e8a0b3b33758e4",
+    "hyper_parallel/core/multicore/examples/moe/run_benchmark.sh": "b0bdd3be3488ba9b516a5cdfd074fcd4fd46eff667c0383fe253f81cf4f6d52b",
+    "hyper_parallel/core/multicore/modules/__init__.py": "5f9d6a858baf557b1c18b33bc12aac092a8c97fe111b03843a46066435c1528a",
+    "hyper_parallel/core/multicore/modules/_precision.py": "2a22c45c7ec7b9461bff3edaa957ab45578cb30ae8c05fadd9a11f8c1a11c970",
+    "hyper_parallel/core/multicore/modules/mega_gate/__init__.py": "f189b2b6c541c0d125f32ee9f6118bf73534fd49c3c570633f6fc8716bd38822",
+    "hyper_parallel/core/multicore/modules/mega_gate/diagnostics.py": "c426ac50bb5d13ad8d848927a17e64f0f86c2bb794bd48c0afa6e9c587754905",
+    "hyper_parallel/core/multicore/modules/mega_gate/function.py": "bde9aeaa8dacafa4d9041058b47d0859f7f3f03a17144d2a586e3b2dc53b0dbf",
+    "hyper_parallel/core/multicore/modules/mega_gate/module.py": "6817c8ca18081f8a85ba85b10f037be4c69f9221342d393b096ff2070e116613",
+    "hyper_parallel/core/multicore/modules/mega_gate/plan.py": "768ad55f99c348a5524f5ad1662c64d52037d09c9aea510afcd591856128d617",
+    "hyper_parallel/core/multicore/modules/mega_mhc/__init__.py": "9a946f55952b45c96fd910f57bdf09b2b983a1f7fbd2bcf642676ab640f9080b",
+    "hyper_parallel/core/multicore/modules/mega_mhc/diagnostics.py": "b27fb97e627d6567684b507030c5cbd5be29f481864d49dc6d262c4817fe8a93",
+    "hyper_parallel/core/multicore/modules/mega_mhc/function.py": "816bb94d888f10d7a6add722f90d4d90abd66b5a973e53b4acaefd51a3c75600",
+    "hyper_parallel/core/multicore/modules/mega_mhc/graph.py": "ada3341eae750031dd173b7b9098bebaa6f75fa86cf4e80ca2d1781ecbd46f9b",
+    "hyper_parallel/core/multicore/modules/mega_mhc/module.py": "fcf28aff49a5cc6bd8af40e7fb1d6b7bda495fb8ccfbc3201d078f5648de4203",
+    "hyper_parallel/core/multicore/modules/mega_mhc/plan.py": "944ac052389192d30a22cda3eee5c0b339486dcca7a9bbdc68337556c57ff6b3",
+    "hyper_parallel/core/multicore/modules/mega_mhc_common.py": "cbd507237339c72c95df4e72d5aaec745dab75e14b76021d80e678ccf83d2d4a",
+    "hyper_parallel/core/multicore/modules/mega_mhc_grad/__init__.py": "6ef7aa6a7033ebb9b2c0b67aa5858049597d0054ef48385a7afb1e4fb92b8d74",
+    "hyper_parallel/core/multicore/modules/mega_mhc_grad/common.py": "b75228d95759c3f452d960e44190bdebdfdc5aa1412bd0691bfd9ac555ea84c3",
+    "hyper_parallel/core/multicore/modules/mega_mhc_grad/diagnostics.py": "258b3f2a4f3ca8cbf4591b71b2c93975a583a263378db8e23a74b1274e962805",
+    "hyper_parallel/core/multicore/modules/mega_mhc_grad/function.py": "67c44f734ccedc530ca4f4fb0bc3bdac122a22dfca1d3e6021e73b7e2111d9f1",
+    "hyper_parallel/core/multicore/modules/mega_mhc_grad/graph.py": "ed94d5b2fae2cdefc4d68d9cb51041d6e1c5ccf26f157ffcb87024edff624e91",
+    "hyper_parallel/core/multicore/modules/mega_mhc_grad/plan.py": "b2a58b8966497f9811d1f6410a9cbbf0f15e41f92145a0c068bbdd67611cfb83",
+    "hyper_parallel/core/multicore/modules/mega_moe/__init__.py": "5f9d6a858baf557b1c18b33bc12aac092a8c97fe111b03843a46066435c1528a",
+    "hyper_parallel/core/multicore/modules/mega_moe/assignments.py": "ea484778ff1f67269c8c928c878558e554900da2c5dc080e6b2f784d645b8a3c",
+    "hyper_parallel/core/multicore/modules/mega_moe/backward/__init__.py": "8233d9caec464aa7e010d4806aefe0feb18de5a0a9f3b10e5a8a13561196ec93",
+    "hyper_parallel/core/multicore/modules/mega_moe/backward/gen_runtime_data.py": "e34586be0c1527a56c5820f17d434d58c70a847dbcb3891c9890c15f9807a30c",
+    "hyper_parallel/core/multicore/modules/mega_moe/backward/graph.py": "b94d52ab0924d5c18212e9055ccf6d5c30f37f7873f73ece814561b9b7203fad",
+    "hyper_parallel/core/multicore/modules/mega_moe/backward/storage.py": "95def9b016c10b1e8fb3d342a56b0ecebf1a92dd362ffc5ed9f785b5ff48cd43",
+    "hyper_parallel/core/multicore/modules/mega_moe/backward/tiling_tables.py": "1c1ef5fda387a42b77635fb44cdbaba3f6df7da1a129357402eef649a9a5e83e",
+    "hyper_parallel/core/multicore/modules/mega_moe/diagnostics.py": "91d1e08409e05b430a8843ca1e428957d1ee637ee689a9582b8f991f8aec829d",
+    "hyper_parallel/core/multicore/modules/mega_moe/empty_dispatch.py": "f4f48664f046918dadf61c72ca4f4e12b53ca9ada34d07dd4703356b72f8d5f6",
+    "hyper_parallel/core/multicore/modules/mega_moe/event_refresh.py": "582a6d2b6abfaafc0d84de35aa37ed4a58d4d243367eb243b8d2b1c769dc0e6c",
+    "hyper_parallel/core/multicore/modules/mega_moe/forward/__init__.py": "8233d9caec464aa7e010d4806aefe0feb18de5a0a9f3b10e5a8a13561196ec93",
+    "hyper_parallel/core/multicore/modules/mega_moe/forward/gen_runtime_data.py": "f16971db637b56fb987f31d7aa6657f1671331191b10053ec51036812e1e178a",
+    "hyper_parallel/core/multicore/modules/mega_moe/forward/graph.py": "40413c91b2e7116850fd0183472d97eb63802f8092f98acbfa1cddd0065ed828",
+    "hyper_parallel/core/multicore/modules/mega_moe/forward/tiling_tables.py": "87f82dd0ab09892825721800f89d11c924d17da1b1525254dc90af630ecd7828",
+    "hyper_parallel/core/multicore/modules/mega_moe/function.py": "7f8b611a61054bb1b7a4dbf1091638221c0ba4f97ae89f57ca0e0cd6e04a1ed9",
+    "hyper_parallel/core/multicore/modules/mega_moe/gradient_queue.py": "2d8551317dbddac5905e591b1342f797f671f1879f73f611a05fc718e476c890",
+    "hyper_parallel/core/multicore/modules/mega_moe/heap_manager.py": "d76c168f8f7fdde202b13173558b0775a99f5637a796c4ca07d4bec7b40a3c84",
+    "hyper_parallel/core/multicore/modules/mega_moe/inactive_tasks.py": "b16c7e9772fa2dbccaaee956729b806ac9c4d00c040dbc212e2d97c34b9aac7d",
+    "hyper_parallel/core/multicore/modules/mega_moe/kernel_gradients.py": "06d2d9f69be64ecacc8efbc97248e5cfc3d2cbae67366d5d70b767e949b219de",
+    "hyper_parallel/core/multicore/modules/mega_moe/module.py": "146994f51ffd4ee8eece5630428639585d8fe4a7629cb678d6c18859bdb3a0cd",
+    "hyper_parallel/core/multicore/modules/mega_moe/plan.py": "051f6f261a12cfe9a09f960664ab2b055e2a47edf4ec22d6dd69197cda148e64",
+    "hyper_parallel/core/multicore/modules/mega_moe/route.py": "bfaabdb3fd8e0105876df92ac6d9b219fc6a9c2fc575f9b1bf8a955860c9a79b",
+    "hyper_parallel/core/multicore/modules/mega_moe/spec.py": "1d237fc96da767b11ab17174309736b6b0fb075e472a6a291e963dd2f89c18a7",
+    "hyper_parallel/core/multicore/modules/mega_moe/tensor_dump.py": "81e814c4d7809796c7a64cd7ce41144782df622e3674bbfdd16fdcf01ee3bd58",
+    "hyper_parallel/core/multicore/modules/mega_moe/workspace.py": "8b82b18a8c7fb31afe521dd3b53ebd17524acf67e233530f4ba4ffdad735931d",
+    "hyper_parallel/core/multicore/modules/module.py": "c1d9fba12431eb69b215c8b48529633f93207474f0e53a2485789ba75d2507ea",
+    "hyper_parallel/core/multicore/ops/grouped_matmul_bands.patch": "7b7ef9d8aa6eee1c33fc55481333115b50d09667563af3690b45a23aa8c7c0db",
+    "hyper_parallel/core/multicore/ops/grouped_matmul_explicit_split.patch": "a44522ea69d3aef3806dfd0880aaf7a1919ea9e8dd051032184b1ed66c1eccb5",
+    "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch": "9311b39fc5b152935662cb665ea1ddb8a353ea6706aa8b3dacfd0d2d3ef72837",
+    "hyper_parallel/core/multicore/ops/grouped_matmul_lane.patch": "7a11398984ece485edada247bb41f92136cb3bafe9693f9c93118b3aa690dc06",
+    "hyper_parallel/core/multicore/ops/grouped_matmul_local_tiling.patch": "bc87b97fa777b35a7fd24f9e746f5e51f9fba64df29bc0295a8a5a7e446c0d9c",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/CMakeLists.txt": "47c20c91876931d7b76685c23819ad1dda167f3c8810cf350cd9e6d2c9c1140b",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_graph/CMakeLists.txt": "e87bc9c7b62793d71e55b3d2fa5bf3ff5ca1ed93535229bf9cb2346c4655b481",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_graph/hyper_mega_gate_route_proto.h": "a998015ddb3c11da91e18ea836b89a7f09a52ac9dc1ce1f34f479df453a68593",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/CMakeLists.txt": "4f0e89049ca383e320836b27e673036addbaf988bbfbc16231ba08cbcc8f9f15",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/config/ascend910_93/hyper_mega_gate_route_binary.json": "1fedbad6293dd5fd32fb01112590ee9525c1978ed176fe09e8efddc40d171379",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/config/ascend910_93/hyper_mega_gate_route_simplified_key.ini": "9bbaacc394ee20c94e02c0dd5f4c2f64a88ea76a08bfd53d33ea50b5e9c29f66",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/config/ascend910b/hyper_mega_gate_route_binary.json": "1fedbad6293dd5fd32fb01112590ee9525c1978ed176fe09e8efddc40d171379",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/config/ascend910b/hyper_mega_gate_route_simplified_key.ini": "9bbaacc394ee20c94e02c0dd5f4c2f64a88ea76a08bfd53d33ea50b5e9c29f66",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/hyper_mega_gate_route_def.cpp": "e8b196e20dbf0e519b938f1968be8b8d93254eb5fd9a95ca1a65b663a65dc55c",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/hyper_mega_gate_route_infershape.cpp": "fed45e9ae2fcf166ea4021408fd9700dec7f1a5155a3e2397feade839215e4fe",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/hyper_mega_gate_route_tiling.cpp": "1e9ff12dcdbb8b1c1ffc27aa648e3d65411e103fbcaad2746e7dd0ab1339595b",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/hyper_mega_gate_route_tiling.h": "7feb38d81f6de8f938c43b25ecea979cdb98357895778d47cdba53736a7f21d3",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/op_api/aclnn_hyper_mega_gate_route.cpp": "e56b47153001a96891c8c4725a16b2109ce79d12d341fec0806ceb23b86fd7ea",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/op_api/aclnn_hyper_mega_gate_route.h": "e7c760a16ff91fe27272ddd1e28fc7ea53359ca3bf530785b8bee8c6762c408e",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/op_api/hyper_mega_gate_route.cpp": "8663a6bf9bc9924de7661878ad56a5c8ee577f9af71d2c76343ec0f8dfadab29",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_host/op_api/hyper_mega_gate_route.h": "e46a3d9d0c2e6c43a652480dfaa079f6742b1a0631e3bbd9d5f54198b2c3ee93",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_kernel/hyper_mega_gate_route.cpp": "dac567d1940f9a3a60a268fe79d7a1c175a7599306956790a86c716f0788e6f5",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate/op_kernel/route_pipeline.h": "ae132073781993cc7a081bb8c83f8ec3e91c712f6b629e9518dcef0c5460dc85",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/CMakeLists.txt": "47c20c91876931d7b76685c23819ad1dda167f3c8810cf350cd9e6d2c9c1140b",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_graph/CMakeLists.txt": "e87bc9c7b62793d71e55b3d2fa5bf3ff5ca1ed93535229bf9cb2346c4655b481",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_graph/hyper_mega_gate_route_grad_proto.h": "43fc06153ff1ab2e05839d789ab04e93418fcc6b2e148eb3ff0bd565e3551c47",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/CMakeLists.txt": "a1bf39deefa5b48fd818524ddcc817b6c5592174085aaac701de0f8ede12a64f",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/config/ascend910_93/hyper_mega_gate_route_grad_binary.json": "26049d568c43afe7dade96d077d5f1597e9d9a97f5a6e713cb06223ff948deab",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/config/ascend910_93/hyper_mega_gate_route_grad_simplified_key.ini": "001677f52bfe6754ab4db6b936ca49e45df7a0726f1267b8eb4a2b05cfa70d12",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/config/ascend910b/hyper_mega_gate_route_grad_binary.json": "26049d568c43afe7dade96d077d5f1597e9d9a97f5a6e713cb06223ff948deab",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/config/ascend910b/hyper_mega_gate_route_grad_simplified_key.ini": "001677f52bfe6754ab4db6b936ca49e45df7a0726f1267b8eb4a2b05cfa70d12",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_def.cpp": "7e2314a3f9f57c51b8f13d40434a63ceb6c507573aa7a7e483550f5efaca1301",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_infershape.cpp": "074fb11f2fa7648a67e4b9bd1faf321fb61bdab739a478d1cadc6fb01acd456a",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_tiling.cpp": "9274dbbd37820f59b1cee96707ba2887c2e09d339085a7ab390209fee6b2673a",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_tiling.h": "ba84db8f929477f42a80260d87e9e409ee06b2963168c117caedb4899914303c",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/aclnn_hyper_mega_gate_route_grad.cpp": "c73a083c0f979ff2932843c899ad2f8bba24176b63cf6a5ff8b733067d9669f7",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/aclnn_hyper_mega_gate_route_grad.h": "a7154ee5bdd7c618068eadd9a130e1a62b34f5c5aea94c87175bec4da8253054",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/hyper_mega_gate_route_grad.cpp": "d7859d1bf1421739b2a428bfc93397d69cd965a1de0a02f50e439149b52a966c",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/hyper_mega_gate_route_grad.h": "838d8a7d663b6515a524eb18e678ba4fec76509d16bebcdd6ddeee2da3b63013",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/hyper_mega_gate_route_grad_post.cpp": "2374fdccfa80b3fa171dd719c9e27741e5c891be17e582fe44e30a7449c045c2",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_host/op_api/hyper_mega_gate_route_grad_post.h": "82c7744203c6abcf264beca695633af0407817ede142e791f1f5ac579e132072",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_kernel/hyper_mega_gate_route_grad.cpp": "632822e53f56ccf073654f6c1d3ff8b552aee9ea83c0e6650b269ba20bf37c35",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_kernel/route_grad_pipeline.h": "95553eeaa11b4293b3d7ae3a84e21cf052fedc3917190a1fa93226ca5e88a597",
+    "hyper_parallel/core/multicore/ops/hyper_mega_gate_grad/op_kernel/route_grad_runtime.h": "ebca52a6f8213e893f071786aae5a06e9fca97998b42d53de7ff7cf621e8bb38",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/hyper_mega_mhc_def.cpp": "596a3acd947cb9c1e49a2fcc01127b44a66b96b18001f79971a86a1835252800",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/hyper_mega_mhc_infershape.cpp": "8f2b7388caf306db4fbdaf89239946b98fb332e49048849a2d5a5928867fe077",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/hyper_mega_mhc_tiling.cpp": "68a925b8c3434029ed1b17801544e68247a9e5be983f6d5e5a545e6a5e1e79b8",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/op_api/aclnn_hyper_mega_mhc.cpp": "bedfe5984c91b56a06edb756c275ead6db37adb53107626735ed78b5fe80e668",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/op_api/aclnn_hyper_mega_mhc.h": "c91b400732c32187f05d87bb4cf8cc27bf7db672108036d8a7bffd5871589ce1",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/op_api/hyper_mega_mhc.cpp": "b680c2852c315f1107df3c8fea392958a5c7336483ebbaacd4282f2ee516ba27",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/op_api/hyper_mega_mhc.h": "9b666ac108a31204db693b52823f79de0deca17f4c186e6cf5c359eab874b634",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_host/op_host/tiling_util.h": "b1de4c1327dd6a86772adf315747cd4531f5fc28f8367da1a406bf2ab3c873ad",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_kernel/hyper_mega_mhc.cpp": "d971cd896baea4f6970804ffa61775a733ace293b12d26f0bbf8047ac23788d5",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_kernel/hyper_mega_mhc_task_tiling.h": "0afdc31d402249b7ff733b43b6209c6a5bf24cf707bc59c6b7b86e4b06e8e5e4",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_kernel/hyper_mega_mhc_tiling_key.h": "440ca726ad1a15973910e32c257d83e254e7d1094c8f234f144c9bf9f58fba9c",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc/op_kernel/worker_kernel.cpp": "92ac75b61c2091c9d8a45abaf9f86e363b7ca5c6fabd136268d09c7cd74e2ce0",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/hyper_mega_mhc_grad_def.cpp": "88ecc457059827e74cfba2bd896926d96292253438943ace1dd4cf1c6d301c3f",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/hyper_mega_mhc_grad_infershape.cpp": "46716a4c8eab3537c405746316161af02f10d05bdbf59aaf74689dc24d430e5f",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/hyper_mega_mhc_grad_tiling.cpp": "22b51cd25206e0868c73aa5316483a9280de8d2f7f594bccc07cb0dce30c3b97",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/op_api/aclnn_hyper_mega_mhc_grad.cpp": "437eff6a35a74ceb9449b6afad6eb332ac0d6cbcb06e8deded82a3166d4224df",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/op_api/aclnn_hyper_mega_mhc_grad.h": "c60d877aacce6c7d56e76917190556a1789d485f76fd3ebc91c273b4d455cf81",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/op_api/hyper_mega_mhc_grad.cpp": "fbe6db8820567a898aa548cfad00eee7b776ec8a0dc7aad50d25b029a5029d49",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_host/op_api/hyper_mega_mhc_grad.h": "ff4914ff7d09f20c0704ca160d733704addea4fb00113e8ed2deb69ad87d3c6c",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_kernel/hyper_mega_mhc_grad.cpp": "453ae2466b531435ee0948129387cdd407065477717918ee54c382fafdfc0a6b",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_kernel/hyper_mega_mhc_grad_task_tiling.h": "00b94c6333a6b538ddca280f4b7a174e324295faf8f2a563bf235eacfc8adc84",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_kernel/hyper_mega_mhc_grad_tiling_key.h": "5fa400a15b114213ac3896d14304db439959df5ee91ffa254d72624619f57dc2",
+    "hyper_parallel/core/multicore/ops/hyper_mega_mhc_grad/op_kernel/worker_kernel.cpp": "de7042b1207c81a02ea63c71e86b0f757804fcbb47a8d31717deb288a9498f66",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/CMakeLists.txt": "360d2b785562e0ef72d34e69159a075f738e8402bb5f599b0aee3991accc9a5d",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_graph/CMakeLists.txt": "531271a714d780a9f6d1a6a5d3480fa4c6be8a6c25f93cd4e5ef3cd487b015d4",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_graph/fusion_pass/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_graph/hyper_mega_moe_proto.h": "764f77da1002c20ed19c877231247017de46bafc62c071661f83963ec4e1a778",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/CMakeLists.txt": "bda4f0cef929af01fe6a0f6e5a882159cba7d614ff421421bd5fbbb2db6f9fca",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/config/ascend910_93/hyper_mega_moe_binary.json": "d7a858b65e27c86e434371f1ffe84712eae7186b80db805b635b55dc707dc6fc",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/config/ascend910_93/hyper_mega_moe_simplified_key.ini": "c74589154a81ba6250710f3fa1f5b9f21fe001a8dc8aa86a153f80fd435c1df7",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/config/ascend910b/hyper_mega_moe_binary.json": "d7a858b65e27c86e434371f1ffe84712eae7186b80db805b635b55dc707dc6fc",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/config/ascend910b/hyper_mega_moe_simplified_key.ini": "c74589154a81ba6250710f3fa1f5b9f21fe001a8dc8aa86a153f80fd435c1df7",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_def.cpp": "25046e03a293088699dffacf7b673697f36661bc051226375080d5e42d5a333f",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_infershape.cpp": "087071b46114b06ae190ef63b7b2f17401d2fb76dc66da142b5d73443808fa5e",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_tiling.cpp": "dd1214fb70bb0ba8c099a448789aaad212ddfda456824393e15bb50b51f45281",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_tiling.h": "9455233f3b9b0519f4659b71d1cc6a46415d2f9c1172791336445ba0e49b8502",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/op_api/aclnn_hyper_mega_moe.cpp": "c7c8fa3f53ebe6388ec6188781e9cea76e29414de9e95f535a5e199930941d56",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/op_api/aclnn_hyper_mega_moe.h": "2cac52e5c3a309d32ad4317866e98b87d60b62ec48942a1330dac735616b1fab",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/op_api/hyper_mega_moe.cpp": "748f5c9142205145ce8d7243f22ebe7c20ff9ebf10dbd54ce598059c1d18d8fc",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/op_api/hyper_mega_moe.h": "d403e82044b73f0af7912876b791826421d34f320ccc5a0a4e3a7cec5798e6cc",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_kernel/hyper_mega_moe.cpp": "97abffe7c6852fcc6e087b3d98e78093eeef70f77c8845a45e726f98010e9573",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_kernel/hyper_mega_moe_tiling_key.h": "2d15a2497bcdda62ec69261cf12b4c5fdf74016f8d112b6728dc182a24c6fcb0",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_kernel/put_mem_signal/put_mem_signal_kernel.cpp": "3c60e19f83ab79c6847e5483cf0213b8bfe306c8fc534031f0c3719aa8f2af65",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp": "3468468eb0df268c577812ef70a8a072ad3df630efe42ff2667e7801a5a45fc8",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/CMakeLists.txt": "3d2416b6048d87c0033460842f3d548f8456892a6ec152ac6e675201d8d1c744",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_graph/CMakeLists.txt": "573d09df76b3f0ea7142ce2ad337235722992bd9b4244c978a9cf645840f8fc3",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_graph/fusion_pass/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_graph/hyper_mega_moe_grad_proto.h": "2edafe44c55a66e6bda8aff192ec346d4ad824ff072363e587ebca8fa9fe9e5c",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/CMakeLists.txt": "12bde9d59f2d03b4bb93c7d0cc492b1b55ee6e2c60b8690175b62bf5c8f9a67c",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/config/ascend910_93/hyper_mega_moe_grad_binary.json": "165ea8d6e5a0fb23df4260f6bdf25374dafaa698a17f913395c92fd93d571bf6",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/config/ascend910_93/hyper_mega_moe_grad_simplified_key.ini": "2d6f8602c94365e0df86012c785becec0ea168e029ce2256b9cafd0170abf5d6",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/config/ascend910b/hyper_mega_moe_grad_binary.json": "165ea8d6e5a0fb23df4260f6bdf25374dafaa698a17f913395c92fd93d571bf6",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/config/ascend910b/hyper_mega_moe_grad_simplified_key.ini": "2d6f8602c94365e0df86012c785becec0ea168e029ce2256b9cafd0170abf5d6",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/hyper_mega_moe_grad_def.cpp": "5b3c83a1bdba84bef57acfd54d801080c682de86ed174ff59bb0c513ddc3d555",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/hyper_mega_moe_grad_infershape.cpp": "69615786fa9da6a0bcefdbdcd26e3caa10b4b7c3a8d530e54b060616394b047b",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/hyper_mega_moe_grad_tiling.cpp": "95525b81dba4b3471b0aef95b4deb605fb786f48f997dd04af325adc9d8f9771",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/hyper_mega_moe_grad_tiling.h": "f5dbe1d1d46c965ee7ed500cba36cdb0bf1dd1a60eca74c5ac58bc6963501a70",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/op_api/aclnn_hyper_mega_moe_grad.cpp": "8030b7d457a58476ee19c6f4a2393cfca4c241735ed9822591e7c6ee9be685eb",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/op_api/aclnn_hyper_mega_moe_grad.h": "d433b279612f318851a3c37335917a33fc935d0de772e7a3cf5f517caa1fc0b9",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/op_api/hyper_mega_moe_grad.cpp": "4ba48a5540fb8fce2179b300b94d927e60a2744dd1b21dff1eace2d80c4860ba",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/op_api/hyper_mega_moe_grad.h": "bd915ef762d9e3bef2f15946c178ce6bf56a97ccdb78d4fb1ca6bc0ff87b5871",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_kernel/hyper_mega_moe_grad.cpp": "5c86429eda8f4df2f13089cbd175e83afb891fa63d31b389f48915dd31ff73fa",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_kernel/hyper_mega_moe_grad_tiling_key.h": "a4d0a60ccd5c338fdf3a9a13d62bc69101d551e97e2ea1006b1c7e8156e774a6",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_kernel/put_mem_signal/put_mem_signal_kernel.cpp": "3c60e19f83ab79c6847e5483cf0213b8bfe306c8fc534031f0c3719aa8f2af65",
+    "hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp": "d91cf7b7bb461368c894f9c351375d0329706783631f0999913b7ee588dd8bf9",
+    "hyper_parallel/core/multicore/ops/mhc_post_and_pre_sinkhorn_worker_primitives.patch": "9d60a12e1b58fe5b8364b310a5938ac9d8f4b10137a0e697ea3018709d2419b5",
+    "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_4_task_primitives.patch": "12434fae310dca30b53bc285a0a54af49e221275c52b9b3437302d2f851c005e",
+    "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_worker_primitives.patch": "20a1ad0d0ff548a12282c4331afb03bbff7aabfd8f391a2b085907b52cf5d260",
+    "hyper_parallel/core/multicore/ops/mhc_tiling_cann_compat.patch": "9cdd9cdaaea272d18e15465af56bb63b5da0f18651f4677d17aadbf9d2902b24",
+    "hyper_parallel/core/multicore/ops/rms_norm_grad_worker_fusion.patch": "b55856bdaa183684576febdcbf2df01cace97932f00d2a336e54cb7d59ee8964",
+    "hyper_parallel/core/multicore/ops/rms_norm_worker_fusion.patch": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f",
+    "hyper_parallel/core/multicore/ops/runtime/aiv_pipeline_worker.h": "6810eb180ba3a8836050983ddfb693702d51555cc4ca32d5c78dfd950b52de15",
+    "hyper_parallel/core/multicore/ops/runtime/cycle_trace_recorder.h": "8842a65ba7254300c5c7656e3b9a759a89e39deef98cf2a22d5e8ca68d212f55",
+    "hyper_parallel/core/multicore/ops/runtime/empty_dispatch.h": "751bc2797c46d354ece0ea9690d973509ea09ef748bdd002946bca9b74bb6ec0",
+    "hyper_parallel/core/multicore/ops/runtime/get_mem.h": "2b1533a4dd9063ce9f0c2fcfafb810c8bc7acb0dba73fd28bb27c503ef000249",
+    "hyper_parallel/core/multicore/ops/runtime/gradient_band.h": "3912895624d52cd8bf708cea85767eac115841ca243cb7da7905ce8c5a475e6f",
+    "hyper_parallel/core/multicore/ops/runtime/gradient_band_observer.h": "0595b1934b90538d752a5a86d9bfd018792a918e624c00b7c8396c09b104adcd",
+    "hyper_parallel/core/multicore/ops/runtime/gradient_order_policy.h": "2f1c85053555136a5f0eb6e7a4ace4c45fe5da79ae63b4a3bc742ffb7300253e",
+    "hyper_parallel/core/multicore/ops/runtime/l1_tensor_dump.h": "2fbf6ad05e1ecf4e9673d84f41533c5f349445cca5dadf96fe6541ebac85ed6b",
+    "hyper_parallel/core/multicore/ops/runtime/replica_gradient.h": "777a0261c0f8ff8d359d230430d749a109e79619a664ee41118513e98c470338",
+    "hyper_parallel/core/multicore/ops/runtime/replica_trace.h": "ce03494ddfd04e47f2b0021eb1cf83d00136d40922b0f8961c79c6ac262322a5",
+    "hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp": "b1ea85543753ff39976b9564b10d6622319aa665a3a69f235e21cccc0b0f5169",
+    "hyper_parallel/core/multicore/ops/runtime/runtime_storage_bounds.h": "eac5d65c2e756b160715ac8d6bb20157fb9a17dc5de7262f96ca155b9f88197e",
+    "hyper_parallel/core/multicore/ops/runtime/runtime_storage_bounds_host.h": "7b0980bf18b601c9a608fddbc279b33647cd318f7edbff235b25442ca7fd1ff9",
+    "hyper_parallel/core/multicore/ops/runtime/worker_kernel.h": "d8f6eb9b7f144f2994b80e03f03a8296ee60526efa0e2447910e0ca7ae8a6446",
+    "hyper_parallel/core/multicore/ops/swi_glu_clamp.patch": "a28d5a60b140ee948542199d3750ccd6d9910fbf81658aa270cb778252b8a18f",
+    "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d",
+    "hyper_parallel/core/multicore/ops/swi_glu_hf_bf16.patch": "3fbf8c4e47a43c1aa0cb65a2a1219a940a4a66add445c1488625cde097cdc0b9",
+    "hyper_parallel/core/multicore/scheduler/__init__.py": "4c3ad9b34e3cb241b77ed90ff6cb4b8b37c7099edcb2bd87d7112a1ba857b423",
+    "hyper_parallel/core/multicore/scheduler/allocator.py": "e5279310f71ce2376b52bd35a5463a4e9c42ebb1e76759a129de24ebb585b809",
+    "hyper_parallel/core/multicore/scheduler/builder.py": "af07c84376fc8129ea61f17b19711ff5ce4d31323db00cba69011d6eeb96e398",
+    "hyper_parallel/core/multicore/scheduler/config.py": "a1f71ff3a482238adddd10c097522981abdef4efa1fb7cee6560d6eea56a3c54",
+    "hyper_parallel/core/multicore/scheduler/graph.py": "218ab2cd4cfef0f88a1fd66ea3e443071a72856c0fd038bfd87f1b8c7a79989b",
+    "hyper_parallel/core/multicore/scheduler/runtime.py": "9b9ba05812eccecf87d97677216e544a52143970e280ef429a055a333578c284",
+    "hyper_parallel/core/multicore/scheduler/scheduler.py": "d5159bb51ceff53732915c0874c4a4fd3ee10e1b1a427e4d3d7a8f41d718e00b",
+    "hyper_parallel/core/multicore/scripts/hyper_parallel_multicore_set_env.bash": "b457ce3f54d769b065afbc75adef4399433a754b2c690d3e57b261b2a40635e2",
+    "hyper_parallel/core/multicore/set_env.bash": "d6cfd24918349e34d5fabf2e8cdee8e03c4cc0f1981d52282fc567e115cef698",
+    "hyper_parallel/core/multicore/shmem/__init__.py": "e72c4819f1894f065d75047c670e9f7b9845eb001ffa7ceee48a60126102671d",
+    "hyper_parallel/core/multicore/shmem/_api.py": "098e27925975e596183fd0d63fdba8980cfa5e4e04e843b0c4f7946eab77dd4e",
+    "hyper_parallel/core/multicore/shmem/_build/patches/cann_kernel_debug.patch": "560836f951a2b05f07f72ecc946517f76cacf0825a1ca74900e99ea36cadb600",
+    "hyper_parallel/core/multicore/shmem/_build/patches/cann_runtime_symbols.patch": "049d3e85e413dbebc6953aaf0940108b66348e2ff3647aeb11349fd8ead2bc98",
+    "hyper_parallel/core/multicore/shmem/_build/patches/cann_shmem_log_api.patch": "3ec6f508509a70add2bb55671acf32cbfa77ef4eb2f75e2a56da2080607c2eb5",
+    "hyper_parallel/core/multicore/shmem/_build/patches/cann_shmem_uid_port_range.patch": "6ae1012b1df5349417b2f47af8a79bb2d61d9cdcc7ab262d19a03c244e010788",
+    "hyper_parallel/core/multicore/shmem/_build/shmem_sdk.sh": "9aaaf8213b51bd5a658b078f167e8185ef3275df3d61c2e4ec465375fd135928",
+    "hyper_parallel/core/multicore/shmem/_debug.py": "7f78fadeb78f60d4019860931d10940e7f8b2a9cef7a796bea2cba550cc6fc1e",
+    "hyper_parallel/core/multicore/shmem/_lifecycle.py": "e338335d43525371c6916d59407948ff9b345b520fe99275abaa9c404ee84a5f",
+    "hyper_parallel/core/multicore/shmem/_runtime.py": "f7cc78b77830f09f90b885b5767e7f4b37e2766d7d8fe113c58893604cb3946e",
+    "hyper_parallel/core/multicore/shmem/build.sh": "bb2bab565f502814920783f74bdb2b40058438f5e69221e3fe1ad1971c65e4dc",
+    "hyper_parallel/core/multicore/shmem/ccsrc/CMakeLists.txt": "7847812661d37da28237650de8f066b5afd6b1c84269e79a947cb9cbff0ac011",
+    "hyper_parallel/core/multicore/shmem/ccsrc/bindings/torch_bindings.cpp": "44dbf5346bbdee358a90fca1409e7edda4abe3609339e85c4562572ffd59df10",
+    "hyper_parallel/core/multicore/shmem/ccsrc/cann/device.h": "37f8b10be70d075ddac88fc59b4410ea4fe76aa2c95846fbba5eb65e48387932",
+    "hyper_parallel/core/multicore/shmem/ccsrc/cann/host.cpp": "7767e537d57f7bed193666ae1864d056fff2834a81033dda4c3f5659e9b7439c",
+    "hyper_parallel/core/multicore/shmem/ccsrc/cann/host.h": "e87a5b20d7cd46cf27698308b76d4b67341c37516de7cd8909b7e1c4ad30377a",
+    "hyper_parallel/core/multicore/shmem/ccsrc/cann/log.cpp": "1cd3f89803fb6e616312829f0a5523df7dea9c10af58d935fceb6ee8c4c0bd04",
+    "hyper_parallel/core/multicore/shmem/ccsrc/cann/log.h": "f83f75cb6de4bfeaad1aaafebdf2c48b671c5e83be39328cbbfd42a518cc38cc",
+    "hyper_parallel/core/multicore/shmem/ccsrc/cann/signal.h": "676cba0bf598bc509edb452ff83b39fdf3ff8266bc8cbcfaea35d3b984bf7d2d",
+    "hyper_parallel/core/multicore/shmem/ccsrc/data_plane/mte_rma.h": "fd0d05b18b3e023f7f72f9d32492753936e3258abd40ff452c520ec113a0712c",
+    "hyper_parallel/core/multicore/shmem/ccsrc/data_plane/rma.h": "34d4224cb571506cb3f18daf34c4be5c50d0230d7805d57c748ff588946a9a1f",
+    "hyper_parallel/core/multicore/shmem/ccsrc/data_plane/sync.h": "9e2ffb9b1d3f5481f6b3ac7527914aa553d1b48e3d00176c64121f875dfdd2a5",
+    "hyper_parallel/core/multicore/shmem/ccsrc/data_plane/transfer_chunking.h": "13ef7355df2db6fcb0144659930e91da741306ebe41c67ec2837fefdb35da1da",
+    "hyper_parallel/core/multicore/shmem/ccsrc/device/device_model.h": "10d58ed6a4a774fc3e74ed0210e7f2c959d592d25409117ffc3119d4e12a7e20",
+    "hyper_parallel/core/multicore/shmem/ccsrc/ops/CMakeLists.txt": "79a68888f077919fdfaa7a9ab8fcd97353b9a6299c34fdeebc598e0a2c4c452c",
+    "hyper_parallel/core/multicore/shmem/ccsrc/ops/all_gather/host/all_gather.cpp": "7382e1cd96522c5623865f77dfab6f59bfc5782e761ac8cdbdb51f2e2da0baaf",
+    "hyper_parallel/core/multicore/shmem/ccsrc/ops/all_gather/kernel/all_gather_kernel.cpp": "ac3e5bc884e46be6e4dba94543eb68803846306fa1da8d626f81ce397f76e91a",
+    "hyper_parallel/core/multicore/shmem/ccsrc/ops/include/shmem_kernel.h": "9df8da724cd51aa5c6c1a5d81cd9be31042e33ecd12feb3b858bf3b9f82e8e0c",
+    "hyper_parallel/core/multicore/shmem/ccsrc/runtime/allocation.cpp": "650c193e4cf7b819401be00868a26506684e9208850648fc12154cfbb5f153cf",
+    "hyper_parallel/core/multicore/shmem/ccsrc/runtime/allocation.h": "fc96e549cb2dcb7df5dc45eb1a4a6858cdd3ae5194fd7a5fdfa541dd392071cc",
+    "hyper_parallel/core/multicore/shmem/ccsrc/runtime/config.cpp": "85bd99d43ad6d4c89d78120a8a836b16c3db9492e4a281f35522ad5208d71d55",
+    "hyper_parallel/core/multicore/shmem/ccsrc/runtime/config.h": "fa0ae573383d6898013626eb06f9a218a4c67c5ae1dc4efafaebd0688c03547a",
+    "hyper_parallel/core/multicore/shmem/ccsrc/runtime/dfx.h": "f3d1e2c2fafeb56daf2b43782781a1786ec6fe9b1915791e193fc3c461bec4be",
+    "hyper_parallel/core/multicore/shmem/ccsrc/runtime/log.cpp": "a6eb40b60be81c8fbdf98cb61d6dc41b6d4e92d66b7e4f18822cabaf8ccaf773",
+    "hyper_parallel/core/multicore/shmem/ccsrc/runtime/log.h": "eeead425204d58b6ada492a18e106ff6a8a13cd7a5398dfdbd7d931ce8179109",
+    "hyper_parallel/core/multicore/shmem/ccsrc/runtime/runtime.cpp": "5f952aaecd5c4f9b12e017a981b17ef594622163102293b1fd22f957d4958b2a",
+    "hyper_parallel/core/multicore/shmem/ccsrc/runtime/runtime.h": "e02ec6c2c2790404921732cc32e98c54d6f27306b95ba5ab4343835379f48689",
+    "hyper_parallel/core/multicore/shmem/ccsrc/runtime/types.h": "3402e96bfd4e8b626e63ae0ed7faaf29a9e7aafcb50fbab9946da4cde458ae12",
+    "hyper_parallel/core/multicore/shmem/cmake/shmem_wrapper/CMakeLists.txt": "f8c86405f9e013eb48a3d8e8b515311d9be1b6c9ce5b102459690af55acf6a5e",
+    "hyper_parallel/core/multicore/tasks/__init__.py": "9a1a4195c0e72f9f1568c315aa282efc500066012f3b9d7c0a640958ed513988",
+    "hyper_parallel/core/multicore/tasks/alltoall.py": "3330d0b67b9d958ead37390f8ed6b317048cfe4f38917ca5b5b62ecd781b862e",
+    "hyper_parallel/core/multicore/tasks/gmm.py": "4216f6a8c3d2472a6e88081f6240062f275dbd4fc8832fe52fe425d87c83f515",
+    "hyper_parallel/core/multicore/tasks/registry.py": "aec8579458392523ce9b6895900a71434696967effb11c4be96ca16bb6766c64",
+    "hyper_parallel/core/multicore/tasks/swiglu.py": "8aae9c2ce09c00a5a9d5324e1971c052e3b603522c24fde8918aa52e86d134de",
+    "hyper_parallel/core/multicore/tasks/task_base.py": "91aa30c5faa325e51da4d490a07e4287f0f9c7cfebd7aa81492ed83832f964c7",
+    "hyper_parallel/core/multicore/tasks/tiling.py": "1c7ddc69cd6a78ecb2da3b351aafb07a16fd3ef05af88703fa92645e84f125f2",
+    "hyper_parallel/core/multicore/tasks/utils.py": "44a51a0be103b53f54e8d15d5ac060e1de558f1ad611c39b03eb86852041faa2",
+    "hyper_parallel/core/multicore/torch/CMakeLists.txt": "0641fea586188fe99e4b844717e8326ae67cab57edb56af9bb2961fd630dbf14",
+    "hyper_parallel/core/multicore/torch/__init__.py": "5f9d6a858baf557b1c18b33bc12aac092a8c97fe111b03843a46066435c1528a",
+    "hyper_parallel/core/multicore/torch/csrc/cached_op_api.h": "ddab498c63ac5da61c85f2d69820953b4c936a3b34a7eb753a1ebd262e36f5a8",
+    "hyper_parallel/core/multicore/torch/csrc/legacy_op_api.h": "4d2dbce00395b5263d0739266ccb6a964faadefb17c73cb2f5bfa3cde53ed715",
+    "hyper_parallel/core/multicore/torch/csrc/mega_gate.cpp": "667ce5cb274cc2280164a6a2ff191a9a661ad6328cf7ca5a6df7fdbd7c5a7929",
+    "hyper_parallel/core/multicore/torch/csrc/mega_gate_registration.cpp": "79d0606b9bb9ede929d313c64d3fcbe38323d9739639fbc07908dfd54aa9e3e8",
+    "hyper_parallel/core/multicore/torch/csrc/mega_mhc.cpp": "00324f910a9c4a7b0381debce2f11c86dfcc4aa2c1102958bd49c03303db5b9c",
+    "hyper_parallel/core/multicore/torch/csrc/mega_moe.cpp": "d47093d3b4a71d30fe3df4dc972572600dd243f9e6655bbc19b6ac500689cee6",
+    "hyper_parallel/core/multicore/torch/csrc/mega_moe_grad.cpp": "b6605228b91c6d06104f1e40c8b5b9a05d604ee33061a1056d3d436f1892876a",
+    "hyper_parallel/core/multicore/torch/csrc/mega_moe_unpermute.cpp": "13814228f5e37f0428eeb2158879117b28a2d0ba40012e4721f55b7d4ad2ea49",
+    "hyper_parallel/core/multicore/torch/csrc/moe_token_permute_grad.cpp": "7e95b22fdd0d2f5dbac70f3a0b3ccf87fa222a8914d08610ba24125366d9b196",
+    "hyper_parallel/core/multicore/torch/csrc/moe_token_permute_out.cpp": "6c793cd97d41948f13725ab4fa84149ccb61922f43b76f7284e5465dd9a3a94a",
+    "hyper_parallel/core/multicore/torch/csrc/registration.cpp": "e0c8af46421d15e97fd3a3a877a5d32b45d54a7273fd68f19c746f86809afd45",
+    "hyper_parallel/core/multicore/torch/csrc/registration_mhc.cpp": "8334f7df619c5c90a01dc157e7db177f1d5c8021ecabc455fb8c4e0b6c39b466",
+    "hyper_parallel/core/multicore/torch/mega_gate_ops.py": "91654b6c78834d68cf2b8c5b5d5fbfba2b25bc0eb7081c629bb3d86e92aaf2a0",
+    "hyper_parallel/core/multicore/torch/ops.py": "69a9c65fe59fcf666cc27556d7984b7a2f58a5e3d9d0ad394273f99211c7a3b0",
+    "hyper_parallel/models/longcat_flash/README.md": "5f2f6ca4111b239e734471b1bceb6d404d7e696bc3e887642a9cd3757c4d6323",
+    "hyper_parallel/models/longcat_flash/__init__.py": "198bdd4ad73a5a9e9c6c35c8080e0155fd5a518ff38a757fc23fb494108df038",
+    "hyper_parallel/models/longcat_flash/adapter/__init__.py": "1e8e44b34ea747cbfa4d357b7e9551ad6b82eb00482879b11025c05be7fb9d47",
+    "hyper_parallel/models/longcat_flash/adapter/attention.py": "2f7fdf2277d599b405653407054de48d48d3088c0c5d07ae9897a015fd52c0ef",
+    "hyper_parallel/models/longcat_flash/adapter/experts.py": "60f09a895ff7334ff44add3e37567ec40c85fbbbb0b046d6b6b6205b2af4d009",
+    "hyper_parallel/models/longcat_flash/adapter/fused_routing.py": "c41e51ee891b07c7e3f0748d5ab16570bee365e7d1809f14f8ff3eec7491e766",
+    "hyper_parallel/models/longcat_flash/adapter/layout.py": "0008280725b9e3beadc432dc4a87e8f407f0e7a618c34ad793f372a3f3f1c52a",
+    "hyper_parallel/models/longcat_flash/adapter/materialization.py": "03ac95502c70c6faa7e3e76bd290aa1845cff854837ef3c0a97893f71b53a4aa",
+    "hyper_parallel/models/longcat_flash/adapter/mlp.py": "607afa9879547d8c3c60a1050e205ab4a8ec56d9b243cdd11ba17cd4b015a207",
+    "hyper_parallel/models/longcat_flash/adapter/native.py": "2dac2a3b8f2bed8ab9964e4b7e4fa606e35ec0e7a0f95cad61610cd9a6b9d808",
+    "hyper_parallel/models/longcat_flash/adapter/npu.py": "0cbd1ac2228579f1de7db0e826564de9960933b86e6f51f18073de6033e16cbe",
+    "hyper_parallel/models/longcat_flash/adapter/parallel.py": "c4e0722698ca4f5e7f60087351db2d405fdf3618b3678068d16f928e660d4300",
+    "hyper_parallel/models/longcat_flash/adapter/parameter_grad.py": "488809433497058b06f2c8dfa128ac430a4bd596e938d8fadf583e68c4421fc0",
+    "hyper_parallel/models/longcat_flash/adapter/registration.py": "a2b095abbdf153f516b1d8ba43c089a2cdbce2a37fbdeb3d348ee4c161e5faff",
+    "hyper_parallel/models/longcat_flash/adapter/route_kernels.py": "fd2518aef514d47332650c640e3afc5124158075f378942a4684071ef48f3101",
+    "hyper_parallel/models/longcat_flash/adapter/routing.py": "581b4e42e8caa74d585fe07caee5e20e8cca6bc9a2c9d13315cf6e5fe1977bb2",
+    "hyper_parallel/models/longcat_flash/adapter/validation.py": "006f76bf2b1fb617b617a5cab3fd3af6e512a3678f7728df5570f1907a6f9392",
+    "hyper_parallel/models/longcat_flash/modeling_longcat_flash.py": "c91ee8c000210d1e1e2ce23fd32226014e50e9d584295d142d37562736cedcb5",
+    "hyper_parallel/models/longcat_flash/recipes/train.yaml": "f524c2ed6b63198654799193c8d89786ddcd8fd194d24aa29280c40cd43cf4b9",
+    "hyper_parallel/models/longcat_flash/recipes/train_native.yaml": "2a81fd3f5decfdd4a04567203164c75fab7c329399f4f4280fc7fd167e0abe46",
+    "hyper_parallel/models/longcat_flash/recipes/train_one_layer.yaml": "0302dfc947a36c6988026cafa10387cf88e929ac644400258157eba19a18268f",
+    "hyper_parallel/models/longcat_flash/validation.yaml": "a9e51c0ab5e252ec970bc75de73fe114052e2f7fcf7b62b82e750be4ac74bda2"
+  },
+  "native_sha256": {
+    "hyper_parallel/core/multicore/lib/framework/torch/libhyper_parallel_mega_moe_torch.so": "af92f8d6c5187a704f1ecce98d01840a61ce246c4c1d5e5b138d3e8969a7efdb",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_proto/lib/linux/aarch64/libcust_opsproto_rt2.0.so": "7958508ff6fbd0e264e5155abb8673fb06acf8250338a299267292fdf86be6fe",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/op_tiling/liboptiling.so": "d3c003f813b46e7b3d853da830fa7937bda204522948fa362c334c5f32129328",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so": "d3c003f813b46e7b3d853da830fa7937bda204522948fa362c334c5f32129328",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_api/lib/libcust_opapi.so": "af85564951aa9383a0967080519eb50e0d4ad14e62c71383bc5cb44ae3d0690b",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe/HyperMegaMoe_e6c0ec2992b0e7c6cc20aea213fa5428.o": "d6ae0954f3c70561a37a0a1edcc04c2c806b5eafb33ad6fca7cef884f94bc95e",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe/HyperMegaMoe_8fa11c3f49d35b114d045c751d29ca02.o": "83e8878fca995178849dde08aa24dbdece2177e1fce5a818da1b47413184255d",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_gate_route/HyperMegaGateRoute_51b3ed5fb437e5de2c66aff4a6043505.o": "3b2b734e35458b02b22ba4e5b8ecd59ddf84adf49510d6cf4f457c3eb0d22a09",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_mhc_grad/HyperMegaMhcGrad_bf9c317a8a7bc83c9f4bed060af1a9cc.o": "b5aa27030272454151a55a0775768b84bed931b87956f7bed7cf10fc7707df9d",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_mhc/HyperMegaMhc_433fc592441f7ac1b484cebbff756b75.o": "f4b85d01b17706d7df4742d040e9c9a39d6631d331a1787db3fdf6be1efb9fc9",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_gate_route_grad/HyperMegaGateRouteGrad_303d12d6648a9fd322199a0a8d3ab5c0.o": "1af2ee64cfb7c7d501cfe100144ddb04c250be4af86d3f00713332b3ddd5ca1e",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe_grad/HyperMegaMoeGrad_a3e209fcfebb8705529dbb31c9eba29b.o": "078f546248b751713165da8de4530a652249f3d2739da7de6459fee930e2d067",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe_grad/HyperMegaMoeGrad_4a749b390f901cd7613a0b8a93a36252.o": "e0789406ba5191a0d635f9871ec150e06c3065b5958835b4b1d233c5acebb0df",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe_grad/HyperMegaMoeGrad_33fe31e677f6832eb668ca0702fc8322.o": "d1f76841217c2b9b8a5383613fbfd1e133f700c6fdc3f8c88f393fb0dab4cb1c",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe_grad/HyperMegaMoeGrad_9ae186170dd467d23b745fc44c511eee.o": "b7def7ebdd65a3a3f486b596b3a64475f868b3d13aeda37fb73fe57ab18c6644",
+    "hyper_parallel/core/multicore/shmem/lib/libhyper_parallel_shmem_ops.so": "4b4c89c49d129b3c75a31f6d372d7646da515f4baa1d349b0101c92c7720efee",
+    "hyper_parallel/core/multicore/shmem/lib/shmem/libhyper_parallel_shmem_utils.so": "cd2dba5814ce875094763582e8f4d2980a6a427fb0ce5f611292e67db1b3eba3",
+    "hyper_parallel/core/multicore/shmem/lib/shmem/aclshmem_bootstrap_config_store.so": "45b0562fa3cc4b4ab87e8dc80c48c733ad49883082396e4f5f943d37ecd648d9",
+    "hyper_parallel/core/multicore/shmem/lib/shmem/aclshmem_bootstrap_uid.so": "ddf03f1a386c099c9724135bf2de7ef6950e5ccf59086e1363f060cb7684c758",
+    "hyper_parallel/core/multicore/shmem/lib/shmem/libhyper_parallel_shmem.so": "0a524be75efd51e9429765fd5aaae1f53ca40d6a479573228e876c50f7e3a5c7",
+    "hyper_parallel/core/multicore/shmem/lib/framework/torch/hyper_parallel_shmem_torch.so": "58821583f82c824d8307c0ceece3be4d5e7f41b01af7fdec77733e835d31aa60"
+  },
+  "worker_sha256": "79ef1397cdbdafa9fec7a91a168b84a983e09cb46b6d911d58602290d06b9f9e",
+  "terminal": {
+    "run_id": "20261106-194624-35d85f",
+    "exit_code": 0,
+    "remaining_owned_pids": [],
+    "result_sha256": "0bcd54825be35cc84b0f12c91281e21f5c5ee2c2e2309823abdb3dd3fe498d95"
+  },
+  "profile_diagnostic": {
+    "source_note": "Profiles from the earlier prefix-only source, before the six expert commits; do not attribute them to the latest measured source",
+    "earlier_source": "35f96f98c",
+    "reports": [
+      {
+        "variant": "shortcut-layer-deterministic",
+        "mode": "serial",
+        "rank": 0,
+        "moe_streams": [
+          "47"
+        ],
+        "dense_streams": [],
+        "accelerator_types": [
+          "AI_CORE",
+          "AI_CPU",
+          "AI_VECTOR_CORE",
+          "COMMUNICATION",
+          "MIX_AIC",
+          "MIX_AIV"
+        ],
+        "dense_matmul_union_us": 0,
+        "moe_route_vector_union_us": 0,
+        "route_vector_dense_overlap_us": 0,
+        "communication_dense_overlap_us": 0,
+        "selected_kernels": []
+      },
+      {
+        "variant": "shortcut-layer-deterministic",
+        "mode": "serial",
+        "rank": 1,
+        "moe_streams": [
+          "47"
+        ],
+        "dense_streams": [],
+        "accelerator_types": [
+          "AI_CORE",
+          "AI_CPU",
+          "AI_VECTOR_CORE",
+          "COMMUNICATION",
+          "MIX_AIC",
+          "MIX_AIV"
+        ],
+        "dense_matmul_union_us": 0,
+        "moe_route_vector_union_us": 0,
+        "route_vector_dense_overlap_us": 0,
+        "communication_dense_overlap_us": 0,
+        "selected_kernels": []
+      },
+      {
+        "variant": "shortcut-layer-deterministic",
+        "mode": "serial",
+        "rank": 2,
+        "moe_streams": [
+          "47"
+        ],
+        "dense_streams": [],
+        "accelerator_types": [
+          "AI_CORE",
+          "AI_CPU",
+          "AI_VECTOR_CORE",
+          "COMMUNICATION",
+          "MIX_AIC",
+          "MIX_AIV"
+        ],
+        "dense_matmul_union_us": 0,
+        "moe_route_vector_union_us": 0,
+        "route_vector_dense_overlap_us": 0,
+        "communication_dense_overlap_us": 0,
+        "selected_kernels": []
+      },
+      {
+        "variant": "shortcut-layer-deterministic",
+        "mode": "serial",
+        "rank": 3,
+        "moe_streams": [
+          "47"
+        ],
+        "dense_streams": [],
+        "accelerator_types": [
+          "AI_CORE",
+          "AI_CPU",
+          "AI_VECTOR_CORE",
+          "COMMUNICATION",
+          "MIX_AIC",
+          "MIX_AIV"
+        ],
+        "dense_matmul_union_us": 0,
+        "moe_route_vector_union_us": 0,
+        "route_vector_dense_overlap_us": 0,
+        "communication_dense_overlap_us": 0,
+        "selected_kernels": []
+      },
+      {
+        "variant": "shortcut-layer-deterministic",
+        "mode": "ordered",
+        "rank": 0,
+        "moe_streams": [
+          "44"
+        ],
+        "dense_streams": [
+          "47"
+        ],
+        "accelerator_types": [
+          "AI_CORE",
+          "AI_CPU",
+          "AI_VECTOR_CORE",
+          "COMMUNICATION",
+          "MIX_AIC",
+          "MIX_AIV"
+        ],
+        "dense_matmul_union_us": 44995.0,
+        "moe_route_vector_union_us": 4899.25,
+        "route_vector_dense_overlap_us": 3110.75,
+        "communication_dense_overlap_us": 1010.0,
+        "selected_kernels": [
+          {
+            "name": "_combine_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1799.396
+          },
+          {
+            "name": "_identity_prefix_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 713.235
+          },
+          {
+            "name": "_expert_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1251.385
+          },
+          {
+            "name": "_input_prefix_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1134.923
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 223.764
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 270.545
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 137.543
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 728.635
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1145.722
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1061.241
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1007.12
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 3550.091
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1079.122
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 122.163
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 721.034
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1001.48
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1016.22
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1005.38
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1535.971
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 3299.926
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1776.256
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 10756.055
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1060.101
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1175.724
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 674.533
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 777.676
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 135.483
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 223.604
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 254.165
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 286.766
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 212.964
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 228.185
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1047.0
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1163.464
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1042.061
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1178.883
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1063.242
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1189.163
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 682.574
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 810.596
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 150.062
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 228.125
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 254.246
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 290.165
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 209.724
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 218.224
+          }
+        ]
+      },
+      {
+        "variant": "shortcut-layer-deterministic",
+        "mode": "ordered",
+        "rank": 1,
+        "moe_streams": [
+          "44"
+        ],
+        "dense_streams": [
+          "47"
+        ],
+        "accelerator_types": [
+          "AI_CORE",
+          "AI_CPU",
+          "AI_VECTOR_CORE",
+          "COMMUNICATION",
+          "MIX_AIC",
+          "MIX_AIV"
+        ],
+        "dense_matmul_union_us": 46328.25,
+        "moe_route_vector_union_us": 4885.75,
+        "route_vector_dense_overlap_us": 3097.0,
+        "communication_dense_overlap_us": 1061.75,
+        "selected_kernels": [
+          {
+            "name": "_combine_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1788.835
+          },
+          {
+            "name": "_identity_prefix_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 696.694
+          },
+          {
+            "name": "_expert_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1252.505
+          },
+          {
+            "name": "_input_prefix_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1147.822
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 223.944
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 270.906
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 134.742
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 761.535
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1134.722
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1084.241
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1009.36
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 4655.913
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 827.637
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 122.242
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 751.775
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 997.2
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1013.761
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1010.38
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1522.531
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 3354.287
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1796.816
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 10926.399
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1097.322
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1188.884
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 671.554
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 786.976
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 150.103
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 228.125
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 253.346
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 288.445
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 220.104
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 220.905
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1061.941
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1182.363
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1069.842
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1194.984
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1056.841
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1192.744
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 675.334
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 827.936
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 160.523
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 222.465
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 259.406
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 280.085
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 207.144
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 232.525
+          }
+        ]
+      },
+      {
+        "variant": "shortcut-layer-deterministic",
+        "mode": "ordered",
+        "rank": 2,
+        "moe_streams": [
+          "44"
+        ],
+        "dense_streams": [
+          "47"
+        ],
+        "accelerator_types": [
+          "AI_CORE",
+          "AI_CPU",
+          "AI_VECTOR_CORE",
+          "COMMUNICATION",
+          "MIX_AIC",
+          "MIX_AIV"
+        ],
+        "dense_matmul_union_us": 45762.75,
+        "moe_route_vector_union_us": 4748.75,
+        "route_vector_dense_overlap_us": 2909.5,
+        "communication_dense_overlap_us": 1217.25,
+        "selected_kernels": [
+          {
+            "name": "_combine_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1839.297
+          },
+          {
+            "name": "_identity_prefix_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 706.894
+          },
+          {
+            "name": "_expert_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1076.881
+          },
+          {
+            "name": "_input_prefix_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1125.602
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 224.664
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 265.825
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 137.683
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 733.375
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1134.303
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1074.522
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1008.801
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 4540.311
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 919.198
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 125.922
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 718.895
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 997.24
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1003.96
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1004.62
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1249.445
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 3065.022
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1782.676
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 11173.743
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1028.12
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1185.504
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 675.354
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 782.215
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 140.723
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 224.825
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 255.865
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 286.426
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 212.324
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 226.005
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1042.201
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1188.904
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1054.341
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1182.204
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1059.221
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1203.304
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 685.054
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 811.716
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 155.183
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 222.584
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 257.186
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 289.286
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 212.584
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 222.345
+          }
+        ]
+      },
+      {
+        "variant": "shortcut-layer-deterministic",
+        "mode": "ordered",
+        "rank": 3,
+        "moe_streams": [
+          "44"
+        ],
+        "dense_streams": [
+          "47"
+        ],
+        "accelerator_types": [
+          "AI_CORE",
+          "AI_CPU",
+          "AI_VECTOR_CORE",
+          "COMMUNICATION",
+          "MIX_AIC",
+          "MIX_AIV"
+        ],
+        "dense_matmul_union_us": 43702.5,
+        "moe_route_vector_union_us": 4992.0,
+        "route_vector_dense_overlap_us": 3144.5,
+        "communication_dense_overlap_us": 1006.0,
+        "selected_kernels": [
+          {
+            "name": "_combine_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1847.517
+          },
+          {
+            "name": "_identity_prefix_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 695.914
+          },
+          {
+            "name": "_expert_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1284.605
+          },
+          {
+            "name": "_input_prefix_gradient_kernel",
+            "stream": "44",
+            "core": "AI_VECTOR_CORE",
+            "duration_us": 1163.964
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 222.724
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 259.245
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 137.362
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 734.795
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1140.583
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1072.241
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1005.96
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 2009.86
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1188.743
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 125.443
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 721.915
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 997.82
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1008.06
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1008.16
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1584.972
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 3345.206
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1848.777
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 10640.453
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1058.721
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1187.483
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 671.293
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 787.656
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 140.503
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 222.425
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 254.045
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 287.226
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 215.204
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 226.224
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1054.721
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1165.344
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1049.302
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1199.804
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1070.881
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 1188.904
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 685.174
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 836.676
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 135.183
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 224.144
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 253.346
+          },
+          {
+            "name": "aclnnMatmul_MatMulCommon_MatMulV2",
+            "stream": "47",
+            "core": "AI_CORE",
+            "duration_us": 291.245
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 219.925
+          },
+          {
+            "name": "aclnnMatmul_MatMulV3Common_MatMulV3",
+            "stream": "47",
+            "core": "MIX_AIC",
+            "duration_us": 224.465
+          }
+        ]
+      }
+    ]
+  },
+  "source_parent": "35f96f98c283ddc939aa74b7376d0f70766ce6d0",
+  "expert_branch_integrated": "de127408c6ac3d053d12ca222b7e7669203515b3"
+}

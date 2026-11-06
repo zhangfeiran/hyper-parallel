@@ -77,8 +77,10 @@ class TestMegaMoeExperts(unittest.TestCase):
                         callback = options.get("_select_replica_route")
                         replica = None
                         if callback is not None:
-                            _, replica = callback(torch.zeros(2, 4), [[0] * 6 + [1], [0] * 6 + [2]], None)
-                        return SimpleNamespace(metadata=SimpleNamespace(replica_route=replica, plan_tokens=128),
+                            # A hot owner can pass the optional admission bound, exercising the planner callback.
+                            _, replica = callback(torch.zeros(2, 4), [[0] * 7, [0] * 6 + [2]], None)
+                        return SimpleNamespace(metadata=SimpleNamespace(
+                            replica_route=replica, plan_tokens=128, empty_owner_experts=None),
                                                unpermute_mapping=None, maximum_received_slots=128)
 
                     # Recording mocks would retain input tensors and hide the actual lifetime contract.
@@ -205,7 +207,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                                         plan_for_tokens=Mock(side_effect=lambda _tokens, _device, **kw:
                                                              plans[kw.get('home_only', False)]))
             route = SimpleNamespace(unpermute_mapping=object(), maximum_received_slots=256,
-                                    metadata=SimpleNamespace(plan_tokens=128))
+                                    metadata=SimpleNamespace(plan_tokens=128, empty_owner_experts=None))
             try:
                 with (self.subTest(mode=mode),
                       patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
@@ -727,7 +729,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                                     plan=object(), workspace=object(), ensure_capacity=Mock(),
                                     plan_for_tokens=Mock())
         route = SimpleNamespace(
-            routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
+            routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128, empty_owner_experts=None),
             unpermute_mapping=object(), maximum_received_slots=512
         )
         resources.plan_for_tokens.return_value = resources.plan
@@ -813,7 +815,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                                             workspace=Mock(capacity_floor=512), ensure_capacity=Mock())
                 resources.plan_for_tokens = Mock(return_value=resources.plan)
                 replica = SimpleNamespace(physical_ids=ids, counts_by_source=torch.zeros(2, 6), home_only=False)
-                route = SimpleNamespace(routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
+                route = SimpleNamespace(routed_tokens=object(),
+                                        metadata=SimpleNamespace(plan_tokens=128, empty_owner_experts=None),
                                         unpermute_mapping=object(),
                                         maximum_received_slots=256)
                 try:
@@ -858,7 +861,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 resources.plan_for_tokens = Mock(side_effect=lambda _tokens, _device, *, home_only=False,
                                                    owner=resources: owner.home_plan if home_only else owner.plan)
                 route = SimpleNamespace(unpermute_mapping=object(), maximum_received_slots=256,
-                                        metadata=SimpleNamespace(plan_tokens=128))
+                                        metadata=SimpleNamespace(plan_tokens=128, empty_owner_experts=None))
                 try:
                     with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
                           patch.object(torch.npu, "is_current_stream_capturing", return_value=False),

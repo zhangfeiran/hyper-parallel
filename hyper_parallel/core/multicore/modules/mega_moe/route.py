@@ -76,6 +76,7 @@ class RouteMetadata:
     plan_tokens: int | None = None
     replica_route: ReplicaRoute | None = None
     schedule: RouteSchedule | None = None
+    empty_owner_experts: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -560,6 +561,22 @@ def _summarize_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec,
     return max(1, rows[spec.rank_id][6]), plan_tokens, maximum
 
 
+def _owner_empty_experts(spec: MegaMoeSpec, agreement: list[list[int]] | None,
+                         host_rows: list[list[int]] | None) -> tuple[int, ...] | None:
+    """Elide full initialization only when every owner gradient is overwritten."""
+    if not spec._selective_owner_gradient_init or spec.replica_slots_per_rank:
+        return None
+    if agreement is not None and any(row[4] > 0 for row in agreement):
+        # One source covers every logical expert, so every group has positive K.
+        return ()
+    if host_rows is None:
+        return None
+    first = 3 + spec.rank_id * spec.local_experts
+    if all(any(row[first + expert] for row in host_rows) for expert in range(spec.local_experts)):
+        return ()
+    return None
+
+
 def _read_dynamic_route(
     payload: torch.Tensor,
     spec: MegaMoeSpec,
@@ -601,15 +618,21 @@ def _read_cached_route(
     payload: torch.Tensor, spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None, device: Any,
 ) -> tuple[tuple[int, int, int], list[list[int]] | None, RouteMetadata | None]:
     """Reuse only an identical, previously validated all-rank wire table."""
+    if workspace is not None:
+        workspace.empty_owner_experts = None
     if workspace is None or not spec.auto_tokens or spec.ep_size * spec.num_experts > _HOST_ROUTE_MAX_COUNTS:
-        summary, raw, _ = _read_dynamic_route(payload, spec)
+        summary, raw, agreement = _read_dynamic_route(payload, spec)
+        if workspace is not None:
+            workspace.empty_owner_experts = _owner_empty_experts(spec, agreement, raw)
         return summary, raw, None
     cached = getattr(workspace, "route_cache", None)
     same_topology = isinstance(cached, _HostRouteCache) and cached.signature == _route_cache_signature(spec, device)
     remaining = getattr(workspace, "route_cache_probe_after", 0)
     if same_topology and remaining > 0:
         workspace.route_cache_probe_after = remaining - 1
-        return _dynamic_summary(payload, spec), None, None
+        agreement = _device_route_rows(payload, spec)
+        workspace.empty_owner_experts = _owner_empty_experts(spec, agreement, None)
+        return _summarize_dynamic_rows(agreement, spec), None, None
     workspace.route_cache_probe_after = 0
     raw = payload.tolist()
     if same_topology and cached.raw == raw:
@@ -803,7 +826,11 @@ def _prepare_ordinary_dynamic_route(
         routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum,
-        metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens),
+        metadata=replace(
+            metadata, local_num_tokens=tokens, plan_tokens=plan_tokens,
+            empty_owner_experts=(_owner_empty_experts(spec, None, host_rows) if host_rows is not None
+                                 else getattr(workspace, "empty_owner_experts", None)),
+        ),
     )
 
 
@@ -835,6 +862,7 @@ def _finish_replica_dynamic_route(hidden_states: torch.Tensor, counts: torch.Ten
                                   summary: tuple | None, host_rows: list | None, source_summary: list | None,
                                   replica_route: ReplicaRoute | None) -> PreparedTopKRoute:
     """Pack the selected replica route after permutation and count exchange complete."""
+    agreement = source_summary
     if (source_summary is not None and replica_route._host_counts is not None
             and spec.ep_size * spec.num_experts <= _HOST_ROUTE_MAX_COUNTS):
         # The CPU planner already owns these counts. Match the ordinary small-route
@@ -843,7 +871,7 @@ def _finish_replica_dynamic_route(hidden_states: torch.Tensor, counts: torch.Ten
                      for header, counts in zip(source_summary, replica_route._host_counts)]
     if summary is None:
         if source_summary is None:
-            summary, host_rows, _ = _read_dynamic_route(gathered, spec)
+            summary, host_rows, agreement = _read_dynamic_route(gathered, spec)
         else:
             summary = _summarize_dynamic_rows(source_summary, spec)
     capacity, plan_tokens, maximum = summary
@@ -862,6 +890,7 @@ def _finish_replica_dynamic_route(hidden_states: torch.Tensor, counts: torch.Ten
         metadata=replace(
             metadata, local_num_tokens=hidden_states.shape[0], plan_tokens=plan_tokens,
             replica_route=None if replica_route is not None and replica_route.home_only else replica_route,
+            empty_owner_experts=_owner_empty_experts(spec, agreement, host_rows),
         ),
     )
 

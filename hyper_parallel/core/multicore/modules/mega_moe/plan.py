@@ -39,6 +39,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
     can_reuse_backward_dispatch,
     join_w1_phase_once,
     prepare_w13_overlap_schedule,
+    prioritize_activation_gradient,
     replica_w2_ready_events,
     replica_w13_ready_events,
 )
@@ -65,6 +66,7 @@ from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 
 from .diagnostics import _mega_moe_owner_options
 from .gradient_queue import (
+    ACT_FIRST_GRADIENT_PROJECTIONS,
     ACTIVE_GRADIENT_PROJECTIONS,
     ADAPTIVE_GRADIENT_QUEUE,
     has_adaptive_gradient_native,
@@ -279,7 +281,10 @@ def _resolve_gradient_queue(spec: MegaMoeSpec, device: Any) -> MegaMoeSpec:
     if order in ('auto', 'auto_w1'):
         abi = 4 if spec.replica_slots_per_rank else 3
         supported = torch.device(device).type == 'npu' and has_adaptive_gradient_native(abi)
-        candidate = 'device_active_lanes' if order == 'auto' else 'device_active_w1_lanes'
+        if order == 'auto':
+            candidate = 'device_active_lanes' if spec.replica_slots_per_rank else 'device_active_lanes_act_first'
+        else:
+            candidate = 'device_active_w1_lanes'
         return replace(spec, _gradient_queue_order=candidate if supported else 'original')
     if order in ACTIVE_GRADIENT_PROJECTIONS:
         require_device_gradient_native(order, physical=bool(spec.replica_slots_per_rank))
@@ -301,16 +306,31 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     """
     if spec._batch_empty_dispatch:
         require_empty_dispatch_native()
+    automatic = spec._gradient_queue_order in ('auto', 'auto_w1')
     spec = _resolve_gradient_queue(spec, device)
     projections = ACTIVE_GRADIENT_PROJECTIONS.get(spec._gradient_queue_order)
     baseline = replace(spec, _gradient_queue_order='original') if projections else spec
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(
         baseline, overlap_w13=False,
     )
+    act_first = spec._gradient_queue_order in ACT_FIRST_GRADIENT_PROJECTIONS
     if projections and not mark_active_gradient_lanes(
             backward_config, spec.local_experts, spec.num_cube_cores, projections=projections):
+        if act_first and not automatic:
+            raise ValueError('ActGrad priority requires complete gradient tile waves')
+        act_first = False
         spec = baseline
-    original_reuse = can_reuse_backward_dispatch(backward_config, spec.local_experts, spec.num_cube_cores)
+    if act_first and (spec.replica_slots_per_rank or not prioritize_activation_gradient(
+            backward_config, spec.local_experts, spec.num_cube_cores)):
+        if not automatic:
+            raise ValueError('ActGrad priority requires a canonical owner-only backward graph')
+        act_first = False
+        spec = replace(spec, _gradient_queue_order='device_active_lanes')
+    original_reuse = can_reuse_backward_dispatch(
+        backward_config, spec.local_experts, spec.num_cube_cores, act_first=act_first,
+    )
+    if act_first and not original_reuse:
+        raise ValueError('ActGrad priority failed to prove dispatch buffer reuse')
     original_backward_config = backward_config
     fallback = None
     if spec.replica_slots_per_rank and spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES:
@@ -346,7 +366,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         replica_w13_events=replica_w13_ready_events(backward_config, spec.local_experts, spec.num_cube_cores),
         replica_w2_events=replica_w2_ready_events(backward_config, spec.local_experts, spec.num_cube_cores),
         reuse_backward_dispatch=can_reuse_backward_dispatch(
-            backward_config, spec.local_experts, spec.num_cube_cores,
+            backward_config, spec.local_experts, spec.num_cube_cores, act_first=act_first,
         ),
         bwd_runtime_no_replica_reuse_dispatch=original_reuse if fallback else False,
         forward_graph=forward_graph,

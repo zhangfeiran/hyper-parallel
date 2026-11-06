@@ -31,6 +31,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.expert_parallel.hot_replica.admission import (
+    optional_peak_gain_is_sufficient,
     reduction_basis_points,
     resolve_replica_admission,
 )
@@ -51,7 +52,8 @@ from hyper_parallel.core.expert_parallel.hot_replica.device import (
     validate_planner_backend,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.routing import (
-    ReplicaRoute, _GatheredReplicaCounts, prepare_replica_route,
+    ReplicaRoute, _GatheredReplicaCounts, _has_home_recompute_hint, _record_home_decision,
+    prepare_replica_route,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
     KERNEL_GRADIENT_TRANSPORT_MODES,
@@ -346,6 +348,7 @@ class _MegaMoeExecutionResources:
                   "ep_size", "auto_tokens",
                   "_replica_cost_model_enabled", "_replica_critical_path_identity", "_gradient_queue_order",
                   "_cube_event_refresh_us", "_vector_event_refresh_us", "_batch_empty_dispatch",
+                  "_selective_owner_gradient_init",
                   "replica_slots_per_rank", "replica_transport", "replica_granularity")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v4", "bfloat16",
@@ -608,6 +611,15 @@ class MegaMoeExperts(MulticoreModule):
         self.replica_minimum_load_reduction = replica_minimum_load_reduction
         self.replica_transport = replica_transport
         _integer(initial_token_capacity, "initial_token_capacity", 1)
+
+        self._summary_home_admission = 0
+        self._summary_home_bypasses = 0
+        if (os.environ.get('HYPER_PARALLEL_MOE_SUMMARY_HOME_ADMISSION', '1') == '1'
+                and replica_slots_per_rank and replica_planner == 'cpu'
+                and (not self._cost_model_enabled or not _calibration_available(
+                    dispatch_mode, hidden_size, intermediate_size, ep_size, replica_transport, num_experts, top_k))):
+            self._summary_home_admission = reduction_basis_points(
+                resolve_replica_admission(replica_minimum_load_reduction)[0])
         gradient_order = os.environ.get('HYPER_PARALLEL_MOE_GRADIENT_QUEUE_ORDER', 'auto')
         if gradient_order not in ('auto', 'original', 'w1_reverse', 'w1_join_once',
                                    'device_w1_asc', 'device_w1_desc',
@@ -649,6 +661,7 @@ class MegaMoeExperts(MulticoreModule):
             "_cube_event_refresh_us": cube_refresh,
             "_vector_event_refresh_us": vector_refresh,
             "_batch_empty_dispatch": batch_empty_dispatch,
+            "_selective_owner_gradient_init": os.environ.get('HYPER_PARALLEL_MOE_OWNER_GRADIENT_INIT') != 'full',
         }
         specification["auto_tokens"] = True
         if replica_slots_per_rank:
@@ -872,6 +885,31 @@ class MegaMoeExperts(MulticoreModule):
             "_capacity_budget": resources.receive_capacity_limit if self.dispatch_mode != "pull" else None,
         }
 
+    def _summary_keeps_home(
+        self, resources: _MegaMoeExecutionResources, summary: list[list[int]], loads: list[int],
+    ) -> bool:
+        """Keep an already feasible home layout if even perfect balance cannot be admitted."""
+        admission = self._summary_home_admission
+        if not admission:
+            return False
+        peak = max(loads)
+        if peak > 2**31 - 1:
+            return False
+        lower_bound = (sum(loads) + len(loads) - 1) // len(loads)
+        if optional_peak_gain_is_sufficient(peak, lower_bound, admission, 0):
+            return False
+        if self.dispatch_mode == 'push':
+            planned_tokens = max(128, _align_capacity(max(row[1] for row in summary)))
+            if (planned_tokens > resources._token_capacity
+                    or peak > resources.workspace.capacity_floor):
+                return False
+        state = get_recompute_state()
+        if state is not None and state.is_recomputing and not _has_home_recompute_hint():
+            return False
+        _record_home_decision()
+        self._summary_home_bypasses += 1
+        return True
+
     def _prepare_replica_route(
         self, topk_ids: torch.Tensor, resources: _MegaMoeExecutionResources, hidden: torch.Tensor,
         autograd_mask: int, counts: torch.Tensor | None,
@@ -946,7 +984,7 @@ class MegaMoeExperts(MulticoreModule):
                             host_counts: Optional host count values from the same exchange.
                         """
                         loads = [row[6] for row in summary]
-                        if min(loads) == max(loads):
+                        if min(loads) == max(loads) or self._summary_keeps_home(resources, summary, loads):
                             return None
                         gathered = _GatheredReplicaCounts(counts, summary, host_counts)
                         proposal = self._prepare_replica_route(
@@ -981,6 +1019,7 @@ class MegaMoeExperts(MulticoreModule):
                 replica_route = route.metadata.replica_route
                 if replica_route is not None:
                     topk_ids = replica_route.physical_ids
+        resources.last_empty_owner_experts = route.metadata.empty_owner_experts
         return route, topk_ids, replica_route, integrated
 
     def forward(

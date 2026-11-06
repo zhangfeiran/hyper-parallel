@@ -376,6 +376,9 @@ def _save_forward_state(
     ctx.workspace = workspace
     schedule = getattr(metadata, "schedule", None)
     ctx.empty_experts = None if schedule is None else schedule.empty_experts
+    ctx.empty_owner_experts = getattr(metadata, "empty_owner_experts", None)
+    if not plan.spec.replica_slots_per_rank and not getattr(plan.spec, "_selective_owner_gradient_init", True):
+        ctx.empty_experts = None
     ctx.save_for_backward(
         saved_dispatch,
         up_proj,
@@ -669,7 +672,8 @@ def _prepare_forward_context(ctx: Any, routed_tokens: Any, route: RouteMetadata,
 def _backward_empty_experts(ctx: Any, transfers: bool, home_experts: int) -> tuple[int, ...] | None:
     """Resolve empty home matrices from the exact selected execution route."""
     if not transfers:
-        return getattr(ctx, "empty_experts", None)
+        return (getattr(ctx, "empty_experts", None) if getattr(ctx, "empty_experts", None) is not None
+                else getattr(ctx, "empty_owner_experts", None))
     counts = ctx.replica_route.plan.destination_counts[ctx.replica_route.rank][:home_experts]
     return tuple(expert for expert, rows in enumerate(counts) if not rows)
 

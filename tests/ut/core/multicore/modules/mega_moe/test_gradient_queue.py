@@ -22,7 +22,7 @@ from unittest.mock import patch
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
 from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import build_config_for_rank
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
-    can_reuse_backward_dispatch, join_w1_phase_once,
+    can_reuse_backward_dispatch, join_w1_phase_once, prioritize_activation_gradient,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.gradient_queue import (
     ADAPTIVE_GRADIENT_QUEUE, mark_active_gradient_lanes, mark_device_gradient_queue, require_device_gradient_native,
@@ -31,11 +31,64 @@ from hyper_parallel.core.multicore.modules.mega_moe.gradient_queue import (
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts, _MegaMoeExecutionResources
 from hyper_parallel.core.multicore.modules.mega_moe.plan import _build_runtime_artifacts, _resolve_gradient_queue
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
-from hyper_parallel.core.multicore.scheduler.config import EVENT_INVALID_ID, TaskSplitValue, validate_runtime_config
+from hyper_parallel.core.multicore.scheduler.config import (
+    EVENT_INVALID_ID, TaskSplitValue, TaskType, validate_runtime_config,
+)
+from tests.common.mark_utils import arg_mark
 
 
 class TestGradientQueue(unittest.TestCase):
     """Preserve descriptor identity, dependencies and per-core phase boundaries."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_act_first_joins_w2_before_overwriting_dispatch(self) -> None:
+        """Feature: Activation-first backward scheduling.
+
+        Description: Earlier ActGrad releases SwiGLU while Gate still joins both receive readers.
+        Expectation: Receive storage remains reusable, event counts validate and every W2 reader precedes overwrite.
+        """
+        for mode in ('push', 'pull'):
+            with self.subTest(mode=mode):
+                topology = TaskSplitValue(tp=1, ep=4, seq_size=512, all_expert_num=12, top_k=2, dispatch_mode=mode)
+                graph = build_backward_graph(topology, hidden_size=1536, intermediate_size=768)
+                graph.propagate_splits(topology)
+                config = build_config_for_rank(graph, topology, rank_id=1, num_cube_cores=24)
+                queue = config.cube_task_indices
+                counts = sum(config.all_event_num_triggers)
+                vectors = bytes(config.vector_task_indices)
+                self.assertTrue(prioritize_activation_gradient(config, 3, 24))
+                validate_runtime_config(config, topology, 24)
+                self.assertEqual(vectors, bytes(config.vector_task_indices))
+                self.assertEqual(counts, sum(config.all_event_num_triggers))
+                for expert in range(3):
+                    act, weight = (config.all_tasks[queue[expert * 48 + offset]] for offset in (0, 24))
+                    self.assertEqual(act.outputs[0].input_position, 8)
+                    self.assertEqual(weight.outputs[0].input_position, 6)
+                    gate = config.all_tasks[queue[144 + expert * 24]]
+                    self.assertEqual(weight.trigger_event, gate.dependent_event)
+                self.assertTrue(can_reuse_backward_dispatch(config, 3, 24, act_first=True))
+                self.assertFalse(can_reuse_backward_dispatch(config, 3, 24))
+                config.all_tasks[queue[24]].trigger_event = EVENT_INVALID_ID
+                self.assertFalse(can_reuse_backward_dispatch(config, 3, 24, act_first=True))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_act_first_leaves_an_unknown_completion_graph_unchanged(self) -> None:
+        """Feature: Activation-first scheduling rejection.
+
+        Description: The original global completion must contain precisely the counted producers.
+        Expectation: An unknown producer set rejects the transform and leaves the original descriptors unchanged.
+        """
+        topology = TaskSplitValue(tp=1, ep=4, seq_size=512, all_expert_num=12, top_k=2, dispatch_mode='push')
+        graph = build_backward_graph(topology, hidden_size=1536, intermediate_size=768)
+        graph.propagate_splits(topology)
+        config = build_config_for_rank(graph, topology, rank_id=1, num_cube_cores=24)
+        term = next(task for task in config.all_tasks[:config.task_num] if task.task_type == TaskType.TASK_TERMINATE)
+        config.all_event_num_triggers[term.dependent_event] -= 1
+        damaged = bytes(config)
+        self.assertFalse(prioritize_activation_gradient(config, 3, 24))
+        self.assertEqual(damaged, bytes(config))
 
     def test_active_lane_marks_reject_incomplete_waves(self) -> None:
         """A divergent Cube wave cannot share the same active-expert ordinal."""
@@ -143,7 +196,7 @@ class TestGradientQueue(unittest.TestCase):
                              ._gradient_queue_order, 'original')
             abi.return_value = True
             large = resources.plan_for_tokens(896, 'npu')
-            self.assertEqual(large.spec._gradient_queue_order, 'device_active_lanes')
+            self.assertEqual(large.spec._gradient_queue_order, 'device_active_lanes_act_first')
             self.assertIs(resources.plan_for_tokens(768, 'npu'), large)
             self.assertEqual(abi.call_count, 2)
 
@@ -156,7 +209,8 @@ class TestGradientQueue(unittest.TestCase):
         module = 'hyper_parallel.core.multicore.modules.mega_moe'
         with (patch(module + '.plan.torch.device', return_value=SimpleNamespace(type='npu')),
               patch(module + '.plan.has_adaptive_gradient_native', side_effect=lambda version: version <= 3) as abi):
-            self.assertEqual(_resolve_gradient_queue(spec, 'npu')._gradient_queue_order, 'device_active_lanes')
+            self.assertEqual(_resolve_gradient_queue(spec, 'npu')._gradient_queue_order,
+                             'device_active_lanes_act_first')
             physical = replace(spec, replica_slots_per_rank=2, num_experts=24)
             self.assertEqual(_resolve_gradient_queue(physical, 'npu')._gradient_queue_order, 'original')
             self.assertEqual([call.args[0] for call in abi.call_args_list], [3, 4])

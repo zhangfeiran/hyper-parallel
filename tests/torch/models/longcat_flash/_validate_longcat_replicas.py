@@ -164,11 +164,13 @@ def validate(args: argparse.Namespace, options: argparse.Namespace) -> None:
             break
     resources = candidate[0]._executor._resource_group.resources
     resolved_queue = resources.last_execution_plan.spec._gradient_queue_order
+    summary_home_bypasses = getattr(candidate[0]._executor, "_summary_home_bypasses", 0)
     candidate[0].close_runtime()
     reference[0].close_runtime()
     report = {"rank": rank, "pid": os.getpid(), "dispatch_mode": options.dispatch_mode,
               "layout": options.layout, "budget": options.budget, "granularity": "expert",
               "resolved_gradient_queue": resolved_queue,
+              "summary_home_bypasses": summary_home_bypasses,
               "transport": options.transport, "records": records,
               "shape": {key: getattr(args, key) for key in
                         ("ep", "tokens", "hidden", "intermediate", "real", "zero", "top_k")},

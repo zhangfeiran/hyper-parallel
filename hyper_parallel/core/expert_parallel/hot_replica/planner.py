@@ -23,7 +23,7 @@ from itertools import chain
 from math import isfinite
 import os
 
-from .admission import reduction_basis_points
+from .admission import optional_peak_gain_is_sufficient, reduction_basis_points
 from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
 from .cost import ExpertReplicaCostModel, _QuotaCostState, refine_replica_quotas
@@ -1036,8 +1036,7 @@ def _optional_peak_is_useful(candidate_peak, loads, limit, admission, minimum_sa
     peak = max(loads)
     if (not admission and not minimum_saved_rows) or peak > limit:
         return True
-    saved = peak - candidate_peak
-    return saved >= minimum_saved_rows and saved * 10000 >= peak * admission
+    return optional_peak_gain_is_sufficient(peak, candidate_peak, admission, minimum_saved_rows)
 
 
 def _fill_critical_guest_rows(copies: list[dict[int, int]], home: int) -> None:

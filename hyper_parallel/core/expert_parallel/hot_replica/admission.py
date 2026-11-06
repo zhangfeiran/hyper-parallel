@@ -52,3 +52,11 @@ def resolve_replica_admission(value: Optional[float]) -> tuple[float, int]:
     resolved = _DEFAULT_MINIMUM_LOAD_REDUCTION if value is None else value
     reduction_basis_points(resolved)
     return resolved, 0
+
+
+def optional_peak_gain_is_sufficient(
+    peak: int, candidate_peak: int, admission: int, minimum_saved_rows: int,
+) -> bool:
+    """Apply the same integer gain threshold to bounds and completed placements."""
+    saved = peak - candidate_peak
+    return saved >= minimum_saved_rows and saved * _BASIS_POINTS >= peak * admission

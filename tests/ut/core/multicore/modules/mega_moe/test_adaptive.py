@@ -281,7 +281,7 @@ class TestAdaptiveExecution(unittest.TestCase):
                 hidden = torch.ones(64, 16, dtype=torch.bfloat16)
                 ids, probabilities = torch.zeros(64, 2, dtype=torch.int32), torch.full((64, 2), .5)
                 route = SimpleNamespace(unpermute_mapping=object(), maximum_received_slots=320,
-                                        metadata=SimpleNamespace(plan_tokens=128))
+                                        metadata=SimpleNamespace(plan_tokens=128, empty_owner_experts=None))
                 try:
                     with (patch.object(torch.Tensor, 'is_npu', new_callable=PropertyMock, return_value=True),
                           patch.object(torch.npu, 'is_current_stream_capturing', return_value=False),

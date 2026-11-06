@@ -55,7 +55,15 @@ def reverse_w1_gradient_queue(config: RuntimeConfigC, graph: ComputeGraph, topol
 
 
 ADAPTIVE_GRADIENT_QUEUE = 'device_w1_shape_auto'
-ACTIVE_GRADIENT_PROJECTIONS = {'device_active_lanes': (6, 18), 'device_active_w1_lanes': (18,)}
+ACT_FIRST_GRADIENT_PROJECTIONS = {
+    'device_active_lanes_act_first': (6, 18),
+    'device_active_w1_lanes_act_first': (18,),
+}
+ACTIVE_GRADIENT_PROJECTIONS = {
+    'device_active_lanes': (6, 18),
+    'device_active_w1_lanes': (18,),
+    **ACT_FIRST_GRADIENT_PROJECTIONS,
+}
 _DEVICE_POLICIES = {'device_w1_asc': 1, 'device_w1_desc': 2, 'device_w1_asc_join': 3, 'device_late_auto': 4,
                     'device_lane_rotate': 5, 'device_w1_asc_join_once': 6, 'device_w1_asc_join_rotate': 7,
                     ADAPTIVE_GRADIENT_QUEUE: 8}

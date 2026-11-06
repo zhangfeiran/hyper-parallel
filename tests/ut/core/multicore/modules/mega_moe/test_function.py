@@ -16,7 +16,6 @@
 
 import struct
 import unittest
-from functools import partial
 import weakref
 from functools import partial
 from types import SimpleNamespace
@@ -133,6 +132,25 @@ class TestMegaMoeFunction(unittest.TestCase):
                              msg=f"Gradient stride: expected={weight.stride()}, actual={gradient.stride()}")
             self.assertEqual(torch.count_nonzero(gradient).item(), 0,
                              msg=f"Empty-expert gradients: expected=0, actual={gradient}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_eoi_selective_initialization_clears_only_proven_empty_experts(self) -> None:
+        """Feature: EOI owner gradient initialization.
+
+        Description: Known empty experts receive exact zeros in the native gradient orientation.
+        Expectation: Only the empty expert is zero; covered experts retain poisoned uninitialized storage.
+        """
+        spec = SimpleNamespace(expert_weight_layout="EOI", replica_slots_per_rank=0, local_experts=2,
+                               hidden_size=4, intermediate_size=3)
+        weights = torch.ones(2, 6, 4), torch.ones(2, 4, 3)
+        with patch.object(torch, "empty_like",
+                          lambda value, **kw: torch.full_like(value, float("nan"), **kw)):
+            output = function_module._allocate_backward_intermediates(
+                spec, 3, torch.ones(3, 4), *weights, empty_experts=(1,))
+        for value in (output.grad_weight1, output.grad_weight2):
+            self.assertTrue(torch.isnan(value[0]).all())
+            torch.testing.assert_close(value[1], torch.zeros_like(value[1]))
 
     def test_checkpoint_backward_reuses_replayed_replica_weights(self) -> None:
         """Replay refreshes the original context without a third weight transfer."""

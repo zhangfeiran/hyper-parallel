@@ -26,7 +26,7 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
 from hyper_parallel.core.activation_memory import checkpoint
-from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts
+from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts, get_recompute_state
 from hyper_parallel.core.expert_parallel.hot_replica import routing as replica_routing
 
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
@@ -35,6 +35,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.routing import (
 )
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
+from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.route import (
     _expert_capacity,
     _resolve_counts,
@@ -790,6 +791,62 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         self.assertEqual(exchange.call_count, 4)
         torch.testing.assert_close(value.grad, 2 * value.detach().sin() * value.detach().cos())
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_home_summary_retains_capacity_and_exact_admission_boundary(self) -> None:
+        """Feature: Owner-only admission bound.
+
+        Description: An impossible optional gain cannot bypass a required Push capacity decision.
+        Expectation: The summary shortcut honors the exact gain boundary and required receive capacity.
+        """
+        with patch.dict("os.environ", {"HYPER_PARALLEL_MOE_SUMMARY_HOME_ADMISSION": "1"}):
+            module = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+                                    ep_size=2, replica_slots_per_rank=2, create_parameters=False)
+        resources = SimpleNamespace(_token_capacity=128, workspace=SimpleNamespace(capacity_floor=100))
+
+        def may_skip(other_rows: int, tokens: int = 128) -> bool:
+            """Check one load bound against fixed owner capacity.
+
+            Args:
+                other_rows: Rows on the second owner.
+                tokens: Tokens announced by each source.
+            """
+            rows = [[0, tokens, 31, 0, 0, 0, load] for load in (100, other_rows)]
+            return module._summary_keeps_home(resources, rows, [100, other_rows])
+
+        self.assertTrue(may_skip(21))
+        self.assertFalse(may_skip(20))
+        self.assertFalse(may_skip(21, 129))
+        resources.workspace.capacity_floor = 99
+        self.assertFalse(may_skip(21))
+        module.close()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_home_summary_preserves_replay_cursor_and_a_following_guest_plan(self) -> None:
+        """Feature: Owner-only admission replay.
+
+        Description: Fresh summary rejection records one home decision without consuming an active guest plan.
+        Expectation: Home decisions preserve checkpoint replay order and the next active guest decision.
+        """
+        with patch.dict("os.environ", {"HYPER_PARALLEL_MOE_SUMMARY_HOME_ADMISSION": "1"}):
+            module = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+                                    ep_size=2, replica_slots_per_rank=2, create_parameters=False,
+                                    dispatch_mode="pull")
+        rows = [[0, 128, 31, 0, 0, 0, load] for load in (100, 21)]
+        initial, replay = create_recompute_contexts()
+        with initial:
+            self.assertTrue(module._summary_keeps_home(SimpleNamespace(), rows, [100, 21]))
+            state = get_recompute_state()
+            cache_type = replica_routing._RecomputedReplicaPlans
+            cache = state.get_resource(cache_type, cache_type)
+            cache.entries.append((None, object()))
+        with replay:
+            self.assertTrue(module._summary_keeps_home(SimpleNamespace(), rows, [100, 21]))
+            self.assertFalse(module._summary_keeps_home(SimpleNamespace(), rows, [100, 21]))
+            self.assertEqual(cache.cursor, 1)
+        module.close()
+
     def test_shared_home_agreement_rejects_invalid_ids_before_selection(self) -> None:
         """Untrusted invalid routes fail collectively before allocation or placement."""
         spec = replace(self._spec(4), ep_size=1)
@@ -924,6 +981,53 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             auto_tokens=automatic,
             max_local_num_tokens=None if automatic else 512,
         )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_owner_empty_expert_proof_never_guesses_from_rank_load(self) -> None:
+        """Feature: Owner gradient overwrite proof.
+
+        Description: Without exact host counts only a strictly positive source minimum proves full coverage.
+        Expectation: Partial rank loads do not authorize overwrite without complete source coverage or exact counts.
+        """
+        spec = replace(self._spec(8), _selective_owner_gradient_init=True)
+        partial = [[0, 128, 31, 256, 0, 5, 256] for _ in range(spec.ep_size)]
+        self.assertIsNone(route_module._owner_empty_experts(spec, partial, None))
+        partial[-1][4] = 1
+        self.assertEqual(route_module._owner_empty_experts(spec, partial, None), ())
+        partial[-1][4] = 0
+        rows = [[0, 128, 31] + [0, 1] * 4 for _ in range(spec.ep_size)]
+        self.assertIsNone(route_module._owner_empty_experts(spec, partial, rows))
+        rows[0] = [0, 128, 31] + [1, 0] * 4
+        self.assertEqual(route_module._owner_empty_experts(spec, partial, rows), ())
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_device_summary_invalidates_owner_overwrite_proof_when_routes_change(self) -> None:
+        """Feature: Selective owner gradient initialization.
+
+        Description: Reuse one workspace across complete, incomplete and disabled coverage summaries.
+        Expectation: Only the complete current route authorizes uninitialized owner gradient storage.
+        """
+        spec = replace(self._spec(1024), _selective_owner_gradient_init=True)
+        payload = torch.zeros((4, 1027), dtype=torch.int32)
+        payload[:, 2] = 31
+        payload[-1, 1] = 512
+        payload[-1, 3:] = 1
+        workspace = SimpleNamespace(route_cache=None, route_cache_probe_after=0)
+        _, raw, metadata = route_module._read_cached_route(payload, spec, workspace, "cpu")
+        self.assertIsNone(raw, msg=f"Wide summary must avoid a full table: expected=None, actual={raw}")
+        self.assertIsNone(metadata, msg=f"Wide summary has no cached descriptors: expected=None, actual={metadata}")
+        self.assertEqual(workspace.empty_owner_experts, (),
+                         msg=f"Complete source coverage: expected=(), actual={workspace.empty_owner_experts}")
+        payload[-1, 3], payload[-1, 4] = 0, 2
+        route_module._read_cached_route(payload, spec, workspace, "cpu")
+        self.assertIsNone(workspace.empty_owner_experts,
+                          msg=f"No overwrite permission: expected=None, actual={workspace.empty_owner_experts}")
+        payload[-1, 3:] = 1
+        route_module._read_cached_route(payload, replace(spec, _selective_owner_gradient_init=False), workspace, "cpu")
+        self.assertIsNone(workspace.empty_owner_experts,
+                          msg=f"No overwrite permission: expected=None, actual={workspace.empty_owner_experts}")
 
     @staticmethod
     def _payload(experts: int, dtype: torch.dtype) -> torch.Tensor:
@@ -1324,7 +1428,8 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         route_module._cache_host_route(workspace, spec, raw, changed, metadata, "cpu")
         self.assertEqual(workspace.route_cache_probe_after, route_module._ROUTE_CACHE_REPROBE_STEPS)
         with (patch.object(payload, "tolist", side_effect=AssertionError("unexpected full Host table read")),
-              patch.object(route_module, "_dynamic_summary", wraps=route_module._dynamic_summary) as device_summary):
+              patch.object(route_module, "_device_route_rows",
+                           wraps=route_module._device_route_rows) as device_summary):
             for remaining in range(route_module._ROUTE_CACHE_REPROBE_STEPS - 1, -1, -1):
                 observed, host, cached = route_module._read_cached_route(payload, spec, workspace, "cpu")
                 self.assertEqual(observed, changed)

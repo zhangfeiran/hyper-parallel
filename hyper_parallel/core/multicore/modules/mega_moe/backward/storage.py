@@ -31,9 +31,10 @@ _WEIGHT13_GRAD = 18
 
 
 def _worker_read_order(
-    tasks: list[TaskDescC], num_experts: int, num_cores: int,
+    tasks: list[TaskDescC], num_experts: int, num_cores: int, *, act_first: bool = False,
 ) -> bool:
     """Require every Cube to finish both receive readers before writing dX."""
+    readers = (_ACTIVATION_GRAD, _WEIGHT2_GRAD) if act_first else (_WEIGHT2_GRAD, _ACTIVATION_GRAD)
     for worker in range(num_cores):
         locations = {}
         for index, task in enumerate(tasks[worker::num_cores]):
@@ -47,8 +48,7 @@ def _worker_read_order(
         if len(locations) != 3 * num_experts:
             return False
         for expert in range(num_experts):
-            order = [locations.get((output, expert), -1)
-                     for output in (_WEIGHT2_GRAD, _ACTIVATION_GRAD, _INPUT_GRAD)]
+            order = [locations.get((output, expert), -1) for output in (*readers, _INPUT_GRAD)]
             if not 0 <= order[0] < order[1] < order[2]:
                 return False
     return True
@@ -56,18 +56,21 @@ def _worker_read_order(
 
 def _expert_events_join_readers(
     cfg: RuntimeConfigC, cube_tasks: list[TaskDescC], vector_tasks: list[TaskDescC],
-    num_experts: int, num_cores: int,
+    num_experts: int, num_cores: int, *, act_first: bool = False,
 ) -> bool:
     """Require the existing event chain to join all readers of each expert."""
     acts = defaultdict(list)
     gates = defaultdict(list)
     swiglu = defaultdict(list)
+    late_reads = defaultdict(list)
     for task in cube_tasks:
         expert = task.task_index // num_cores
         if task.outputs[0].input_position == _ACTIVATION_GRAD:
             acts[expert].append(task)
         elif task.outputs[0].input_position == _INPUT_GRAD:
             gates[expert].append(task)
+        elif act_first and task.outputs[0].input_position == _WEIGHT2_GRAD:
+            late_reads[expert].append(task)
     for task in vector_tasks:
         if task.task_type != TaskType.TASK_SWI_GLU_GRAD:
             continue
@@ -80,7 +83,8 @@ def _expert_events_join_readers(
         producers[task.trigger_event].append(task)
         if task.task_type == TaskType.TASK_GROUPED_MATMUL and task.extra_value_1:
             producers[task.extra_value_1].append(task)
-    return all(_expert_dependency_chain(cfg, acts[expert], gates[expert], swiglu[expert], num_cores, producers)
+    return all(_expert_dependency_chain(cfg, acts[expert], gates[expert], swiglu[expert],
+                                       num_cores, producers, late_reads[expert])
                for expert in range(num_experts))
 
 
@@ -94,12 +98,12 @@ def _event_joins_tasks(cfg: RuntimeConfigC, tasks: list[TaskDescC], producers: d
 
 def _expert_dependency_chain(
     cfg: RuntimeConfigC, acts: list[TaskDescC], gates: list[TaskDescC],
-    swiglu: list[TaskDescC], num_cores: int, producers: dict,
+    swiglu: list[TaskDescC], num_cores: int, producers: dict, late_reads: list[TaskDescC],
 ) -> bool:
     """Join every expert reader before any task overwrites its receive rows."""
     if len(acts) != num_cores or len(gates) != num_cores or not swiglu:
         return False
-    if not _event_joins_tasks(cfg, acts, producers) or not _event_joins_tasks(cfg, swiglu, producers):
+    if not _event_joins_tasks(cfg, acts, producers) or not _event_joins_tasks(cfg, swiglu + late_reads, producers):
         return False
     act_event = acts[0].trigger_event
     swiglu_event = swiglu[0].trigger_event
@@ -108,13 +112,16 @@ def _expert_dependency_chain(
             and all(task.dependent_event == swiglu_event for task in gates))
 
 
-def can_reuse_backward_dispatch(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> bool:
+def can_reuse_backward_dispatch(
+    cfg: RuntimeConfigC, num_experts: int, num_cores: int, *, act_first: bool = False,
+) -> bool:
     """Check a validated runtime before reusing received dY storage for dX.
 
     Args:
         cfg: Validated, fully reordered backward runtime descriptors.
         num_experts: Number of local experts.
         num_cores: Number of active Cube workers.
+        act_first: Prove the alternative join with W2 as a late receive reader.
 
     Returns:
         Whether every receive reader precedes dX through worker order and
@@ -130,8 +137,9 @@ def can_reuse_backward_dispatch(cfg: RuntimeConfigC, num_experts: int, num_cores
         if reads_dispatch and (task.task_type != TaskType.TASK_GROUPED_MATMUL
                                or task.outputs[0].input_position not in (_WEIGHT2_GRAD, _ACTIVATION_GRAD)):
             return False
-    return (_worker_read_order(cube_tasks, num_experts, num_cores)
-            and _expert_events_join_readers(cfg, cube_tasks, vector_tasks, num_experts, num_cores))
+    return (_worker_read_order(cube_tasks, num_experts, num_cores, act_first=act_first)
+            and _expert_events_join_readers(cfg, cube_tasks, vector_tasks, num_experts, num_cores,
+                                            act_first=act_first))
 
 
 def replica_w2_ready_events(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> tuple[int, ...]:
@@ -188,6 +196,55 @@ def _w13_producers(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> lis
             return []
         producer_order = order
     return weights
+
+
+def prioritize_activation_gradient(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> bool:
+    """Start SwiGLU earlier without additional counters, atomics or receive storage.
+
+    W2 and ActGrad depend on the same dispatch event. GateGrad must join
+    W2 as well as SwiGLU before it can reuse the receive buffer. Every W2
+    then reaches termination through GateGrad and W13, so its original
+    termination increment can move to the existing per-expert GateGrad join.
+    """
+    w13_groups = _w13_producers(cfg, num_experts, num_cores)
+    count = cfg.task_index_num[0]
+    if not w13_groups or count != 4 * num_experts * num_cores:
+        return False
+    ids = list(cfg.cube_task_indices[:count])
+    cube = [cfg.all_tasks[index] for index in ids]
+    vector = [cfg.all_tasks[index] for index in cfg.vector_task_indices[:cfg.task_index_num[1]]]
+    terms = [task for task in vector if task.task_type == TaskType.TASK_TERMINATE]
+    if len(terms) != 1 or any(task.extra_value_1 for task in cube):
+        return False
+    final = terms[0].dependent_event
+    if (final == EVENT_INVALID_ID
+            or any(task.dependent_event == final and task.task_type != TaskType.TASK_TERMINATE
+                   for task in cube + vector)
+            or sum(task.trigger_event == final for task in cube + vector) != cfg.all_event_num_triggers[final]
+            or any(task.trigger_event != final for group in w13_groups for task in group)):
+        return False
+    joins = []
+    for expert in range(num_experts):
+        start = 2 * expert * num_cores
+        middle, stop = start + num_cores, start + 2 * num_cores
+        w2, act = cube[start:middle], cube[middle:stop]
+        gate = cube[(2 * num_experts + expert) * num_cores]
+        if (gate.outputs[0].input_position != _INPUT_GRAD or gate.task_index != expert * num_cores
+                or any(w.outputs[0].input_position != _WEIGHT2_GRAD
+                       or a.outputs[0].input_position != _ACTIVATION_GRAD
+                       or w.task_index != expert * num_cores + worker or a.task_index != w.task_index
+                       or w.dependent_event != a.dependent_event or w.trigger_event != final
+                       for worker, (w, a) in enumerate(zip(w2, act)))):
+            return False
+        joins.append((gate.dependent_event, w2))
+        ids[start:stop] = ids[middle:stop] + ids[start:middle]
+    for event, tasks in joins:
+        cfg.all_event_num_triggers[event] += num_cores
+        for task in tasks:
+            task.trigger_event = event
+    cfg.all_event_num_triggers[final] -= num_experts * num_cores
+    cfg.cube_task_indices[:count] = ids
+    return True
 
 
 def _guest_w13_indices(cfg: RuntimeConfigC, num_experts: int, num_cores: int,
