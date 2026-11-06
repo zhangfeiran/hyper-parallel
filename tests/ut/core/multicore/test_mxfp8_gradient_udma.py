@@ -14,6 +14,7 @@
 # ============================================================================
 """Bounded scratch and ordered metadata for the optional MX UDMA gradient return."""
 
+from dataclasses import replace
 import os
 import struct
 from types import SimpleNamespace
@@ -25,7 +26,10 @@ import torch
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import SignalReplicaTransport, signal_storage_bytes
 from hyper_parallel.core.multicore.modules.mega_moe.kernel_gradients import prepare_kernel_gradient_return
-from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_gradient_udma import mx_udma_gradient_scratch
+from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_gradient_udma import (
+    mx_gradient_peer_qps,
+    mx_udma_gradient_scratch,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_graph import build_mxfp8_runtime
 from hyper_parallel.core.multicore.modules.mega_moe import mxfp8_module
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -65,8 +69,9 @@ class TestMXFP8GradientUdma(unittest.TestCase):
                            mx_vector_policy="window2", mx_gradient_udma=True,
                            replica_transport="shmem_signal_kernel_gradient")
         for qps, engine, feature_error, expected in (
-                (16, "mte_udma", None, "32 QPs"),
+                (8, "mte_udma", None, "16 or 32 QPs"),
                 (32, "mte", None, "mte_udma"),
+                (16, "mte_udma", RuntimeError("Missing gradient capability"), "Missing gradient capability"),
                 (32, "mte_udma", RuntimeError("Missing gradient capability"), "Missing gradient capability")):
             with self.subTest(qps=qps, engine=engine, capability=feature_error), mock.patch.dict(
                     os.environ, {"HYPER_PARALLEL_SHMEM_UDMA_QP_NUM": str(qps),
@@ -78,7 +83,7 @@ class TestMXFP8GradientUdma(unittest.TestCase):
                     mxfp8_module._MXFP8Resources({}, torch.empty(1), shared=False, active_specifications=())
                 heap.assert_not_called()
                 if feature_error:
-                    require.assert_called_once_with("replica_udma_gradient")
+                    require.assert_called_once_with("replica_udma_gradient_peer_qp")
                 else:
                     require.assert_not_called()
 
@@ -106,13 +111,13 @@ class TestMXFP8GradientUdma(unittest.TestCase):
                 mxfp8_module.MXFP8MegaMoeExperts(**options)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
-    def test_token_qp_owners_remain_exclusive_for_all_target_budgets(self) -> None:
+    def test_gradient_qps_do_not_change_token_owners_for_all_target_budgets(self) -> None:
         """Feature: Concurrent token and FP32 gradient UDMA.
-        Description: Build EP4/16/64 backward queues for B1/B2/B6 with the lower token bank.
-        Expectation: Each peer/QP has one producer and no token uses helper QPs 16..19.
+        Description: Build EP4/16/64 backward queues for B1/B2/B6 with the original QP16 bank.
+        Expectation: Four unused queues per peer preserve every token queue and exclude signal QP0.
         """
         with mock.patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma",
-                                          "HYPER_PARALLEL_SHMEM_UDMA_QP_NUM": "32"}):
+                                          "HYPER_PARALLEL_SHMEM_UDMA_QP_NUM": "16"}):
             for ep in (4, 16, 64):
                 for budget in (1, 2, 6):
                     with self.subTest(ep=ep, budget=budget):
@@ -122,6 +127,12 @@ class TestMXFP8GradientUdma(unittest.TestCase):
                                            mx_vector_policy="window2", mx_gradient_udma=True,
                                            replica_transport="shmem_signal_kernel_gradient")
                         runtime = build_mxfp8_runtime(spec, forward=False)
+                        baseline = build_mxfp8_runtime(replace(spec, mx_gradient_udma=False), forward=False)
+                        self.assertEqual(list(runtime.config.vector_task_indices),
+                                         list(baseline.config.vector_task_indices))
+                        self.assertEqual(list(runtime.config.mix_task_indices),
+                                         list(baseline.config.mix_task_indices))
+                        gradient_qps = mx_gradient_peer_qps(runtime.config, spec)
                         owners = {}
                         cfg = runtime.config
                         for worker in range(1, 64, 2):
@@ -138,6 +149,35 @@ class TestMXFP8GradientUdma(unittest.TestCase):
                                 self.assertLess(qp, 16)
                                 self.assertEqual(owners.setdefault((peer, qp), worker), worker)
                         self.assertTrue(owners)
+                        for peer, row in enumerate(gradient_qps):
+                            self.assertEqual(len(row), 4)
+                            self.assertEqual(len(set(row)), 4)
+                            for qp in row:
+                                self.assertGreater(qp, 0)
+                                self.assertLess(qp, 16)
+                                self.assertNotIn((peer, qp), owners)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_no_free_peer_queue_is_rejected_before_any_device_submission(self) -> None:
+        """Feature: Exclusive gradient QP admission.
+        Description: Occupy every QP of one peer with a distinct existing token producer.
+        Expectation: Fail instead of aliasing a token QP or silently changing its producer.
+        """
+        queues = [[] for _ in range(64)]
+        tasks = []
+        for qp in range(16):
+            queues[4 * qp + 1] = [qp]
+            tasks.append(SimpleNamespace(task_type=TaskType.TASK_SHMEM_PUT_MEM_SIGNAL,
+                                         task_index=1, task_split_num=2))
+        offsets = [0]
+        for queue in queues:
+            offsets.append(offsets[-1] + len(queue))
+        config = SimpleNamespace(vector_task_indices=[task for queue in queues for task in queue],
+                                 mix_task_indices=offsets, all_tasks=tasks)
+        with mock.patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma",
+                                          "HYPER_PARALLEL_SHMEM_UDMA_QP_NUM": "16"}):
+            with self.assertRaisesRegex(ValueError, "peer=1, free=0"):
+                mx_gradient_peer_qps(config, SimpleNamespace(ep_size=2, rank_id=0))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_scratch_borrows_only_the_unused_weight_prefix_for_b1_b2_b6(self) -> None:
@@ -169,10 +209,10 @@ class TestMXFP8GradientUdma(unittest.TestCase):
         Description: Try a token-only QP allocation or an MTE-only runtime.
         Expectation: Fail before any epoch or transfer can advance.
         """
-        for qps, engine in ((16, "mte_udma"), (32, "mte")):
+        for qps, engine in ((8, "mte_udma"), (32, "mte")):
             with self.subTest(qps=qps, engine=engine):
                 provider = _provider(1, qps=qps, engine=engine)
-                with self.assertRaisesRegex(ValueError, "32 QPs"):
+                with self.assertRaisesRegex(ValueError, "16 or 32 QPs"):
                     mx_udma_gradient_scratch(provider)
                 self.assertEqual(provider.epoch, 0)
                 provider.runtime.put.assert_not_called()
@@ -187,6 +227,8 @@ class TestMXFP8GradientUdma(unittest.TestCase):
         placement = build_expert_replica_plan([[100, 0, 0, 0]] * 4, 1)
         provider = _provider(1)
         layout = mx_udma_gradient_scratch(provider)
+        peer_qps = ((1, 2, 3, 4),) * 4
+        layout = replace(layout, peer_qps=peer_qps)
         events = ((32, 64), (96, 128))
         plan = SimpleNamespace(replica_w2_events=events[0], replica_w13_events=events[1],
                                spec=SimpleNamespace(num_cube_cores=32))
@@ -207,9 +249,8 @@ class TestMXFP8GradientUdma(unittest.TestCase):
                 records = (words[words[1]:words[2]], words[words[2]:])
                 self.assertEqual(result.resources, (layout.scratch,))
                 for index, (record, fences) in enumerate(zip(records, events)):
-                    self.assertEqual(record[0], 8)
+                    self.assertEqual(record[0], 9)
                     self.assertEqual(record[3], before_epoch + index + 1)
-                    self.assertEqual(record[12:16], (layout.scratch.data_ptr(), layout.chunk_elements, 4, 16))
                     expected = []
                     for transfer in placement.transfers:
                         if transfer.target_rank == rank:
@@ -219,4 +260,7 @@ class TestMXFP8GradientUdma(unittest.TestCase):
                         if transfer.owner_rank == rank:
                             expected.extend((transfer.target_rank, transfer.target_slot - 1,
                                              transfer.owner_slot, fences[transfer.owner_slot]))
-                    self.assertEqual(record[16:], tuple(expected))
+                    end = 16 + len(expected)
+                    self.assertEqual(record[12:16], (layout.scratch.data_ptr(), layout.chunk_elements, 4, end))
+                    self.assertEqual(record[16:end], tuple(expected))
+                    self.assertEqual(record[end:], tuple(qp for row in peer_qps for qp in row))

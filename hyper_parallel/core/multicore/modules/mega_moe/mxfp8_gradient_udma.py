@@ -19,6 +19,9 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.core.multicore.scheduler.window_queue import _validate_qp_owners
+from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
+
 from .kernel_gradients import _UdmaGradientScratch
 
 _HELPERS = 4
@@ -43,6 +46,27 @@ def mx_udma_gradient_enabled(slots: int, transport: str) -> bool:
     return enabled
 
 
+def mx_gradient_peer_qps(config: Any, spec: Any) -> tuple[tuple[int, ...], ...]:
+    """Reserve four unowned queues per peer without changing any token producer.
+
+    Args:
+        config: Final backward CSR task queues, including dispatch and combine.
+        spec: Physical expert topology owning those queues.
+    """
+    qps = configured_udma_qp_count()
+    vectors = [list(config.vector_task_indices[config.mix_task_indices[worker]:config.mix_task_indices[worker + 1]])
+               for worker in range(64)]
+    owners = _validate_qp_owners(config, spec, vectors, qps)
+    rows = []
+    for peer in range(spec.ep_size):
+        # Keep QP0 available to generic control/signal operations on UDMA-only links.
+        available = tuple(qp for qp in range(1, qps) if (peer, qp) not in owners)
+        if len(available) < _HELPERS:
+            raise ValueError(f"Insufficient unowned gradient QPs: peer={peer}, free={len(available)}")
+        rows.append(available[:_HELPERS])
+    return tuple(rows)
+
+
 def mx_udma_gradient_scratch(provider: Any) -> _UdmaGradientScratch:
     """Borrow scratch without changing weight generations or FP32 inbox storage.
 
@@ -57,9 +81,9 @@ def mx_udma_gradient_scratch(provider: Any) -> _UdmaGradientScratch:
         return cached
     state = provider.runtime.debug_state()
     config = state.get("config") or {}
-    if (state.get("backend_soc_type") != "Ascend950" or config.get("udma_qp_num") != 32
+    if (state.get("backend_soc_type") != "Ascend950" or config.get("udma_qp_num") not in (16, 32)
             or config.get("data_engine") != "mte_udma"):
-        raise ValueError("MX UDMA gradients require an Ascend950 MTE/UDMA runtime with 32 QPs")
+        raise ValueError("MX UDMA gradients require an Ascend950 MTE/UDMA runtime with 16 or 32 QPs")
     if provider.pool is None or not provider.pool.weights:
         raise ValueError("MX UDMA gradient scratch requires a bound signal provider")
     prefix = provider.pool.weights[0].view(torch.uint8).reshape(-1)

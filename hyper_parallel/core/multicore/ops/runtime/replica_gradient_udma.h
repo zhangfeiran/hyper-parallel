@@ -26,22 +26,21 @@ __aicore__ inline uint32_t ReplicaGradientChunkSize(int64_t elements, int64_t of
   return static_cast<uint32_t>(elements - offset < chunk_elements ? elements - offset : chunk_elements);
 }
 
-__aicore__ inline void ValidateReplicaGradientUdmaLayout(GM_ADDR scratch, uint64_t chunk_elements,
-                                                        uint64_t workers, uint64_t qp_base) {
+__aicore__ inline void ValidateReplicaGradientUdmaLayout(GM_ADDR scratch, uint64_t chunk_elements, uint64_t workers) {
   if (scratch == nullptr || reinterpret_cast<uint64_t>(scratch) % DATA_CACHE_LINE_SIZE != 0 ||
       chunk_elements == 0 || chunk_elements % 8 != 0 || chunk_elements > (1U << 19) ||
-      workers != 4 || qp_base != 16) {
+      workers != 4) {
     AscendC::Trap();
   }
 }
 
-// A caller must reserve every (peer, qp_base + worker) for this helper alone.
+// A caller must reserve every (peer, qp) for this helper alone.
 // Source/slot iteration remains in the caller's existing deterministic order.
 __aicore__ inline void AddReplicaGradientUdma(GM_ADDR output, GM_ADDR source, int64_t elements,
                                              int32_t peer, int32_t worker, int32_t workers,
-                                             GM_ADDR scratch, uint32_t chunk_elements, uint32_t qp_base) {
+                                             GM_ADDR scratch, uint32_t chunk_elements, uint32_t qp) {
 #if !defined(__DAV_CUBE__) && defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
-  ValidateReplicaGradientUdmaLayout(scratch, chunk_elements, workers, qp_base);
+  ValidateReplicaGradientUdmaLayout(scratch, chunk_elements, workers);
   if (peer < 0 || peer >= aclshmem_n_pes() || elements <= 0 || worker < 0 || worker >= workers) {
     AscendC::Trap();
   }
@@ -50,7 +49,6 @@ __aicore__ inline void AddReplicaGradientUdma(GM_ADDR output, GM_ADDR source, in
     AddReplicaGradient(output, source, elements, peer, worker, workers);
     return;
   }
-  const uint32_t qp = qp_base + static_cast<uint32_t>(worker);
   if (qp >= aclshmemi_udma_qp_info_fetch()->qp_num) {
     AscendC::Trap();
   }

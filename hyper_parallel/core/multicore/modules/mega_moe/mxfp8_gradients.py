@@ -152,7 +152,8 @@ def lease_mx_gradient_return(resources: Any, plan: Any, route: Any,
         raise ValueError("MX kernel gradient return requires an active sparse replica route")
     with lease_mx_gradient_inbox(provider, tuple(weight.row_data for weight in weights), route) as pool:
         first, second = pool.gradients
-        udma = mx_udma_gradient_scratch(provider) if plan.spec.mx_gradient_udma else None
+        udma = (replace(mx_udma_gradient_scratch(provider), peer_qps=plan.backward.gradient_udma_qps)
+                if plan.spec.mx_gradient_udma else None)
         metadata = prepare_kernel_gradient_return(plan, route, provider, gradients[1], second,
                                                  gradient_w13=gradients[0], guest_w13=first, udma=udma)
         if metadata is None or metadata.matrices != (1, 0):

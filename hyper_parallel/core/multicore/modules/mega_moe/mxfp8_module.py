@@ -38,7 +38,7 @@ from .mxfp8_execution import MXFP8Execution
 from .mxfp8_diagnostics import prepare_mx_diagnostics
 from .mxfp8_function import execute_mxfp8_experts
 from .mxfp8_graph import build_mxfp8_runtime
-from .mxfp8_gradient_udma import mx_udma_gradient_enabled
+from .mxfp8_gradient_udma import mx_gradient_peer_qps, mx_udma_gradient_enabled
 from .mxfp8_gradients import mx_projection_events
 from .mxfp8_prefetch import MXProjectionPrefetch
 from .mxfp8_ops import require_mxfp8_window_feature
@@ -59,6 +59,7 @@ class _DeviceRuntime:
     event_capacity: int
     host: Any
     spec: Any
+    gradient_udma_qps: tuple[tuple[int, ...], ...] = ()
 
     @cached_property
     def normal_diagnostic(self) -> torch.Tensor:
@@ -89,6 +90,7 @@ class _MXFP8Plan:
 
 
 def _device_runtime(host: Any, device: Any, spec: Any) -> _DeviceRuntime:
+    gradient_qps = mx_gradient_peer_qps(host.config, spec) if spec.mx_gradient_udma and host.kernel_gradients else ()
     return _DeviceRuntime(
         _device_bytes(serialize_runtime_config(host.config), device),
         _device_bytes(host.gmm_descriptors, device),
@@ -96,6 +98,7 @@ def _device_runtime(host: Any, device: Any, spec: Any) -> _DeviceRuntime:
         host.config.event_capacity,
         host,
         spec,
+        gradient_qps,
     )
 
 
@@ -144,11 +147,11 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
                 require_mxfp8_window_feature("nograd_row_only")
                 require_mxfp8_window_feature("nograd_x_row_only")
             if self.spec.mx_gradient_udma:
-                if configured_udma_qp_count() != 32:
-                    raise ValueError("MX UDMA gradient helpers require 32 QPs")
+                if configured_udma_qp_count() not in (16, 32):
+                    raise ValueError("MX UDMA gradient helpers require 16 or 32 QPs")
                 if os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte") != "mte_udma":
                     raise ValueError("MX UDMA gradient helpers require mte_udma")
-                require_mxfp8_window_feature("replica_udma_gradient")
+                require_mxfp8_window_feature("replica_udma_gradient_peer_qp")
 
         if self.spec.mx_ready_depth or self.spec.mx_swiglu_row_only or self.spec.mx_gradient_udma:
             _collective.collective_call(validate_features, stage="MXFP8 window capabilities", group=self.spec.ep_group)

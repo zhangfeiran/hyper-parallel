@@ -57,6 +57,7 @@ class _UdmaGradientScratch:
     chunk_elements: int
     helpers: int = 4
     qp_base: int = 16
+    peer_qps: tuple[tuple[int, ...], ...] = ()
 
 
 def _validate_gradient_pair(gradient: torch.Tensor, guest: torch.Tensor | None) -> None:
@@ -85,12 +86,15 @@ def _matrix_record(route: ReplicaRoute, provider: Any, events: tuple[int, ...],
         values.extend((bands.owner.data_ptr(), bands.guest.data_ptr(), bands.rows,
                        gradient.shape[-2], gradient.shape[-1], bands.owner.shape[1]))
     elif udma is not None:
-        values[0] = 8
-        values.extend((udma.scratch.data_ptr(), udma.chunk_elements, udma.helpers, udma.qp_base))
+        values[0] = 9 if udma.peer_qps else 8
+        qp_field = 16 + len(incoming) * 3 + len(owned) * 4 if udma.peer_qps else udma.qp_base
+        values.extend((udma.scratch.data_ptr(), udma.chunk_elements, udma.helpers, qp_field))
     for item in incoming:
         values.extend((item.owner_rank, item.target_slot - home, events[item.target_slot]))
     for item in owned:
         values.extend((item.target_rank, item.target_slot - home, item.owner_slot, events[item.owner_slot]))
+    if udma is not None:
+        values.extend(qp for row in udma.peer_qps for qp in row)
     return values
 
 

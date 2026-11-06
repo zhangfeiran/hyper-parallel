@@ -52,7 +52,7 @@ def _reuse_post_dispatch_math(
         vectors[2 * lane + 1] = communication[:boundary] + borrowed + communication[boundary:]
 
 
-def _validate_qp_owners(cfg: Any, spec: Any, vectors: list[list[int]], qps: int) -> None:
+def _validate_qp_owners(cfg: Any, spec: Any, vectors: list[list[int]], qps: int) -> dict[tuple[int, int], int]:
     """Reject concurrent producers of one peer/QP without changing task order."""
     owners = {}
     for worker in range(1, 64, 2):
@@ -68,6 +68,7 @@ def _validate_qp_owners(cfg: Any, spec: Any, vectors: list[list[int]], qps: int)
             owner = owners.setdefault(key, worker)
             if owner != worker:
                 raise ValueError(f"QP owner collision: peer={peer}, qp={qp}, workers={owner}/{worker}")
+    return owners
 
 
 def _window_stages(graph: Any, experts: int) -> dict[str, tuple[int, int]]:
@@ -128,10 +129,7 @@ def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) ->
             vectors[2 * lane].extend(tasks(inputs[1], expert, lane))
     _reuse_post_dispatch_math(cfg, vectors, stages["combine"][0], stages[inputs[0]],
                              active_replicas=bool(spec.replica_slots_per_rank))
-    # A backward with UDMA gradient helpers reserves QPs 16..19. Validate the
-    # token producers against the same lower bank selected by the device.
-    qps = (16 if not forward and getattr(spec, "mx_gradient_udma", False) and spec.replica_slots_per_rank
-           else configured_udma_qp_count())
+    qps = configured_udma_qp_count()
     if qps < 32:
         _validate_qp_owners(cfg, spec, vectors, qps)
     install_worker_queues(cfg, cubes, vectors)

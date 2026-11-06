@@ -137,7 +137,7 @@ class KernelWorkerBase {
         }
         replica_gradient_config_ = reinterpret_cast<GM_ADDR>(extension[9]);
         auto config = reinterpret_cast<__gm__ uint64_t *>(replica_gradient_config_);
-        replica_udma_gradient_ = config[0] == 8 || (config[0] == 2 && config[config[1]] == 8);
+        replica_udma_legacy_qp_bank_ = config[0] == 8 || (config[0] == 2 && config[config[1]] == 8);
       }
     }
     this->runtime_task_capacity = getRuntimeTaskCapacity(runtimeConfigPtr);
@@ -224,7 +224,8 @@ class KernelWorkerBase {
   CycleTraceRecorder *replica_trace_ = nullptr;
   uint32_t replica_trace_task_ = 0;
   GM_ADDR replica_gradient_config_ = nullptr;
-  bool replica_udma_gradient_ = false;
+  // Mode 9 retains token QPs and selects unowned queues separately for each peer.
+  bool replica_udma_legacy_qp_bank_ = false;
 
   __aicore__ inline void ProcessReplicaGradients() {
 #ifndef __DAV_CUBE__
@@ -259,14 +260,18 @@ class KernelWorkerBase {
     const int32_t rank = config[1], slots = config[2], epoch = config[3];
     const int64_t elements = config[4];
     const int32_t incoming_count = config[10], owned_count = config[11];
-    if ((config[0] != 1 && config[0] != 7 && config[0] != 8) ||
+    if ((config[0] != 1 && config[0] != 7 && config[0] != 8 && config[0] != 9) ||
         rank < 0 || rank >= ep || slots <= 0 || epoch <= 0 || elements <= 0 ||
         incoming_count < 0 || incoming_count > slots || owned_count < 0 || owned_count > ep * slots) {
       AscendC::Trap();
     }
-    if (config[0] == 8) {
-      ValidateReplicaGradientUdmaLayout(reinterpret_cast<GM_ADDR>(config[12]), config[13], config[14], config[15]);
+    if (config[0] == 8 || config[0] == 9) {
+      ValidateReplicaGradientUdmaLayout(reinterpret_cast<GM_ADDR>(config[12]), config[13], config[14]);
       if (core_num != 4) {
+        AscendC::Trap();
+      }
+      const uint64_t qp_field = config[0] == 8 ? 16 : 16 + incoming_count * 3 + owned_count * 4;
+      if (config[15] != qp_field) {
         AscendC::Trap();
       }
     }
@@ -287,7 +292,8 @@ class KernelWorkerBase {
     GM_ADDR output = reinterpret_cast<GM_ADDR>(config[5]);
     GM_ADDR guest = reinterpret_cast<GM_ADDR>(config[6]);
     GM_ADDR ready = reinterpret_cast<GM_ADDR>(config[7]);
-    __gm__ uint64_t *incoming = config + (config[0] == 7 ? 18 : config[0] == 8 ? 16 : 12);
+    const int32_t header_words = config[0] == 7 ? 18 : (config[0] == 8 || config[0] == 9) ? 16 : 12;
+    __gm__ uint64_t *incoming = config + header_words;
     __gm__ uint64_t *owned = incoming + incoming_count * 3;
     // Publishing every local producer before remote waits breaks ring dependencies.
     if (worker == 0 && config[0] != 7) {
@@ -309,9 +315,13 @@ class KernelWorkerBase {
       WaitForDependency(owned[index * 4 + 3]);
       WaitReplicaCompletion(ready + (peer * slots + slot) * DATA_CACHE_LINE_SIZE, epoch);
       const uint64_t start = profiling ? trace.Now() : 0;
-      if (config[0] == 8) {
+      if (config[0] == 8 || config[0] == 9) {
+        const uint64_t qp = config[0] == 8 ? config[15] + worker : config[config[15] + peer * 4 + worker];
+        if (qp >= 32) {
+          AscendC::Trap();
+        }
         AddReplicaGradientUdma(output + owner * elements * sizeof(float), guest + slot * elements * sizeof(float),
-            elements, peer, worker, core_num, reinterpret_cast<GM_ADDR>(config[12]), config[13], config[15]);
+            elements, peer, worker, core_num, reinterpret_cast<GM_ADDR>(config[12]), config[13], qp);
       } else {
         AddReplicaGradient(output + owner * elements * sizeof(float), guest + slot * elements * sizeof(float),
                             elements, peer, worker, core_num);

@@ -118,7 +118,7 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
                           this->input_list[task_desc.inputs[1].input_position] +
                             task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type,
                           src_offset_, send_data_size_, signal, static_cast<int64_t>(task_desc.trigger_event), 1,
-                          nullptr, 1, target_pe, false, this->replica_udma_gradient_ ? 16 : 0);
+                          nullptr, 1, target_pe, false, this->replica_udma_legacy_qp_bank_ ? 16 : 0);
   }
 #endif
 };
