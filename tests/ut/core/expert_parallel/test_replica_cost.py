@@ -17,6 +17,7 @@
 import random
 import unittest
 from dataclasses import replace
+from typing import Tuple, Union
 from unittest.mock import PropertyMock, patch
 
 from hyper_parallel.core.expert_parallel.hot_replica import (
@@ -31,6 +32,26 @@ from hyper_parallel.core.expert_parallel.hot_replica.planner import (
 
 class TestReplicaCost(unittest.TestCase):
     """Keep measured costs advisory and preserve every routing invariant."""
+
+    def test_zero_token_coefficient_skips_unused_source_expert_reads(self) -> None:
+        """A zero token term retains the score without walking per-expert source hits."""
+        class NoHits(tuple):
+            """Allow aggregate iteration while rejecting unused expert-index reads."""
+
+            def __getitem__(self, _index: Union[int, slice]) -> Union[int, Tuple[int, ...]]:
+                raise AssertionError('Source expert hit was read')
+
+        counts = ((10, 4, 0, 0), (6, 0, 0, 0))
+        guarded = tuple(NoHits(row) for row in counts)
+        copies = [{0: 10, 1: 4}, {2: 0, 3: 0, 0: 6}]
+        config = ExpertReplicaConfig(4, 2, 1)
+        model = self._model(effective_group_ms=(.5, .1, .2, .3, 0., .4), _rank_nodes=(0, 1))
+        expected = cost._QuotaCostState(model, copies, counts, config).score()
+        actual = cost._QuotaCostState(model, copies, guarded, config).score()
+        self.assertEqual(actual, expected)
+        positive = replace(model, effective_group_ms=(.5, .1, .2, .3, .25, .4))
+        with self.assertRaisesRegex(AssertionError, 'Source expert hit'):
+            cost._QuotaCostState(positive, copies, guarded, config).score()
 
     def test_resident_backward_weights_keep_forward_copy_cost(self) -> None:
         """Residency removes one backward copy without discounting forward or replay."""
@@ -103,6 +124,54 @@ class TestReplicaCost(unittest.TestCase):
         self.assertEqual(state.source_totals, [10, 6])
         self.assertIs(state.source_totals, state.source_totals)
         self.assertGreater(state.score(), cost._QuotaCostState(self._model(), copies, counts, config).score())
+
+    def test_group_quota_trials_sum_each_immutable_source_once(self) -> None:
+        """Quota changes must refresh their score without rescanning immutable source rows."""
+        counts, config = ((10, 0, 0, 0), (6, 0, 0, 0)), ExpertReplicaConfig(4, 2, 1)
+        copies = [{0: 8, 1: 0}, {2: 0, 3: 0, 0: 8}]
+        model = self._model(effective_group_ms=(.5, 1., 2., 3., .25, 4.), _rank_nodes=(0, 1))
+        state = cost._QuotaCostState(model, copies, counts, config)
+        trials = (8, 3, 0, 7, 8)
+        expected, actual = [], []
+        with patch.object(cost, 'sum', wraps=sum, create=True) as aggregate:
+            for quota in trials:
+                copies[0][0], copies[1][0] = 16 - quota, quota
+                actual.append(state.trial_score(0, 1, 0, (0., 0.)))
+                actual.append(state.score())
+            source_sums = [sum(call.args[0] is row for call in aggregate.call_args_list) for row in counts]
+        for quota in trials:
+            copies[0][0], copies[1][0] = 16 - quota, quota
+            features = cost._effective_group_features(copies, counts, config.home_experts, model._rank_nodes)
+            expected.extend([sum(value * coefficient for value, coefficient
+                                 in zip(features, model.effective_group_ms))] * 2)
+        self.assertEqual(actual, expected)
+        self.assertEqual(source_sums, [1, 1])
+
+    def test_group_state_skips_unused_rank_costs_during_refinement(self) -> None:
+        """Group scoring and quota acceptance must not compute ignored legacy phase sums."""
+        counts, config = ((10, 0, 0, 0), (6, 0, 0, 0)), ExpertReplicaConfig(4, 2, 1)
+        copies = [{0: 8, 1: 0}, {2: 0, 3: 0, 0: 8}]
+        model = self._model(effective_group_ms=(.5, 1., 2., 3., .25, 4.), _rank_nodes=(0, 1))
+        with patch.object(cost._QuotaCostState, '_rank_cost', side_effect=AssertionError('Unused rank cost')):
+            state = cost._QuotaCostState(model, copies, counts, config)
+            first = state.score()
+            copies[0][0], copies[1][0] = 9, 7
+            second = state.trial_score(0, 1, 0, (0., 0.))
+            state.accept(0, 1, 0)
+            self.assertEqual(state.score(), second)
+            self.assertNotEqual(first, second)
+            cost.refine_replica_quotas(copies, counts, config, 16, model, minimum_replica_rows=8)
+        plan = _materialize(counts, copies, config, 16)
+        plan.validate()
+        self.assertLessEqual(model.estimate_ms(plan), first)
+
+    def test_group_state_retains_interpolation_coverage_checks(self) -> None:
+        """Skipping unused sums must not turn out-of-range expert rows into valid predictions."""
+        model = self._model(effective_group_ms=(.5, 1., 2., 3., .25, 4.), _rank_nodes=(0, 1))
+        counts = ((129, 0, 0, 0), (0, 0, 0, 0))
+        copies = [{0: 129, 1: 0}, {2: 0, 3: 0}]
+        with self.assertRaisesRegex(ValueError, 'calibrated cost range'):
+            cost._QuotaCostState(model, copies, counts, ExpertReplicaConfig(4, 2, 1))
 
     def test_small_copy_is_removed_on_score_plateau_before_search_guard(self) -> None:
         """A cheap deletion must not require a strict gain or expensive quota search."""
@@ -358,3 +427,17 @@ class TestReplicaCost(unittest.TestCase):
             candidate.validate()
         with self.assertRaisesRegex(ValueError, "quota_search_budget_ms"):
             self._model(quota_search_budget_ms=-1)
+
+    def test_disabled_quota_sweep_retains_capacity_required_replicas(self) -> None:
+        """A no-sweep table still checks whether an owner-only plan is feasible."""
+        counts = [[10, 4, 0, 0]] * 2
+        model = self._model(quota_search_budget_ms=None, minimum_replica_gain_ms=100)
+        with patch.object(cost, "_refine_edge", side_effect=AssertionError("Disabled quota sweep ran")):
+            loose = build_expert_replica_plan(counts, 1, capacity_limit=28, cost_model=model, adaptive=True)
+            tight = build_expert_replica_plan(counts, 1, capacity_limit=14, cost_model=model, adaptive=True)
+
+        loose.validate()
+        tight.validate()
+        self.assertFalse(loose.transfers)
+        self.assertTrue(tight.transfers)
+        self.assertEqual(max(tight.destination_loads), 14)

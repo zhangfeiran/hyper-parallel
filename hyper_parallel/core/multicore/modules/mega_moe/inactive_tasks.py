@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Small runtime patches that omit only unmapped guest suffix computation."""
+"""Runtime patches omitting unmapped guest work with matched remote signals."""
 
 from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import lcm
+import os
 import struct
 from typing import Any
 import weakref
@@ -29,7 +31,15 @@ from hyper_parallel.core.expert_parallel.hot_replica._metadata import _copy_devi
 from hyper_parallel.core.multicore.scheduler.config import RuntimeConfigC, TaskType
 
 
-UNMAPPED_GUEST_SUFFIX_SCHEDULE = 'fixed_queue_unmapped_guest_suffix_v1'
+UNMAPPED_GUEST_SUFFIX_SCHEDULE = 'fixed_queue_global_guest_communication_suffix_v1'
+RANK_LOCAL_GUEST_SUFFIX_SCHEDULE = 'fixed_queue_rank_local_guest_communication_suffix_v1'
+
+
+def replica_runtime_schedule() -> str:
+    """Return the schedule selected before building an immutable runtime."""
+    if os.environ.get('HYPER_PARALLEL_REPLICA_RANK_LOCAL_COMM') == '1':
+        return RANK_LOCAL_GUEST_SUFFIX_SCHEDULE
+    return UNMAPPED_GUEST_SUFFIX_SCHEDULE
 
 
 @dataclass(frozen=True)
@@ -42,6 +52,12 @@ class GuestTaskPrefix:
     patches: tuple[tuple[int, bytes], ...]
     dropped_cube: int
     dropped_vector: int
+    communication_experts: int = 0
+    ep_size: int = 0
+    communication_variants: tuple[GuestTaskPrefix, ...] = ()
+    combine_event: int = -1
+    dropped_combine: int = 0
+    incoming_combine: int = 0
 
 
 def _whole_round_suffixes(queue: list[int], experts: dict[int, int], active: int,
@@ -69,16 +85,60 @@ def _encode(values: Sequence[int]) -> bytes:
     return struct.pack(f'<{len(values)}i', *values)
 
 
-def build_guest_task_prefixes(config: RuntimeConfigC, *, home_experts: int) -> tuple[GuestTaskPrefix, ...]:
+def _communication_prefix(config: RuntimeConfigC, queue: list[int], *, local: int, ep: int,
+                          active: int, workers: int, mode: str,
+                          dispatch: bool | None = None) -> tuple[list[int], list[int], Counter]:
+    """Drop whole empty rounds and count their destination-side signals."""
+    experts, stages = {}, {}
+    for task_id in queue:
+        task = config.all_tasks[task_id]
+        if task.task_type not in (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM):
+            continue
+        if task.inputs[3].input_position not in (4, 15, 16) or task.task_split_num % (local * ep):
+            return queue, [], Counter()
+        if dispatch is not None and (task.inputs[3].input_position == 4) != dispatch:
+            continue
+        expected = (TaskType.TASK_SHMEM_GET_MEM if task.inputs[3].input_position == 4 and mode == 'pull'
+                    else TaskType.TASK_SHMEM_PUT_MEM_SIGNAL)
+        if task.task_type != expected:
+            return queue, [], Counter()
+        tiles = int(task.task_split_num) // (local * ep)
+        if tiles < 1:
+            return queue, [], Counter()
+        experts[task_id] = (int(task.task_index) // tiles) % local
+        stages[task_id] = (int(task.inputs[3].input_position), int(task.task_index) // tiles)
+    # RATR rotates peer order by sender rank. Whole peer rounds preserve equal
+    # incoming signal counts, and whole worker rounds preserve core ownership.
+    kept, removed = _whole_round_suffixes(queue, experts, active, lcm(workers, ep))
+    groups = Counter(stages[task_id] for task_id in removed)
+    # Every sender must omit the same tiles for each destination. Keep ordinary
+    # communication if a future graph does not have that symmetric geometry.
+    for stage, group in groups:
+        if any(groups[stage, group % local + rank * local] != groups[stage, group] for rank in range(ep)):
+            return queue, [], Counter()
+    reductions = Counter()
+    for task_id in removed:
+        task = config.all_tasks[task_id]
+        is_dispatch = stages[task_id][0] == 4
+        reductions[int(task.trigger_event)] += ep if is_dispatch and mode == 'push' else 1
+    return kept, removed, reductions
+
+
+def build_guest_task_prefixes(config: RuntimeConfigC, *, home_experts: int, ep_size: int = 0,
+                              dispatch_mode: str = 'push',
+                              rank_local_communication: bool = False) -> tuple[GuestTaskPrefix, ...]:
     """Precompile bounded CPU patches for every possible mapped guest prefix.
 
-    Communication descriptors and their queues remain untouched except for
-    positions shifted by complete worker rounds. Partial rounds remain as harmless
-    empty tasks so retained work stays on the same physical worker.
+    Local computation uses the rank's mapped prefix. Communication can additionally
+    use a common EP-wide prefix; receiver thresholds omit exactly the removed
+    remote signals. Partial rounds retain physical worker ownership.
 
     Args:
         config: Final physical runtime, including any independent producer fences.
         home_experts: Number of owned expert slots preceding the guest pool.
+        ep_size: Enable symmetric communication variants for this EP size, or zero.
+        dispatch_mode: Native dispatch protocol used by this physical runtime.
+        rank_local_communication: Use the local prefix for Pull dispatch and combine.
 
     Returns:
         One immutable patch per active prefix, including the complete restoration
@@ -87,6 +147,8 @@ def build_guest_task_prefixes(config: RuntimeConfigC, *, home_experts: int) -> t
     local = int(config.dynamic_data.dynamic_group_size)
     if type(home_experts) is not int or not 0 < home_experts < local:
         raise ValueError('home_experts must be positive and smaller than the physical local expert count')
+    if type(ep_size) is not int or ep_size < 0 or dispatch_mode not in ('push', 'pull'):
+        raise ValueError('Communication prefixes require a nonnegative EP size and push/pull dispatch')
     workers = int(config.num_workers) // 2
     if workers < 1 or config.num_workers % 2 or config.task_index_num[2]:
         return ()
@@ -104,15 +166,46 @@ def build_guest_task_prefixes(config: RuntimeConfigC, *, home_experts: int) -> t
         trigger_events[task_id] = (int(task.trigger_event),)
         if task.task_type == TaskType.TASK_GROUPED_MATMUL and task.extra_value_1:
             trigger_events[task_id] += (int(task.extra_value_1),)
+    communication = {local: (queues[1], [], Counter())}
+    dispatches, combines = {}, {}
+    combine_event = -1
+    if ep_size and rank_local_communication:
+        events = {int(config.all_tasks[task_id].trigger_event) for task_id in queues[1]
+                  if config.all_tasks[task_id].task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL
+                  and config.all_tasks[task_id].inputs[3].input_position in (15, 16)}
+        if len(events) != 1:
+            return ()
+        combine_event = events.pop()
+        for prefixes, dispatch in ((dispatches, True), (combines, False)):
+            prefixes[local] = communication[local]
+            prefixes.update((active, _communication_prefix(
+                config, queues[1], local=local, ep=ep_size, active=active, workers=workers, mode=dispatch_mode,
+                dispatch=dispatch,
+            )) for active in range(home_experts, local))
+    elif ep_size:
+        communication.update((active, _communication_prefix(
+            config, queues[1], local=local, ep=ep_size, active=active, workers=workers, mode=dispatch_mode,
+        )) for active in range(home_experts, local))
     layout = type(config)
-    prefixes = []
-    for active in range(home_experts, local + 1):
-        selected = [_whole_round_suffixes(queue, experts, active, workers) for queue in queues]
-        reductions = Counter(event for _, removed in selected for task in removed for event in trigger_events[task])
+
+    def compile_prefix(active: int, common: int, *, use_local: bool = False) -> GuestTaskPrefix | None:
+        removed_combine = 0
+        if use_local:
+            dispatch = dispatches[common if dispatch_mode == 'push' else active]
+            combine = combines[active]
+            removed_communication = set(dispatch[1]) | set(combine[1])
+            vector = [task_id for task_id in queues[1] if task_id not in removed_communication]
+            remote_reductions = dispatch[2] + combine[2]
+            removed_combine = len(combine[1])
+        else:
+            vector, removed_communication, remote_reductions = communication[common]
+        selected = [_whole_round_suffixes(queue, experts, active, workers) for queue in (queues[0], vector)]
+        reductions = remote_reductions + Counter(
+            event for _, removed in selected for task in removed for event in trigger_events[task])
         triggers = list(config.all_event_num_triggers)
         for event, count in reductions.items():
             if not 0 <= event < len(triggers) or triggers[event] < count:
-                return ()
+                return None
             triggers[event] -= count
         counts = list(config.task_index_num)
         counts[:2] = [len(kept) for kept, _ in selected]
@@ -125,18 +218,33 @@ def build_guest_task_prefixes(config: RuntimeConfigC, *, home_experts: int) -> t
             (layout.cube_task_indices.offset, queue_bytes[0]),
             (layout.vector_task_indices.offset, queue_bytes[1]),
         )
-        prefixes.append(GuestTaskPrefix(home_experts, active, local, patches,
-                                        len(selected[0][1]), len(selected[1][1])))
+        return GuestTaskPrefix(home_experts, active, local, patches, len(selected[0][1]),
+                               len(selected[1][1]) + len(removed_communication), common, ep_size,
+                               combine_event=combine_event, dropped_combine=removed_combine,
+                               incoming_combine=removed_combine)
+
+    prefixes = []
+    for active in range(home_experts, local + 1):
+        prefix = compile_prefix(active, local)
+        if ep_size and rank_local_communication:
+            variants = tuple(compile_prefix(active, common, use_local=True) for common in range(active, local + 1))
+        else:
+            variants = tuple(compile_prefix(active, common) for common in range(active, local)) if ep_size else ()
+        if prefix is None or any(variant is None for variant in variants):
+            return ()
+        prefixes.append(replace(prefix, communication_variants=variants))
     return tuple(prefixes)
 
 
 def select_guest_task_prefix(prefixes: tuple[GuestTaskPrefix, ...],
-                             slot_to_logical: Sequence[int] | None) -> GuestTaskPrefix | None:
+                             slot_to_logical: Sequence[int] | None, *,
+                             all_slot_to_logical: Sequence[Sequence[int]] | None = None) -> GuestTaskPrefix | None:
     """Retain holes and mapped zero-row guests; remove only a proven unmapped suffix.
 
     Args:
         prefixes: Physical runtime patches compiled before steady-state execution.
         slot_to_logical: The saved invocation's local physical mapping, or no pruning.
+        all_slot_to_logical: The same immutable EP-wide plan on every participant.
 
     Returns:
         The smallest prefix containing every mapped slot. The full prefix restores
@@ -155,11 +263,48 @@ def select_guest_task_prefix(prefixes: tuple[GuestTaskPrefix, ...],
     for slot in range(full.home_experts, full.local_experts):
         if slot_to_logical[slot] >= 0:
             active = slot + 1
-    return prefixes[active - full.home_experts]
+    selected = prefixes[active - full.home_experts]
+    if all_slot_to_logical is None or not selected.ep_size:
+        return selected
+    if len(all_slot_to_logical) != selected.ep_size or any(
+            len(row) != full.local_experts or any(type(value) is not int or value < -1 for value in row)
+            for row in all_slot_to_logical):
+        raise ValueError('Global replica mapping does not match the physical EP geometry')
+    if selected.combine_event < 0:
+        common = max((slot + 1 for row in all_slot_to_logical
+                      for slot in range(full.home_experts, full.local_experts) if row[slot] >= 0),
+                     default=full.home_experts)
+        if common < active:
+            raise ValueError('Global replica mapping omits a locally mapped guest slot')
+        return selected if common == full.local_experts else selected.communication_variants[common - active]
+    mapped = tuple(max((slot + 1 for slot in range(full.home_experts, full.local_experts) if row[slot] >= 0),
+                       default=full.home_experts) for row in all_slot_to_logical)
+    common = max(mapped)
+    if common < active:
+        raise ValueError('Global replica mapping omits a locally mapped guest slot')
+    if not any(tuple(row) == tuple(slot_to_logical) for row in all_slot_to_logical):
+        raise ValueError('Global replica mapping omits the local physical mapping')
+    selected = selected.communication_variants[common - active]
+    removed = sum(prefixes[count - full.home_experts].communication_variants[-1].dropped_combine
+                  for count in mapped)
+    if removed % selected.ep_size:
+        raise ValueError('Combine suffixes do not have symmetric per-peer signal counts')
+    incoming = removed // selected.ep_size
+    if incoming == selected.incoming_combine:
+        return selected
+    # Replace the local sender's omitted signals with the actual incoming count.
+    offset, original = selected.patches[0]
+    triggers = bytearray(original)
+    index = selected.combine_event * struct.calcsize('<i')
+    needed = struct.unpack_from('<i', triggers, index)[0] + selected.dropped_combine - incoming
+    if needed < 0:
+        raise ValueError('Combine suffixes exceed the receiver completion threshold')
+    struct.pack_into('<i', triggers, index, needed)
+    return replace(selected, patches=((offset, bytes(triggers)), *selected.patches[1:]), incoming_combine=incoming)
 
 
 def apply_guest_task_prefix(runtime: torch.Tensor, prefix: GuestTaskPrefix | None, *,
-                            base: torch.Tensor, cache: dict[int, tuple[Any, int]] | None = None) -> torch.Tensor:
+                            base: torch.Tensor, cache: dict[int, tuple[Any, Any]] | None = None) -> torch.Tensor:
     """Update only an exclusively leased runtime image, never the saved plan body.
 
     Args:
@@ -177,7 +322,8 @@ def apply_guest_task_prefix(runtime: torch.Tensor, prefix: GuestTaskPrefix | Non
     if runtime is base:
         raise ValueError('Guest task patches require an exclusive runtime image')
     previous = None if cache is None else cache.get(id(base))
-    if previous is not None and previous[0]() is runtime and previous[1] == prefix.active_experts:
+    identity = (prefix.active_experts, prefix.communication_experts, prefix.incoming_combine, prefix.dropped_vector)
+    if previous is not None and previous[0]() is runtime and previous[1] == identity:
         return runtime
     for offset, payload in prefix.patches:
         if offset < 0 or offset + len(payload) > base.numel():
@@ -188,5 +334,5 @@ def apply_guest_task_prefix(runtime: torch.Tensor, prefix: GuestTaskPrefix | Non
     for offset, payload in prefix.patches:
         _copy_device_bytes(payload, runtime[offset:offset + len(payload)])
     if cache is not None:
-        cache[id(base)] = (weakref.ref(runtime), prefix.active_experts)
+        cache[id(base)] = (weakref.ref(runtime), identity)
     return runtime

@@ -20,6 +20,7 @@ __all__ = ["MegaMoeExperts"]
 
 import hashlib
 import math
+import os
 import struct
 from collections.abc import Mapping
 from dataclasses import replace
@@ -43,6 +44,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.policy import (
 )
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 from hyper_parallel.core.expert_parallel.hot_replica.critical_path import execution_fingerprint
+from hyper_parallel.core.expert_parallel.hot_replica.calibration_catalog import ENVIRONMENT_DEFAULTS
 from hyper_parallel.core.multicore._loader import get_multicore_paths
 from hyper_parallel.core.expert_parallel.hot_replica.topology import _local_node_identity, _node_ids
 from hyper_parallel.core.expert_parallel.hot_replica.device import (
@@ -57,10 +59,11 @@ from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
 from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capacity
 
+from .event_refresh import event_refresh_intervals
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
-from .inactive_tasks import UNMAPPED_GUEST_SUFFIX_SCHEDULE
+from .inactive_tasks import replica_runtime_schedule
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
@@ -76,6 +79,19 @@ from .workspace import MegaMoeWorkspace
 
 ExpertWeightLayout = Literal["EIO", "EOI"]
 _EXPERT_WEIGHT_LAYOUTS = frozenset(("EIO", "EOI"))
+_CHECKPOINT_GRAD_MODE_KEY = object()
+
+
+def _checkpoint_contract() -> str:
+    """Remember original call-boundary grad mode across one checkpoint invocation."""
+    state = get_recompute_state()
+    if state is None:
+        return 'none'
+    original_grad = state.get_resource(
+        _CHECKPOINT_GRAD_MODE_KEY, lambda: None if state.is_recomputing else torch.is_grad_enabled())
+    if original_grad is None:
+        return 'unknown'
+    return 'nonreentrant' if original_grad else 'reentrant'
 
 
 @lru_cache(maxsize=1)
@@ -90,7 +106,7 @@ def _critical_native_fingerprint() -> str:
     return digest.hexdigest()
 
 
-def _critical_execution_signature(module: Any, resources: Any) -> str:
+def _critical_execution_signature(module: Any, resources: Any, *, execution_tokens: int | None = None) -> str:
     """Bind calibration to the actual static execution and normalized EP topology."""
     metadata = {name: getattr(module, name) for name in
                 ('dispatch_mode', 'hidden_size', 'intermediate_size', 'ep_size', 'num_experts', 'top_k',
@@ -103,10 +119,18 @@ def _critical_execution_signature(module: Any, resources: Any) -> str:
                     route_task_bounds=resources.spec.route_task_bounds,
                     dispatch_split=resources.spec.dispatch_split, combine_split=resources.spec.combine_split,
                     rank_nodes=resources.rank_nodes, checkpointed=get_recompute_state() is not None,
+                    checkpoint_contract=_checkpoint_contract(),
                     native_payload=_critical_native_fingerprint(), policy_abi='dynamic_tokens_v4',
+                    cube_cores=getattr(resources.spec, 'num_cube_cores', None),
+                    global_world_size=dist.get_world_size() if dist.is_initialized() else module.ep_size,
                     template='replica_ready_ack_v1', weight_dtype='bfloat16', partial_dtype='float32')
     if module.replica_slots_per_rank:
-        metadata['runtime_schedule'] = UNMAPPED_GUEST_SUFFIX_SCHEDULE
+        metadata['runtime_schedule'] = replica_runtime_schedule()
+    metadata['runtime_environment'] = {name: os.environ.get(name, default)
+                                       for name, default in ENVIRONMENT_DEFAULTS.items()}
+    if execution_tokens is not None:
+        _integer(execution_tokens, 'Execution token domain', 0)
+        metadata['maximum_source_tokens'] = execution_tokens
     return execution_fingerprint(metadata)
 
 
@@ -288,23 +312,9 @@ class _MegaMoeExecutionResources:
         if self.spec.dispatch_mode == "pull":
             self.workspace.claim()
 
-    def replica_receive_capacity(self, tokens: int, reservation: int) -> int:
-        """Price bounded optional receive growth before committing the selected plan.
-
-        Args:
-            tokens: Proposed source token capacity.
-            reservation: Existing owner receive reservation.
-        """
-        return self.heap_manager.replica_receive_capacity(self.workspace, tokens, reservation)
-
-    def critical_path_receive_capacity(self, tokens: int, reservation: int) -> int:
-        """Use committed storage or an explicit hard Heap budget for calibrated candidates.
-
-        Args:
-            tokens: Proposed source token capacity.
-            reservation: Existing owner receive reservation.
-        """
-        return self.heap_manager.replica_receive_capacity(self.workspace, tokens, reservation, use_hard_budget=True)
+    def receive_capacity_limit(self, tokens: int) -> int:
+        """Query the allocator's common Push growth limit before selecting a route."""
+        return self.heap_manager.receive_capacity_limit(self.workspace, tokens)
 
     def can_close(self) -> bool:
         """Report whether neither an active call nor a backward graph needs buffers."""
@@ -319,7 +329,8 @@ class _MegaMoeExecutionResources:
                   "dispatch_split", "combine_split", "swiglu_limit", "swiglu_hf_bf16", "single_expert_tasks",
                   "route_task_bounds", "gate_up_expert_padding", "expert_weight_layout",
                   "ep_size", "auto_tokens",
-                  "_replica_cost_model_enabled", "_replica_critical_path_identity",
+                  "_replica_cost_model_enabled", "_replica_critical_path_identity", "_gradient_queue_order",
+                  "_cube_event_refresh_us", "_vector_event_refresh_us", "_batch_empty_dispatch",
                   "replica_slots_per_rank", "replica_transport")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v4", "bfloat16",
@@ -327,6 +338,11 @@ class _MegaMoeExecutionResources:
                     getattr(self, 'soc_name', ''))
         if any(spec.get('_replica_critical_path_identity') for spec in specifications):
             manifest += (_critical_native_fingerprint(),)
+        if any(spec.get('replica_slots_per_rank') for spec in specifications):
+            manifest += (replica_runtime_schedule(),)
+        if any(spec.get('replica_slots_per_rank') == 2 for spec in specifications):
+            manifest += (os.environ.get('HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH', '0'),
+                         os.environ.get('HYPER_PARALLEL_REPLICA_PROJECTED_GUEST_SEARCH', '0'))
         # Resource groups must have the same order as their symmetric allocations.
         manifest += (_local_node_identity(),)
         manifests = [None] * self.spec.ep_size
@@ -568,6 +584,18 @@ class MegaMoeExperts(MulticoreModule):
         self.replica_minimum_load_reduction = replica_minimum_load_reduction
         self.replica_transport = replica_transport
         _integer(initial_token_capacity, "initial_token_capacity", 1)
+        gradient_order = os.environ.get('HYPER_PARALLEL_MOE_GRADIENT_QUEUE_ORDER', 'original')
+        if gradient_order not in ('original', 'w1_reverse', 'w1_join_once', 'device_w1_asc', 'device_w1_desc',
+                                   'device_w1_asc_join', 'device_late_auto', 'device_lane_rotate',
+                                   'device_w1_asc_join_once', 'device_w1_asc_join_rotate'):
+            raise ValueError('Unsupported HYPER_PARALLEL_MOE_GRADIENT_QUEUE_ORDER')
+        if gradient_order != 'original' and self._cost_model_enabled:
+            raise ValueError('Experimental gradient queues require the replica cost model to be disabled')
+        cube_refresh, vector_refresh = event_refresh_intervals()
+        if (cube_refresh or vector_refresh) and self._cost_model_enabled:
+            raise ValueError('Experimental event refresh intervals require the replica cost model to be disabled')
+        batch_empty_dispatch = (dispatch_mode == 'push' and not replica_slots_per_rank
+                                and os.environ.get('HYPER_PARALLEL_MOE_BATCH_EMPTY_DISPATCH') == '1')
         specification = {
             "local_num_tokens": _align_capacity(initial_token_capacity),
             "hidden_size": hidden_size,
@@ -590,6 +618,10 @@ class MegaMoeExperts(MulticoreModule):
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
+            "_gradient_queue_order": gradient_order,
+            "_cube_event_refresh_us": cube_refresh,
+            "_vector_event_refresh_us": vector_refresh,
+            "_batch_empty_dispatch": batch_empty_dispatch,
         }
         specification["auto_tokens"] = True
         if replica_slots_per_rank:
@@ -805,17 +837,14 @@ class MegaMoeExperts(MulticoreModule):
         self._validate_tensors(hidden_flat, expert_weights)
         return hidden_flat
 
-    def _replica_capacity_options(self, resources: _MegaMoeExecutionResources, cost_model: Any) -> dict:
+    def _replica_capacity_options(self, resources: _MegaMoeExecutionResources) -> dict:
         """Retain the existing fixed/growing capacity policy for replica admission."""
         return {
             "receive_capacity": (initial_receive_capacity(self._resource_group.specification)
                               if self.dispatch_mode != "pull" and not resources.spec.auto_tokens else None),
             "_auto_capacity_factor": (self.initial_capacity_factor
                                    if resources.spec.auto_tokens and self.dispatch_mode != "pull" else None),
-            "_capacity_budget": ((resources.critical_path_receive_capacity if cost_model.critical_path is not None
-                               else resources.replica_receive_capacity)
-                              if resources.spec.auto_tokens and self.dispatch_mode != "pull"
-                              and cost_model is not None else None),
+            "_capacity_budget": resources.receive_capacity_limit if self.dispatch_mode != "pull" else None,
         }
 
     def _prepare_replica_route(
@@ -824,12 +853,14 @@ class MegaMoeExperts(MulticoreModule):
         gathered: _GatheredReplicaCounts | None = None,
     ) -> ReplicaRoute:
         """Resolve the unchanged bounded policy only when placement is needed."""
-        selection = ({'execution_schedule': UNMAPPED_GUEST_SUFFIX_SCHEDULE}
+        selection = ({'execution_schedule': replica_runtime_schedule()}
                      if self.replica_slots_per_rank else {})
         if self._cost_model_enabled and _critical_path_available(
                 self.dispatch_mode, self.hidden_size, self.intermediate_size, self.ep_size,
                 self.replica_transport, self.num_experts, self.top_k):
-            selection['execution_signature'] = _critical_execution_signature(self, resources)
+            maximum_tokens = max(row[1] for row in gathered.source_summary) if gathered is not None else None
+            selection['execution_signature'] = _critical_execution_signature(
+                self, resources, execution_tokens=maximum_tokens)
         cost_model = _runtime_cost_model(self._cost_model_enabled, self.dispatch_mode,
             self.hidden_size, self.intermediate_size, self.ep_size, self.replica_transport,
             self.num_experts, self.top_k, hidden.device, **selection)
@@ -843,7 +874,8 @@ class MegaMoeExperts(MulticoreModule):
         # Credit only half of mandatory FP32 gradient bytes. One routed row
         # costs at most 12*H BF16 payload bytes across forward, replay and
         # backward dispatch/combine; weight copies and residency hits add no credit.
-        gradient_units = (2 * bool(autograd_mask & 4) + bool(autograd_mask & 8)) if autograd_mask & 1 else 0
+        training_gradients = bool(autograd_mask & 1) or get_recompute_state() is not None
+        gradient_units = (2 * bool(autograd_mask & 4) + bool(autograd_mask & 8)) if training_gradients else 0
         transfer_row_credit = self.intermediate_size * gradient_units // 6 if cost_model is None else 0
         return prepare_replica_route(
             topk_ids, self.replica_config, self._ep_group,
@@ -856,7 +888,7 @@ class MegaMoeExperts(MulticoreModule):
             compact_home=resources.home_spec is not None,
             dynamic_header=(int(hidden.shape[0] * max(self.hidden_size, self.top_k) > 2**31 - 1),
                             hidden.shape[0], autograd_mask),
-            **self._replica_capacity_options(resources, cost_model),
+            **self._replica_capacity_options(resources),
             _trusted_counts=counts, _gathered_counts=gathered,
         )
 
@@ -964,6 +996,8 @@ class MegaMoeExperts(MulticoreModule):
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
+        # Prime before internal no-grad route preparation; replay uses this original mode.
+        _checkpoint_contract()
         route_options = {"autograd_mask": (
             int(torch.is_grad_enabled()) | (int(hidden_flat.requires_grad) << 1)
             | (int(weights[0].requires_grad) << 2) | (int(weights[1].requires_grad) << 3)

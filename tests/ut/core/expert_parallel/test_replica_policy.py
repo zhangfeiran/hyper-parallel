@@ -16,7 +16,7 @@ import inspect
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -114,7 +114,7 @@ class TestReplicaScheduleSelection(unittest.TestCase):
     """Keep changed runtime queues separate from legacy calibration measurements."""
 
     arguments = ('push', 5120, 2304, 64, 'shmem_signal_kernel_gradient_bands', 384, 6, 'Ascend910_9392')
-    schedule = 'fixed_queue_unmapped_guest_suffix_v1'
+    schedule = 'fixed_queue_global_guest_communication_suffix_v1'
 
     def setUp(self) -> None:
         """Retain real packaged coefficients only as synthetic selector fixtures."""
@@ -129,6 +129,13 @@ class TestReplicaScheduleSelection(unittest.TestCase):
                 arguments = self.arguments[:-1] + (soc,)
                 self.assertIsNone(policy._resolve_cost_model(
                     *arguments, True, execution_schedule=self.schedule))
+
+    def test_communication_schedule_does_not_reuse_compute_only_coefficients(self) -> None:
+        """Compute-only pruning and communication pruning have distinct execution costs."""
+        compute_only = replace(self.legacy, schedule='fixed_queue_unmapped_guest_suffix_v1')
+        with patch.object(policy, '_calibrations', return_value={self.arguments: compute_only}):
+            self.assertIsNone(policy._resolve_cost_model(
+                *self.arguments, True, execution_schedule=self.schedule))
 
     def test_schedule_participates_in_the_resolver_cache_key(self) -> None:
         """Interleaved old and new runtimes must not share a cached legacy match."""
@@ -186,7 +193,8 @@ class TestReplicaScheduleSelection(unittest.TestCase):
         owner = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
                                ep_size=2, replica_slots_per_rank=1)
         self.addCleanup(owner.close)
-        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=True), home_spec=object(), rank_nodes=(0, 1))
+        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=True), home_spec=object(), rank_nodes=(0, 1),
+                                    receive_capacity_limit=Mock())
         with (patch.object(mega_module, '_critical_path_available', return_value=False),
               patch.object(mega_module, '_runtime_cost_model', return_value=None) as resolve,
               patch.object(mega_module, 'prepare_replica_route', return_value=object()) as prepare):

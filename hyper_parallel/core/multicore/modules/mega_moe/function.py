@@ -143,7 +143,7 @@ class _ForwardExecution:
     intermediates: _ForwardIntermediates
     runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
     task_prefix: GuestTaskPrefix | None = None
-    prefix_cache: dict[int, tuple[Any, int]] | None = None
+    prefix_cache: dict[int, tuple[Any, tuple[int, int, int, int]]] | None = None
 
 
 @dataclass(frozen=True)
@@ -159,7 +159,7 @@ class _BackwardExecution:
     diagnostics: Any = None
     runtime_cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None
     task_prefix: GuestTaskPrefix | None = None
-    prefix_cache: dict[int, tuple[Any, int]] | None = None
+    prefix_cache: dict[int, tuple[Any, tuple[int, int, int, int]]] | None = None
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -411,7 +411,7 @@ def _split_runtime(base: torch.Tensor, pool: Any, home: int, *, backward: bool =
                    gradient_return: torch.Tensor | None = None, home_only: bool = False,
                    cache: dict[int, tuple[Any, bytes, torch.Tensor]] | None = None,
                    task_prefix: GuestTaskPrefix | None = None,
-                   prefix_cache: dict[int, tuple[Any, int]] | None = None) -> torch.Tensor:
+                   prefix_cache: dict[int, tuple[Any, tuple[int, int, int, int]]] | None = None) -> torch.Tensor:
     """Append split addresses after profiler preparation, retaining the base ABI."""
     if gradient_return is not None and (not backward or getattr(pool, "projection_ready", None) is None):
         raise ValueError("Kernel gradient metadata requires a projection-ready backward lease")
@@ -681,7 +681,9 @@ def _backward_task_prefix(ctx: Any, execution: Any, plan: MegaMoePlan) -> Any:
                     else plan.bwd_no_replica_task_prefixes)
         slots = None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical[
             ctx.replica_route.rank]
-        return replace(execution, task_prefix=select_guest_task_prefix(prefixes, slots))
+        return replace(execution, task_prefix=select_guest_task_prefix(
+            prefixes, slots, all_slot_to_logical=None if ctx.replica_route is None
+            else ctx.replica_route.plan.slot_to_logical))
     return execution
 
 
@@ -762,7 +764,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             if spec.replica_slots_per_rank and plan.fwd_task_prefixes:
                 slots = None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical[
                     ctx.replica_route.rank]
-                execution = replace(execution, task_prefix=select_guest_task_prefix(plan.fwd_task_prefixes, slots))
+                execution = replace(execution, task_prefix=select_guest_task_prefix(
+                    plan.fwd_task_prefixes, slots,
+                    all_slot_to_logical=None if ctx.replica_route is None else ctx.replica_route.plan.slot_to_logical))
             _launch_forward_kernel(
                 plan,
                 metadata,

@@ -37,6 +37,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
 )
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import (
     can_reuse_backward_dispatch,
+    join_w1_phase_once,
     prepare_w13_overlap_schedule,
     replica_w2_ready_events,
     replica_w13_ready_events,
@@ -63,7 +64,11 @@ from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 
 from .diagnostics import _mega_moe_owner_options
-from .inactive_tasks import GuestTaskPrefix, build_guest_task_prefixes
+from .gradient_queue import mark_device_gradient_queue, require_device_gradient_native, reverse_w1_gradient_queue
+from .empty_dispatch import mark_empty_dispatch, require_empty_dispatch_native
+from .event_refresh import apply_event_refresh
+from .inactive_tasks import RANK_LOCAL_GUEST_SUFFIX_SCHEDULE, GuestTaskPrefix, build_guest_task_prefixes
+from .inactive_tasks import replica_runtime_schedule
 from .spec import MegaMoeSpec
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
 
@@ -205,9 +210,23 @@ def _build_runtime_artifacts(spec: MegaMoeSpec, *, overlap_w13: bool = True) -> 
         spec.rank_id,
         spec.num_cube_cores,
     )
+    join_once = spec._gradient_queue_order in ('w1_join_once', 'device_w1_asc_join_once', 'device_w1_asc_join_rotate')
+    if join_once and not spec.replica_slots_per_rank:
+        if not join_w1_phase_once(backward_data, spec.local_experts, spec.num_cube_cores):
+            raise ValueError('W1 phase join requires the canonical owner-only backward queue')
+    if spec._gradient_queue_order.startswith('device_') and not spec.replica_slots_per_rank:
+        mark_device_gradient_queue(backward_data, backward_graph, spec._gradient_queue_order)
+    if spec._gradient_queue_order == 'w1_reverse' and not spec.replica_slots_per_rank:
+        reverse_w1_gradient_queue(backward_data, backward_graph, task_values)
     if overlap_w13 and spec.replica_slots_per_rank and spec.replica_transport in KERNEL_GRADIENT_TRANSPORT_MODES:
         prepare_w13_overlap_schedule(backward_data, spec.local_experts, spec.num_cube_cores,
                                     replica_slots=spec.replica_slots_per_rank)
+    if spec._cube_event_refresh_us or spec._vector_event_refresh_us:
+        for runtime in (forward_data, backward_data):
+            apply_event_refresh(runtime, spec._cube_event_refresh_us, spec._vector_event_refresh_us)
+    if spec._batch_empty_dispatch and spec.dispatch_mode == 'push' and not spec.replica_slots_per_rank:
+        mark_empty_dispatch(forward_data)
+        mark_empty_dispatch(backward_data)
     return forward_graph, forward_data, backward_graph, backward_data
 
 
@@ -254,6 +273,10 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     Returns:
         Rank-local forward and backward runtime resources.
     """
+    if spec._batch_empty_dispatch:
+        require_empty_dispatch_native()
+    if spec._gradient_queue_order.startswith('device_') and not spec.replica_slots_per_rank:
+        require_device_gradient_native(spec._gradient_queue_order)
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(spec, overlap_w13=False)
     original_reuse = can_reuse_backward_dispatch(backward_config, spec.local_experts, spec.num_cube_cores)
     original_backward_config = backward_config
@@ -276,7 +299,10 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         "num_groups": spec.local_experts,
         "num_cube_cores": spec.num_cube_cores,
     }
-    prefix_options = {"home_experts": spec.local_experts - spec.replica_slots_per_rank}
+    prefix_options = {"home_experts": spec.local_experts - spec.replica_slots_per_rank,
+                      "ep_size": spec.ep_size, "dispatch_mode": spec.dispatch_mode,
+                      "rank_local_communication": (spec.replica_slots_per_rank > 0
+                                                   and replica_runtime_schedule() == RANK_LOCAL_GUEST_SUFFIX_SCHEDULE)}
     return MegaMoePlan(
         spec=spec,
         fwd_task_prefixes=(build_guest_task_prefixes(forward_config, **prefix_options)

@@ -20,6 +20,19 @@ from dataclasses import dataclass
 from functools import cached_property
 
 from .capacity import ExpertReplicaConfig
+from .host import _column_totals
+
+
+def _destination_counts_from_dispatch(
+    dispatch: tuple[tuple[int, ...], ...], config: ExpertReplicaConfig,
+) -> tuple[tuple[int, ...], ...]:
+    """Reduce physical dispatch columns without relying on any cached quotas."""
+    width = config.slots_per_rank
+    if any(len(row) != config.physical_experts for row in dispatch):
+        raise ValueError("dispatch row does not match physical expert count")
+    columns = _column_totals(dispatch)
+    totals = tuple(columns) if columns is not None else tuple(map(sum, zip(*dispatch)))
+    return tuple(totals[rank * width:(rank + 1) * width] for rank in range(config.ep_size))
 
 
 @dataclass(frozen=True)
@@ -50,11 +63,7 @@ class ExpertExecutionPlan:
     @cached_property
     def destination_counts(self) -> tuple[tuple[int, ...], ...]:
         """Return per-slot work for every destination without device readback."""
-        width = self.config.slots_per_rank
-        if any(len(row) != self.config.physical_experts for row in self.dispatch_counts):
-            raise ValueError("dispatch row does not match physical expert count")
-        totals = tuple(map(sum, zip(*self.dispatch_counts)))
-        return tuple(totals[rank * width:(rank + 1) * width] for rank in range(self.config.ep_size))
+        return _destination_counts_from_dispatch(self.dispatch_counts, self.config)
 
     @cached_property
     def destination_loads(self) -> tuple[int, ...]:
@@ -62,10 +71,20 @@ class ExpertExecutionPlan:
         return tuple(sum(row) for row in self.destination_counts)
 
     @cached_property
+    def _source_slot_order(self) -> tuple[int, ...]:
+        """Share stable expert/slot ordering without materializing every source row."""
+        return tuple(slot for _, slot in sorted((expert, slot)
+                     for slot, expert in enumerate(self.physical_to_logical) if expert >= 0))
+
+    @cached_property
     def source_runs(self) -> tuple[tuple[tuple[int, int], ...], ...]:
         """Return stable logical-expert runs as physical slot and source quota."""
-        order = sorted((expert, slot) for slot, expert in enumerate(self.physical_to_logical) if expert >= 0)
-        return tuple(tuple((slot, row[slot]) for _, slot in order) for row in self.dispatch_counts)
+        return tuple(self.source_runs_for(rank) for rank in range(len(self.dispatch_counts)))
+
+    def source_runs_for(self, rank: int) -> tuple[tuple[int, int], ...]:
+        """Return one source row without materializing runs for every source rank."""
+        source = self.dispatch_counts[rank]
+        return tuple((slot, source[slot]) for slot in self._source_slot_order)
 
     @cached_property
     def physical_to_logical(self) -> tuple[int, ...]:
@@ -111,3 +130,6 @@ class ExpertExecutionPlan:
                     reconstructed[expert] += count
             if tuple(reconstructed) != self.logical_counts[source]:
                 raise ValueError("physical dispatch must conserve every source/logical-expert count")
+        if ("destination_counts" in self.__dict__
+                and self.destination_counts != _destination_counts_from_dispatch(self.dispatch_counts, config)):
+            raise ValueError("cached destination quotas must match the physical dispatch")

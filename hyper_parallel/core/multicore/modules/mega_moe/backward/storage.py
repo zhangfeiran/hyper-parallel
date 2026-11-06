@@ -18,7 +18,7 @@ from collections import defaultdict
 from typing import Optional
 
 from hyper_parallel.core.multicore.scheduler.config import (
-    ATOMIC_ADD_VALUE_LEN, RuntimeConfigC, TaskDescC, TaskType,
+    ATOMIC_ADD_VALUE_LEN, EVENT_INVALID_ID, RuntimeConfigC, TaskDescC, TaskType,
 )
 
 
@@ -207,6 +207,37 @@ def _guest_w13_indices(cfg: RuntimeConfigC, num_experts: int, num_cores: int,
            for offset, index in enumerate(reordered)):
         return None
     return reordered
+
+
+def join_w1_phase_once(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> bool:
+    """Use one full GateGrad completion fence per ordinary W1 Cube queue.
+
+    The last GateGrad event joins the preceding GateGrad work by per-worker
+    program order. A worker's subsequent W1 tasks inherit that first wait.
+    Unrecognized schedules are left unchanged.
+    """
+    weights = _w13_producers(cfg, num_experts, num_cores)
+    if not weights:
+        return False
+    cube = [cfg.all_tasks[i] for i in cfg.cube_task_indices[:cfg.task_index_num[0]]]
+    ordered = [task for task in cube if task.outputs[0].input_position == _WEIGHT13_GRAD]
+    if any(task.task_index != ordinal for ordinal, task in enumerate(ordered)):
+        return False
+    join = weights[-1][0].dependent_event
+    if join == EVENT_INVALID_ID or cfg.all_event_num_triggers[join] != num_cores:
+        return False
+    vector = [cfg.all_tasks[i] for i in cfg.vector_task_indices[:cfg.task_index_num[1]]]
+    producers = [task for task in cube + vector if task.trigger_event == join]
+    if (len(producers) != num_cores or
+            any(task.outputs[0].input_position != _INPUT_GRAD or
+                task.task_index // num_cores != num_experts - 1 for task in producers) or
+            any(task.task_type == TaskType.TASK_GROUPED_MATMUL and task.extra_value_1 == join
+                for task in cube)):
+        return False
+    for expert, tasks in enumerate(weights):
+        for task in tasks:
+            task.dependent_event = join if expert == 0 else EVENT_INVALID_ID
+    return True
 
 
 def prepare_w13_overlap_schedule(cfg: RuntimeConfigC, num_experts: int, num_cores: int,

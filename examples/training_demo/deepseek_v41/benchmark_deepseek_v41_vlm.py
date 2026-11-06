@@ -37,7 +37,9 @@ import yaml
 from examples.training_demo.deepseek_v41.deepseek_v41_random_init import initialize_random_shards
 from examples.training_demo.deepseek_v41.deepseek_v41_moe_timing import MoeTiming
 from examples.training_demo.deepseek_v41.deepseek_v41_mega_ab import ModuleTiming, select_kernels
+from hyper_parallel.core.expert_parallel.hot_replica import planner as replica_planner
 from hyper_parallel.core.multicore import _loader, shmem
+from hyper_parallel.core.multicore.modules.mega_moe import heap_manager
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
@@ -46,6 +48,7 @@ from hyper_parallel.trainer.vlm_trainer import VLMTrainer
 from hyper_parallel.trainer.text_trainer import TextTrainer
 from hyper_parallel.models.deepseek_v41.adapter.policies import activation_checkpointing
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedDSAAttentionBase
+from examples.training_demo.deepseek_v41.deepseek_v41_benchmark_control import BenchmarkControl, record_failure
 
 
 def _validate_full_model_assets(args: argparse.Namespace, text: dict, assets: dict) -> None:
@@ -119,9 +122,7 @@ def _set_engram_backend(recipe: dict, args: argparse.Namespace) -> None:
 def _replica_options(args: argparse.Namespace) -> tuple[int, str]:
     """Resolve the explicit replica budget and its backend transport default."""
     replica_slots = getattr(args, "replica_slots_per_rank", 0)
-    replica_transport = getattr(args, "replica_transport", None)
-    if replica_transport is None:
-        replica_transport = "p2p" if args.backend == "owner_ep" else "shmem_signal_kernel_gradient_bands"
+    replica_transport = getattr(args, "replica_transport", "p2p")
     if replica_slots < 0:
         raise ValueError("replica_slots_per_rank must be nonnegative")
     return replica_slots, replica_transport
@@ -324,6 +325,8 @@ class _RouteDiagnostics:
         """
         self.token_rows: dict[str, int] = {}
         self.input_identity: _BatchIdentity | None = None
+        self.route_window: dict[str, str] | None = None
+        self.control: BenchmarkControl | None = None
         self.hooks = [module.register_forward_pre_hook(self._record_rows(name))
                       for name, module in model.named_modules()
                       if enabled and name.endswith(".mlp") and hasattr(module, "gate")]
@@ -351,13 +354,26 @@ class _RouteDiagnostics:
             self.input_identity.close()
 
 
+def _heap_growth_records() -> list[dict[str, Any]]:
+    """Read already collected host records without issuing a device operation."""
+    manager = heap_manager._HEAP_MANAGER  # pylint: disable=protected-access
+    return manager.growth_records if manager is not None else []
+
+
 def _step(trainer: Any, iterator: Any, step: int, work: Path,
           diagnostics: _RouteDiagnostics, warmup_steps: int, moe_timing: MoeTiming | None = None) -> dict[str, Any]:
-    dist.barrier()
+    control = getattr(diagnostics, 'control', None)
+    if control is None:
+        dist.barrier()
+    else:
+        control.barrier(step + 1)
     torch.npu.synchronize()
     diagnostics.clear()
     if moe_timing is not None:
         moe_timing.clear()
+    if control is not None:
+        control.mark('train_begin', step + 1)
+    initial_heap_epoch = len(_heap_growth_records())
     started_at = datetime.now(timezone.utc).isoformat()
     start = time.perf_counter()
     metrics = trainer.train_step(iterator)
@@ -366,9 +382,15 @@ def _step(trainer: Any, iterator: Any, step: int, work: Path,
     finished_at = datetime.now(timezone.utc).isoformat()
     if not all(math.isfinite(value) for value in metrics.values()):
         raise RuntimeError(f"Nonfinite metrics at step {step}: {metrics}")
-    times = torch.tensor([elapsed], device="npu", dtype=torch.float32)
-    dist.all_reduce(times, op=dist.ReduceOp.MAX)
-    row = {"step": step + 1, "local_seconds": elapsed, "max_rank_seconds": times.item(),
+    if control is None:
+        times = torch.tensor([elapsed], device="npu", dtype=torch.float32)
+        dist.all_reduce(times, op=dist.ReduceOp.MAX)
+        maximum = times.item()
+    else:
+        control.mark('train_complete', step + 1, local_seconds=elapsed)
+        maximum = control.maximum(elapsed)
+        control.mark('rank_max_complete', step + 1)
+    row = {"step": step + 1, "local_seconds": elapsed, "max_rank_seconds": maximum,
            "allocated_bytes": torch.npu.memory_allocated(), "reserved_bytes": torch.npu.memory_reserved(),
            "phase": "warmup" if step < warmup_steps else "measured",
            "started_at": started_at, "finished_at": finished_at,
@@ -381,8 +403,14 @@ def _step(trainer: Any, iterator: Any, step: int, work: Path,
            "trainer_metrics": dict(trainer.base.step_train_metrics), **metrics}
     if diagnostics.input_identity is not None:
         row["input_sha256"] = diagnostics.input_identity.snapshot()
+    if diagnostics.route_window is not None:
+        row.update(diagnostics.route_window)
+    if growth := _heap_growth_records()[initial_heap_epoch:]:
+        row["heap_growth"] = growth
     with (work / "steps.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(row) + "\n")
+    if control is not None:
+        control.mark('step_written', step + 1)
     return row
 
 
@@ -431,9 +459,8 @@ def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--capacity-factor", type=float)
     parser.add_argument("--replica-slots-per-rank", type=int, default=0,
                         help="Adaptive expert replica cap; zero retains owner-only execution")
-    parser.add_argument("--replica-transport",
-                        choices=("p2p", "shmem_signal_kernel_gradient", "shmem_signal_kernel_gradient_bands"),
-                        help="Defaults to p2p for owner_ep and shmem_signal_kernel_gradient_bands for MegaMoe")
+    parser.add_argument("--replica-transport", default="p2p",
+                        choices=("p2p", "shmem_signal_kernel_gradient", "shmem_signal_kernel_gradient_bands"))
     parser.add_argument("--disable-route-diagnostics", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--modality", choices=("text", "vlm"), default="vlm")
@@ -550,10 +577,16 @@ def _train_rows(trainer: Any, args: argparse.Namespace, work: Path,
             trainer.base.state.epoch = epoch + 1
             if len(rows) == args.steps:
                 break
+    except BaseException as error:
+        if diagnostics.control is not None:
+            record_failure(work, error)
+        raise
     finally:
         diagnostics.close()
         if moe_timing is not None:
             moe_timing.close()
+        if diagnostics.control is not None:
+            diagnostics.control.close()
     if len(rows) != args.steps:
         raise RuntimeError(f"Incomplete training: {len(rows)} of {args.steps} steps")
     return rows
@@ -581,12 +614,15 @@ def main() -> None:
     torch.npu.reset_peak_memory_stats()
     diagnostics = _RouteDiagnostics(
         trainer.base.model, enabled=not getattr(args, "disable_route_diagnostics", False))
+    if os.environ.get('DSV41_BENCHMARK_CONTROL') == 'cpu':
+        diagnostics.control = BenchmarkControl(work)
     if args.record_input_identity:
         diagnostics.input_identity = _BatchIdentity(trainer)
     timing_class = ModuleTiming if args.mega_kernels is not None else MoeTiming
     moe_timing = timing_class(trainer.base.model) if args.moe_timing else None
     rows = _train_rows(trainer, args, work, diagnostics, moe_timing)
     measured = rows[args.warmup_steps:]
+    control_backend = diagnostics.control.backend if diagnostics.control is not None else 'hccl_world'
     result = {"vision_enabled": args.modality == "vlm", **vars(args), "native_lib": str(args.native_lib),
               "rank": rank, "world_size": world,
               "steps_detail": rows, "peak_allocated_bytes": max(row["peak_allocated_bytes"] for row in rows),
@@ -599,7 +635,9 @@ def main() -> None:
               "weights_initialization": "canonical_random_not_pretrained", "workspace_shared": bool(experts),
               "profiling_enabled": config.profiler.enable,
               "mega_module_counts": module_counts,
+              "complete_guest_search_hits": replica_planner._COMPLETE_GUEST_SEARCH_HITS,
               "attention_module_counts": attention_counts,
+              "benchmark_control_backend": control_backend,
               "fused_rmsnorm_module_count": fused_norm_count,
               "shmem_state": shmem.debug_state() if experts else None,
               "owner_use_grouped_gemm": args.backend == "owner_ep"}

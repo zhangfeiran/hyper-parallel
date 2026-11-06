@@ -64,6 +64,10 @@ class MegaMoeSpec:
     route_task_bounds: bool = False
     schedule_expert_rows: int | None = None
     schedule_source_expert_rows: int | None = None
+    _gradient_queue_order: str = 'original'
+    _cube_event_refresh_us: int = 0
+    _vector_event_refresh_us: int = 0
+    _batch_empty_dispatch: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -85,13 +89,9 @@ class MegaMoeSpec:
         """Return the bound for dynamic growth without requiring preallocation."""
         if not self.replica_slots_per_rank:
             return _align_capacity(self.ep_size * self.routed_slots)
-        upper = ExpertReplicaConfig(
-            self.logical_num_experts, self.ep_size, self.replica_slots_per_rank,
-        ).maximum_receive_rows(self.local_num_tokens, self.top_k)
-        if self.dispatch_mode == 'pull':
-            return ExpertReplicaConfig(self.logical_num_experts, self.ep_size, 0).maximum_receive_rows(
-                self.local_num_tokens, self.top_k)
-        return max(upper, self.receive_capacity)
+        upper = ExpertReplicaConfig(self.logical_num_experts, self.ep_size, 0).maximum_receive_rows(
+            self.local_num_tokens, self.top_k)
+        return upper if self.dispatch_mode == 'pull' else max(upper, self.receive_capacity)
 
     @property
     def routed_slots(self) -> int:
@@ -258,4 +258,8 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        _gradient_queue_order=specification.get("_gradient_queue_order", "original"),
+        _cube_event_refresh_us=specification.get("_cube_event_refresh_us", 0),
+        _vector_event_refresh_us=specification.get("_vector_event_refresh_us", 0),
+        _batch_empty_dispatch=specification.get("_batch_empty_dispatch", False),
     )

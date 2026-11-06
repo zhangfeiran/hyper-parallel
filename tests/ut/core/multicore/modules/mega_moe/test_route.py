@@ -26,6 +26,7 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
 from hyper_parallel.core.activation_memory import checkpoint
+from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts
 from hyper_parallel.core.expert_parallel.hot_replica import routing as replica_routing
 
 from hyper_parallel.core.expert_parallel.hot_replica import build_expert_replica_plan
@@ -571,6 +572,129 @@ class TestMegaMoeRoute(unittest.TestCase):
 
 class TestMegaMoeDynamicMetadata(unittest.TestCase):
     """Keep dynamic validation and the native count ABI independent of count-table policy."""
+
+    def test_home_replay_overlaps_only_trusted_push_counts(self) -> None:
+        """Fresh agreement still decides the physical route after local speculation."""
+        for trusted in (False, True):
+            with self.subTest(trusted=trusted):
+                self._home_hint_order(trusted)
+
+    def _home_hint_order(self, trusted: bool) -> None:
+        """Keep offsets equal while moving only a trusted local permutation."""
+        spec = replace(self._spec(4), ep_size=2, dispatch_mode="push")
+        hidden = torch.ones(2, 16)
+        ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+        counts = torch.ones(4, dtype=torch.int32)
+        events = []
+
+        def gather(output: torch.Tensor, payload: torch.Tensor, **_options: Any) -> Any:
+            events.append("gather")
+            output.copy_(payload.repeat(2))
+            return SimpleNamespace(wait=lambda: events.append("wait"))
+
+        def permute(*_args: Any) -> tuple:
+            events.append("permute")
+            return hidden.repeat_interleave(2, dim=0), torch.arange(4)
+
+        def choose(*_args: Any) -> None:
+            events.append("choose")
+            replica_routing._record_home_decision()
+            return None
+
+        forward, replay = create_recompute_contexts()
+        with forward:
+            replica_routing._record_home_decision()
+        with (
+            replay,
+            patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather),
+            patch.object(route_module, "_permute_topk_input", side_effect=permute),
+        ):
+            actual = prepare_topk_route(
+                hidden, ids, torch.ones(2, 2), spec, counts if trusted else None,
+                prepare_workspace=lambda *_args: events.append("grow"), _select_replica_route=choose)
+        expected = (["gather", "permute", "wait", "choose", "grow"] if trusted else
+                    ["gather", "wait", "choose", "grow", "permute"])
+        self.assertEqual(events, expected)
+        self.assertIsNone(actual.metadata.replica_route)
+
+    def test_changed_replay_layout_discards_speculative_permutation(self) -> None:
+        """A stale home hint cannot change fresh guest placement or add a gather."""
+        home = replace(self._spec(4), ep_size=2, dispatch_mode="push")
+        config = ExpertReplicaConfig(4, 2, 1)
+        physical = replace(home, num_experts=6, logical_num_experts=4, replica_slots_per_rank=1)
+        ids = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+        counts = torch.tensor([2, 2, 0, 0], dtype=torch.int32)
+        hidden = torch.ones(2, 16)
+        events, choices = [], []
+
+        def gather(output: torch.Tensor, payload: torch.Tensor, **_options: Any) -> Any:
+            events.append("gather")
+            output.copy_(payload.repeat(2))
+            return SimpleNamespace(wait=lambda: events.append("wait"))
+
+        def permute(*_args: Any) -> tuple:
+            events.append("permute")
+            return torch.full((4, 16), float(events.count("permute"))), torch.arange(4)
+
+        def choose(table: torch.Tensor, summary: list, host_counts: list | None) -> tuple:
+            events.append("choose")
+            with patch.object(replica_routing, "dist") as distributed:
+                distributed.is_initialized.return_value = True
+                distributed.get_rank.return_value = 0
+                distributed.get_world_size.return_value = 2
+                route = prepare_replica_route(
+                    ids, config, compact_home=True, target_load=4, receive_capacity=4,
+                    dynamic_header=(0, 2, 31),
+                    _gathered_counts=_GatheredReplicaCounts(table, summary, host_counts))
+            self.assertTrue(route.plan.transfers)
+            choices.append(route)
+            return physical, route
+
+        forward, replay = create_recompute_contexts()
+        with forward:
+            replica_routing._record_home_decision()
+        with (
+            replay,
+            patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
+            patch.object(route_module, "_permute_topk_input", side_effect=permute),
+        ):
+            actual = prepare_topk_route(
+                hidden, ids, torch.ones(2, 2), home, counts,
+                prepare_workspace=lambda *_args: events.append("grow"), _select_replica_route=choose)
+        self.assertEqual(exchange.call_count, 1)
+        # Push permutation is local and may precede symmetric workspace growth.
+        self.assertEqual(events, ["gather", "permute", "wait", "choose", "permute", "grow"])
+        torch.testing.assert_close(actual.routed_tokens, torch.full((4, 16), 2.0))
+        self.assertIs(actual.metadata.replica_route, choices[0])
+
+    def test_remote_rejection_still_precedes_admission_after_home_hint(self) -> None:
+        """Speculation cannot bypass a peer rejection or publish a route."""
+        spec = replace(self._spec(4), ep_size=2, dispatch_mode="push")
+        ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+        counts = torch.ones(4, dtype=torch.int32)
+        hidden = torch.ones(2, 16)
+
+        def gather(output: torch.Tensor, payload: torch.Tensor, **_options: Any) -> Mock:
+            output.copy_(payload.repeat(2))
+            output.reshape(2, 7)[1, 0] = 1
+            return Mock()
+
+        forward, replay = create_recompute_contexts()
+        with forward:
+            replica_routing._record_home_decision()
+        choose, publish = Mock(), Mock()
+        with (
+            replay,
+            patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
+            patch.object(route_module, "_permute_topk_input",
+                         return_value=(hidden.repeat_interleave(2, dim=0), torch.arange(4))),
+            self.assertRaises(RuntimeError),
+        ):
+            prepare_topk_route(hidden, ids, torch.ones(2, 2), spec, counts,
+                              prepare_workspace=publish, _select_replica_route=choose)
+        exchange.assert_called_once()
+        choose.assert_not_called()
+        publish.assert_not_called()
 
     def test_cpu_replica_counts_pack_the_same_metadata_without_device_prefixes(self) -> None:
         """Retained CPU counts cover home-only, guest, empty-source and empty-owner routes."""

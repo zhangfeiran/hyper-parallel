@@ -52,9 +52,10 @@ def _clear_profiles() -> None:
         function.cache_clear()
 
 
-def _synthetic_profile(module: MegaMoeExperts, values: torch.Tensor) -> ExpertReplicaCostModel:
+def _synthetic_profile(module: MegaMoeExperts, values: torch.Tensor,
+                       maximum_tokens: int | None = None) -> ExpertReplicaCostModel:
     resources = module._get_execution_resources(values)
-    signature = mega._critical_execution_signature(module, resources)
+    signature = mega._critical_execution_signature(module, resources, execution_tokens=maximum_tokens)
     table = ((0, 0.), (1000000, 1000.))
     calibration = DeviceCriticalPathCalibration(
         signature, ((0, 0.), (1000000, 2000.)), ((0, 0.), (1000000, 2000.)),
@@ -222,6 +223,9 @@ def main() -> None:
                     patterns = [pattern for pattern in ('balanced','middle','hot','ragged','empty','hot','balanced')
                                 for _ in range(args.repeats)]
                     for step, pattern in enumerate(patterns):
+                        maximum_tokens = (max((0, 128, args.tokens, 512)[member % 4]
+                                              for member in dist.get_process_group_ranks(group))
+                                          if pattern == 'ragged' else (0 if pattern == 'empty' else args.tokens))
                         tokens = args.tokens
                         if pattern=='ragged':
                             tokens = (0, 128, args.tokens, 512)[rank % 4]
@@ -239,7 +243,7 @@ def main() -> None:
 
                         def operation(hidden: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
                             if budget and args.synthetic_correctness:
-                                profile = _synthetic_profile(module, hidden)
+                                profile = _synthetic_profile(module, hidden, maximum_tokens)
                                 key = (mode,args.hidden,args.intermediate,size,module.replica_transport,
                                        args.experts,args.top_k,
                                        policy._soc_name(device),profile.critical_path.execution_signature)
@@ -249,7 +253,8 @@ def main() -> None:
                             output = module(hidden, ids, weights, tokens_per_expert=counts)
                             if budget:
                                 resources = module._get_execution_resources(hidden)
-                                active['execution_signature'] = mega._critical_execution_signature(module, resources)
+                                active['execution_signature'] = mega._critical_execution_signature(
+                                    module, resources, execution_tokens=maximum_tokens)
                             return output
 
                         optimizer.zero_grad(set_to_none=True)

@@ -204,6 +204,31 @@ pytest -q tests/torch/multicore/test_deepseek_v41_megamoe.py -k megamoe_parallel
 动态本地行数，以及输出、输入梯度、路由梯度、专家梯度和共享专家梯度。
 验证范围为 MoE 模块及实际接入边界，不代表整网训练或性能验收。
 
+## W1 权重梯度队列顺序
+
+`HYPER_PARALLEL_MOE_GRADIENT_QUEUE_ORDER` 是默认值为 `original` 的可选调度开关。
+在构造 `MegaMoeExperts` 前为所有 EP rank 设置相同值：
+
+```bash
+export HYPER_PARALLEL_MOE_GRADIENT_QUEUE_ORDER=w1_reverse
+export HYPER_PARALLEL_REPLICA_COST_MODEL=0
+```
+
+`w1_reverse` 只将普通 owner 执行路径中 W1Grad（合并 gate/up 权重梯度）的本地专家任务组反序，
+保留各个 Cube worker 的 lane、其他阶段的任务顺序和依赖事件。
+运行图准备后按原缓存机制复用，不增加每步矩阵搬运、设备读回或 collective。
+权重和 token 的物理布局、前向、Vector 队列及反向 dispatch 存储复用保持原语义。
+一个本地专家时顺序自然不变；实际分配 guest 槽的副本执行路径保留原调度。
+
+该开关同时适用于 B0 和 B>0 返回普通 owner 布局的执行，接口没有新增模型参数。
+启用热副本成本模型时，当前会拒绝 `w1_reverse`，避免把原始调度的成本表用于新执行顺序；
+需要先重新校准并接入对应执行身份才能解除该限制。恢复 `original` 即可使用原路径及现有成本模型。
+GateGrad 和组合反序实验不属于此接口。
+
+已验证的性能场景为 Ascend 910C 上的 PanGu EIO/BF16 MoE 组件与完整 checkpoint；
+其他模型、形状、布局或硬件须用相同输入、路由、参数和 profiler-off 对照确认收益。
+该选项不承诺所有负载加速，也不代表完整模型性能验收。
+
 ## 诊断与性能验证
 
 使用 [MegaKernel Profiling 与 Tensor dump](docs/mega_kernel_profiling.md) 查看 AIC/AIV 内部 timeline

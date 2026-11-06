@@ -137,12 +137,66 @@ class TestReplicaRecipe(unittest.TestCase):
 class TestReplicaMatrix(unittest.TestCase):
     """Check stage selection and generated commands before cluster scheduling."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
-              essential_mark="essential")
-    def test_nine_commands_parse_into_actual_training_recipe(self) -> None:
+    def test_no_table_load_controls_leave_heap_automatic(self) -> None:
+        """Ordinary performance controls must not inherit a diagnostic fixed heap."""
+        environment = dict(
+            HYPER_ROOT='/source', RUN_ROOT='/results', MASTER_PORT_BASE='28600',
+            SHMEM_HOST='127.0.0.1', MASTER_ADDR='127.0.0.1', NNODES='8', NODE_RANK='0',
+            NUM_CARDS='16', TRAIN_ITERS='194', WARMUP_STEPS='5', MODEL_DIR='/model',
+            ENGRAM='/engram.json', DATA='/data.jsonl', NATIVE_LIB='/native',
+            DSV41_COMPLETE_GUEST_SEARCH_E2E='1')
+        with patch.dict('os.environ', environment, clear=True):
+            for backend, budget in (('native', 0), ('push', 0), ('push', 2), ('push', 6),
+                                    ('pull', 0), ('pull', 2), ('pull', 6)):
+                with self.subTest(backend=backend, budget=budget):
+                    command = runner.command_for(runner.Stage(backend, budget), 0)
+                    self.assertFalse(any(value.startswith('HYPER_PARALLEL_SHMEM_HEAP_SIZE=')
+                                         for value in command))
+
+    def test_schedule_matrix_has_three_baselines_and_four_adjacent_graph_pairs(self) -> None:
+        """The whole-model schedule comparison preserves B0 and compares every changed cap."""
+        matrix = runner.stages(schedule_comparison=True)
+        self.assertEqual([stage.name for stage in matrix[:3]], ['native_b0', 'push_b0', 'pull_b0'])
+        self.assertEqual(len(matrix), 11)
+        self.assertEqual(len({stage.name for stage in matrix}), 11)
+        for old, new in zip(matrix[3::2], matrix[4::2]):
+            self.assertEqual((old.backend, old.budget), (new.backend, new.budget))
+            self.assertEqual((old.graph, new.graph), ('original', 'suffix'))
+            self.assertIn(old.budget, (1, 6))
+        selected = runner.stages('push_b6_original,push_b6_suffix', schedule_comparison=True)
+        self.assertEqual([stage.name for stage in selected], ['push_b6_original', 'push_b6_suffix'])
+        with self.assertRaises(ValueError):
+            runner.stages('push_b1', schedule_comparison=True)
+
+    def test_complete_guest_arm_requires_both_stock_controls(self) -> None:
+        """Do not launch the physical B2 candidate without matched B2 and B6."""
+        selection = 'push_b0,push_b6,push_b2,push_b2_complete,native_b0'
+        with self.assertRaises(ValueError):
+            runner.stages(selection)
+        with self.assertRaisesRegex(ValueError, 'requires stock Push B2 and B6'):
+            runner.stages('push_b2,push_b2_complete', complete_guest_comparison=True)
+        with self.assertRaisesRegex(ValueError, 'requires the ordinary no-table schedule'):
+            runner.stages(selection, calibration_comparison=True, complete_guest_comparison=True)
+        with self.assertRaisesRegex(ValueError, 'requires the same complete layout'):
+            runner.stages('push_b2,push_b6,push_b2_complete_repack', complete_guest_comparison=True)
+        matrix = runner.stages(selection, complete_guest_comparison=True)
+        self.assertEqual(tuple(stage.name for stage in matrix), tuple(selection.split(',')))
+        self.assertEqual((matrix[2].budget, matrix[3].budget), (2, 2))
+        combined = runner.stages(selection + ',push_b2_complete_repack', complete_guest_comparison=True)
+        self.assertEqual(combined[-1].budget, 2)
+        with self.assertRaisesRegex(ValueError, 'requires stock Push B6'):
+            runner.stages('push_b0,push_b6_repack', complete_guest_comparison=True)
+        b6_pair = runner.stages('push_b6,push_b6_repack', complete_guest_comparison=True)
+        self.assertEqual([(stage.budget, stage.policy) for stage in b6_pair], [(6, None), (6, 'repack')])
+        with self.assertRaisesRegex(ValueError, 'requires stock Pull B2'):
+            runner.stages('pull_b0,pull_b2_heap2g', complete_guest_comparison=True)
+        heap_pair = runner.stages('pull_b2,pull_b2_heap2g', complete_guest_comparison=True)
+        self.assertEqual([(stage.budget, stage.policy) for stage in heap_pair], [(2, None), (2, 'heap2g')])
+
+    def test_selected_commands_parse_into_actual_training_recipe(self) -> None:
         """Feature: Cluster stage reachability.
-        Description: Feed every generated stage command through the real benchmark parser and recipe resolver.
-        Expectation: All nine select the requested cap, backend and unchanged safe training policy.
+        Description: Parse default stages and explicitly selected B2 commands through the real recipe resolver.
+        Expectation: Defaults remain nine stages; B2 reaches the requested backend and safe training policy.
         """
         with TemporaryDirectory() as directory:
             environment = {
@@ -154,8 +208,10 @@ class TestReplicaMatrix(unittest.TestCase):
                 'REPLICA_TRANSPORT': 'shmem_signal_kernel_gradient_bands',
             }
             with patch.dict('os.environ', environment):
-                self.assertEqual(len(runner.stages()), 9)
-                for index, stage in enumerate(runner.stages()):
+                selected = runner.stages()
+                self.assertEqual(len(selected), 9)
+                selected += runner.stages('native_b2,push_b2,pull_b2')
+                for index, stage in enumerate(selected):
                     with self.subTest(stage=stage.name):
                         command = runner.command_for(stage, index)
                         argv = command[command.index('--full-model'):]

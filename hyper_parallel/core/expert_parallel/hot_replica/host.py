@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import lru_cache
 from importlib import import_module
 import os
@@ -43,6 +44,31 @@ def _validate_counts(rows: tuple[tuple[int, ...], ...]) -> bool:
     """Accept ordinary bounded integers natively; retain Python for other inputs."""
     module = _native_backend()
     return module is not None and module.validate_counts(rows)
+
+
+def _column_totals(rows: Sequence[Sequence[int]]) -> list[int] | None:
+    """Reduce ordinary columns while preserving older ABI3 and arbitrary-precision fallbacks."""
+    module = _native_backend()
+    if module is None or not hasattr(module, "column_totals"):
+        return None
+    return module.column_totals(rows)
+
+
+def _locality_moves(copies: list[dict[int, int]], home: int, budget: int, nodes: tuple[int, ...]) -> tuple | None:
+    """Use an additive ABI3 primitive while preserving the Python fallback and dict order."""
+    module = _native_backend()
+    if module is None or not hasattr(module, 'locality_moves'):
+        return None
+    return module.locality_moves(copies, home, budget, nodes)
+
+
+def _materialize_dispatch(counts: tuple[tuple[int, ...], ...], copies: list[dict[int, int]],
+                          home: int, budget: int, nodes: tuple[int, ...]) -> tuple | None:
+    """Use the additive integer primitive while retaining optional backend fallback."""
+    module = _native_backend()
+    if module is None or not hasattr(module, "materialize_dispatch"):
+        return None
+    return module.materialize_dispatch(counts, copies, home, budget, nodes)
 
 
 def _rank_compute(

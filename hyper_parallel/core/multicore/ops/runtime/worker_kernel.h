@@ -756,12 +756,15 @@ class KernelWorkerBase {
     eventPipe.Destroy();
   }
 
+  __aicore__ inline void ResolveTaskDescriptor(TaskId &, TaskDesc &) {}
+
   __aicore__ inline void ExecuteTaskFast(TaskId task_id) {
     if (task_id >= runtime_task_capacity) {
       AscendC::Trap();
     }
     TaskDesc task_desc;
     getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
+    static_cast<Derived *>(this)->ResolveTaskDescriptor(task_id, task_desc);
     if ((task_desc.dependent_event != EVENT_INVALID_ID && task_desc.dependent_event >= runtime_event_capacity) ||
         static_cast<uint64_t>(task_desc.trigger_event) + ATOMIC_ADD_VALUE_LEN > runtime_event_capacity) {
       AscendC::Trap();
@@ -782,6 +785,7 @@ class KernelWorkerBase {
     }
     TaskDesc task_desc;
     getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
+    static_cast<Derived *>(this)->ResolveTaskDescriptor(task_id, task_desc);
     if ((task_desc.dependent_event != EVENT_INVALID_ID && task_desc.dependent_event >= runtime_event_capacity) ||
         static_cast<uint64_t>(task_desc.trigger_event) + ATOMIC_ADD_VALUE_LEN > runtime_event_capacity) {
       AscendC::Trap();
@@ -808,6 +812,7 @@ class KernelWorkerBase {
     }
     TaskDesc task_desc;
     getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
+    static_cast<Derived *>(this)->ResolveTaskDescriptor(task_id, task_desc);
     if ((task_desc.dependent_event != EVENT_INVALID_ID && task_desc.dependent_event >= runtime_event_capacity) ||
         static_cast<uint64_t>(task_desc.trigger_event) + ATOMIC_ADD_VALUE_LEN > runtime_event_capacity) {
       AscendC::Trap();

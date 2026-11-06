@@ -27,7 +27,7 @@ from typing import Any
 
 
 GRAPH_FILES = tuple('hyper_parallel/core/multicore/modules/mega_moe/' + name
-                    for name in ('module.py', 'plan.py', 'function.py', 'workspace.py'))
+                    for name in ('module.py', 'plan.py', 'function.py', 'workspace.py', 'inactive_tasks.py'))
 
 
 def weight_submission_summary(events: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
@@ -71,7 +71,7 @@ def schedule_cases(phases: str, order: str) -> list[dict[str, Any]]:
     return cases
 
 
-def prepare_controls(repository: Path, bundle: Path, original: str = '304f1ec6e',
+def prepare_controls(repository: Path, bundle: Path, original: str = 'fc3c5040e',
                      control_source: Path | None = None) -> dict[str, Any]:
     """Save immutable source deltas and provenance without modifying the active repository."""
     if (bundle / 'READY').exists():
@@ -219,7 +219,7 @@ def main() -> None:
     parser.add_argument('--repository', type=Path, required=True)
     parser.add_argument('--bundle', type=Path, required=True)
     parser.add_argument('--parent-fixtures', type=Path, required=True)
-    parser.add_argument('--original', default='304f1ec6e')
+    parser.add_argument('--original', default='fc3c5040e')
     parser.add_argument('--control-source', type=Path)
     args = parser.parse_args()
     controls = prepare_controls(args.repository, args.bundle, args.original, args.control_source)

@@ -26,7 +26,9 @@ import torch
 import torch.distributed as dist
 from torch.autograd.function import once_differentiable
 
-from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, _replica_count_payload
+from hyper_parallel.core.expert_parallel.hot_replica.routing import (
+    ReplicaRoute, _has_home_recompute_hint, _replica_count_payload,
+)
 
 from hyper_parallel.core.multicore._loader import load_torch_npu
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
@@ -806,9 +808,11 @@ def _prepare_ordinary_dynamic_route(
 
 
 def _overlap_replica_permutation(hidden: torch.Tensor, ids: torch.Tensor, spec: MegaMoeSpec,
-                                 invalid: bool, selector: ReplicaRouteSelector | None) -> tuple | None:
+                                 invalid: bool, selector: ReplicaRouteSelector | None,
+                                 supplied_counts: torch.Tensor | None = None) -> tuple | None:
     """Overlap only a validated push route whose physical IDs cannot change."""
-    if spec.auto_tokens and spec.dispatch_mode == "push" and not invalid and selector is None:
+    if (spec.auto_tokens and spec.dispatch_mode == "push" and not invalid
+            and (selector is None or supplied_counts is not None and _has_home_recompute_hint())):
         return _permute_topk_input(hidden, ids)
     return None
 
@@ -921,7 +925,8 @@ def _prepare_dynamic_route(
         workspace.wait_for_reuse()
     gathered, work = (_start_dynamic_gather(payload, spec) if payload is not None
                       else (replica_route.counts_by_source, None))
-    permuted = _overlap_replica_permutation(hidden_states, topk_ids, spec, invalid, select_replica_route)
+    permuted = _overlap_replica_permutation(hidden_states, topk_ids, spec, invalid,
+                                            select_replica_route, supplied_counts)
     summary, host_rows = None, None
     if spec.auto_tokens:
         if work is not None:

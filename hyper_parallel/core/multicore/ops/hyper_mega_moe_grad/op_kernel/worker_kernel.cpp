@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -20,7 +20,9 @@
 #include "swi_glu_grad/swi_glu_grad.cpp"
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
+#include "runtime/empty_dispatch.h"
 #include "runtime/worker_kernel.h"
+#include "runtime/gradient_order_policy.h"
 
 using namespace AscendC;
 
@@ -40,16 +42,39 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     static_cast<uint32_t>(offsetof(SwiGluTilingData, rowLen));
   static constexpr int64_t SWIGLU_DYNAMIC_FIELDS_BYTES =
     offsetof(SwiGluTilingData, baseRowLen) + sizeof(uint32_t) - SWIGLU_DYNAMIC_FIELDS_OFFSET;
-  static constexpr uint32_t GMM_BASE_M_OFFSET = static_cast<uint32_t>(
-    offsetof(GMMTilingData, gmmBaseParams) + offsetof(GMMBaseParams, m));
-  static constexpr uint32_t GMM_MATMUL_M_OFFSET = static_cast<uint32_t>(
-    offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, M));
-  static constexpr int64_t GMM_MATMUL_M_FIELDS_BYTES =
-    offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
-  static constexpr uint32_t GMM_MATMUL_K_OFFSET = static_cast<uint32_t>(
-    offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, Ka));
-  static constexpr int64_t GMM_MATMUL_K_FIELDS_BYTES =
-    offsetof(TCubeTiling, singleCoreK) + sizeof(int32_t) - offsetof(TCubeTiling, Ka);
+
+  __aicore__ inline void ResolveTaskDescriptor(TaskId &task_id, TaskDesc &task) {
+#ifdef __DAV_C220_CUBE__
+    if ((task.extra_value_0 & GRADIENT_ORDER_MAGIC_MASK) != GRADIENT_ORDER_MAGIC) return;
+    if (task.extra_value_0 == GRADIENT_LANE_MARKER) return;
+    const uint32_t policy = (task.extra_value_0 >> 20) & 0xF;
+    const uint32_t join_event = task.extra_value_0 & GRADIENT_ORDER_EVENT_MASK;
+    const bool original_w1 = task.outputs[0].input_position == 18;
+    const uint32_t experts = task.inputs[2].dim[0];
+    ValidateGradientTask(task, experts, policy);
+    PrepareGradientOrder(task, experts, policy);
+    const uint32_t original_expert = task.task_index / this->core_num;
+    const uint32_t lane = task.task_index % this->core_num;
+    const uint32_t own_base = task_id - task.task_index;
+    uint32_t selected = task_id;
+    if (policy == 4) {
+      if (!gradient_join_) return;
+      const uint32_t gate_base = original_w1 ? task.tiling_data_offset : own_base;
+      const uint32_t w1_base = original_w1 ? own_base : task.tiling_data_offset;
+      const uint32_t ordinal = original_expert + (original_w1 ? experts : 0);
+      selected = (ordinal % 2 ? w1_base : gate_base) + (ordinal / 2) * this->core_num + lane;
+    } else {
+      selected = own_base + gradient_order_[original_expert] * this->core_num + lane;
+    }
+    if (selected >= this->runtime_task_capacity) AscendC::Trap();
+    getTaskDesc(this->runtimeConfigPtr, &task, selected);
+    task_id = selected;
+    if (policy == 3 || policy >= 6) {
+      if (join_event >= this->runtime_event_capacity) AscendC::Trap();
+      task.dependent_event = (policy == 3 || original_expert == 0) ? join_event : EVENT_INVALID_ID;
+    }
+#endif
+  }
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     switch (task_desc.task_type) {
@@ -76,6 +101,44 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
  private:
+  bool gradient_order_ready_ = false;
+  bool gradient_join_ = false;
+  int64_t gradient_rows_[GRADIENT_ORDER_MAX_EXPERTS];
+  uint32_t gradient_order_[GRADIENT_ORDER_MAX_EXPERTS];
+
+  __aicore__ inline void ValidateGradientTask(const TaskDesc &task, uint32_t experts, uint32_t policy) {
+    if (this->home_experts_ != 0 || task.task_type != TaskType::TASK_GROUPED_MATMUL ||
+        experts == 0 || experts > GRADIENT_ORDER_MAX_EXPERTS || policy < 1 || policy == 5 || policy > 7) AscendC::Trap();
+    if (task.outputs[0].input_position != 18 &&
+        (task.outputs[0].input_position != 12 || policy != 4)) AscendC::Trap();
+  }
+
+  __aicore__ inline uint32_t GradientLaneExpert(const TaskDesc &task, uint32_t expert) {
+    const uint32_t mode = task.extra_value_0 & (GRADIENT_ORDER_MAGIC_MASK | 0x00F00000U);
+    if (mode != GRADIENT_LANE_MARKER && mode != (GRADIENT_ORDER_MAGIC | (7U << 20))) {
+      return GRADIENT_LANE_DISABLED;
+    }
+    const uint32_t position = task.outputs[0].input_position;
+    if (this->home_experts_ != 0 || !getTransposeData(task.inputs[0].transpose_flag) ||
+        (position != 6 && position != 18)) AscendC::Trap();
+    return expert;
+  }
+
+  __aicore__ inline void PrepareGradientOrder(const TaskDesc &task, uint32_t experts, uint32_t policy) {
+    if (gradient_order_ready_) return;
+    GlobalTensor<int64_t> glist;
+    glist.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[2].input_position]), experts);
+    int64_t previous = 0;
+    for (uint32_t i = 0; i < experts; ++i) {
+      const int64_t current = glist.GetValue(i);
+      if (current < previous) AscendC::Trap();
+      gradient_rows_[i] = current - previous;
+      previous = current;
+    }
+    gradient_join_ = BuildGradientExpertOrder(gradient_rows_, experts, policy, gradient_order_);
+    gradient_order_ready_ = true;
+  }
+
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
     union {
       uint32_t bits;
@@ -226,9 +289,6 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         int64_t expert_num_single_rank = expert_num / ep;
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
-        GM_ADDR grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
-        GlobalTensor<int64_t> grouped_list_tensor_real;
-        grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;
         int64_t value = grouped_list_tensor.GetValue(data_index);
         int64_t start = 0;
@@ -251,45 +311,18 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           }
           return;
         }
-        if (this->home_experts_ > 0) {
-          grouped_list_tensor_real.SetValue(0, value);
-          cacheWriteThrough(grouped_list_real, sizeof(int64_t));
-        } else {
-          for (uint32_t i = 0; i < expert_num_single_rank; i++) {
-            grouped_list_tensor_real.SetValue(i, i >= data_index ? value : 0);
-          }
-          cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
-        }
-
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
-        __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
-        if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
-          tilingdata_data->mmTilingData.Ka = value;
-          tilingdata_data->mmTilingData.Kb = value;
-          tilingdata_data->mmTilingData.singleCoreK = value;
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
-        } else {
-          tilingdata_data->gmmBaseParams.m = value;
-          tilingdata_data->mmTilingData.M = value;
-          tilingdata_data->mmTilingData.singleCoreM = value;
-          cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
-        }
-        if (this->home_experts_ > 0) {
-          tilingdata_data->gmmBaseParams.groupNum = 1;
-          cacheWriteThrough(tiling_data_addr, sizeof(tilingdata_data->gmmBaseParams));
-        }
-        PipeBarrier<PIPE_ALL>();
-
         const auto buffers = ResolveGroupedMatmulBuffers(task_desc, start, data_index);
         grouped_matmul(buffers.input, buffers.weight, nullptr, nullptr, nullptr,
-                       nullptr, nullptr, grouped_list_real, nullptr,
+                       nullptr, nullptr, nullptr, nullptr,
                        buffers.output, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
                        getTransposeData(task_desc.inputs[1].transpose_flag),
                        task_desc.outputs[0].data_type == sizeof(float), band_flags, band_epoch, band_rows,
                        this->replica_trace_, task_desc.outputs[0].input_position == 18,
-                       getExtraValueFromTiling(input_list[TILING_IDX], 0) % ep, data_index);
+                       getExtraValueFromTiling(input_list[TILING_IDX], 0) % ep, data_index,
+                       value, this->home_experts_ > 0, this->home_experts_ > 0 ? 0 : data_index,
+                       GradientLaneExpert(task_desc, data_index));
       }
       return;
     }
@@ -319,8 +352,12 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     int32_t start = value * task_desc.task_split_value * hidden_size;
     int32_t end = (value + 1) * task_desc.task_split_value * hidden_size;
     if (start >= size_) {
-      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1, ACLSHMEM_SIGNAL_ADD,
-                          target_pe);
+      const int32_t credit = EmptyDispatchCredit(task_desc.extra_value_0, value, single_expert_task_num,
+                                                 start, size_, send_data_size_);
+      if (credit != 0) {
+        aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, credit,
+                           ACLSHMEM_SIGNAL_ADD, target_pe);
+      }
       return;
     } else {
       if (end > size_) {

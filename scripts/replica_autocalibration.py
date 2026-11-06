@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Scheduler-neutral collection, fitting and model-in-loop calibration coordinator."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import signal
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+QUALITY_REJECTED_EXIT = 20
+
+
+class CalibrationRejected(RuntimeError):
+    """Keep completed quality rejections separate from failed observations."""
+
+
+def _write(path: Path, value: Any) -> None:
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(value, indent=2) + '\n')
+    temporary.replace(path)
+
+
+def _publish_closed(source: Path, destination: Path) -> None:
+    """Publish only completed node-local files using an atomic shared rename."""
+    if source.resolve() == destination.resolve() or not source.exists():
+        return
+    for path in sorted(source.rglob('*')):
+        if not path.is_file():
+            continue
+        target = destination / path.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + f'.tmp-{os.getpid()}')
+        shutil.copy2(path, temporary)
+        temporary.replace(target)
+
+
+def _run(command: list[str], log: Path, timeout: int, peers: list[Path] | None = None) -> int:
+    """Own the full child process group through normal completion or interruption."""
+    with log.open('w') as stream:
+        process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                status = process.poll()
+                if status is not None:
+                    return status
+                if peers and any(json.loads(path.read_text())['exit_status'] for path in peers if path.exists()):
+                    raise RuntimeError('A peer calibration node failed')
+                time.sleep(.5)
+            raise subprocess.TimeoutExpired(command, timeout)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            raise
+
+
+def _wait(paths: list[Path], timeout: int, *, quality_gate: bool = False) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        present = [json.loads(path.read_text()) for path in paths if path.exists()]
+        if quality_gate and any(record['exit_status'] == QUALITY_REJECTED_EXIT for record in present):
+            raise CalibrationRejected('Completed replica calibration was rejected by its quality gates')
+        if any(record['exit_status'] for record in present):
+            raise RuntimeError(f'Calibration stage failed: {present}')
+        if len(present) == len(paths):
+            return present
+        time.sleep(1)
+    raise TimeoutError(f'Calibration stage completion missing: {[str(path) for path in paths if not path.exists()]}')
+
+
+def _terminate(signum: int, _frame: Any) -> None:
+    """Propagate scheduler termination through owned child groups and terminal evidence."""
+    raise SystemExit(128 + signum)
+
+
+def _shmem_host(address: str, *, dry_run: bool) -> str:
+    """Keep the allocation identity intact while shortening the native bootstrap host."""
+    try:
+        socket.inet_pton(socket.AF_INET, address)
+        return address
+    except OSError:
+        if dry_run:
+            return 'resolved-ipv4-at-launch'
+    try:
+        resolved = socket.gethostbyname(address)
+        socket.inet_pton(socket.AF_INET, resolved)
+    except OSError as error:
+        raise ValueError(f'Cannot resolve SHMEM bootstrap host to IPv4: {address}') from error
+    return resolved
+
+
+def _shmem_endpoint(host: str, port: int) -> str:
+    """Fail before starting workers if the native bootstrap ABI cannot hold the endpoint."""
+    endpoint = f'tcp://{host}:{port}'
+    if not 1 <= port <= 65535 or len(endpoint.encode()) > 63:
+        raise ValueError(f'SHMEM bootstrap endpoint must use a valid port and at most 63 bytes: {endpoint}')
+    return endpoint
+
+
+def main() -> None:
+    """Run on every node; publish only after all ranks and both untouched holdouts pass."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--manifest', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--dry-run', action='store_true')
+    args = parser.parse_args()
+    signal.signal(signal.SIGTERM, _terminate)
+    hosts = [host.strip() for host in os.environ.get('VC_WORKER_HOSTS', '').split(',') if host.strip()]
+    nodes = int(os.environ.get('NNODES') or os.environ.get('MA_NUM_HOSTS') or len(hosts) or 1)
+    node = int(os.environ.get('NODE_RANK') or os.environ.get('RANK_AFTER_ACC')
+               or os.environ.get('VC_TASK_INDEX') or '-1')
+    cards = int(os.environ.get('NUM_CARDS') or '16')
+    address = os.environ.get('MASTER_ADDR') or (hosts[0].split(':')[0] if hosts else '')
+    port = int(os.environ.get('MASTER_PORT_BASE') or '29300')
+    timeout = int(os.environ.get('CALIBRATION_PHASE_TIMEOUT_SECONDS') or '3600')
+    if nodes < 1 or not 0 <= node < nodes or cards < 1 or not address or not 1024 <= port < 65532 or timeout < 1:
+        raise ValueError('Require valid scheduler NNODES/NODE_RANK/MASTER_ADDR and a free rendezvous port')
+    manifest = json.loads(args.manifest.read_text())
+    if nodes * cards % manifest['ep_size']:
+        raise ValueError('Cluster world size must be divisible by the model manifest EP size')
+    os.environ['HYPER_PARALLEL_REPLICA_WEIGHT_RESIDENCY'] = '0'
+    os.environ['HYPER_PARALLEL_REPLICA_METADATA_REUSE'] = '0'
+    os.environ.update(MASTER_ADDR=address, NNODES=str(nodes), NUM_CARDS=str(cards))
+    os.environ.pop('HYPER_PARALLEL_REPLICA_CALIBRATION_DIR', None)
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    local_setting = os.environ.get('CALIBRATION_NODE_LOCAL_ROOT')
+    capture_root = Path(local_setting) if local_setting else args.output
+    if local_setting and (str(capture_root).startswith(('/work/', '/home/ma-user/work/'))
+                          or capture_root.resolve().is_relative_to(args.output.resolve())):
+        raise ValueError('CALIBRATION_NODE_LOCAL_ROOT must use separate node-local storage')
+    base = [sys.executable, '-m', 'torch.distributed.run', f'--nnodes={nodes}', f'--node-rank={node}',
+            f'--nproc-per-node={cards}', f'--master-addr={address}']
+    worker = ['-m', 'tests.torch.expert_parallel._replica_capture_launcher',
+              '--worker-module', 'tests.torch.expert_parallel._replica_autocalibration_worker',
+              '--manifest', str(args.manifest.resolve())]
+    fitter = [sys.executable, '-m', 'hyper_parallel.core.expert_parallel.hot_replica.autocalibration',
+              '--manifest', str(args.manifest.resolve()), '--output', str(args.output / 'models')]
+    commands = {'collect': base + [f'--master-port={port}'] + worker + ['--output', str(capture_root / 'collect'),
+                            '--placement-output', str(capture_root / 'collect' / 'placement')],
+                'fit': fitter + ['--input', str(args.output / 'collect')],
+                'verify': base + [f'--master-port={port+2}'] + worker + ['--output', str(capture_root / 'verify'),
+                                                                 '--candidate-directory', str(args.output / 'models')],
+                'publish': fitter + ['--input', str(args.output / 'verify'), '--verify']}
+    commands['verify'] += ['--placement-output', str(capture_root / 'verify' / 'placement')]
+    shmem_host = _shmem_host(address, dry_run=args.dry_run)
+    stage_environment = {
+        phase: {'HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT': _shmem_endpoint(shmem_host, endpoint_port)}
+        for phase, endpoint_port in (('collect', port + 1), ('verify', port + 3))
+    }
+    if args.dry_run:
+        print(json.dumps({'commands': commands, 'model': manifest, 'nodes': nodes, 'node_rank': node,
+                          'cards_per_node': cards, 'stage_environment': stage_environment,
+                          'runtime_bootstrap': 'caller-owned CANN/native/Python activation'},
+                         indent=2))
+        return
+    node_root = args.output / 'nodes' / f'node_{node}'
+    node_root.mkdir(parents=True, exist_ok=True)
+    (node_root / 'started').mkdir()
+    log_root = capture_root / 'nodes' / f'node_{node}'
+    log_root.mkdir(parents=True, exist_ok=True)
+    terminal = 1
+    collection_complete = False
+    fit_rejected = False
+    catalog = args.output / 'models' / 'catalog.json'
+    try:
+        for phase in ('collect', 'fit', 'verify', 'publish'):
+            if phase in ('collect', 'verify'):
+                os.environ.update(stage_environment[phase])
+                peers = [args.output / f'{phase}-node{index}.json' for index in range(nodes)]
+                try:
+                    status = _run(commands[phase], log_root / f'{phase}.log', timeout, peers)
+                    _publish_closed(capture_root / phase, args.output / phase)
+                except BaseException:
+                    _write(args.output / f'{phase}-node{node}.json', {'exit_status': 1, 'node': node})
+                    raise
+                _write(args.output / f'{phase}-node{node}.json', {'exit_status': status, 'node': node})
+                _wait([args.output / f'{phase}-node{index}.json' for index in range(nodes)], timeout)
+                missing = [rank for rank in range(nodes * cards)
+                           if not (args.output / phase / f'status-rank{rank}.json').exists()]
+                if missing:
+                    raise RuntimeError(f'Missing completed rank evidence: {phase}: {missing}')
+                if phase == 'collect':
+                    collection_complete = True
+            else:
+                if node == 0:
+                    try:
+                        if phase == 'publish' and fit_rejected:
+                            _write(args.output / 'private-verification-only.json', dict(
+                                collection_complete=True, private_verification_complete=True,
+                                catalog_published=False, reason='Initial untouched holdout rejected the candidate'))
+                            status = QUALITY_REJECTED_EXIT
+                        else:
+                            status = _run(commands[phase], log_root / f'{phase}.log', timeout)
+                    except BaseException:
+                        _write(args.output / f'{phase}-done.json', {'exit_status': 1, 'node': node})
+                        raise
+                    _write(args.output / f'{phase}-done.json', {
+                        'exit_status': status, 'worker_exit_status': status, 'node': node,
+                        'quality_rejected': status == QUALITY_REJECTED_EXIT})
+                try:
+                    _wait([args.output / f'{phase}-done.json'], timeout, quality_gate=True)
+                except CalibrationRejected:
+                    if phase != 'fit':
+                        raise
+                    # Failed-quality candidates remain private. A fresh capture
+                    # still explains changed decisions without authorizing publication.
+                    fit_rejected = True
+                    missing = [f'{mode}-b{cap}.json'
+                               for mode in manifest.get('dispatch_modes', ['push', 'pull'])
+                               for cap in manifest.get('replica_caps', [1, 2, 6])
+                               if not (args.output / 'models' / f'{mode}-b{cap}.json').is_file()]
+                    if missing:
+                        if node == 0:
+                            _write(args.output / 'private-verification-skipped.json', dict(
+                                collection_complete=True, private_verification_complete=False,
+                                catalog_published=False, missing_candidates=missing,
+                                reason='The rejected TRAIN design did not fit a complete private candidate set'))
+                        raise CalibrationRejected('Private verification requires complete fitted candidates') from None
+        if not catalog.is_file():
+            raise RuntimeError('Calibration finished without a validated catalog')
+        if node == 0:
+            _write(args.output / 'outcome.json', dict(
+                status='validated', collection_complete=collection_complete, catalog_published=True))
+        terminal = 0
+    except CalibrationRejected:
+        terminal = QUALITY_REJECTED_EXIT
+        if node == 0:
+            _write(args.output / 'outcome.json', dict(
+                status='rejected', collection_complete=collection_complete, catalog_published=False,
+                rejected_phase='fit' if fit_rejected else phase))
+        raise SystemExit(QUALITY_REJECTED_EXIT) from None
+    finally:
+        _publish_closed(log_root, node_root)
+        _write(node_root / 'terminal.json', {'exit_status': terminal, 'node': node})
+    print(json.dumps({'status': 'validated', 'calibration_directory': str(args.output / 'models'),
+                      'runtime_environment': {'HYPER_PARALLEL_REPLICA_CALIBRATION_DIR': str(args.output / 'models')}}))
+
+
+if __name__ == '__main__':
+    main()

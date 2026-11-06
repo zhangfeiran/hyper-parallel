@@ -19,6 +19,14 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <new>
+#include <stdexcept>
+#include <vector>
+
+namespace ReplicaHost {
+PyObject *MaterializeDispatch(PyObject *, PyObject *);
+PyObject *LocalityMoves(PyObject *, PyObject *);
+}
 
 namespace {
 
@@ -61,6 +69,61 @@ PyObject *ValidateCounts(PyObject *, PyObject *rows) {
     }
   }
   Py_RETURN_TRUE;
+}
+
+bool ExactSequence(PyObject *value) { return PyTuple_CheckExact(value) || PyList_CheckExact(value); }
+
+bool ColumnShape(PyObject *rows, Py_ssize_t *width) {
+  if (!ExactSequence(rows) || PySequence_Fast_GET_SIZE(rows) == 0) return false;
+  PyObject *first = PySequence_Fast_GET_ITEM(rows, 0);
+  if (!ExactSequence(first) || PySequence_Fast_GET_SIZE(first) == 0) return false;
+  *width = PySequence_Fast_GET_SIZE(first);
+  // Reject every malformed row before allocating even the bounded native vector.
+  for (Py_ssize_t rank = 0; rank < PySequence_Fast_GET_SIZE(rows); ++rank) {
+    PyObject *row = PySequence_Fast_GET_ITEM(rows, rank);
+    if (!ExactSequence(row) || PySequence_Fast_GET_SIZE(row) != *width) return false;
+  }
+  return true;
+}
+
+bool SumColumns(PyObject *rows, std::vector<int64_t> *totals) {
+  for (Py_ssize_t rank = 0; rank < PySequence_Fast_GET_SIZE(rows); ++rank) {
+    PyObject *row = PySequence_Fast_GET_ITEM(rows, rank);
+    for (size_t column = 0; column < totals->size(); ++column) {
+      int64_t count = 0;
+      if (!Integer(PySequence_Fast_GET_ITEM(row, column), &count) ||
+          count > std::numeric_limits<int64_t>::max() - (*totals)[column]) return false;
+      (*totals)[column] += count;
+    }
+  }
+  return true;
+}
+
+PyObject *ColumnTotals(PyObject *, PyObject *rows) {
+  Py_ssize_t width = 0;
+  if (!ColumnShape(rows, &width)) Py_RETURN_NONE;
+  try {
+    std::vector<int64_t> totals(static_cast<size_t>(width), 0);
+    if (!SumColumns(rows, &totals)) {
+      if (PyErr_Occurred()) return nullptr;
+      Py_RETURN_NONE;
+    }
+    PyObject *result = PyList_New(width);
+    if (result == nullptr) return nullptr;
+    for (Py_ssize_t column = 0; column < width; ++column) {
+      PyObject *value = PyLong_FromLongLong(static_cast<PY_LONG_LONG>(totals[column]));
+      if (value == nullptr) {
+        Py_DECREF(result);
+        return nullptr;
+      }
+      PyList_SET_ITEM(result, column, value);
+    }
+    return result;
+  } catch (const std::bad_alloc &) {
+    return PyErr_NoMemory();
+  } catch (const std::length_error &) {
+    return PyErr_NoMemory();
+  }
 }
 
 bool Point(PyObject *table, Py_ssize_t index, int64_t *rows, double *duration) {
@@ -251,8 +314,13 @@ PyObject *AbiVersion(PyObject *, PyObject *) { return PyLong_FromLong(3); }
 PyMethodDef methods[] = {
   {"abi_version", AbiVersion, METH_NOARGS, "Return the host primitive ABI version."},
   {"validate_counts", ValidateCounts, METH_O, "Validate a frozen ordinary integer matrix."},
+  {"column_totals", ColumnTotals, METH_O, "Sum ordinary tuple/list integer columns within the native signed range."},
   {"rank_compute", RankCompute, METH_VARARGS, "Accumulate exact ordered calibrated expert compute bins."},
   {"ordered_compute", OrderedCompute, METH_VARARGS, "Interpolate ordered guest rows and serially sum home rows."},
+  {"materialize_dispatch", ReplicaHost::MaterializeDispatch, METH_VARARGS,
+   "Materialize exact physical slots and source dispatch quotas."},
+  {"locality_moves", ReplicaHost::LocalityMoves, METH_VARARGS,
+   "Return exact whole-guest placement operations without changing Python input objects."},
   {nullptr, nullptr, 0, nullptr},
 };
 

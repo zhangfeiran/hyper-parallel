@@ -41,6 +41,53 @@ def _default_schedule(backend: str, transport: str) -> str:
             'shmem_signal_kernel_gradient': 'fixed_queue_w13_first_v1'}.get(transport, 'fixed_queue_v1')
 
 
+def _group_transfer_counts(copies: list[dict[int, int]], home: int,
+                           nodes: tuple[int, ...]) -> tuple[list[int], list[int]]:
+    """Count both endpoints of every active local or remote replica transfer."""
+    local, remote = [0] * len(copies), [0] * len(copies)
+    for target, experts in enumerate(copies):
+        for expert, rows in experts.items():
+            owner = expert // home
+            if rows and owner != target:
+                edges = local if nodes[owner] == nodes[target] else remote
+                edges[owner] += 1
+                edges[target] += 1
+    return local, remote
+
+
+def _effective_group_features(copies: list[dict[int, int]], counts: tuple[tuple[int, ...], ...],
+                              home: int, nodes: tuple[int, ...],
+                              source_totals: list[int] | None = None,
+                              source_row_floor: float = 0., expert_cell: bool = False,
+                              token_work: bool = True) -> tuple[float, ...]:
+    """Summarize group component maxima without treating synchronized rank waits as local work."""
+    if len(nodes) != len(copies):
+        raise ValueError('Effective group scoring requires the measured EP topology')
+    if source_totals is None:
+        source_totals = [sum(row) for row in counts]
+    local, remote = _group_transfer_counts(copies, home, nodes)
+    tasks, received, tokens = [], [], []
+    for rank, experts in enumerate(copies):
+        if not expert_cell:
+            tasks.append(sum(rows > 0 for rows in experts.values()))
+        received.append(sum(experts.values()))
+        if token_work:
+            hits = sum(min(counts[rank][expert], rows) for expert, rows in experts.items())
+            tokens.append((source_totals[rank] + received[-1] - 2 * hits) / 2)
+    received_max = max(max(received), source_row_floor * max(source_totals))
+    fixed = int(any(source_totals)) if expert_cell else max(tasks)
+    base = fixed, received_max, max(local), max(remote), max(tokens, default=0.), int(any(local) or any(remote))
+    if expert_cell:
+        # Owner-only captures identify a common call intercept, not a per-task
+        # service that can be extrapolated to a different number of guests.
+        peak = max(max(experts.values(), default=0) for experts in copies)
+        # More guest slots must not make aggregate compute free when a rank
+        # exceeds the expert width represented by its owner-only calibration.
+        peak = max(peak, max(received) / home)
+        return base + (peak,)
+    return base
+
+
 @dataclass(frozen=True)
 class ExpertReplicaCostModel:
     """Offline-calibrated millisecond costs for one shape and execution backend.
@@ -66,6 +113,7 @@ class ExpertReplicaCostModel:
         planner_overhead_ms: Common host budget per forward, including owner-only
             candidates. This invariant budget must not bias replica admission.
         quota_search_budget_ms: Measured host budget for attempting finer quotas.
+            None disables quota sweeps while retaining pruning and owner admission.
         minimum_gain_ms: Minimum predicted worst-rank gain, including measurement
             uncertainty and the budget for extra host decision work.
         backward_weight_ms: Measured backward weight-copy cost per replica. None
@@ -84,6 +132,12 @@ class ExpertReplicaCostModel:
         _rank_nodes: Internal immutable EP-rank node labels, bound during runtime setup.
         critical_path: Optional exact-signature device dependency calibration. It
             replaces residual-based scoring with physical services and resource queues.
+        effective_group_ms: Empirical group service coefficients. Six entries retain
+            the legacy task/rank-row/link/token/path features. Seven entries use a
+            nonempty-call intercept and append the maximum destination expert quota.
+            These coefficients do not identify separate physical services.
+        effective_source_row_floor: Internal TRAIN-selected source-row floor for
+            effective receive work. Zero retains the unfloored predictor.
 
     Tables start at (0, 0), use nondecreasing times and cover the intended expert
     row counts. Out-of-range plans retain the original policy. Every EP rank
@@ -109,7 +163,7 @@ class ExpertReplicaCostModel:
     gradient_dtype: str = "float32"
     forward_repeats: int = 1
     replica_overhead_ms: float = 0.0
-    quota_search_budget_ms: float = 0.0
+    quota_search_budget_ms: float | None = 0.0
     planner_overhead_ms: float = 0.0
     backward_weight_ms: float | None = None
     minimum_replica_gain_ms: float | None = None
@@ -122,9 +176,22 @@ class ExpertReplicaCostModel:
     weight_fanout_ms: tuple[tuple[int, float, float], ...] = ()
     _rank_nodes: tuple[int, ...] = field(default=(), repr=False)
     critical_path: DeviceCriticalPathCalibration | None = None
+    effective_group_ms: tuple[float, ...] = ()
+    effective_source_row_floor: float = 0.
 
     def __post_init__(self) -> None:
         """Freeze measured inputs and reject inconsistent calibration contracts."""
+        coefficients = tuple(self.effective_group_ms)
+        if coefficients:
+            if len(coefficients) not in (6, 7) or self.critical_path is not None:
+                raise ValueError('Effective group calibration requires six coefficients or seven with expert-cell '
+                                 'service, and no physical template')
+            for value in coefficients:
+                _nonnegative(value, 'Effective group milliseconds')
+        object.__setattr__(self, 'effective_group_ms', coefficients)
+        _nonnegative(self.effective_source_row_floor, 'Effective source-row floor')
+        if self.effective_source_row_floor > 1 or self.effective_source_row_floor and not coefficients:
+            raise ValueError('Source-row floor requires group calibration and a value between zero and one')
         if isinstance(self.critical_path, dict):
             object.__setattr__(self, 'critical_path', DeviceCriticalPathCalibration(**self.critical_path))
         if self.critical_path is not None:
@@ -139,10 +206,13 @@ class ExpertReplicaCostModel:
         expected_schedule = _default_schedule(self.backend, self.transport)
         schedules = (expected_schedule,)
         if expected_schedule == 'fixed_queue_gradient_bands_v1':
-            schedules += ('fixed_queue_unmapped_guest_suffix_v1',)
+            schedules += ('fixed_queue_unmapped_guest_suffix_v1', 'fixed_queue_global_guest_communication_suffix_v1',
+                          'fixed_queue_rank_local_guest_communication_suffix_v1')
         if self.schedule is not None and self.schedule not in schedules:
             raise ValueError("Replica calibration schedule does not match the execution")
-        if self.schedule == 'fixed_queue_unmapped_guest_suffix_v1' and self.critical_path is not None:
+        if self.schedule in ('fixed_queue_unmapped_guest_suffix_v1',
+                             'fixed_queue_global_guest_communication_suffix_v1',
+                             'fixed_queue_rank_local_guest_communication_suffix_v1') and self.critical_path is not None:
             raise ValueError('Critical-path template does not support the unmapped guest schedule')
         object.__setattr__(self, "schedule", self.schedule or expected_schedule)
         if self.gradient_dtype != "float32":
@@ -169,9 +239,10 @@ class ExpertReplicaCostModel:
                 previous_rows, previous_ms = rows, duration
             object.__setattr__(self, name, table)
         for name in ("weight_ms", "gradient_ms", "token_ms_per_row", "minimum_gain_ms", "replica_overhead_ms",
-                     "quota_search_budget_ms", "planner_overhead_ms"):
+                     "planner_overhead_ms"):
             _nonnegative(getattr(self, name), name)
-        for name in ("backward_weight_ms", "minimum_replica_gain_ms", "intra_node_weight_ms", "inter_node_weight_ms",
+        for name in ("quota_search_budget_ms", "backward_weight_ms", "minimum_replica_gain_ms",
+                     "intra_node_weight_ms", "inter_node_weight_ms",
                      "intra_node_gradient_ms", "inter_node_gradient_ms", "intra_node_backward_weight_ms",
                      "inter_node_backward_weight_ms"):
             if getattr(self, name) is not None:
@@ -286,6 +357,18 @@ class ExpertReplicaCostModel:
         return _QuotaCostState(self, copies, plan.logical_counts, plan.config).score()
 
 
+@dataclass(frozen=True)
+class _GroupQuotaTrial:
+    """Features that stay fixed while moving one quota between two ranks."""
+
+    other_rows: int
+    other_expert: int
+    other_local: int
+    other_remote: int
+    endpoint_local: int
+    endpoint_remote: int
+
+
 class _QuotaCostState:
     """Invocation-local scores; a quota trial changes only its owner and target."""
 
@@ -308,9 +391,18 @@ class _QuotaCostState:
         self.config = config
         if model.critical_path is not None:
             return
+        self.durations = {} if durations is None else durations
+        if model.effective_group_ms:
+            # Refinement still uses the calibrated knots for coverage and its
+            # existing search bound, but group scores never read phase sums.
+            for row in copies:
+                for rows in row.values():
+                    if rows not in self.durations:
+                        self.durations[rows] = model.compute_ms(rows), model.compute_ms(rows, backward=True)
+            self.costs = [(0., 0.)] * config.ep_size
+            return
         self.backward_weight_ms = model.weight_ms if model.backward_weight_ms is None else model.backward_weight_ms
         self.link_costs = model._link_costs[:2] if model._rank_nodes and len(set(model._link_costs)) > 1 else None
-        self.durations = {} if durations is None else durations
         self.weight_durations = {}
         self.transfers = [0] * config.ep_size
         self.local_transfers = [0] * config.ep_size
@@ -337,8 +429,45 @@ class _QuotaCostState:
         """Sum immutable source rows only when token costs or refinement need them."""
         return [sum(row) for row in self.counts]
 
+    def prepare_group_trial(self, owner: int, target: int) -> _GroupQuotaTrial | None:
+        """Compute unaffected peaks once for zero-token expert-cell quota trials."""
+        coefficients = self.model.effective_group_ms
+        if len(coefficients) != 7 or coefficients[4]:
+            return None
+        local, remote = _group_transfer_counts(self.copies, self.home, self.model._rank_nodes)
+        other = [rank for rank in range(len(self.copies)) if rank not in (owner, target)]
+        return _GroupQuotaTrial(
+            max((sum(self.copies[rank].values()) for rank in other), default=0),
+            max((max(self.copies[rank].values(), default=0) for rank in other), default=0),
+            max((local[rank] for rank in other), default=0),
+            max((remote[rank] for rank in other), default=0),
+            max(local[owner], local[target]), max(remote[owner], remote[target]))
+
+    def _group_trial_score(self, owner: int, target: int, expert: int, trial: _GroupQuotaTrial) -> float:
+        """Recompute the two mutable rank rows and preserve the original score order."""
+        source, guest = self.copies[owner], self.copies[target]
+        received = max(trial.other_rows, sum(source.values()), sum(guest.values()))
+        peak = max(trial.other_expert, max(source.values(), default=0), max(guest.values(), default=0),
+                   received / self.home)
+        removed = int(not guest[expert])
+        removed_local = removed * int(self.model._rank_nodes[owner] == self.model._rank_nodes[target])
+        local = max(trial.other_local, trial.endpoint_local - removed_local)
+        remote = max(trial.other_remote, trial.endpoint_remote - (removed - removed_local))
+        features = (int(any(self.source_totals)),
+                    max(received, self.model.effective_source_row_floor * max(self.source_totals)),
+                    local, remote, 0., int(bool(local or remote)), peak)
+        return sum(value * coefficient for value, coefficient in zip(features, self.model.effective_group_ms))
+
     def score(self, removed: int = 0) -> float:
         """Charge replay and replica-only scheduling work without assuming overlap."""
+        if self.model.effective_group_ms:
+            if removed:
+                raise ValueError('Effective group scoring requires final explicit quotas')
+            features = _effective_group_features(self.copies, self.counts, self.home, self.model._rank_nodes,
+                                                 self.source_totals, self.model.effective_source_row_floor,
+                                                 expert_cell=len(self.model.effective_group_ms) == 7,
+                                                 token_work=bool(self.model.effective_group_ms[4]))
+            return sum(value * coefficient for value, coefficient in zip(features, self.model.effective_group_ms))
         if self.model.critical_path is not None:
             if removed:
                 raise ValueError('Critical-path scoring requires final explicit quotas')
@@ -360,7 +489,7 @@ class _QuotaCostState:
         # the native primitive's exact compute_ms contract.
         native = (_rank_compute(experts, self.counts[rank] if token_rate else None, self.home, rank,
                                 durations, self.model.forward_ms, self.model.backward_ms)
-                  if type(self.model) is ExpertReplicaCostModel else None)
+                  if type(self.model) is ExpertReplicaCostModel and not self.model.effective_group_ms else None)
         if native is None:
             for expert, rows in experts.items():
                 guest = int(expert // self.home != rank)
@@ -412,7 +541,8 @@ class _QuotaCostState:
         local_ms, remote_ms = (row[0] for row in self.model._link_costs[:2])
         return duration + local_incoming * local_ms + (incoming - local_incoming) * remote_ms
 
-    def trial_score(self, owner: int, target: int, expert: int, unchanged: tuple[float, float]) -> float:
+    def trial_score(self, owner: int, target: int, expert: int, unchanged: tuple[float, float],
+                    group_trial: _GroupQuotaTrial | None = None) -> float:
         """Refresh the two changed ranks against the accepted edge counts.
 
         Args:
@@ -420,10 +550,15 @@ class _QuotaCostState:
             target: Guest rank whose quota was changed on an accepted active edge.
             expert: Logical expert shared by these ranks.
             unchanged: Phase maxima of ranks unaffected by this edge.
+            group_trial: Fixed features of an eligible expert-cell trial.
 
         Returns:
             Separate forward/backward rank maxima for the trial quotas.
         """
+        if group_trial is not None:
+            return self._group_trial_score(owner, target, expert, group_trial)
+        if self.model.effective_group_ms:
+            return self.score()
         removed = int(not self.copies[target][expert])
         local_removed = int(bool(removed and self.model._rank_nodes
                                  and self.model._rank_nodes[owner] == self.model._rank_nodes[target]))
@@ -445,6 +580,8 @@ class _QuotaCostState:
             target: Guest rank with its chosen quota restored, including a zero quota.
             expert: Logical expert whose edge may now be removed.
         """
+        if self.model.effective_group_ms:
+            return
         removed = int(not self.copies[target][expert])
         local_removed = int(bool(removed and self.model._rank_nodes
                                  and self.model._rank_nodes[owner] == self.model._rank_nodes[target]))
@@ -473,12 +610,15 @@ def _refine_edge(target: int, expert: int, limit: int, knots: list[int], costs: 
     quotas.update(value for point in knots for value in (point, total - point))
     measured = min(costs.model.forward_ms[-1][0], costs.model.backward_ms[-1][0])
     best, best_cost = current, costs.score()
-    unchanged = tuple(max((value[phase] for rank, value in enumerate(costs.costs)
-                           if rank not in (owner, target)), default=0.0) for phase in (0, 1))
-    for quota in sorted(value for value in quotas if lower <= value <= upper and value != current
-                        and max(value, total - value) <= measured):
+    unchanged = ((0., 0.) if costs.model.effective_group_ms else
+                 tuple(max((value[phase] for rank, value in enumerate(costs.costs)
+                            if rank not in (owner, target)), default=0.0) for phase in (0, 1)))
+    trials = sorted(value for value in quotas if lower <= value <= upper and value != current
+                    and max(value, total - value) <= measured)
+    group_trial = costs.prepare_group_trial(owner, target) if len(trials) > 1 else None
+    for quota in trials:
         copies[target][expert], copies[owner][expert] = quota, total - quota
-        cost = costs.trial_score(owner, target, expert, unchanged)
+        cost = costs.trial_score(owner, target, expert, unchanged, group_trial)
         if cost + costs.model.minimum_gain_ms < best_cost:
             best, best_cost = quota, cost
     copies[target][expert], copies[owner][expert] = best, total - best
@@ -503,8 +643,9 @@ def _prune_small_edges(costs: _QuotaCostState, limit: int, minimum_rows: int, me
         if loads[owner] + rows > ceiling or owner_rows + rows > measured:
             continue
         previous = costs.score()
-        unchanged = tuple(max((value[phase] for rank, value in enumerate(costs.costs)
-                               if rank not in (owner, target)), default=0.0) for phase in (0, 1))
+        unchanged = ((0., 0.) if costs.model.effective_group_ms else
+                     tuple(max((value[phase] for rank, value in enumerate(costs.costs)
+                                if rank not in (owner, target)), default=0.0) for phase in (0, 1)))
         copies[target][expert], copies[owner][expert] = 0, owner_rows + rows
         if costs.trial_score(owner, target, expert, unchanged) <= previous:
             loads[owner] += rows
@@ -543,7 +684,6 @@ def refine_replica_quotas(copies: list[dict[int, int]], counts: tuple[tuple[int,
                    for expert, rows in row.items() if expert // home != target and rows)
     if not edges:
         return
-    knots = sorted(set(model.row_knots[0] + model.row_knots[1]))
     costs = _QuotaCostState(model, copies, counts, config, _durations)
     totals = list(map(sum, zip(*counts)))
     home_copies = [{expert: totals[expert] for expert in range(rank * home, (rank + 1) * home)}
@@ -560,26 +700,29 @@ def refine_replica_quotas(copies: list[dict[int, int]], counts: tuple[tuple[int,
     edges = [(target, expert) for target, expert in edges if copies[target].get(expert, 0)]
     if not edges:
         return
-    forward_rate = min(duration / rows for rows, duration in model.forward_ms if rows)
-    backward_rate = min(duration / rows for rows, duration in model.backward_ms if rows)
-    average_rows = sum(costs.source_totals) / config.ep_size
-    moving = {expert for _, expert in edges}
-    fixed = [max(sum(costs.durations[rows][phase] for expert, rows in row.items() if expert not in moving)
-                 for row in copies) for phase in (0, 1)]
-    # Owner-only execution was compared above. Every other profitable supported
-    # candidate retains a guest and cannot move experts outside these edges.
-    optimistic = (model.forward_repeats * (max(forward_rate * average_rows, fixed[0])
-                                         + model.replica_overhead_ms + model.planner_overhead_ms)
-                  + max(backward_rate * average_rows, fixed[1]))
-    # Two deterministic sweeps bound Python work; candidate count depends on
-    # calibration knots and existing edges, not the number of routed tokens.
-    if costs.score() - optimistic > model.minimum_gain_ms + model.quota_search_budget_ms:
-        for _ in range(2):
-            changed = False
-            for target, expert in edges:
-                changed |= _refine_edge(target, expert, limit, knots, costs)
-            if not changed:
-                break
+    search_budget = model.quota_search_budget_ms
+    if search_budget is not None:
+        forward_rate = min(duration / rows for rows, duration in model.forward_ms if rows)
+        backward_rate = min(duration / rows for rows, duration in model.backward_ms if rows)
+        average_rows = sum(costs.source_totals) / config.ep_size
+        moving = {expert for _, expert in edges}
+        fixed = [max(sum(costs.durations[rows][phase] for expert, rows in row.items() if expert not in moving)
+                     for row in copies) for phase in (0, 1)]
+        # Owner-only execution was compared above. Every other profitable supported
+        # candidate retains a guest and cannot move experts outside these edges.
+        optimistic = (model.forward_repeats * (max(forward_rate * average_rows, fixed[0])
+                                             + model.replica_overhead_ms + model.planner_overhead_ms)
+                      + max(backward_rate * average_rows, fixed[1]))
+        # Two deterministic sweeps bound Python work; candidate count depends on
+        # calibration knots and existing edges, not the number of routed tokens.
+        if costs.score() - optimistic > model.minimum_gain_ms + search_budget:
+            knots = sorted(set(model.row_knots[0] + model.row_knots[1]))
+            for _ in range(2):
+                changed = False
+                for target, expert in edges:
+                    changed |= _refine_edge(target, expert, limit, knots, costs)
+                if not changed:
+                    break
     if (home_cost is not None and model.minimum_replica_gain_ms is not None
             and costs.score() + model.minimum_replica_gain_ms >= home_cost):
         copies[:] = home_copies

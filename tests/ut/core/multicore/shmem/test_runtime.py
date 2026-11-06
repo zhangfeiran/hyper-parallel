@@ -480,12 +480,76 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertEqual(self.dist.all_gather_object.call_count, 7)
         payloads = [call.args[1] for call in self.dist.all_gather_object.call_args_list]
         self.assertEqual(payloads[0], (
-            (256, ("layout", 1), (((4,), "torch.float32", 16),), (((8,), "torch.float32", 16, 32),)),
+            (256, ("layout", 1), (((4,), "torch.float32", 16),), (((8,), "torch.float32", 16, 32),), False),
             None,
             False,
         ))
         self.assertEqual(payloads[1:], [(None, None, False)] * 6)
         self.assertFalse(_lifecycle._runtime_invalidated)  # pylint: disable=protected-access
+
+    def test_fixed_heap_repack_keeps_the_live_runtime_and_replaces_allocations(self) -> None:
+        """Reuse a fixed-size heap only after the usual quiescence and release stages."""
+        _lifecycle.acquire()
+        self.native._initialize.reset_mock()
+        self.native._get_unique_id.reset_mock()
+        registry = self.native._debug_state.return_value["active_allocations"]
+        registry.append({"allocation_base": 100, "allocation_bytes": 16})
+        current = Mock(shape=(4,), dtype=torch.float32, _base=None)
+        current.data_ptr.return_value = 100
+        current.numel.return_value = 4
+        current.element_size.return_value = 4
+        current.is_contiguous.return_value = True
+        new = torch.empty(8, dtype=torch.float32)
+        replacement = _lifecycle._AllocationReplacement(
+            current, _lifecycle._AllocationSpec((8,), torch.float32, 16))
+        with (
+            patch("hyper_parallel.core.multicore.shmem._api.free", side_effect=lambda _: registry.clear()) as free,
+            patch("hyper_parallel.core.multicore.shmem._api.empty", return_value=new) as empty,
+        ):
+            result = _lifecycle._restart(
+                heap_size_bytes=128, replacements=(replacement,), preflight_hook=lambda: ("layout", 1),
+                allow_existing_runtime=True,
+            )
+        self.torch.npu.synchronize.assert_called_once_with("npu:0")
+        free.assert_called_once_with(current)
+        empty.assert_called_once_with((8,), dtype=torch.float32, alignment=16)
+        self.native._validate_shutdown.assert_not_called()
+        self.native._shutdown.assert_not_called()
+        self.native._initialize.assert_not_called()
+        self.native._get_unique_id.assert_not_called()
+        self.assertEqual(result.tensors, (new,))
+        self.assertEqual([result.stages_ms[name] for name in ("finalize_ms", "bootstrap_ms", "initialize_ms")],
+                         [0.0, 0.0, 0.0])
+        self.assertFalse(_lifecycle._runtime_invalidated)
+
+    def test_fixed_heap_repack_requires_root_agreement_before_quiescence(self) -> None:
+        """A peer selecting reinitialization cannot enter a different collective order."""
+        _lifecycle.acquire()
+
+        def disagree(output: list, payload: tuple, **_kwargs: object) -> None:
+            value, error, unavailable = payload
+            output[:] = [payload, (value[:-1] + (False,), error, unavailable)]
+
+        self.dist.all_gather_object.side_effect = disagree
+        with self.assertRaisesRegex(RuntimeError, "Preflight: values differ across Root ranks"):
+            _lifecycle._restart(
+                heap_size_bytes=128, replacements=(), preflight_hook=lambda: ("layout", 1),
+                allow_existing_runtime=True,
+            )
+        self.torch.npu.synchronize.assert_not_called()
+        self.native._shutdown.assert_not_called()
+        self.assertFalse(_lifecycle._runtime_invalidated)
+
+    def test_fixed_heap_repack_does_not_preserve_an_undersized_heap(self) -> None:
+        """A changed physical heap size still performs the existing native restart."""
+        _lifecycle.acquire()
+        self.native._initialize.reset_mock()
+        _lifecycle._restart(
+            heap_size_bytes=256, replacements=(), preflight_hook=lambda: ("layout", 1),
+            allow_existing_runtime=True,
+        )
+        self.native._shutdown.assert_called_once()
+        self.native._initialize.assert_called_once_with(0, 2, b"group-bootstrap", 256)
 
     def test_runtime_restart_preflight_failure_preserves_runtime(self) -> None:
         """Converge ownership, device, Allocation and hook failures before teardown."""

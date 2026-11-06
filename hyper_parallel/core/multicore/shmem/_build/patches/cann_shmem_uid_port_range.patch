@@ -1,0 +1,14 @@
+--- a/src/host/bootstrap/config_store/store_net_utils.h
++++ b/src/host/bootstrap/config_store/store_net_utils.h
+@@ -27,8 +27,9 @@
+ namespace shm {
+ namespace utils {
+
+-constexpr int MIN_PORT = 1024;
+-constexpr int MAX_PORT = 65536;
++// The config-store URL parser accepts only (1024, UINT16_MAX].
++constexpr int MIN_PORT = 1025;
++constexpr int MAX_PORT = UINT16_MAX;
+ constexpr int MAX_ATTEMPTS = 1000;
+ constexpr int MAX_IFCONFIG_LENGTH = 23;
+ constexpr int MAX_IP = 256;

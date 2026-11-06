@@ -69,10 +69,39 @@ saved-row floors, capacity-required copies, and ordered checkpoint replay remain
 the same as in the full planner. An existing native count agreement needs no
 additional histogram readback or collective for this decision.
 
+With positive admission and fragment thresholds, a slot cap of at least two,
+and an owner peak at least three times the average, the default CPU policy may
+compare one additional completed single-guest seed. It reuses the balancing
+skeleton and can rescue a useful layout rejected after thin-fragment pruning.
+The proposal must satisfy the original admission and receive allowance, keep
+each expert at or below the average rank load, and keep every receiver below
+twice that average. Replacing an already active layout additionally requires
+halving both matrix edges and the maximum owner fanout. This can trade some
+receive rows for fewer fixed matrix transfers; it does not estimate latency.
+Light routes retain the existing compact rejection, and no public option,
+calibration table, or extra collective is required.
+
 The final uncalibrated layout also consolidates redundant guest matrices above
 the small-copy threshold. Existing copies of the same owner may take over work;
 no new matrix edge is created and the receive peak cannot increase. Cross-node
 edges and owners with larger fanout are considered first.
+
+After final locality placement and consolidation, a bounded pass can refill
+already retained guest matrices from their own logical expert's remaining home
+rows. Existing guest rows and uncopied home rows establish a lower bound on the
+expert peak, so the pass skips home fragments that cannot reduce it. It creates
+no matrix edges or active slots. The proposal must reduce the largest expert
+fragment while keeping the rank receive peak and every source/node traffic
+objective nonincreasing. This pass uses no
+additional budget candidates, public parameter, calibration table or collective.
+Zero admission/fragment compatibility policies, explicit placement experiments,
+and matched cost models retain their existing paths. Structural improvement is
+not a latency guarantee.
+
+The optional ABI3 host extension can emit the same ordered whole-guest locality
+moves as Python. Python applies each move in sequence to preserve dictionary
+insertion order and remains the fallback for unsupported integer ranges or
+older extension builds. This CPU primitive does not change device kernels.
 
 For training, MegaMoe derives an internal activation-row credit from its own
 expert shape and gradient flags. With intermediate dimension `I`, it credits
@@ -108,10 +137,22 @@ change is needed for these rules.
 CPU 计划的 `replica_slots_used` 返回各 rank 的实际使用量。
 没有副本且 event 偏移兼容时使用 home-only 图。
 
-Push 可选布局必须装入初始接收预留；预留不足时保留必要副本或执行有界扩容。
+Push 根据已绑定的对称堆预算、其他 workspace 和当前 source 容量计算接收硬上限。
+初始接收预留仍是布局偏好，实际选择后才分配或扩容，B0 和 B>0 使用相同规则。
 Pull/Native 的接收张量按所选布局分配。底层规划器的 `capacity_limit` 可表达接收硬约束。
 checkpoint 重算检查计数、配置和调用顺序后复用原计划；接收预留扩大不会改变原调用的重算布局。
 backward 保留本次调用自己的不可变计划和权重 generation。
+
+实验开关默认为关闭，须在作业启动前对所有参与 rank 一致设置：
+
+| 环境变量 | 启用时的行为 |
+| --- | --- |
+| `HYPER_PARALLEL_REPLICA_COMPLETE_GUEST_SEARCH=1` | 无表 B2 强热点下比较完整配额，只接受仍装入两个物理槽且改善接收峰的候选。 |
+| `HYPER_PARALLEL_REPLICA_PROJECTED_GUEST_SEARCH=1` | 用拓扑感知的准入规则比较可投影到 B2 的更宽配额。 |
+| `HYPER_PARALLEL_SHMEM_FIXED_HEAP_REPACK=1` | 堆字节数不变时保留 SHMEM runtime，仍同步并重建 workspace 分配。 |
+| `HYPER_PARALLEL_REPLICA_RANK_LOCAL_COMM=1` | 按 rank 裁剪空 combine/Pull dispatch，按实际发端同步修正接收信号计数。 |
+
+校准表按运行签名匹配，包含上述开关和通信图身份。
 
 本版不自动探测可用 HBM、不在线采集校准表，也不做副本池热扩缩容。
 

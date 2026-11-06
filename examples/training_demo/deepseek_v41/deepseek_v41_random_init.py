@@ -15,7 +15,14 @@
 """Generate topology-independent canonical random shards without weight files."""
 # pylint: disable=forbidden-backend-import
 
+from collections import deque
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from functools import partial
+from itertools import islice
 import math
+import os
 from typing import Any
 
 import numpy as np
@@ -27,11 +34,37 @@ from hyper_parallel.models.external_state import get_model_external_state
 
 
 _CHUNK_ELEMENTS = 1 << 20
+_INITIALIZATION_WORKERS = 2
+
+
+def _linear_shard_base(shape: tuple[int, ...], area: tuple[tuple[int, int], ...]) -> int | None:
+    """Return the global start only when all local elements are contiguous in row-major order."""
+    start, stride, full_suffix = 0, 1, True
+    for extent, (begin, end) in reversed(tuple(zip(shape, area, strict=True))):
+        if end - begin > 1 and not full_suffix:
+            return None
+        start += begin * stride
+        full_suffix = full_suffix and begin == 0 and end == extent
+        stride *= extent
+    return start
 
 
 def canonical_indices(start: int, count: int, shape: tuple[int, ...],
                       area: tuple[tuple[int, int], ...], transpose: bool) -> np.ndarray:
     """Translate local flat coordinates into native-layout global flat indices."""
+    if not transpose:
+        base = _linear_shard_base(shape, area)
+        if base is not None:
+            return np.arange(base + start, base + start + count, dtype=np.uint64)
+    elif len(shape) >= 2:
+        base = _linear_shard_base(shape[:-2], area[:-2])
+        if base is not None:
+            rows, columns = shape[-2:]
+            (first_row, last_row), (first_column, last_column) = area[-2:]
+            offsets = np.arange(start, start + count, dtype=np.uint64)
+            row_offsets, column = np.divmod(offsets, last_column - first_column)
+            prefix, row = np.divmod(row_offsets, last_row - first_row)
+            return ((prefix + base) * columns + column + first_column) * rows + row + first_row
     local_shape = tuple(end - begin for begin, end in area)
     offsets = np.arange(start, start + count, dtype=np.int64)
     coordinates = []
@@ -49,6 +82,40 @@ def canonical_indices(start: int, count: int, shape: tuple[int, ...],
     return indices
 
 
+def _generate_chunk(start: int, *, numel: int, shape: tuple[int, ...],
+                    area: tuple[tuple[int, int], ...], transpose: bool,
+                    name: str, seed: int, std: float, constant: float | None,
+                    padding_id: int | None) -> np.ndarray:
+    """Generate one CPU chunk without touching model or device state."""
+    size = min(_CHUNK_ELEMENTS, numel - start)
+    if constant is not None and padding_id is None:
+        return np.full(size, constant, dtype=np.float32)
+    indices = canonical_indices(start, size, shape, area, transpose)
+    values = (canonical_normal(indices, name, seed, std) if constant is None
+              else np.full(size, constant, dtype=np.float32))
+    if padding_id is not None:
+        values[indices // shape[-1] == padding_id] = 0
+    return values
+
+
+def _initialization_chunks(generate: Callable[[int], np.ndarray], numel: int, *,
+                           pool: ThreadPoolExecutor | None) -> Iterator[tuple[int, np.ndarray]]:
+    """Generate bounded chunks ahead of the ordered copies on the caller thread."""
+    offsets = range(0, numel, _CHUNK_ELEMENTS)
+    if pool is None or len(offsets) <= 1:
+        for start in offsets:
+            yield start, generate(start)
+        return
+    remaining = iter(offsets)
+    pending = deque((start, pool.submit(generate, start)) for start in islice(remaining, _INITIALIZATION_WORKERS))
+    while pending:
+        start, future = pending.popleft()
+        values = future.result()
+        if (next_start := next(remaining, None)) is not None:
+            pending.append((next_start, pool.submit(generate, next_start)))
+        yield start, values
+
+
 def initialize_random_shards(trainer: Any, *, seed: int, backend: str, std: float = 0.02) -> dict[str, Any]:
     """Fill local shards using the native parameter layout and reload optimizer masters.
 
@@ -60,7 +127,11 @@ def initialize_random_shards(trainer: Any, *, seed: int, backend: str, std: floa
     host_tables = {id(table.weight): table for table in external.tables.values()} if external else {}
     count = 0
     signature = np.uint64(0)
-    with torch.no_grad():
+    cpu_affinity = getattr(os, "sched_getaffinity", lambda _: {0})(0)
+    pool_context = (ThreadPoolExecutor(max_workers=_INITIALIZATION_WORKERS)
+                    if _INITIALIZATION_WORKERS > 1 and len(cpu_affinity) >= _INITIALIZATION_WORKERS
+                    else nullcontext())
+    with torch.no_grad(), pool_context as pool:
         for name, parameter in trainer.base.model.named_parameters():
             local = parameter.to_local() if hasattr(parameter, "to_local") else parameter
             if not local.is_contiguous():
@@ -87,18 +158,16 @@ def initialize_random_shards(trainer: Any, *, seed: int, backend: str, std: floa
                 constant = 1.0
             flat = local.view(-1)
             transpose = backend == "megamoe" and ".mlp.experts." in name
-            for start in range(0, local.numel(), _CHUNK_ELEMENTS):
-                size = min(_CHUNK_ELEMENTS, local.numel() - start)
-                indices = canonical_indices(start, size, shape, area, transpose)
-                values = (canonical_normal(indices, name, seed, std) if constant is None
-                          else np.full(size, constant, dtype=np.float32))
-                # The token embedding padding row stays zero, as in the HF initializer.
-                if name == "model.embed_tokens.weight":
-                    values[indices // shape[-1] == trainer.base.model.config.pad_token_id] = 0
-                flat[start:start + size].copy_(torch.from_numpy(values))
+            # The token embedding padding row stays zero, as in the HF initializer.
+            padding_id = trainer.base.model.config.pad_token_id if name == "model.embed_tokens.weight" else None
+            generate = partial(_generate_chunk, numel=local.numel(), shape=shape, area=area, transpose=transpose,
+                               name=name, seed=seed, std=std, constant=constant, padding_id=padding_id)
+            for start, values in _initialization_chunks(generate, local.numel(),
+                                                        pool=pool if constant is None else None):
+                flat[start:start + values.size].copy_(torch.from_numpy(values))
                 # An order-independent checksum permits comparison after expert transposition.
                 with np.errstate(over="ignore"):
-                    signature += np.sum(values.view(np.uint32).astype(np.uint64), dtype=np.uint64)
+                    signature += np.sum(values.view(np.uint32), dtype=np.uint64)
             count += local.numel()
     optimizers = trainer.base.optimizer
     for optimizer in optimizers if isinstance(optimizers, list) else [optimizers]:

@@ -84,6 +84,21 @@
             "path": "hyper_parallel/core/multicore/ops/grouped_matmul_bands.patch",
             "sha256": "7b7ef9d8aa6eee1c33fc55481333115b50d09667563af3690b45a23aa8c7c0db",
             "purpose": "publish complete-K gradient row bands after final GM write fences"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/grouped_matmul_local_tiling.patch",
+            "sha256": "bc87b97fa777b35a7fd24f9e746f5e51f9fba64df29bc0295a8a5a7e446c0d9c",
+            "purpose": "apply backward GMM dynamic dimensions to the Cube-local tiling copy"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/grouped_matmul_explicit_split.patch",
+            "sha256": "a44522ea69d3aef3806dfd0880aaf7a1919ea9e8dd051032184b1ed66c1eccb5",
+            "purpose": "use the single active backward GMM split without materializing a scratch group list"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/grouped_matmul_lane.patch",
+            "sha256": "7a11398984ece485edada247bb41f92136cb3bafe9693f9c93118b3aa690dc06",
+            "purpose": "rotate ordinary weight-gradient tile lanes while retaining physical workspace ownership"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
@@ -150,6 +165,12 @@
             "path": "hyper_parallel/core/multicore/shmem/_build/patches/cann_kernel_debug.patch",
             "sha256": "560836f951a2b05f07f72ecc946517f76cacf0825a1ca74900e99ea36cadb600",
             "purpose": "suppress production device printf metadata on CANN 8.5 while preserving abort traps and opt-in debug output"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/shmem/_build/patches/cann_shmem_uid_port_range.patch",
+            "sha256": "6ae1012b1df5349417b2f47af8a79bb2d61d9cdcc7ab262d19a03c244e010788",
+            "ignore_space_change": true,
+            "purpose": "keep config-store UID port selection within the URL parser's valid range"
           }
         ],
         "packaging_policy": {

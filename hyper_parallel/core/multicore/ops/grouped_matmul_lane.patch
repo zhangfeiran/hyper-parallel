@@ -1,0 +1,78 @@
+diff --git a/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp b/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
+index e78c82f..f50b52e 100644
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
+@@ -207,6 +207,7 @@ __aicore__ inline void ApplyDynamicRows(GMMBaseParams &base, TCubeTiling &tile,
+         op.Init(&gmmBaseParams_, &mmTilingData_, gmmArrayAddr_, groupList, tiling);                                \
+         op.SetBandPublication(band_flags, band_epoch, band_rows, band_trace, band_projection, band_rank, band_expert);                                                \
+         op.SetExplicitSplit(dynamic_rows, explicit_expert);                                                       \
++        op.SetLaneRotation(rotate_expert);                                                                        \
+         op.Process();                                                                                              \
+     } while (0)
+
+@@ -409,7 +410,8 @@ extern "C" inline __aicore__ void grouped_matmul(GM_ADDR x, GM_ADDR weight, GM_A
+                                                      uint32_t band_projection = 0, uint32_t band_rank = 0,
+                                                      uint32_t band_expert = 0, int64_t dynamic_rows = 0,
+                                                      bool single_group = false,
+-                                                     uint32_t explicit_expert = UINT32_MAX)
++                                                     uint32_t explicit_expert = UINT32_MAX,
++                                                     uint32_t rotate_expert = UINT32_MAX)
+ {
+     TPipe tPipe;
+     AscendCUtils::SetOverflow(1);
+diff --git a/gmm/grouped_matmul/op_kernel/grouped_matmul.h b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+index 337cb27..237ce58 100644
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.h
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+@@ -19,6 +19,7 @@
+ #include "kernel_operator.h"
+
+ #include "../runtime/gradient_band.h"
++#include "../runtime/gradient_order_policy.h"
+
+ namespace GROUPED_MATMUL {
+
+@@ -124,6 +125,7 @@ class GMMProcess {
+     uint32_t coreIdx;
+     uint32_t explicitExpert = UINT32_MAX;
+     int64_t explicitRows = 0;
++    uint32_t rotateExpert = MulticoreRuntime::GRADIENT_LANE_DISABLED;
+     uint32_t groupNum;
+     int32_t preOffset = 0;
+     GM_ADDR groupListPtr;
+@@ -143,6 +145,8 @@ class GMMProcess {
+         explicitExpert = expert;
+     }
+
++    __aicore__ inline void SetLaneRotation(uint32_t expert) { rotateExpert = expert; }
++
+     __aicore__ inline void SetBandPublication(GM_ADDR flags, int32_t epoch, uint32_t rows,
+         MulticoreRuntime::CycleTraceRecorder *trace, uint32_t projection, uint32_t rank, uint32_t expert) {
+         bandProducer.Set(flags, epoch, rows);
+@@ -329,8 +333,15 @@ __aicore__ inline void GMMProcess<ComputeType>::Process() {
+         mnConfig.blockDimM = Ceil(mnConfig.m, mnConfig.singleM);
+         mnConfig.blockDimN = Ceil(mnConfig.n, mnConfig.singleN);
+
+-        uint32_t curCount = count + mnConfig.blockDimM * mnConfig.blockDimN;
+-        uint32_t curBlock = coreIdx >= count ? coreIdx : coreIdx + gmmBaseParams->coreNum;
++        const uint32_t blockCount = mnConfig.blockDimM * mnConfig.blockDimN;
++        const uint32_t curCount = count + blockCount;
++        uint32_t tileLane = coreIdx;
++        if (rotateExpert != MulticoreRuntime::GRADIENT_LANE_DISABLED) {
++            if (bandProducer.Enabled()) AscendC::Trap();
++            tileLane = MulticoreRuntime::RotateGradientLane(coreIdx, gmmBaseParams->coreNum,
++                                                            blockCount, rotateExpert);
++        }
++        uint32_t curBlock = tileLane >= count ? tileLane : tileLane + gmmBaseParams->coreNum;
+         uint32_t thresholdM_dimN = thresholdBlockNum * mnConfig.blockDimN;
+
+         if (bandProducer.Enabled()) {
+@@ -346,7 +357,7 @@ __aicore__ inline void GMMProcess<ComputeType>::Process() {
+         }
+         while (curBlock < curCount) {
+             MNBlockIdxCompute(mnConfig, curBlock, count, thresholdM_dimN);
+-            computeOp.MMCompute(groupIdx, mnConfig, coreIdx);
++            computeOp.MMCompute(groupIdx, mnConfig, tileLane);
+             if (bandProducer.Enabled()) {
+                 uint32_t row = mnConfig.mIdx * mnConfig.singleM;
+                 uint32_t rows = mnConfig.m - row < mnConfig.singleM ? mnConfig.m - row : mnConfig.singleM;

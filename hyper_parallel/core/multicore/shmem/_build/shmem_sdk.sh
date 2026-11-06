@@ -170,9 +170,11 @@ for adapter in lock.get("patches", []):
     actual_hash = hashlib.sha256(adapter_path.read_bytes()).hexdigest()
     if actual_hash != adapter["sha256"]:
         raise ValueError(f"SHMEM adapter hash mismatch: {adapter_path}")
+    # The pinned config-store header has CRLF in the archived source.
+    whitespace = ["--ignore-space-change"] if adapter.get("ignore_space_change") else []
     for options in (("--check",), (), ("--check", "--reverse")):
         subprocess.run(
-            ["git", "apply", *options, str(adapter_path)],
+            ["git", "apply", *whitespace, *options, str(adapter_path)],
             cwd=source_dir,
             env=environment,
             check=True,

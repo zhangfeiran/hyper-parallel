@@ -1,0 +1,77 @@
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.h
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+@@ -122,6 +122,8 @@
+
+     uint32_t blockIdx;
+     uint32_t coreIdx;
++    uint32_t explicitExpert = UINT32_MAX;
++    int64_t explicitRows = 0;
+     uint32_t groupNum;
+     int32_t preOffset = 0;
+     GM_ADDR groupListPtr;
+@@ -135,6 +137,11 @@
+  public:
+     /** @brief constructor */
+     MulticoreRuntime::GradientBandProducer bandProducer;
++
++    __aicore__ inline void SetExplicitSplit(int64_t rows, uint32_t expert) {
++        explicitRows = rows;
++        explicitExpert = expert;
++    }
+
+     __aicore__ inline void SetBandPublication(GM_ADDR flags, int32_t epoch, uint32_t rows,
+         MulticoreRuntime::CycleTraceRecorder *trace, uint32_t projection, uint32_t rank, uint32_t expert) {
+@@ -287,8 +294,15 @@
+ template <typename ComputeType>
+ __aicore__ inline void GMMProcess<ComputeType>::Process() {
+     MNConfig mnConfig;
++    const bool hasExplicitSplit = explicitExpert != UINT32_MAX;
++    if (hasExplicitSplit &&
++        (explicitRows <= 0 || explicitRows > INT32_MAX || explicitExpert >= groupNum ||
++         gmmBaseParams->groupListType != 0 ||
++         (gmmBaseParams->groupType != 0 && gmmBaseParams->groupType != 2))) {
++        AscendC::Trap();
++    }
+     if (gmmBaseParams->groupType != -1) {  // -1: no split
+-        if (unlikely(groupListPtr == nullptr)) {
++        if (unlikely(groupListPtr == nullptr && !hasExplicitSplit)) {
+             return;
+         }
+         preOffset = 0;
+@@ -297,10 +311,14 @@
+     // 2: groupList shape: [e, 2]; 1: groupList shape: [e]
+     uint32_t groupListType = gmmBaseParams->groupListType;
+     uint32_t groupListInnerShape = groupListType == GROUP_LIST_TYPE_SPARSE ? 2 : 1;
+-    uint32_t groupListShapeSize = groupNum * groupListInnerShape;
++    // A worker materializes one nonempty group. Keep prefix offset calculation
++    // unchanged but avoid the GM group-list scratch and trailing empty groups.
++    uint32_t groupListShapeSize = hasExplicitSplit ? explicitExpert + 1 : groupNum * groupListInnerShape;
+     for (uint32_t groupIdx = 0, count = 0; groupIdx < groupListShapeSize; groupIdx += groupListInnerShape) {
+         UpdateMnConfig(mnConfig);
+-        int32_t splitValue = GetSplitValueFromGroupList(groupIdx, preOffset, gmmBaseParams, groupListGm);
++        int32_t splitValue = hasExplicitSplit
++                                 ? (groupIdx == explicitExpert ? static_cast<int32_t>(explicitRows) : 0)
++                                 : GetSplitValueFromGroupList(groupIdx, preOffset, gmmBaseParams, groupListGm);
+         if (groupListType == GROUP_LIST_TYPE_SPARSE && splitValue <= 0) {
+             break;
+         }
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
+@@ -206,6 +206,7 @@
+         processClass<decltype(computeOp)> op(computeOp);                                                           \
+         op.Init(&gmmBaseParams_, &mmTilingData_, gmmArrayAddr_, groupList, tiling);                                \
+         op.SetBandPublication(band_flags, band_epoch, band_rows, band_trace, band_projection, band_rank, band_expert);                                                \
++        op.SetExplicitSplit(dynamic_rows, explicit_expert);                                                       \
+         op.Process();                                                                                              \
+     } while (0)
+
+@@ -407,7 +408,8 @@
+                                                      MulticoreRuntime::CycleTraceRecorder *band_trace = nullptr,
+                                                      uint32_t band_projection = 0, uint32_t band_rank = 0,
+                                                      uint32_t band_expert = 0, int64_t dynamic_rows = 0,
+-                                                     bool single_group = false)
++                                                     bool single_group = false,
++                                                     uint32_t explicit_expert = UINT32_MAX)
+ {
+     TPipe tPipe;
+     AscendCUtils::SetOverflow(1);

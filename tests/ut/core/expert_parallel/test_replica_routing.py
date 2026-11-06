@@ -16,7 +16,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
@@ -28,11 +28,33 @@ from hyper_parallel.core.expert_parallel.hot_replica import (
     routing,
 )
 from hyper_parallel.core.expert_parallel.hot_replica.planner import _build_expert_replica_plan as build_expert_replica_plan
+from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
 from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts, get_recompute_state
 
 
 class TestReplicaRouting(unittest.TestCase):
     """Compare both remap paths with explicit per-expert occurrence quotas."""
+
+    def test_upload_builds_only_the_current_source_runs(self) -> None:
+        """Retain stable expert/slot order and zero runs without materializing other ranks."""
+        for empty in (False, True):
+            logical = ((0, 0, 0, 0), (8, 2, 0, 0)) if empty else ((5, 0, 0, 0), (3, 2, 0, 0))
+            dispatch = ((0, 0, 0, 0, 0, 0), (4, 2, 0, 0, 0, 4)) if empty else (
+                (3, 0, 0, 0, 0, 2), (1, 2, 0, 0, 0, 2))
+            plan = ExpertExecutionPlan(ExpertReplicaConfig(4, 2, 1), logical,
+                                       ((0, 1, -1), (2, 3, 0)), dispatch)
+            plan.validate()
+            for rank in range(2):
+                with self.subTest(empty=empty, rank=rank):
+                    with patch.object(ExpertExecutionPlan, 'source_runs', new_callable=PropertyMock,
+                                      side_effect=AssertionError('Global source runs were materialized')):
+                        slots, lengths, counts = routing._upload_route_metadata(plan, rank, torch.device('cpu'))
+                    self.assertEqual(slots.tolist(), [0, 5, 1, 3, 4])
+                    self.assertEqual(lengths.tolist(), [dispatch[rank][slot] for slot in (0, 5, 1, 3, 4)])
+                    self.assertEqual(counts.tolist(), [list(row) for row in dispatch])
+                    self.assertEqual((slots.dtype, lengths.dtype, counts.dtype),
+                                     (torch.int64, torch.int64, torch.int32))
+                    self.assertNotIn('source_runs', plan.__dict__)
 
     def test_trusted_histogram_skips_recount_and_retains_host_dispatch(self) -> None:
         """Trusted Router counts and ordinary validation produce identical placements."""

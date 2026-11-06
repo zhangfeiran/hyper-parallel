@@ -23,12 +23,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import torch
+
 from hyper_parallel.core.expert_parallel.hot_replica import cost, host, planner
+from hyper_parallel.core.expert_parallel.hot_replica import routing
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica.critical_path import DeviceCriticalPathCalibration
+from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
+from tests.common.mark_utils import arg_mark
 
 
 @unittest.skipUnless(shutil.which("cmake") and shutil.which("c++"), "CPU native tests require CMake and C++")
@@ -65,6 +71,161 @@ class TestReplicaHost(unittest.TestCase):
                   "forward_repeats": 2, "backward_weight_ms": 0}
         return cost.ExpertReplicaCostModel(**(values | options))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_column_totals_match_logical_and_physical_count_matrices(self) -> None:
+        """Feature: Exact native column reductions.
+        Description: Sum real logical and padded physical matrix geometries with empty source ranks.
+        Expectation: Every integer total exactly matches the independent Python reduction.
+        """
+        generator = random.Random(20261105)
+        for peers in (1, 4, 16, 64):
+            for budget in (0, 1, 2, 6):
+                width = peers * (6 + budget)
+                matrix = tuple(tuple(0 if rank % 3 == 2 else generator.randrange(2000)
+                                     for _ in range(width)) for rank in range(peers))
+                for values in (matrix, [list(row) for row in matrix]):
+                    with self.subTest(peers=peers, budget=budget, mutable=isinstance(values, list)):
+                        self.assertEqual(self.native.column_totals(values), list(map(sum, zip(*matrix))))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_column_totals_keep_python_fallback_for_unsupported_values_and_overflow(self) -> None:
+        """Feature: Native integer reduction boundaries.
+        Description: Cross scalar, tuple, shape and signed-64-bit accumulation limits.
+        Expectation: Unsupported inputs return None without replacing arbitrary-precision Python behavior.
+        """
+        class CountSubclass(int):
+            """Keep custom scalar arithmetic on the Python reference path."""
+
+        class RowSubclass(tuple):
+            """Keep custom sequence iteration on the Python reference path."""
+
+        class ListSubclass(list):
+            """Keep custom mutable sequence behavior on the reference path."""
+
+        cases = ((), ((),), ((1,), ()), ((True,),), ((-1,),), ((1.5,),), ((2**80,),),
+                 ((2**63-1,), (1,)), ((CountSubclass(1),),), (RowSubclass((1,)),), ListSubclass([(1,)]))
+        for matrix in cases:
+            with self.subTest(matrix=matrix):
+                self.assertIsNone(self.native.column_totals(matrix))
+        for matrix in (((2**63-1, 0), (0, 1)), ((0, 0), (0, 0)), [(1,)], ([1, 2], (3, 4))):
+            self.assertEqual(self.native.column_totals(matrix), list(map(sum, zip(*matrix))))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_column_totals_reach_native_agreement_prepared_candidate_admission(self) -> None:
+        """Feature: Native agreement CPU reduction.
+        Description: Build a real prepared candidate from the native agreement's ordinary host lists.
+        Expectation: The C API consumes that list without another gather or adaptive search and preserves the plan.
+        """
+        config = ExpertReplicaConfig(4, 2, 1)
+        ids = torch.tensor([[0, 1]] * 4, dtype=torch.int32)
+        counts = torch.tensor([[4, 4, 0, 0], [2, 2, 0, 0]], dtype=torch.int64)
+        summary = [[0, 4, 31, 8, 0, 4, 12], [0, 2, 31, 4, 0, 2, 0]]
+        prepared = routing._GatheredReplicaCounts(counts, summary, counts.tolist())
+        observations = []
+        reduce_columns = self.native.column_totals
+
+        def observe(values: object) -> object:
+            """Record actual list consumption while retaining the compiled reduction."""
+            result = reduce_columns(values)
+            observations.append((isinstance(values, list), result is not None))
+            return result
+
+        plans = []
+        with patch.object(routing, "dist") as distributed:
+            distributed.is_initialized.return_value = True
+            distributed.get_rank.return_value = 0
+            distributed.get_world_size.return_value = 2
+            for backend in (None, self.native):
+                with patch.object(host, "_native_backend", return_value=backend), \
+                        patch.object(self.native, "column_totals", side_effect=observe), \
+                        patch.object(routing, "_gather_replica_counts", side_effect=AssertionError("Extra gather")), \
+                        patch.object(planner, "_adaptive_copies", side_effect=AssertionError("Duplicate search")):
+                    route = routing.prepare_replica_route(
+                        ids, config, dynamic_header=(0, 4, 31), target_load=6, receive_capacity=12,
+                        compact_home=True, minimum_load_reduction=.4, _gathered_counts=prepared)
+                    route.plan.validate()
+                    plans.append(route.plan)
+        self.assertEqual(plans[0], plans[1])
+        self.assertIn((True, True), observations)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_column_totals_reach_owner_and_destination_summaries_without_changing_types(self) -> None:
+        """Feature: Real planner summary integration.
+        Description: Run owner and destination summaries through the actual compiled primitive and fallback.
+        Expectation: Both call sites consume native results and preserve list, tuple and overflow behavior.
+        """
+        matrix = ((3, 1, 0, 0, 5, 0, 0, 0),) * 4
+        config = ExpertReplicaConfig(8, 4, 0)
+        slots = tuple(tuple(range(rank*2, (rank+1)*2)) for rank in range(4))
+        with patch.object(host, "_native_backend", return_value=None):
+            expected_home = planner._home_layout(matrix, config)
+            expected_destination = ExpertExecutionPlan(config, matrix, slots, matrix).destination_counts
+        with patch.object(host, "_native_backend", return_value=self.native), \
+                patch.object(self.native, "column_totals", wraps=self.native.column_totals) as actual:
+            home = planner._home_layout(matrix, config)
+            destination = ExpertExecutionPlan(config, matrix, slots, matrix).destination_counts
+        self.assertEqual(actual.call_count, 2)
+        self.assertEqual(home, expected_home)
+        self.assertIs(type(home[0]), list)
+        self.assertEqual(destination, expected_destination)
+        self.assertEqual(tuple(map(type, destination)), (tuple,) * len(destination))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_column_totals_callers_keep_big_integer_and_older_abi3_results(self) -> None:
+        """Feature: End-to-end column reduction fallback.
+        Description: Run both consumers with overflowing column sums and an older ABI3 capability set.
+        Expectation: Arbitrary-precision values and original container types match the Python reference.
+        """
+        older = SimpleNamespace(abi_version=lambda: 3, validate_counts=self.native.validate_counts,
+                                materialize_dispatch=self.native.materialize_dispatch)
+        for matrix in (((3, 1), (4, 0)), ((2**63-1, 0), (1, 0))):
+            config = ExpertReplicaConfig(2, 2, 0)
+            slots = ((0,), (1,))
+            with patch.object(host, "_native_backend", return_value=None):
+                expected_home = planner._home_layout(matrix, config)
+                expected_destination = ExpertExecutionPlan(config, matrix, slots, matrix).destination_counts
+            for backend in (self.native, older):
+                with self.subTest(matrix=matrix, older=backend is older), \
+                        patch.object(host, "_native_backend", return_value=backend):
+                    actual_home = planner._home_layout(matrix, config)
+                    actual_destination = ExpertExecutionPlan(config, matrix, slots, matrix).destination_counts
+                    self.assertEqual(actual_home, expected_home)
+                    self.assertIs(type(actual_home[0]), list)
+                    self.assertEqual(actual_destination, expected_destination)
+                    self.assertEqual(tuple(map(type, actual_destination)), (tuple,) * len(actual_destination))
+
+    @unittest.skipUnless(sys.platform == "linux", "The allocation boundary probe uses Linux address-space accounting")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_column_totals_reject_jagged_rows_before_native_allocation(self) -> None:
+        """Feature: Shape-first native reduction.
+        Description: Limit a child process after constructing a wide first row and an empty second row.
+        Expectation: Invalid shape returns None before a native vector can exceed the small allocation allowance.
+        """
+        program = f'''
+import importlib.util
+import os
+from pathlib import Path
+import resource
+spec = importlib.util.spec_from_file_location("_replica_host", {self.native.__file__!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+matrix = ((0,) * (2**20), ())
+current = int(Path("/proc/self/statm").read_text().split()[0]) * os.sysconf("SC_PAGE_SIZE")
+limit = current + 4 * 1024**2
+resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+if module.column_totals(matrix) is not None:
+    raise AssertionError("A jagged matrix entered native column reduction")
+print("shape rejected before allocation")
+'''
+        completed = subprocess.run([sys.executable, "-S", "-c", program], check=True,
+                                   capture_output=True, text=True, timeout=15)
+        self.assertIn("shape rejected before allocation", completed.stdout)
+
     def test_count_validation_retains_python_boundary_behavior(self) -> None:
         """Feature: Host count validation.
         Description: Compare valid, invalid, generator and large-integer inputs.
@@ -79,6 +240,139 @@ class TestReplicaHost(unittest.TestCase):
                     except ValueError as error:
                         outcomes.append(("error", str(error)))
             self.assertEqual(outcomes[0], outcomes[1])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_materialization_matches_all_source_quotas_and_slots(self) -> None:
+        """Feature: Native integer dispatch materialization.
+        Description: Replay empty sources, guest budgets, and arbitrary node labels through the real C API.
+        Expectation: Every physical slot and source quota exactly matches the Python reference.
+        """
+        generator = random.Random(2641105)
+        for size in (2, 4, 8, 16, 64):
+            for budget in (0, 1, 2, 6):
+                for iteration in range(8):
+                    with self.subTest(size=size, budget=budget, iteration=iteration):
+                        config = ExpertReplicaConfig(size * 6, size, budget)
+                        counts = tuple(tuple(0 if iteration % 2 and rank % 3 == 0 else
+                                             generator.randrange(80) * (8 if expert < 6 else 1)
+                                             for expert in range(size * 6)) for rank in range(size))
+                        nodes = tuple(101 + 7 * (rank // 2) for rank in range(size)) if iteration % 3 else ()
+                        with patch.object(host, "_native_backend", return_value=None):
+                            selected = planner._build_expert_replica_plan(
+                                counts, budget, adaptive=bool(budget), _rank_nodes=nodes)
+                            copies = [{expert: rows for expert, rows in zip(slots, destination) if expert >= 0}
+                                      for slots, destination in zip(selected.slot_to_logical,
+                                                                    selected.destination_counts)]
+                            expected = planner._materialize(counts, copies, config, rank_nodes=nodes)
+                        before = [tuple(row.items()) for row in copies]
+                        slots, dispatch = self.native.materialize_dispatch(counts, copies, 6, budget, nodes)
+                        self.assertEqual(slots, expected.slot_to_logical)
+                        self.assertEqual(dispatch, expected.dispatch_counts)
+                        self.assertEqual(before, [tuple(row.items()) for row in copies])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_materialization_preserves_fallback_and_capacity_errors(self) -> None:
+        """Feature: Native materialization boundary.
+        Description: Cross Python integer limits and mapping subclasses with exact capacity checks.
+        Expectation: Unsupported inputs retain the Python result and capacity errors remain descriptive.
+        """
+        counts = ((12, 0, 0, 0), (0, 0, 0, 0))
+        copies = [{0: 4, 1: 0}, {2: 0, 3: 0, 0: 8}]
+        config = ExpertReplicaConfig(4, 2, 1)
+        unsupported = (
+            (((2**80, 0, 0, 0), (0, 0, 0, 0)), [{0: 2**80 - 8, 1: 0}, copies[1]]),
+            (counts, [OrderedDict(copies[0]), copies[1]]),
+        )
+        for values, quotas in unsupported:
+            with self.subTest(values=values, quotas=quotas):
+                self.assertIsNone(self.native.materialize_dispatch(values, quotas, 2, 1, (0, 0)))
+                outcomes = []
+                for backend in (None, self.native):
+                    with patch.object(host, "_native_backend", return_value=backend):
+                        outcomes.append(planner._materialize(values, quotas, config, rank_nodes=(0, 0)))
+                self.assertEqual(outcomes[0], outcomes[1])
+        with patch.object(host, "_native_backend", return_value=self.native):
+            with self.assertRaisesRegex(ValueError, "exceeds capacity_limit"):
+                planner._materialize(counts, copies, config, 7)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_materializer_is_reached_by_the_real_planner(self) -> None:
+        """Feature: Native materialization reachability.
+        Description: Spy on the concrete primitive used by an active guest plan.
+        Expectation: The planner consumes the native dispatch result and validates its complete plan.
+        """
+        counts = ((600, 300, 50, 50, 20, 10, 0, 0),) * 4
+        with patch.object(host, "_native_backend", return_value=self.native), patch.object(
+                planner, "_materialize_dispatch", wraps=host._materialize_dispatch) as called:
+            plan = planner._build_expert_replica_plan(counts, 2, adaptive=True, _rank_nodes=(0, 0, 1, 1))
+        plan.validate()
+        self.assertTrue(plan.transfers)
+        called.assert_called_once()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_prior_domain_abi_retains_python_materialization_without_the_additive_method(self) -> None:
+        """Feature: Optional native materialization capability.
+        Description: Present a domain-compatible module without the additional integer primitive.
+        Expectation: Dispatch uses the Python reference while the existing domain ABI remains unchanged.
+        """
+        counts = ((12, 0, 0, 0), (0, 0, 0, 0))
+        copies = [{0: 4, 1: 0}, {2: 0, 3: 0, 0: 8}]
+        config = ExpertReplicaConfig(4, 2, 1)
+        with patch.object(host, "_native_backend", return_value=None):
+            expected = planner._materialize(counts, copies, config)
+        with patch.object(host, "_native_backend", return_value=object()):
+            actual = planner._materialize(counts, copies, config)
+        self.assertEqual(actual, expected)
+        self.assertEqual(self.native.abi_version(), 3)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Address-space validation requires Linux procfs")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_materializer_validates_declared_width_before_allocating(self) -> None:
+        """Feature: Native input-shape admission.
+        Description: Present an empty row with a declared width beyond a bounded child address space.
+        Expectation: The native function returns the reference fallback without attempting the large allocation.
+        """
+        script = """
+import importlib.util
+import os
+from pathlib import Path
+import resource
+import sys
+
+spec = importlib.util.spec_from_file_location('_replica_host', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+virtual = int(Path('/proc/self/statm').read_text().split()[0]) * os.sysconf('SC_PAGE_SIZE')
+limit = virtual + 4 * 1024**2
+resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+assert module.materialize_dispatch(((),), [{}], 2**23, 0, ()) is None
+"""
+        result = subprocess.run([sys.executable, "-S", "-c", script, self.native.__file__],
+                                check=False, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, f"returncode={result.returncode} stderr={result.stderr}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_materialization_retains_interleaved_nodes_and_fully_migrated_owner(self) -> None:
+        """Feature: Interleaved physical-node placement.
+        Description: Replay full owner migration and node-local residual filling across noncontiguous ranks.
+        Expectation: Native slots and all source dispatch counts exactly match the Python reference.
+        """
+        counts = tuple((rows,) + (0,) * 7 for rows in (1, 4, 5, 2))
+        nodes = (101, 108, 101, 108)
+        config = ExpertReplicaConfig(8, 4, 1)
+        for owner, first, last in ((0, 0, 12), (6, 3, 3)):
+            copies = [{0: owner, 1: 0}, {2: 0, 3: 0}, {4: 0, 5: 0}, {6: 0, 7: 0, 0: last}]
+            if first:
+                copies[1][0] = first
+            with patch.object(host, "_native_backend", return_value=None):
+                expected = planner._materialize(counts, copies, config, rank_nodes=nodes)
+            slots, dispatch = self.native.materialize_dispatch(counts, copies, 2, 1, nodes)
+            self.assertEqual((slots, dispatch), (expected.slot_to_logical, expected.dispatch_counts))
 
     def test_ordered_costs_match_double_bits_and_cache(self) -> None:
         """Feature: Ordered calibrated costs.

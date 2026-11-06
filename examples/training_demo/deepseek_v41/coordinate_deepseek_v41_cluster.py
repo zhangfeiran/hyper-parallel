@@ -14,12 +14,15 @@
 # ============================================================================
 """Run one isolated case and coordinate cleanup before advancing every node."""
 
+from __future__ import annotations
+
 import argparse
 from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -88,31 +91,60 @@ def _snapshot(path: Path) -> None:
         print(f'HBM snapshot failed with status {status}: {path}', flush=True)
 
 
+def _publish_local_case(local_root: Path, folder: Path) -> None:
+    """Copy closed local rank and node evidence before publishing shared completion."""
+    shared = folder.parents[2]
+    for relative in (Path(folder.name), Path('nodes') / folder.parent.name / folder.name,
+                     Path('torchrun') / folder.parent.name):
+        source = local_root / relative
+        if source.exists():
+            shutil.copytree(source, shared / relative, dirs_exist_ok=True)
+
+
+def _progress(local_root: Path, folder: Path) -> None:
+    """Expose a small shared heartbeat while detailed training writes remain local."""
+    states = [json.loads(path.read_text()) for path in (local_root / folder.name).glob('rank*/progress.json')]
+    write_json(folder / 'progress.json', dict(ranks=len(states),
+        min_step=min((row['step'] for row in states), default=0),
+        max_step=max((row['step'] for row in states), default=0), states=states))
+
+
 def run_case(command: list[str], folder: Path, peers: list[Path], cards: int,
-             interval: int, timeout: float) -> list[dict[str, Any]]:
-    """Abort peer failures promptly, clean owned workers, then allow safe continuation."""
+             interval: int, timeout: float, *, local_root: Path | None = None) -> list[dict[str, Any]]:
+    """Abort failed workers, optionally publish a closed local spool, then converge cleanup."""
     folder.mkdir(parents=True, exist_ok=True)
-    _snapshot(folder / 'npu_before.txt')
+    artifacts = folder if local_root is None else local_root / 'nodes' / folder.parent.name / folder.name
+    artifacts.mkdir(parents=True, exist_ok=True)
+    _snapshot(artifacts / 'npu_before.txt')
     with ExitStack() as stack:
-        log = stack.enter_context((folder / 'run.log').open('w', encoding='utf-8'))
+        log = stack.enter_context((artifacts / 'run.log').open('w', encoding='utf-8'))
         process = stack.enter_context(subprocess.Popen(
             command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True))
         # The group callback runs before Popen's context can wait for a live child.
         stack.callback(_stop_group, process.pid)
-        (folder / 'launcher.pid').write_text(f'{process.pid}\n')
+        (artifacts / 'launcher.pid').write_text(f'{process.pid}\n')
         monitor = None
         peer_failed = False
+        local_failed = False
+        next_progress = 0.0
         try:
-            monitor_log = stack.enter_context((folder / 'monitor.log').open('w', encoding='utf-8'))
+            monitor_log = stack.enter_context((artifacts / 'monitor.log').open('w', encoding='utf-8'))
             monitor_command = [sys.executable, '-m',
                                'examples.training_demo.deepseek_v41.monitor_deepseek_v41_hbm',
                                '--root-pid', str(process.pid), '--num-devices', str(cards),
-                               '--interval', str(interval), '--output', str(folder)]
+                               '--interval', str(interval), '--output', str(artifacts)]
             monitor = stack.enter_context(subprocess.Popen(
                 monitor_command, stdout=monitor_log, stderr=subprocess.STDOUT))
             stack.callback(monitor.kill)
-            (folder / 'monitor.pid').write_text(f'{monitor.pid}\n')
+            (artifacts / 'monitor.pid').write_text(f'{monitor.pid}\n')
             while process.poll() is None:
+                if local_root is not None:
+                    if any((local_root / folder.name).glob('rank*/failure.json')):
+                        local_failed = True
+                        break
+                    if time.monotonic() >= next_progress:
+                        _progress(local_root, folder)
+                        next_progress = time.monotonic() + 10
                 failures = [peer / 'exit_status.json' for peer in peers]
                 if any(path.exists() and json.loads(path.read_text())['training_exit_status'] != 0
                        for path in failures):
@@ -121,7 +153,7 @@ def run_case(command: list[str], folder: Path, peers: list[Path], cards: int,
                 time.sleep(0.2)
         finally:
             # Publish failure before waiting for cleanup so peers stop their collectives.
-            status = process.poll() if process.poll() is not None else (125 if peer_failed else 130)
+            status = process.poll() if process.poll() is not None else (125 if peer_failed or local_failed else 130)
             write_json(folder / 'exit_status.json', {'training_exit_status': status})
             (folder / 'exit_status.txt').write_text(f'{status}\n')
             cleanup_ok = _stop_group(process.pid)
@@ -137,13 +169,22 @@ def run_case(command: list[str], folder: Path, peers: list[Path], cards: int,
                 except subprocess.TimeoutExpired:
                     monitor.kill()
                     monitor_status = monitor.wait()
-            (folder / 'monitor_exit_status.txt').write_text(f'{monitor_status}\n')
+            (artifacts / 'monitor_exit_status.txt').write_text(f'{monitor_status}\n')
             try:
-                _snapshot(folder / 'npu_after.txt')
+                _snapshot(artifacts / 'npu_after.txt')
             finally:
+                publication = {}
+                if local_root is not None:
+                    publication['artifact_exit_status'] = 0
+                    try:
+                        _publish_local_case(local_root, folder)
+                    except OSError as error:
+                        publication['artifact_exit_status'] = 1
+                        write_json(folder / 'artifact-publication.json',
+                                   dict(error=str(error), error_type=type(error).__name__, local_root=str(local_root)))
                 write_json(folder / 'case_complete.json', {
                     'training_exit_status': status, 'monitor_exit_status': monitor_status,
-                    'cleanup_ok': cleanup_ok, 'peer_failed': peer_failed,
+                    'cleanup_ok': cleanup_ok, 'peer_failed': peer_failed, **publication,
                 })
     return wait_for_cleanup(peers, timeout)
 
