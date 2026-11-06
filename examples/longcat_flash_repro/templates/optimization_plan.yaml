@@ -1,0 +1,145 @@
+created_before_formal_runs: true
+user_constraint: 'Preserve EP64 local ownership: eight real/four identity experts
+  per rank; original H/I/TopK/tokens per rank; one logical layer'
+component:
+  ep: 4
+  tokens_per_rank:
+  - 2048
+  hidden: 6144
+  intermediate: 2048
+  real_experts: 32
+  identity_experts: 16
+  top_k: 12
+  warmup: 10
+  samples_per_phase: 30
+  formal_processes_per_implementation: 3
+  implementations:
+  - native_torch
+  - native_triton_prefix
+  - push_direct_gradient
+  - pull_direct_gradient
+  formal_order:
+  - native_torch
+  - native_triton_prefix
+  - push_direct_gradient
+  - pull_direct_gradient
+  - pull_direct_gradient
+  - push_direct_gradient
+  - native_triton_prefix
+  - native_torch
+  - push_direct_gradient
+  - native_torch
+  - pull_direct_gradient
+  - native_triton_prefix
+  secondary_512_tokens: Original-width full-value precision and boundary diagnostics;
+    no new T512 formal performance claim
+  acceptance_candidates:
+  - push_direct_gradient
+  - pull_direct_gradient
+  ablation_control: 'push_ordinary_gradient: same optimized source/routing with direct
+    gradients disabled; report differences, do not gate the selected final implementation
+    on this earlier control'
+  local_real_experts: 8
+  local_identity_experts: 4
+  initial_token_capacity: 24576
+trainer:
+  logical_layers: 1
+  world: 16
+  ep: 16
+  dense_fsdp: 16
+  expert_fsdp: 1
+  sequence: 2048
+  global_batch: 16
+  hidden: 6144
+  expert_intermediate: 2048
+  dense_intermediate: 12288
+  vocab: 131072
+  heads: 64
+  q_lora: 1536
+  kv_lora: 512
+  numerical_steps:
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  warmup_steps:
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  performance_steps:
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  norm_policy: Literal HF RMSNorm in every arm
+  common_checkpoint: __OUTPUT__/warmstart/global_step_1
+  replay: Existing local JSON data with deterministic replay; validate per-step input
+    hashes; cursor restore disabled consistently
+  performance_order:
+  - native
+  - fast-native
+  - megamoe
+  - megamoe
+  - fast-native
+  - native
+  real_experts: 128
+  identity_experts: 64
+  local_real_experts: 8
+  local_identity_experts: 4
+  checkpoint_creation: Fresh fused-native step1 model/optimizer/scheduler/RNG state,
+    before all compared cases
+  initial_token_capacity: 24576
+precision:
+  primary_oracle: Native NPU GMM with original Torch routing and ordinary slice backward
+  module: 'Every value of output/dX/dP/both dW: require max_abs=0 in final module
+    checks'
+  loss_atol: 0.001
+  loss_rtol: 0.001
+  norm_atol: 0.01
+  norm_rtol: 0.01
+  updated_model_and_main_hashes: Require exact equality at every one of ten numerical
+    updates
+  hf_eager: Preserve prior original-width HF F.linear strict FAIL; no acceptance substitution
+  activation: Native torch_npu.npu_swiglu and embedded CANN swi_glu/grad, HF BF16
+    compatibility disabled in all compared MoE paths
+performance_gate:
+  pilot: Three fresh strongest-native processes at each topology before formal candidate
+    timing
+  minimum_speedup: 1 + max(0.01, 2 * pilot p50 relative span)
+  maximum_p90_regression: max(0.03, 2 * pilot p90 relative span)
+  maximum_peak_allocated_ratio: 1.05
+  aggregation: Median of per-process p50/p90 from all raw rank-max samples
+  preserve_all_slow_samples: true
+  profiler: false
+  fallback: Explicit Triton backend; unsupported input/dependency raises
+scope: EP4/E32/Z16 component and EP16/E128/Z64 one-layer scratch training. Smaller
+  router candidate pool and EP topology are explicit crop limits, not full EP64 scaling.
+selected_transport_for_trainer: push, selected before formal runs
+rejected_experiment:
+  name: unweighted K=1 restore
+  reason: No clear diagnostic performance gain; removed before source freeze
+  evidence: candidate-fast-v6-trial
+version: 'Fused SwiGLU default: fresh full component and trainer comparison'
+strong_control: Native NPU GMM with identical Triton routing and the independently
+  checked selective-tail prefix backward
+candidate_mechanism: Full HF Gate/Up tensor is the MegaMoE autograd input; real-expert
+  gradients are written into the full buffer, inactive tail is zeroed; parameter and
+  optimizer layouts unchanged
+native_payload: Same V7 binary payload from candidate1; no native C++ source or ABI
+  changes
+capacity_gate: Every MegaMoE rank source capacity24576, epoch0 and no growth through
+  step16

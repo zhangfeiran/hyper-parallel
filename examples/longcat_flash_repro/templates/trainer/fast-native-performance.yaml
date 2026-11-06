@@ -1,0 +1,218 @@
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.LongcatFlashConfig.from_dict
+    config_dict:
+      num_layers: 1
+      use_cache: false
+      n_routed_experts: 128
+      zero_expert_num: 64
+  torch_dtype: bfloat16
+  attn_implementation: eager
+training:
+  train_iters: 16
+  train_samples: null
+  global_batch_size: 16
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+  lr_scheduler_iters: 16
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 16
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+fsdp_config:
+  dp_shard_size: 16
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+  edp_shard_size: 1
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+plan_overrides:
+- match: model.layers.*.self_attn.[01]
+  replace:
+    kind: module
+    source_type: transformers.models.longcat_flash.modeling_longcat_flash.LongcatFlashMLA
+    implementation:
+      _target_: hyper_parallel.models.longcat_flash.adapter.attention.LongcatFlashMLAAttention
+- match: model.layers.*.mlps.[01]
+  replace:
+    kind: module
+    source_type: transformers.models.longcat_flash.modeling_longcat_flash.LongcatFlashMLP
+    implementation:
+      _target_: hyper_parallel.models.longcat_flash.adapter.mlp.LongcatFlashSwiGLUMLP
+- match: model.layers.*.mlp.experts
+  replace:
+    kind: module
+    source_type: transformers.models.longcat_flash.modeling_longcat_flash.LongcatFlashExperts
+    implementation:
+      _target_: hyper_parallel.models.longcat_flash.adapter.experts.LongcatFlashMegaMoeExperts
+      backend: native
+      dispatch_mode: push
+      swiglu_precision: fused
+      routing_backend: triton
+      optimize_tasks: true
+      direct_weight_gradients: true
+      initial_token_capacity: 24576
+- match: model.layers.*.mlps.[01]
+  params:
+    linear_fc1.weight:
+      tp: replicate
+    linear_fc2.weight:
+      tp: replicate
+  in_src:
+    x:
+      tp: replicate
+      ep: replicate
+  in_dst:
+    x:
+      tp: replicate
+      ep: replicate
+  out_src:
+    tp: replicate
+    ep: replicate
+  out_dst:
+    tp: replicate
+    ep: replicate
+- match: model.layers.*.mlp
+  in_src:
+    hidden_states:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  in_dst:
+    hidden_states:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_src:
+    tp: replicate
+    cp: shard(1)
+    ep: replicate
+  out_dst:
+    tp: replicate
+    cp: shard(1)
+    ep: replicate
+  region_dispatch: false
+  params:
+    experts.gate_up_proj:
+      ep: shard(0)
+    experts.down_proj:
+      ep: shard(0)
+- match: model.layers.*.mlp.forward
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.longcat_flash.adapter.parallel.longcat_flash_ep_compute_fn
+mixed_precision:
+  enabled: false
+activation_checkpoint:
+  mode: full
+activation_swap: none
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: __ASSETS__/tokenizer
+      use_fast: true
+      trust_remote_code: true
+      local_files_only: true
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 2048
+  data_config:
+    config_name: null
+    cache_dir: null
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: true
+    create_ltor_fields_in_dataloader: false
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: __ASSETS__/train.jsonl
+dataloader:
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 4
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: dense
+  sampler_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.1
+    adamw_betas:
+    - 0.9
+    - 0.95
+    adamw_eps: 1.0e-08
+  fp32_main_params: true
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 3.0e-05
+    lr_warmup_steps: 1
+    min_lr: 0.0
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: __OUTPUT__/warmstart
+  save_steps: 10
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: false
+  restore_from: __OUTPUT__/warmstart/global_step_1
+  restore_optimizer: true
+  restore_train_state: true
+  restore_dataloader_state: false
+debug:
+  check_nan_inf: false
+  check_dataset: null
+profiler:
+  enable: false
+  start_step: 1
+  stop_step: 10
+  memory: true
+  rank_ids: null
+  output_path: ./outputs/longcat_flash
+  level: 1
+  with_stack: false
+  data_simplification: false
+model_init_dtype: float32
+model_integration:
+  mode: 'off'

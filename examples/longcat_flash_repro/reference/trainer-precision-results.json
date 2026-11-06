@@ -1,0 +1,92 @@
+{
+  "status": "PRECISION_PASS",
+  "module": {
+    "status": "PASS",
+    "full_value_max_abs": 0,
+    "geometry": {
+      "ep": 4,
+      "real": 32,
+      "identity": 16,
+      "local_real": 8,
+      "local_identity": 4,
+      "tokens": 2048,
+      "hidden": 6144,
+      "intermediate": 2048,
+      "top_k": 12
+    },
+    "reports": [
+      {
+        "path": "precision-t2048/rank0.json",
+        "rank": 0,
+        "sha256": "4b5fa605fc2c5f8962fe5792a57b69d95f85d24ecac1c0e292bbe5c73cbf840d",
+        "cases": 5
+      },
+      {
+        "path": "precision-t2048/rank1.json",
+        "rank": 1,
+        "sha256": "4d6eb14063a0170dc546fca2ed3d0fdb6b3962b0cec45ea1529d0ccfd97440a8",
+        "cases": 5
+      },
+      {
+        "path": "precision-t2048/rank2.json",
+        "rank": 2,
+        "sha256": "86b71690adf8d305e213ac360595c4c9c02a2017a3b3efdcd3a18a7666c5cfad",
+        "cases": 5
+      },
+      {
+        "path": "precision-t2048/rank3.json",
+        "rank": 3,
+        "sha256": "b8adebf41a49d621d5f1d3ad446458f69012f3278d81d7dfc6cda294cc37dd6b",
+        "cases": 5
+      },
+      {
+        "path": "precision-edges/rank0.json",
+        "rank": 0,
+        "sha256": "28ee34d891cbb36aee039abeceb082d8c07b77ec0554b939290fffa9d6d78d22",
+        "cases": 9
+      },
+      {
+        "path": "precision-edges/rank1.json",
+        "rank": 1,
+        "sha256": "490b0813775217b2544f59f2d4ca303d218743bde9d9eec2d8a7c3353dce06d5",
+        "cases": 9
+      },
+      {
+        "path": "precision-edges/rank2.json",
+        "rank": 2,
+        "sha256": "5262fa4db531c9bc0f41f2471c9d5babf9cfcb3309aa9b6dde0822885747ae03",
+        "cases": 9
+      },
+      {
+        "path": "precision-edges/rank3.json",
+        "rank": 3,
+        "sha256": "edc9d64f9518d6ab0d8b044d22bfee79954d6c0bfbc1f39f44d099e847fb4773",
+        "cases": 9
+      }
+    ]
+  },
+  "trainer": [
+    {
+      "candidate": "megamoe",
+      "status": "PASS",
+      "rows": 160,
+      "consecutive_updates_per_rank": 10,
+      "maximum_loss_absolute_delta": 0.0,
+      "maximum_preclip_norm_absolute_delta": 0.0,
+      "exact_updated_model_main_hash_pairs": 8320,
+      "evidence": "trainer/numerical-megamoe-comparison.json"
+    },
+    {
+      "candidate": "fast-native",
+      "status": "PASS",
+      "rows": 160,
+      "consecutive_updates_per_rank": 10,
+      "maximum_loss_absolute_delta": 0.0,
+      "maximum_preclip_norm_absolute_delta": 0.0,
+      "exact_updated_model_main_hash_pairs": 8320,
+      "evidence": "trainer/numerical-fast-native-comparison.json"
+    }
+  ],
+  "literal_hf_linear": "Prior original-width strict FAIL retained; primary oracle is native GMM",
+  "literal_hf_evidence": "<historical_hf_eager_reports>"
+}

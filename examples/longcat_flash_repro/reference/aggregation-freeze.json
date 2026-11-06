@@ -1,0 +1,22 @@
+{
+  "created_before_formal_runs": true,
+  "sha256": {
+    "optimization_plan.yaml": "3da79f501805a16c121032e2188451fa0576e79dbe78ee119bbb588e937b86b5",
+    "component/helpers.py": "dad6b9ba9c61271b583089005de33d4a5fbfe4e2701527d22593509a00891bf6",
+    "component/controller.py": "bcc4b20509e18c213fe968976463b265b2ed61778d9af30726ec1a22e8c3848c",
+    "trainer/controller.py": "4a823ab2679c4da04bb787ef7a487aafae868f53136ee7032e23c0fe5311bde5",
+    "trainer/controller_prefix.py": "05089efa3a3aed8d230a2b0f68428a37ef3054b9798b20e65a1937098f363fe0",
+    "trainer/audit_train.py": "820e5ee9c12c0dc4bdccd214fc203481d56efd85c29a0c8f951af117b46bb764",
+    "verify_module.py": "8952bd4d127a2ee7fbfa208251bc87281dbbbb4d0b2e0836f4294ee3dd2d5d48",
+    "audit_raw.py": "9ca9a5a302340a2f9e05e84f47c41ede497553b9655ae7ad15b9960eb2afd123",
+    "aggregate.py": "a5964cb944175c4ae19fac28c333844d6e9fae7c9efbb23958cde3ebc34f543b",
+    "pipeline.py": "6ecfd85e69e175573a16da44e3898cbd453ffa48789d64c49ff5082ebf049413",
+    "trainer/megamoe.yaml": "2d3929dfed8a9e52776c48b29b5adc83de1665c84760df8d624d50ec8205bd5a",
+    "trainer/native-performance.yaml": "0a011d15428f7345b3256f09e1c5a77ded1bf2bd71b1e190217cdf1bb32eab0d",
+    "trainer/megamoe-performance.yaml": "f507ab98d86ac44aa3e6db819264498f24a372a154a8bed67c53c9883f66b09b",
+    "trainer/native.yaml": "1382a2f27840f28a060fd766feca0986d1c145835fe4cb3a66eb8d9117d64150",
+    "trainer/initialize.yaml": "400b9957e2fc89de0e788628e8aba56cb3e3b6c5a2b020c6d4bb9b70f73089a7",
+    "trainer/fast-native.yaml": "8d2b3d005ed3a81a94c04840377538242043d748ccd7f2865efc2ed354d32f16",
+    "trainer/fast-native-performance.yaml": "412eecade5a2e3b5a93001be95ab0b006bdb6e5e425541fe7428c1ca5ba02e06"
+  }
+}

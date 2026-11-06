@@ -1,0 +1,49 @@
+PRECISION_PASS / PERFORMANCE_PASS
+
+已完成每卡八个真实专家的 LongCat 裁剪验证。下表同时列出原始原生实现和使用相同路由融合和优化 prefix 梯度的强化原生对照；正式结果与此前诊断样本分开。
+
+源码提交：`ca3ce419464f32f43b7299b086d5347da2f5c3e3`。全部比较采用同权重、同输入、同学习路由、同拓扑、同 fused SwiGLU 语义（native 调用 npu_swiglu，MegaMoE 嵌入 CANN 实现）。
+
+| 每卡 tokens | 阶段 | 实现 | p50 ms | p90 ms | 对原生原路由加速比 | 对强化原生加速比 | 强化对照验收 |
+|---:|---|---|---:|---:|---:|---:|---|
+| 2048 | forward | native_torch | 29.438 | 30.378 | 1.0000x | 0.6179x | REFERENCE |
+| 2048 | forward | native_triton_prefix | 18.188 | 18.430 | 1.6185x | 1.0000x | REFERENCE |
+| 2048 | forward | push_direct_gradient | 12.823 | 13.086 | 2.2958x | 1.4185x | PERFORMANCE_PASS |
+| 2048 | forward | pull_direct_gradient | 11.903 | 12.185 | 2.4733x | 1.5281x | PERFORMANCE_PASS |
+| 2048 | forward_backward | native_torch | 76.468 | 78.861 | 1.0000x | 0.5722x | REFERENCE |
+| 2048 | forward_backward | native_triton_prefix | 43.754 | 44.257 | 1.7477x | 1.0000x | REFERENCE |
+| 2048 | forward_backward | push_direct_gradient | 32.471 | 33.027 | 2.3550x | 1.3475x | PERFORMANCE_PASS |
+| 2048 | forward_backward | pull_direct_gradient | 31.527 | 31.859 | 2.4255x | 1.3878x | PERFORMANCE_PASS |
+
+每个组件实现包含三个独立进程，每阶段每进程预热 10 次、保留 30 个所有 rank 最大耗时样本。p50/p90 均为进程分位数的中位数。
+
+| 单层训练实现 | p50 s | p90 s | 全局 tokens/s | 对原生原路由加速比 | 对强化原生加速比 | 进程 allocated/reserved 峰值 GiB | 强化对照验收 |
+|---|---:|---:|---:|---:|---:|---|---|
+| native | 0.473005 | 0.490029 | 69276.2 | 1.0000x | 0.8894x | 20.251 / 30.680 | REFERENCE |
+| fast-native | 0.420678 | 0.433373 | 77893.3 | 1.1244x | 1.0000x | 19.874 / 30.678 | REFERENCE |
+| megamoe | 0.399879 | 0.409080 | 81944.8 | 1.1829x | 1.0520x | 19.298 / 28.555 | PERFORMANCE_PASS |
+
+单层训练保留词表 131072、H6144、专家 I2048、dense12288、64 heads、Q1536/KV512、128/64 专家（每卡 8/4）和 Top-12；逻辑层数裁为 1，并随 EP 缩减全局专家池。EP16、dense FSDP16、expert FSDP1，序列 2048、全局 batch16。每个正式进程在五次预热更新后测十次更新；三种实现各两个独立进程。
+
+精度验收以原生 NPU GMM 为准，保留原始 Torch 路由作为独立数学对照。所有组件输出、dX、dP、两组 dW 全值比较最大绝对误差为 0；空 source、空 owner、全零专家、跨网格启动分别通过。
+
+megamoe：连续 10 次更新 × 16 rank，loss 最大差 0，全局 preclip norm 最大差 0，完整模型/FP32 main 参数哈希精确相同 8320 对。
+fast-native：连续 10 次更新 × 16 rank，loss 最大差 0，全局 preclip norm 最大差 0，完整模型/FP32 main 参数哈希精确相同 8320 对。
+
+参数、优化器、scheduler、RNG 初始哈希一致；每步输入、路由和 LR 一致。HF RMSNorm 与 FP32 objective 均有实际运行记录，FP32 main 参数在所有 rank 终态有限。所有 rank 的退出、NPU PID 所有权、SHMEM 释放和原始样本均经检查。
+
+本轮没有重新定义 HF per-expert F.linear 门限；此前原始宽度下它与原生 GMM 的 BF16 末位差异仍保留为严格失败明细。当前原生 GMM 验收不等同于字面 HF F.linear 验收。
+
+组件只预计算 learned Router 决策，计时包括专家路由/FFN/通信/combine；单层训练包含 Router、attention、dense MLP、checkpoint recompute、梯度同步、优化器与其余训练步工作。组件收益不能代替训练步收益，也不能外推到全 28 层预训练吞吐。
+
+实现包含精确任务范围、只清零空专家梯度、单专家 GMM 寻址、可选 BF16 路由融合以及完整 Gate/Up 梯度直接写回。原始 HF 参数名、unused Gate/Up 行和 checkpoint 布局均保留；仍存在真实专家 [R,H] scratch，不声称消除 sender 扩展 HBM。无权重 K=1 实验因没有清晰诊断收益而在冻结前撤下。
+
+[结构化结果](results.json)，[冻结方案](optimization_plan.yaml)，[精度明细](precision-results.json)，[组件原始样本](component/results.json)，[训练原始样本](trainer/performance-results.json)，[源码和制品哈希](frozen-provenance.json)，[本地提交补丁](fused-default.patch)，[AutoGit 检查](autogit-check.log)，[CPU 回归](cpu-ut.log)。
+
+本次默认值已合入工作树 `ca3ce4194`，未 push。当前工作树的374个源码/制品文件与冻结测量逐文件一致；独立可编辑环境 `workspace-env` 从 `/tmp` 验证导入当前仓库，CPU回归14项测试及11项子测试通过。
+
+原生MoE显式调用 `torch_npu.npu_swiglu`；MegaMoE在persistent kernel中调用CANN `swi_glu`/`swi_glu_grad`，其前反向 `hf_bf16` 标志均为false，不声称调用Python入口。两者MoE全值前反向误差0；相同的dense MLP/HF RMSNorm在三条整网路径中保持一致。
+
+组件的SHMEM heap分别为Push 0.6348 GiB、Pull 0.5645 GiB，单独于PyTorch allocator allocated/reserved统计。表中allocator数字不是物理HBM总量。
+
+[独立原始记录复核](raw-evidence-audit.json)、[当前工作树验证](workspace-integration.json)、[复现脚本](reproduce.sh)。复现脚本接受一个全新的绝对报告目录，在共享NPU锁下从精度检查开始重新执行整套固定方案。

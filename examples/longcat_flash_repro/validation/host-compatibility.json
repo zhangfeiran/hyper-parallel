@@ -1,0 +1,19 @@
+{
+  "status": "PASS",
+  "cpu_test_count": 8,
+  "cpu_subtest_count": 8,
+  "supported_host_architectures": [
+    "x86_64",
+    "aarch64"
+  ],
+  "wrong_architecture_native_elf_rejected": true,
+  "actual_arm_native_preflight": "PASS",
+  "x86_npu_end_to_end_validated": false,
+  "customer_npu_family": "910C",
+  "python_abi": "cp311",
+  "full_trainer_logical_devices_required": 16,
+  "component_logical_devices_required": 4,
+  "x86_triton_wheel_available": "triton_ascend-3.2.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "x86_triton_wheel_sha256": "17c8d7161eed1e96a286281963fe04d3113ee85affaa5d82c7dd0c35803962f0",
+  "x86_triton_native_elf_machine": 62
+}

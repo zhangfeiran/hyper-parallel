@@ -1,0 +1,16 @@
+{
+  "trainer": {
+    "processes": 12,
+    "ranks_per_process": 16,
+    "raw_step_rows_checked": 2640,
+    "raw_source": "<report_root>/trainer",
+    "all_rank_terminal_and_rank_max_verified": true
+  },
+  "component": {
+    "processes": 15,
+    "ranks_per_process": 4,
+    "rank_max_samples_recomputed": 900,
+    "all_rank_terminal_and_shape_checks_verified": true
+  },
+  "status": "PASS"
+}

@@ -1,0 +1,137 @@
+{
+  "cases": [
+    {
+      "case": "performance-0-native",
+      "implementation": "native",
+      "rank_max_seconds": [
+        0.4867031816393137,
+        0.4608382545411587,
+        0.4823233801871538,
+        0.4676454793661833,
+        0.48988503217697144,
+        0.4627530323341489,
+        0.50532250944525,
+        0.46874426025897264,
+        0.4954259851947427,
+        0.46770063042640686
+      ],
+      "p50_seconds": 0.47553382022306323,
+      "p90_seconds": 0.49641563761979346,
+      "peak_allocated_bytes": 21744399360,
+      "peak_reserved_bytes": 32942063616
+    },
+    {
+      "case": "performance-1-fast-native",
+      "implementation": "fast-native",
+      "rank_max_seconds": [
+        0.4280120600014925,
+        0.4148862436413765,
+        0.4308728277683258,
+        0.41021104995161295,
+        0.43216951843351126,
+        0.41275546327233315,
+        0.4277869164943695,
+        0.4197845309972763,
+        0.4630981348454952,
+        0.4128740457817912
+      ],
+      "p50_seconds": 0.4237857237458229,
+      "p90_seconds": 0.4352623800747097,
+      "peak_allocated_bytes": 21339475456,
+      "peak_reserved_bytes": 32939966464
+    },
+    {
+      "case": "performance-2-megamoe",
+      "implementation": "megamoe",
+      "rank_max_seconds": [
+        0.40712604112923145,
+        0.3934295503422618,
+        0.39898479264229536,
+        0.4039944401010871,
+        0.41067466512322426,
+        0.392210197634995,
+        0.4045401457697153,
+        0.38889195676892996,
+        0.40040807612240314,
+        0.38825057074427605
+      ],
+      "p50_seconds": 0.39969643438234925,
+      "p90_seconds": 0.40748090352863076,
+      "peak_allocated_bytes": 20721254912,
+      "peak_reserved_bytes": 30660362240
+    },
+    {
+      "case": "performance-3-megamoe",
+      "implementation": "megamoe",
+      "rank_max_seconds": [
+        0.41051199194043875,
+        0.39420545753091574,
+        0.4054044038057327,
+        0.3916391022503376,
+        0.4049392193555832,
+        0.39518417604267597,
+        0.4121765783056617,
+        0.3949523540213704,
+        0.409181478433311,
+        0.39503092505037785
+      ],
+      "p50_seconds": 0.4000616976991296,
+      "p90_seconds": 0.41067845057696106,
+      "peak_allocated_bytes": 20721254912,
+      "peak_reserved_bytes": 30660362240
+    },
+    {
+      "case": "performance-4-fast-native",
+      "implementation": "fast-native",
+      "rank_max_seconds": [
+        0.42974783573299646,
+        0.40841563139110804,
+        0.41721735522150993,
+        0.4106257827952504,
+        0.42487079929560423,
+        0.4179228516295552,
+        0.43881022185087204,
+        0.4135170094668865,
+        0.4306691326200962,
+        0.41537584736943245
+      ],
+      "p50_seconds": 0.4175701034255326,
+      "p90_seconds": 0.4314832415431738,
+      "peak_allocated_bytes": 21339475456,
+      "peak_reserved_bytes": 32939966464
+    },
+    {
+      "case": "performance-5-native",
+      "implementation": "native",
+      "rank_max_seconds": [
+        0.4874600563198328,
+        0.4660902116447687,
+        0.4832186158746481,
+        0.46405170299112797,
+        0.47856831084936857,
+        0.4574149288237095,
+        0.4784789802506566,
+        0.46283221058547497,
+        0.47486395575106144,
+        0.46257299836724997
+      ],
+      "p50_seconds": 0.4704770836979151,
+      "p90_seconds": 0.48364275991916655,
+      "peak_allocated_bytes": 21744399360,
+      "peak_reserved_bytes": 32942063616
+    }
+  ],
+  "order": [
+    "native",
+    "fast-native",
+    "megamoe",
+    "megamoe",
+    "fast-native",
+    "native"
+  ],
+  "numerical_status": "PASS",
+  "scope": "One original-width LongCat logical layer; EP16/denseFSDP16/expertFSDP1; sequence2048/globalbatch16; BF16 compute/FP32 main/reduction; same step1 DCP; 10 measured optimizer updates per fresh process",
+  "oracle": "Native GMM with original Torch routing; stronger native control uses identical Triton routing to MegaMoE",
+  "norm_policy": "Literal HF RMSNorm in every arm",
+  "precision_option": "Fused SwiGLU: torch_npu.npu_swiglu native; embedded CANN swi_glu MegaMoE"
+}

@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "npu_benchmarks_rerun": false,
+  "existing_mode_runtime_check_without_install": "PASS",
+  "experiment_assets_templates_reference_and_dependency_lock_unchanged": "PASS",
+  "missing_and_mismatched_dependencies_reported_without_install": "PASS",
+  "delivery": "Git branch",
+  "dependency_installation_performed": false
+}
