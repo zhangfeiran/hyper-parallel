@@ -55,14 +55,7 @@ def lease_replica_weights(
             aliases = tuple(tensor.view(torch.uint8).reshape(tensor.shape[0], -1) for tensor in originals)
             config = route.plan.config
             pool = leases.enter_context(prefetch_weights(aliases, route))
-            active = {
-                item.target_slot - config.home_experts
-                for item in route.plan.transfers if item.target_rank == route.rank
-            }
-            for guest in pool.weights:
-                for slot in range(config.replica_slots_per_rank):
-                    if slot not in active:
-                        guest[slot].zero_()
+            # Empty guest tasks never read weights; prefetch fully overwrites active slots.
             guests = tuple(
                 guest.view(tensor.dtype).reshape((config.replica_slots_per_rank, *tensor.shape[1:]))
                 for tensor, guest in zip(originals, pool.weights)

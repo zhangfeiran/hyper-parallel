@@ -63,17 +63,6 @@ def _projection_operations(aliases: tuple[torch.Tensor, ...], pool: Any, route: 
     return operations
 
 
-def _clear_inactive_slots(pool: Any, route: Any) -> set[int]:
-    """Keep unused guest bytes defined while zero-token native tasks skip readiness waits."""
-    active = {item.target_slot - route.plan.config.home_experts for item in route.plan.transfers
-              if item.target_rank == route.rank}
-    for guest in pool.weights:
-        for slot in range(route.plan.config.replica_slots_per_rank):
-            if slot not in active:
-                guest[slot].zero_()
-    return active
-
-
 class MXProjectionPrefetch:
     """Own one reusable copy stream without retaining FSDP weight generations."""
 
@@ -107,7 +96,10 @@ class MXProjectionPrefetch:
             self.stream = backend.Stream(device=originals[0].device)
         pool = replica_pool(aliases, route.plan.config.replica_slots_per_rank, route.group)
         with pool.lease():
-            active = _clear_inactive_slots(pool, route)
+            # Zero-row guest tasks return before reading weights. Current receives
+            # overwrite every byte of active slots before their readiness is published.
+            active = {item.target_slot - route.plan.config.home_experts for item in route.plan.transfers
+                      if item.target_rank == route.rank}
             start = backend.Event()
             start.record(caller)
             self.stream.wait_event(start)

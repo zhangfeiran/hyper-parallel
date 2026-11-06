@@ -299,7 +299,7 @@ class TestMXFP8Integration(unittest.TestCase):
     def test_replica_lease_borrows_only_current_phase_axes(self) -> None:
         """Feature: MXFP8 replicas.
         Description: Borrow separate guest buffers through native consumer submission.
-        Expectation: No concatenation, exact active bytes and exception-safe lease release.
+        Expectation: No concatenation, exact active bytes, untouched inactive bytes and exception-safe release.
         """
         owner, guest = _physical(2, 64, 128), _physical(1, 64, 128)
         config = ExpertReplicaConfig(4, 2, 2)
@@ -337,7 +337,7 @@ class TestMXFP8Integration(unittest.TestCase):
                                     self.assertEqual(value.shape[0], config.replica_slots_per_rank)
                                     self.assertTrue(torch.equal(value[:1].view(torch.uint8),
                                                                 getattr(guest, field).view(torch.uint8)))
-                                    self.assertEqual(int(value[1].view(torch.uint8).count_nonzero()), 0)
+                                    self.assertTrue(torch.all(value[1].view(torch.uint8) == 77))
                                 events.append("consumer")
                                 raise RuntimeError("Consumer failure")
                 self.assertEqual(events, ["enter", "consumer", "exit"])

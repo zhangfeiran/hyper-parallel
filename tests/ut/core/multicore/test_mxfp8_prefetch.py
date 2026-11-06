@@ -136,6 +136,68 @@ class TestMXFP8Prefetch(unittest.TestCase):
                 self.assertTrue(all(call.kwargs["use_sdma"] for call in runtime.put.call_args_list))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_changing_active_slots_preserves_inactive_bytes_and_receives_fresh_axes(self) -> None:
+        """Feature: MX inactive guest storage.
+        Description: Alternate two guest slots and current forward/backward axes in one reusable pool.
+        Expectation: Receives replace every active byte; inactive poison and prior generations stay untouched.
+        """
+        initial = (_weight(64, 128), _weight(128, 64))
+        aliases = tuple(getattr(weight, field).view(torch.uint8).reshape(1, -1)
+                        for weight in initial for field in ("col_data", "col_scale"))
+        pool = ReplicaPool(aliases, 2)
+        for guest in pool.weights:
+            guest.fill_(255)
+        runtime, backend = mock.MagicMock(), mock.MagicMock()
+        storage = torch.empty(signal_storage_bytes(((64, 128), (128, 64)), 2, 2, 2), dtype=torch.uint8)
+        provider = SignalReplicaTransport(runtime, storage, 2, 2)
+        config = SimpleNamespace(home_experts=1, ep_size=2, replica_slots_per_rank=2)
+        prefetch = MXProjectionPrefetch()
+        for generation, backward in enumerate((False, True, False, True)):
+            active = generation % 2
+            with self.subTest(generation=generation, backward=backward, active=active):
+                weights = (_weight(64, 128), _weight(128, 64))
+                fields = ("row_data", "row_scale") if backward else ("col_data", "col_scale")
+                axes = tuple(getattr(weight, field) for weight in weights for field in fields)
+                for index, axis in enumerate(axes):
+                    axis.view(torch.uint8).fill_(generation * 4 + index + 1)
+                inactive = tuple(guest[1 - active].clone() for guest in pool.weights)
+                transfers = (SimpleNamespace(owner_rank=1, owner_slot=0, target_rank=0,
+                                             target_slot=1 + active),)
+                route = SimpleNamespace(rank=0, group=object(),
+                                        plan=SimpleNamespace(config=config, transfers=transfers))
+                order = (2, 3, 0, 1) if backward else (0, 1, 2, 3)
+                received = []
+
+                def exchange(operations: list) -> list:
+                    """Complete exact current projection receives before publishing readiness."""
+                    for operation in operations:
+                        self.assertIs(operation[0], dist.irecv)
+                        index = order[len(received)]
+                        operation[1].copy_(axes[index].view(torch.uint8).reshape(-1))
+                        received.append(index)
+                    return [mock.MagicMock()]
+
+                target = "hyper_parallel.core.multicore.modules.mega_moe.mxfp8_prefetch"
+                runtime.put.reset_mock()
+                with mock.patch(target + ".replica_pool", return_value=pool), \
+                        mock.patch(target + "._global_peer_rank", side_effect=lambda group, peer: peer), \
+                        mock.patch.object(torch, "npu", backend), mock.patch.object(torch.Tensor, "record_stream"), \
+                        mock.patch.object(dist, "P2POp", side_effect=lambda *args: args), \
+                        mock.patch.object(dist, "batch_isend_irecv", side_effect=exchange):
+                    with prefetch.lease(weights, route, provider, backward=backward) as (guests, _):
+                        self.assertEqual(received, list(order))
+                        for guest, axis, old in zip(guests, axes, inactive):
+                            self.assertTrue(torch.equal(guest[active].view(torch.uint8),
+                                                        axis[0].view(torch.uint8)))
+                            self.assertTrue(torch.equal(guest[1 - active].view(torch.uint8).reshape(-1), old))
+                        self.assertEqual(runtime.put.call_count, 2)
+                        for call, matrix in zip(runtime.put.call_args_list, ((1, 0) if backward else (0, 1))):
+                            self.assertEqual(call.args[0].data_ptr(),
+                                             provider.projection_signals[matrix, active, :1].data_ptr())
+                self.assertFalse(pool._lock.locked())
+        self.assertEqual(backend.current_stream.return_value.wait_event.call_count, 4)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_prefetch_requires_the_owned_symmetric_inbox(self) -> None:
         """Feature: Prefetch configuration boundary.
         Description: Enable overlap without its symmetric readiness storage.
