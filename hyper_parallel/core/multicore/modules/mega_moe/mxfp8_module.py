@@ -28,6 +28,7 @@ import torch.distributed as dist
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.multicore import _collective
+from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
 from hyper_parallel.core.multicore.scheduler.config import mega_moe_event_capacity
 
@@ -37,6 +38,7 @@ from .mxfp8_execution import MXFP8Execution
 from .mxfp8_diagnostics import prepare_mx_diagnostics
 from .mxfp8_function import execute_mxfp8_experts
 from .mxfp8_graph import build_mxfp8_runtime
+from .mxfp8_gradient_udma import mx_udma_gradient_enabled
 from .mxfp8_gradients import mx_projection_events
 from .mxfp8_prefetch import MXProjectionPrefetch
 from .mxfp8_ops import require_mxfp8_window_feature
@@ -141,8 +143,14 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             if self.spec.mx_swiglu_row_only:
                 require_mxfp8_window_feature("nograd_row_only")
                 require_mxfp8_window_feature("nograd_x_row_only")
+            if self.spec.mx_gradient_udma:
+                if configured_udma_qp_count() != 32:
+                    raise ValueError("MX UDMA gradient helpers require 32 QPs")
+                if os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte") != "mte_udma":
+                    raise ValueError("MX UDMA gradient helpers require mte_udma")
+                require_mxfp8_window_feature("replica_udma_gradient")
 
-        if self.spec.mx_ready_depth or self.spec.mx_swiglu_row_only:
+        if self.spec.mx_ready_depth or self.spec.mx_swiglu_row_only or self.spec.mx_gradient_udma:
             _collective.collective_call(validate_features, stage="MXFP8 window capabilities", group=self.spec.ep_group)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
@@ -179,6 +187,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             self.spec.mx_ready_depth,
             self.spec.compute_stages,
             self.weight_prefetch is not None,
+            self.spec.mx_gradient_udma,
         )
 
     def _validate_distributed_configuration(self, specifications: tuple[Mapping[str, Any], ...]) -> None:
@@ -186,11 +195,13 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         super()._validate_distributed_configuration(specifications)
         if self.spec.ep_size == 1:
             return
-        flags = tuple(bool(spec.get("mx_weight_prefetch", False)) for spec in specifications)
+        flags = tuple((bool(spec.get("mx_weight_prefetch", False)), bool(spec.get("mx_gradient_udma", False)))
+                      for spec in specifications)
         gathered = [None] * self.spec.ep_size
         dist.all_gather_object(gathered, flags, group=self.spec.ep_group)
         if any(value != flags for value in gathered):
-            raise ValueError("MXFP8 projection-prefetch configuration differs across expert ranks")
+            raise ValueError(
+                "MXFP8 projection-prefetch or gradient-transport configuration differs across expert ranks")
 
     def plan_for_capacity(
         self, capacity: int, device: Any, *, home_only: bool = False, swiglu_row_only: bool = False
@@ -295,6 +306,7 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             raise ValueError("MXFP8 projection prefetch requires the symmetric FP32 gradient inbox.")
         if overlap_weights and os.environ.get("HCCL_OP_EXPANSION_MODE") != "AICPU_CacheDisable":
             raise ValueError("MXFP8 projection prefetch requires HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable.")
+        udma_gradients = mx_udma_gradient_enabled(replica_slots_per_rank, replica_transport)
         depth, row_only = _mx_window_options(vector_policy)
         config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_planner = "cpu"
@@ -322,6 +334,7 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             "replica_slots_per_rank": replica_slots_per_rank,
             "replica_transport": replica_transport,
             "mx_weight_prefetch": overlap_weights,
+            "mx_gradient_udma": udma_gradients,
             "auto_tokens": False,
             "compute_stages": 6,
             "mx_vector_policy": vector_policy,

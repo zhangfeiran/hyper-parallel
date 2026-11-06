@@ -87,6 +87,7 @@ class MegaMoeSpec:
     mx_ready_depth: int = 0
     mx_poll_policy: str = "0"
     mx_schedule_dir: str = ""
+    mx_gradient_udma: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -275,6 +276,7 @@ def bind_mega_moe_spec(
         mx_swiglu_row_only=specification.get("mx_swiglu_row_only", False),
         mx_ready_depth=specification.get("mx_ready_depth", 0),
         mx_poll_policy=specification.get("mx_poll_policy", "0"),
+        mx_gradient_udma=specification.get("mx_gradient_udma", False),
         replica_transport=specification.get("replica_transport", "shmem_signal_kernel_gradient_bands"),
         top_k=top_k,
         initial_capacity_factor=initial_capacity_factor,

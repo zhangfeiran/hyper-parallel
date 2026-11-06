@@ -128,7 +128,10 @@ def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) ->
             vectors[2 * lane].extend(tasks(inputs[1], expert, lane))
     _reuse_post_dispatch_math(cfg, vectors, stages["combine"][0], stages[inputs[0]],
                              active_replicas=bool(spec.replica_slots_per_rank))
-    qps = configured_udma_qp_count()
+    # A backward with UDMA gradient helpers reserves QPs 16..19. Validate the
+    # token producers against the same lower bank selected by the device.
+    qps = (16 if not forward and getattr(spec, "mx_gradient_udma", False) and spec.replica_slots_per_rank
+           else configured_udma_qp_count())
     if qps < 32:
         _validate_qp_owners(cfg, spec, vectors, qps)
     install_worker_queues(cfg, cubes, vectors)

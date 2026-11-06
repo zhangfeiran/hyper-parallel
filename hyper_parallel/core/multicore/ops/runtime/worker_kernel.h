@@ -34,6 +34,7 @@
 
 #include "get_mem.h"
 #include "replica_gradient.h"
+#include "replica_gradient_udma.h"
 #include "gradient_band.h"
 #include "gradient_band_observer.h"
 
@@ -135,6 +136,8 @@ class KernelWorkerBase {
           AscendC::Trap();
         }
         replica_gradient_config_ = reinterpret_cast<GM_ADDR>(extension[9]);
+        auto config = reinterpret_cast<__gm__ uint64_t *>(replica_gradient_config_);
+        replica_udma_gradient_ = config[0] == 8 || (config[0] == 2 && config[config[1]] == 8);
       }
     }
     this->runtime_task_capacity = getRuntimeTaskCapacity(runtimeConfigPtr);
@@ -221,6 +224,7 @@ class KernelWorkerBase {
   CycleTraceRecorder *replica_trace_ = nullptr;
   uint32_t replica_trace_task_ = 0;
   GM_ADDR replica_gradient_config_ = nullptr;
+  bool replica_udma_gradient_ = false;
 
   __aicore__ inline void ProcessReplicaGradients() {
 #ifndef __DAV_CUBE__
@@ -255,9 +259,16 @@ class KernelWorkerBase {
     const int32_t rank = config[1], slots = config[2], epoch = config[3];
     const int64_t elements = config[4];
     const int32_t incoming_count = config[10], owned_count = config[11];
-    if ((config[0] != 1 && config[0] != 7) || rank < 0 || rank >= ep || slots <= 0 || epoch <= 0 || elements <= 0 ||
+    if ((config[0] != 1 && config[0] != 7 && config[0] != 8) ||
+        rank < 0 || rank >= ep || slots <= 0 || epoch <= 0 || elements <= 0 ||
         incoming_count < 0 || incoming_count > slots || owned_count < 0 || owned_count > ep * slots) {
       AscendC::Trap();
+    }
+    if (config[0] == 8) {
+      ValidateReplicaGradientUdmaLayout(reinterpret_cast<GM_ADDR>(config[12]), config[13], config[14], config[15]);
+      if (core_num != 4) {
+        AscendC::Trap();
+      }
     }
   }
 
@@ -276,7 +287,7 @@ class KernelWorkerBase {
     GM_ADDR output = reinterpret_cast<GM_ADDR>(config[5]);
     GM_ADDR guest = reinterpret_cast<GM_ADDR>(config[6]);
     GM_ADDR ready = reinterpret_cast<GM_ADDR>(config[7]);
-    __gm__ uint64_t *incoming = config + (config[0] == 7 ? 18 : 12);
+    __gm__ uint64_t *incoming = config + (config[0] == 7 ? 18 : config[0] == 8 ? 16 : 12);
     __gm__ uint64_t *owned = incoming + incoming_count * 3;
     // Publishing every local producer before remote waits breaks ring dependencies.
     if (worker == 0 && config[0] != 7) {
@@ -298,8 +309,13 @@ class KernelWorkerBase {
       WaitForDependency(owned[index * 4 + 3]);
       WaitReplicaCompletion(ready + (peer * slots + slot) * DATA_CACHE_LINE_SIZE, epoch);
       const uint64_t start = profiling ? trace.Now() : 0;
-      AddReplicaGradient(output + owner * elements * sizeof(float), guest + slot * elements * sizeof(float),
-                          elements, peer, worker, core_num);
+      if (config[0] == 8) {
+        AddReplicaGradientUdma(output + owner * elements * sizeof(float), guest + slot * elements * sizeof(float),
+            elements, peer, worker, core_num, reinterpret_cast<GM_ADDR>(config[12]), config[13], config[15]);
+      } else {
+        AddReplicaGradient(output + owner * elements * sizeof(float), guest + slot * elements * sizeof(float),
+                            elements, peer, worker, core_num);
+      }
       if (profiling) {
         trace.Record(profile_desc, 0, peer, rank * (home_experts_ + slots) + owner, start, trace.Now());
       }

@@ -40,7 +40,7 @@ class PutMemSignalKernel {
   __aicore__ inline PutMemSignalKernel() {}
   __aicore__ inline void Init(GM_ADDR target, int64_t target_offset, GM_ADDR src, int64_t src_offset, int64_t size,
                               GM_ADDR signal, int64_t signal_offset, int32_t signal_value, int64_t signal_op,
-                              int64_t target_pe, bool non_blocking, GM_ADDR workspace) {
+                              int64_t target_pe, bool non_blocking, GM_ADDR workspace, uint32_t udma_qp_limit = 0) {
     // Initialize pointers and parameters
     target_ = reinterpret_cast<__gm__ T *>(target);
     src_ = reinterpret_cast<__gm__ T *>(src);
@@ -53,6 +53,7 @@ class PutMemSignalKernel {
     signal_op_ = signal_op;
     target_pe_ = target_pe;
     non_blocking_ = non_blocking;
+    udma_qp_limit_ = udma_qp_limit;
 
     // UB tiling set
     aiv_idx_ = 0;
@@ -86,9 +87,15 @@ class PutMemSignalKernel {
       if (worker % 2 == 0 || worker / 2 >= 32) {
         AscendC::Trap();
       }
-      const uint32_t qp_count = aclshmemi_udma_qp_info_fetch()->qp_num;
+      uint32_t qp_count = aclshmemi_udma_qp_info_fetch()->qp_num;
       if (qp_count != 1 && qp_count != 8 && qp_count != 16 && qp_count != 32) {
         AscendC::Trap();
+      }
+      if (udma_qp_limit_ != 0) {
+        if (udma_qp_limit_ != 16 || qp_count != 32) {
+          AscendC::Trap();
+        }
+        qp_count = udma_qp_limit_;
       }
       const uint32_t qp = worker / (64 / qp_count);
       AscendC::TBuf<AscendC::TPosition::VECOUT> staging;
@@ -184,6 +191,7 @@ class PutMemSignalKernel {
   int64_t signal_op_ = 0;
   int64_t target_pe_ = 0;
   bool non_blocking_ = true;
+  uint32_t udma_qp_limit_ = 0;
   AscendC::GlobalTensor<int32_t> syncGlobal;
   AscendC::TQue<AscendC::TPosition::VECIN, 1> localwork;
   // ub
@@ -196,9 +204,10 @@ class PutMemSignalKernel {
 extern "C" inline __aicore__ void put_mem_signal_kernel(GM_ADDR target, int64_t target_offset, GM_ADDR src,
                                                         int64_t src_offset, int64_t size, GM_ADDR signal,
                                                         int64_t signal_offset, int64_t signal_value, GM_ADDR workspace,
-                                                        int64_t signal_op, int64_t target_pe, bool non_blocking) {
+                                                        int64_t signal_op, int64_t target_pe, bool non_blocking,
+                                                        uint32_t udma_qp_limit = 0) {
   hyper_parallel::multicore::PutMemSignalKernel<DTYPE_DISPATCH_TARGET> op;
   op.Init(target, target_offset, src, src_offset, size, signal, signal_offset, signal_value, signal_op, target_pe,
-          non_blocking, workspace);
+          non_blocking, workspace, udma_qp_limit);
   op.Process();
 }

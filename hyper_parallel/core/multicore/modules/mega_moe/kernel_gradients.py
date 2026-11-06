@@ -49,6 +49,16 @@ class _GradientBandReturn:
     rows: int
 
 
+@dataclass(frozen=True)
+class _UdmaGradientScratch:
+    """Borrow bounded per-helper banks and exclusive UDMA queue indices."""
+
+    scratch: torch.Tensor
+    chunk_elements: int
+    helpers: int = 4
+    qp_base: int = 16
+
+
 def _validate_gradient_pair(gradient: torch.Tensor, guest: torch.Tensor | None) -> None:
     """Reject borrowed, cast-requiring or incompatible gradient storage."""
     if gradient.dtype != torch.float32 or gradient.requires_grad or not gradient.is_contiguous():
@@ -60,7 +70,8 @@ def _validate_gradient_pair(gradient: torch.Tensor, guest: torch.Tensor | None) 
 
 def _matrix_record(route: ReplicaRoute, provider: Any, events: tuple[int, ...],
                    gradient: torch.Tensor, guest: torch.Tensor, completion: torch.Tensor,
-                   bands: _GradientBandReturn | None = None) -> list[int]:
+                   bands: _GradientBandReturn | None = None,
+                   udma: _UdmaGradientScratch | None = None) -> list[int]:
     """Encode one epoch with complete local producers before ordered peer reads."""
     home = route.plan.config.home_experts
     incoming = [item for item in route.plan.transfers if item.target_rank == route.rank]
@@ -73,6 +84,9 @@ def _matrix_record(route: ReplicaRoute, provider: Any, events: tuple[int, ...],
         values[0] = 7
         values.extend((bands.owner.data_ptr(), bands.guest.data_ptr(), bands.rows,
                        gradient.shape[-2], gradient.shape[-1], bands.owner.shape[1]))
+    elif udma is not None:
+        values[0] = 8
+        values.extend((udma.scratch.data_ptr(), udma.chunk_elements, udma.helpers, udma.qp_base))
     for item in incoming:
         values.extend((item.owner_rank, item.target_slot - home, events[item.target_slot]))
     for item in owned:
@@ -102,8 +116,20 @@ def _prepare_gradient_bands(plan: MegaMoePlan, provider: Any,
 def prepare_kernel_gradient_return(plan: MegaMoePlan, route: ReplicaRoute | None, provider: Any,
                                    gradient: torch.Tensor, guest: torch.Tensor | None, *,
                                    gradient_w13: torch.Tensor | None = None,
-                                   guest_w13: torch.Tensor | None = None) -> KernelGradientReturn | None:
-    """Encode proven projection fences and retain FP32 peer order and ACK leases."""
+                                   guest_w13: torch.Tensor | None = None,
+                                   udma: _UdmaGradientScratch | None = None) -> KernelGradientReturn | None:
+    """Encode proven projection fences and retain FP32 peer order and ACK leases.
+
+    Args:
+        plan: Physical task plan with complete projection producer fences.
+        route: Immutable logical-to-physical replica placement for this invocation.
+        provider: Serial symmetric gradient inbox and ready/ACK generation owner.
+        gradient: FP32 owner gradient of the second projection.
+        guest: Symmetric FP32 guest gradient of the second projection.
+        gradient_w13: Optional owner gradient of the first projection.
+        guest_w13: Optional symmetric guest gradient of the first projection.
+        udma: Optional bounded staging banks and exclusive UDMA helper QPs.
+    """
     if (route is None or not route.plan.transfers or not plan.replica_w2_events
             or not getattr(provider, "kernel_gradients", False)):
         return None
@@ -113,10 +139,12 @@ def prepare_kernel_gradient_return(plan: MegaMoePlan, route: ReplicaRoute | None
         pairs.append((w13_events, gradient_w13, guest_w13))
     for _, owner, replica in pairs:
         _validate_gradient_pair(owner, replica)
+    if udma is not None and getattr(provider, "gradient_bands", False):
+        raise ValueError("UDMA projection gradients cannot share the band return protocol")
     bands = _prepare_gradient_bands(plan, provider, pairs)
     completion = torch.zeros((len(pairs), plan.spec.num_cube_cores, 16),
                              dtype=torch.int32, device=gradient.device)
-    records = [_matrix_record(route, provider, events, owner, replica, completion[index], bands[index])
+    records = [_matrix_record(route, provider, events, owner, replica, completion[index], bands[index], udma)
                for index, (events, owner, replica) in enumerate(pairs)]
     # The two-matrix envelope retains the original single-matrix records. Epochs
     # are distinct because ready/ACK words are shared across ordered matrices.
@@ -129,4 +157,7 @@ def prepare_kernel_gradient_return(plan: MegaMoePlan, route: ReplicaRoute | None
     resources = tuple(band.owner for band in bands if band is not None)
     for tensor in (metadata, completion, *resources):
         tensor.record_stream(stream)
-    return KernelGradientReturn(metadata, completion, (1,) if len(records) == 1 else (1, 0), resources)
+    # The serial provider owns external symmetric storage through the ACK lease;
+    # retain its view without recording it in the Torch caching allocator.
+    retained = resources + ((udma.scratch,) if udma is not None else ())
+    return KernelGradientReturn(metadata, completion, (1,) if len(records) == 1 else (1, 0), retained)
