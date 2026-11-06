@@ -15,12 +15,32 @@
 """Generate the measured two-expert window from the current task graph."""
 
 from __future__ import annotations
+import os
 from typing import Any
 
 from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 
 from .config import TaskType
 from .planned_queue import install_worker_queues
+
+
+def _reuse_post_dispatch_math(cfg: Any, vectors: list[list[int]], combine_start: int) -> None:
+    """Borrow each communication lane only after its entire dispatch prefix completes."""
+    enabled = os.environ.get("PANGU_MX_REUSE_DISPATCH_WORKERS", "0")
+    if enabled not in ("0", "1"):
+        raise ValueError("PANGU_MX_REUSE_DISPATCH_WORKERS must be exactly 0 or 1")
+    if enabled == "0":
+        return
+    for lane in range(32):
+        math, communication = vectors[2 * lane], vectors[2 * lane + 1]
+        if len(math) % 2:
+            raise ValueError("Post-dispatch reuse requires paired logical quantization workers")
+        boundary = next((index for index, task in enumerate(communication)
+                         if task >= combine_start or cfg.all_tasks[task].task_type == 0), len(communication))
+        # Preserving the full communication subsequence keeps every peer/QP owner.
+        # Borrowing a lane before dispatch drains could introduce remote wait cycles.
+        vectors[2 * lane] = math[::2]
+        vectors[2 * lane + 1] = communication[:boundary] + math[1::2] + communication[boundary:]
 
 
 def _validate_qp_owners(cfg: Any, spec: Any, vectors: list[list[int]], qps: int) -> None:
@@ -41,6 +61,18 @@ def _validate_qp_owners(cfg: Any, spec: Any, vectors: list[list[int]], qps: int)
                 raise ValueError(f"QP owner collision: peer={peer}, qp={qp}, workers={owner}/{worker}")
 
 
+def _window_stages(graph: Any, experts: int) -> dict[str, tuple[int, int]]:
+    """Locate expert-partitioned stages without changing their topological task IDs."""
+    stages = {}
+    offset = 0
+    for op in graph.topological_sort():
+        if op.name != "terminate" and op.task_num % experts:
+            raise ValueError(f"Window stage {op.name} cannot partition {op.task_num} tasks across experts")
+        stages[op.name] = (offset, op.task_num)
+        offset += op.task_num
+    return stages
+
+
 def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) -> None:
     """Preserve tasks, dependencies and QP ownership without shape-specific files.
 
@@ -49,13 +81,7 @@ def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) ->
         graph: Completed task graph with operator-local task ranges.
         spec: Validated physical expert topology and current capacity.
     """
-    stages = {}
-    offset = 0
-    for op in graph.topological_sort():
-        if op.name != "terminate" and op.task_num % spec.local_experts:
-            raise ValueError(f"Window stage {op.name} cannot partition {op.task_num} tasks across experts")
-        stages[op.name] = (offset, op.task_num)
-        offset += op.task_num
+    stages = _window_stages(graph, spec.local_experts)
 
     def tasks(stage: str, expert: int, lane: int) -> list[int]:
         """Select the task IDs owned by one expert and physical compute lane.
@@ -91,6 +117,7 @@ def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) ->
             if expert + 1 < spec.local_experts:
                 vectors[2 * lane].extend(tasks(inputs[0], expert + 1, lane))
             vectors[2 * lane].extend(tasks(inputs[1], expert, lane))
+    _reuse_post_dispatch_math(cfg, vectors, stages["combine"][0])
     qps = configured_udma_qp_count()
     if qps < 32:
         _validate_qp_owners(cfg, spec, vectors, qps)
