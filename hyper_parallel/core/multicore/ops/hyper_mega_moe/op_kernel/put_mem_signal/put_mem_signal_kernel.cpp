@@ -40,7 +40,8 @@ class PutMemSignalKernel {
   __aicore__ inline PutMemSignalKernel() {}
   __aicore__ inline void Init(GM_ADDR target, int64_t target_offset, GM_ADDR src, int64_t src_offset, int64_t size,
                               GM_ADDR signal, int64_t signal_offset, int32_t signal_value, int64_t signal_op,
-                              int64_t target_pe, bool non_blocking, GM_ADDR workspace, uint32_t udma_qp_limit = 0) {
+                              int64_t target_pe, bool non_blocking, GM_ADDR workspace, uint32_t udma_qp_limit = 0,
+                              bool prefer_mapped_mte = false) {
     // Initialize pointers and parameters
     target_ = reinterpret_cast<__gm__ T *>(target);
     src_ = reinterpret_cast<__gm__ T *>(src);
@@ -54,6 +55,7 @@ class PutMemSignalKernel {
     target_pe_ = target_pe;
     non_blocking_ = non_blocking;
     udma_qp_limit_ = udma_qp_limit;
+    prefer_mapped_mte_ = prefer_mapped_mte;
 
     // UB tiling set
     aiv_idx_ = 0;
@@ -79,9 +81,16 @@ class PutMemSignalKernel {
     if (aiv_idx_ == aiv_num_ - 1) {
       size_per_core = size_ - size_per_core * aiv_idx_;
     }
+    __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
-    if (target_pe_ != aclshmem_my_pe() &&
-        (aclshmemi_get_state()->topo_list[target_pe_] & ACLSHMEM_TRANSPORT_UDMA) != 0) {
+    // Token traffic may use mapped MTE while replica transfers retain their UDMA queues.
+    // Missing MTE capability or a peer mapping must preserve the existing UDMA path.
+    const bool mapped_mte = prefer_mapped_mte_ &&
+                            (device_state->topo_list[target_pe_] & ACLSHMEM_TRANSPORT_MTE) != 0 &&
+                            device_state->p2p_device_heap_base != nullptr &&
+                            reinterpret_cast<uintptr_t>(device_state->p2p_device_heap_base[target_pe_]) != 0;
+    if (!mapped_mte && target_pe_ != aclshmem_my_pe() &&
+        (device_state->topo_list[target_pe_] & ACLSHMEM_TRANSPORT_UDMA) != 0) {
       // Host validation gives each peer/QP pair one odd-worker owner.
       const uint32_t worker = AscendC::GetBlockIdx();
       if (worker % 2 == 0 || worker / 2 >= 32) {
@@ -118,7 +127,6 @@ class PutMemSignalKernel {
       return;
     }
 #endif
-    __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
     /* CopyUB Config Set */
     uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
     uint64_t copy_ub_size = device_state->mte_config.ub_size;
@@ -192,6 +200,7 @@ class PutMemSignalKernel {
   int64_t target_pe_ = 0;
   bool non_blocking_ = true;
   uint32_t udma_qp_limit_ = 0;
+  bool prefer_mapped_mte_ = false;
   AscendC::GlobalTensor<int32_t> syncGlobal;
   AscendC::TQue<AscendC::TPosition::VECIN, 1> localwork;
   // ub
@@ -205,9 +214,10 @@ extern "C" inline __aicore__ void put_mem_signal_kernel(GM_ADDR target, int64_t 
                                                         int64_t src_offset, int64_t size, GM_ADDR signal,
                                                         int64_t signal_offset, int64_t signal_value, GM_ADDR workspace,
                                                         int64_t signal_op, int64_t target_pe, bool non_blocking,
-                                                        uint32_t udma_qp_limit = 0) {
+                                                        uint32_t udma_qp_limit = 0,
+                                                        bool prefer_mapped_mte = false) {
   hyper_parallel::multicore::PutMemSignalKernel<DTYPE_DISPATCH_TARGET> op;
   op.Init(target, target_offset, src, src_offset, size, signal, signal_offset, signal_value, signal_op, target_pe,
-          non_blocking, workspace, udma_qp_limit);
+          non_blocking, workspace, udma_qp_limit, prefer_mapped_mte);
   op.Process();
 }
