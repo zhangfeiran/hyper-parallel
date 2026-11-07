@@ -53,6 +53,7 @@ from hyper_parallel.core.expert_parallel.hot_replica.device import (
 from hyper_parallel.core.expert_parallel.hot_replica.routing import (
     ReplicaRoute, _GatheredReplicaCounts, _RejectedQuotaMemo, prepare_replica_route,
 )
+from hyper_parallel.core.expert_parallel.hot_replica._metadata import _ReplicaCountHeaderCache
 from hyper_parallel.core.expert_parallel.hot_replica.signal_transport import (
     KERNEL_GRADIENT_TRANSPORT_MODES,
 )
@@ -831,6 +832,7 @@ class MegaMoeExperts(MulticoreModule):
         self, topk_ids: torch.Tensor, resources: _MegaMoeExecutionResources, hidden: torch.Tensor,
         autograd_mask: int, counts: torch.Tensor | None,
         gathered: _GatheredReplicaCounts | None = None,
+        *, count_header_cache: _ReplicaCountHeaderCache | None = None,
     ) -> ReplicaRoute:
         """Resolve the unchanged bounded policy only when placement is needed."""
         selection = ({'execution_schedule': UNMAPPED_GUEST_SUFFIX_SCHEDULE}
@@ -876,6 +878,7 @@ class MegaMoeExperts(MulticoreModule):
                               if self.dispatch_mode != "pull" else None),
             _trusted_counts=counts, _gathered_counts=gathered,
             _rejected_quota_memo=self._rejected_quota_memo,
+            _count_header_cache=count_header_cache,
         )
 
     def forward(

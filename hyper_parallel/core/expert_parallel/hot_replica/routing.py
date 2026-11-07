@@ -29,7 +29,7 @@ import torch.distributed as dist
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 
 from .admission import reduction_basis_points
-from ._metadata import _async_device_bytes, _recompute_metadata
+from ._metadata import _async_device_bytes, _recompute_metadata, _ReplicaCountHeaderCache
 from .capacity import ExpertReplicaConfig, _integer, align_capacity
 from .cost import ExpertReplicaCostModel
 from .count_kernel import try_count_payload
@@ -526,6 +526,7 @@ def prepare_replica_route(
     _gathered_counts: _GatheredReplicaCounts | None = None,
     _replica_transfer_row_credit: int = 0,
     _rejected_quota_memo: _RejectedQuotaMemo | None = None,
+    _count_header_cache: _ReplicaCountHeaderCache | None = None,
 ) -> ReplicaRoute:
     """Gather logical counts once, plan replicas, and preserve every TopK slot.
 
@@ -552,6 +553,7 @@ def prepare_replica_route(
         _trusted_counts: Internal exact Router histogram, using the executor's trusted-count contract.
         _gathered_counts: Internal validated native count agreement for CPU planning.
         _replica_transfer_row_credit: Internal conservative activation-row credit per deleted matrix edge.
+        _count_header_cache: Internal immutable control uploads owned by MX execution resources.
 
     Returns:
         Invocation-owned placement, physical IDs and dispatch counts.
@@ -590,7 +592,8 @@ def prepare_replica_route(
             raise ValueError("Trusted replica counts must be an integer expert histogram on the route device")
         header = (0,) + (() if dynamic_header is None else dynamic_header)
         counts = _trusted_counts.to(torch.int64)
-        descriptor = _async_device_bytes(struct.pack(f"<{len(header)}q", *header), ids.device).view(torch.int64)
+        upload = _async_device_bytes if _count_header_cache is None else _count_header_cache.upload
+        descriptor = upload(struct.pack(f"<{len(header)}q", *header), ids.device).view(torch.int64)
         payload = torch.cat((counts, descriptor))
     if _gathered_counts is None:
         matrix = _gather_replica_counts(payload, size, group)

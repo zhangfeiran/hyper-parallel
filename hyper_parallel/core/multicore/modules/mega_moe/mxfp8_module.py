@@ -27,6 +27,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
+from hyper_parallel.core.expert_parallel.hot_replica._metadata import _ReplicaCountHeaderCache
 from hyper_parallel.core.multicore import _collective
 from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
@@ -128,6 +129,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         """Bind validated invocation resources without retaining gathered weight views."""
         self.spec = bind_mega_moe_spec(specification, tensor)
         self.weight_prefetch = MXProjectionPrefetch() if specification.get("mx_weight_prefetch", False) else None
+        self.replica_headers = _ReplicaCountHeaderCache() if self.spec.replica_slots_per_rank else None
         if self.spec.num_cube_cores != 32:
             raise ValueError("MXFP8 MegaMoE requires the Ascend 950 32-Cube kernel.")
         self.soc_name = ""
@@ -234,6 +236,12 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         while len(self._plans) > 4:
             self._plans.popitem(last=False)
         return self._plans[key]
+
+    def close(self) -> None:
+        """Release immutable control uploads after closing the execution workspace."""
+        super().close()
+        if self.replica_headers is not None:
+            self.replica_headers.clear()
 
 
 def _mx_window_options(vector_policy: str) -> tuple[int, bool]:
@@ -403,7 +411,9 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
                 | (int(topk_weights.requires_grad) << 4)
             )
             with torch.no_grad():
-                replica_route = self._prepare_replica_route(topk_ids, resources, flat, mask, tokens_per_expert)
+                replica_route = self._prepare_replica_route(
+                    topk_ids, resources, flat, mask, tokens_per_expert, count_header_cache=resources.replica_headers
+                )
                 topk_ids = replica_route.physical_ids
                 tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]
         execution = MXFP8Execution(
