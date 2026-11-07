@@ -69,8 +69,9 @@ class TestMXFP8GradientUdma(unittest.TestCase):
                            mx_vector_policy="window2", mx_gradient_udma=True,
                            replica_transport="shmem_signal_kernel_gradient")
         for qps, engine, feature_error, expected in (
-                (8, "mte_udma", None, "16 or 32 QPs"),
+                (1, "mte_udma", None, "8, 16 or 32 QPs"),
                 (32, "mte", None, "mte_udma"),
+                (8, "mte_udma", RuntimeError("Missing gradient capability"), "Missing gradient capability"),
                 (16, "mte_udma", RuntimeError("Missing gradient capability"), "Missing gradient capability"),
                 (32, "mte_udma", RuntimeError("Missing gradient capability"), "Missing gradient capability")):
             with self.subTest(qps=qps, engine=engine, capability=feature_error), mock.patch.dict(
@@ -180,6 +181,61 @@ class TestMXFP8GradientUdma(unittest.TestCase):
                 mx_gradient_peer_qps(config, SimpleNamespace(ep_size=2, rank_id=0))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_eight_qps_keep_exclusive_helpers_for_each_replica_rank(self) -> None:
+        """Feature: Smaller gradient QP banks.
+        Description: Reserve helpers for all EP16/32 ranks and B1/B2/B6 task queues.
+        Expectation: Preserve token queues and keep four distinct helpers outside their ownership and QP0.
+        """
+        with mock.patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_DATA_ENGINE": "mte_udma",
+                                          "HYPER_PARALLEL_SHMEM_UDMA_QP_NUM": "8"}):
+            for ep in (16, 32):
+                for budget in (1, 2, 6):
+                    for rank in range(ep):
+                        with self.subTest(ep=ep, budget=budget, rank=rank):
+                            spec = MegaMoeSpec(4096, 5120, 1792, ep * (6 + budget), 8, 1.25, 40960,
+                                               ep, None, rank, 32, logical_num_experts=ep * 6,
+                                               replica_slots_per_rank=budget, compute_stages=6,
+                                               mx_vector_policy="window2", mx_gradient_udma=True,
+                                               replica_transport="shmem_signal_kernel_gradient")
+                            cfg = build_mxfp8_runtime(spec, forward=False).config
+                            original = tuple(cfg.vector_task_indices)
+                            gradient_qps = mx_gradient_peer_qps(cfg, spec)
+                            self.assertEqual(tuple(cfg.vector_task_indices), original)
+                            owners = set()
+                            for worker in range(1, 64, 2):
+                                queue = cfg.vector_task_indices[
+                                    cfg.mix_task_indices[worker]:cfg.mix_task_indices[worker + 1]]
+                                for task_id in queue:
+                                    task = cfg.all_tasks[task_id]
+                                    if task.task_type == TaskType.TASK_SHMEM_PUT_MEM_SIGNAL:
+                                        peer = task.task_index // (task.task_split_num // ep)
+                                        if peer != rank:
+                                            owners.add((peer, worker // 8))
+                            for peer, row in enumerate(gradient_qps):
+                                self.assertEqual(len(set(row)), 4)
+                                for qp in row:
+                                    self.assertGreater(qp, 0)
+                                    self.assertLess(qp, 8)
+                                    self.assertNotIn((peer, qp), owners)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_eight_qp_scratch_keeps_the_existing_fp32_prefix_layout(self) -> None:
+        """Feature: Eight-QP gradient scratch admission.
+        Description: Borrow a poisoned BF16 prefix with the smaller initialized bank.
+        Expectation: Keep four helpers, reuse storage and leave both FP32 gradient destinations untouched.
+        """
+        provider = _provider(2, qps=8)
+        originals = tuple(gradient.view(torch.uint8).clone() for gradient in provider.pool.gradients)
+        layout = mx_udma_gradient_scratch(provider)
+        self.assertEqual(layout.helpers, 4)
+        self.assertEqual(layout.scratch.data_ptr(), provider.pool.weights[0].data_ptr())
+        self.assertEqual(layout.scratch.dtype, torch.float32)
+        self.assertEqual(layout.scratch.numel(), 8 * layout.chunk_elements)
+        self.assertLessEqual(layout.scratch.numel() * 4, provider.pool.weights[0].numel() * 2)
+        for original, gradient in zip(originals, provider.pool.gradients):
+            self.assertTrue(torch.equal(original, gradient.view(torch.uint8)))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_scratch_borrows_only_the_unused_weight_prefix_for_b1_b2_b6(self) -> None:
         """Feature: MX UDMA gradient staging.
         Description: Construct all helper ping-pong banks inside the existing BF16 prefix.
@@ -209,10 +265,10 @@ class TestMXFP8GradientUdma(unittest.TestCase):
         Description: Try a token-only QP allocation or an MTE-only runtime.
         Expectation: Fail before any epoch or transfer can advance.
         """
-        for qps, engine in ((8, "mte_udma"), (32, "mte")):
+        for qps, engine in ((1, "mte_udma"), (32, "mte")):
             with self.subTest(qps=qps, engine=engine):
                 provider = _provider(1, qps=qps, engine=engine)
-                with self.assertRaisesRegex(ValueError, "16 or 32 QPs"):
+                with self.assertRaisesRegex(ValueError, "8, 16 or 32 QPs"):
                     mx_udma_gradient_scratch(provider)
                 self.assertEqual(provider.epoch, 0)
                 provider.runtime.put.assert_not_called()

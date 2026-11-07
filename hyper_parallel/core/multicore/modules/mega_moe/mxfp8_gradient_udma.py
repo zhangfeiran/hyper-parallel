@@ -81,9 +81,9 @@ def mx_udma_gradient_scratch(provider: Any) -> _UdmaGradientScratch:
         return cached
     state = provider.runtime.debug_state()
     config = state.get("config") or {}
-    if (state.get("backend_soc_type") != "Ascend950" or config.get("udma_qp_num") not in (16, 32)
+    if (state.get("backend_soc_type") != "Ascend950" or config.get("udma_qp_num") not in (8, 16, 32)
             or config.get("data_engine") != "mte_udma"):
-        raise ValueError("MX UDMA gradients require an Ascend950 MTE/UDMA runtime with 16 or 32 QPs")
+        raise ValueError("MX UDMA gradients require an Ascend950 MTE/UDMA runtime with 8, 16 or 32 QPs")
     if provider.pool is None or not provider.pool.weights:
         raise ValueError("MX UDMA gradient scratch requires a bound signal provider")
     prefix = provider.pool.weights[0].view(torch.uint8).reshape(-1)

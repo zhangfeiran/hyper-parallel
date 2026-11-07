@@ -147,8 +147,8 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
                 require_mxfp8_window_feature("nograd_row_only")
                 require_mxfp8_window_feature("nograd_x_row_only")
             if self.spec.mx_gradient_udma:
-                if configured_udma_qp_count() not in (16, 32):
-                    raise ValueError("MX UDMA gradient helpers require 16 or 32 QPs")
+                if configured_udma_qp_count() not in (8, 16, 32):
+                    raise ValueError("MX UDMA gradient helpers require 8, 16 or 32 QPs")
                 if os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte") != "mte_udma":
                     raise ValueError("MX UDMA gradient helpers require mte_udma")
                 require_mxfp8_window_feature("replica_udma_gradient_peer_qp")
