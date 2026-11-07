@@ -23,6 +23,7 @@ import json
 
 import torch
 
+from hyper_parallel.core.expert_parallel.hot_replica._metadata import _async_device_bytes
 from hyper_parallel.core.multicore.scheduler.mxfp8 import MxLaunchDescriptor, serialize_mx_launch_metadata
 from hyper_parallel.core.multicore.torch.ops import _load_native
 from hyper_parallel.core.multicore._loader import get_multicore_paths
@@ -115,7 +116,7 @@ def prepare_mxfp8_launch(
     """
     metadata = serialize_mxfp8_launch(buffers, runtime, events, spec, kernel_gradients=kernel_gradients,
                                      weight_prefetch=weight_prefetch)
-    return torch.frombuffer(bytearray(metadata), dtype=torch.uint8).to(device=runtime.device)
+    return _async_device_bytes(metadata, runtime.device)
 
 
 def launch_mxfp8_task_graph(
