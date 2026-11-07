@@ -1,7 +1,9 @@
 # 客户项目接入 LongCat Flash MegaMoE
 
 本文面向已能运行 LongCat Flash 的客户项目，说明如何用当前分支的 MegaMoE 替换专家执行。
-接口以 `feat/longcat-flash-repro` 所包含的模型基线 `ca3ce4194` 为准；核对过的 HF 实现来自 Transformers5.13.1。
+当前客户交付分支为 `feat/longcat-flash-repro`，已包含 EOI 热副本、路由反向和 expert 调度增量。
+原始接口基于模型提交 `ca3ce4194`，核对过的 HF 实现来自 Transformers5.13.1；当前优化验收见
+[调优说明](../../docs/longcat-flash-cv-tuning.md)，热副本配置见[热副本说明](../../docs/longcat-flash-hot-replicas.md)。
 环境准备、x86架构检查和独立复现命令见 [复现指南](README.zh-CN.md)。
 
 ## 1. 替换范围和数据流
@@ -32,7 +34,7 @@ Router仍在真实专家与identity专家的完整集合上做TopK；保留原�
 
 identity份额表示路由规模和HF保留的未使用参数行，不表示identity需要跨卡计算。
 缩小实验时按EP同比例缩E/Z、保持每卡8/4和原始宽度，模型仅减少层数；不能在EP16仍配置E512后声称是同一每卡负载。
-本分支的实测性能范围是后两行；原始EP64规模需要另行验收。
+历史冻结版本验收了后两行；当前新增优化的验收范围见对应调优报告，不能将旧 Trainer 结果移作新版本证明。原始EP64规模需要另行验收。
 
 ## 2. 公共调用与推荐选项
 
@@ -68,7 +70,7 @@ EP本地权重已经切好的客户项目使用第4节，不能把局部张量�
 | `optimize_tasks=True` | 使用当前路由的任务边界和单专家任务寻址，默认开启 |
 | `direct_weight_gradients=True` | EOI、无副本且任务优化开启时，保留完整Gate/Up梯度形状并清零unused尾部，默认开启 |
 | `initial_token_capacity=24576` | 对每卡T2048、TopK12的初始compact-real行预留；变长输入可自动增长，不丢token；其他T应按实际负载设置 |
-| `replica_slots_per_rank=0` | 历史参考实验保持无副本；`feat/longcat-flash-hot-replica`分支已支持EOI热副本，LongCat默认按完整专家迁移，见[热副本接入与验收](../../docs/longcat-flash-hot-replicas.md) |
+| `replica_slots_per_rank=0` | 默认无副本；当前 `feat/longcat-flash-repro` 分支已支持EOI热副本，LongCat默认按完整专家迁移，见[热副本接入与验收](../../docs/longcat-flash-hot-replicas.md) |
 
 原生Router的TopK仍是12。adapter压紧真实slots以后，内部使用 `num_experts=E, top_k=1` 的执行器，
 逐assignment执行；不要把内部K=1误改为12，也不要把identity ID直接传给通用 `MegaMoeExperts`。
@@ -333,13 +335,14 @@ dist.destroy_process_group()
 
 ## 8. 客户侧验收顺序
 
-1. 先运行复现入口 `--check-only`，核对editable来源、CANN、adapter/vendor/SHMEM主机库及x86 ELF架构。
-   保留客户已验证的Torch/PTA；导入通过仅证明入口可用。
+1. 按[当前版本指南](README.zh-CN.md)重新编译匹配的 native、核对 editable 来源和实际加载库，再运行独立历史前端精度入口。
+   保留客户已验证的Torch/PTA；x86 native必须由客户环境构建。旧 `run.sh --check-only` 只对应历史冻结提交。
 2. 在客户项目中固定同一份输入、权重、上游梯度、原Router ID和权重，对照原生GMM路径：
    核对输出、dX、dRouter权重、完整Gate/Up及Down梯度，覆盖混合/全真实/全identity/本rank空真实路由。
    CPU缩小形状可检查接口；NPU验收保留H6144/I2048、TopK12和每卡8/4，仅缩层数或按EP裁剪专家规模。
 3. 使用现场同一checkpoint、输入与路由运行连续更新，比较loss、裁剪前梯度范数、更新后的模型和FP32主参数。
-   本次复现约定为10次更新×16rank；客户更换优化器或框架后要重新验证该路径。
+   历史 Trainer 复现约定为10次更新×16rank；当前热副本组件连续更新入口见[热副本验收](../../docs/longcat-flash-hot-replicas.md)。
+   客户全模型、更换优化器或框架后的路径需要独立验证。
 4. 精度通过后再测性能：两侧相同EP、形状、初始化、checkpoint/recompute和SwiGLU/路由语义，
    预热后记录所有rank完成时间及rank-max样本，保留慢样本，正式耗时关闭profiler。
 5. 与参考结果比较时区分“只替换MoE”和参考配置中同时启用attention/dense适配的完整单层Trainer。

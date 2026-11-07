@@ -1,12 +1,61 @@
-# LongCat Flash 分支复现指南
+# LongCat Flash 客户分支交付与复现指南
 
-> 本页描述冻结的历史 `feat/longcat-flash-repro` 分支。
-> 新的 `feat/longcat-flash-hot-replica` 功能与调优分支需要重新编译 native，使用独立的
-> [热副本接入与验收](../../docs/longcat-flash-hot-replicas.md)入口；本页历史源码校验会主动拒绝新代码。
+当前交付统一使用 **`feat/longcat-flash-repro`**。本分支已包含 EOI 完整专家热副本、路由反向优化、
+expert 调度增量，以及完整逻辑层 shortcut 重叠的独立诊断入口。无需切换到其他功能分支。
 
-交付分支为 `feat/longcat-flash-repro`，基于客户已经编译并通过 pytest 的 `feat/cann-8.5.0`，
+## 当前版本的接入与验收
+
+- 客户项目替换接口、权重切分和生命周期：[接入指南](INTEGRATION.zh-CN.md)。
+- EOI 热副本配置及连续更新验收：[热副本接入与验收](../../docs/longcat-flash-hot-replicas.md)。
+- 当前组件优化、性能数据和独立精度命令：[路由与 expert 调优](../../docs/longcat-flash-cv-tuning.md)。
+- 完整逻辑层有序多流 benchmark：[shortcut 重叠实验](../../docs/longcat-flash-shortcut-overlap.md)。
+  该路径目前作为诊断入口提供，未替换默认 decoder，未验收 FSDP、激活重算或完整 Trainer。
+
+本版本修改了 native 源码，需要在客户原有 CANN8.5.0 / Python3.11 / Torch-PTA 环境中重新编译。
+不能直接沿用此前 `feat/cann-8.5.0` 或历史复现版本的 native 产物。保留客户自建 Torch/PTA，不安装或替换它们。
+在客户仓库根目录执行：
+
+```bash
+git fetch origin feat/longcat-flash-repro
+git switch feat/longcat-flash-repro
+git merge --ff-only origin/feat/longcat-flash-repro
+source "$CANN_ENV"
+bash build.sh --multicore on --soc-list ascend910_93 --strict on
+python -m pip install --no-deps --no-build-isolation -e .
+python -c 'import hyper_parallel; print(hyper_parallel.__file__)'
+source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+```
+
+先自行预留 4 个逻辑 NPU，将 `LONGCAT_DEVICES` 设置为其逗号分隔 ID，
+`LONGCAT_OUTPUT` 设置为仓库之外的新输出目录。当前精度验收入口使用 Git 历史中的冻结旧路由作为原生 GMM 参考：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES="$LONGCAT_DEVICES"
+export HCCL_DETERMINISTIC=true OMP_NUM_THREADS=1
+python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  tests/torch/models/longcat_flash/_validate_longcat_route_migration.py \
+  --check component --backend push \
+  --ep 4 --tokens 2048 --real 32 --zero 16 \
+  --hidden 6144 --intermediate 2048 --top-k 12 \
+  --routing-backend triton --swiglu-precision fused \
+  --initial-token-capacity 24576 --output "$LONGCAT_OUTPUT"
+```
+
+命令需要已可用的 Triton-Ascend3.2.0。B2 连续更新、组件性能、完整层诊断的参数和验收范围见上面的对应文档。
+每个逻辑 NPU 保持 8 个真实专家和 4 个 identity 份额，保留 H6144/I2048、TopK12 与 tokens/rank，裁剪只减少层数或按 EP 同比缩 E/Z。
+当前新增优化的证据来自原宽度 EP4 专家组件与独立逻辑层，不能将下文历史 EP16 Trainer 结果当作新版本完整 Trainer 的验收。
+
+## 历史冻结结果复现
+
+以下保留 2026-11-04 的历史实验说明。`run.sh` / `launch.py` 和 `manifest.json` 仍冻结在原模型源码基线，
+会主动拒绝当前优化版源码；这是历史结果的来源校验。当前优化版使用上面的新入口，不删除或绕过该校验。
+
+需要重跑历史结果时，在独立工作树或检出下方固定提交后，重新编译匹配的历史版本 native，
+或者显式选择此前留存的匹配产物；不要沿用当前优化版构建目录中的 native 库。
+
+本节对应历史交付提交 `a124e13044bf0c36ebbfe20d114cacfa4aec6d04`，基于客户已经编译并通过 pytest 的 `feat/cann-8.5.0`，
 模型基线提交为 `ca3ce419464f32f43b7299b086d5347da2f5c3e3`。
-分支只增加复现材料和对应 CPU 测试，不改模型或 native 源码；客户保留与该基线匹配且已验证的编译产物。
+该历史提交只增加复现材料和对应 CPU 测试，不改模型或 native 源码；历史复现必须使用与该基线匹配的编译产物。
 入口接受包含基线的后续提交，同时逐文件核对模型、库和测试支持源码哈希。
 
 客户在自己项目中替换原生MoE的接口、权重和生命周期说明见 [接入指南](INTEGRATION.zh-CN.md)。
@@ -43,13 +92,13 @@
    三条路径均从现场同一份 checkpoint 恢复，比较状态、输入、路由和连续更新。
    只有8个逻辑 NPU 的机器可运行4卡组件，不能按本配置复现 EP16 Trainer。
 
-## 拉取分支并检查环境
+## 检出历史提交并检查环境
 
 在客户已编译的仓库中执行；如远端名称不是 `origin`，替换为实际远端：
 
 ```bash
 git fetch origin feat/longcat-flash-repro
-git switch feat/longcat-flash-repro
+git switch --detach a124e13044bf0c36ebbfe20d114cacfa4aec6d04
 export REPRO_REPO="$(git rev-parse --show-toplevel)"
 export REPRO_PYTHON="$(command -v python)"
 ```

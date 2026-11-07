@@ -1,7 +1,7 @@
 # LongCat Flash 热专家副本接入与验收
 
-`feat/longcat-flash-hot-replica` 分支已支持 LongCat 原生 EOI 权重布局的热专家副本，包括权重发送、物理槽位路由和 FP32 专家梯度回传。
-原 `feat/longcat-flash-repro` 分支的历史参考结果仍然使用 B0；此处是独立实现与验收，不能把旧结果写成已启用副本。
+当前客户交付分支 `feat/longcat-flash-repro` 已支持 LongCat 原生 EOI 权重布局的热专家副本，包括权重发送、物理槽位路由和 FP32 专家梯度回传。
+原交付提交 `a124e1304` 的历史参考结果仍然使用 B0；此处是独立实现与验收，不能把旧结果写成已启用副本。
 切换到本优化分支需要重新编译 native，不能直接沿用原客户分支的二进制。客户自建 Torch/PTA 保持原版本。
 
 ## 配置
