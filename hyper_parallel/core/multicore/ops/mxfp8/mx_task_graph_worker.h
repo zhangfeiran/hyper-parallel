@@ -89,6 +89,7 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
       return;
     }
     GM_ADDR signal = this->input_list[EVENT_IDX];
+    GM_ADDR transport_probe = TransportProbeCounters();
 
     int64_t ep = getExtraValueFromTiling(this->input_list[TILING_IDX], 1);
     int64_t expert_num = getExtraValueFromTiling(this->input_list[TILING_IDX], 2);
@@ -113,6 +114,8 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
     if (start >= size_) {
       aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1, ACLSHMEM_SIGNAL_ADD,
                           target_pe);
+      hyper_parallel::multicore::RecordTokenTransport(
+        transport_probe, hyper_parallel::multicore::TokenTransportProbeSlot::EMPTY);
       return;
     } else {
       if (end > size_) {
@@ -123,13 +126,64 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
     src_offset_ = src_offset_ + static_cast<int64_t>(start);
     send_data_size_ = static_cast<int64_t>(send_data_size_);
 
+    constexpr uint32_t kMixedCombineMarker = 0x4D584D00U;
+    const uint32_t transport = static_cast<uint32_t>(task_desc.extra_value_0);
+    const bool mixed_combine = (transport & 0xFFFFFFFCU) == kMixedCombineMarker;
+    if (mixed_combine && ((transport & 3U) == 0 || task_desc.inputs[1].input_position == 2 ||
+                         (AscendC::GetBlockIdx() & 1U) == 0)) Trap();
+    // Keep quiet and credit publication per task while testing concurrent data engines.
+    const bool prefer_mapped_mte = !mixed_combine || (AscendC::GetBlockIdx() / 2) % 4 < (transport & 3U);
     put_mem_signal_kernel(this->input_list[task_desc.outputs[0].input_position] +
                             task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type,
                           target_offset_,
                           this->input_list[task_desc.inputs[1].input_position] +
                             task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type,
                           src_offset_, send_data_size_, signal, static_cast<int64_t>(task_desc.trigger_event), 1,
-                          nullptr, 1, target_pe, false, this->replica_udma_legacy_qp_bank_ ? 16 : 0, true);
+                          nullptr, 1, target_pe, false, this->replica_udma_legacy_qp_bank_ ? 16 : 0,
+                          prefer_mapped_mte, transport_probe);
+  }
+
+  __aicore__ inline GM_ADDR TransportProbeCounters() {
+    static_assert(CYCLE_TRACE_RESERVED_WORDS == 9, "MX transport probe requires the existing eight padding words");
+    if (getDiagnosticMode(this->runtimeConfigPtr) != DiagnosticMode::PROFILE) return nullptr;
+    const uint64_t aic_stride = sizeof(CycleTraceCoreHeader) +
+                               uint64_t(getAicProfileRecordCapacity(this->runtimeConfigPtr)) * sizeof(CycleTraceRecord);
+    const uint64_t aiv_stride = sizeof(CycleTraceCoreHeader) +
+                               uint64_t(getAivProfileRecordCapacity(this->runtimeConfigPtr)) * sizeof(CycleTraceRecord);
+    auto header = reinterpret_cast<__gm__ CycleTraceCoreHeader *>(
+      this->input_list[DIAGNOSTIC_IDX] + getCubeWorkerCapacity(this->runtimeConfigPtr) * aic_stride +
+      this->worker_id_ * aiv_stride);
+    if (header->coreType != 2 || header->blockId != this->worker_id_) AscendC::Trap();
+    // The existing decoder requires reserved[0] to remain zero; the following eight words are ignored padding.
+    auto probe = header->reserved + 1;
+    if (probe[0] != hyper_parallel::multicore::TOKEN_TRANSPORT_PROBE_MAGIC) {
+      auto state = aclshmemi_get_state();
+      const uint32_t world = static_cast<uint32_t>(aclshmem_n_pes());
+      const uint32_t rank = static_cast<uint32_t>(aclshmem_my_pe());
+      if (world == 0 || world > 0xFF || rank >= world) AscendC::Trap();
+      bool all_remote_udma = false;
+      probe[7] = TransportProbeTopology(world, rank, all_remote_udma);
+      probe[5] = (uint32_t(all_remote_udma) << 31) | (world << 16) | rank;
+      probe[6] = state->mte_config.ub_size;
+      probe[0] = hyper_parallel::multicore::TOKEN_TRANSPORT_PROBE_MAGIC;
+    }
+    return reinterpret_cast<GM_ADDR>(probe);
+  }
+
+  __aicore__ static inline uint32_t TransportProbeTopology(uint32_t world, uint32_t rank, bool &all_remote_udma) {
+    auto state = aclshmemi_get_state();
+    uint32_t capabilities = 0, mappings = 0;
+    all_remote_udma = state->topo_list != nullptr;
+    for (uint32_t peer = 0; peer < world; ++peer) {
+      if (peer != rank &&
+          (state->topo_list == nullptr || (state->topo_list[peer] & ACLSHMEM_TRANSPORT_UDMA) == 0))
+        all_remote_udma = false;
+      if (peer < 16 && state->topo_list != nullptr && (state->topo_list[peer] & ACLSHMEM_TRANSPORT_MTE) != 0)
+        capabilities |= uint32_t(1) << peer;
+      if (peer < 16 && state->p2p_device_heap_base != nullptr && state->p2p_device_heap_base[peer] != nullptr)
+        mappings |= uint32_t(1) << peer;
+    }
+    return (mappings << 16) | capabilities;
   }
 #endif
 };

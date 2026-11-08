@@ -25,6 +25,25 @@ namespace shmem_data_plane = hyper_parallel::multicore::shmem::data_plane;
 
 namespace hyper_parallel::multicore {
 
+constexpr uint32_t TOKEN_TRANSPORT_PROBE_MAGIC = 0x4D545031;
+enum class TokenTransportProbeSlot : uint32_t {
+  MAGIC = 0,
+  REMOTE_MTE = 1,
+  REMOTE_UDMA = 2,
+  LOCAL_MTE = 3,
+  EMPTY = 4,
+  ROOT = 5,
+  UB_BYTES = 6,
+  CAP_MAP = 7,
+};
+
+__aicore__ inline void RecordTokenTransport(GM_ADDR probe, TokenTransportProbeSlot slot) {
+  if (probe == nullptr) return;
+  auto counters = reinterpret_cast<__gm__ uint32_t *>(probe);
+  const uint32_t index = static_cast<uint32_t>(slot);
+  counters[index] = counters[index] + 1;
+}
+
 template <typename T>
 __aicore__ inline void CopyGmSingleValueToUb(GM_ADDR gm_addr, T *result) {
   __ubuf__ T *ubAddr = (__ubuf__ T *)(32);
@@ -41,7 +60,7 @@ class PutMemSignalKernel {
   __aicore__ inline void Init(GM_ADDR target, int64_t target_offset, GM_ADDR src, int64_t src_offset, int64_t size,
                               GM_ADDR signal, int64_t signal_offset, int32_t signal_value, int64_t signal_op,
                               int64_t target_pe, bool non_blocking, GM_ADDR workspace, uint32_t udma_qp_limit = 0,
-                              bool prefer_mapped_mte = false) {
+                              bool prefer_mapped_mte = false, GM_ADDR transport_probe = nullptr) {
     // Initialize pointers and parameters
     target_ = reinterpret_cast<__gm__ T *>(target);
     src_ = reinterpret_cast<__gm__ T *>(src);
@@ -56,6 +75,7 @@ class PutMemSignalKernel {
     non_blocking_ = non_blocking;
     udma_qp_limit_ = udma_qp_limit;
     prefer_mapped_mte_ = prefer_mapped_mte;
+    transport_probe_ = transport_probe;
 
     // UB tiling set
     aiv_idx_ = 0;
@@ -72,6 +92,7 @@ class PutMemSignalKernel {
       shmem_data_plane::signal(signal_ + signal_offset_, signal_value_,
                                signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
                                target_pe_);
+      RecordTokenTransport(transport_probe_, TokenTransportProbeSlot::EMPTY);
       return;
     }
     // Perform data transfer
@@ -124,6 +145,7 @@ class PutMemSignalKernel {
       shmem_data_plane::signal(signal_ + signal_offset_, signal_value_,
                                signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
                                target_pe_);
+      RecordTokenTransport(transport_probe_, TokenTransportProbeSlot::REMOTE_UDMA);
       return;
     }
 #endif
@@ -182,6 +204,8 @@ class PutMemSignalKernel {
       shmem_data_plane::signal(signal_ptr, signal_value_,
                                signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
                                target_pe_);
+      RecordTokenTransport(transport_probe_, target_pe_ == aclshmem_my_pe() ? TokenTransportProbeSlot::LOCAL_MTE
+                                                                          : TokenTransportProbeSlot::REMOTE_MTE);
     }
   }
 
@@ -201,6 +225,7 @@ class PutMemSignalKernel {
   bool non_blocking_ = true;
   uint32_t udma_qp_limit_ = 0;
   bool prefer_mapped_mte_ = false;
+  GM_ADDR transport_probe_ = nullptr;
   AscendC::GlobalTensor<int32_t> syncGlobal;
   AscendC::TQue<AscendC::TPosition::VECIN, 1> localwork;
   // ub
@@ -215,9 +240,10 @@ extern "C" inline __aicore__ void put_mem_signal_kernel(GM_ADDR target, int64_t 
                                                         int64_t signal_offset, int64_t signal_value, GM_ADDR workspace,
                                                         int64_t signal_op, int64_t target_pe, bool non_blocking,
                                                         uint32_t udma_qp_limit = 0,
-                                                        bool prefer_mapped_mte = false) {
+                                                        bool prefer_mapped_mte = false,
+                                                        GM_ADDR transport_probe = nullptr) {
   hyper_parallel::multicore::PutMemSignalKernel<DTYPE_DISPATCH_TARGET> op;
   op.Init(target, target_offset, src, src_offset, size, signal, signal_offset, signal_value, signal_op, target_pe,
-          non_blocking, workspace, udma_qp_limit, prefer_mapped_mte);
+          non_blocking, workspace, udma_qp_limit, prefer_mapped_mte, transport_probe);
   op.Process();
 }
