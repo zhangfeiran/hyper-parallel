@@ -88,8 +88,9 @@ class TestMXFP8Ingress(unittest.TestCase):
             self.assertFalse(source_row_fp8_enabled(**arguments))
         with patch.dict("os.environ", {"PANGU_MX_SOURCE_ROW_FP8": "1"}):
             self.assertTrue(source_row_fp8_enabled(**arguments))
+            self.assertTrue(source_row_fp8_enabled(**{**arguments, "replica_slots": 2}))
             for changed in ({"vector_policy": "legacy_odd"}, {"row_only": False},
-                            {"replica_slots": 2}, {"hidden_size": 512}, {"hidden_size": 9216}):
+                            {"replica_slots": -1}, {"hidden_size": 512}, {"hidden_size": 9216}):
                 with self.subTest(changed=changed), self.assertRaises(ValueError):
                     source_row_fp8_enabled(**{**arguments, **changed})
         with patch.dict("os.environ", {"PANGU_MX_SOURCE_ROW_FP8": "yes"}):

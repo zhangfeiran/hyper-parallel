@@ -273,7 +273,8 @@ class MXFP8Execution:
         spec = resources.home_spec if home_only else resources.spec
         flat = hidden.reshape(-1, spec.hidden_size)
         row_only = _use_row_only(spec, retain_backward)
-        source_row_fp8 = bool(getattr(resources, "source_row_fp8", False) and row_only)
+        source_row_fp8 = bool(getattr(resources, "source_row_fp8", False) and row_only
+                              and not spec.replica_slots_per_rank)
         route_spec = replace(spec, forward_ingress_mode="indexed") if source_row_fp8 else spec
         route = prepare_topk_route(
             flat, ids, probs, route_spec, self.counts, workspace=workspace, replica_route=self.replica_route

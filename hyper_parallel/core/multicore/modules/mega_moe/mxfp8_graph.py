@@ -347,13 +347,13 @@ def _validate_mx_options(spec: MegaMoeSpec, forward: bool, row_only: bool, exper
 
 
 def _b0_backward_dag_enabled(spec: MegaMoeSpec) -> bool:
-    """Keep the independent gradient branches opt-in and isolated from replica return protocols."""
+    """Use independent home-only gradients while retaining the active replica return protocol."""
     option = os.environ.get("HYPER_PARALLEL_MX_B0_BACKWARD_DAG", "0")
     if option not in ("0", "1"):
         raise ValueError("HYPER_PARALLEL_MX_B0_BACKWARD_DAG must be exactly 0 or 1")
-    if option == "1" and (spec.mx_vector_policy != "window2" or spec.replica_slots_per_rank):
-        raise ValueError("B0 backward DAG requires window2 without replicas")
-    return option == "1"
+    if option == "1" and spec.mx_vector_policy != "window2":
+        raise ValueError("B0 backward DAG requires window2")
+    return option == "1" and not spec.replica_slots_per_rank
 
 
 def _validate_dispatch_quant(spec: MegaMoeSpec, row_only: bool, expert_window: int, event_base: int) -> None:

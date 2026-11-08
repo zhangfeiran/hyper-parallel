@@ -37,19 +37,19 @@ def source_row_fp8_enabled(*, vector_policy: str, row_only: bool, replica_slots:
     Args:
         vector_policy: Existing MX queue policy.
         row_only: Whether original no-grad forwards retain only the consumed row axis.
-        replica_slots: Physical guest budget; the initial protocol supports B0 only.
+        replica_slots: Configured guest budget; only home-only invocations use the protocol.
         hidden_size: Feature width; packed scale copies must be aligned and fit the SDK UB lease.
 
     Returns:
-        Whether to use the source-row protocol for an eligible no-grad invocation.
+        Whether eligible home-only no-grad invocations may use the source-row protocol.
     """
     value = os.environ.get("PANGU_MX_SOURCE_ROW_FP8", "0")
     if value not in ("0", "1"):
         raise ValueError("PANGU_MX_SOURCE_ROW_FP8 must be 0 or 1.")
     if value == "0":
         return False
-    if vector_policy != "window2" or not row_only or replica_slots:
-        raise ValueError("Source-row FP8 ingress requires row-only window2 with no replica slots.")
+    if vector_policy != "window2" or not row_only or replica_slots < 0:
+        raise ValueError("Source-row FP8 ingress requires row-only window2 and a nonnegative guest budget.")
     if hidden_size < 1024 or hidden_size > 8192 or hidden_size % 1024:
         raise ValueError("Source-row FP8 ingress requires a hidden width divisible by 1024 and at most 8192.")
     return True
