@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import contextmanager
 from collections.abc import Iterator
 from functools import partial
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch_npu
@@ -33,6 +33,7 @@ from .mxfp8_gradients import lease_mx_gradient_return
 from .mxfp8_diagnostics import current_mx_profile_scope, mx_profile_capture_enabled, profile_mx_launch
 from .mxfp8_ops import launch_mxfp8_task_graph, prepare_mxfp8_launch, serialize_mxfp8_launch
 from .mxfp8_weights import MXFP8PhysicalWeight
+from .mxfp8_ingress import borrow_row_planes, quantize_source_rows
 from .mxfp8_replica import lease_replica_weights, reduce_replica_gradients
 from .route import prepare_topk_route
 
@@ -81,6 +82,68 @@ def _forward_quantized_buffers(
         _quantized_buffers(rows, width, spec.local_experts, device, row_only=row_only)
         for width in (spec.hidden_size, spec.intermediate_size)
     )
+
+
+def _forward_ingress_buffers(spec: Any, workspace: Any, hidden: torch.Tensor, route: Any, *,
+                              source_row_fp8: bool, row_only: bool) -> tuple[Any, ...]:
+    """Prepare original source planes or the existing routed source under the same workspace lease."""
+    capacity, device = route.metadata.expert_capacity, hidden.device
+    if not source_row_fp8:
+        x_buffers, a_buffers = _forward_quantized_buffers(spec, capacity, device, row_only=row_only)
+        return route.routed_tokens, x_buffers, a_buffers, (), route.routed_tokens.shape[0]
+    if route.routed_tokens is not None or route.permute_src_index is None:
+        raise ValueError("Source-row FP8 ingress requires scalar route indices without expanded token storage.")
+    source, source_scale = quantize_source_rows(hidden)
+    row, scale = borrow_row_planes(workspace.expert_buffer)
+    x_buffers = (row, scale, row, torch.empty(1, dtype=torch.uint8, device=device))
+    a_buffers = _quantized_buffers(capacity, spec.intermediate_size, spec.local_experts, device, row_only=True)
+    return source, x_buffers, a_buffers, (source_scale, route.permute_src_index), hidden.shape[0] * spec.top_k
+
+
+def _forward_graph_buffers(workspace: Any, metadata: Any, source: torch.Tensor,
+                             weights: tuple[Any, Any], activations: tuple[torch.Tensor, torch.Tensor],
+                             quantized: tuple[tuple[torch.Tensor, ...], ...], runtime: Any) -> list[torch.Tensor]:
+    """Bind the forward business ABI without changing activation or weight ownership."""
+    weight1, weight2 = weights
+    hidden_size = source.shape[1]
+    up, down = activations
+    (x_row, x_scale, x_col, x_col_scale), (a_row, a_scale, a_col, a_col_scale) = quantized
+    return [
+        workspace.expert_buffer,
+        metadata.dispatch_target_off * hidden_size,
+        source,
+        metadata.dispatch_src_off * hidden_size,
+        metadata.dispatch_size * hidden_size,
+        weight1.col_data,
+        metadata.group_list,
+        up,
+        a_row,
+        weight2.col_data,
+        metadata.group_list,
+        down,
+        workspace.routed_buffer,
+        metadata.combine_target_off * hidden_size,
+        metadata.combine_src_off * hidden_size,
+        metadata.combine_size * hidden_size,
+        x_row,
+        x_scale,
+        x_col,
+        x_col_scale,
+        a_scale,
+        a_col,
+        a_col_scale,
+        weight1.col_scale,
+        weight2.col_scale,
+        runtime.gmm,
+        runtime.quant,
+    ]
+
+
+def _source_row_launches(host: Any, *functions: Callable) -> tuple[Callable, ...]:
+    """Bind the explicit source protocol only to eligible original-forward calls."""
+    if not getattr(host, "source_row_fp8", False):
+        return functions
+    return tuple(partial(function, source_row_fp8=True) for function in functions)
 
 
 def _empty_expert_ranges(counts: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
@@ -151,6 +214,8 @@ class MXFP8Execution:
         if swiglu_row_only:
             launch_graph = partial(launch_graph, swiglu_row_only=True)
         prepare_launch, serialize_launch = prepare_mxfp8_launch, serialize_mxfp8_launch
+        prepare_launch, serialize_launch, launch_graph = _source_row_launches(
+            runtime.host, prepare_launch, serialize_launch, launch_graph)
         if runtime.host.kernel_gradients:
             prepare_launch = partial(prepare_launch, kernel_gradients=True)
             serialize_launch = partial(serialize_launch, kernel_gradients=True)
@@ -207,59 +272,37 @@ class MXFP8Execution:
         home_only = self.replica_route is not None and self.replica_route.home_only
         spec = resources.home_spec if home_only else resources.spec
         flat = hidden.reshape(-1, spec.hidden_size)
+        row_only = _use_row_only(spec, retain_backward)
+        source_row_fp8 = bool(getattr(resources, "source_row_fp8", False) and row_only)
+        route_spec = replace(spec, forward_ingress_mode="indexed") if source_row_fp8 else spec
         route = prepare_topk_route(
-            flat, ids, probs, spec, self.counts, workspace=workspace, replica_route=self.replica_route
+            flat, ids, probs, route_spec, self.counts, workspace=workspace, replica_route=self.replica_route
         )
         resources.ensure_capacity(route.maximum_received_slots)
         workspace.ensure(resources.spec, hidden.dtype, hidden.device)
-        row_only = _use_row_only(spec, retain_backward)
         plan = resources.plan_for_capacity(workspace.expert_capacity, hidden.device,
-                                           home_only=home_only, swiglu_row_only=row_only)
+                                           home_only=home_only, swiglu_row_only=row_only, source_row_fp8=source_row_fp8)
         resources.last_execution_plan = plan
         metadata = route.metadata
         capacity, device = metadata.expert_capacity, hidden.device
-        x_buffers, a_buffers = _forward_quantized_buffers(spec, capacity, device, row_only=row_only)
-        x_row, x_scale, x_col, x_col_scale = x_buffers
-        a_row, a_scale, a_col, a_col_scale = a_buffers
+        dispatch_source, x_buffers, a_buffers, source_bindings, routed_rows = _forward_ingress_buffers(
+            spec, workspace, flat, route, source_row_fp8=source_row_fp8, row_only=row_only)
+        x_col, x_col_scale = x_buffers[2:]
+        a_col, a_col_scale = a_buffers[2:]
         up = torch.empty((capacity, 2 * spec.intermediate_size), dtype=torch.bfloat16, device=device)
         down = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
         workspace.claim()
         try:
-            buffers = [
-                workspace.expert_buffer,
-                metadata.dispatch_target_off * spec.hidden_size,
-                route.routed_tokens,
-                metadata.dispatch_src_off * spec.hidden_size,
-                metadata.dispatch_size * spec.hidden_size,
-                weight1.col_data,
-                metadata.group_list,
-                up,
-                a_row,
-                weight2.col_data,
-                metadata.group_list,
-                down,
-                workspace.routed_buffer,
-                metadata.combine_target_off * spec.hidden_size,
-                metadata.combine_src_off * spec.hidden_size,
-                metadata.combine_size * spec.hidden_size,
-                x_row,
-                x_scale,
-                x_col,
-                x_col_scale,
-                a_scale,
-                a_col,
-                a_col_scale,
-                weight1.col_scale,
-                weight2.col_scale,
-                plan.forward.gmm,
-                plan.forward.quant,
-            ]
+            buffers = _forward_graph_buffers(
+                workspace, metadata, dispatch_source, (weight1, weight2), (up, down),
+                (x_buffers, a_buffers), plan.forward)
             events = workspace.prepare_event_counters(forward=True)
             with self._lease_weights((weight1, weight2), plan.forward, backward=False) as (guests, ready):
                 buffers.extend(guests)
                 buffers.extend(ready)
+                buffers.extend(source_bindings)
                 self._launch(buffers, plan.forward, events, plan)
-            expert_output = workspace.routed_buffer[: route.routed_tokens.shape[0]]
+            expert_output = workspace.routed_buffer[:routed_rows]
             if retain_backward or not self.nograd_no_clone:
                 expert_output = expert_output.clone()
             output, probabilities = _unpermute_mx_output(
@@ -288,7 +331,7 @@ class MXFP8Execution:
             return MXFP8ForwardState(
                 output.reshape_as(hidden),
                 saved,
-                _ExecutionMetadata(plan, tuple(hidden.shape), route.routed_tokens.shape[0], probs.dtype),
+                _ExecutionMetadata(plan, tuple(hidden.shape), routed_rows, probs.dtype),
                 workspace,
             )
         finally:

@@ -11,6 +11,7 @@
 #include "mxfp8_quant/mx_quant_worker.h"
 #define DTYPE_DISPATCH_TARGET bfloat16_t
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
+#include "mxfp8/mx_source_row_ingress.h"
 #endif
 
 using namespace AscendC;
@@ -77,6 +78,11 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
   }
 
   __aicore__ inline void ExecuteShmemPutMem(TaskDesc task_desc) {
+    auto launch = reinterpret_cast<__gm__ MulticoreMx::MxLaunchDescriptor *>(this->input_list[TILING_IDX]);
+    if (launch->version == 14 && task_desc.inputs[1].input_position == 2) {
+      MulticoreMx::ExecuteSourceRowPut(task_desc, this->input_list, launch);
+      return;
+    }
     GM_ADDR signal = this->input_list[EVENT_IDX];
 
     int64_t ep = getExtraValueFromTiling(this->input_list[TILING_IDX], 1);
@@ -169,7 +175,8 @@ __aicore__ inline void RunMxTaskGraph(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR 
                 "The integrated MX payload supports legacy and window2 queues only");
   const bool prefetch = HasMxPrefetch(launch);
   const bool gradients = HasMxGradientReturn(launch);
-  const bool window = (launch->version == 6 && launch->reserved == 5) || gradients || prefetch;
+  const bool source_row = launch->version == 14 && launch->reserved == 13;
+  const bool window = (launch->version == 6 && launch->reserved == 5) || gradients || prefetch || source_row;
   const bool legacy = launch->version == 1 && launch->reserved == 0;
   if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || (!window && !legacy) || launch->buffer_count == 0 ||
       launch->buffer_count > 64 || !MulticoreMx::IsMxLaunchTopologyValid(launch->ep, launch->experts))

@@ -596,7 +596,8 @@ if kernels.is_dir():
     if metadata.get('sha256') != digest:
         raise RuntimeError(f'MXFP8 kernel metadata does not match {binary}')
     receipt = {'schema': 7, 'object': binary.name, 'sha256': digest,
-               'features': ['nograd_row_only', 'ready_math']}
+               'features': ['nograd_row_only', 'ready_math', 'nograd_x_row_only', 'replica_udma_gradient',
+                            'replica_udma_gradient_peer_qp', 'mx_token_mapped_mte', 'mx_source_row_fp8']}
     target = output / 'capabilities/mxfp8_window.json'
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(receipt, indent=2) + '\n')

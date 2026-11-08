@@ -29,6 +29,8 @@ from hyper_parallel.core.multicore.torch.ops import _load_native
 from hyper_parallel.core.multicore._loader import get_multicore_paths
 
 from .spec import MegaMoeSpec
+from .mxfp8_ingress import (MX_SOURCE_ROW_LAUNCH_RESERVED, MX_SOURCE_ROW_LAUNCH_VERSION,
+                            validate_source_row_buffers)
 
 
 @lru_cache(maxsize=1)
@@ -71,7 +73,7 @@ def _byte_aliases(buffers: Sequence[torch.Tensor]) -> list[torch.Tensor]:
 
 def serialize_mxfp8_launch(
     buffers: Sequence[torch.Tensor], runtime: torch.Tensor, events: torch.Tensor, spec: MegaMoeSpec,
-    *, kernel_gradients: bool = False, weight_prefetch: bool = False,
+    *, kernel_gradients: bool = False, weight_prefetch: bool = False, source_row_fp8: bool = False,
 ) -> bytes:
     """Serialize exact current byte bounds without reading device tensor contents.
 
@@ -93,6 +95,13 @@ def serialize_mxfp8_launch(
         event_bytes=events.numel(),
         vector_policy=spec.mx_vector_policy,
     )
+    if source_row_fp8:
+        if kernel_gradients or weight_prefetch:
+            raise ValueError("Source-row FP8 ingress cannot use the guest weight or gradient launch protocol.")
+        validate_source_row_buffers(buffers, spec)
+        record = MxLaunchDescriptor.from_buffer_copy(content)
+        record.version, record.reserved = MX_SOURCE_ROW_LAUNCH_VERSION, MX_SOURCE_ROW_LAUNCH_RESERVED
+        return bytes(record)
     if not kernel_gradients and not weight_prefetch:
         return content
     if spec.mx_vector_policy != "window2" or spec.replica_transport != "shmem_signal_kernel_gradient":
@@ -104,7 +113,7 @@ def serialize_mxfp8_launch(
 
 def prepare_mxfp8_launch(
     buffers: Sequence[torch.Tensor], runtime: torch.Tensor, events: torch.Tensor, spec: MegaMoeSpec,
-    *, kernel_gradients: bool = False, weight_prefetch: bool = False,
+    *, kernel_gradients: bool = False, weight_prefetch: bool = False, source_row_fp8: bool = False,
 ) -> torch.Tensor:
     """Transfer the byte-bounds launch descriptor to the active device.
 
@@ -115,7 +124,7 @@ def prepare_mxfp8_launch(
         spec: Validated physical expert topology and current capacity.
     """
     metadata = serialize_mxfp8_launch(buffers, runtime, events, spec, kernel_gradients=kernel_gradients,
-                                     weight_prefetch=weight_prefetch)
+                                     weight_prefetch=weight_prefetch, source_row_fp8=source_row_fp8)
     return _async_device_bytes(metadata, runtime.device)
 
 
@@ -128,6 +137,7 @@ def launch_mxfp8_task_graph(
     *,
     vector_policy: str = "legacy_odd",
     swiglu_row_only: bool = False,
+    source_row_fp8: bool = False,
 ) -> None:
     """Run the native fused task graph with alias-preserving physical arguments.
 
@@ -145,4 +155,6 @@ def launch_mxfp8_task_graph(
     if swiglu_row_only:
         require_mxfp8_window_feature("nograd_row_only")
         require_mxfp8_window_feature("nograd_x_row_only")
+    if source_row_fp8:
+        require_mxfp8_window_feature("mx_source_row_fp8")
     torch.ops.hyper_parallel.mxfp8_task_graph(aliases, runtime, events, diagnostic, launch)

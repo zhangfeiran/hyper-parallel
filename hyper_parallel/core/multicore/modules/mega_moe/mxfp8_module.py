@@ -38,8 +38,9 @@ from .module import MegaMoeExperts, _MegaMoeExecutionResources, _checkpoint_cont
 from .mxfp8_execution import MXFP8Execution
 from .mxfp8_diagnostics import prepare_mx_diagnostics
 from .mxfp8_function import execute_mxfp8_experts
-from .mxfp8_graph import build_mxfp8_runtime
+from .mxfp8_graph import build_mxfp8_runtime, with_source_row_ingress
 from .mxfp8_gradient_udma import mx_gradient_peer_qps, mx_udma_gradient_enabled
+from .mxfp8_ingress import source_row_fp8_enabled
 from .mxfp8_gradients import mx_projection_events
 from .mxfp8_prefetch import MXProjectionPrefetch
 from .mxfp8_ops import require_mxfp8_window_feature
@@ -128,6 +129,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
     ) -> None:
         """Bind validated invocation resources without retaining gathered weight views."""
         self.spec = bind_mega_moe_spec(specification, tensor)
+        self.source_row_fp8 = specification.get("mx_source_row_fp8", False)
         self.weight_prefetch = MXProjectionPrefetch() if specification.get("mx_weight_prefetch", False) else None
         self.replica_headers = _ReplicaCountHeaderCache() if self.spec.replica_slots_per_rank else None
         if self.spec.num_cube_cores != 32:
@@ -154,8 +156,11 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
                 if os.environ.get("HYPER_PARALLEL_SHMEM_DATA_ENGINE", "mte") != "mte_udma":
                     raise ValueError("MX UDMA gradient helpers require mte_udma")
                 require_mxfp8_window_feature("replica_udma_gradient_peer_qp")
+            if self.source_row_fp8:
+                require_mxfp8_window_feature("mx_source_row_fp8")
 
-        if self.spec.mx_ready_depth or self.spec.mx_swiglu_row_only or self.spec.mx_gradient_udma:
+        if (self.spec.mx_ready_depth or self.spec.mx_swiglu_row_only or self.spec.mx_gradient_udma
+                or self.source_row_fp8):
             _collective.collective_call(validate_features, stage="MXFP8 window capabilities", group=self.spec.ep_group)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
@@ -193,6 +198,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             self.spec.compute_stages,
             self.weight_prefetch is not None,
             self.spec.mx_gradient_udma,
+            self.source_row_fp8,
         )
 
     def _validate_distributed_configuration(self, specifications: tuple[Mapping[str, Any], ...]) -> None:
@@ -200,7 +206,8 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         super()._validate_distributed_configuration(specifications)
         if self.spec.ep_size == 1:
             return
-        flags = tuple((bool(spec.get("mx_weight_prefetch", False)), bool(spec.get("mx_gradient_udma", False)))
+        flags = tuple((bool(spec.get("mx_weight_prefetch", False)), bool(spec.get("mx_gradient_udma", False)),
+                       bool(spec.get("mx_source_row_fp8", False)))
                       for spec in specifications)
         gathered = [None] * self.spec.ep_size
         dist.all_gather_object(gathered, flags, group=self.spec.ep_group)
@@ -209,7 +216,8 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
                 "MXFP8 projection-prefetch or gradient-transport configuration differs across expert ranks")
 
     def plan_for_capacity(
-        self, capacity: int, device: Any, *, home_only: bool = False, swiglu_row_only: bool = False
+        self, capacity: int, device: Any, *, home_only: bool = False, swiglu_row_only: bool = False,
+        source_row_fp8: bool = False,
     ) -> _MXFP8Plan:
         """Cache pointer-free MX plans against the current symmetric receive bound.
 
@@ -217,17 +225,20 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             capacity: Current symmetric receive-row bound.
             device: Device owning execution and diagnostic storage.
         """
-        key = (capacity, home_only, swiglu_row_only)
+        key = (capacity, home_only, swiglu_row_only) + (("source_row_fp8",) if source_row_fp8 else ())
         selected = self.home_spec if home_only else self.spec
         if selected is None:
             raise ValueError("MX home-only graph does not fit the physical event layout.")
         if key not in self._plans:
             spec = replace(selected, receive_capacity=capacity)
+            forward = build_mxfp8_runtime(
+                spec, forward=True, swiglu_row_only=swiglu_row_only, ready_depth=spec.mx_ready_depth,
+                weight_prefetch=self.weight_prefetch is not None)
+            if source_row_fp8:
+                forward = with_source_row_ingress(spec, forward)
             self._plans[key] = _MXFP8Plan(
                 spec,
-                _device_runtime(build_mxfp8_runtime(
-                    spec, forward=True, swiglu_row_only=swiglu_row_only, ready_depth=spec.mx_ready_depth,
-                    weight_prefetch=self.weight_prefetch is not None), device, spec),
+                _device_runtime(forward, device, spec),
                 _device_runtime(build_mxfp8_runtime(
                     spec, forward=False, ready_depth=spec.mx_ready_depth,
                     weight_prefetch=self.weight_prefetch is not None), device, spec),
@@ -319,6 +330,8 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             raise ValueError("MXFP8 projection prefetch requires HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable.")
         udma_gradients = mx_udma_gradient_enabled(replica_slots_per_rank, replica_transport)
         depth, row_only = _mx_window_options(vector_policy)
+        source_row_fp8 = source_row_fp8_enabled(vector_policy=vector_policy, row_only=row_only,
+                                               replica_slots=replica_slots_per_rank, hidden_size=hidden_size)
         config = ExpertReplicaConfig(num_experts, ep_size, replica_slots_per_rank)
         self.replica_planner = "cpu"
         self.replica_min_rows = replica_min_rows
@@ -350,6 +363,7 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             "compute_stages": 6,
             "mx_vector_policy": vector_policy,
             "mx_swiglu_row_only": row_only,
+            "mx_source_row_fp8": source_row_fp8,
             "mx_ready_depth": depth,
             "mx_poll_policy": "0",
             "_replica_cost_model_enabled": False,

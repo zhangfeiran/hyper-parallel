@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from hyper_parallel.core.multicore.scheduler.config import (
@@ -65,6 +65,7 @@ from hyper_parallel.core.multicore.tasks.utils import (
 )
 
 from .spec import MegaMoeSpec
+from .mxfp8_ingress import MX_SOURCE_ROW_BUFFER_COUNT
 from .mxfp8_gradients import configure_mx_gradient_helpers
 
 
@@ -95,6 +96,7 @@ class MXFP8Runtime:
     transport_schedule: str = "legacy_odd"
     kernel_gradients: bool = False
     weight_prefetch: bool = False
+    source_row_fp8: bool = False
 
 
 def _fill_compute_stage(
@@ -452,6 +454,26 @@ def _configure_mx_ready_depth(config: Any, depth: int) -> None:
             if task.extra_value_1 & ~MX_PROJECTION_READY_MASK:
                 raise ValueError("MX task flags overlap the projection-ready buffer code.")
             task.extra_value_1 |= flag
+
+
+def with_source_row_ingress(spec: MegaMoeSpec, runtime: MXFP8Runtime) -> MXFP8Runtime:
+    """Keep original producer credits while replacing completed input quantization with a barrier.
+
+    Args:
+        spec: Bound B0 window2 topology.
+        runtime: Completed row-only forward graph whose configuration remains unchanged.
+
+    Returns:
+        An independent configuration with source-row byte bindings and the original event protocol.
+    """
+    if (not runtime.swiglu_row_only or runtime.buffer_count != 27 or spec.replica_slots_per_rank
+            or spec.mx_vector_policy != "window2" or runtime.kernel_gradients or runtime.weight_prefetch):
+        raise ValueError("Source-row FP8 requires a no-grad B0 window2 forward without guest helpers.")
+    config = type(runtime.config).from_buffer_copy(bytes(runtime.config))
+    for task in config.all_tasks[:config.task_num]:
+        if task.task_type == MX_QUANT_ROW_TASK:
+            task.task_type = 0
+    return replace(runtime, config=config, buffer_count=MX_SOURCE_ROW_BUFFER_COUNT, source_row_fp8=True)
 
 
 def build_mxfp8_runtime(
