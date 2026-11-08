@@ -44,6 +44,13 @@ __aicore__ inline void RecordTokenTransport(GM_ADDR probe, TokenTransportProbeSl
   counters[index] = counters[index] + 1;
 }
 
+__aicore__ inline void RecordMteScratchBytes(GM_ADDR probe, uint32_t bytes) {
+  if (probe == nullptr) return;
+  auto counters = reinterpret_cast<__gm__ uint32_t *>(probe);
+  const uint32_t index = static_cast<uint32_t>(TokenTransportProbeSlot::UB_BYTES);
+  if (counters[index] < bytes) counters[index] = bytes;
+}
+
 template <typename T>
 __aicore__ inline void CopyGmSingleValueToUb(GM_ADDR gm_addr, T *result) {
   __ubuf__ T *ubAddr = (__ubuf__ T *)(32);
@@ -60,7 +67,8 @@ class PutMemSignalKernel {
   __aicore__ inline void Init(GM_ADDR target, int64_t target_offset, GM_ADDR src, int64_t src_offset, int64_t size,
                               GM_ADDR signal, int64_t signal_offset, int32_t signal_value, int64_t signal_op,
                               int64_t target_pe, bool non_blocking, GM_ADDR workspace, uint32_t udma_qp_limit = 0,
-                              bool prefer_mapped_mte = false, GM_ADDR transport_probe = nullptr) {
+                              bool prefer_mapped_mte = false, GM_ADDR transport_probe = nullptr,
+                              uint32_t mapped_mte_ub_bytes = 0) {
     // Initialize pointers and parameters
     target_ = reinterpret_cast<__gm__ T *>(target);
     src_ = reinterpret_cast<__gm__ T *>(src);
@@ -76,6 +84,7 @@ class PutMemSignalKernel {
     udma_qp_limit_ = udma_qp_limit;
     prefer_mapped_mte_ = prefer_mapped_mte;
     transport_probe_ = transport_probe;
+    mapped_mte_ub_bytes_ = mapped_mte_ub_bytes;
 
     // UB tiling set
     aiv_idx_ = 0;
@@ -152,6 +161,7 @@ class PutMemSignalKernel {
     /* CopyUB Config Set */
     uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
     uint64_t copy_ub_size = device_state->mte_config.ub_size;
+    PrepareMteScratch(copy_ub, copy_ub_size);
     __ubuf__ T *ping_buff = reinterpret_cast<__ubuf__ T *>(copy_ub);
     __ubuf__ T *pong_buff = reinterpret_cast<__ubuf__ T *>(copy_ub + copy_ub_size / 2);
     auto ptr = shmem_data_plane::remote_ptr(target_ptr, target_pe_);
@@ -206,10 +216,20 @@ class PutMemSignalKernel {
                                target_pe_);
       RecordTokenTransport(transport_probe_, target_pe_ == aclshmem_my_pe() ? TokenTransportProbeSlot::LOCAL_MTE
                                                                           : TokenTransportProbeSlot::REMOTE_MTE);
+      RecordMteScratchBytes(transport_probe_, static_cast<uint32_t>(copy_ub_size));
     }
   }
 
  private:
+  __aicore__ inline void PrepareMteScratch(uint64_t &address, uint64_t &bytes) {
+    if (mapped_mte_ub_bytes_ == 0) return;
+    if (mapped_mte_ub_bytes_ != 32768 && mapped_mte_ub_bytes_ != 65536) AscendC::Trap();
+    // Keep the SDK scratch unchanged for indexed ingress and other communication helpers.
+    pipe.InitBuffer(mapped_mte_staging_, mapped_mte_ub_bytes_);
+    address = reinterpret_cast<uint64_t>(mapped_mte_staging_.Get<uint8_t>().GetPhyAddr());
+    bytes = mapped_mte_ub_bytes_;
+  }
+
   __gm__ T *target_;
   __gm__ T *src_;
   __gm__ int32_t *signal_;
@@ -226,6 +246,8 @@ class PutMemSignalKernel {
   uint32_t udma_qp_limit_ = 0;
   bool prefer_mapped_mte_ = false;
   GM_ADDR transport_probe_ = nullptr;
+  uint32_t mapped_mte_ub_bytes_ = 0;
+  AscendC::TBuf<AscendC::TPosition::VECOUT> mapped_mte_staging_;
   AscendC::GlobalTensor<int32_t> syncGlobal;
   AscendC::TQue<AscendC::TPosition::VECIN, 1> localwork;
   // ub
@@ -241,9 +263,10 @@ extern "C" inline __aicore__ void put_mem_signal_kernel(GM_ADDR target, int64_t 
                                                         int64_t signal_op, int64_t target_pe, bool non_blocking,
                                                         uint32_t udma_qp_limit = 0,
                                                         bool prefer_mapped_mte = false,
-                                                        GM_ADDR transport_probe = nullptr) {
+                                                        GM_ADDR transport_probe = nullptr,
+                                                        uint32_t mapped_mte_ub_bytes = 0) {
   hyper_parallel::multicore::PutMemSignalKernel<DTYPE_DISPATCH_TARGET> op;
   op.Init(target, target_offset, src, src_offset, size, signal, signal_offset, signal_value, signal_op, target_pe,
-          non_blocking, workspace, udma_qp_limit, prefer_mapped_mte, transport_probe);
+          non_blocking, workspace, udma_qp_limit, prefer_mapped_mte, transport_probe, mapped_mte_ub_bytes);
   op.Process();
 }

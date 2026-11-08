@@ -140,7 +140,14 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
                             task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type,
                           src_offset_, send_data_size_, signal, static_cast<int64_t>(task_desc.trigger_event), 1,
                           nullptr, 1, target_pe, false, this->replica_udma_legacy_qp_bank_ ? 16 : 0,
-                          prefer_mapped_mte, transport_probe);
+                          prefer_mapped_mte, transport_probe, MteScratchBytes(transport));
+  }
+
+  __aicore__ static inline uint32_t MteScratchBytes(uint32_t transport) {
+    if ((transport & 0xFFFFFFFCU) != 0x4D585500U) return 0;
+    const uint32_t scale = transport & 3U;
+    if ((scale != 1 && scale != 2) || (AscendC::GetBlockIdx() & 1U) == 0) AscendC::Trap();
+    return 16384U << scale;
   }
 
   __aicore__ inline GM_ADDR TransportProbeCounters() {
