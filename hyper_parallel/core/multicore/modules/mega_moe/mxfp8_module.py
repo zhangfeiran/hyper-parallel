@@ -38,12 +38,12 @@ from .module import MegaMoeExperts, _MegaMoeExecutionResources, _checkpoint_cont
 from .mxfp8_execution import MXFP8Execution
 from .mxfp8_diagnostics import prepare_mx_diagnostics
 from .mxfp8_function import execute_mxfp8_experts
-from .mxfp8_graph import build_mxfp8_runtime, with_source_row_ingress
+from .mxfp8_graph import build_mxfp8_runtime, with_source_row_ingress, with_token_mte_scratch
 from .mxfp8_gradient_udma import mx_gradient_peer_qps, mx_udma_gradient_enabled
 from .mxfp8_ingress import source_row_fp8_enabled
 from .mxfp8_gradients import mx_projection_events
 from .mxfp8_prefetch import MXProjectionPrefetch
-from .mxfp8_ops import require_mxfp8_window_feature
+from .mxfp8_ops import mxfp8_window_feature_available, require_mxfp8_window_feature
 from .mxfp8_weights import MXFP8ExpertWeightBinding
 from .spec import bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace
@@ -130,6 +130,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
         """Bind validated invocation resources without retaining gathered weight views."""
         self.spec = bind_mega_moe_spec(specification, tensor)
         self.source_row_fp8 = specification.get("mx_source_row_fp8", False)
+        self.token_mte_scratch_bytes = 16384
         self.weight_prefetch = MXProjectionPrefetch() if specification.get("mx_weight_prefetch", False) else None
         self.replica_headers = _ReplicaCountHeaderCache() if self.spec.replica_slots_per_rank else None
         if self.spec.num_cube_cores != 32:
@@ -160,6 +161,8 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
                 require_mxfp8_window_feature("mx_source_row_fp8")
                 require_mxfp8_window_feature("mx_source_row_ready_event")
                 require_mxfp8_window_feature("mx_source_row_base_bindings")
+                if mxfp8_window_feature_available("mx_token_mte_scratch_v1"):
+                    self.token_mte_scratch_bytes = 65536
 
         if (self.spec.mx_ready_depth or self.spec.mx_swiglu_row_only or self.spec.mx_gradient_udma
                 or self.source_row_fp8):
@@ -238,12 +241,15 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
                 weight_prefetch=self.weight_prefetch is not None)
             if source_row_fp8:
                 forward = with_source_row_ingress(spec, forward)
+            forward = with_token_mte_scratch(forward, spec, self.token_mte_scratch_bytes)
+            backward = build_mxfp8_runtime(
+                spec, forward=False, ready_depth=spec.mx_ready_depth,
+                weight_prefetch=self.weight_prefetch is not None)
+            backward = with_token_mte_scratch(backward, spec, self.token_mte_scratch_bytes)
             self._plans[key] = _MXFP8Plan(
                 spec,
                 _device_runtime(forward, device, spec),
-                _device_runtime(build_mxfp8_runtime(
-                    spec, forward=False, ready_depth=spec.mx_ready_depth,
-                    weight_prefetch=self.weight_prefetch is not None), device, spec),
+                _device_runtime(backward, device, spec),
             )
         self._plans.move_to_end(key)
         while len(self._plans) > 4:

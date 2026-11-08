@@ -598,7 +598,8 @@ if kernels.is_dir():
     receipt = {'schema': 7, 'object': binary.name, 'sha256': digest,
                'features': ['nograd_row_only', 'ready_math', 'nograd_x_row_only', 'replica_udma_gradient',
                             'replica_udma_gradient_peer_qp', 'mx_token_mapped_mte', 'mx_source_row_fp8',
-                            'mx_source_row_ready_event', 'mx_source_row_base_bindings']}
+                            'mx_source_row_ready_event', 'mx_source_row_base_bindings',
+                            'mx_token_mte_scratch_v1']}
     target = output / 'capabilities/mxfp8_window.json'
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(receipt, indent=2) + '\n')

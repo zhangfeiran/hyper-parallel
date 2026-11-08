@@ -232,9 +232,13 @@ class TestMXFP8Graph(unittest.TestCase):
             with mock.patch.object(mxfp8_ops, "_load_mxfp8_native"), \
                     mock.patch.object(mxfp8_ops, "get_multicore_paths", return_value=(vendor, None)):
                 mxfp8_ops.require_mxfp8_window_feature("ready_math")
+                self.assertTrue(mxfp8_ops.mxfp8_window_feature_available("ready_math"))
+                self.assertFalse(mxfp8_ops.mxfp8_window_feature_available("mx_token_mte_scratch_v1"))
                 with self.assertRaisesRegex(RuntimeError, "unavailable"):
                     mxfp8_ops.require_mxfp8_window_feature("unknown")
                 binary.write_bytes(b"old-payload")
+                with self.assertRaisesRegex(RuntimeError, "does not match"):
+                    mxfp8_ops.mxfp8_window_feature_available("mx_token_mte_scratch_v1")
                 mxfp8_ops.require_mxfp8_window_feature.cache_clear()
                 with self.assertRaisesRegex(RuntimeError, "does not match"):
                     mxfp8_ops.require_mxfp8_window_feature("ready_math")

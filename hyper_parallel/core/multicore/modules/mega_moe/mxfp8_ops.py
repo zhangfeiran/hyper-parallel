@@ -40,6 +40,29 @@ def _load_mxfp8_native() -> None:
         raise RuntimeError("MXFP8 task-graph adapter ABI mismatch; rebuild the local multicore component.")
 
 
+def mxfp8_window_feature_available(feature: str) -> bool:
+    """Check an optional feature against the actual native payload.
+
+    Args:
+        feature: Optional task capability to query.
+
+    Returns:
+        Whether the verified payload implements the requested feature.
+    """
+    _load_mxfp8_native()
+    vendor, _ = get_multicore_paths()
+    receipt = json.loads((vendor.parent.parent / "capabilities/mxfp8_window.json").read_text())
+    expected = "PanguMxfp8TaskGraph_ed65f2bbd39f9cc68999acec5148f3f8.o"
+    if receipt.get("schema") != 7:
+        raise RuntimeError("MX window capability receipt has an unsupported schema.")
+    if receipt.get("object") != expected:
+        raise RuntimeError("MX window capability receipt names an unexpected binary.")
+    binary = vendor / "op_impl/ai_core/tbe/kernel/ascend950/pangu_mxfp8_task_graph" / expected
+    if hashlib.sha256(binary.read_bytes()).hexdigest() != receipt.get("sha256"):
+        raise RuntimeError("MX window capability receipt does not match the loaded vendor payload.")
+    return feature in receipt.get("features", ())
+
+
 @lru_cache(maxsize=None)
 def require_mxfp8_window_feature(feature: str) -> None:
     """Require a matching native capability receipt before submitting optional tasks.
@@ -47,17 +70,8 @@ def require_mxfp8_window_feature(feature: str) -> None:
     Args:
         feature: Optional task capability required by the current graph.
     """
-    _load_mxfp8_native()
-    vendor, _ = get_multicore_paths()
-    receipt = json.loads((vendor.parent.parent / "capabilities/mxfp8_window.json").read_text())
-    expected = "PanguMxfp8TaskGraph_ed65f2bbd39f9cc68999acec5148f3f8.o"
-    if receipt.get("schema") != 7 or feature not in receipt.get("features", ()):
+    if not mxfp8_window_feature_available(feature):
         raise RuntimeError(f"MX window feature is unavailable: {feature}")
-    if receipt.get("object") != expected:
-        raise RuntimeError("MX window capability receipt names an unexpected binary.")
-    binary = vendor / "op_impl/ai_core/tbe/kernel/ascend950/pangu_mxfp8_task_graph" / expected
-    if hashlib.sha256(binary.read_bytes()).hexdigest() != receipt.get("sha256"):
-        raise RuntimeError("MX window capability receipt does not match the loaded vendor payload.")
 
 
 def _byte_aliases(buffers: Sequence[torch.Tensor]) -> list[torch.Tensor]:

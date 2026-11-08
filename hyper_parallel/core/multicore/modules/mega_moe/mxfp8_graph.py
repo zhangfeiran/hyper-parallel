@@ -27,6 +27,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
     TaskAiCoreType,
     TaskDescC,
     TaskSplitValue,
+    TaskType,
     configure_ready_handshake,
     init_task_split_value,
     validate_runtime_config,
@@ -53,7 +54,7 @@ from hyper_parallel.core.multicore.scheduler.expert_window import reorder_mx_exp
 from hyper_parallel.core.multicore.scheduler.all_transport import balance_all_transport
 from hyper_parallel.core.multicore.scheduler.vector_roles import configure_vector_roles, configure_rule_stages
 from hyper_parallel.core.multicore.scheduler.dispatch_quant import DispatchQuantStage, configure_dispatch_quant_queue
-from hyper_parallel.core.multicore.scheduler.planned_queue import configure_planned_queue
+from hyper_parallel.core.multicore.scheduler.planned_queue import PLANNED_QUEUE_TAG, configure_planned_queue
 from hyper_parallel.core.multicore.scheduler.window_queue import configure_window_queue
 from hyper_parallel.core.multicore.shmem._runtime import configured_udma_qp_count
 from hyper_parallel.core.multicore.tasks.alltoall import AllToAllFillConfig, AllToAllType
@@ -489,6 +490,57 @@ def with_source_row_ingress(spec: MegaMoeSpec, runtime: MXFP8Runtime) -> MXFP8Ru
         if task.task_type == MX_QUANT_ROW_TASK:
             task.task_type = MX_SOURCE_ROW_READY_TASK
     return replace(runtime, config=config, buffer_count=MX_SOURCE_ROW_BUFFER_COUNT, source_row_fp8=True)
+
+
+def _token_mte_transfer_tasks(runtime: MXFP8Runtime) -> set[int]:
+    """Select ordinary token transfers while leaving source-row dispatch unmarked."""
+    selected, offset = set(), 0
+    for operator in runtime.graph.topological_sort():
+        if operator.name == "combine" or (operator.name == "dispatch" and not runtime.source_row_fp8):
+            selected.update(range(offset, offset + operator.task_num))
+        offset += operator.task_num
+    if not selected or any(runtime.config.all_tasks[index].task_type != TaskType.TASK_SHMEM_PUT_MEM_SIGNAL
+                           or runtime.config.all_tasks[index].extra_value_0 for index in selected):
+        raise ValueError("Token MTE scratch requires the complete unmarked ordinary transfer stages.")
+    return selected
+
+
+def _validate_token_mte_owners(config: Any, selected: set[int]) -> None:
+    """Keep private vector staging exclusive to the original communication workers."""
+    offsets = config.mix_task_indices[:65]
+    owners = [(worker, index) for worker in range(64)
+              for index in config.vector_task_indices[offsets[worker]:offsets[worker + 1]] if index in selected]
+    if (len(owners) != len(selected) or {index for _, index in owners} != selected
+            or any(worker % 2 == 0 for worker, _ in owners)):
+        raise ValueError("Each ordinary token transfer must retain exactly one odd-worker owner.")
+
+
+def with_token_mte_scratch(runtime: MXFP8Runtime, spec: MegaMoeSpec, scratch_bytes: int) -> MXFP8Runtime:
+    """Select private mapped-MTE staging without changing indexed ingress or queues.
+
+    Args:
+        runtime: Completed phase graph before uploading its immutable runtime image.
+        spec: Bound expert topology with owner-validated window queues.
+        scratch_bytes: SDK staging size or a supported private staging size.
+
+    Returns:
+        The original SDK runtime or an independent configuration with marked ordinary token puts.
+    """
+    if scratch_bytes not in (16384, 32768, 65536):
+        raise ValueError("Token MTE scratch must be 16384, 32768 or 65536 bytes.")
+    if scratch_bytes == 16384:
+        return runtime
+    config = runtime.config
+    if (spec.mx_vector_policy != "window2" or spec.num_cube_cores != 32 or config.num_workers != 64
+            or config.task_index_num[3] != PLANNED_QUEUE_TAG):
+        raise ValueError("Private token MTE scratch requires the 32-Cube window2 queues.")
+    selected = _token_mte_transfer_tasks(runtime)
+    _validate_token_mte_owners(config, selected)
+    marked = type(config).from_buffer_copy(bytes(config))
+    marker = 0x4D585500 | (1 if scratch_bytes == 32768 else 2)
+    for index in selected:
+        marked.all_tasks[index].extra_value_0 = marker
+    return replace(runtime, config=marked)
 
 
 def build_mxfp8_runtime(
