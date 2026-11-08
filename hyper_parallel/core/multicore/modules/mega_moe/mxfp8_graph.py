@@ -65,7 +65,7 @@ from hyper_parallel.core.multicore.tasks.utils import (
 )
 
 from .spec import MegaMoeSpec
-from .mxfp8_ingress import MX_SOURCE_ROW_BUFFER_COUNT
+from .mxfp8_ingress import MX_SOURCE_ROW_BUFFER_COUNT, MX_SOURCE_ROW_READY_TASK
 from .mxfp8_gradients import configure_mx_gradient_helpers
 
 
@@ -472,7 +472,7 @@ def with_source_row_ingress(spec: MegaMoeSpec, runtime: MXFP8Runtime) -> MXFP8Ru
     config = type(runtime.config).from_buffer_copy(bytes(runtime.config))
     for task in config.all_tasks[:config.task_num]:
         if task.task_type == MX_QUANT_ROW_TASK:
-            task.task_type = 0
+            task.task_type = MX_SOURCE_ROW_READY_TASK
     return replace(runtime, config=config, buffer_count=MX_SOURCE_ROW_BUFFER_COUNT, source_row_fp8=True)
 
 

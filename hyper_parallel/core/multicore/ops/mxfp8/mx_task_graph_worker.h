@@ -56,6 +56,10 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
       case 0:
       case 10:
         break;
+      case MulticoreMx::MX_SOURCE_ROW_READY_TASK:
+        if (reinterpret_cast<__gm__ MulticoreMx::MxLaunchDescriptor *>(this->input_list[TILING_IDX])->version != 14)
+          Trap();
+        break;
 #ifdef PANGU_MX_ROW_ONLY
       case 164:
       case 165:

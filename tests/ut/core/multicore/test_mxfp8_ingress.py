@@ -184,9 +184,14 @@ class TestMXFP8Ingress(unittest.TestCase):
                         count = 0
                         for task in old.config.all_tasks[:old.config.task_num]:
                             if task.task_type == 165:
-                                task.task_type = 0
+                                task.task_type = 166
                                 count += 1
                         self.assertGreater(count, 0)
+                        before_terminators = sum(task.task_type == 0 for task in
+                                                 unmodified.config.all_tasks[:unmodified.config.task_num])
+                        after_terminators = sum(task.task_type == 0 for task in
+                                                new.config.all_tasks[:new.config.task_num])
+                        self.assertEqual(after_terminators, before_terminators)
                         self.assertEqual(new.buffer_count, 29)
                         self.assertEqual(new.gmm_descriptors, old.gmm_descriptors)
                         self.assertEqual(new.quant_descriptors, old.quant_descriptors)

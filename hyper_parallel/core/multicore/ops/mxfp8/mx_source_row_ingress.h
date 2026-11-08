@@ -10,6 +10,7 @@ constexpr uint32_t MX_SOURCE_ROW_RESERVED = 13;
 constexpr uint32_t MX_SOURCE_SCALE_POSITION = 27;
 constexpr uint32_t MX_SOURCE_INDEX_POSITION = 28;
 constexpr uint32_t MX_SOURCE_ROW_BUFFER_COUNT = 29;
+constexpr uint32_t MX_SOURCE_ROW_READY_TASK = 166;
 
 #ifdef __NPU_ARCH__
 #define MX_SOURCE_INLINE __aicore__ inline

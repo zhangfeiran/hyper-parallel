@@ -28,6 +28,7 @@ MX_SOURCE_ROW_LAUNCH_RESERVED = 13
 MX_SOURCE_SCALE_POSITION = 27
 MX_SOURCE_INDEX_POSITION = 28
 MX_SOURCE_ROW_BUFFER_COUNT = 29
+MX_SOURCE_ROW_READY_TASK = 166
 
 
 def source_row_fp8_enabled(*, vector_policy: str, row_only: bool, replica_slots: int, hidden_size: int) -> bool:
