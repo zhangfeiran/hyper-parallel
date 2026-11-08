@@ -28,7 +28,9 @@ from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_graph import build_mxf
 from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_execution import (
     _forward_graph_buffers, _forward_ingress_buffers,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_ops import serialize_mxfp8_launch
+from hyper_parallel.core.multicore.modules.mega_moe.mxfp8_ops import (
+    launch_mxfp8_task_graph, serialize_mxfp8_launch,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.scheduler.mxfp8 import MxLaunchDescriptor
 from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
@@ -99,13 +101,37 @@ class TestMXFP8Ingress(unittest.TestCase):
         storage = torch.empty(8, 1024, dtype=torch.bfloat16)
         row, scale = borrow_row_planes(storage)
         buffers = [torch.empty(1, dtype=torch.uint8) for _ in range(29)]
-        buffers[0], buffers[16], buffers[17] = storage, row, scale
+        buffers[0], buffers[16], buffers[17], buffers[18] = storage, row, scale, row
         buffers[2] = torch.empty(4, 1024, dtype=torch.float8_e4m3fn)
         buffers[27] = torch.empty(4, 16, 2, dtype=torch.uint8)
         buffers[28] = torch.arange(8, dtype=torch.int32)
         spec = SimpleNamespace(rank_id=0, ep_size=1, num_experts=2, hidden_size=1024, local_num_tokens=4,
                                num_cube_cores=32, top_k=2, mx_vector_policy="window2", replica_slots_per_rank=0)
         return buffers, spec
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_native_receive_bindings_use_full_storage_without_changing_logical_bounds(self) -> None:
+        """Feature: CANN TensorList backing-storage descriptors.
+        Description: Model the observed 400 MiB base versus 200 MiB row and 6.25 MiB scale storage mismatch.
+        Expectation: The native call receives complete base aliases while the logical launch retains plane bounds.
+        """
+        buffers, spec = self._bindings()
+        resource = torch.empty(64, dtype=torch.uint8)
+        before = serialize_mxfp8_launch(buffers, resource, resource, spec, source_row_fp8=True)
+        prefix = "hyper_parallel.core.multicore.modules.mega_moe.mxfp8_ops."
+        with patch(prefix + "_load_mxfp8_native"), patch(prefix + "require_mxfp8_window_feature"), \
+                patch.object(torch.ops.hyper_parallel, "mxfp8_task_graph", create=True) as native:
+            launch_mxfp8_task_graph(buffers, resource, resource, resource, resource,
+                                   vector_policy="window2", source_row_fp8=True)
+        physical = native.call_args.args[0]
+        for position in (16, 17, 18):
+            with self.subTest(position=position):
+                self.assertEqual(physical[position].numel(), buffers[0].numel() * 2)
+                self.assertEqual(physical[position].data_ptr(), buffers[0].data_ptr())
+                self.assertEqual(physical[position].untyped_storage().data_ptr(),
+                                 buffers[0].untyped_storage().data_ptr())
+        self.assertEqual(buffers[17].data_ptr() - buffers[0].data_ptr(), buffers[16].numel())
+        self.assertEqual(serialize_mxfp8_launch(buffers, resource, resource, spec, source_row_fp8=True), before)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_launch_version_is_explicit_and_old_bytes_are_unchanged(self) -> None:

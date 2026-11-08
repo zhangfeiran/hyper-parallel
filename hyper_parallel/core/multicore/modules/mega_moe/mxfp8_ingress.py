@@ -98,15 +98,45 @@ def validate_source_row_buffers(buffers: Sequence[torch.Tensor], spec: Any) -> N
     contracts = ((2, torch.float8_e4m3fn, (spec.local_num_tokens, width)),
                  (16, torch.float8_e4m3fn, (capacity, width)),
                  (17, torch.uint8, (capacity, width // 64, 2)),
+                 (18, torch.float8_e4m3fn, (capacity, width)),
                  (MX_SOURCE_SCALE_POSITION, torch.uint8, (spec.local_num_tokens, width // 64, 2)),
                  (MX_SOURCE_INDEX_POSITION, torch.int32, (spec.local_num_tokens * spec.top_k,)))
     for position, dtype, shape in contracts:
         value = buffers[position]
         if value.dtype != dtype or value.shape != shape or not value.is_contiguous():
             raise ValueError(f"Source-row FP8 binding {position} has an invalid physical layout.")
-    if (buffers[16].data_ptr() != buffers[0].data_ptr()
+    if (buffers[16].data_ptr() != buffers[0].data_ptr() or buffers[18].data_ptr() != buffers[0].data_ptr()
             or buffers[17].data_ptr() != buffers[0].data_ptr() + capacity * width):
         raise ValueError("Source-row receive planes must alias the existing symmetric expert workspace.")
+
+
+def source_row_physical_buffers(buffers: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+    """Pass complete registered storage through CANN while retaining separate logical plane bounds.
+
+    Args:
+        buffers: Validated logical source-row business bindings, with receive views in positions 16 through 18.
+
+    Returns:
+        Current bindings whose three receive roles share the complete registered base allocation. Native code
+        restores the scale offset after checking the physical aliases; no data is copied or allocated here.
+    """
+    if len(buffers) != MX_SOURCE_ROW_BUFFER_COUNT:
+        raise ValueError("Source-row physical bindings require exactly 29 buffers.")
+    base = buffers[0]
+    if base.dtype != torch.bfloat16 or base.ndim != 2 or not base.is_contiguous():
+        raise ValueError("Source-row physical bindings require the contiguous BF16 expert allocation.")
+    capacity, width = base.shape
+    contracts = ((16, torch.float8_e4m3fn, (capacity, width), 0),
+                 (17, torch.uint8, (capacity, width // 64, 2), capacity * width),
+                 (18, torch.float8_e4m3fn, (capacity, width), 0))
+    for position, dtype, shape, offset in contracts:
+        value = buffers[position]
+        if (value.dtype != dtype or value.shape != shape or not value.is_contiguous()
+                or value.data_ptr() != base.data_ptr() + offset):
+            raise ValueError("Source-row physical aliases must retain the validated logical receive planes.")
+    physical = list(buffers)
+    physical[16:19] = [base, base, base]
+    return physical
 
 
 def quantize_source_rows(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

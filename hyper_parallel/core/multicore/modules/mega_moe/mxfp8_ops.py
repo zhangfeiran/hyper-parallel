@@ -30,7 +30,7 @@ from hyper_parallel.core.multicore._loader import get_multicore_paths
 
 from .spec import MegaMoeSpec
 from .mxfp8_ingress import (MX_SOURCE_ROW_LAUNCH_RESERVED, MX_SOURCE_ROW_LAUNCH_VERSION,
-                            validate_source_row_buffers)
+                            source_row_physical_buffers, validate_source_row_buffers)
 
 
 @lru_cache(maxsize=1)
@@ -148,7 +148,7 @@ def launch_mxfp8_task_graph(
         diagnostic: Explicit diagnostic storage; ordinary launches keep capture disabled.
         launch: Native task-graph launch callable.
     """
-    aliases = _byte_aliases(buffers)
+    aliases = _byte_aliases(source_row_physical_buffers(buffers) if source_row_fp8 else buffers)
     _load_mxfp8_native()
     if vector_policy not in ("legacy_odd", "window2") or (swiglu_row_only and vector_policy != "window2"):
         raise ValueError("The integrated MX payload supports legacy_odd and window2 graphs only.")
@@ -158,4 +158,5 @@ def launch_mxfp8_task_graph(
     if source_row_fp8:
         require_mxfp8_window_feature("mx_source_row_fp8")
         require_mxfp8_window_feature("mx_source_row_ready_event")
+        require_mxfp8_window_feature("mx_source_row_base_bindings")
     torch.ops.hyper_parallel.mxfp8_task_graph(aliases, runtime, events, diagnostic, launch)

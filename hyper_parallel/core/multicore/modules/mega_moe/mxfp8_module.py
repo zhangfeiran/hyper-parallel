@@ -159,6 +159,7 @@ class _MXFP8Resources(_MegaMoeExecutionResources):
             if self.source_row_fp8:
                 require_mxfp8_window_feature("mx_source_row_fp8")
                 require_mxfp8_window_feature("mx_source_row_ready_event")
+                require_mxfp8_window_feature("mx_source_row_base_bindings")
 
         if (self.spec.mx_ready_depth or self.spec.mx_swiglu_row_only or self.spec.mx_gradient_udma
                 or self.source_row_fp8):

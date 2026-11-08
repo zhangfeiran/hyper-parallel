@@ -4,6 +4,7 @@
 #include "kernel_operator.h"
 #include "mxfp8/mx_launch_descriptor.h"
 #include "mxfp8/mx_byte_tensor_list.h"
+#include "mxfp8/mx_source_row_layout.h"
 #include "runtime/worker_kernel.h"
 #ifdef __DAV_CUBE__
 #include "mxfp8/mx_gmm_worker.h"
@@ -137,14 +138,23 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker<Policy>, Policy, Runti
 #include "mx_planned_worker.h"
 __aicore__ inline void LoadMxGraphInputs(GM_ADDR buffers, const __gm__ MulticoreMx::MxLaunchDescriptor *launch,
                                          GM_ADDR *inputs) {
+  const bool source_row = launch->version == 14 && launch->reserved == 13;
+  if (source_row && !MulticoreMx::IsSourceRowLaunchValid(launch)) Trap();
   auto list_words = reinterpret_cast<__gm__ uint64_t *>(buffers);
   const uint64_t pointer_offset = list_words[0];
   if (!MulticoreMx::IsMxByteListHeaderValid(pointer_offset, launch->buffer_count)) Trap();
   auto data_pointers = list_words + pointer_offset / sizeof(uint64_t);
   for (uint32_t i = 0; i < launch->buffer_count; ++i) {
-    if (!MulticoreMx::IsMxByteVectorShapeValid(list_words[1 + 2 * i], list_words[2 + 2 * i], launch->buffer_bytes[i]))
+    const uint64_t physical_bytes = MulticoreMx::SourceRowPhysicalBufferBytes(launch, i);
+    if (!MulticoreMx::IsMxByteVectorShapeValid(list_words[1 + 2 * i], list_words[2 + 2 * i], physical_bytes))
       Trap();
     inputs[i] = reinterpret_cast<GM_ADDR>(data_pointers[i]);
+  }
+  if (source_row) {
+    if (!MulticoreMx::AreSourceRowBaseAliasesValid(launch, reinterpret_cast<uint64_t>(inputs[0]),
+          reinterpret_cast<uint64_t>(inputs[16]), reinterpret_cast<uint64_t>(inputs[17]),
+          reinterpret_cast<uint64_t>(inputs[18]))) Trap();
+    inputs[17] += launch->buffer_bytes[16];
   }
 }
 
