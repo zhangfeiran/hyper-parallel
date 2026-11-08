@@ -15,19 +15,27 @@
 """Compact role-owned schedules reuse the existing task-index storage."""
 
 from __future__ import annotations
+from collections import Counter
 from typing import Any
 
 VECTOR_ROLE_BOUNDARY_SLOT = 3
 RULE_POOL_WORDS = 10
 
 
-def configure_vector_roles(cfg: Any, graph: Any, *, ready: bool, forward: bool) -> None:
+def configure_vector_roles(
+    cfg: Any, graph: Any, *, ready: bool, forward: bool, join_gradients: bool = False,
+) -> None:
     """Keep physical communication owners while moving math to the even AIVs.
 
     Args:
         cfg: Mutable host runtime image being assembled.
         graph: Completed task graph with operator-local task ranges.
+        ready: Allow activation gradients to start with their quantized operands.
+        forward: Whether this is a forward graph.
+        join_gradients: Require all weight and activation gradient tasks before combine.
     """
+    if join_gradients and (not ready or forward):
+        raise ValueError("Gradient joins require ready backward roles")
     original = list(cfg.vector_task_indices)[: cfg.task_index_num[1]]
     communication = [index for index in original if cfg.all_tasks[index].task_type in (0, 105)]
     mathematics = [index for index in original if cfg.all_tasks[index].task_type not in (0, 105)]
@@ -38,6 +46,11 @@ def configure_vector_roles(cfg: Any, graph: Any, *, ready: bool, forward: bool) 
     cfg.task_index_num[VECTOR_ROLE_BOUNDARY_SLOT] = len(communication)
     if not ready or forward:
         return
+    _configure_backward_role_events(cfg, graph, join_gradients)
+
+
+def _configure_backward_role_events(cfg: Any, graph: Any, join_gradients: bool) -> None:
+    """Wire activation operands independently, then optionally join all gradient completions."""
     stages, offset = {}, 0
     for op in graph.topological_sort():
         stages[op.name] = (offset, op.task_num)
@@ -49,6 +62,25 @@ def configure_vector_roles(cfg: Any, graph: Any, *, ready: bool, forward: bool) 
             raise ValueError("Backward role stages require matching per-expert logical cube counts.")
         for lane in range(count):
             cfg.all_tasks[target_start + lane].dependent_event = cfg.all_tasks[source_start + lane].dependent_event
+    if join_gradients:
+        _join_backward_gradient_events(cfg, stages)
+
+
+def _join_backward_gradient_events(cfg: Any, stages: dict[str, tuple[int, int]]) -> None:
+    """Reuse each DX completion event for all three disjoint gradient outputs."""
+    target_start, count = stages["dx"]
+    producers = (stages["dw1"], stages["dw2"])
+    if any(size != count for _, size in producers):
+        raise ValueError("Gradient joins require matching per-expert projection task counts")
+    targets = [cfg.all_tasks[target_start + lane].trigger_event for lane in range(count)]
+    credits = Counter(targets)
+    if not credits or any(cfg.all_event_num_triggers[event] != needed for event, needed in credits.items()):
+        raise ValueError("Gradient joins require fresh per-expert DX completion events")
+    for start, size in producers:
+        for lane in range(size):
+            cfg.all_tasks[start + lane].trigger_event = targets[lane]
+    for event, needed in credits.items():
+        cfg.all_event_num_triggers[event] = needed * (len(producers) + 1)
 
 
 def configure_rule_stages(cfg: Any, graph: Any, *, forward: bool) -> None:

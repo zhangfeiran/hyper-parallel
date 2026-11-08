@@ -83,15 +83,39 @@ def _window_stages(graph: Any, experts: int) -> dict[str, tuple[int, int]]:
     return stages
 
 
-def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) -> None:
+def _window_cube_stages(
+    cfg: Any, stages: dict[str, tuple[int, int]], *, forward: bool, activation_first: bool,
+) -> tuple[str, ...]:
+    """Prioritize activations only after their independent input events are wired."""
+    if not activation_first:
+        return ("up", "down") if forward else ("dw2", "da", "dw1", "dx")
+    if forward:
+        raise ValueError("Activation-first window queues require a backward graph")
+    for target, source in (("da", "dw2"), ("dx", "dw1")):
+        target_start, count = stages[target]
+        source_start, source_count = stages[source]
+        if count != source_count or any(
+            cfg.all_tasks[target_start + lane].dependent_event != cfg.all_tasks[source_start + lane].dependent_event
+            for lane in range(count)
+        ):
+            raise ValueError("Activation-first window queues require independent gradient dependencies")
+    return ("da", "dw2", "dx", "dw1")
+
+
+def configure_window_queue(
+    cfg: Any, graph: Any, spec: Any, *, forward: bool, activation_first: bool = False,
+) -> None:
     """Preserve tasks, dependencies and QP ownership without shape-specific files.
 
     Args:
         cfg: Mutable host runtime image being assembled.
         graph: Completed task graph with operator-local task ranges.
         spec: Validated physical expert topology and current capacity.
+        forward: Whether this is a forward graph.
+        activation_first: Prioritize independently ready activation gradients over weight gradients.
     """
     stages = _window_stages(graph, spec.local_experts)
+    cube_stages = _window_cube_stages(cfg, stages, forward=forward, activation_first=activation_first)
 
     def tasks(stage: str, expert: int, lane: int) -> list[int]:
         """Select the task IDs owned by one expert and physical compute lane.
@@ -105,7 +129,6 @@ def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) ->
         width = count // spec.local_experts
         return list(range(start + expert * width + lane, start + (expert + 1) * width, 32))
 
-    cube_stages = ("up", "down") if forward else ("dw2", "da", "dw1", "dx")
     inputs = ("quant_x", "swiglu_quant") if forward else ("quant_dy", "swiglu_grad_quant")
     front = 1 if forward else 2
     vectors = [[] for _ in range(64)]

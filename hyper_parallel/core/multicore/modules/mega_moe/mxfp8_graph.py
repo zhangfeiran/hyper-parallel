@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import os
 from typing import Any
 
 from hyper_parallel.core.multicore.scheduler.config import (
@@ -328,8 +329,9 @@ def _apply_mx_poll_policy(cfg: Any, policy: str) -> None:
                 task.extra_value_2 = interval
 
 
-def _validate_mx_options(spec: MegaMoeSpec, forward: bool, row_only: bool, expert_window: int) -> None:
-    """Reject unsupported precision and queue combinations before graph construction."""
+def _validate_mx_options(spec: MegaMoeSpec, forward: bool, row_only: bool, expert_window: int) -> bool:
+    """Validate precision and queues, returning the independent backward dependency policy."""
+    b0_backward_dag = _b0_backward_dag_enabled(spec)
     if row_only and not forward:
         raise ValueError("Row-only SwiGLU is valid only for a forward without saved backward state.")
     if spec.dispatch_mode != "push" or spec.swiglu_limit is not None:
@@ -340,6 +342,17 @@ def _validate_mx_options(spec: MegaMoeSpec, forward: bool, row_only: bool, exper
     if roles and (spec.num_cube_cores != 32 or (row_only and spec.mx_vector_policy != "window2") or expert_window
                   or spec.dispatch_split != spec.combine_split):
         raise ValueError("Vector roles require Cube32, dual-axis, equal transport splits and no expert window.")
+    return b0_backward_dag or spec.mx_vector_policy == "roles_ready"
+
+
+def _b0_backward_dag_enabled(spec: MegaMoeSpec) -> bool:
+    """Keep the independent gradient branches opt-in and isolated from replica return protocols."""
+    option = os.environ.get("HYPER_PARALLEL_MX_B0_BACKWARD_DAG", "0")
+    if option not in ("0", "1"):
+        raise ValueError("HYPER_PARALLEL_MX_B0_BACKWARD_DAG must be exactly 0 or 1")
+    if option == "1" and (spec.mx_vector_policy != "window2" or spec.replica_slots_per_rank):
+        raise ValueError("B0 backward DAG requires window2 without replicas")
+    return option == "1"
 
 
 def _validate_dispatch_quant(spec: MegaMoeSpec, row_only: bool, expert_window: int, event_base: int) -> None:
@@ -369,9 +382,11 @@ def _revise_mx_task_queue(cfg: Any, values: TaskSplitValue, graph: ComputeGraph,
 def _configure_mx_vector_policy(cfg: Any, graph: ComputeGraph, spec: MegaMoeSpec, forward: bool,
                                 transport_schedule: str) -> str:
     """Apply the selected existing queue policy without changing its event contract."""
+    b0_backward_dag = _b0_backward_dag_enabled(spec) and not forward
     _apply_mx_poll_policy(cfg, spec.mx_poll_policy)
     if spec.mx_vector_policy in ("roles", "roles_ready", "roles_rule", "planned", "window2"):
-        configure_vector_roles(cfg, graph, ready=spec.mx_vector_policy == "roles_ready", forward=forward)
+        configure_vector_roles(cfg, graph, ready=spec.mx_vector_policy == "roles_ready" or b0_backward_dag,
+                               forward=forward)
         transport_schedule = spec.mx_vector_policy + ": odd communication, even mathematics, no padding"
     if spec.mx_vector_policy == "roles_rule":
         configure_rule_stages(cfg, graph, forward=forward)
@@ -380,7 +395,7 @@ def _configure_mx_vector_policy(cfg: Any, graph: ComputeGraph, spec: MegaMoeSpec
         configure_planned_queue(cfg, spec, forward=forward)
         transport_schedule = "planned CSR: fixed odd communication, arbitrary AIV mathematics"
     if spec.mx_vector_policy == "window2":
-        configure_window_queue(cfg, graph, spec, forward=forward)
+        configure_window_queue(cfg, graph, spec, forward=forward, activation_first=b0_backward_dag)
         if _mx_gradient_return(spec, forward):
             configure_mx_gradient_helpers(cfg)
         transport_schedule = "window2 CSR: odd communication, even math, two-expert Cube lookahead"
@@ -491,9 +506,8 @@ def build_mxfp8_runtime(
     Args:
         spec: Validated physical expert topology and current capacity.
     """
-    _validate_mx_options(spec, forward, swiglu_row_only, expert_window)
+    independent_backward = _validate_mx_options(spec, forward, swiglu_row_only, expert_window)
     _validate_mx_ready_depth(spec, ready_depth)
-    ready_policy = spec.mx_vector_policy == "roles_ready"
     kernel_gradients = _mx_gradient_return(spec, forward)
     weight_prefetch = bool(weight_prefetch and spec.replica_slots_per_rank)
     values = _MXTaskValues(
@@ -610,7 +624,9 @@ def build_mxfp8_runtime(
         gmm("dx", "NT", (capacity, h, 2 * width), [10, 11], 12, (26, 29))
         order = ["dispatch", "quant_dy", "dw2", "da", "swiglu_grad_quant", "dw1", "dx", "combine"]
     edges = list(zip(order, order[1:]))
-    if ready_policy and not forward:
+    # Weight gradients and activation gradients only share read-only quantized inputs.
+    # Combine consumes DX; every Cube worker still drains its complete gradient queue before native launch completion.
+    if independent_backward and not forward:
         edges = [
             ("dispatch", "quant_dy"),
             ("quant_dy", "dw2"),
@@ -618,8 +634,6 @@ def build_mxfp8_runtime(
             ("da", "swiglu_grad_quant"),
             ("swiglu_grad_quant", "dw1"),
             ("swiglu_grad_quant", "dx"),
-            ("dw2", "combine"),
-            ("dw1", "combine"),
             ("dx", "combine"),
         ]
     for left, right in edges:
