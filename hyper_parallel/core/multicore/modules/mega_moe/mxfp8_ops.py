@@ -157,4 +157,5 @@ def launch_mxfp8_task_graph(
         require_mxfp8_window_feature("nograd_x_row_only")
     if source_row_fp8:
         require_mxfp8_window_feature("mx_source_row_fp8")
+        require_mxfp8_window_feature("mx_source_row_ready_event")
     torch.ops.hyper_parallel.mxfp8_task_graph(aliases, runtime, events, diagnostic, launch)
