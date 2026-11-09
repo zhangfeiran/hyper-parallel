@@ -22,12 +22,10 @@ from dataclasses import dataclass, replace
 from itertools import accumulate
 from typing import TYPE_CHECKING, Any, Optional
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch_npu
 
-from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
 from hyper_parallel.core.expert_parallel.hot_replica.routing import ReplicaRoute, _replica_count_payload
 
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
@@ -322,8 +320,8 @@ def _host_route_prefixes(
 
 
 def _pack_host_route(
-    wide: tuple[list[int] | np.ndarray, ...],
-    size_fields: tuple[list[int] | np.ndarray, ...],
+    wide: tuple[list[int], ...],
+    size_fields: tuple[list[int], ...],
     capacity: int,
     device: Any,
 ) -> RouteMetadata:
@@ -333,10 +331,7 @@ def _pack_host_route(
     storage = bytearray()
     slices = []
     for values, dtype in zip(fields, dtypes):
-        if isinstance(values, np.ndarray):
-            encoded = values.astype(np.int64 if dtype == torch.int64 else np.int32, copy=False).tobytes()
-        else:
-            encoded = array("q" if dtype == torch.int64 else "i", values).tobytes()
+        encoded = array("q" if dtype == torch.int64 else "i", values).tobytes()
         start = len(storage)
         storage.extend(encoded)
         slices.append((start, len(storage), dtype))
@@ -354,72 +349,6 @@ def _pack_host_route(
         group_list=offsets[4],
         expert_capacity=capacity,
     )
-
-
-def _numpy_route_metadata(
-    counts: np.ndarray, spec: MegaMoeSpec, capacity: int, device: Any,
-) -> RouteMetadata:
-    """Pack the same native prefixes directly from immutable CPU source quotas."""
-    local, rank = spec.local_experts, spec.rank_id
-    start = rank * local
-    received = counts[:, start:start + local]
-    expert_major = received.T.reshape(-1)
-    local_prefix = expert_major.cumsum(dtype=np.int64)
-    groups = local_prefix[spec.ep_size - 1::spec.ep_size]
-    combine_src = (local_prefix - expert_major).reshape(local, spec.ep_size).T.reshape(-1)
-    preceding_destinations = counts[:, :start].sum(axis=1, dtype=np.int64)
-    combine_dst = (preceding_destinations[:, None] + received.cumsum(axis=1, dtype=np.int64) - received).reshape(-1)
-    combine_size = received.reshape(-1)
-    if spec.dispatch_mode == 'pull':
-        dispatch_src, dispatch_dst, dispatch_size = combine_dst, combine_src, combine_size
-    else:
-        dispatch_size = counts[rank]
-        dispatch_src = dispatch_size.cumsum(dtype=np.int64) - dispatch_size
-        preceding_sources = counts[:rank].sum(axis=0, dtype=np.int64)
-        destination_totals = (preceding_sources + counts[rank:].sum(axis=0, dtype=np.int64)).reshape(-1, local)
-        prior_experts = destination_totals.cumsum(axis=1, dtype=np.int64) - destination_totals
-        dispatch_dst = preceding_sources + prior_experts.reshape(-1)
-    wide = (dispatch_src, dispatch_dst, combine_src, combine_dst, groups)
-    return _pack_host_route(wide, (dispatch_size, combine_size), capacity, device)
-
-
-def _cpu_plan_route_metadata(
-    route: ReplicaRoute | None, spec: MegaMoeSpec, capacity: int, device: Any,
-) -> RouteMetadata | None:
-    """Use the actual CPU plan for fixed MX routes without another device prefix scan."""
-    if route is None or route.home_only or not isinstance(route.plan, ExpertExecutionPlan):
-        return None
-    config = route.plan.config
-    if (spec.ep_size, spec.num_experts) != (config.ep_size, config.physical_experts):
-        raise ValueError("Replica descriptor topology differs from the selected physical graph")
-    counts = np.frombuffer(route.plan._dispatch_counts_bytes, dtype='<i4')
-    metadata = _numpy_route_metadata(counts.reshape(spec.ep_size, spec.num_experts), spec, capacity, device)
-    if spec.forward_ingress_mode in ('peer_overlap', 'peer_token'):
-        metadata = replace(metadata, expert_row_counts=metadata.combine_size.reshape(
-            spec.ep_size, spec.local_experts).sum(0, dtype=torch.int32))
-    return metadata
-
-
-def _static_route_metadata(
-    counts: torch.Tensor, gathered: torch.Tensor, work: Any | None, spec: MegaMoeSpec,
-    replica_route: ReplicaRoute | None,
-) -> tuple[RouteMetadata, torch.Tensor, int]:
-    """Finish the existing agreement before using either CPU or device descriptors."""
-    if (replica_route is not None and not replica_route.home_only
-            and isinstance(replica_route.plan, ExpertExecutionPlan)):
-        if work is not None:
-            work.wait()
-            work = None
-        capacity, maximum = _expert_capacity(gathered, spec, replica_route.plan.destination_loads)
-        metadata = _cpu_plan_route_metadata(replica_route, spec, capacity, counts.device)
-        if metadata is not None:
-            return metadata, metadata.combine_size.reshape(spec.ep_size, spec.local_experts), maximum
-    received = _finish_count_gather(gathered, work, spec)
-    loads = None if replica_route is None else replica_route.plan.destination_loads
-    capacity, maximum = _expert_capacity(gathered, spec, loads)
-    return _compute_route_metadata(counts, gathered, received, spec, capacity), received, maximum
-
-
 def _build_route_indices(topk_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Sort scalar route slots without constructing Top-K expanded token vectors."""
     if topk_ids.numel() > 2**24:
@@ -509,8 +438,9 @@ def prepare_topk_route(
         routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     else:
         routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
-    metadata, received_counts, maximum_received_slots = _static_route_metadata(
-        counts, counts_by_source, count_work, spec, replica_route)
+    received_counts = _finish_count_gather(counts_by_source, count_work, spec)
+    loads = None if replica_route is None else replica_route.plan.destination_loads
+    expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec, loads)
     return PreparedTopKRoute(
         routed_tokens=routed_tokens,
         unpermute_mapping=unpermute_mapping,
@@ -521,8 +451,13 @@ def prepare_topk_route(
         peer_row_ordinals=(
             _peer_row_ordinals(topk_ids, permute_src_index, counts)
             if spec.forward_ingress_mode in ("peer_dedup", "peer_overlap", "peer_token", "peer_tile") else None),
-        metadata=replace(metadata, replica_route=None if replica_route is not None and replica_route.home_only
-                         else replica_route),
+        metadata=replace(_compute_route_metadata(
+            counts,
+            counts_by_source,
+            received_counts,
+            spec,
+            expert_capacity,
+        ), replica_route=None if replica_route is not None and replica_route.home_only else replica_route),
     )
 
 
