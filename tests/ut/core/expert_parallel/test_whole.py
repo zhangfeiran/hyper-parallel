@@ -23,7 +23,7 @@ from hyper_parallel.core.expert_parallel.hot_replica import routing, whole
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica.plan import ExpertExecutionPlan
 from hyper_parallel.core.expert_parallel.hot_replica.planner import _build_expert_replica_plan
-from hyper_parallel.core.expert_parallel.hot_replica.whole import place_whole_experts
+from hyper_parallel.core.expert_parallel.hot_replica.whole import build_whole_expert_plan, place_whole_experts
 from tests.common.mark_utils import arg_mark
 
 
@@ -231,7 +231,7 @@ class TestWholeExpertRoute(unittest.TestCase):
                     self.counts, self.config, self.group, 0, _complete_experts=True, **self.options)
                 self.assertTrue(reused)
                 self.assertIs(second, first)
-        self.assertEqual(build.call_count, 1)
+        self.assertEqual(build.call_count, 0)
         self.assertEqual(len(first.transfers), 1)
         self.assertEqual(max(first.destination_loads), 400)
 
@@ -262,3 +262,80 @@ class TestWholeExpertRoute(unittest.TestCase):
             routing._plan_replica_route(self.counts, self.config, self.group, 0,
                                         _complete_experts=True, **self.options, cost_model=object())
         build.assert_not_called()
+
+
+class TestDirectWholeExpertPlan(unittest.TestCase):
+    """Keep the complete decision while removing the unused partial-K search."""
+
+    def setUp(self) -> None:
+        """Release bounded metadata caches after every independent case."""
+        place_whole_experts.cache_clear()
+        self.addCleanup(place_whole_experts.cache_clear)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_direct_plan_matches_converted_plans_with_unequal_sources(self) -> None:
+        """Feature: Exact complete placement from source counts.
+        Description: Compare both backends across EP sizes, guest budgets, unequal sources and empty routes.
+        Expectation: Complete logical identities, physical slots and every source quota remain identical.
+        """
+        generator = random.Random(43)
+        for ep in (1, 2, 4, 8):
+            for budget in (0, 1, 2):
+                for empty in (False, True):
+                    counts = tuple(tuple(0 if empty else generator.randrange(20) for _ in range(2 * ep))
+                                   for _ in range(ep))
+                    config = ExpertReplicaConfig(2 * ep, ep, budget)
+                    options = {'capacity_limit': 10000, 'minimum_load_reduction': .1,
+                               'minimum_replica_rows': 4, 'rank_nodes': tuple(rank // 2 for rank in range(ep))}
+                    partial = _build_expert_replica_plan(counts, budget, capacity_limit=10000)
+                    expected = place_whole_experts(partial, **options)
+                    with self.subTest(ep=ep, budget=budget, empty=empty):
+                        self.assertEqual(build_whole_expert_plan(counts, config, **options), expected)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_direct_plan_can_migrate_an_over_capacity_home_seed(self) -> None:
+        """Feature: Mandatory receive-bound preservation.
+        Description: Start with a home peak above capacity and restrictive optional thresholds.
+        Expectation: Complete migration satisfies the common bound exactly as the converted partial plan does.
+        """
+        counts = ((45, 25, 15, 10, 5, 0),) * 3
+        config = ExpertReplicaConfig(6, 3, 2)
+        options = {'capacity_limit': 150, 'minimum_load_reduction': .4,
+                   'minimum_saved_rows': 1000, 'minimum_replica_rows': 1000}
+        partial = _build_expert_replica_plan(counts, 2, capacity_limit=150)
+        actual = build_whole_expert_plan(counts, config, **options)
+        self.assertEqual(actual, place_whole_experts(partial, **options))
+        self.assertLessEqual(max(actual.destination_loads), 150)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_direct_plan_rejects_topology_and_zero_budget_capacity_errors(self) -> None:
+        """Feature: Direct backend validation.
+        Description: Supply mismatched histograms, a negative count and an infeasible zero-guest receive bound.
+        Expectation: No malformed plan reaches route upload or physical dispatch.
+        """
+        counts = ((100, 0, 0, 0),) * 4
+        cases = ((counts, ExpertReplicaConfig(8, 4, 1), 1000),
+                 (((-1, 0), (0, 0)), ExpertReplicaConfig(2, 2, 1), 1000),
+                 (counts, ExpertReplicaConfig(4, 4, 0), 100))
+        for table, config, capacity in cases:
+            with self.subTest(config=config, capacity=capacity), self.assertRaises(ValueError):
+                build_whole_expert_plan(table, config, capacity_limit=capacity, minimum_load_reduction=.4)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_skipped_partial_search_retains_option_validation(self) -> None:
+        """Feature: Shared option boundary preservation.
+        Description: Pass invalid target, residency, credit and adaptive controls to the complete backend.
+        Expectation: Validation fails before the skipped partial planner could mask the input error.
+        """
+        counts = ((100, 100, 0, 0),) * 4
+        config = ExpertReplicaConfig(4, 4, 1)
+        options = {'capacity_limit': 1000, 'minimum_load_reduction': .4}
+        changes = ({'target_load': -1}, {'receive_capacity': -1}, {'_replica_transfer_row_credit': -1},
+                   {'_replica_transfer_row_credit': None}, {'adaptive': 1}, {'_uncalibrated_candidate': object()})
+        with patch.object(routing, 'build_expert_replica_plan') as partial:
+            for change in changes:
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    routing._build_route_plan(counts, config, True, {**options, **change})
+            with self.assertRaisesRegex(TypeError, 'Unknown complete expert options'):
+                routing._build_route_plan(counts, config, True, {**options, 'unexpected': 0})
+            partial.assert_not_called()

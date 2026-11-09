@@ -46,7 +46,7 @@ from .planner import (
     _projected_rank_nodes,
 )
 from .topology import _validate_rank_nodes
-from .whole import place_whole_experts
+from .whole import build_whole_expert_plan
 
 
 @dataclass(frozen=True)
@@ -200,18 +200,39 @@ def _validate_complete_expert_policy(selected: bool, backend: str) -> None:
 def _build_route_plan(counts: Any, config: ExpertReplicaConfig, complete_experts: bool,
                       options: dict[str, Any]) -> ExpertExecutionPlan:
     """Select complete MX reductions before checkpoint caching and metadata upload."""
-    if complete_experts and options.get('cost_model') is not None:
-        raise ValueError("Complete MXFP8 experts require costs calibrated for complete reductions")
-    plan = build_expert_replica_plan(counts, config.replica_slots_per_rank, **options)
     if not complete_experts:
-        return plan
-    return place_whole_experts(
-        plan, capacity_limit=options.get('capacity_limit'),
+        return build_expert_replica_plan(counts, config.replica_slots_per_rank, **options)
+    if options.get('cost_model') is not None:
+        raise ValueError("Complete MXFP8 experts require costs calibrated for complete reductions")
+    _validate_complete_options(options, config)
+    return build_whole_expert_plan(
+        counts, config, capacity_limit=options.get('capacity_limit'),
         minimum_load_reduction=options.get('minimum_load_reduction', 0.0),
         minimum_saved_rows=options.get('minimum_saved_rows', 0),
         minimum_replica_rows=options.get('minimum_replica_rows', 0),
         rank_nodes=options.get('_rank_nodes') or None,
     )
+
+
+def _validate_complete_options(options: dict[str, Any], config: ExpertReplicaConfig) -> None:
+    """Retain shared boundary checks while skipping unused split-K computation."""
+    allowed = {'target_load', 'minimum_replica_rows', 'capacity_limit', 'cost_model', 'minimum_load_reduction',
+               'minimum_saved_rows', 'receive_capacity', 'adaptive', '_rank_nodes',
+               '_replica_transfer_row_credit', '_uncalibrated_candidate'}
+    unknown = options.keys() - allowed
+    if unknown:
+        raise TypeError("Unknown complete expert options: " + ', '.join(sorted(unknown)))
+    _integer(options.get('_replica_transfer_row_credit', 0), "Replica transfer row credit", 0)
+    for name in ('target_load', 'receive_capacity'):
+        value = options.get(name)
+        if value is not None:
+            _integer(value, name, 0)
+    adaptive = options.get('adaptive', False)
+    if not isinstance(adaptive, bool) or (adaptive and not config.replica_slots_per_rank):
+        raise ValueError("Adaptive replicas require a boolean flag and a positive slot cap")
+    candidate = options.get('_uncalibrated_candidate')
+    if candidate is not None and not isinstance(candidate, _UncalibratedCandidate):
+        raise ValueError("Complete expert admission requires a validated compact candidate")
 
 
 def _plan_replica_route(counts: Any, config: ExpertReplicaConfig, group: object, rank: int,

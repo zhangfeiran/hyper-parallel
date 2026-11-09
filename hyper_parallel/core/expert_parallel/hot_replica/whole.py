@@ -16,12 +16,45 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import lru_cache
 
 from .admission import reduction_basis_points
-from .capacity import _integer
+from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
+from .planner import _counts_matrix, _home_layout, _materialize as _materialize_home
 from .topology import _validate_rank_nodes
+
+
+def build_whole_expert_plan(counts: Sequence[Sequence[int]], config: ExpertReplicaConfig, *, capacity_limit: int,
+                            minimum_load_reduction: float, minimum_saved_rows: int = 0,
+                            minimum_replica_rows: int = 0,
+                            rank_nodes: tuple[int, ...] | None = None) -> ExpertExecutionPlan:
+    """Seed complete reductions directly after the unchanged compact admission gate.
+
+    Args:
+        counts: Exact CPU logical-expert histograms from the existing count gather.
+        config: Validated logical topology and physical guest budget.
+        capacity_limit: Common receive bound applied to the final complete plan.
+        minimum_load_reduction: Existing optional migration threshold.
+        minimum_saved_rows: Existing minimum absolute peak reduction.
+        minimum_replica_rows: Existing minimum optional guest size.
+        rank_nodes: Immutable node identities in expert-parallel rank order.
+
+    Returns:
+        The same complete plan as converting an intermediate split-K placement.
+    """
+    matrix = _counts_matrix(counts)
+    if len(matrix) != config.ep_size or len(matrix[0]) != config.num_experts:
+        raise ValueError("Exact counts must match the complete expert topology")
+    _, _, home = _home_layout(matrix, config)
+    # Necessary migrations can make an over-capacity home layout feasible.
+    seed_limit = capacity_limit if not config.replica_slots_per_rank else None
+    seed = _materialize_home(matrix, home, config, seed_limit)
+    return place_whole_experts(
+        seed, capacity_limit=capacity_limit, minimum_load_reduction=minimum_load_reduction,
+        minimum_saved_rows=minimum_saved_rows, minimum_replica_rows=minimum_replica_rows, rank_nodes=rank_nodes,
+    )
 
 
 def _materialize(plan: ExpertExecutionPlan, targets: list[int]) -> ExpertExecutionPlan:
