@@ -57,7 +57,8 @@ __aicore__ inline void AddReplicaGradientUdma(GM_ADDR output, GM_ADDR source, in
   if (offset >= elements) {
     return;
   }
-  constexpr uint32_t tile_elements = 4096;
+  // Keep network banks unchanged while amortizing arithmetic fences over 32 KiB tiles.
+  constexpr uint32_t tile_elements = 8192;
   AscendC::TPipe pipe;
   AscendC::TBuf<AscendC::TPosition::VECCALC> arithmetic;
   AscendC::TBuf<AscendC::TPosition::VECOUT> wqe;
