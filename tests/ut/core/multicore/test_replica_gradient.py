@@ -47,7 +47,7 @@ class TestReplicaGradient(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
             (work / "native_gradient.h").write_text(function + "\n")
-            for architecture, udma_mode, tile in ((2201, 0, 4096), (3510, 0, 4096), (3510, 1, 8192)):
+            for architecture, udma_mode, tile in ((2201, 0, 4096), (3510, 0, 4096), (3510, 1, 16384)):
                 with self.subTest(architecture=architecture, udma=udma_mode):
                     binary = work / str(architecture)
                     build = subprocess.run(
@@ -61,5 +61,5 @@ class TestReplicaGradient(unittest.TestCase):
                     result = subprocess.run([str(binary)], capture_output=True, text=True, check=False)
                     self.assertEqual(result.returncode, 0,
                                      f"expected exact coverage/order actual={result.stdout} {result.stderr}")
-                    self.assertIn("Verified 11 guarded ordered FP32 gradient shapes", result.stdout,
-                                  f"expected 11 complete shapes actual={result.stdout}")
+                    self.assertIn("Verified 14 guarded ordered FP32 gradient shapes", result.stdout,
+                                  f"expected 14 complete shapes actual={result.stdout}")

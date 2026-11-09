@@ -178,8 +178,8 @@ int CheckShape(size_t elements, GM_ADDR scratch, size_t chunk) {
 }
 
 int main() {
-  const size_t shapes[] = {0, 1, 7, 4095, 4096, 4097, 8191, 8192, 8193, 32771, 131089};
-  constexpr size_t chunk = 8192;
+  const size_t shapes[] = {0, 1, 7, 4095, 4096, 4097, 8191, 8192, 8193, 16383, 16384, 16385, 32771, 131089};
+  constexpr size_t chunk = 32768;
   std::vector<unsigned char> scratch_storage(8 * chunk * sizeof(float) + DATA_CACHE_LINE_SIZE);
   auto scratch_bits = (reinterpret_cast<uintptr_t>(scratch_storage.data()) + DATA_CACHE_LINE_SIZE - 1) &
                       ~(DATA_CACHE_LINE_SIZE - 1);
@@ -191,6 +191,6 @@ int main() {
   for (const auto &peer : pending) for (const auto &get : peer) if (get.target != nullptr) return 8;
   if (max_copy_bytes != HP_EXPECTED_TILE * sizeof(float)) return 5;
   if (max_buffer_bytes != 2 * HP_EXPECTED_TILE * sizeof(float)) return 6;
-  std::cout << "Verified 11 guarded ordered FP32 gradient shapes" << std::endl;
+  std::cout << "Verified 14 guarded ordered FP32 gradient shapes" << std::endl;
   return 0;
 }
