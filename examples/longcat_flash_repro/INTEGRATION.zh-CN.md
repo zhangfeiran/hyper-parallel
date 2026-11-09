@@ -65,7 +65,7 @@ EP本地权重已经切好的客户项目使用第4节，不能把局部张量�
 | `backend="megamoe"` | MegaMoE执行；`native`用于对照，NPU上使用GMM/permute/AllToAll/unpermute等算子 |
 | `dispatch_mode="push"` | 参考单层Trainer使用的传输方式；`pull`可单独建模块比较 |
 | `expert_weight_layout="EOI"` | 与客户现有 `[expert, out, in]` 权重一致，直接使用该轴序 |
-| `swiglu_precision="fused"` | **默认值**；原生路径调用 `torch_npu.npu_swiglu`，MegaMoE内嵌CANN `swi_glu/swi_glu_grad` |
+| `swiglu_precision="fused"` | **默认值**；选择融合 SwiGLU 数值语义。原生 NPU 路径通过 `torch_npu.npu_swiglu` 启动独立算子；MegaMoE 在融合内核中执行由 CANN SwiGLU/SwiGLUGrad 源码适配的设备函数，不再次调用 Python 接口 |
 | `routing_backend="triton"` | 参考性能结果所用的有序gather/combine；依赖Triton-Ascend3.2.0，要求NPU BF16输入及FP32路由权重 |
 | `routing_backend="torch"` | adapter的默认路由实现，可先用于功能接入；精度阶段和性能比较两侧使用同一选择 |
 | `optimize_tasks=True` | 使用当前路由的任务边界和单专家任务寻址，默认开启 |
@@ -90,6 +90,10 @@ output = moe.experts(
 
 保留Router输出的真实权重；不要 `detach()`、转NumPy或重建为无梯度Tensor。
 `swiglu_precision="hf"` 是显式的HF BF16中间舍入兼容选项，不能混用两种语义比较性能。
+它控制前反向的中间舍入位置，MegaMoE 的 `hf` 模式也在融合内核中执行；不是禁用 MegaMoE 融合的开关。
+如果客户参考仍是 `F.silu(gate) * up`，而候选使用默认 `fused`，即使公式相同也可能产生约 0.5% 的 BF16 相对 L2。
+不能仅凭这个量级判定现场原因；先运行[数值语义诊断](../../docs/longcat-flash-precision-diagnosis.md)，
+分别比较原始 HF、同语义原生 GMM 和 MegaMoE。两条融合路径的源码版本、tiling 和启动方式不同，跨芯片逐位一致需实测。
 即使选择 `hf`，HF逐专家 `F.linear` 与原生GMM也可能有BF16末位差异；本次主验收对照为原生GMM。
 
 ## 3. HF模块尚未做EP切分：先替换，再切分
@@ -286,7 +290,7 @@ dist.destroy_process_group()
 4. 精度通过后再测性能：两侧相同EP、形状、初始化、checkpoint/recompute和SwiGLU/路由语义，
    预热后记录所有rank完成时间及rank-max样本，保留慢样本，正式耗时关闭profiler。
 5. 与参考结果比较时区分“只替换MoE”和参考配置中同时启用attention/dense适配的完整单层Trainer。
-   x86/910C、客户PTA和客户全网络的结果以现场报告为准，组件收益不能直接换算成全网络吞吐。
+   x86_64/910B2C、客户PTA和客户全网络的结果以现场报告为准，组件收益不能直接换算成全网络吞吐。
 
 源码入口：[LongCat experts](../../hyper_parallel/models/longcat_flash/adapter/experts.py)、
 [EP绑定](../../hyper_parallel/models/longcat_flash/adapter/parallel.py)、

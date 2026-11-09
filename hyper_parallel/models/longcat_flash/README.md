@@ -17,10 +17,18 @@ Real and identity contributions are accumulated in expert order, retaining the r
 cast. Identity weights and the input bypass remain differentiable. Storage-sharing identity input views and
 an ordered gather backward preserve HF's per-expert BF16 input-gradient accumulation without expanding
 identity tokens. `swiglu_precision: fused` is the model default for both native and MegaMoE backends.
-The native NPU path calls `torch_npu.npu_swiglu`; MegaMoE embeds CANN `swi_glu` / `swi_glu_grad` inside
-its persistent kernel. Accelerator parity uses the native operator as the activation oracle.
+The native NPU path launches the standalone `torch_npu.npu_swiglu` operator. MegaMoE executes device
+functions adapted from pinned CANN SwiGLU/SwiGLUGrad sources inside its persistent kernel; it does not
+call the Python `torch_npu.npu_swiglu` interface again. Their source versions, tiling and launch paths
+can differ, so same-semantics parity must be verified on the selected chip and installed CANN/PTA.
+Accelerator parity uses the native operator as the activation oracle.
 Explicit `swiglu_precision: hf` enables the optional generic `swiglu_hf_bf16=True` compatibility switch,
 which rounds the SiLU intermediate in forward and both multiply branches in backward.
+MegaMoE also executes this compatibility mode inside its fused kernel. The option selects intermediate
+rounding semantics rather than enabling or disabling fusion. Comparing the default fused mode with
+literal HF's separate BF16 SiLU/multiply can produce approximately 0.5% relative L2 in an original-width
+expert experiment. See the [precision diagnosis](../../../docs/longcat-flash-precision-diagnosis.md) for
+the measured scope and a customer-side triangulation command.
 
 `LongcatFlashMegaMoeExperts` compacts active real assignments into a K=1 `MegaMoeExperts` executor.
 The `megamoe` backend requires BF16 NPU inputs and supports push and pull. The explicit `native` backend

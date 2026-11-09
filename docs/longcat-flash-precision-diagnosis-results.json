@@ -1,0 +1,562 @@
+{
+  "schema_version": 1,
+  "scope": "Expert component diagnosis on local 910C; customer x86_64/910B2C acceptance remains unverified",
+  "baseline_commit": "83ba41dee3c020bb7d178da4cd7a8aab6415b3bc",
+  "runtime_sources_changed": false,
+  "validation_source_sha256": {
+    "tests/torch/models/longcat_flash/_compare_longcat_flash.py": "bd5c9efbdb3f2dc0115d332369db4a74b9d935df40ebedff303023e3b012e191",
+    "tests/torch/models/longcat_flash/_precision.py": "3283aa4a6b7f1c76f093f2148ad95fd48d53b1267dc445646cfe61969d9134e3",
+    "tests/torch/models/longcat_flash/_diagnose_longcat_swiglu.py": "3af73040f021d5876a17bb9296e766d2bbca880666399b16f867318c4e358681"
+  },
+  "environment": {
+    "python": "3.11.15",
+    "torch": "2.9.1+cpu",
+    "torch_npu": "2.9.1",
+    "chip": "Ascend910_9382",
+    "device_limits": {
+      "cube_core_num": 24,
+      "vector_core_num": 48
+    }
+  },
+  "host_arch": "aarch64",
+  "cann": "8.5.0",
+  "reference_frontend": {
+    "revision": "ca76a20089d03dc0d9f9f7e8852c93931c5396ef",
+    "sha256": "976d3f059df1f1c95683a63378f386b3b8b7640389bb17e24426a8d81c04db89",
+    "applies_to": "native reference only"
+  },
+  "component_shape": {
+    "tokens": 2048,
+    "hidden": 6144,
+    "intermediate": 2048,
+    "real": 32,
+    "zero": 16,
+    "top_k": 12
+  },
+  "semantics_shape": {
+    "ep": 1,
+    "real": 8,
+    "zero": 4,
+    "hidden": 6144,
+    "intermediate": 2048,
+    "tokens": 2048,
+    "top_k": 12
+  },
+  "gate": {
+    "atol": 2e-05,
+    "rtol": 0.05,
+    "relative_l2": 0.05
+  },
+  "component": [
+    {
+      "rank": 0,
+      "strict_pass": true,
+      "native_root_matches": true,
+      "shmem_reference_count_after_close": 0,
+      "modes": [
+        {
+          "mode": "push",
+          "all_ranks_strict_pass": true,
+          "maximum_absolute_error": 0.0,
+          "strict_bad_elements": 0
+        },
+        {
+          "mode": "pull",
+          "all_ranks_strict_pass": true,
+          "maximum_absolute_error": 0.0,
+          "strict_bad_elements": 0
+        }
+      ]
+    },
+    {
+      "rank": 1,
+      "strict_pass": true,
+      "native_root_matches": true,
+      "shmem_reference_count_after_close": 0,
+      "modes": [
+        {
+          "mode": "push",
+          "all_ranks_strict_pass": true,
+          "maximum_absolute_error": 0.0,
+          "strict_bad_elements": 0
+        },
+        {
+          "mode": "pull",
+          "all_ranks_strict_pass": true,
+          "maximum_absolute_error": 0.0,
+          "strict_bad_elements": 0
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "strict_pass": true,
+      "native_root_matches": true,
+      "shmem_reference_count_after_close": 0,
+      "modes": [
+        {
+          "mode": "push",
+          "all_ranks_strict_pass": true,
+          "maximum_absolute_error": 0.0,
+          "strict_bad_elements": 0
+        },
+        {
+          "mode": "pull",
+          "all_ranks_strict_pass": true,
+          "maximum_absolute_error": 0.0,
+          "strict_bad_elements": 0
+        }
+      ]
+    },
+    {
+      "rank": 3,
+      "strict_pass": true,
+      "native_root_matches": true,
+      "shmem_reference_count_after_close": 0,
+      "modes": [
+        {
+          "mode": "push",
+          "all_ranks_strict_pass": true,
+          "maximum_absolute_error": 0.0,
+          "strict_bad_elements": 0
+        },
+        {
+          "mode": "pull",
+          "all_ranks_strict_pass": true,
+          "maximum_absolute_error": 0.0,
+          "strict_bad_elements": 0
+        }
+      ]
+    }
+  ],
+  "semantics": [
+    {
+      "case": "HF_repeat",
+      "primary": true,
+      "strict_pass": true,
+      "all_ranks_strict_pass": true,
+      "comparison": {
+        "output": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "input_gradient": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "probability_gradient": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "gate_up_proj": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "down_proj": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        }
+      }
+    },
+    {
+      "case": "native_GMM_hf_vs_original_HF",
+      "primary": false,
+      "strict_pass": false,
+      "all_ranks_strict_pass": false,
+      "comparison": {
+        "output": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "input_gradient": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "probability_gradient": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "gate_up_proj": {
+          "max_abs": 1.0,
+          "relative_l2": 3.750753989648123e-05,
+          "strict_bad": 1,
+          "component_bad": 0,
+          "strict_pass": false,
+          "component_pass": true,
+          "first_strict_failure": {
+            "flat_index": 36253512,
+            "actual": -1.8477439880371094e-05,
+            "reference": -4.124641418457031e-05
+          }
+        },
+        "down_proj": {
+          "max_abs": 1.0,
+          "relative_l2": 3.6328025119617915e-05,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        }
+      }
+    },
+    {
+      "case": "Mega_hf_vs_native_GMM_hf",
+      "primary": true,
+      "strict_pass": true,
+      "all_ranks_strict_pass": true,
+      "comparison": {
+        "output": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "input_gradient": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "probability_gradient": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "gate_up_proj": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "down_proj": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        }
+      }
+    },
+    {
+      "case": "native_GMM_fused_vs_original_HF",
+      "primary": false,
+      "strict_pass": false,
+      "all_ranks_strict_pass": false,
+      "comparison": {
+        "output": {
+          "max_abs": 0.25,
+          "relative_l2": 0.0045075686954984635,
+          "strict_bad": 489679,
+          "component_bad": 1032224,
+          "strict_pass": false,
+          "component_pass": false,
+          "first_strict_failure": {
+            "flat_index": 22,
+            "actual": 0.2451171875,
+            "reference": 0.2294921875
+          }
+        },
+        "input_gradient": {
+          "max_abs": 0.25,
+          "relative_l2": 0.004963400898987884,
+          "strict_bad": 530124,
+          "component_bad": 1167310,
+          "strict_pass": false,
+          "component_pass": false,
+          "first_strict_failure": {
+            "flat_index": 12,
+            "actual": -0.0400390625,
+            "reference": -0.0458984375
+          }
+        },
+        "probability_gradient": {
+          "max_abs": 1.776641845703125,
+          "relative_l2": 0.003180220114345909,
+          "strict_bad": 735,
+          "component_bad": 1802,
+          "strict_pass": false,
+          "component_pass": false,
+          "first_strict_failure": {
+            "flat_index": 51,
+            "actual": 4.107891082763672,
+            "reference": 3.656881332397461
+          }
+        },
+        "gate_up_proj": {
+          "max_abs": 2.0,
+          "relative_l2": 0.0035682812762234035,
+          "strict_bad": 7083827,
+          "component_bad": 17600464,
+          "strict_pass": false,
+          "component_pass": false,
+          "first_strict_failure": {
+            "flat_index": 14,
+            "actual": 0.423828125,
+            "reference": 0.609375
+          }
+        },
+        "down_proj": {
+          "max_abs": 2.0,
+          "relative_l2": 0.0035760600381198816,
+          "strict_bad": 3546375,
+          "component_bad": 8803492,
+          "strict_pass": false,
+          "component_pass": false,
+          "first_strict_failure": {
+            "flat_index": 66,
+            "actual": -2.359375,
+            "reference": -2.140625
+          }
+        }
+      }
+    },
+    {
+      "case": "Mega_fused_vs_native_GMM_fused",
+      "primary": true,
+      "strict_pass": true,
+      "all_ranks_strict_pass": true,
+      "comparison": {
+        "output": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "input_gradient": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "probability_gradient": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "gate_up_proj": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "down_proj": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        }
+      }
+    },
+    {
+      "case": "fixed_operand_fused_SwiGLU_grid",
+      "primary": true,
+      "strict_pass": true,
+      "all_ranks_strict_pass": true,
+      "comparison": {
+        "output": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "input_gradient": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "probability_gradient": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "gate_up_proj": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        },
+        "down_proj": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "strict_bad": 0,
+          "component_bad": 0,
+          "strict_pass": true,
+          "component_pass": true
+        }
+      }
+    }
+  ],
+  "additional_local_diagnostics": [
+    {
+      "suite": "matrix",
+      "worker_sha256": "3f038364e7feeddc6d098c00c4aafe34aebaf704aaff1bc01c512baccf60eee8",
+      "worker_delivery": "internal diagnostic prototype; delivery entrypoints are the scripts listed above",
+      "cases": [
+        "standard",
+        "variable_257",
+        "variable_129",
+        "variable_17",
+        "variable_1",
+        "real_17",
+        "real_257",
+        "hot_257",
+        "identity_17",
+        "empty_source",
+        "large_activation",
+        "tiny_activation",
+        "all_empty"
+      ],
+      "ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "maximum_absolute_error": 0,
+      "all_ranks_strict_pass": true,
+      "shmem_reference_count_after_close": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "suite": "pending",
+      "worker_sha256": "c7ff5fe97f9eb9aed859781c0ab9148b7010b8f69155ec8076581d6a2039a5ea",
+      "worker_delivery": "internal diagnostic prototype; delivery entrypoints are the scripts listed above",
+      "cases": [
+        "pending_forwards_2",
+        "pending_forwards_3",
+        "two_layers_shared_checkpoint_False",
+        "two_layers_shared_checkpoint_True"
+      ],
+      "ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "maximum_absolute_error": 0,
+      "all_ranks_strict_pass": true,
+      "shmem_reference_count_after_close": [
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "native_sha256": {
+    "hyper_parallel/core/multicore/lib/framework/torch/libhyper_parallel_mega_moe_torch.so": "af92f8d6c5187a704f1ecce98d01840a61ce246c4c1d5e5b138d3e8969a7efdb",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_proto/lib/linux/aarch64/libcust_opsproto_rt2.0.so": "7958508ff6fbd0e264e5155abb8673fb06acf8250338a299267292fdf86be6fe",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/op_tiling/liboptiling.so": "d3c003f813b46e7b3d853da830fa7937bda204522948fa362c334c5f32129328",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so": "d3c003f813b46e7b3d853da830fa7937bda204522948fa362c334c5f32129328",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_api/lib/libcust_opapi.so": "af85564951aa9383a0967080519eb50e0d4ad14e62c71383bc5cb44ae3d0690b",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe/HyperMegaMoe_e6c0ec2992b0e7c6cc20aea213fa5428.o": "d6ae0954f3c70561a37a0a1edcc04c2c806b5eafb33ad6fca7cef884f94bc95e",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe/HyperMegaMoe_8fa11c3f49d35b114d045c751d29ca02.o": "83e8878fca995178849dde08aa24dbdece2177e1fce5a818da1b47413184255d",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_gate_route/HyperMegaGateRoute_51b3ed5fb437e5de2c66aff4a6043505.o": "3b2b734e35458b02b22ba4e5b8ecd59ddf84adf49510d6cf4f457c3eb0d22a09",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_mhc_grad/HyperMegaMhcGrad_bf9c317a8a7bc83c9f4bed060af1a9cc.o": "b5aa27030272454151a55a0775768b84bed931b87956f7bed7cf10fc7707df9d",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_mhc/HyperMegaMhc_433fc592441f7ac1b484cebbff756b75.o": "f4b85d01b17706d7df4742d040e9c9a39d6631d331a1787db3fdf6be1efb9fc9",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_gate_route_grad/HyperMegaGateRouteGrad_303d12d6648a9fd322199a0a8d3ab5c0.o": "1af2ee64cfb7c7d501cfe100144ddb04c250be4af86d3f00713332b3ddd5ca1e",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe_grad/HyperMegaMoeGrad_a3e209fcfebb8705529dbb31c9eba29b.o": "078f546248b751713165da8de4530a652249f3d2739da7de6459fee930e2d067",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe_grad/HyperMegaMoeGrad_4a749b390f901cd7613a0b8a93a36252.o": "e0789406ba5191a0d635f9871ec150e06c3065b5958835b4b1d233c5acebb0df",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe_grad/HyperMegaMoeGrad_33fe31e677f6832eb668ca0702fc8322.o": "d1f76841217c2b9b8a5383613fbfd1e133f700c6fdc3f8c88f393fb0dab4cb1c",
+    "hyper_parallel/core/multicore/lib/vendors/hyper_parallel_multicore_nn/op_impl/ai_core/tbe/kernel/ascend910_93/hyper_mega_moe_grad/HyperMegaMoeGrad_9ae186170dd467d23b745fc44c511eee.o": "b7def7ebdd65a3a3f486b596b3a64475f868b3d13aeda37fb73fe57ab18c6644",
+    "hyper_parallel/core/multicore/shmem/lib/libhyper_parallel_shmem_ops.so": "4b4c89c49d129b3c75a31f6d372d7646da515f4baa1d349b0101c92c7720efee",
+    "hyper_parallel/core/multicore/shmem/lib/shmem/libhyper_parallel_shmem_utils.so": "cd2dba5814ce875094763582e8f4d2980a6a427fb0ce5f611292e67db1b3eba3",
+    "hyper_parallel/core/multicore/shmem/lib/shmem/aclshmem_bootstrap_config_store.so": "45b0562fa3cc4b4ab87e8dc80c48c733ad49883082396e4f5f943d37ecd648d9",
+    "hyper_parallel/core/multicore/shmem/lib/shmem/aclshmem_bootstrap_uid.so": "ddf03f1a386c099c9724135bf2de7ef6950e5ccf59086e1363f060cb7684c758",
+    "hyper_parallel/core/multicore/shmem/lib/shmem/libhyper_parallel_shmem.so": "0a524be75efd51e9429765fd5aaae1f53ca40d6a479573228e876c50f7e3a5c7",
+    "hyper_parallel/core/multicore/shmem/lib/framework/torch/hyper_parallel_shmem_torch.so": "58821583f82c824d8307c0ceece3be4d5e7f41b01af7fdec77733e835d31aa60"
+  },
+  "terminal_runs": [
+    {
+      "run_id": "20261109-152631-78e6eb",
+      "exit_codes": [
+        0
+      ],
+      "remaining_owned_processes": 0,
+      "post_inventory_free_logical_devices": 16
+    },
+    {
+      "run_id": "20261109-153706-5bc2e9",
+      "exit_codes": [
+        0
+      ],
+      "remaining_owned_processes": 0,
+      "post_inventory_free_logical_devices": 16
+    },
+    {
+      "run_id": "20261109-155233-35675c",
+      "exit_codes": [
+        0
+      ],
+      "remaining_owned_processes": 0,
+      "post_inventory_free_logical_devices": 16
+    }
+  ]
+}

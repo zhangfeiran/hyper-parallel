@@ -16,13 +16,15 @@
 
 import json
 import os
+import platform
 
 import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.multicore import shmem
 from tests.torch.models.longcat_flash._benchmark_longcat_flash import _arguments, _build, _hash, _step
-from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime
+from tests.torch.models.longcat_flash._precision import STRICT_GATE, compare_tensors as _compare, require_strict_pass
+from tests.torch.multicore._mega_moe_utils import environment_identity, start_shmem_lifetime
 
 
 def _snapshot(tensors: tuple, output: torch.Tensor) -> dict:
@@ -32,29 +34,6 @@ def _snapshot(tensors: tuple, output: torch.Tensor) -> dict:
               "probability_gradient": probabilities.grad.detach().cpu()}
     result.update({name: value.grad.detach().cpu() for name, value in experts.named_parameters()})
     return result
-
-
-def _compare(actual: torch.Tensor, reference: torch.Tensor) -> dict:
-    """Check every element in bounded chunks with two explicitly distinct gates."""
-    flat = actual.detach().reshape(-1)
-    expected = reference.reshape(-1)
-    maximum = 0.0
-    delta_square = reference_square = 0.0
-    strict_bad = component_bad = 0
-    for offset in range(0, flat.numel(), 8 * 1024 * 1024):
-        observed = flat[offset:offset + 8 * 1024 * 1024].float()
-        target = expected[offset:offset + observed.numel()].to(observed.device).float()
-        delta = observed - target
-        maximum = max(maximum, float(delta.abs().max()))
-        delta_square += float(delta.double().square().sum())
-        reference_square += float(target.double().square().sum())
-        strict_bad += int((delta.abs() > 2e-5 + 0.05 * target.abs()).sum())
-        component_bad += int((delta.abs() > 2e-3 + 0.02 * target.abs()).sum())
-    relative = (delta_square / max(reference_square, 1e-24)) ** 0.5
-    return {"max_abs": maximum, "relative_l2": relative, "strict_bad": strict_bad,
-            "component_bad": component_bad, "elements": flat.numel(),
-            "component_pass": component_bad == 0 and relative <= 0.02,
-            "strict_pass": strict_bad == 0 and relative <= 0.05}
 
 
 def _values(tensors: tuple, output: torch.Tensor) -> dict:
@@ -72,6 +51,8 @@ def main() -> None:
     rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(rank)
     dist.init_process_group("hccl")
+    if dist.get_world_size() != args.ep:
+        raise ValueError("component comparison requires WORLD_SIZE to match EP")
     start_shmem_lifetime()
     tensors = _build(args, rank)
     experts = tensors[0]
@@ -92,6 +73,10 @@ def main() -> None:
         results.append({"mode": mode, "comparison": comparison,
                         "strict_pass": all(row["strict_pass"] for row in comparison.values()),
                         "component_pass": all(row["component_pass"] for row in comparison.values())})
+        status = torch.tensor([results[-1]["strict_pass"]], device="npu", dtype=torch.int32)
+        dist.all_reduce(status, op=dist.ReduceOp.MIN)
+        results[-1]["all_ranks_strict_pass"] = bool(status.item())
+        results[-1]["failed_tensors"] = [name for name, row in comparison.items() if not row["strict_pass"]]
         experts.zero_grad(set_to_none=True)
     experts.close_runtime()
     report = {"rank": rank, "pid": os.getpid(), "ep": args.ep,
@@ -99,13 +84,15 @@ def main() -> None:
                         ("tokens", "hidden", "intermediate", "real", "zero", "top_k")},
               "oracle": "native NPU GMM/activation/permute/AllToAll/unpermute with identical parameters",
               "swiglu_precision": args.swiglu_precision,
+              "gate": {"name": "strict", **STRICT_GATE, "component_pass": "diagnostic only"},
+              "strict_pass": all(row["all_ranks_strict_pass"] for row in results),
+              "host_arch": platform.machine(), "environment": environment_identity(),
               "identities": identities, "results": results, "shmem_after_close": shmem.debug_state()}
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / f"rank{rank}.json").write_text(json.dumps(report, indent=2) + "\n")
     dist.barrier()
     dist.destroy_process_group()
-    if not all(row["component_pass"] for row in results):
-        raise RuntimeError("native/MegaMoE component precision failed")
+    require_strict_pass(results)
 
 
 if __name__ == "__main__":

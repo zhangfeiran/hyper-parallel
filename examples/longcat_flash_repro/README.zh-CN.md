@@ -8,6 +8,7 @@ expert 调度增量，以及完整逻辑层 shortcut 重叠的独立诊断入口
 - 客户项目替换接口、权重切分和生命周期：[接入指南](INTEGRATION.zh-CN.md)。
 - EOI 热副本配置及连续更新验收：[热副本接入与验收](../../docs/longcat-flash-hot-replicas.md)。
 - 当前组件优化、性能数据和独立精度命令：[路由与 expert 调优](../../docs/longcat-flash-cv-tuning.md)。
+- BF16 约 0.5% 差异、SwiGLU 模式含义及现场区分实验：[精度诊断](../../docs/longcat-flash-precision-diagnosis.md)。
 - 完整逻辑层有序多流 benchmark：[shortcut 重叠实验](../../docs/longcat-flash-shortcut-overlap.md)。
   该路径目前作为诊断入口提供，未替换默认 decoder，未验收 FSDP、激活重算或完整 Trainer。
 
@@ -20,11 +21,15 @@ git fetch origin feat/longcat-flash-repro
 git switch feat/longcat-flash-repro
 git merge --ff-only origin/feat/longcat-flash-repro
 source "$CANN_ENV"
-bash build.sh --multicore on --soc-list ascend910_93 --strict on
+bash build.sh --multicore on --soc-list ascend910b,ascend910_93 --strict on
 python -m pip install --no-deps --no-build-isolation -e .
 python -c 'import hyper_parallel; print(hyper_parallel.__file__)'
 source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
 ```
+
+上述命令包含本仓库支持的两个构建目标，避免只生成本地参考机所用的 `ascend910_93` 产物。
+CPU 架构与 NPU 构建目标需分别核对；x86_64 客户必须在自己的 Torch/PTA/CANN 环境重新构建。
+当前已知客户芯片为 910B2C，本地数值报告来自 910C，不能作为客户芯片已验收的证明。
 
 先自行预留 4 个逻辑 NPU，将 `LONGCAT_DEVICES` 设置为其逗号分隔 ID，
 `LONGCAT_OUTPUT` 设置为仓库之外的新输出目录。当前精度验收入口使用 Git 历史中的冻结旧路由作为原生 GMM 参考：
