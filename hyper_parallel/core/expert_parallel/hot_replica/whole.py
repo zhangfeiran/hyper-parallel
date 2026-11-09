@@ -152,8 +152,11 @@ def place_whole_experts(plan: ExpertExecutionPlan, *, capacity_limit: int,
         return best, selected
 
     def prune_guests() -> None:
-        """Return redundant guests home without increasing the selected receive peak."""
-        ceiling = max(loads)
+        """Remove transfer costs while retaining every original capacity and admission bound."""
+        ceiling = capacity_limit
+        if not capacity_required:
+            ceiling = min(ceiling, baseline_peak - 1, baseline_peak - minimum_saved_rows,
+                          int(baseline_peak * (1 - minimum_load_reduction)))
         for _ in range(config.num_experts):
             changed = False
             order = sorted(range(config.num_experts),
