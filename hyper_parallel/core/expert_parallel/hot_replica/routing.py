@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, lru_cache
 import math
 import struct
 from typing import Any
@@ -154,6 +154,24 @@ class _RejectedQuotaMemo:
             return False
         self.hits += 1
         return True
+
+
+@lru_cache(maxsize=64, typed=True)
+def _cached_complete_admission(signature: tuple[Any, ...]) -> tuple[tuple[tuple[int, int], ...], ...] | None:
+    """Retain only immutable CPU quotas after an exact fresh-count admission signature."""
+    decision, limit, resident, complete_search, _, projected_nodes = signature
+    copies = _admitted_uncalibrated_copies(
+        list(decision.totals), list(decision.loads), decision.config, limit, resident, decision.target,
+        decision.minimum_rows, decision.admission, decision.saved_rows,
+        allow_complete_search=complete_search, projected_rank_nodes=projected_nodes)
+    return None if copies is None else tuple(tuple(row.items()) for row in copies)
+
+
+def _complete_admission_copies(signature: tuple[Any, ...]) -> list[dict[int, int]] | None:
+    """Keep mutable quota dictionaries invocation-owned instead of sharing cached planner state."""
+    _integer(signature[0].minimum_rows, 'minimum_replica_rows', 0)
+    copies = _cached_complete_admission(signature)
+    return None if copies is None else [dict(row) for row in copies]
 
 
 class _RecomputedReplicaPlans:
@@ -430,6 +448,7 @@ def _try_compact_home_route(
     capacity_budget: Callable[[int], int] | None = None,
     gathered_counts: _GatheredReplicaCounts | None = None,
     rejected_quota_memo: _RejectedQuotaMemo | None = None,
+    complete_experts: bool = False,
 ) -> ReplicaRoute | _UncalibratedCandidate | None:
     """Read bounded statistics before deciding whether a full CPU table is needed."""
     # A larger allowance must not replace the original checkpoint graph with
@@ -527,10 +546,11 @@ def _try_compact_home_route(
                     config, totals, destination_loads, target, admission, minimum_saved_rows, minimum_replica_rows)
                 memo_rejected = rejected_quota_memo is not None and rejected_quota_memo.contains(signature)
                 if not (replay_rejected or memo_rejected):
-                    candidate = _admitted_uncalibrated_copies(
-                        totals, list(destination_loads), config, upper, resident, target,
-                        minimum_replica_rows, admission, minimum_saved_rows,
-                        allow_complete_search=complete_search, projected_rank_nodes=projected_nodes)
+                    candidate = (_complete_admission_copies(signature) if complete_experts else
+                                 _admitted_uncalibrated_copies(
+                                     totals, list(destination_loads), config, upper, resident, target,
+                                     minimum_replica_rows, admission, minimum_saved_rows,
+                                     allow_complete_search=complete_search, projected_rank_nodes=projected_nodes))
                     if candidate is not None and any(expert // config.home_experts != rank and count
                                                      for rank, row in enumerate(candidate)
                                                      for expert, count in row.items()):
@@ -687,7 +707,8 @@ def prepare_replica_route(
             minimum_saved_rows=minimum_saved_rows,
             minimum_replica_rows=minimum_replica_rows,
             cost_model=_cost_model, rank_nodes=_rank_nodes, capacity_budget=_capacity_budget,
-            gathered_counts=_gathered_counts, rejected_quota_memo=_rejected_quota_memo)
+            gathered_counts=_gathered_counts, rejected_quota_memo=_rejected_quota_memo,
+            complete_experts=_complete_experts)
         if isinstance(ordinary, ReplicaRoute):
             return ordinary
         prepared_candidate = ordinary
