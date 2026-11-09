@@ -60,6 +60,45 @@ EP4 的 13 组路由边界实验覆盖正常路由、不同真实 slot 数、全
 
 ## 客户现场区分实验
 
+推荐使用[自动诊断入口](../examples/longcat_flash_repro/diagnose.py)，无需逐条复制以下底层命令。
+客户在已有 Python3.11/Torch/PTA 环境中预留四个逻辑 NPU，设置 `CANN_ENV` 为本机 CANN 环境脚本、
+`LONGCAT_DIAG_OUTPUT` 为仓库外尚不存在的目录，然后执行：
+
+```bash
+python examples/longcat_flash_repro/diagnose.py \
+  --devices 0,1,2,3 \
+  --cann-env "$CANN_ENV" \
+  --output "$LONGCAT_DIAG_OUTPUT"
+```
+
+设备列表必须显式传入并替换为现场已预留的逻辑设备。入口会切换到所属仓库根目录，分别激活客户指定的 CANN 和
+当前仓库的 native 环境；检查 editable 来源、主机 ELF 架构、算子接口和 Git 历史，记录实际依赖与芯片信息。
+首次更新到当前功能分支、尚无匹配 native 产物时加 `--build`，显式编译 `ascend910b,ascend910_93` 并以
+`--no-deps --no-build-isolation` 安装本仓库 editable 包。客户 Torch/PTA 和其他依赖沿用原环境。
+
+默认顺序是 EP1 → EP4 fused。EP1 出现完整的数值失败报告时仍继续 EP4；若报告不完整或运行异常，则停止并保留日志。
+EP4 fused 完成但数值失败时自动补跑 EP4 hf，hf 通过也不会掩盖 fused 的失败。运行错误不自动重试。
+可用 `--ep4-hf always` 总是补跑 hf，或 `--ep4-hf never` 关闭补跑。
+只有一个已预留设备时使用 `--stage ep1 --devices 0`；单独运行四卡用 `--stage ep4`。
+H6144/I2048、T2048、TopK12 和每卡 8/4 的规模由入口固定。
+
+输出目录包含：
+
+- `summary.txt`：中文结论、逐项相对 L2、失败位置和后续定位方向。
+- `summary.json`：各阶段命令、真实退出码、完整 rank 判定、源码标识和机器可读结论。
+- `environment.json`、`preflight.log`、`prepare.log`：实际环境、native 选择与准备过程；`--build` 另有 `build.log`。
+- `ep1.log`、`ep1/rank0.json`：单卡六项比较。
+- `ep4-fused.log`、`ep4-fused/rank0.json` 至 `rank3.json`：四卡 push/pull 比较。
+- 补跑时的 `ep4-hf.log` 与 `ep4-hf/rank*.json`。
+
+最终退出码为 0（所有所选主验收通过）、1（数值失败）、2（准备/运行异常或报告不完整）、130（中断）。
+中途汇总标记 `RUNNING`，不会将只完成单卡的整个诊断误报为 PASS。主验收需要完整 case、全部五类张量、
+全部 rank、当前源码库选择和已关闭的 SHMEM；原始 HF 参考差异单独保留。
+客户回传上述日志、JSON 和汇总，即可区分参考语义、单卡计算、分布式路径或项目接入问题。
+这些是固定种子的组件实验；现场原始失败批次、checkpoint 与完整模型需要继续在客户项目中对齐。
+
+以下为已有匹配环境时的底层命令，便于单独重跑或在客户原启动器中调用。
+
 先按[当前分支指南](../examples/longcat_flash_repro/README.zh-CN.md)在客户环境重编译、核对 editable 安装来源及加载产物。
 不要安装或替换客户自建 Torch/PTA。正常组件主验收继续运行指南里的 EP4 独立历史前端命令；
 两侧选择相同的 `swiglu_precision`。

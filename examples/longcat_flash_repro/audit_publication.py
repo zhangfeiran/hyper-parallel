@@ -34,6 +34,9 @@ SOURCE_FILES = {
     "check_deps.py",
     "audit_publication.py",
     "checksums.py",
+    "diagnose.py",
+    "diagnose_probe.py",
+    "diagnose_reports.py",
 }
 SOURCE_DIRECTORIES = {"assets", "templates", "reference", "validation"}
 TEXT_SUFFIXES = {".py", ".sh", ".json", ".jsonl", ".yaml", ".md", ".txt", ".lock"}

@@ -31,6 +31,19 @@ source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
 CPU 架构与 NPU 构建目标需分别核对；x86_64 客户必须在自己的 Torch/PTA/CANN 环境重新构建。
 当前已知客户芯片为 910B2C，本地数值报告来自 910C，不能作为客户芯片已验收的证明。
 
+客户诊断可直接使用新入口，自动记录环境、运行单卡语义实验、四卡 EP 比较并生成中文汇总。
+先预留四个逻辑 NPU，设置 `LONGCAT_DIAG_OUTPUT` 为仓库外尚不存在的目录：
+
+```bash
+python examples/longcat_flash_repro/diagnose.py \
+  --devices 0,1,2,3 --cann-env "$CANN_ENV" \
+  --output "$LONGCAT_DIAG_OUTPUT"
+```
+
+设备 ID 按现场预留情况替换。尚未编译当前分支时加 `--build`，显式编译两个目标并以 `--no-deps` 安装本仓库，
+沿用客户现有 Torch/PTA。默认四卡 `fused` 完成但数值失败时补跑 `hf`；原始 `fused` 失败仍保留为最终失败。
+单卡可用 `--stage ep1 --devices 0`。完整参数、退出码和报告解释见[精度诊断](../../docs/longcat-flash-precision-diagnosis.md)。
+
 先自行预留 4 个逻辑 NPU，将 `LONGCAT_DEVICES` 设置为其逗号分隔 ID，
 `LONGCAT_OUTPUT` 设置为仓库之外的新输出目录。当前精度验收入口使用 Git 历史中的冻结旧路由作为原生 GMM 参考：
 
@@ -89,7 +102,7 @@ python -m torch.distributed.run --standalone --nproc-per-node=4 \
    "$REPRO_PYTHON" -m pip install --no-deps --no-build-isolation -e "$REPRO_REPO"
    ```
 
-3. 客户目标为 x86_64 / 910C / Python3.11。参考实测来自 aarch64 / Ascend910_9382；
+3. 客户目标为 x86_64 / 910B2C / Python3.11。参考实测来自 aarch64 / Ascend910_9382；
    x86 入口和 ELF 检查已有 CPU 验证，x86 NPU 端到端精度与性能仍需在客户机器上实测。
    完整实验需要单机 **16个逻辑 NPU**，组件需要 **4个逻辑 NPU**；数量按 `npu-smi info -m` 的逻辑设备计算。
    设备 ID 由调用方显式指定，入口检查数量、唯一性和可用设备；完整运行的组件设备必须属于 Trainer 设备集合。
