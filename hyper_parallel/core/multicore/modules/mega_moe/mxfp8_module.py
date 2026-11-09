@@ -26,6 +26,7 @@ import os
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 from hyper_parallel.core.expert_parallel.hot_replica.capacity import ExpertReplicaConfig
 from hyper_parallel.core.expert_parallel.hot_replica._metadata import _ReplicaCountHeaderCache
 from hyper_parallel.core.multicore import _collective
@@ -434,7 +435,9 @@ class MXFP8MegaMoeExperts(MegaMoeExperts):
             )
             with torch.no_grad():
                 replica_route = self._prepare_replica_route(
-                    topk_ids, resources, flat, mask, tokens_per_expert, count_header_cache=resources.replica_headers
+                    topk_ids, resources, flat, mask, tokens_per_expert,
+                    count_header_cache=resources.replica_headers,
+                    complete_experts=bool(mask & 1) or get_recompute_state() is not None,
                 )
                 topk_ids = replica_route.physical_ids
                 tokens_per_expert = replica_route.counts_by_source[resources.spec.rank_id]

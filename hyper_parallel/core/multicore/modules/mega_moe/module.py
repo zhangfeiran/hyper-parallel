@@ -833,6 +833,7 @@ class MegaMoeExperts(MulticoreModule):
         autograd_mask: int, counts: torch.Tensor | None,
         gathered: _GatheredReplicaCounts | None = None,
         *, count_header_cache: _ReplicaCountHeaderCache | None = None,
+        complete_experts: bool = False,
     ) -> ReplicaRoute:
         """Resolve the unchanged bounded policy only when placement is needed."""
         selection = ({'execution_schedule': UNMAPPED_GUEST_SUFFIX_SCHEDULE}
@@ -879,6 +880,7 @@ class MegaMoeExperts(MulticoreModule):
             _trusted_counts=counts, _gathered_counts=gathered,
             _rejected_quota_memo=self._rejected_quota_memo,
             _count_header_cache=count_header_cache,
+            _complete_experts=complete_experts,
         )
 
     def forward(

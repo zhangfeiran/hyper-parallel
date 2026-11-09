@@ -266,19 +266,23 @@ class TestMXFP8BackwardDAG(unittest.TestCase):
                 self.assertEqual(backwards[0], backwards[1])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
-    def test_replicas_and_other_queues_rejected(self) -> None:
+    def test_active_replicas_keep_the_original_graph_and_legacy_queue_is_rejected(self) -> None:
         """Feature: B0 backward scope validation.
-        Description: Enable the experiment with active replicas or a legacy queue.
-        Expectation: Unsupported replica and queue combinations fail before graph construction.
+        Description: Request the home-only option with active guests or a legacy queue.
+        Expectation: Active guests retain their complete original graph; the legacy queue fails before construction.
         """
         os.environ[OPTION] = "1"
         spec = self._shape(16)
         guests = replace(spec, num_experts=128, logical_num_experts=96, replica_slots_per_rank=2,
                          replica_transport="shmem_signal_kernel_gradient")
-        for shape in (guests, replace(spec, mx_vector_policy="legacy_odd")):
-            with self.subTest(budget=shape.replica_slots_per_rank, policy=shape.mx_vector_policy):
-                with self.assertRaisesRegex(ValueError, "B0 backward DAG requires window2 without replicas"):
-                    build_mxfp8_runtime(shape, forward=False)
+        actual = build_mxfp8_runtime(guests, forward=False)
+        with patch.dict(os.environ, {OPTION: "0"}):
+            reference = build_mxfp8_runtime(guests, forward=False)
+        self.assertEqual(serialize_runtime_config(actual.config), serialize_runtime_config(reference.config))
+        self.assertEqual(actual.gmm_descriptors, reference.gmm_descriptors)
+        self.assertEqual(actual.quant_descriptors, reference.quant_descriptors)
+        with self.assertRaisesRegex(ValueError, "B0 backward DAG requires window2"):
+            build_mxfp8_runtime(replace(spec, mx_vector_policy="legacy_odd"), forward=False)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_gradient_join_rejects_nonready_or_forward_without_mutation(self) -> None:
