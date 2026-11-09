@@ -288,8 +288,7 @@ def _upload_route_metadata(plan: ExpertExecutionPlan, rank: int,
     runs = plan.source_runs_for(rank) if plan.transfers else ()
     slots = tuple(slot for slot, _ in runs)
     lengths = tuple(count for _, count in runs)
-    counts = tuple(count for row in plan.dispatch_counts for count in row)
-    data = struct.pack(f"<{2 * len(runs)}q{len(counts)}i", *slots, *lengths, *counts)
+    data = struct.pack(f"<{2 * len(runs)}q", *slots, *lengths) + plan._dispatch_counts_bytes
     # The pinned allocator retains the source through its copy event. Device
     # views own the result through remapping and every downstream consumer.
     packed = _async_device_bytes(data, device)

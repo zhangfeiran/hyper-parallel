@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
+from itertools import chain
+import struct
 
 from .capacity import ExpertReplicaConfig
 from .host import _column_totals
@@ -59,6 +61,12 @@ class ExpertExecutionPlan:
         """Own immutable rows so cached derived metadata cannot become stale."""
         for name in ("logical_counts", "slot_to_logical", "dispatch_counts"):
             object.__setattr__(self, name, tuple(tuple(row) for row in getattr(self, name)))
+
+    @cached_property
+    def _dispatch_counts_bytes(self) -> bytes:
+        """Encode immutable INT32 quotas once for upload and exact host descriptors."""
+        size = self.config.ep_size * self.config.physical_experts
+        return struct.pack(f"<{size}i", *chain.from_iterable(self.dispatch_counts))
 
     @cached_property
     def destination_counts(self) -> tuple[tuple[int, ...], ...]:
